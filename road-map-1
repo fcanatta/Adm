@@ -1,0 +1,150 @@
+============================================================
+       ADM BUILD SYSTEM - ROADMAP (SCRIPTS DE CONSTRU??O)
+============================================================
+
+Diret?rio base: /usr/src/adm/
+
+Estrutura de diret?rios:
+------------------------
+/usr/src/adm/scripts/    - todos os scripts principais do sistema
+/usr/src/adm/repo/<categoria>/<programa,hooks,patch>/      - reposit?rio de pacotes, hooks, patches e metadados (build.conf)
+/usr/src/adm/build/      - diret?rio tempor?rio de compila??o
+/usr/src/adm/logs/       - registros e sa?das organizadas por data
+/usr/src/adm/bootstrap/output/     - imagens finais stages
+/usr/src/adm/bootstrap/  - diret?rio de bootstrap
+/usr/src/adm/cache/      - sources e pacotes criados
+/usr/src/adm/config/     - arquivos de configura??o e perfis de build
+
+------------------------------------------------------------
+Scripts principais (todos em /usr/src/adm/scripts/):
+------------------------------------------------------------
+adm.sh              - script principal (cli, execut?vel)
+env.sh              - define vari?veis globais
+deps.sh             - verifica depend?ncias de compila??o do pacote (lendo DEPEND= do build.conf), resolve recursivamente e ordena
+fetch.sh            - baixa m?ltiplos c?digo-fonte em todos os formatos
+patch.sh            - aplica corre??es automaticamente
+build.sh            - compila automaticamente e instala na ?rvore tempor?ria
+install.sh          - instala para / ou /usr/src/adm/bootstrap/mnt/lfs ou bin?rio em cache ou diret?rio e registra
+package.sh          - empacota resultados
+boot.sh             - cria mkinitramfs, mkinitramfs
+bootstrap.sh        - cria o stage0, stage1, stage2, stage3, atualiza, ger?ncia o toolchain e no final cria um rootfs de cada um stage
+log.sh              - registra tudo (timestamps e erros)
+recover.sh          - retoma builds interrompidos
+ui.sh               - interface limpa (progresso e status), define fun??es de cor (para terminais reais)
+scheduler.sh        - resolve depend?ncias e ordem de build
+integrity.sh        - verifica hashes, assinaturas, permiss?es
+diff.sh             - mostra, compara, cria, edita, remove, aplica diffs com cores
+clean.sh            - limpa diret?rios de trabalho, caches, logs tudo
+
+------------------------------------------------------------
+Adi??es novas:
+------------------------------------------------------------
+update.sh           - verifica no upstream se h? nova vers?o do pacote definido no build.conf, compara e atualiza
+uninstall.sh        - desinstala pacotes instalados, executa hooks pr?/p?s uninstall e remove depend?ncias ?rf?s
+
+------------------------------------------------------------
+Reposit?rio de pacotes (/usr/src/adm/repo/):
+------------------------------------------------------------
+toolchain/
+  binutils/build.conf
+  gcc/build.conf
+  glibc/build.conf
+
+base/
+  coreutils/build.conf
+  bash/build.conf
+
+desktop/
+  gnome/meta_pacote-build.sh (cont?m somente as depend?ncias para instalar tudo)
+  kde/meta_pacote-build.sh
+
+Libs/
+  gtk3/build.conf
+
+www/
+  firefox/build.conf
+  chromium/build.conf
+
+Cada arquivo build.conf cont?m apenas metadados, por exemplo:
+
+NAME=firefox
+VERSION=130.0
+DESC=Navegador web
+URL=https://ftp.mozilla.org/pub/$NAME/releases/$VERSION/$NAME-$VERSION-source.tar.xz
+DEPEND=gtk3,cairo,rust
+BUILD=autotools,python,go,rust,make,ninja,custom
+JOBS=8
+STRIP=yes
+
+custom_build ()
+{}
+
+------------------------------------------------------------
+Fluxo autom?tico (sem comandos manuais):
+------------------------------------------------------------
+1. Executar apenas:
+   sudo adm --install <programa>
+
+2. O sistema faz automaticamente:
+   - Carrega ambiente (env.sh)
+   - Checa depend?ncias de compila??o (deps.sh)
+   - L? perfil ativo (/usr/src/adm/config/default.conf)
+   - Monta plano de compila??o (scheduler.sh)
+   - Para cada pacote:
+       fetch.sh     - baixa
+       integrity.sh - verifica
+       patch.sh     - aplica automaticamente
+       hooks.sh     - aplica automaticamente
+       build.sh     - compila e instala em diret?rio tempor?rio
+       package.sh   - empacota e strip
+       install.sh   - instala??o final
+   - log.sh registra tudo
+   - ui.sh exibe progresso e status no terminal
+
+------------------------------------------------------------
+Etapas de desenvolvimento (roadmap cronol?gico):
+------------------------------------------------------------
+Fase 1: Base estrutural
+  - Criar /usr/src/adm/ com pastas scripts, repo, logs, output
+  - Resultado: estrutura limpa e organizada
+
+Fase 2: Core scripts
+  - Implementar env.sh, log.sh, colors.sh
+  - Resultado: ambiente e sistema de logs prontos
+
+Fase 3: Fetch + Integrity
+  - Adicionar fetch.sh e integrity.sh
+  - Resultado: download e verifica??o autom?ticos
+
+Fase 4: Build engine
+  - Criar build.sh, install.sh, package.sh
+  - Resultado: compila??o automatizada
+
+Fase 5: Scheduler
+  - Adicionar scheduler.sh
+  - Resultado: ordem autom?tica de depend?ncias
+
+Fase 6: UI e cores
+  - Adicionar ui.sh para progresso e feedback visual
+  - Implementar painel din?mico de status (exibi??o cont?nua durante a constru??o)
+  - O log completo ? redirecionado para arquivo, e a tela exibe somente o painel padronizado:
+      ? Mostra pacote, vers?o, etapa atual, progresso, depend?ncia, status e tempo decorrido
+      ? Atualiza em tempo real a cada etapa (fetch, patch, build, package, install)
+      ? Ao final, transforma-se na tela de finaliza??o (sucesso/erro) com resumo e caminhos
+  - Resultado: interface limpa, din?mica e informativa
+
+Fase 7: Reposit?rio de pacotes
+  - Criar /repo/ com arquivos build.conf
+  - Resultado: base funcional de pacotes
+
+Fase 8: Recupera??o autom?tica
+  - Implementar recover.sh
+  - Resultado: retoma builds interrompidos
+
+Fase 9: Perfis de compila??o
+  - Criar /config/ com perfis (desktop, minimal, xorg)
+  - Resultado: perfis de build gerenci?veis
+
+Fase 10: Atualiza??o e remo??o
+  - Adicionar update.sh e uninstall.sh
+  - Resultado: sistema capaz de atualizar e remover pacotes automaticamente
