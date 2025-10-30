@@ -1,111 +1,115 @@
 ============================================================
-       ADM BUILD SYSTEM - ROADMAP (SCRIPTS DE CONSTRU??O)
+       ADM BUILD SYSTEM - V 1.0 CONSTRUCTION
 ============================================================
 
-Diret?rio base: /usr/src/adm/
+Objetivo; criar scripts simples com código limpo,completo,funcional,funções limpas,completas,funcionais
+priorizar automação,limpeza,clareza,funcionalidade,completude quero todos os scripts completos,funcionais,limpos e organizados
+quero que eles fazem o que precisa somente com o que precisa,não completar o código com coisas desnecessárias
+que não fazem parte do escopo do projeto.
 
-Estrutura de diret?rios:
+Diretório base: /usr/src/adm/
+
+Estrutura de diretórios:
 ------------------------
 /usr/src/adm/scripts/    - todos os scripts principais do sistema
-/usr/src/adm/repo/<categoria>/<programa,hooks,patch>/      - reposit?rio de pacotes, hooks, patches e metadados (build.conf)
-/usr/src/adm/build/      - diret?rio tempor?rio de compila??o
-/usr/src/adm/logs/       - registros e sa?das organizadas por data
-/usr/src/adm/bootstrap/output/     - imagens finais stages
-/usr/src/adm/bootstrap/  - diret?rio de bootstrap
+/usr/src/adm/repo/<categoria>/{<programa,hooks,patch>}/      - repositório de pacotes, hooks, patches e metadados (build.pkg)
+/usr/src/adm/build/      - diretório temporário de compilação 
+/usr/src/adm/logs/       - registros e saídas organizadas por data
+/usr/src/adm/bootstrap/  - diretório de bootstrap e imagens finais e stages 1,2,3,4
 /usr/src/adm/cache/      - sources e pacotes criados
-/usr/src/adm/config/     - arquivos de configura??o e perfis de build
+/usr/src/adm/config/     - arquivos de configuração e perfis de build
+/usr/src/adm/update/<categoria>/<programa/build.pkg     - diretório de updates com versões novas de atualização 
+Categorias do repo  É pra ser criado nos diretórios update/ e repo/ com o env.sh
 
 ------------------------------------------------------------
 Scripts principais (todos em /usr/src/adm/scripts/):
 ------------------------------------------------------------
-adm.sh              - script principal (cli, execut?vel)
-env.sh              - define vari?veis globais
-deps.sh             - verifica depend?ncias de compila??o do pacote (lendo DEPEND= do build.conf), resolve recursivamente e ordena
-fetch.sh            - baixa m?ltiplos c?digo-fonte em todos os formatos
-patch.sh            - aplica corre??es automaticamente
-build.sh            - compila automaticamente e instala na ?rvore tempor?ria
-install.sh          - instala para / ou /usr/src/adm/bootstrap/mnt/lfs ou bin?rio em cache ou diret?rio e registra
-package.sh          - empacota resultados
+adm.sh              - script principal (cli, executável)
+env.sh              - define variáveis globais, cria todos os diretórios do sistema com as devidas permissões 
+deps.sh             - verifica dependências de compilação do pacote (lendo DEPEND= do build.pkg), resolve recursivamente e ordena
+fetch.sh            - baixa múltiplos código-fonte em todos os formatos em todos os tipos de links checa sha256sum e guarda em cache
+patch.sh            - aplica correções automaticamente
+build.sh            - compila automaticamente e instala na árvore temporária e gera registro
+install.sh          - instala para / ou diretório qualquer ou binário em cache ou diretório e registra
+package.sh          - empacota resultados e strip e guarda em cache
 boot.sh             - cria mkinitramfs, mkinitramfs
-bootstrap.sh        - cria o stage0, stage1, stage2, stage3, atualiza, ger?ncia o toolchain e no final cria um rootfs de cada um stage
+bootstrap.sh        - cria o bootstrap,stage0, stage1, stage2, stage3, atualiza, gerência o toolchain e no final cria um rootfs de cada um stage
 log.sh              - registra tudo (timestamps e erros)
 recover.sh          - retoma builds interrompidos
-ui.sh               - interface limpa (progresso e status), define fun??es de cor (para terminais reais)
-scheduler.sh        - resolve depend?ncias e ordem de build
-integrity.sh        - verifica hashes, assinaturas, permiss?es
-diff.sh             - mostra, compara, cria, edita, remove, aplica diffs com cores
-clean.sh            - limpa diret?rios de trabalho, caches, logs tudo
+ui.sh               - interface limpa (progresso e status), define funções de cor (para terminais reais) e barra de progresso pra downloads
+scheduler.sh        - cordena a ordem de build otimizações,perfis de construção (agressive,conservador,básico) define com comando
+integrity.sh        - verifica hashes, assinaturas, permissões, verifica se o toolchain está funcional, se um programa está correto, se tem lib quebrada
+diff.sh             - mostra, compara, cria, edita, remove, aplica diffs com cores manipulação completa 
+clean.sh            - limpa diretórios de trabalho, caches, logs, limpa tudo
+update.sh           - verifica no upstream se há nova versão do pacote definido no build.pkg, compara e cria build.conf no diretório de update
+uninstall.sh        - desinstala pacotes instalados, executa hooks pre/post uninstall e remove dependências órfãs 
 
 ------------------------------------------------------------
-Adi??es novas:
-------------------------------------------------------------
-update.sh           - verifica no upstream se h? nova vers?o do pacote definido no build.conf, compara e atualiza
-uninstall.sh        - desinstala pacotes instalados, executa hooks pr?/p?s uninstall e remove depend?ncias ?rf?s
-
-------------------------------------------------------------
-Reposit?rio de pacotes (/usr/src/adm/repo/):
+Repositório de pacotes (/usr/src/adm/repo/):
 ------------------------------------------------------------
 toolchain/
-  binutils/build.conf
-  gcc/build.conf
-  glibc/build.conf
+  binutils/build.pkg
+  gcc/build.pkg
+  glibc/build.pkg
 
 base/
-  coreutils/build.conf
-  bash/build.conf
+  coreutils/build.pkg
+  bash/build.pkg
 
 desktop/
-  gnome/meta_pacote-build.sh (cont?m somente as depend?ncias para instalar tudo)
-  kde/meta_pacote-build.sh
+  gnome/meta_build.pkg (contém somente as dependências para instalar tudo)
+  
 
-Libs/
-  gtk3/build.conf
+xorg/
+  xorg/xorg_build.pkg (contém somente as dependências para instalar tudo)
 
-www/
-  firefox/build.conf
-  chromium/build.conf
+apps/
+  firefox/build.pkg
+  chromium/build.pkg
 
-Cada arquivo build.conf cont?m apenas metadados, por exemplo:
+Cada arquivo build.pkg contém apenas metadados, por exemplo:
 
 NAME=firefox
 VERSION=130.0
+RELEASE=1
 DESC=Navegador web
 URL=https://ftp.mozilla.org/pub/$NAME/releases/$VERSION/$NAME-$VERSION-source.tar.xz
 DEPEND=gtk3,cairo,rust
-BUILD=autotools,python,go,rust,make,ninja,custom
-JOBS=8
-STRIP=yes
+BUILD_DEPEND=
+BUILD=autotools,python,go,rust,make,ninja,todos os compiladores,custom
 
 custom_build ()
-{}
+{# Aparecer somente se opção BUILD=custom estiver selecionada}
+
+
 
 ------------------------------------------------------------
-Fluxo autom?tico (sem comandos manuais):
+Fluxo automático (sem comandos manuais):
 ------------------------------------------------------------
 1. Executar apenas:
    sudo adm --install <programa>
 
 2. O sistema faz automaticamente:
    - Carrega ambiente (env.sh)
-   - Checa depend?ncias de compila??o (deps.sh)
-   - L? perfil ativo (/usr/src/adm/config/default.conf)
-   - Monta plano de compila??o (scheduler.sh)
+   - Checa dependências de compilação (deps.sh)
+   - Le perfil ativo (agressive,conservador,básico) aplica
+   - Monta plano de compilação (scheduler.sh)
    - Para cada pacote:
        fetch.sh     - baixa
        integrity.sh - verifica
        patch.sh     - aplica automaticamente
        hooks.sh     - aplica automaticamente
-       build.sh     - compila e instala em diret?rio tempor?rio
+       build.sh     - compila e instala em diretório temporário 
        package.sh   - empacota e strip
-       install.sh   - instala??o final
+       install.sh   - instalação final
    - log.sh registra tudo
    - ui.sh exibe progresso e status no terminal
 
 ------------------------------------------------------------
-Etapas de desenvolvimento (roadmap cronol?gico):
+Etapas de desenvolvimento (roadmap cronológico):
 ------------------------------------------------------------
 Fase 1: Base estrutural
-  - Criar /usr/src/adm/ com pastas scripts, repo, logs, output
+  - Criar /usr/src/adm/ com pastas scripts, repo, logs, update, bootstrap, cache com sources/ e packages/
   - Resultado: estrutura limpa e organizada
 
 Fase 2: Core scripts
@@ -114,37 +118,37 @@ Fase 2: Core scripts
 
 Fase 3: Fetch + Integrity
   - Adicionar fetch.sh e integrity.sh
-  - Resultado: download e verifica??o autom?ticos
+  - Resultado: download e verificação automáticas 
 
 Fase 4: Build engine
   - Criar build.sh, install.sh, package.sh
-  - Resultado: compila??o automatizada
+  - Resultado: compilação automatizada
 
 Fase 5: Scheduler
   - Adicionar scheduler.sh
-  - Resultado: ordem autom?tica de depend?ncias
+  - Resultado: ordem automática de construção otimizado
 
 Fase 6: UI e cores
   - Adicionar ui.sh para progresso e feedback visual
-  - Implementar painel din?mico de status (exibi??o cont?nua durante a constru??o)
-  - O log completo ? redirecionado para arquivo, e a tela exibe somente o painel padronizado:
-      ? Mostra pacote, vers?o, etapa atual, progresso, depend?ncia, status e tempo decorrido
-      ? Atualiza em tempo real a cada etapa (fetch, patch, build, package, install)
-      ? Ao final, transforma-se na tela de finaliza??o (sucesso/erro) com resumo e caminhos
-  - Resultado: interface limpa, din?mica e informativa
+  - Implementar painel dinâmico de status (exibição contínua durante a construção)
+  - O log completo é redirecionado para arquivo, e a tela exibe somente o painel padronizado:
+      e Mostra pacote, versão, etapa atual, progresso, dependências, status e tempo decorrido
+      e Atualiza em tempo real a cada etapa (fetch, patch, build, package, install)
+      e Ao final, transforma-se na tela de finalização (sucesso/erro) com resumo e caminhos
+  - Resultado: interface limpa, dinâmica e informativa
 
-Fase 7: Reposit?rio de pacotes
-  - Criar /repo/ com arquivos build.conf
+Fase 7: Repositório de pacotes
+  - Criar /repo/ com arquivos build.pkg
   - Resultado: base funcional de pacotes
 
-Fase 8: Recupera??o autom?tica
+Fase 8: Recuperação automática 
   - Implementar recover.sh
   - Resultado: retoma builds interrompidos
 
-Fase 9: Perfis de compila??o
+Fase 9: Perfis de compilação 
   - Criar /config/ com perfis (desktop, minimal, xorg)
-  - Resultado: perfis de build gerenci?veis
+  - Resultado: perfis de build gerenciáveis 
 
-Fase 10: Atualiza??o e remo??o
+Fase 10: Atualização e remoção
   - Adicionar update.sh e uninstall.sh
   - Resultado: sistema capaz de atualizar e remover pacotes automaticamente
