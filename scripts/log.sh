@@ -1,168 +1,332 @@
-#!/bin/bash
-#===============================================================
-#  ADM BUILD SYSTEM - log.sh
-#  Sistema centralizado de logs e execução silenciosa
-#===============================================================
-#---------------------------------------------------------------
-# Diretórios e variáveis essenciais
-#---------------------------------------------------------------
-ADM_ROOT="/usr/src/adm"
-ADM_LOGS="$ADM_ROOT/logs"
-mkdir -p "$ADM_LOGS" 2>/dev/null || {
-    echo "Erro: não foi possível criar diretório de logs: $ADM_LOGS" >&2
-    exit 1
+#!/usr/bin/env bash
+# log.sh - Central logging facility for ADM Build System
+# Location: /usr/src/adm/scripts/log.sh
+# Purpose: structured, thread-safe logging with levels, rotation, per-job logs and terminal colorization
+# SPDX-License-Identifier: MIT
+
+# Guard: allow multiple sources
+: "${ADM_LOG_SH_LOADED:-}" || ADM_LOG_SH_LOADED=0
+if [ "$ADM_LOG_SH_LOADED" -eq 1 ]; then
+    return 0
+fi
+ADM_LOG_SH_LOADED=1
+
+# Require bash
+if [ -z "$BASH_VERSION" ]; then
+    echo "log.sh: WARNING: bash features preferred" >&2
+fi
+
+set -u
+
+# Load env if present (but don't fail if not)
+ADM_SCRIPTS_DEFAULT="/usr/src/adm/scripts"
+: "${ADM_SCRIPTS:=${ADM_SCRIPTS_DEFAULT}}"
+if [ -f "${ADM_SCRIPTS}/env.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${ADM_SCRIPTS}/env.sh" || true
+fi
+
+# Defaults (can be overridden by env.sh)
+: "${ADM_LOGS:=/usr/src/adm/logs}"
+: "${ADM_LOGLEVEL:=INFO}"
+: "${ADM_COLOR:=true}"
+: "${ADM_LOG_ROTATE_DAYS:=7}"
+: "${ADM_LOG_TIMESTAMP_FMT:='%Y-%m-%d %H:%M:%S'}"
+: "${ADM_LOG_SESSION:=adm-$(date +%F_%H-%M-%S)}"
+: "${ADM_LOG_PID:=${BASHPID:-$$}}"
+: "${ADM_JOB_ID:=default}"
+: "${ADM_MAX_LOG_LINE:=10000}"
+: "${ADM_LOG_ARCHIVE_DIR:=${ADM_LOGS}/archive}"
+
+# Create directories
+mkdir -p "$ADM_LOGS" "$ADM_LOG_ARCHIVE_DIR" 2>/dev/null || true
+
+# Utilities: detect flock
+_have_flock=false
+if command -v flock >/dev/null 2>&1; then _have_flock=true; fi
+
+# Color sequences
+_log_color_reset='\e[0m'
+_log_color_debug='\e[1;36m'
+_log_color_info='\e[1;34m'
+_log_color_warn='\e[1;33m'
+_log_color_error='\e[1;31m'
+
+# Determine if terminal supports colors
+_log_use_color=false
+if [ "$ADM_COLOR" = "true" ] && [ -t 1 ]; then
+    _log_use_color=true
+fi
+
+# Map level to priority
+declare -A _LOG_PRI
+_LOG_PRI[DEBUG]=10
+_LOG_PRI[INFO]=20
+_LOG_PRI[WARN]=30
+_LOG_PRI[ERROR]=40
+_LOG_PRI[FATAL]=50
+
+# Helper: current priority threshold
+_log_threshold() {
+    local lvl="$1"
+    echo "${_LOG_PRI[$lvl]:-20}"
 }
 
-#---------------------------------------------------------------
-# Variáveis de ambiente
-#---------------------------------------------------------------
-ADM_LOGFILE=""
-ADM_PKG_NAME="${ADM_PKG_NAME:-unknown}"
-BUILD_ID=$(date +%Y-%m-%d_%H-%M-%S)
+_LOG_CURRENT_THRESHOLD=${_LOG_PRI[$ADM_LOGLEVEL]:-${_LOG_PRI[INFO]}}
 
-#---------------------------------------------------------------
-# Cores (para terminal)
-#---------------------------------------------------------------
-C_RESET="\033[0m"
-C_BLUE="\033[1;34m"
-C_GREEN="\033[1;32m"
-C_YELLOW="\033[1;33m"
-C_RED="\033[1;31m"
-C_GRAY="\033[0;37m"
-
-#---------------------------------------------------------------
-# Função interna: timestamp formatado
-#---------------------------------------------------------------
-log_timestamp() {
-    date '+%Y-%m-%d %H:%M:%S'
+# Timestamp with optional milliseconds
+_log_timestamp() {
+    if date +%s >/dev/null 2>&1; then
+        # try to include milliseconds if possible
+        if date +%Y >/dev/null 2>&1; then
+            date +"%Y-%m-%d %H:%M:%S"
+        else
+            date
+        fi
+    else
+        printf '%s' "$(date)"
+    fi
 }
 
-#---------------------------------------------------------------
-# Inicializa sessão de log
-#---------------------------------------------------------------
-log_init() {
-    local context="${1:-session}"
-    ADM_LOGFILE="$ADM_LOGS/${BUILD_ID}_${context}.log"
+# Sanitize message: remove control characters except newline and tab
+_log_sanitize() {
+    local msg="$1"
+    # remove escape sequences and control chars (except newline/tab)
+    # keep UTF-8 bytes
+    printf '%s' "$msg" | tr -d '\000-\010\013\014\016-\037' || true
+}
 
-    {
-        echo "============================================================"
-        echo " ADM BUILD SYSTEM - LOG SESSION"
-        echo " Contexto : $context"
-        echo " Início   : $(log_timestamp)"
-        echo "============================================================"
-        echo
-    } >> "$ADM_LOGFILE"
+# File for global session log and per-job
+_LOG_GLOBAL_FILE="$ADM_LOGS/${ADM_LOG_SESSION}.log"
+_LOG_JOB_FILE="$ADM_LOGS/${ADM_JOB_ID}.log"
 
-    export ADM_LOGFILE
+# Ensure log files exist and with safe perms
+: > "$_LOG_GLOBAL_FILE" 2>/dev/null || true
+: > "$_LOG_JOB_FILE" 2>/dev/null || true
+chmod 0644 "$_LOG_GLOBAL_FILE" 2>/dev/null || true
+chmod 0644 "$_LOG_JOB_FILE" 2>/dev/null || true
+
+# Locking primitives
+_log_acquire_lock() {
+    local lockfile="$1"
+    if $_have_flock; then
+        exec 9>"$lockfile" || return 1
+        flock -x 9 || return 1
+        return 0
+    else
+        # fallback lockfile with pid
+        local tryfile
+        tryfile="$lockfile.pid"
+        local i=0
+        while ! ( set -C; : > "$tryfile" ) 2>/dev/null; do
+            # wait briefly
+            i=$((i+1))
+            sleep 0.05
+            if [ $i -gt 200 ]; then
+                return 1
+            fi
+        done
+        printf '%s' "${BASHPID:-$$}" > "$tryfile"
+        return 0
+    fi
+}
+
+_log_release_lock() {
+    local lockfile="$1"
+    if $_have_flock; then
+        # close fd9
+        exec 9>&- 2>/dev/null || true
+        return 0
+    else
+        local tryfile="$lockfile.pid"
+        rm -f "$tryfile" 2>/dev/null || true
+        return 0
+    fi
+}
+
+# Internal atomic write to log file
+_log_write_atomic() {
+    local file="$1"; shift
+    local msg="$*"
+    local tmp
+    tmp="${file}.$(date +%s%N).tmp"
+    umask 022
+    printf '%s\n' "$msg" > "$tmp" || return 1
+    mv -f "$tmp" "$file" 2>/dev/null || { cat "$tmp" >> "$file" && rm -f "$tmp"; }
     return 0
 }
 
-#---------------------------------------------------------------
-# Fecha sessão de log
-#---------------------------------------------------------------
-log_close() {
-    {
-        echo
-        echo "============================================================"
-        echo " Fim da sessão : $(log_timestamp)"
-        echo "============================================================"
-        echo
-    } >> "$ADM_LOGFILE"
-}
+# Core writer: writes to both global and job logs, with locking
+_log_write() {
+    local level="$1"; shift
+    local context="$1"; shift || context=""
+    local pkg="$1"; shift || pkg=""
+    local message="$*"
 
-#---------------------------------------------------------------
-# Registra mensagem informativa
-#---------------------------------------------------------------
-log_info() {
-    local msg="$*"
-    echo "[$(log_timestamp)] [INFO] $msg" >> "$ADM_LOGFILE"
-}
+    local ts
+    ts=$(_log_timestamp)
+    local sanitized
+    sanitized=$(_log_sanitize "$message")
 
-#---------------------------------------------------------------
-# Registra aviso
-#---------------------------------------------------------------
-log_warn() {
-    local msg="$*"
-    echo -e "${C_YELLOW}[WARN]${C_RESET} $msg"
-    echo "[$(log_timestamp)] [WARN] $msg" >> "$ADM_LOGFILE"
-}
+    local line="[${ts}][${context}][${pkg}][${level}] ${sanitized}"
 
-#---------------------------------------------------------------
-# Registra erro
-#---------------------------------------------------------------
-log_error() {
-    local msg="$*"
-    echo -e "${C_RED}[ERROR]${C_RESET} $msg" >&2
-    echo "[$(log_timestamp)] [ERROR] $msg" >> "$ADM_LOGFILE"
-}
+    # write to terminal based on level and ADM_LOGLEVEL
+    local lvlpri=${_LOG_PRI[$level]:-20}
+    if [ $lvlpri -ge $_LOG_CURRENT_THRESHOLD ]; then
+        if $_log_use_color; then
+            local color=''
+            case "$level" in
+                DEBUG) color="${_log_color_debug}" ;;
+                INFO) color="${_log_color_info}" ;;
+                WARN) color="${_log_color_warn}" ;;
+                ERROR|FATAL) color="${_log_color_error}" ;;
+                *) color="" ;;
+            esac
+            printf '%b%s%b\n' "$color" "$line" "${_log_color_reset}"
+        else
+            printf '%s\n' "$line"
+        fi
+    fi
 
-#---------------------------------------------------------------
-# Executa comandos silenciosamente e registra saída
-#---------------------------------------------------------------
-log_exec() {
-    local cmd="$*"
-    local start=$(date +%s)
-    echo "[CMD] $cmd" >> "$ADM_LOGFILE"
-
-    eval "$cmd" >>"$ADM_LOGFILE" 2>&1
-    local status=$?
-
-    local end=$(date +%s)
-    local elapsed=$((end - start))
-    local m=$((elapsed / 60))
-    local s=$((elapsed % 60))
-    local duration=$(printf "%02dm%02ds" "$m" "$s")
-
-    if [ $status -eq 0 ]; then
-        echo "[OK] Comando concluído em $duration" >> "$ADM_LOGFILE"
-        echo -e "${C_GREEN}✔${C_RESET} $cmd (${C_GRAY}${duration}${C_RESET})"
+    # try to write to files with lock
+    local lockfile="${ADM_LOGS}/.adm_log_lock"
+    if _log_acquire_lock "$lockfile"; then
+        # write global
+        echo "$line" >> "$_LOG_GLOBAL_FILE" 2>/dev/null || true
+        # write job-specific
+        echo "$line" >> "$_LOG_JOB_FILE" 2>/dev/null || true
+        _log_release_lock "$lockfile"
     else
-        echo "[FAIL] Código $status após $duration" >> "$ADM_LOGFILE"
-        echo -e "${C_RED}✖${C_RESET} $cmd (${C_GRAY}${duration}${C_RESET})"
+        # fallback: append without lock (best-effort)
+        echo "$line" >> "$_LOG_GLOBAL_FILE" 2>/dev/null || true
+        echo "$line" >> "$_LOG_JOB_FILE" 2>/dev/null || true
     fi
-
-    return $status
 }
 
-#---------------------------------------------------------------
-# Seção de log (com nome do pacote e diretório atual)
-#---------------------------------------------------------------
+# Public API
+log_init() {
+    # usage: log_init [jobid] [context]
+    local jid="${1:-$ADM_JOB_ID}"
+    local ctx="${2:-adm}"
+    ADM_JOB_ID="$jid"
+    _LOG_JOB_FILE="$ADM_LOGS/${ADM_JOB_ID}.log"
+    : > "$_LOG_JOB_FILE" 2>/dev/null || true
+    chmod 0644 "$_LOG_JOB_FILE" 2>/dev/null || true
+    log_info "$ctx" "$ADM_JOB_ID" "Log initialized for job $ADM_JOB_ID"
+}
+
+log_debug() { _log_write DEBUG "$@"; }
+log_info() { _log_write INFO "$@"; }
+log_warn() { _log_write WARN "$@"; }
+log_error() { _log_write ERROR "$@"; }
+
+log_fatal() {
+    _log_write FATAL "$@"
+    # ensure flush
+    sleep 0.01
+    # exit depending on context (if sourced, return non-zero)
+    if (return 0 2>/dev/null); then
+        return 1
+    else
+        exit 1
+    fi
+}
+
 log_section() {
-    local section="$*"
-    local dir="$(pwd)"
-    local pkg="${ADM_PKG_NAME:-unknown}"
-
-    echo -e "\n${C_BLUE}------------------------------------------------------------${C_RESET}"
-    echo -e "${C_GREEN}[SECTION]${C_RESET} ${C_YELLOW}${section}${C_RESET}"
-    echo -e "${C_GRAY} Pacote   : ${pkg}${C_RESET}"
-    echo -e "${C_GRAY} Diretório: ${dir}${C_RESET}"
-    echo -e "${C_BLUE}------------------------------------------------------------${C_RESET}\n"
-
-    {
-        echo "------------------------------------------------------------"
-        echo " [SECTION] $section"
-        echo " Pacote   : $pkg"
-        echo " Diretório: $dir"
-        echo "------------------------------------------------------------"
-    } >> "$ADM_LOGFILE"
+    local title="$1"
+    local sep='────────────────────────────────────────────────────────────────'
+    _log_write INFO "adm" "" "$sep"
+    _log_write INFO "adm" "" "  $title"
+    _log_write INFO "adm" "" "$sep"
 }
 
-#---------------------------------------------------------------
-# Rotação automática de logs (mantém últimos 20)
-#---------------------------------------------------------------
-log_rotate() {
-    local max=20
-    cd "$ADM_LOGS" || return 0
-    local count
-    count=$(ls -1t *.log 2>/dev/null | wc -l)
-    if [ "$count" -gt "$max" ]; then
-        ls -1t *.log | tail -n +$((max + 1)) | while read -r oldlog; do
-            gzip -f "$oldlog" 2>/dev/null
-        done
+# write directly to specific file
+log_to_file() {
+    local file="$1"; shift
+    local msg="$*"
+    # sanitize path
+    case "$file" in
+        /*) : ;; # absolute ok
+        *) file="$ADM_LOGS/$file" ;;
+    esac
+    # atomic
+    local lockfile="${file}.lock"
+    if _log_acquire_lock "$lockfile"; then
+        echo "$(_log_timestamp) $msg" >> "$file" 2>/dev/null || true
+        _log_release_lock "$lockfile"
+    else
+        echo "$(_log_timestamp) $msg" >> "$file" 2>/dev/null || true
     fi
 }
 
-#---------------------------------------------------------------
-# Execução de segurança
-#---------------------------------------------------------------
-trap 'log_close' EXIT
+# Sanitize and mask secrets (very basic)
+log_sanitize() {
+    local s="$1"
+    # mask things that look like tokens (simple heuristic)
+    s=${s//--password[[:space:]]*([![:space:]])/--password=***}
+    s=${s//--token[[:space:]]*([![:space:]])/--token=***}
+    printf '%s' "$s"
+}
+
+# Rotate logs older than ADM_LOG_ROTATE_DAYS (simple daily archive)
+log_rotate() {
+    local days=${1:-$ADM_LOG_ROTATE_DAYS}
+    local cutoff
+    cutoff=$(date -d "${days} days ago" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    mkdir -p "$ADM_LOG_ARCHIVE_DIR" 2>/dev/null || true
+    find "$ADM_LOGS" -maxdepth 1 -type f -name "*.log" | while read -r f; do
+        # skip current session file
+        [ "$f" = "$_LOG_GLOBAL_FILE" ] && continue
+        # get file date (YYYY-MM-DD) from name or mtime; move if older
+        local mdate
+        mdate=$(date -r "$f" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+        if [[ "$mdate" < "$cutoff" ]]; then
+            mkdir -p "$ADM_LOG_ARCHIVE_DIR/$mdate" 2>/dev/null || true
+            mv -f "$f" "$ADM_LOG_ARCHIVE_DIR/$mdate/" 2>/dev/null || true
+        fi
+    done
+}
+
+# Print a summary for the session
+log_summary() {
+    # count success/fail heuristically
+    local total=0 success=0 fail=0
+    for f in "$ADM_LOGS"/*.log; do
+        [ -f "$f" ] || continue
+        total=$((total+1))
+        if grep -q "\[.*\]\[.*\]\[.*\]\[ERROR\]" "$f" 2>/dev/null; then
+            fail=$((fail+1))
+        else
+            success=$((success+1))
+        fi
+    done
+    local elapsed=0
+    if [ -n "${ADM_SESSION_START_TS-}" ]; then
+        elapsed=$(( $(date +%s) - ADM_SESSION_START_TS ))
+    fi
+    _log_write INFO adm "" "Session summary: total=${total} success=${success} fail=${fail} time=${elapsed}s"
+}
+
+# If disk nearly full, warn and fallback
+_log_check_disk() {
+    local min_free_mb=${1:-50}
+    if df --output=avail -m "$ADM_LOGS" 2>/dev/null | tail -n1 >/dev/null 2>&1; then
+        local avail
+        avail=$(df --output=avail -m "$ADM_LOGS" 2>/dev/null | tail -n1 || echo 0)
+        if [ "$avail" -lt "$min_free_mb" ]; then
+            _log_write WARN adm "" "Low disk space for logs: ${avail}MB (< ${min_free_mb}MB)"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Export functions for other scripts
+export -f log_init log_debug log_info log_warn log_error log_fatal log_section log_to_file log_rotate log_summary log_sanitize
+
+# Record session start timestamp
+ADM_SESSION_START_TS=$(date +%s)
+_log_write INFO adm "" "Log subsystem initialized: session=${ADM_LOG_SESSION} pid=${ADM_LOG_PID}"
+
+# Rotate old logs in background (best-effort)
+( log_rotate & ) >/dev/null 2>&1 &
