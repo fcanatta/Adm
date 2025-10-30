@@ -1,459 +1,404 @@
 #!/usr/bin/env bash
-# /usr/src/adm/scripts/clean.sh
-# ADM Build System - clean utilities
-# Safe, idempotent cleaning of build artifacts, logs, sources and orphaned packages.
-# Usage: clean.sh [--check] [--light|--full] [--yes]
-set -o errexit
-set -o nounset
-set -o pipefail
+# clean.sh - Safe cleaning utilities for ADM Build System
+# Location: /usr/src/adm/scripts/clean.sh
+# Purpose: selective cleanup (tmp, cache, logs, builds, orphans), dry-run mode,
+#          integration with scheduler, robust error handling and reporting
+# SPDX-License-Identifier: MIT
 
-# ----------------------
-# Environment bootstrap
-# ----------------------
-ADM_BASE="${ADM_BASE:-/usr/src/adm}"
-ADM_SCRIPTS="${ADM_BASE}/scripts"
-ADM_LOGS="${ADM_LOGS:-${ADM_BASE}/logs}"
-ADM_REPO="${ADM_REPO:-${ADM_BASE}/repo}"
-ADM_BUILD="${ADM_BUILD:-${ADM_BASE}/build}"
-ADM_CACHE="${ADM_CACHE:-${ADM_BASE}/cache}"
-ADM_DB="${ADM_DB:-${ADM_BASE}/db}"
-CLEAN_LOG=""
-TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
-CLEAN_LOG="${ADM_LOGS}/clean-${TIMESTAMP}.log"
+# Guard to allow sourcing
+: "${ADM_CLEAN_SH_LOADED:-}" || ADM_CLEAN_SH_LOADED=0
+if [ "$ADM_CLEAN_SH_LOADED" -eq 1 ]; then
+    return 0
+fi
+ADM_CLEAN_SH_LOADED=1
 
-# Try to source env/log/ui if present (non-fatal)
-if [[ -r "${ADM_SCRIPTS}/env.sh" ]]; then
-  # shellcheck disable=SC1091
-  source "${ADM_SCRIPTS}/env.sh" || true
+set -uo pipefail
+IFS=$'\n\t'
+
+# Load environment and helpers if present (non-fatal)
+ADM_SCRIPTS_DEFAULT="/usr/src/adm/scripts"
+: "${ADM_SCRIPTS:=${ADM_SCRIPTS_DEFAULT}}"
+if [ -f "${ADM_SCRIPTS}/env.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${ADM_SCRIPTS}/env.sh" || true
+fi
+if [ -f "${ADM_SCRIPTS}/log.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${ADM_SCRIPTS}/log.sh" || true
+fi
+if [ -f "${ADM_SCRIPTS}/ui.sh" ]; then
+    # shellcheck disable=SC1090
+    source "${ADM_SCRIPTS}/ui.sh" || true
 fi
 
-_LOG_PRESENT=no
-_UI_PRESENT=no
-if [[ -r "${ADM_SCRIPTS}/log.sh" ]]; then
-  # shellcheck disable=SC1091
-  source "${ADM_SCRIPTS}/log.sh" || true
-  _LOG_PRESENT=yes
-fi
-if [[ -r "${ADM_SCRIPTS}/ui.sh" ]]; then
-  # shellcheck disable=SC1091
-  source "${ADM_SCRIPTS}/ui.sh" || true
-  _UI_PRESENT=yes
-fi
+# Defaults (safe defaults if not provided by env.sh)
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_TMP:=${ADM_ROOT}/tmp}"
+: "${ADM_CACHE:=${ADM_ROOT}/cache}"
+: "${ADM_LOGS:=${ADM_ROOT}/logs}"
+: "${ADM_BUILD:=${ADM_ROOT}/build}"
+: "${ADM_CONFIG_DIR:=${ADM_ROOT}/config}"
+: "${ADM_JOB_LOCK:=${ADM_ROOT}/.scheduler.lock}"
+: "${ADM_CLEAN_MODE:=safe}"
+: "${ADM_CLEAN_REPORT:=${ADM_LOGS}/clean-report.log}"
+: "${ADM_KEEP_LOGS_DAYS:=7}"
+: "${ADM_KEEP_BUILDS_DAYS:=3}"
+: "${ADM_FORCE:=false}"
+: "${ADM_DRY_RUN:=false}"
+: "${ADM_ONLY:="tmp,cache,logs,builds,orphans"}"
+: "${ADM_UI_REFRESH:=0.2}"
 
-# Local logging wrappers (safe even if log.sh not loaded)
+# Lockfile for clean execution
+_CLEAN_LOCKFILE="${ADM_ROOT}/.clean_lock"
+
+# Internal counters
+declare -i CLEAN_REMOVED_COUNT=0
+declare -i CLEAN_REMOVED_BYTES=0
+declare -A CLEAN_DETAILS
+
+# Ensure directories exist (create safe defaults)
+mkdir -p "$ADM_TMP" "$ADM_CACHE" "$ADM_LOGS" "$ADM_BUILD" 2>/dev/null || true
+
+# Helpers: logging fallback if log.sh not loaded
+_have_log=false
+if declare -f log_info >/dev/null 2>&1; then
+    _have_log=true
+fi
 _log_info() {
-  local msg="$*"
-  printf "%s [INFO] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >>"$CLEAN_LOG" 2>/dev/null || true
-  if [[ "${_LOG_PRESENT}" == "yes" && "$(type -t log_info 2>/dev/null)" == "function" ]]; then
-    log_info "$msg"
-  fi
+    if $_have_log; then log_info "clean" "" "$*"; else printf '%s\n' "[INFO] $*"; fi
 }
 _log_warn() {
-  local msg="$*"
-  printf "%s [WARN] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >>"$CLEAN_LOG" 2>/dev/null || true
-  if [[ "${_LOG_PRESENT}" == "yes" && "$(type -t log_warn 2>/dev/null)" == "function" ]]; then
-    log_warn "$msg"
-  else
-    printf "[WARN] %s\n" "$msg" >&2
-  fi
+    if $_have_log; then log_warn "clean" "" "$*"; else printf '%s\n' "[WARN] $*"; fi
 }
 _log_error() {
-  local msg="$*"
-  printf "%s [ERROR] %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$msg" >>"$CLEAN_LOG" 2>/dev/null || true
-  if [[ "${_LOG_PRESENT}" == "yes" && "$(type -t log_error 2>/dev/null)" == "function" ]]; then
-    log_error "$msg"
-  else
-    printf "[ERROR] %s\n" "$msg" >&2
-  fi
-}
-_ui_start() {
-  if [[ "${_UI_PRESENT}" == "yes" && "$(type -t ui_header 2>/dev/null)" == "function" ]]; then
-    ui_header
-  fi
-}
-_ui_section() {
-  if [[ "${_UI_PRESENT}" == "yes" && "$(type -t ui_section 2>/dev/null)" == "function" ]]; then
-    ui_section "$1"
-  else
-    printf "[*] %s\n" "$1"
-  fi
-}
-_ui_end_section() {
-  local status=$1; shift
-  if [[ "${_UI_PRESENT}" == "yes" && "$(type -t ui_end_section 2>/dev/null)" == "function" ]]; then
-    ui_end_section "$status" "$@"
-  else
-    if [[ "$status" -eq 0 ]]; then
-      printf "[✔] %s... concluído\n" "$*"
-    else
-      printf "[✖] %s... falhou\n" "$*"
-    fi
-  fi
-}
-_ui_info() {
-  if [[ "${_UI_PRESENT}" == "yes" && "$(type -t ui_info 2>/dev/null)" == "function" ]]; then
-    ui_info "$*"
-  else
-    printf "[i] %s\n" "$*"
-  fi
+    if $_have_log; then log_error "clean" "" "$*"; else printf '%s\n' "[ERROR] $*"; fi
 }
 
-# ----------------------
-# Options / state
-# ----------------------
-DRY_RUN=0
-MODE="light"    # light | full
-AUTO_YES=0
-# stats
-FILES_REMOVED=0
-BYTES_FREED=0
-
-# safe rm wrapper (only operates under ADM_BASE or /tmp fallback)
-_safe_rm() {
-  local path="$1"
-  if [[ -z "$path" ]]; then return 0; fi
-  # Resolve absolute path
-  local abs
-  abs="$(readlink -f "$path" 2>/dev/null || printf "%s" "$path")"
-  # safety: only remove within ADM_BASE or /tmp/adm-fallback
-  case "$abs" in
-    "$ADM_BASE"/*|/tmp/adm-fallback/*)
-      if [[ $DRY_RUN -eq 1 ]]; then
-        _log_info "DRY-RUN remove $abs"
-      else
-        if [[ -d "$abs" ]]; then
-          local before
-          before=$(du -sb "$abs" 2>/dev/null | awk '{print $1}' || echo 0)
-          rm -rf "$abs"
-          local after=0
-          FILES_REMOVED=$((FILES_REMOVED + $(find "$abs" -type f 2>/dev/null | wc -l) )) || true
-          BYTES_FREED=$((BYTES_FREED + before - after))
-          _log_info "Removed directory $abs (approx freed ${before} bytes)"
-        elif [[ -f "$abs" ]]; then
-          local sz
-          sz=$(stat -c%s "$abs" 2>/dev/null || echo 0)
-          rm -f "$abs"
-          FILES_REMOVED=$((FILES_REMOVED + 1))
-          BYTES_FREED=$((BYTES_FREED + sz))
-          _log_info "Removed file $abs (freed ${sz} bytes)"
-        fi
-      fi
-      ;;
-    *)
-      _log_warn "Refusing to remove outside ADM_BASE: $abs"
-      ;;
-  esac
-}
-
-# ----------------------
-# clean_init - ensure dirs and logfile
-# ----------------------
-clean_init() {
-  mkdir -p "$ADM_LOGS" "$ADM_BUILD" "$ADM_CACHE" "$ADM_REPO" "$ADM_DB" 2>/dev/null || true
-  touch "$CLEAN_LOG" 2>/dev/null || true
-  chmod 0644 "$CLEAN_LOG" 2>/dev/null || true
-  _log_info "clean_init: started (mode=${MODE}, dry_run=${DRY_RUN})"
-  _ui_start
-}
-
-# ----------------------
-# clean_temp - remove temp build dirs
-# ----------------------
-clean_temp() {
-  _ui_section "Limpando temporários"
-  # patterns to consider
-  local patterns=( "${ADM_BUILD}/tmp" "${ADM_BUILD}/.tmp*" "/tmp/build-*" "${ADM_CACHE}/tmp" "${ADM_CACHE}/.tmp*" )
-  for p in "${patterns[@]}"; do
-    # expand globs safely
-    for candidate in $(ls -d $p 2>/dev/null || true); do
-      _safe_rm "$candidate"
-    done
-  done
-  _ui_end_section 0 "Limpeza de temporários"
-}
-
-# ----------------------
-# clean_logs - rotate/clean logs by age/size
-# ----------------------
-clean_logs() {
-  _ui_section "Limpando logs antigos"
-  local age_days=7
-  local size_limit=$((50 * 1024 * 1024)) # 50 MB
-
-  # delete logs older than age_days
-  if [[ $DRY_RUN -eq 1 ]]; then
-    _log_info "DRY-RUN: would remove logs older than ${age_days}d in $ADM_LOGS"
-  else
-    find "$ADM_LOGS" -maxdepth 1 -type f -mtime +"${age_days}" -name '*.log' -print0 2>/dev/null | while IFS= read -r -d '' lf; do
-      _safe_rm "$lf"
-    done
-  fi
-
-  # remove logs bigger than size_limit (compress older first, then remove)
-  if [[ $DRY_RUN -eq 1 ]]; then
-    _log_info "DRY-RUN: would compress or remove logs > ${size_limit} bytes"
-  else
-    # compress logs > 5MB older than 1 day
-    find "$ADM_LOGS" -type f -name '*.log' -size +5M -mtime +1 -print0 2>/dev/null | xargs -0 -r gzip -9 2>/dev/null || true
-    # remove any compressed logs > 500MB (safety)
-    find "$ADM_LOGS" -type f -name '*.gz' -size +500M -print0 2>/dev/null | xargs -0 -r rm -f 2>/dev/null || true
-  fi
-
-  _ui_end_section 0 "Limpeza de logs finalizada"
-}
-
-# ----------------------
-# clean_sources - remove cached sources not referenced
-# ----------------------
-clean_sources() {
-  _ui_section "Limpando fontes/caches não referenciados"
-  # Keep sources referenced by repo (list all URLs or files referenced in repo)
-  # Strategy: keep files referenced in repo (cache or repo/source). Remove others in ADM_CACHE
-  local keep_patterns=()
-  # gather filenames referenced under repo/source and repo/*
-  if [[ -d "${ADM_REPO}" ]]; then
-    # find archive files under repo/source
-    while IFS= read -r f; do
-      keep_patterns+=("$f")
-    done < <(find "${ADM_REPO}/source" -type f -print 2>/dev/null || true)
-  fi
-
-  # iterate cache and remove files not in keep_patterns
-  if [[ -d "${ADM_CACHE}" ]]; then
-    # build a temp file listing keep basenames
-    local tmpkeep
-    tmpkeep="$(mktemp)"
-    for kp in "${keep_patterns[@]}"; do
-      basename "$kp" >>"$tmpkeep"
-    done
-    # remove cache files not matching
-    while IFS= read -r cf; do
-      local base
-      base="$(basename "$cf")"
-      if ! grep -Fxq "$base" "$tmpkeep" 2>/dev/null; then
-        _safe_rm "$cf"
-      fi
-    done < <(find "${ADM_CACHE}" -type f -print 2>/dev/null || true)
-    rm -f "$tmpkeep"
-  fi
-
-  _ui_end_section 0 "Limpeza de fontes concluída"
-}
-
-# ----------------------
-# helper: build dependency reverse map
-# ----------------------
-_build_reverse_deps() {
-  # produce a list: for each package in repo, map dependency -> package
-  # Output format: depname|packagename
-  local repo="${ADM_REPO}"
-  if [[ ! -d "$repo" ]]; then return 0; fi
-  # search build.conf files (simple parsing: lines starting with DEPEND=)
-  find "$repo" -mindepth 2 -maxdepth 3 -type f -name 'build.conf' -print0 2>/dev/null | while IFS= read -r -d '' bf; do
-    local pkgdir
-    pkgdir="$(dirname "$bf")"
-    local pkgname
-    pkgname="$(basename "$pkgdir")"
-    # read DEPEND line
-    local depline
-    depline="$(grep -E '^DEPEND=' "$bf" 2>/dev/null || true)"
-    if [[ -n "$depline" ]]; then
-      # strip DEPEND= and quotes
-      depline="${depline#DEPEND=}"
-      depline="${depline%\"}"
-      depline="${depline#\"}"
-      # split by comma
-      IFS=',' read -r -a depsarr <<<"$depline"
-      for d in "${depsarr[@]}"; do
-        d="$(echo "$d" | tr -d '[:space:]')"
-        if [[ -n "$d" ]]; then
-          printf '%s|%s\n' "$d" "$pkgname"
-        fi
-      done
-    fi
-  done
-}
-
-# ----------------------
-# clean_orphans - detect and optionally remove orphan packages
-# ----------------------
-clean_orphans() {
-  _ui_section "Detectando órfãos"
-  # Expect installed list at ADM_DB/installed.db (one pkg per line: name[:version])
-  local installed_file="${ADM_DB}/installed.db"
-  if [[ ! -f "$installed_file" ]]; then
-    _log_warn "Arquivo de instalação não encontrado: $installed_file (nenhum órfão detectado)"
-    _ui_end_section 0 "Detecção de órfãos"
-    return 0
-  fi
-
-  # build map of reverse deps
-  local revtmp
-  revtmp="$(mktemp)"
-  _build_reverse_deps >"$revtmp" || true
-
-  # read installed packages
-  local orphans=()
-  while IFS= read -r line; do
-    local pkg
-    pkg="${line%%[: ]*}"
-    # check if any package depends on pkg
-    if ! grep -qE "^${pkg}\|" "$revtmp" 2>/dev/null; then
-      # no reverse deps -> candidate orphan
-      orphans+=("$pkg")
-    fi
-  done < <(sed -e '/^\s*#/d' -e '/^\s*$/d' "$installed_file" 2>/dev/null || true)
-
-  rm -f "$revtmp"
-
-  if [[ "${#orphans[@]}" -eq 0 ]]; then
-    _log_info "Nenhum órfão detectado."
-    _ui_end_section 0 "Detecção de órfãos"
-    return 0
-  fi
-
-  _log_info "Órfãos detectados: ${orphans[*]}"
-  _ui_info "Órfãos detectados: ${orphans[*]}"
-
-  if [[ $DRY_RUN -eq 1 ]]; then
-    _log_info "DRY-RUN: não serão removidos órfãos."
-    _ui_end_section 0 "Detecção de órfãos (DRY-RUN)"
-    return 0
-  fi
-
-  # confirmation unless AUTO_YES
-  if [[ $AUTO_YES -ne 1 ]]; then
-    printf "Remover órfãos? [y/N]: "
-    read -r ans
-    case "$ans" in
-      y|Y) ;;
-      *) _ui_end_section 0 "Remoção de órfãos cancelada"; return 0 ;;
+# Safety: ensure path is inside ADM_ROOT
+_safe_within_root() {
+    local p
+    p="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+    case "$p" in
+        "$ADM_ROOT"* ) return 0 ;;
+        * ) return 1 ;;
     esac
-  fi
+}
 
-  # perform removal: try to call uninstall.sh if exists, else remove files under repo/install manifests
-  for p in "${orphans[@]}"; do
-    if [[ -x "${ADM_SCRIPTS}/uninstall.sh" ]]; then
-      _log_info "Invocando uninstall.sh para $p"
-      if "${ADM_SCRIPTS}/uninstall.sh" "$p" >>"$CLEAN_LOG" 2>&1; then
-        _log_info "Uninstalled orphan: $p"
-      else
-        _log_warn "uninstall.sh failed for $p, attempting manual cleanup"
-        # manual attempt: remove repo/build/source for the package
-        _safe_rm "${ADM_REPO}/${p}"
-        _safe_rm "${ADM_BUILD}/${p}"
-      fi
-    else
-      _log_info "No uninstall.sh found; removing repo/build entries for $p"
-      _safe_rm "${ADM_REPO}/${p}"
-      _safe_rm "${ADM_BUILD}/${p}"
+# Safe remove: do not follow symlinks outside ADM_ROOT, support dry-run
+_safe_rm() {
+    local path="$1"
+    if [ -z "$path" ]; then return 0; fi
+    if ! _safe_within_root "$path"; then
+        _log_warn "Skipping removal outside ADM_ROOT: $path"
+        return 1
     fi
-  done
-
-  _ui_end_section 0 "Remoção de órfãos concluída"
+    if [ "$ADM_DRY_RUN" = "true" ]; then
+        _log_info "[DRY-RUN] Would remove: $path"
+        CLEAN_DETAILS["$path"]=dryrun
+        return 0
+    fi
+    # compute size before removing
+    local bytes=0
+    if [ -e "$path" ]; then
+        bytes=$(du -sb "$path" 2>/dev/null | awk '{print $1}' || echo 0)
+    fi
+    # remove safely
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+        rm -rf -- "$path" || { _log_warn "Failed to remove dir $path"; return 1; }
+    else
+        rm -f -- "$path" || { _log_warn "Failed to remove file $path"; return 1; }
+    fi
+    CLEAN_REMOVED_COUNT=$((CLEAN_REMOVED_COUNT+1))
+    CLEAN_REMOVED_BYTES=$((CLEAN_REMOVED_BYTES+bytes))
+    CLEAN_DETAILS["$path"]=$bytes
+    _log_info "Removed: $path (${bytes} bytes)"
+    return 0
 }
 
-# ----------------------
-# clean_all - orchestrator
-# ----------------------
-clean_all() {
-  clean_init
-  case "$MODE" in
-    light)
-      clean_temp
-      clean_logs
-      ;;
-    full)
-      clean_temp
-      clean_logs
-      clean_sources
-      clean_orphans
-      ;;
-    *)
-      clean_temp
-      clean_logs
-      ;;
-  esac
-  clean_summary
+# Acquire exclusive lock to avoid concurrent cleaners
+_acquire_clean_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$_CLEAN_LOCKFILE" || return 1
+        flock -n 9 || return 1
+        return 0
+    else
+        # simple pid file
+        if [ -f "$_CLEAN_LOCKFILE" ]; then
+            local otherpid
+            otherpid=$(cat "$_CLEAN_LOCKFILE" 2>/dev/null || echo "")
+            if [ -n "$otherpid" ] && kill -0 "$otherpid" 2>/dev/null; then
+                return 1
+            fi
+        fi
+        printf '%s' "$BASHPID" > "$_CLEAN_LOCKFILE" || return 1
+        return 0
+    fi
+}
+_release_clean_lock() {
+    if command -v flock >/dev/null 2>&1; then
+        # close fd 9
+        exec 9>&- 2>/dev/null || true
+        return 0
+    else
+        rm -f "$_CLEAN_LOCKFILE" 2>/dev/null || true
+        return 0
+    fi
 }
 
-# ----------------------
-# clean_summary - show stats
-# ----------------------
-clean_summary() {
-  local freed_human
-  if command -v numfmt >/dev/null 2>&1; then
-    freed_human=$(numfmt --to=iec --suffix=B --format="%.1f" "$BYTES_FREED" 2>/dev/null || printf "%s" "${BYTES_FREED}")
-  else
-    # rough
-    freed_human="${BYTES_FREED} bytes"
-  fi
-
-  _log_info "clean_summary: files_removed=${FILES_REMOVED} bytes_freed=${BYTES_FREED}"
-  echo
-  printf "╔══════════════════════════════════════════════════════════════════════╗\n"
-  printf "║  Limpeza concluída                                                   ║\n"
-  printf "║  Arquivos removidos: %s\n" "${FILES_REMOVED}"
-  printf "║  Espaço liberado: %s\n" "${freed_human}"
-  printf "║  Tempo: %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"
-  printf "║  Log: %s\n" "${CLEAN_LOG}"
-  printf "╚══════════════════════════════════════════════════════════════════════╝\n"
+# Check scheduler integration: don't clean when scheduler indicates active jobs
+_scheduler_check() {
+    # If scheduler lock exists and process alive, avoid destructive cleaning
+    if [ -f "$ADM_JOB_LOCK" ]; then
+        local pid
+        pid=$(cat "$ADM_JOB_LOCK" 2>/dev/null || echo "")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            _log_warn "Scheduler appears active (pid=$pid). Aborting clean to avoid interfering with running jobs."
+            return 1
+        fi
+    fi
+    return 0
 }
 
-# ----------------------
-# CLI parsing
-# ----------------------
+# Age helper: file age in seconds
+_file_age_seconds() {
+    local f="$1"
+    if [ ! -e "$f" ]; then echo 0; return; fi
+    local now
+    now=$(date +%s)
+    local mtime
+    mtime=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
+    echo $(( now - mtime ))
+}
+
+# Convert days to seconds
+_days_to_seconds() { echo $(( $1 * 86400 )); }
+
+# =================== Cleaning actions ===================
+
+clean_tmp() {
+    _log_info "Cleaning temporary directories: $ADM_TMP and /tmp/adm-*"
+    # ADM_TMP
+    if [ -d "$ADM_TMP" ]; then
+        for item in "$ADM_TMP"/*; do
+            [ -e "$item" ] || continue
+            _safe_rm "$item" || _log_warn "Could not remove $item"
+        done
+    fi
+    # /tmp/adm-*
+    for t in /tmp/adm-*; do
+        [ -e "$t" ] || continue
+        _safe_rm "$t" || _log_warn "Could not remove $t"
+    done
+}
+
+clean_cache() {
+    _log_info "Cleaning cache directory: $ADM_CACHE"
+    if [ ! -d "$ADM_CACHE" ]; then
+        _log_info "Cache directory not present: $ADM_CACHE"
+        return 0
+    fi
+    local ttl_seconds
+    ttl_seconds=$(_days_to_seconds ${ADM_KEEP_BUILDS_DAYS:-3})
+    for f in "$ADM_CACHE"/*; do
+        [ -e "$f" ] || continue
+        # Skip protected files
+        if [ -f "$f/.protected" ] || [ -f "$f/.keep" ]; then
+            _log_info "Skipping protected cache: $f"
+            continue
+        fi
+        local age
+        age=$(_file_age_seconds "$f")
+        if [ "$age" -ge "$ttl_seconds" ] || [ "${ADM_CLEAN_MODE}" = "purge" ] || [ "${ADM_CLEAN_MODE}" = "deep" ]; then
+            _safe_rm "$f" || _log_warn "Failed to remove cache $f"
+        fi
+    done
+}
+
+clean_logs() {
+    _log_info "Cleaning logs older than ${ADM_KEEP_LOGS_DAYS} days in $ADM_LOGS"
+    if [ ! -d "$ADM_LOGS" ]; then _log_info "No logs directory: $ADM_LOGS"; return 0; fi
+    local cutoff_days=${ADM_KEEP_LOGS_DAYS}
+    local cutoff_seconds=$(_days_to_seconds $cutoff_days)
+    for lf in "$ADM_LOGS"/*.log; do
+        [ -f "$lf" ] || continue
+        local age
+        age=$(_file_age_seconds "$lf")
+        if [ "$age" -ge "$cutoff_seconds" ] || [ "${ADM_CLEAN_MODE}" = "purge" ]; then
+            # Avoid deleting current session logs
+            if [ "$lf" = "${ADM_LOGS}/${ADM_LOG_SESSION}.log" ]; then
+                _log_info "Skipping current session log: $lf"
+                continue
+            fi
+            _safe_rm "$lf" || _log_warn "Failed to remove log $lf"
+        fi
+    done
+    # rotate via log.sh if available
+    if declare -f log_rotate >/dev/null 2>&1; then
+        if [ "$ADM_DRY_RUN" = "true" ]; then
+            _log_info "[DRY-RUN] Would invoke log_rotate"
+        else
+            log_rotate || _log_warn "log_rotate returned non-zero"
+        fi
+    fi
+}
+
+clean_builds() {
+    _log_info "Cleaning old or incomplete builds in $ADM_BUILD"
+    [ -d "$ADM_BUILD" ] || { _log_info "No build dir: $ADM_BUILD"; return 0; }
+    local cutoff_seconds=$(_days_to_seconds ${ADM_KEEP_BUILDS_DAYS:-3})
+    for bd in "$ADM_BUILD"/*; do
+        [ -e "$bd" ] || continue
+        # identify incomplete builds: presence of .incomplete or .lock or missing build.success
+        if [ -f "$bd/.incomplete" ] || [ -f "$bd/.failed" ] || [ -f "$bd/.lock" ] || [ ! -f "$bd/build.success" ]; then
+            _log_info "Found candidate incomplete build: $bd"
+            if [ "${ADM_CLEAN_MODE}" = "safe" ]; then
+                # only remove if older than cutoff
+                local age
+                age=$(_file_age_seconds "$bd")
+                if [ "$age" -ge "$cutoff_seconds" ]; then
+                    _safe_rm "$bd" || _log_warn "Failed to remove build $bd"
+                else
+                    _log_info "Skipping recent incomplete build: $bd"
+                fi
+            else
+                # deep or purge: remove unconditionally
+                _safe_rm "$bd" || _log_warn "Failed to remove build $bd"
+            fi
+        fi
+    done
+}
+
+clean_orphans() {
+    _log_info "Cleaning orphaned directories in $ADM_ROOT"
+    # orphan = dir in build/ or repo/ without a corresponding entry in repo or repo metadata
+    # simple heuristic: directories in ADM_BUILD without a matching repo/<name>
+    for d in "$ADM_BUILD"/*; do
+        [ -d "$d" ] || continue
+        local name
+        name=$(basename "$d")
+        if [ ! -d "$ADM_ROOT/repo/$name" ]; then
+            _log_info "Orphan build dir: $d"
+            _safe_rm "$d" || _log_warn "Failed to remove orphan $d"
+        fi
+    done
+}
+
+# Selective cleaning: parse ADM_ONLY which is comma-separated list
+_should_run_target() {
+    local target="$1"
+    IFS=',' read -r -a ots <<<"$ADM_ONLY"
+    for t in "${ots[@]}"; do
+        if [ "$t" = "$target" ] || [ "$t" = "all" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Summary reporter
+_clean_report() {
+    local report_file="${ADM_CLEAN_REPORT}"
+    local freed_human
+    freed_human=$(numfmt --to=iec --suffix=B "$CLEAN_REMOVED_BYTES" 2>/dev/null || echo "${CLEAN_REMOVED_BYTES} bytes")
+    {
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] Clean mode=${ADM_CLEAN_MODE} dry-run=${ADM_DRY_RUN} removed_count=${CLEAN_REMOVED_COUNT} removed_bytes=${CLEAN_REMOVED_BYTES}"
+        for p in "${!CLEAN_DETAILS[@]}"; do
+            echo "  ${p} => ${CLEAN_DETAILS[$p]}"
+        done
+        echo "Summary: removed ${CLEAN_REMOVED_COUNT} items, freed ${freed_human}"
+    } >> "$report_file"
+
+    _log_info "Clean finished: removed=${CLEAN_REMOVED_COUNT} freed=${freed_human} report=${report_file}"
+}
+
+# Safety prompt for purge
+_confirm_purge() {
+    if [ "$ADM_FORCE" = "true" ]; then
+        return 0
+    fi
+    printf 'Purge mode requested. This will remove logs, caches and builds under %s.\n' "$ADM_ROOT"
+    printf 'Type YES to confirm: '
+    read -r ans
+    if [ "$ans" != "YES" ]; then
+        _log_warn "Purge aborted by user"
+        return 1
+    fi
+    return 0
+}
+
+# Parse args
 _print_usage() {
-  cat <<'EOF'
-clean.sh - safe cleaning utilities for ADM Build System
-
-Usage:
-  clean.sh [--check] [--light|--full] [--yes]
+    cat <<EOF
+Usage: $(basename "$0") [--mode safe|deep|purge] [--only <comma-list>] [--dry-run] [--force] [--help]
 Options:
-  --check     Dry-run: show what would be removed
-  --light     Remove only temporary build dirs and old logs (default)
-  --full      Full cleanup: temp, logs, sources not referenced, orphan packages
-  --yes       Auto-confirm destructive operations
-  --help      Show this help
+  --mode       choose clean mode: safe (default), deep, purge
+  --only       comma-separated targets: tmp,cache,logs,builds,orphans,all
+  --dry-run    show actions without deleting
+  --force      skip interactive confirmation for purge
+  --help       show this help
 EOF
 }
 
-# parse args
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --check|-n)
-      DRY_RUN=1
-      shift
-      ;;
-    --full)
-      MODE="full"
-      shift
-      ;;
-    --light)
-      MODE="light"
-      shift
-      ;;
-    --yes|-y)
-      AUTO_YES=1
-      shift
-      ;;
-    --help|-h)
-      _print_usage
-      exit 0
-      ;;
-    *)
-      printf "Unknown arg: %s\n" "$1" >&2
-      _print_usage
-      exit 2
-      ;;
-  esac
-done
+_parse_args() {
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode) shift; ADM_CLEAN_MODE=${1:-safe}; shift ;;
+            --mode=*) ADM_CLEAN_MODE=${1#--mode=} ; shift ;;
+            --only) shift; ADM_ONLY=${1:-$ADM_ONLY}; shift ;;
+            --only=*) ADM_ONLY=${1#--only=} ; shift ;;
+            --dry-run) ADM_DRY_RUN=true; shift ;;
+            --force) ADM_FORCE=true; shift ;;
+            --yes) ADM_FORCE=true; shift ;;
+            --help|-h) _print_usage; exit 0 ;;
+            *) _log_warn "Unknown arg: $1"; _print_usage; exit 2 ;;
+        esac
+    done
+}
 
-# ensure CLEAN_LOG exists
-mkdir -p "$ADM_LOGS" 2>/dev/null || true
-touch "$CLEAN_LOG" 2>/dev/null || true
+# Main controller
+clean_main() {
+    _parse_args "$@"
 
-# Execute
-clean_all
+    # Acquire lock
+    if ! _acquire_clean_lock; then
+        _log_warn "Another clean.sh appears to be running (lock ${_CLEAN_LOCKFILE}). Exiting."
+        return 1
+    fi
 
-exit 0
+    # scheduler check
+    if ! _scheduler_check; then
+        _log_warn "Scheduler active; aborting clean to avoid interference."
+        _release_clean_lock
+        return 1
+    fi
+
+    # Purge confirmation
+    if [ "${ADM_CLEAN_MODE}" = "purge" ]; then
+        if ! _confirm_purge; then
+            _release_clean_lock
+            return 1
+        fi
+    fi
+
+    _log_info "Starting clean: mode=${ADM_CLEAN_MODE} only=${ADM_ONLY} dry-run=${ADM_DRY_RUN}"
+
+    # Run selected targets
+    if _should_run_target tmp; then clean_tmp; fi
+    if _should_run_target cache; then clean_cache; fi
+    if _should_run_target logs; then clean_logs; fi
+    if _should_run_target builds; then clean_builds; fi
+    if _should_run_target orphans; then clean_orphans; fi
+
+    # summary and release lock
+    _clean_report
+    _release_clean_lock
+    return 0
+}
+
+# If script executed directly, run clean_main
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    clean_main "$@"
+fi
+
+# Export public functions
+export -f clean_main clean_tmp clean_cache clean_logs clean_builds clean_orphans _safe_rm
