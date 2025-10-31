@@ -1,0 +1,36 @@
+/usr/src/adm/
+├── repo/
+│   ├── toolchain/
+│   │   ├── binutils/
+│   │   │   └── build.pkg
+│   │   ├── gcc/
+│   │   │   └── build.pkg
+│   │   ├── glibc/
+│   │   │   └── build.pkg
+│   │   ├── gmp/
+│   │   │   └── build.pkg
+│   │   ├── mpfr/
+│   │   │   └── build.pkg
+│   │   ├── mpc/
+│   │   │   └── build.pkg
+│   │   ├── isl/
+│   │   │   └── build.pkg
+│   │   └── zlib/
+│   │       └── build.pkg
+│   ├── base/
+│   │   ├── bash/
+│   │   │   └── build.pkg
+│   │   ├── coreutils/
+│   │   │   └── build.pkg
+│   │   └── ...
+│   └── extra/
+│       └── ...
+└── scripts/
+    ├── fetch.sh
+    ├── build.sh
+    ├── install.sh
+    ├── package.sh
+    ├── bootstrap.sh
+    ├── log.sh
+    ├── hooks.sh
+    └── ...
