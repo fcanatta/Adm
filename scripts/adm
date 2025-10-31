@@ -1,0 +1,656 @@
+#!/usr/bin/env bash
+# ================================================================
+# ADM — Unified Build System CLI V 1.0
+# Orquestrador principal dos scripts em /usr/src/adm/scripts
+# ================================================================
+set -euo pipefail
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+SCRIPTS_DIR="${ADM_ROOT}/scripts"
+REPO_DIR="${ADM_ROOT}/repo"
+CACHE_DIR="${ADM_ROOT}/cache"
+LOG_DIR="${LOG_DIR:-${ADM_ROOT}/logs}"
+VERSION="${VERSION:-1.0.0}"
+
+# Load color functions if available
+[[ -f "${SCRIPTS_DIR}/color.sh" ]] && source "${SCRIPTS_DIR}/color.sh"
+
+# ---------------------------------------------------------------
+# Color fallback
+# ---------------------------------------------------------------
+bold=$(tput bold 2>/dev/null || echo "")
+reset=$(tput sgr0 2>/dev/null || echo "")
+red=$(tput setaf 1 2>/dev/null || echo "")
+green=$(tput setaf 2 2>/dev/null || echo "")
+yellow=$(tput setaf 3 2>/dev/null || echo "")
+blue=$(tput setaf 4 2>/dev/null || echo "")
+cyan=$(tput setaf 6 2>/dev/null || echo "")
+
+# ---------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------
+error() { echo "${red}[ERRO]${reset} $*" >&2; exit 1; }
+info() { echo "${cyan}→${reset} $*"; }
+ok() { echo "${green}✔${reset} $*"; }
+warn() { echo "${yellow}⚠${reset} $*"; }
+
+# ---------------------------------------------------------------
+# Help text for all commands
+# ---------------------------------------------------------------
+show_help() {
+cat <<'EOF'
+┌─────────────────────────────────────────────┐
+│  ADM Build System CLI - Help & Reference    │
+└─────────────────────────────────────────────┘
+
+Uso geral:
+  adm [comando] [opções] [pacote|grupo]
+
+Comandos principais:
+  env, e              Gerencia variáveis e estrutura do sistema
+  color, c            Define temas de cores e estilos
+  log, l              Exibe logs e histórico de builds
+  fetch, f            Baixa fontes e sincroniza repositórios
+  build, b            Compila pacotes (autotools, cmake, etc)
+  package, p          Empacota builds concluídos
+  install, i          Instala pacotes (resolvendo dependências)
+  uninstall, u        Remove pacotes e dependências órfãs
+  check, integrity    Verifica integridade de builds
+  update, up          Atualiza pacotes e build.pkg
+  bootstrap, bs       Constrói systema base (stage0–3)
+  recover, r          Corrige pacotes quebrados
+  profile, pf         Gerencia perfis de compilação
+  hooks, hk           Gerencia hooks pré/pós execução
+  tui, ui             Interface interativa (TUI)
+  bi, build-install   Constrói e instala automaticamente
+  info                Mostra detalhes de um pacote
+  search, s           Busca pacotes por nome
+  deps, d             Mostra dependências
+  version, v          Exibe versão do sistema ADM
+  help, h             Exibe esta ajuda ou ajuda detalhada de um comando
+
+──────────────────────────────────────────────
+Parâmetros globais:
+  -v, --verbose        Saída detalhada
+  -q, --quiet          Minimiza saída
+  -n, --dry-run        Simula sem executar
+  -a, --all            Opera sobre todos os pacotes
+  -f, --force          Força execução/reinstalação
+  -d, --deps           Inclui dependências
+  -r, --root <path>    Define rootfs alternativo
+  -j, --jobs <N>       Número de threads de compilação
+  -h, --help           Mostra ajuda
+
+──────────────────────────────────────────────
+Comandos adicionais:
+  adm help <comando>   Mostra ajuda detalhada de um comando
+  adm tui              Abre interface interativa
+
+Exemplos:
+  adm fetch toolchain
+  adm build gcc
+  adm bi bash --deps
+  adm install coreutils --force
+  adm update --group base
+  adm bootstrap --full
+  adm search glib
+EOF
+}
+
+# ---------------------------------------------------------------
+# Sub-ajuda detalhada por comando
+# ---------------------------------------------------------------
+show_subhelp() {
+  case "$1" in
+    fetch)
+cat <<'EOF'
+adm fetch [opções]
+  -a, --all             Sincroniza todos os repositórios
+  -g, --group <nome>    Sincroniza um grupo específico
+  -p, --pkg <nome>      Baixa pacote específico
+  -S, --sync            Força sincronização remota
+  -d, --download-only   Apenas baixa fontes
+  -v, --verify          Verifica checksums
+  -C, --clean           Limpa cache de downloads
+  -h, --help            Ajuda
+EOF
+;;
+    build)
+cat <<'EOF'
+adm build [opções]
+  -p, --pkg <nome>      Compila um pacote
+  -g, --group <nome>    Compila um grupo
+  -A, --all             Compila tudo
+  -s, --stage <n>       Define stage
+  -j, --jobs <n>        Threads
+  -d, --deps            Inclui dependências
+  -f, --force           Recompila tudo
+  -R, --resume          Continua build
+  -n, --dry-run         Simula
+  -v, --verbose         Verbose
+  -h, --help            Ajuda
+EOF
+;;
+    install)
+cat <<'EOF'
+adm install [opções]
+  -p, --pkg <nome>      Instala pacote
+  -P, --path <dir>      Instala de diretório
+  -d, --deps            Instala dependências
+  -f, --force           Reinstala
+  -c, --cache           Usa cache binário
+  -b, --build-missing   Constrói deps ausentes
+  -r, --root <path>     Define rootfs
+  -n, --dry-run         Simula
+  -v, --verbose         Verbose
+  -h, --help            Ajuda
+EOF
+;;
+    bi|build-install)
+cat <<'EOF'
+adm build-install [opções]
+  Combina fetch + build + package + install automaticamente.
+
+  -p, --pkg <nome>      Pacote a construir e instalar
+  -g, --group <nome>    Grupo de pacotes
+  -a, --all             Todos pacotes
+  -d, --deps            Constrói dependências
+  -c, --cache           Usa cache binário
+  -f, --force           Reinstala e recompila
+  -r, --root <path>     Define rootfs
+  -j, --jobs <n>        Threads
+  -n, --dry-run         Simula
+  -v, --verbose         Verbose
+  -h, --help            Ajuda
+EOF
+;;
+    bootstrap)
+cat <<'EOF'
+adm bootstrap [opções]
+  -F, --full            Constrói stage0–3
+  -0, --stage0          Apenas stage0
+  -1, --stage1          Apenas stage1
+  -2, --stage2          Apenas stage2
+  -3, --stage3          Apenas stage3
+  -r, --resume          Continua
+  -j, --jobs <n>        Threads
+  -n, --dry-run         Simula
+EOF
+;;
+    update)
+cat <<'EOF'
+adm update [opções]
+  -p, --pkg <nome>      Atualiza pacote
+  -g, --group <nome>    Atualiza grupo
+  -a, --all             Todos pacotes
+  -d, --deps            Atualiza deps primeiro
+  -f, --force           Força atualização
+  -v, --verbose         Verbose
+  -n, --dry-run         Simula
+EOF
+;;
+    recover)
+cat <<'EOF'
+adm recover [opções]
+  -a, --auto            Corrige tudo automaticamente
+  -i, --interactive     Pergunta por pacote
+  -f, --full            Repara tudo
+  -r, --rebuild         Recompila quebrados
+  -n, --dry-run         Simula
+EOF
+;;
+    *)
+      echo "Sem ajuda detalhada para '$1'"
+      ;;
+  esac
+}
+# Load helper functions from Part 1 if not already
+if ! declare -f info >/dev/null 2>&1; then
+  # minimal fallback helpers
+  info(){ echo "→ $*"; }
+  ok(){ echo "✔ $*"; }
+  warn(){ echo "⚠ $*"; }
+  error(){ echo "ERRO: $*"; exit 1; }
+fi
+
+# ---------------------------------------------------------------
+# Global flags state (set by top-level parse)
+# ---------------------------------------------------------------
+GLOBAL_VERBOSE=0
+GLOBAL_QUIET=0
+GLOBAL_DRYRUN=0
+GLOBAL_JOBS="$(nproc 2>/dev/null || echo 1)"
+GLOBAL_FORCE=0
+GLOBAL_DEPS=0
+GLOBAL_ROOT=""
+GLOBAL_AUTO=0
+
+# ---------------------------------------------------------------
+# Utility: join args safely
+# ---------------------------------------------------------------
+join_args() {
+  local sep="$1"; shift
+  local out=""
+  for a in "$@"; do
+    if [[ -z "$out" ]]; then out="${a}"; else out="${out}${sep}${a}"; fi
+  done
+  printf "%s" "$out"
+}
+
+# ---------------------------------------------------------------
+# Parse global flags pre-command (support also inline later)
+# ---------------------------------------------------------------
+_preparse_globals() {
+  local tmp=()
+  while (( "$#" )); do
+    case "$1" in
+      -v|--verbose) GLOBAL_VERBOSE=1; shift;;
+      -q|--quiet) GLOBAL_QUIET=1; shift;;
+      -n|--dry-run) GLOBAL_DRYRUN=1; shift;;
+      -j|--jobs) GLOBAL_JOBS="$2"; shift 2;;
+      -f|--force) GLOBAL_FORCE=1; shift;;
+      -d|--deps) GLOBAL_DEPS=1; shift;;
+      --root) GLOBAL_ROOT="$2"; shift 2;;
+      --auto) GLOBAL_AUTO=1; shift;;
+      --) shift; break;;
+      -h|--help) shift; tmp+=("-h"); break;;
+      *) tmp+=("$1"); shift;;
+    esac
+  done
+  # return remaining args
+  echo "${tmp[@]}"
+}
+
+# ---------------------------------------------------------------
+# Script existence helper
+# ---------------------------------------------------------------
+script_exists() {
+  local s="$1"
+  [[ -x "${SCRIPTS_DIR}/${s}" ]]
+}
+
+# ---------------------------------------------------------------
+# Wrapper to call ADM scripts with propagated flags
+# ---------------------------------------------------------------
+call_script() {
+  local script="$1"; shift
+  local args=()
+  # propagate global flags where meaningful
+  [[ $GLOBAL_VERBOSE -eq 1 ]] && args+=("--verbose")
+  [[ $GLOBAL_DRYRUN -eq 1 ]] && args+=("--dry-run")
+  [[ -n "$GLOBAL_JOBS" ]] && args+=("--jobs" "$GLOBAL_JOBS")
+  [[ $GLOBAL_FORCE -eq 1 ]] && args+=("--force")
+  [[ $GLOBAL_DEPS -eq 1 ]] && args+=("--deps")
+  [[ -n "$GLOBAL_ROOT" ]] && args+=("--root" "$GLOBAL_ROOT")
+  [[ $GLOBAL_AUTO -eq 1 ]] && args+=("--auto")
+
+  # append user args
+  while (( "$#" )); do args+=("$1"); shift; done
+
+  local fullcmd="${SCRIPTS_DIR}/${script} ${args[*]}"
+  if [[ $GLOBAL_DRYRUN -eq 1 ]]; then
+    info "[DRY-RUN] $fullcmd"
+    return 0
+  fi
+  if [[ -x "${SCRIPTS_DIR}/${script}" ]]; then
+    info "Executando: ${SCRIPTS_DIR}/${script} ${args[*]}"
+    bash -lc "'${SCRIPTS_DIR}/${script}' ${args[*]}" || {
+      warn "Script ${script} retornou erro"
+      return 1
+    }
+  else
+    warn "Script não encontrado: ${SCRIPTS_DIR}/${script}"
+    return 2
+  fi
+}
+
+# ---------------------------------------------------------------
+# Search and info utilities (parses repo/*/*/build.pkg)
+# ---------------------------------------------------------------
+repo_find_pkgpath() {
+  local pkg="$1"
+  # find first matching build.pkg by package name or directory
+  if [[ -f "${REPO_DIR}/${pkg}/build.pkg" ]]; then
+    echo "${REPO_DIR}/${pkg}/build.pkg"
+    return 0
+  fi
+  # search across groups
+  local found
+  found=$(find "${REPO_DIR}" -mindepth 2 -maxdepth 3 -type f -name build.pkg -exec grep -l "^PKG_NAME=.*${pkg}.*" {} + 2>/dev/null || true)
+  if [[ -n "$found" ]]; then
+    echo "$found" | head -n1
+    return 0
+  fi
+  # fallback: literal search for directory containing pkg name
+  found=$(find "${REPO_DIR}" -type f -path "*/${pkg}/build.pkg" 2>/dev/null || true)
+  if [[ -n "$found" ]]; then
+    echo "$found" | head -n1
+    return 0
+  fi
+  return 1
+}
+
+repo_list_pkgs() {
+  find "${REPO_DIR}" -mindepth 2 -maxdepth 3 -type f -name build.pkg -printf "%h\n" 2>/dev/null | sed "s|${REPO_DIR}/||" | sort
+}
+
+pkg_read_meta() {
+  local pkgpath="$1"
+  # safe source into subshell to extract variables
+  if [[ ! -f "$pkgpath" ]]; then return 1; fi
+  ( source "$pkgpath"; echo "NAME=${PKG_NAME:-$(basename $(dirname "$pkgpath"))}"; echo "VERSION=${PKG_VERSION:-unknown}"; echo "GROUP=${PKG_GROUP:-unknown}"; echo "STAGE=${PKG_STAGE:-unknown}"; echo "BUILD_HINT=${BUILD_HINT:-unknown}" )
+}
+
+# ---------------------------------------------------------------
+# Commands: search, info, deps, list
+# ---------------------------------------------------------------
+cmd_search() {
+  local term="$1"
+  if [[ -z "$term" ]]; then
+    repo_list_pkgs
+    return 0
+  fi
+  # search by name or description inside build.pkg
+  find "${REPO_DIR}" -type f -name build.pkg -exec grep -H -E "PKG_NAME|PKG_DESC|PKG_SUMMARY|SOURCE_URL" {} + 2>/dev/null \
+    | grep -i "$term" \
+    | sed -E 's|.*/repo/||; s|/build.pkg:|: |' \
+    || echo "Nenhum pacote encontrado para: $term"
+}
+
+cmd_info() {
+  local pkg="$1"
+  if [[ -z "$pkg" ]]; then error "usage: adm info <pkg>"; fi
+  local path
+  path=$(repo_find_pkgpath "$pkg" || true)
+  if [[ -z "$path" ]]; then error "build.pkg for $pkg not found under ${REPO_DIR}"; fi
+  # source and print key vars
+  ( source "$path"
+    cat <<EOF
+Package: ${PKG_NAME:-$pkg}
+Version: ${PKG_VERSION:-unknown}
+Release: ${PKG_RELEASE:-}
+Group:   ${PKG_GROUP:-}
+Stage:   ${PKG_STAGE:-}
+License: ${PKG_LICENSE:-}
+BuildHint: ${BUILD_HINT:-}
+Homepage: ${PKG_HOMEPAGE:-}
+Source:  ${SOURCE_URL:-${PKG_SOURCE:-}} 
+Depends: ${PKG_DEPENDS[*]:-}
+Build-Depends: ${PKG_BUILD_DEPENDS[*]:-}
+Summary: ${PKG_DESC:-${PKG_SUMMARY:-}}
+EOF
+  )
+}
+
+# Minimal dependency resolver (reads PKG_DEPENDS from build.pkg)
+resolve_deps_recursive() {
+  local pkg="$1"
+  local -n out=$2
+  local path
+  path=$(repo_find_pkgpath "$pkg" || true)
+  if [[ -z "$path" ]]; then
+    warn "Pacote ${pkg} não encontrado para resolver dependências"
+    return 1
+  fi
+  # shellload to get PKG_DEPENDS
+  local deps
+  deps=$(bash -c "source '${path}'; if [[ \${#PKG_DEPENDS[@]} -gt 0 ]]; then printf '%s\n' \"\${PKG_DEPENDS[@]}\"; fi" 2>/dev/null || true)
+  local d
+  for d in $deps; do
+    # avoid cycles
+    if [[ " ${out[*]} " == *" ${d} "* ]]; then continue; fi
+    out+=("$d")
+    resolve_deps_recursive "$d" out || true
+  done
+}
+
+cmd_deps() {
+  local pkg="$1"
+  if [[ -z "$pkg" ]]; then error "usage: adm deps <pkg>"; fi
+  local deps=()
+  resolve_deps_recursive "$pkg" deps
+  if ((${#deps[@]})); then
+    printf "%s\n" "${deps[@]}"
+  else
+    echo "Nenhuma dependência encontrada para $pkg"
+  fi
+}
+
+cmd_list() {
+  local group="$1"
+  if [[ -z "$group" ]]; then
+    repo_list_pkgs
+  else
+    find "${REPO_DIR}/${group}" -mindepth 1 -maxdepth 2 -type f -name build.pkg -printf "%h\n" 2>/dev/null | sed "s|${REPO_DIR}/||" | sort
+  fi
+}
+
+# ---------------------------------------------------------------
+# TUI stub: calls ui.sh if exists or fallback to simple menu
+# ---------------------------------------------------------------
+cmd_tui() {
+  if [[ -x "${SCRIPTS_DIR}/ui.sh" ]]; then
+    call_script "ui.sh" "$@"
+    return $?
+  fi
+  # fallback simple interactive menu
+  while true; do
+    echo "ADM TUI (fallback)"
+    echo "1) Build package"
+    echo "2) Install package"
+    echo "3) Search package"
+    echo "4) Exit"
+    read -rp "Escolha> " opt
+    case "$opt" in
+      1) read -rp "Package: " p; adm_dispatch build --pkg "$p";;
+      2) read -rp "Package: " p; adm_dispatch install --pkg "$p";;
+      3) read -rp "Termo: " t; cmd_search "$t";;
+      4) break;;
+      *) echo "Opcao invalida";;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------
+# Core dispatcher: maps adm subcommands to scripts
+# ---------------------------------------------------------------
+adm_dispatch() {
+  local cmd="$1"; shift
+  case "$cmd" in
+    fetch|f)
+      # map flags to fetch.sh
+      # reconstruct args
+      call_script "fetch.sh" "$@"
+      ;;
+    build|b)
+      call_script "build.sh" "$@"
+      ;;
+    package|p)
+      call_script "package.sh" "$@"
+      ;;
+    install|i)
+      call_script "install.sh" "$@"
+      ;;
+    uninstall|u)
+      call_script "uninstall.sh" "$@"
+      ;;
+    check|integrity)
+      call_script "integrity.sh" "$@"
+      ;;
+    patch)
+      call_script "patch.sh" "$@"
+      ;;
+    update|up)
+      call_script "update.sh" "$@"
+      ;;
+    bootstrap|bs)
+      call_script "bootstrap.sh" "$@"
+      ;;
+    recover|r)
+      call_script "recover.sh" "$@"
+      ;;
+    profile|pf)
+      call_script "profile.sh" "$@"
+      ;;
+    hooks|hk)
+      call_script "hooks.sh" "$@"
+      ;;
+    log|l)
+      call_script "log.sh" "$@"
+      ;;
+    env|e)
+      call_script "env.sh" "$@"
+      ;;
+    color|c)
+      call_script "color.sh" "$@"
+      ;;
+    tui|ui|menu)
+      cmd_tui "$@"
+      ;;
+    search|s)
+      cmd_search "$@"
+      ;;
+    info)
+      cmd_info "$@"
+      ;;
+    deps|d)
+      cmd_deps "$@"
+      ;;
+    list)
+      cmd_list "$@"
+      ;;
+    version|v)
+      echo "ADM v${VERSION}"
+      ;;
+    bi|build-install)
+      cmd_build_install "$@"
+      ;;
+    help|h)
+      if [[ -n "${1:-}" ]]; then show_subhelp "$1"; else show_help; fi
+      ;;
+    *)
+      error "Comando inválido: ${cmd}. Use 'adm help' para ver comandos."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------
+# The build-install orchestration (fetch -> integrity -> patch -> build -> package -> install)
+# ---------------------------------------------------------------
+cmd_build_install() {
+  # parse options for build-install locally
+  local pkg=""
+  local group=""
+  local do_all=0
+  local dryrun=0
+  local jobs="$GLOBAL_JOBS"
+  local use_cache=0
+  local build_missing=0
+
+  # local parsing
+  while (( "$#" )); do
+    case "$1" in
+      -p|--pkg) pkg="$2"; shift 2;;
+      -g|--group) group="$2"; shift 2;;
+      -a|--all) do_all=1; shift;;
+      -n|--dry-run) dryrun=1; shift;;
+      -j|--jobs) jobs="$2"; shift 2;;
+      -c|--cache) use_cache=1; shift;;
+      -b|--build-missing) build_missing=1; shift;;
+      -d|--deps) GLOBAL_DEPS=1; shift;;
+      -f|--force) GLOBAL_FORCE=1; shift;;
+      -r|--root) GLOBAL_ROOT="$2"; shift 2;;
+      -v|--verbose) GLOBAL_VERBOSE=1; shift;;
+      -h|--help) show_subhelp build-install; return 0;;
+      *) pkg="$1"; shift;;
+    esac
+  done
+
+  # Sanity checks
+  if [[ -z "$pkg" && -z "$group" && $do_all -eq 0 ]]; then
+    error "Usage: adm build-install --pkg <name> | --group <group> | --all"
+  fi
+
+  # propagate overrides
+  GLOBAL_JOBS="$jobs"
+  [[ $dryrun -eq 1 ]] && GLOBAL_DRYRUN=1
+
+  # Build target list
+  local targets=()
+  if [[ $do_all -eq 1 ]]; then
+    # all packages
+    while read -r p; do targets+=("$p"); done < <(repo_list_pkgs)
+  elif [[ -n "$group" ]]; then
+    while read -r p; do targets+=("$p"); done < <(cmd_list "$group")
+  elif [[ -n "$pkg" ]]; then
+    targets+=("$pkg")
+    if [[ $GLOBAL_DEPS -eq 1 ]]; then
+      # resolve deps
+      local deps=()
+      resolve_deps_recursive "$pkg" deps || true
+      for d in "${deps[@]}"; do
+        targets=("$d" "${targets[@]}")
+      done
+    fi
+  fi
+
+  if ((${#targets[@]}==0)); then
+    error "Nenhum alvo encontrado para build-install"
+  fi
+
+  info "Build+Install targets: ${targets[*]}"
+  # iterate targets in order (deps first)
+  local t
+  for t in "${targets[@]}"; do
+    info "=== Processing: $t ==="
+    # 1) fetch
+    call_script "fetch.sh" "--pkg" "$t" || warn "fetch failed for $t"
+    # 2) integrity verify
+    call_script "integrity.sh" "--pkg" "$t" || warn "integrity issues for $t"
+    # 3) patch
+    call_script "patch.sh" "--pkg" "$t" || warn "patch step failed for $t"
+    # 4) build
+    call_script "build.sh" "--pkg" "$t" "--jobs" "$jobs" || fatal "build failed for $t"
+    # 5) package
+    call_script "package.sh" "--pkg" "$t" || warn "package failed for $t"
+    # 6) install (prefer cache if requested)
+    if [[ $use_cache -eq 1 ]]; then
+      call_script "install.sh" "--pkg" "$t" "--cache" || {
+        warn "cache install failed, trying regular install"
+        call_script "install.sh" "--pkg" "$t" || fatal "install failed for $t"
+      }
+    else
+      call_script "install.sh" "--pkg" "$t" || fatal "install failed for $t"
+    fi
+    ok "Completed build-install for ${t}"
+  done
+
+  ok "All targets processed"
+}
+
+# ---------------------------------------------------------------
+# Entry point: parse globals and dispatch command
+# ---------------------------------------------------------------
+main_entry() {
+  # Pre-parse globals
+  local argv=( "$@" )
+  local rest
+  rest=$(_preparse_globals "${argv[@]}")
+  # Convert rest to array properly
+  IFS=' ' read -r -a ARGS <<< "$rest"
+
+  if ((${#ARGS[@]}==0)); then
+    show_help
+    exit 0
+  fi
+
+  local cmd="${ARGS[0]}"
+  # remove first element
+  ARGS=( "${ARGS[@]:1}" )
+
+  # Dispatch
+  adm_dispatch "$cmd" "${ARGS[@]}"
+}
+
+# Run
+main_entry "$@"
