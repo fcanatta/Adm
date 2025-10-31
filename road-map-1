@@ -32,6 +32,13 @@ Categorias do repo  É pra ser criado nos diretórios update/ e repo/ com o env.
 
 ## Scripts Principais (em /usr/src/adm/scripts)
 
+Script ui.sh 
+    - Responsável por mostrar um painel configurável bonito no lugar da saída de log completo na tela
+    - Com cores e sppiners e porcentagem para toda a construção e download e todo o sistema adm
+    - Com o cabeçalho com o nome do programa de construção e versão 
+    - Em etapas mostrar o nome do programa com a versão quantidade de cpu,memória,load average
+    - Integração com todos os scripts
+
 1. Env
    - Lê e aplica configurações globais do sistema.
    - Define variáveis globais ao sistema para ser usado pelo bootstrap e sistema.
@@ -78,6 +85,7 @@ Categorias do repo  É pra ser criado nos diretórios update/ e repo/ com o env.
 
 8. Install-Pkg
    - Instala binários gerados ou converte binários deb,rpm em pacote para instalar.
+   - Resolve ordem de dependências dos binários se não tiver chamar Emerge-Pkg
    - Com comando para definir diretório final.
    - Salva registro de programa instalado.
 
@@ -136,12 +144,25 @@ Categorias do repo  É pra ser criado nos diretórios update/ e repo/ com o env.
 16. Mkinitramfs
    - Cria mkinitramfs,initramfs completo para o stage com kernel
 
+17. adm
+   - Executável (cli) responsável por chamar todos na ordem correta com comandos.
+   - Comandos com abreviações e comandos de baixo nível para manutenção dry-run para todos 
+   - Comandos para procurar programa, informações completas do programa 
+   - Comandos para mudar profiles,ver o profile ativo e já ativar na hora
+   - Comandos para ver todos os logs ou log específico 
+   - Comando para entrar no chroot com segurança e sair com segurança 
+   - Comandos para manipular diff
+   - Comandos para limpeza 
+   - Um menu TUI
+   - Helper com todos os comandos
+   - Bash,zsh,fish completions já instalado 
+
 
 ## Estrutura de Pacote (build.pkg)
 
 Exemplo: /usr/src/adm/repo/base/bc/build.pkg
 
-DESCRIPTION=Programa de linha de comando no Linux que funciona como uma calculadora.
+DESC=Programa de linha de comando no Linux que funciona como uma calculadora.
 NAME=bc
 VERSION=1.08.2
 BUILD=1
@@ -183,176 +204,25 @@ em ordem numérica (001-*, 002-*, ...).
 
 ## Fluxo de Construção
 
+ env garante que todas as variáveis estejam carregadas corretamente
 1. bootstrap → prepara ambiente
-2. create-pkgqueue → gera lista ordenada
-3. emerge-pkg → constrói todos os pacotes em sequência
-4. build-pkg → compila individualmente
-5. update-pkg → atualiza versões quando necessário
-6. cleanup → remove resíduos
-7. verify-pkg → valida integridade final
-
-
-## Regras Gerais
-
-- Sem suporte a cross-compilação
-- Arquitetura fixa: x86_64
-- Dependências resolvidas linearmente (recursão simples)
-- Fonte, patch e build sempre controlados pelo .desc
-- Todos os logs e caches ficam em /var/adm
-- Nenhum script depende de sistema de build externo
+2. PkgQueue → gera lista ordenada
+3. Emerge-Pkg → organiza a construção de todos os pacotes em sequência
+4. Build-Pkg → orquestra toda a construção do programa
+5. Update-Pkg → atualiza versões quando necessário
+6. Cleanup → Limpa o sistema
+7. Verify-Pkg → valida integridade final
 
 
 ## Resultado
 
-- Sistema totalmente shell puro, modular e previsível
-- Capaz de construir sistemas completos (LFS, BLFS, KDE, GNOME, Firefox)
+- Sistema totalmente shell puro, modular, previsível, limpo, e autoconstrutivo
+- Capaz de construir sistemas completos (LFS, BLFS, KDE, GNOME, Firefox, qualquer tipo de programa)
 - Reprodutível e fácil de depurar
-- Mantém a filosofia original do T2, mas mais leve e direto
+- Mantém a filosofia kiss,leve, limpo, simples e direto
+- Dependências resolvidas antes da construção do programa ou instalação de binários 
+- Fonte e build sempre controlados pelo build.pkg
+- Todos os logs e caches ficam em /usr/src/adm
+- Nenhum script depende de sistema de build externo
 
 # Fim do Roadmap
-
-
-
-
-
-
-
-Objetivo; criar scripts simples com código limpo,completo,funcional,funções limpas,completas,funcionais
-priorizar automação,limpeza,clareza,funcionalidade,completude quero todos os scripts completos,funcionais,limpos e organizados
-quero que eles fazem o que precisa somente com o que precisa,não completar o código com coisas desnecessárias
-que não fazem parte do escopo do projeto.
-
-Diretório base: /usr/src/adm/
-
-
-------------------------------------------------------------
-Scripts principais (todos em /usr/src/adm/scripts/):
-------------------------------------------------------------
-adm.sh              - script principal (cli, executável)
-env.sh              - define variáveis globais, cria todos os diretórios do sistema com as devidas permissões 
-deps.sh             - verifica dependências de compilação do pacote (lendo DEPEND= do build.pkg), resolve recursivamente e ordena
-fetch.sh            - baixa múltiplos código-fonte em todos os formatos em todos os tipos de links checa sha256sum e guarda em cache
-patch.sh            - aplica correções automaticamente
-build.sh            - compila automaticamente e instala na árvore temporária e gera registro
-install.sh          - instala para / ou diretório qualquer ou binário em cache ou diretório e registra
-package.sh          - empacota resultados e strip e guarda em cache
-boot.sh             - cria mkinitramfs, mkinitramfs
-bootstrap.sh        - cria o bootstrap,stage0, stage1, stage2, stage3, atualiza, gerência o toolchain e no final cria um rootfs de cada um stage
-log.sh              - registra tudo (timestamps e erros)
-recover.sh          - retoma builds interrompidos
-ui.sh               - interface limpa (progresso e status), define funções de cor (para terminais reais) e barra de progresso pra downloads
-scheduler.sh        - cordena a ordem de build otimizações,perfis de construção (agressive,conservador,básico) define com comando
-integrity.sh        - verifica hashes, assinaturas, permissões, verifica se o toolchain está funcional, se um programa está correto, se tem lib quebrada
-diff.sh             - mostra, compara, cria, edita, remove, aplica diffs com cores manipulação completa 
-clean.sh            - limpa diretórios de trabalho, caches, logs, limpa tudo
-update.sh           - verifica no upstream se há nova versão do pacote definido no build.pkg, compara e cria build.conf no diretório de update
-uninstall.sh        - desinstala pacotes instalados, executa hooks pre/post uninstall e remove dependências órfãs 
-
-------------------------------------------------------------
-Repositório de pacotes (/usr/src/adm/repo/):
-------------------------------------------------------------
-toolchain/
-  binutils/build.pkg
-  gcc/build.pkg
-  glibc/build.pkg
-
-base/
-  coreutils/build.pkg
-  bash/build.pkg
-
-desktop/
-  gnome/meta_build.pkg (contém somente as dependências para instalar tudo)
-  
-
-xorg/
-  xorg/xorg_build.pkg (contém somente as dependências para instalar tudo)
-
-apps/
-  firefox/build.pkg
-  chromium/build.pkg
-
-Cada arquivo build.pkg contém apenas metadados, por exemplo:
-
-NAME=firefox
-VERSION=130.0
-RELEASE=1
-DESC=Navegador web
-URL=https://ftp.mozilla.org/pub/$NAME/releases/$VERSION/$NAME-$VERSION-source.tar.xz
-DEPEND=gtk3,cairo,rust
-BUILD_DEPEND=
-BUILD=autotools,python,go,rust,make,ninja,todos os compiladores,custom
-
-custom_build ()
-{# Aparecer somente se opção BUILD=custom estiver selecionada}
-
-
-
-------------------------------------------------------------
-Fluxo automático (sem comandos manuais):
-------------------------------------------------------------
-1. Executar apenas:
-   sudo adm --install <programa>
-
-2. O sistema faz automaticamente:
-   - Carrega ambiente (env.sh)
-   - Checa dependências de compilação (deps.sh)
-   - Le perfil ativo (agressive,conservador,básico) aplica
-   - Monta plano de compilação (scheduler.sh)
-   - Para cada pacote:
-       fetch.sh     - baixa
-       integrity.sh - verifica
-       patch.sh     - aplica automaticamente
-       hooks.sh     - aplica automaticamente
-       build.sh     - compila e instala em diretório temporário 
-       package.sh   - empacota e strip
-       install.sh   - instalação final
-   - log.sh registra tudo
-   - ui.sh exibe progresso e status no terminal
-
-------------------------------------------------------------
-Etapas de desenvolvimento (roadmap cronológico):
-------------------------------------------------------------
-Fase 1: Base estrutural
-  - Criar /usr/src/adm/ com pastas scripts, repo, logs, update, bootstrap, cache com sources/ e packages/
-  - Resultado: estrutura limpa e organizada
-
-Fase 2: Core scripts
-  - Implementar env.sh, log.sh, colors.sh
-  - Resultado: ambiente e sistema de logs prontos
-
-Fase 3: Fetch + Integrity
-  - Adicionar fetch.sh e integrity.sh
-  - Resultado: download e verificação automáticas 
-
-Fase 4: Build engine
-  - Criar build.sh, install.sh, package.sh
-  - Resultado: compilação automatizada
-
-Fase 5: Scheduler
-  - Adicionar scheduler.sh
-  - Resultado: ordem automática de construção otimizado
-
-Fase 6: UI e cores
-  - Adicionar ui.sh para progresso e feedback visual
-  - Implementar painel dinâmico de status (exibição contínua durante a construção)
-  - O log completo é redirecionado para arquivo, e a tela exibe somente o painel padronizado:
-      e Mostra pacote, versão, etapa atual, progresso, dependências, status e tempo decorrido
-      e Atualiza em tempo real a cada etapa (fetch, patch, build, package, install)
-      e Ao final, transforma-se na tela de finalização (sucesso/erro) com resumo e caminhos
-  - Resultado: interface limpa, dinâmica e informativa
-
-Fase 7: Repositório de pacotes
-  - Criar /repo/ com arquivos build.pkg
-  - Resultado: base funcional de pacotes
-
-Fase 8: Recuperação automática 
-  - Implementar recover.sh
-  - Resultado: retoma builds interrompidos
-
-Fase 9: Perfis de compilação 
-  - Criar /config/ com perfis (desktop, minimal, xorg)
-  - Resultado: perfis de build gerenciáveis 
-
-Fase 10: Atualização e remoção
-  - Adicionar update.sh e uninstall.sh
-  - Resultado: sistema capaz de atualizar e remover pacotes automaticamente
