@@ -1,0 +1,45 @@
+# repo/toolchain/gcc/build.pkg
+# ADM build.pkg — GCC (GNU Compiler Collection)
+# Conformidade: NÃO contém comandos de build. build.sh deve interpretar BUILD_HINT.
+# Versão exemplo: 14.2.0 (ajuste PKG_VERSION/PKG_SHA256 conforme necessário)
+
+PKG_NAME="gcc"
+PKG_VERSION="14.2.0"
+PKG_RELEASE="1"
+PKG_DESC="GNU Compiler Collection — C/C++ compilers and companion tools"
+PKG_LICENSE="GPL-3.0-or-later"
+PKG_GROUP="toolchain"
+PKG_ARCH="x86_64"
+
+# Fonte primária (tarball upstream). Substitua se preferir espelho local.
+SOURCE_URL="https://ftp.gnu.org/gnu/gcc/gcc-${PKG_VERSION}/gcc-${PKG_VERSION}.tar.xz"
+# SHA256 do tarball upstream (exemplo, verifique antes de usar em produção)
+SOURCE_SHA256="bc5b95cfcb0b9e6a20c8e69c04f95a9ee6eb878d3c2b2b019f98aee7fcbf2f26"
+
+# Dependências em tempo de execução / construção (nomes correspondentes aos build.pkg dos outros pkgs)
+# O build.sh / fetch.sh devem mapear esses nomes para fontes / pacotes disponíveis.
+PKG_DEPENDS=( binutils glibc mpfr mpc gmp isl zlib )
+PKG_BUILD_DEPENDS=( make autoconf automake texinfo pkgconfig )
+
+# Indica ao build.sh qual fluxo usar.
+# Exemplos suportados no seu sistema: autotools, cmake, meson, python, go, rust, custom
+# Aqui usamos autotools; build.sh deve executar configure/make/make install com DESTDIR/--prefix apropriados.
+BUILD_HINT="autotools"
+
+# Indica em qual stage é recomendado construir (stage0/stage1/stage2/stage3)
+# Use conforme seu bootstrap.sh; para gcc normalmente stage1/stage2.
+PKG_STAGE="stage1"
+
+# Metadados opcionais
+PKG_HOMEPAGE="https://gcc.gnu.org/"
+PKG_MAINTAINER="adm-team@example.local"
+
+# Se BUILD_HINT="custom" você poderia definir a função abaixo.
+# Como BUILD_HINT="autotools" NÃO inclua funções de build aqui.
+# Exemplo (comentado):
+# custom_build() {
+#     # Só válido quando BUILD_HINT=custom — o conteúdo só será executado pelo build.sh nesse modo.
+#     configure args...
+#     make -j$(nproc)
+#     make DESTDIR="$PKG_DESTDIR" install
+# }
