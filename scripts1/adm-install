@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+# ================================================================
+# adm-install v1.0
+# Install packages produced by adm-build or DESTDIRs into a chosen root.
+# - supports .pkg.tar.zst, .pkg.tar.xz, tarballs, and build dest dirs
+# - backups + rollback, hooks pre/post, dry-run, force, logs
+# - no silent errors: all actions logged to logs/<pkg>.install.{out,err}
+# ================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+PKG_DIR="${PKG_DIR:-$ADM_ROOT/packages}"
+BUILD_DIR="${BUILD_DIR:-$ADM_ROOT/build}"
+LOG_DIR="${LOG_DIR:-$ADM_ROOT/logs}"
+BACKUP_DIR="${BACKUP_DIR:-$ADM_ROOT/inst-backups}"
+INSTALLED_DIR="${INSTALLED_DIR:-$ADM_ROOT/installed}"
+HOOK_DIR="${HOOK_DIR:-$ADM_ROOT/hooks}"
+
+mkdir -p "$PKG_DIR" "$BUILD_DIR" "$LOG_DIR" "$BACKUP_DIR" "$INSTALLED_DIR" "$HOOK_DIR/pre/install" "$HOOK_DIR/post/install"
+
+# ---------------------------
+# UI / COLORS
+# ---------------------------
+CLR_RESET='\e[0m'
+CLR_MAGENTA='\e[95m'
+CLR_GREEN='\e[92m'
+CLR_CYAN='\e[96m'
+CLR_YELLOW='\e[93m'
+CLR_RED='\e[91m'
+
+timestamp(){ date '+%Y-%m-%d %H:%M:%S'; }
+headline(){ printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$1"; }
+short_ok(){ printf "%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$1"; }
+short_fail(){ printf "%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$1"; }
+short_info(){ printf "%b[%s]%b %s\n" "$CLR_GREEN" "$(timestamp)" "$CLR_RESET" "$1"; }
+short_warn(){ printf "%b[!]%b %s\n" "$CLR_YELLOW" "$CLR_RESET" "$1"; }
+
+# spinner
+__frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+__sp_pid=""
+start_spinner(){
+    local msg="${1:-Working...}"
+    printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$msg"
+    (
+        local i=0
+        while :; do
+            printf "\r%b %s %b %s" "$CLR_GREEN" "${__frames[i % ${#__frames[@]}]}" "$CLR_RESET" "$msg"
+            i=$((i+1))
+            sleep 0.12
+        done
+    ) &
+    __sp_pid=$!
+}
+stop_spinner(){
+    local code=${1:-0} msg="${2:-Done}"
+    if [[ -n "$__sp_pid" ]]; then
+        kill "$__sp_pid" >/dev/null 2>&1 || true
+        wait "$__sp_pid" 2>/dev/null || true
+        __sp_pid=""
+    fi
+    if [[ "$code" -eq 0 ]]; then
+        printf "\r%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$msg"
+    else
+        printf "\r%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$msg"
+    fi
+}
+
+# ---------------------------
+# ARGS / Defaults
+# ---------------------------
+USAGE="Usage: $(basename "$0") [--pkg-file <file>] [--pkg-name <pkg>] [--from-dest <pkg>] [--dest <path>] [--dry-run] [--force] [--no-backup] [--backup-only] [--rollback-on-fail] [--hooks-only]"
+
+PKG_FILE=""
+PKG_NAME=""
+FROM_DEST=""
+DEST="/"
+DRY_RUN=0
+FORCE=0
+NO_BACKUP=0
+BACKUP_ONLY=0
+ROLLBACK_ON_FAIL=1
+HOOKS_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pkg-file) PKG_FILE="$2"; shift 2 ;;
+        --pkg-name) PKG_NAME="$2"; shift 2 ;;
+        --from-dest) FROM_DEST="$2"; shift 2 ;;
+        --dest) DEST="$2"; shift 2 ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --force) FORCE=1; shift ;;
+        --no-backup) NO_BACKUP=1; shift ;;
+        --backup-only) BACKUP_ONLY=1; shift ;;
+        --no-rollback) ROLLBACK_ON_FAIL=0; shift ;;
+        --hooks-only) HOOKS_ONLY=1; shift ;;
+        -h|--help) echo "$USAGE"; exit 0 ;;
+        *) echo "Unknown arg: $1"; echo "$USAGE"; exit 1 ;;
+    esac
+done
+
+# normalize DEST
+DEST="${DEST%/}"
+[[ -z "$DEST" ]] && DEST="/"
+
+# ---------------------------
+# SANITY CHECKS
+# ---------------------------
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    # installing into real root may require root
+    if [[ ! -w "$DEST" ]]; then
+        short_warn "Destination $DEST not writable by current user. You may need to run as root."
+    fi
+fi
+
+# logs per operation
+OP_NAME="${PKG_NAME:-pkg}"
+TIMESTAMP_NOW=$(date +%Y%m%d-%H%M%S)
+LOG_OUT="$LOG_DIR/${OP_NAME}.install.out"
+LOG_ERR="$LOG_DIR/${OP_NAME}.install.err"
+: >"$LOG_OUT"
+: >"$LOG_ERR"
+
+lout(){ printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_OUT"; }
+lerr(){ printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_ERR"; }
+
+# ---------------------------
+# HOOKS runner
+# ---------------------------
+run_hooks() {
+    # args: phase pkg dest
+    local phase="$1"; local pkg="$2"; local dest="$3"
+    local base
+    base="$HOOK_DIR/$phase/install"
+    # global hooks
+    if [[ -d "$base" ]]; then
+        for h in "$base"/*; do
+            [[ -x "$h" ]] || continue
+            lout "RUNHOOK: $h $pkg $dest"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                lout "DRYRUN: would run $h"
+            else
+                if ! "$h" "$pkg" "$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    lerr "HOOKFAIL: $h"
+                    short_warn "Hook failed: $h (see $LOG_ERR)"
+                    return 1
+                fi
+            fi
+        done
+    fi
+    # package-specific hooks
+    base="$HOOK_DIR/$phase/$pkg"
+    if [[ -d "$base" ]]; then
+        for h in "$base"/*; do
+            [[ -x "$h" ]] || continue
+            lout "RUNHOOK: $h $pkg $dest"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                lout "DRYRUN: would run $h"
+            else
+                if ! "$h" "$pkg" "$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    lerr "HOOKFAIL: $h"
+                    short_warn "Hook failed: $h (see $LOG_ERR)"
+                    return 1
+                fi
+            fi
+        done
+    fi
+    return 0
+}
+
+# ---------------------------
+# HELPERS: package detection & metadata
+# ---------------------------
+find_latest_pkgfile_by_name() {
+    # find latest file matching name-*.pkg.tar.*
+    local name="$1"
+    shopt -s nullglob
+    local candidates=("$PKG_DIR"/"$name"-*.pkg.tar.*)
+    shopt -u nullglob
+    if ((${#candidates[@]} == 0)); then
+        return 1
+    fi
+    # sort by mtime, newest last
+    printf "%s\n" "${candidates[@]}" | sort -V | tail -n1
+}
+
+detect_pkgfile_format() {
+    local f="$1"
+    case "$f" in
+        *.zst|*.pkg.tar.zst) echo "zst" ;;
+        *.xz|*.pkg.tar.xz) echo "xz" ;;
+        *.tar|*.tar.gz|*.tgz) echo "tar" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+read_pkg_meta() {
+    # if there's a .meta next to package, return it
+    local f="$1"
+    if [[ -f "${f}.meta" ]]; then
+        cat "${f}.meta"
+    fi
+}
+
+# ---------------------------
+# PREPARE SOURCE (package file or destdir)
+# ---------------------------
+SRC_TYPE=""   # "pkgfile" | "destdir" | "tarball"
+SRC_PATH=""   # path to file or destdir
+PKG_ID=""     # name portion
+PKG_VERSION="" # optional
+
+# choose source
+if [[ -n "$PKG_FILE" ]]; then
+    if [[ ! -f "$PKG_FILE" ]]; then
+        short_fail "Package file not found: $PKG_FILE"
+        exit 1
+    fi
+    SRC_TYPE="pkgfile"
+    SRC_PATH="$PKG_FILE"
+elif [[ -n "$PKG_NAME" ]]; then
+    found=$(find_latest_pkgfile_by_name "$PKG_NAME" || true)
+    if [[ -n "$found" ]]; then
+        SRC_TYPE="pkgfile"
+        SRC_PATH="$found"
+    else
+        short_fail "No package file found for name: $PKG_NAME in $PKG_DIR"
+        exit 1
+    fi
+elif [[ -n "$FROM_DEST" ]]; then
+    local_dest="$BUILD_DIR/$FROM_DEST/dest"
+    if [[ ! -d "$local_dest" ]]; then
+        short_fail "DEST build dir not found for pkg: $FROM_DEST (expected $local_dest)"
+        exit 1
+    fi
+    SRC_TYPE="destdir"
+    SRC_PATH="$local_dest"
+    PKG_NAME="$FROM_DEST"
+else
+    short_fail "No source specified. Use --pkg-file, --pkg-name or --from-dest."
+    exit 1
+fi
+
+# derive pkg id and version if pkgfile
+if [[ "$SRC_TYPE" == "pkgfile" ]]; then
+    bname=$(basename "$SRC_PATH")
+    # expected format: name-version.pkg.tar.zst
+    if [[ "$bname" =~ ^([^[:space:]]+)-([0-9A-Za-z\.\+_~-]+)\.pkg\.tar\.(zst|xz)$ ]]; then
+        PKG_ID="${BASH_REMATCH[1]}"
+        PKG_VERSION="${BASH_REMATCH[2]}"
+    else
+        # fallback: name as filename without extension
+        PKG_ID="${bname%%.pkg.*}"
+        PKG_VERSION="unknown"
+    fi
+    # ensure PKG_NAME set
+    PKG_NAME="${PKG_NAME:-$PKG_ID}"
+fi
+
+headline "Prepare install: source=$SRC_TYPE ($SRC_PATH) pkg=$PKG_NAME dest=$DEST"
+
+# ---------------------------
+# BACKUP existing files (create list) - unless NO_BACKUP or DRY_RUN
+# ---------------------------
+BACKUP_TARGET_DIR="$BACKUP_DIR/${PKG_NAME}-${TIMESTAMP_NOW}"
+MANIFEST_OUT="$INSTALLED_DIR/${PKG_NAME}-${PKG_VERSION:-unknown}.manifest"
+
+backup_existing_files() {
+    # create backup dir
+    mkdir -p "$BACKUP_TARGET_DIR"
+    lout "BACKUP_START $PKG_NAME -> $BACKUP_TARGET_DIR"
+    # we'll extract package into temp and list files to be written, then backup current counterparts
+    local temp_extract
+    temp_extract="$(mktemp -d "${TMPDIR:-/tmp}/adm-install.${PKG_NAME}.XXXX")"
+    trap 'rm -rf "$temp_extract" 2>/dev/null || true' RETURN
+
+    if [[ "$SRC_TYPE" == "pkgfile" ]]; then
+        # extract file list only
+        fmt=$(detect_pkgfile_format "$SRC_PATH")
+        case "$fmt" in
+            zst)
+                if command -v zstd >/dev/null 2>&1; then
+                    (cd "$temp_extract" && tar --warning=no-unknown-keyword -I zstd -xf "$SRC_PATH" ) >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+                else
+                    (cd "$temp_extract" && zstd -d "$SRC_PATH" -c | tar -xf -) >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+                fi
+                ;;
+            xz)
+                (cd "$temp_extract" && tar -xJf "$SRC_PATH") >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+                ;;
+            tar)
+                (cd "$temp_extract" && tar -xf "$SRC_PATH") >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+                ;;
+            *)
+                lerr "Unknown package format: $SRC_PATH"
+                return 1
+                ;;
+        esac
+    elif [[ "$SRC_TYPE" == "destdir" ]]; then
+        # copy the destdir tree list into temp
+        rsync -a --dry-run --delete "$SRC_PATH/" "$temp_extract/" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+        rsync -a "$SRC_PATH/" "$temp_extract/" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+    fi
+
+    # now iterate files in temp_extract and backup existing ones under DEST
+    (cd "$temp_extract" || return 1)
+    find . -type f -o -type l -o -type d | while IFS= read -r p; do
+        target="$DEST/${p#./}"
+        # skip if path outside dest (defensive)
+        if [[ "$target" != "$DEST"* ]]; then
+            lout "SKIP_OUTSIDE: $p"
+            continue
+        fi
+        if [[ -e "$target" ]]; then
+            mkdir -p "$(dirname "$BACKUP_TARGET_DIR/$p")"
+            cp -a --preserve=mode,timestamps,links "$target" "$BACKUP_TARGET_DIR/$p" >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+                lerr "Failed to backup $target"
+            }
+            lout "BACKUP: $target -> $BACKUP_TARGET_DIR/$p"
+        fi
+    done
+    # cleanup temp handled by trap return
+    return 0
+}
+
+# ---------------------------
+# UNPACK & INSTALL
+# ---------------------------
+perform_install_from_pkgfile() {
+    local pkgfile="$1"
+    local tmp_extract
+    tmp_extract="$(mktemp -d "${TMPDIR:-/tmp}/adm-install-extract.${PKG_NAME}.XXXX")"
+    lout "EXTRACT_TMP $tmp_extract"
+
+    fmt=$(detect_pkgfile_format "$pkgfile")
+    case "$fmt" in
+        zst)
+            if command -v zstd >/dev/null 2>&1; then
+                start_spinner "Extracting package (zstd)"
+                if ! (cd "$tmp_extract" && tar --warning=no-unknown-keyword -I zstd -xf "$pkgfile") >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    stop_spinner 1 "Extraction failed"
+                    lerr "EXTRACT_FAIL $pkgfile"
+                    rm -rf "$tmp_extract"
+                    return 1
+                fi
+                stop_spinner 0 "Extracted"
+            else
+                start_spinner "Decompressing zstd -> tar"
+                if ! (zstd -d "$pkgfile" -c | tar -xf - -C "$tmp_extract") >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    stop_spinner 1 "Decompress failed"
+                    lerr "ZSTD_DECOMP_FAIL $pkgfile"
+                    rm -rf "$tmp_extract"
+                    return 1
+                fi
+                stop_spinner 0 "Extracted"
+            fi
+            ;;
+        xz)
+            start_spinner "Extracting package (xz)"
+            if ! (cd "$tmp_extract" && tar -xJf "$pkgfile") >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                stop_spinner 1 "Extraction failed"
+                lerr "EXTRACT_FAIL $pkgfile"
+                rm -rf "$tmp_extract"
+                return 1
+            fi
+            stop_spinner 0 "Extracted"
+            ;;
+        tar)
+            start_spinner "Extracting tar"
+            if ! (cd "$tmp_extract" && tar -xf "$pkgfile") >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                stop_spinner 1 "Extraction failed"
+                lerr "EXTRACT_FAIL $pkgfile"
+                rm -rf "$tmp_extract"
+                return 1
+            fi
+            stop_spinner 0 "Extracted"
+            ;;
+        *)
+            lerr "UNSUPPORTED PKG FORMAT: $pkgfile"
+            rm -rf "$tmp_extract"
+            return 1
+            ;;
+    esac
+
+    # at this point tmp_extract contains packaged filesystem root (like usr/ etc)
+    # create list of files to install
+    mapfile -t files_to_install < <(cd "$tmp_extract" && find . -mindepth 1 -print0 | xargs -0 -n1 echo)
+
+    if ((${#files_to_install[@]} == 0)); then
+        lerr "No files found inside package $pkgfile"
+        rm -rf "$tmp_extract"
+        return 1
+    fi
+
+    # apply files to DEST:
+    start_spinner "Installing files to $DEST"
+    for f in "${files_to_install[@]}"; do
+        src="$tmp_extract/${f#./}"
+        dst="$DEST/${f#./}"
+        # create parent
+        mkdir -p "$(dirname "$dst")"
+        # cp with attributes; if file exists and same inode, skip unless force
+        if [[ -e "$dst" && "$FORCE" -eq 0 ]]; then
+            # check if identical by sha256 (best-effort)
+            if command -v sha256sum >/dev/null 2>&1 && [[ -f "$src" && -f "$dst" ]]; then
+                ssrc=$(sha256sum "$src" | awk '{print $1}')
+                sdst=$(sha256sum "$dst" | awk '{print $1}')
+                if [[ "$ssrc" == "$sdst" ]]; then
+                    lout "SKIP_SAME $dst"
+                    continue
+                fi
+            fi
+        fi
+        # perform copy (preserve mode/timestamps/links/ownership if possible)
+        if cp -a "$src" "$dst" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+            lout "INSTALLED $dst"
+        else
+            lerr "COPY_FAIL $src -> $dst"
+            stop_spinner 1 "Install failed for $dst"
+            rm -rf "$tmp_extract"
+            return 1
+        fi
+    done
+    stop_spinner 0 "Files installed"
+    # build manifest of installed files
+    (cd "$tmp_extract" && find . -type f -o -type l -print | sed 's|^\./||' > "$MANIFEST_OUT") || true
+
+    # cleanup tmp
+    rm -rf "$tmp_extract"
+    return 0
+}
+
+perform_install_from_destdir() {
+    local srcdir="$1"
+    # generate file list
+    mapfile -t files_to_install < <(cd "$srcdir" && find . -mindepth 1 -print)
+    if ((${#files_to_install[@]} == 0)); then
+        lerr "No files found in destdir $srcdir"
+        return 1
+    fi
+    start_spinner "Installing from destdir $srcdir -> $DEST"
+    for f in "${files_to_install[@]}"; do
+        src="$srcdir/${f#./}"
+        dst="$DEST/${f#./}"
+        mkdir -p "$(dirname "$dst")"
+        if cp -a "$src" "$dst" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+            lout "INSTALLED $dst"
+        else
+            lerr "COPY_FAIL $src -> $dst"
+            stop_spinner 1 "Install failed for $dst"
+            return 1
+        fi
+    done
+    stop_spinner 0 "Installed from destdir"
+    (cd "$srcdir" && find . -type f -o -type l -print | sed 's|^\./||' > "$MANIFEST_OUT") || true
+    return 0
+}
+
+# ---------------------------
+# BACKUP_ONLY mode handling
+# ---------------------------
+if [[ "$BACKUP_ONLY" -eq 1 ]]; then
+    if [[ "$NO_BACKUP" -eq 1 ]]; then
+        short_warn "--backup-only requested but --no-backup also set; nothing to do"
+        exit 1
+    fi
+    headline "Backup-only: preparing backup of target files for $PKG_NAME"
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        short_info "DRY-RUN: would backup files that would be overwritten"
+        exit 0
+    fi
+    backup_existing_files || { short_fail "Backup failed"; exit 1; }
+    short_ok "Backup completed at $BACKUP_TARGET_DIR"
+    exit 0
+fi
+
+# ---------------------------
+# MAIN: run hooks pre-install, backup, install, hooks post-install, verify, finish
+# ---------------------------
+# run pre-install hooks
+run_hooks pre "$PKG_NAME" "$DEST" || { short_warn "Pre-install hooks reported issues"; }
+
+if [[ "$HOOKS_ONLY" -eq 1 ]]; then
+    short_ok "Hooks-only mode completed"
+    exit 0
+fi
+
+# backup
+if [[ "$NO_BACKUP" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+    start_spinner "Creating backup of existing files (if any)"
+    if ! backup_existing_files; then
+        stop_spinner 1 "Backup error"
+        short_warn "Backup encountered errors (see logs); aborting"
+        exit 1
+    fi
+    stop_spinner 0 "Backup prepared at $BACKUP_TARGET_DIR"
+else
+    short_info "Skipping backup (NO_BACKUP or DRY_RUN)"
+fi
+
+# perform install
+install_rc=0
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    short_info "DRY-RUN: no files will be written. Would install source $SRC_PATH to $DEST"
+else
+    if [[ "$SRC_TYPE" == "pkgfile" ]]; then
+        if ! perform_install_from_pkgfile "$SRC_PATH"; then
+            install_rc=$?
+        fi
+    elif [[ "$SRC_TYPE" == "destdir" ]]; then
+        if ! perform_install_from_destdir "$SRC_PATH"; then
+            install_rc=$?
+        fi
+    else
+        lerr "Unsupported SRC_TYPE: $SRC_TYPE"
+        install_rc=2
+    fi
+fi
+
+if [[ "$install_rc" -ne 0 ]]; then
+    short_fail "Installation failed (rc=$install_rc)."
+    lerr "INSTALL_FAIL rc=$install_rc"
+    # attempt rollback if enabled and backup exists
+    if [[ "$ROLLBACK_ON_FAIL" -eq 1 && -d "$BACKUP_TARGET_DIR" && "$NO_BACKUP" -eq 0 ]]; then
+        short_info "Attempting rollback from $BACKUP_TARGET_DIR ..."
+        start_spinner "Rolling back files..."
+        (cd "$BACKUP_TARGET_DIR" && tar -cf - .) | (cd "$DEST" && tar -xpf -) >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+            stop_spinner 1 "Rollback failed"
+            short_fail "Rollback failed; manual intervention required (see logs)"
+            exit 1
+        }
+        stop_spinner 0 "Rollback complete"
+        short_fail "Installation rolled back due to failure"
+    fi
+    report_last_error() {
+        printf "%b%s%b %b=>%b Recent error log excerpt:\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET"
+        tail -n 40 "$LOG_ERR" | sed 's/^/  /'
+    }
+    report_last_error
+    exit "$install_rc"
+fi
+
+# run post-install hooks
+if ! run_hooks post "$PKG_NAME" "$DEST"; then
+    short_warn "Post-install hooks reported issues"
+fi
+
+# finalize: write manifest and small metadata
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    if [[ -f "$MANIFEST_OUT" ]]; then
+        # add meta info
+        cat > "${MANIFEST_OUT}.meta" <<EOF
+pkg: $PKG_NAME
+version: ${PKG_VERSION:-unknown}
+installed_to: $DEST
+installed_at: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+source: $SRC_PATH
+backup: ${BACKUP_TARGET_DIR:-none}
+EOF
+        short_ok "Install manifest written: $MANIFEST_OUT"
+        lout "INSTALL_OK $PKG_NAME -> $DEST"
+    fi
+fi
+
+short_ok "Installation completed: $PKG_NAME -> $DEST"
+echo "Logs: $LOG_OUT  Errors: $LOG_ERR"
+exit 0
