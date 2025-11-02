@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# ================================================================
+# adm-uninstall v1.0
+# Safe package uninstaller for ADM framework.
+# Supports orphan detection, pre/post hooks, backups, dry-run, and full logging.
+# ================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+INSTALLED_DIR="$ADM_ROOT/installed"
+LOG_DIR="$ADM_ROOT/logs"
+BACKUP_DIR="$ADM_ROOT/inst-backups"
+HOOK_DIR="$ADM_ROOT/hooks"
+PKG_DIR="$ADM_ROOT/packages"
+
+mkdir -p "$INSTALLED_DIR" "$LOG_DIR" "$BACKUP_DIR" \
+    "$HOOK_DIR/pre/uninstall" "$HOOK_DIR/post/uninstall"
+
+# ---------------------------
+# COLORS / UI
+# ---------------------------
+CLR_RESET='\e[0m'
+CLR_MAGENTA='\e[95m'
+CLR_GREEN='\e[92m'
+CLR_CYAN='\e[96m'
+CLR_YELLOW='\e[93m'
+CLR_RED='\e[91m'
+
+timestamp(){ date '+%Y-%m-%d %H:%M:%S'; }
+headline(){ printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$1"; }
+short_ok(){ printf "%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$1"; }
+short_fail(){ printf "%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$1"; }
+short_info(){ printf "%b[%s]%b %s\n" "$CLR_GREEN" "$(timestamp)" "$CLR_RESET" "$1"; }
+short_warn(){ printf "%b[!]%b %s\n" "$CLR_YELLOW" "$CLR_RESET" "$1"; }
+
+# spinner
+__frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+__sp_pid=""
+start_spinner(){
+    local msg="${1:-Working...}"
+    printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$msg"
+    (
+        local i=0
+        while :; do
+            printf "\r%b %s %b %s" "$CLR_GREEN" "${__frames[i % ${#__frames[@]}]}" "$CLR_RESET" "$msg"
+            i=$((i+1))
+            sleep 0.12
+        done
+    ) &
+    __sp_pid=$!
+}
+stop_spinner(){
+    local code=${1:-0} msg="${2:-Done}"
+    if [[ -n "$__sp_pid" ]]; then
+        kill "$__sp_pid" >/dev/null 2>&1 || true
+        wait "$__sp_pid" 2>/dev/null || true
+        __sp_pid=""
+    fi
+    if [[ "$code" -eq 0 ]]; then
+        printf "\r%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$msg"
+    else
+        printf "\r%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$msg"
+    fi
+}
+
+# ---------------------------
+# ARGUMENTS
+# ---------------------------
+USAGE="Usage: $(basename "$0") [--pkg <name>] [--all] [--orphans] [--dry-run] [--no-backup] [--force]"
+PKG_NAME=""
+REMOVE_ALL=0
+REMOVE_ORPHANS=0
+DRY_RUN=0
+NO_BACKUP=0
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --pkg) PKG_NAME="$2"; shift 2 ;;
+        --all) REMOVE_ALL=1; shift ;;
+        --orphans) REMOVE_ORPHANS=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --no-backup) NO_BACKUP=1; shift ;;
+        --force) FORCE=1; shift ;;
+        -h|--help) echo "$USAGE"; exit 0 ;;
+        *) echo "Unknown arg: $1"; echo "$USAGE"; exit 1 ;;
+    esac
+done
+
+# ---------------------------
+# LOGGING
+# ---------------------------
+OP_NAME="${PKG_NAME:-batch}"
+LOG_OUT="$LOG_DIR/${OP_NAME}.uninstall.out"
+LOG_ERR="$LOG_DIR/${OP_NAME}.uninstall.err"
+: >"$LOG_OUT"
+: >"$LOG_ERR"
+lout(){ printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_OUT"; }
+lerr(){ printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_ERR"; }
+
+# ---------------------------
+# HOOKS
+# ---------------------------
+run_hooks() {
+    local phase="$1" pkg="$2"
+    local base="$HOOK_DIR/$phase/uninstall"
+    if [[ -d "$base" ]]; then
+        for h in "$base"/*; do
+            [[ -x "$h" ]] || continue
+            lout "RUNHOOK: $h $pkg"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                short_info "DRY-RUN: would run hook $h"
+            else
+                if ! "$h" "$pkg" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    lerr "HOOKFAIL: $h"
+                    short_warn "Hook failed: $h"
+                    [[ "$FORCE" -eq 0 ]] && return 1
+                fi
+            fi
+        done
+    fi
+    # per-package hooks
+    local pkgbase="$HOOK_DIR/$phase/$pkg"
+    if [[ -d "$pkgbase" ]]; then
+        for h in "$pkgbase"/*; do
+            [[ -x "$h" ]] || continue
+            lout "RUNHOOK: $h $pkg"
+            if [[ "$DRY_RUN" -eq 1 ]]; then
+                short_info "DRY-RUN: would run hook $h"
+            else
+                if ! "$h" "$pkg" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                    lerr "HOOKFAIL: $h"
+                    short_warn "Hook failed: $h"
+                    [[ "$FORCE" -eq 0 ]] && return 1
+                fi
+            fi
+        done
+    fi
+    return 0
+}
+
+# ---------------------------
+# FIND INSTALLED PACKAGES
+# ---------------------------
+find_installed_packages() {
+    find "$INSTALLED_DIR" -type f -name "*.manifest" -printf "%f\n" | sed 's/.manifest$//' | sort -u
+}
+
+find_manifest_for_pkg() {
+    local pkg="$1"
+    find "$INSTALLED_DIR" -type f -name "${pkg}-*.manifest" | sort -V | tail -n1 || true
+}
+
+# ---------------------------
+# DETECT ORPHANS
+# ---------------------------
+detect_orphans() {
+    headline "Detecting orphans..."
+    local pkgs depmap deps dep
+    pkgs=($(find_installed_packages))
+    declare -A deps
+    for p in "${pkgs[@]}"; do
+        local meta="${INSTALLED_DIR}/${p}.manifest.meta"
+        [[ -f "$meta" ]] || continue
+        grep -i '^depends:' "$meta" 2>/dev/null | while read -r line; do
+            for dep in ${line#depends:}; do deps["$dep"]=1; done
+        done
+    done
+    local orphans=()
+    for p in "${pkgs[@]}"; do
+        if [[ -z "${deps["$p"]:-}" ]]; then
+            orphans+=("$p")
+        fi
+    done
+    if ((${#orphans[@]})); then
+        printf "%s\n" "${orphans[@]}"
+    fi
+}
+
+# ---------------------------
+# BACKUP BEFORE UNINSTALL
+# ---------------------------
+backup_pkg_files() {
+    local manifest="$1" pkg="$2"
+    local bdir="$BACKUP_DIR/${pkg}-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$bdir"
+    lout "BACKUP_START $pkg -> $bdir"
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local target="/$f"
+        if [[ -e "$target" ]]; then
+            mkdir -p "$(dirname "$bdir/$f")"
+            cp -a "$target" "$bdir/$f" >>"$LOG_OUT" 2>>"$LOG_ERR" || lerr "Backup fail $target"
+        fi
+    done <"$manifest"
+    echo "$bdir"
+}
+
+# ---------------------------
+# UNINSTALL ONE PACKAGE
+# ---------------------------
+uninstall_pkg() {
+    local pkg="$1"
+    local manifest
+    manifest=$(find_manifest_for_pkg "$pkg")
+    if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+        short_warn "Manifest not found for $pkg (maybe not installed?)"
+        return 0
+    fi
+    local total=$(wc -l <"$manifest" || echo 0)
+    if (( total == 0 )); then
+        short_warn "Empty manifest for $pkg"
+        return 0
+    fi
+
+    headline "Uninstalling $pkg ($total files)"
+    run_hooks pre "$pkg" || short_warn "Pre-uninstall hooks issues"
+
+    local backup_path=""
+    if [[ "$NO_BACKUP" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+        start_spinner "Backing up files..."
+        backup_path=$(backup_pkg_files "$manifest" "$pkg" || echo "")
+        stop_spinner 0 "Backup done: ${backup_path:-none}"
+    fi
+
+    start_spinner "Removing files for $pkg"
+    local removed=0 failed=0
+    while IFS= read -r rel; do
+        [[ -z "$rel" ]] && continue
+        local f="/$rel"
+        if [[ ! -e "$f" ]]; then
+            lout "MISSING: $f"
+            continue
+        fi
+        if [[ "$DRY_RUN" -eq 1 ]]; then
+            short_info "Would remove $f"
+            continue
+        fi
+        if rm -f "$f" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+            ((removed++))
+            lout "REMOVED $f"
+        else
+            lerr "REMOVE_FAIL $f"
+            ((failed++))
+            if [[ "$FORCE" -eq 0 ]]; then
+                stop_spinner 1 "Failed removing $f"
+                return 1
+            fi
+        fi
+    done <"$manifest"
+    stop_spinner 0 "Removed $removed files ($failed failed)"
+    rm -f "$manifest" "$manifest.meta" 2>/dev/null || true
+    run_hooks post "$pkg" || short_warn "Post-uninstall hook issues"
+    short_ok "Uninstall completed for $pkg ($removed files removed)"
+    return 0
+}
+
+# ---------------------------
+# MAIN EXECUTION
+# ---------------------------
+pkgs_to_remove=()
+if [[ "$REMOVE_ALL" -eq 1 ]]; then
+    mapfile -t pkgs_to_remove < <(find_installed_packages)
+elif [[ "$REMOVE_ORPHANS" -eq 1 ]]; then
+    mapfile -t pkgs_to_remove < <(detect_orphans)
+elif [[ -n "$PKG_NAME" ]]; then
+    pkgs_to_remove=("$PKG_NAME")
+else
+    short_fail "No target specified. Use --pkg, --all, or --orphans."
+    exit 1
+fi
+
+if ((${#pkgs_to_remove[@]} == 0)); then
+    short_info "No packages matched criteria."
+    exit 0
+fi
+
+headline "Starting uninstall for ${#pkgs_to_remove[@]} package(s)"
+for pkg in "${pkgs_to_remove[@]}"; do
+    uninstall_pkg "$pkg" || {
+        short_warn "Uninstall encountered issues for $pkg (see $LOG_ERR)"
+        [[ "$FORCE" -eq 0 ]] && exit 1
+    }
+done
+
+short_ok "All uninstalls completed."
+exit 0
