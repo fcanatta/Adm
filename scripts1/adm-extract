@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+# ================================================================
+# adm-extract
+# Extrai pacotes baixados em /usr/src/adm/src into build/<pkg>/...
+# - aplica patches automaticamente
+# - executa hooks (pre/post)
+# - backups do código original em build/<pkg>/.orig
+# - logs por-pacote: logs/<pkg>.extract.out and .err
+# - comportamento idempotente e robusto (no silent-failures)
+# Usage: adm-extract <pkg|all> [--keep-build] [--dry-run]
+# ================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------
+# CONFIG
+# ------------------------
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+CFG_DIR="$ADM_ROOT/cfg"
+SRC_DIR="$ADM_ROOT/src"
+BUILD_DIR="$ADM_ROOT/build"
+PATCH_DIR="$ADM_ROOT/patches"
+LOG_DIR="$ADM_ROOT/logs"
+HOOK_DIR="$ADM_ROOT/hooks"
+TMP_DIR="${TMP_DIR:-$ADM_ROOT/tmp}"
+
+SOURCES_LIST="${SOURCES_LIST:-$CFG_DIR/sources.list}"
+DELIM="${DELIM:-|}"
+
+mkdir -p "$SRC_DIR" "$BUILD_DIR" "$PATCH_DIR" "$LOG_DIR" "$HOOK_DIR/pre/extract" "$HOOK_DIR/post/extract" "$TMP_DIR"
+
+# ------------------------
+# COLORS & OUTPUT
+# ------------------------
+CLR_RESET='\e[0m'
+CLR_MAGENTA='\e[95m'
+CLR_GREEN='\e[92m'
+CLR_CYAN='\e[96m'
+CLR_YELLOW='\e[93m'
+CLR_RED='\e[91m'
+
+timestamp(){ date '+%H:%M:%S'; }
+headline(){ printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$1"; }
+short_ok(){ printf "%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$1"; }
+short_fail(){ printf "%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$1"; }
+short_info(){ printf "%b[%s]%b %s\n" "$CLR_GREEN" "$(timestamp)" "$CLR_RESET" "$1"; }
+
+# spinner
+__frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+__spinner_pid=""
+start_spinner(){
+    local msg="${1:-Working...}"
+    printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$msg"
+    (
+        local i=0
+        while :; do
+            printf "\r%b %s %b" "$CLR_GREEN" "${__frames[i % ${#__frames[@]}]}" "$CLR_RESET"
+            printf " %s" "$msg"
+            i=$((i+1))
+            sleep 0.12
+        done
+    ) &
+    __spinner_pid=$!
+    disown "$__spinner_pid" 2>/dev/null || true
+}
+
+stop_spinner(){
+    local code=${1:-0}
+    local final_msg="${2:-Concluído.}"
+    if [[ -n "$__spinner_pid" ]]; then
+        kill "$__spinner_pid" >/dev/null 2>&1 || true
+        wait "$__spinner_pid" 2>/dev/null || true
+        __spinner_pid=""
+    fi
+    if [[ "$code" -eq 0 ]]; then
+        printf "\r%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$final_msg"
+    else
+        printf "\r%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$final_msg"
+    fi
+}
+
+# ------------------------
+# HELPERS
+# ------------------------
+err_exit(){
+    local code=${2:-1}
+    local msg="$1"
+    printf "%b%s%b %bERROR:%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$msg"
+    exit "$code"
+}
+
+safe_rm_dir(){
+    local d="$1"
+    [[ -z "$d" ]] && return 0
+    # avoid accidental deletion of root-like paths
+    case "$d" in
+        "/"|"/usr"|"/usr/"|"/usr/src"|"") printf "%b%s%b %bERROR:%b unsafe rm prevented: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$d"; return 1 ;;
+    esac
+    rm -rf "$d" || true
+}
+
+# parse sources.list
+declare -A SRC_VERSION SRC_URL SRC_SHA SRC_DEPS SRC_TYPE
+
+load_sources_list(){
+    if [[ ! -f "$SOURCES_LIST" ]]; then
+        err_exit "sources.list not found: $SOURCES_LIST"
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        line="${line//$'\xef\xbb\xbf'/}"
+        [[ -z "${line//[[:space:]]/}" ]] && continue
+        [[ "${line##[[:space:]]#}" != "$line" ]] && continue
+        IFS="$DELIM" read -r pkg ver url sha deps typ <<<"$line" || continue
+        pkg="${pkg//[[:space:]]/}"
+        [[ -z "$pkg" ]] && continue
+        SRC_VERSION["$pkg"]="${ver:-}"
+        SRC_URL["$pkg"]="${url:-}"
+        SRC_SHA["$pkg"]="${sha:-}"
+        SRC_DEPS["$pkg"]="${deps:-}"
+        SRC_TYPE["$pkg"]="${typ:-}"
+    done < "$SOURCES_LIST"
+}
+
+# determine archive type
+detect_archive_type(){
+    local file="$1"
+    # use file(1) when available
+    if command -v file >/dev/null 2>&1; then
+        local ftype
+        ftype=$(file -b --mime-type "$file" 2>/dev/null || echo "")
+        case "$ftype" in
+            application/x-gzip) echo "tar.gz"; return ;;
+            application/x-xz) echo "tar.xz"; return ;;
+            application/x-bzip2) echo "tar.bz2"; return ;;
+            application/zip) echo "zip"; return ;;
+            application/zstd) echo "tar.zst"; return ;;
+        esac
+    fi
+    # fallback by filename
+    case "$file" in
+        *.tar.gz|*.tgz) echo "tar.gz" ;;
+        *.tar.xz|*.txz) echo "tar.xz" ;;
+        *.tar.bz2|*.tbz2) echo "tar.bz2" ;;
+        *.tar.zst|*.tzst|*.zst) echo "tar.zst" ;;
+        *.zip) echo "zip" ;;
+        *.git.tar.gz|*.git.tgz) echo "git-tar" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+# safe extraction to target dir
+extract_archive(){
+    local archive="$1"
+    local destdir="$2"
+    local pkg="$3"
+    local pkglog="$4"
+
+    mkdir -p "$destdir"
+    # ensure destdir empty (should be ensured earlier unless --keep-build)
+    # choose method based on type
+    local atype
+    atype=$(detect_archive_type "$archive")
+    case "$atype" in
+        tar.gz|tar.xz|tar.bz2|tar.zst)
+            # use tar auto-detect where possible; for zst may need tar with zstd support or zstdcat
+            if tar --version >/dev/null 2>&1; then
+                # use --warning=no-unknown-keyword to reduce noise on older tar?
+                if [[ "$atype" == "tar.zst" ]]; then
+                    if tar --use-compress-program=unzstd -xf "$archive" -C "$destdir" >>"$pkglog" 2>&1; then
+                        return 0
+                    elif command -v zstdcat >/dev/null 2>&1; then
+                        zstdcat "$archive" | tar -xf - -C "$destdir" >>"$pkglog" 2>&1 || return 1
+                    else
+                        printf "%b%s%b %bERROR:%b cannot extract zst, install tar with zstd support or zstdcat\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" >>"$pkglog"
+                        return 1
+                    fi
+                else
+                    if tar -xf "$archive" -C "$destdir" >>"$pkglog" 2>&1; then
+                        return 0
+                    else
+                        return 1
+                    fi
+                fi
+            else
+                printf "%b%s%b %bERROR:%b tar not available to extract %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$archive" >>"$pkglog"
+                return 1
+            fi
+            ;;
+        zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -q "$archive" -d "$destdir" >>"$pkglog" 2>&1 || return 1
+                return 0
+            else
+                printf "%b%s%b %bERROR:%b unzip not available to extract %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$archive" >>"$pkglog"
+                return 1
+            fi
+            ;;
+        git-tar)
+            # already a tarball created from git clone
+            if tar -xf "$archive" -C "$destdir" >>"$pkglog" 2>&1; then
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        *)
+            printf "%b%s%b %bERROR:%b Unknown archive type for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$archive" >>"$pkglog"
+            return 1
+            ;;
+    esac
+}
+
+# apply patches for pkg
+apply_patches(){
+    local pkg="$1"
+    local builddir="$2"
+    local pkglog="$3"
+    local patchdir="$PATCH_DIR/$pkg"
+    local applied_file="$builddir/.applied_patches"
+    touch "$applied_file"
+    if [[ ! -d "$patchdir" ]]; then
+        printf "%b%s%b %b=>%b No patches directory for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$pkg" >>"$pkglog"
+        return 0
+    fi
+
+    # find patches ordered
+    local pats=()
+    while IFS= read -r -d $'\0' f; do pats+=("$f"); done < <(find "$patchdir" -maxdepth 1 -type f -name '*.patch' -print0 | sort -z)
+
+    if ((${#pats[@]} == 0)); then
+        printf "%b%s%b %b=>%b No patch files for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$pkg" >>"$pkglog"
+        return 0
+    fi
+
+    printf "%b%s%b %b=>%b Applying %d patches for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "${#pats[@]}" "$pkg" >>"$pkglog"
+    for p in "${pats[@]}"; do
+        local pname
+        pname=$(basename "$p")
+        # skip if already applied (recorded in .applied_patches)
+        if grep -qxF "$pname" "$applied_file" 2>/dev/null; then
+            printf "%b%s%b %b=>%b Patch already applied: %s (skipping)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$pname" >>"$pkglog"
+            continue
+        fi
+
+        # do a dry-run first to detect failure possibility
+        pushd "$builddir" >/dev/null || return 1
+        if patch --dry-run -p1 < "$p" >>"$pkglog" 2>&1; then
+            # create backup snapshot once before first patch (only if not exists)
+            if [[ ! -d "$builddir/.orig" ]]; then
+                mkdir -p "$builddir/.orig"
+                # copy current files (rsync if available to preserve metadata)
+                if command -v rsync >/dev/null 2>&1; then
+                    rsync -a --delete . "$builddir/.orig/" >>"$pkglog" 2>&1 || true
+                else
+                    tar -C "$builddir" -czf "$builddir/.orig/backup.tar.gz" . >>"$pkglog" 2>&1 || true
+                fi
+                printf "%b%s%b %b=>%b Backup snapshot created at %s/.orig\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$builddir" >>"$pkglog"
+            fi
+
+            # apply patch for real
+            if patch -p1 < "$p" >>"$pkglog" 2>&1; then
+                echo "$pname" >> "$applied_file"
+                printf "%b%s%b %b=>%b Applied: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_GREEN" "$CLR_RESET" "$pname" >>"$pkglog"
+            else
+                printf "%b%s%b %bERROR:%b Patch apply failed for %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pname" "$pkglog" >>"$pkglog"
+                popd >/dev/null || true
+                return 1
+            fi
+        else
+            printf "%b%s%b %bERROR:%b Patch dry-run failed for %s (not applying)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pname" >>"$pkglog"
+            popd >/dev/null || true
+            return 1
+        fi
+        popd >/dev/null || true
+    done
+
+    return 0
+}
+
+# run hooks (reuse structure similar to fetch)
+run_hooks_local(){
+    local phase="$1" area="$2" pkg="${3:-}" log="$4"
+    local hook_base
+    hook_base="$HOOK_DIR/$phase/$area"
+    if [[ -d "$hook_base" ]]; then
+        for h in "$hook_base"/*; do
+            [[ -x "$h" ]] || continue
+            printf "%b%s%b %b=>%b Running hook: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$h" >>"$log"
+            if ! "$h" "$ADM_ROOT" "$pkg" >>"$log" 2>&1; then
+                printf "%b%s%b %bWARNING:%b Hook failed: %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$h" "$log" >>"$log"
+                return 1
+            fi
+        done
+    fi
+    if [[ -n "$pkg" ]]; then
+        hook_base="$HOOK_DIR/$phase/$pkg"
+        if [[ -d "$hook_base" ]]; then
+            for h in "$hook_base"/*; do
+                [[ -x "$h" ]] || continue
+                printf "%b%s%b %b=>%b Running hook: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$h" >>"$log"
+                if ! "$h" "$ADM_ROOT" "$pkg" >>"$log" 2>&1; then
+                    printf "%b%s%b %bWARNING:%b Hook failed: %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$h" "$log" >>"$log"
+                    return 1
+                fi
+            done
+        fi
+    fi
+    return 0
+}
+
+# ------------------------
+# MAIN per-package extraction
+# ------------------------
+extract_package(){
+    local pkg="$1"
+    local keep_build="${2:-0}"
+    local dryrun="${3:-0}"
+    local url="${SRC_URL[$pkg]:-}"
+    local ver="${SRC_VERSION[$pkg]:-}"
+    local filename="$(basename "${url%%#*}")"
+    local archive_path="$SRC_DIR/$filename"
+    local pkglog="$LOG_DIR/${pkg}.extract.out"
+    local pkgeerr="$LOG_DIR/${pkg}.extract.err"
+    : >"$pkglog"
+    : >"$pkgeerr"
+
+    if [[ -z "$url" ]]; then
+        printf "%b%s%b %bERROR:%b No URL for package %s in %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pkg" "$SOURCES_LIST" | tee -a "$pkgeerr"
+        return 1
+    fi
+
+    # if archive is git tar or named differently, try to find best match
+    if [[ ! -f "$archive_path" ]]; then
+        # attempt to find file starting with pkg name or version
+        archive_path=""
+        shopt -s nullglob
+        for f in "$SRC_DIR/${pkg}"* "$SRC_DIR/*${ver}*" "$SRC_DIR/*${pkg}*"; do
+            if [[ -f "$f" ]]; then
+                archive_path="$f"
+                break
+            fi
+        done
+        shopt -u nullglob
+        if [[ -z "$archive_path" ]]; then
+            printf "%b%s%b %bERROR:%b Archive not found for %s (expected %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pkg" "$filename" | tee -a "$pkgeerr"
+            return 1
+        fi
+    fi
+
+    # Ensure archive readability
+    if [[ ! -r "$archive_path" ]]; then
+        printf "%b%s%b %bERROR:%b Archive not readable: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$archive_path" | tee -a "$pkgeerr"
+        return 1
+    fi
+
+    # Build dir
+    local bdir="$BUILD_DIR/${pkg}"
+    if [[ "$keep_build" -ne 1 ]]; then
+        # remove previous build dir to ensure clean state
+        if [[ -d "$bdir" ]]; then
+            safe_rm_dir "$bdir" || { printf "%b%s%b %bERROR:%b Unable to remove build dir %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$bdir" | tee -a "$pkgeerr"; return 1; }
+        fi
+    fi
+    mkdir -p "$bdir"
+
+    # run pre-extract hooks
+    if ! run_hooks_local pre extract "$pkg" "$pkglog"; then
+        printf "%b%s%b %bWARNING:%b pre-extract hooks returned non-zero for %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$pkg" "$pkglog" >>"$pkglog"
+        # continue; hooks can be advisory
+    fi
+
+    # extract
+    start_spinner "Extracting $pkg -> $bdir"
+    if [[ "$dryrun" -eq 1 ]]; then
+        stop_spinner 0 "Dry-run: extraction not performed"
+        printf "%b%s%b %b=>%b Dry-run mode; no files extracted for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$pkg" >>"$pkglog"
+        return 0
+    fi
+
+    if ! extract_archive "$archive_path" "$bdir" "$pkg" "$pkglog"; then
+        stop_spinner 1 "Extraction failed for $pkg"
+        printf "%b%s%b %bERROR:%b Extraction failed for %s. See %s and %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pkg" "$pkglog" "$pkgeerr" | tee -a "$pkgeerr"
+        return 1
+    fi
+    stop_spinner 0 "Extraction complete"
+
+    # apply patches if any
+    start_spinner "Applying patches (if any) for $pkg"
+    if ! apply_patches "$pkg" "$bdir" "$pkglog"; then
+        stop_spinner 1 "Patch application failed"
+        printf "%b%s%b %bERROR:%b Patch application failed for %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$pkg" "$pkglog" | tee -a "$pkgeerr"
+        return 1
+    fi
+    stop_spinner 0 "Patches applied (or none)"
+
+    # run post-extract hooks
+    if ! run_hooks_local post extract "$pkg" "$pkglog"; then
+        printf "%b%s%b %bWARNING:%b post-extract hooks returned non-zero for %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$pkg" "$pkglog" >>"$pkglog"
+        # continue
+    fi
+
+    # create a small manifest for extracted tree
+    pushd "$bdir" >/dev/null 2>&1 || true
+    find . -type f -print0 | xargs -0 sha256sum 2>/dev/null > "$bdir/.extracted_manifest" || true
+    popd >/dev/null 2>&1 || true
+
+    printf "%b%s%b %b=>%b Extracted and prepared %s (build dir: %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$pkg" "$bdir" >>"$pkglog"
+    short_ok "Extracted: $pkg -> $bdir"
+
+    return 0
+}
+
+# ------------------------
+# CLI / main loop
+# ------------------------
+usage(){
+    cat <<EOF
+Usage: $(basename "$0") <pkg|all> [--keep-build] [--dry-run]
+Options:
+  --keep-build    if set, preserve existing build/<pkg> directory (do not rm)
+  --dry-run       perform checks but do not extract nor apply patches
+EOF
+    exit 1
+}
+
+if [[ $# -lt 1 ]]; then usage; fi
+
+ARG="$1"; shift || true
+KEEP_BUILD=0
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --keep-build) KEEP_BUILD=1 ;;
+        --dry-run) DRY_RUN=1 ;;
+        -h|--help) usage ;;
+        *) usage ;;
+    esac
+    shift
+done
+
+load_sources_list
+
+if [[ "$ARG" == "all" ]]; then
+    pkgs=("${!SRC_URL[@]}")
+else
+    if [[ -z "${SRC_URL[$ARG]:-}" ]]; then
+        err_exit "Package not found in sources.list: $ARG"
+    fi
+    pkgs=("$ARG")
+fi
+
+overall_fail=0
+total=${#pkgs[@]}
+i=1
+for pkg in "${pkgs[@]}"; do
+    headline "[$i/$total] Extracting $pkg"
+    i=$((i+1))
+    if ! extract_package "$pkg" "$KEEP_BUILD" "$DRY_RUN"; then
+        overall_fail=1
+        short_fail "Failed: $pkg (check logs $LOG_DIR/${pkg}.extract.err or .out)"
+        # continue to next package
+    fi
+done
+
+if [[ "$overall_fail" -ne 0 ]]; then
+    printf "%b%s%b %bERROR:%b Some extractions failed. Check logs in %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$LOG_DIR"
+    exit 1
+else
+    printf "%b%s%b %b=>%b All extractions completed successfully\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET"
+    exit 0
+fi
