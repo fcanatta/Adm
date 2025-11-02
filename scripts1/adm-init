@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# ================================================================
+#  adm-init
+#  Inicializa e valida o ambiente de build do sistema ADM LFS/BLFS
+#  Autor: Fernando Canata (Gerado por GPT-5)
+# ================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -------------------------
+# CONFIGURAÇÕES GERAIS
+# -------------------------
+ADM_ROOT="/usr/src/adm"
+CFG_DIR="$ADM_ROOT/cfg"
+SRC_DIR="$ADM_ROOT/src"
+PATCH_DIR="$ADM_ROOT/patches"
+CACHE_DIR="$ADM_ROOT/cache"
+BUILD_DIR="$ADM_ROOT/build"
+ROOTFS_DIR="$ADM_ROOT/rootfs"
+PKG_DIR="$ADM_ROOT/packages"
+LOG_DIR="$ADM_ROOT/logs"
+HOOK_DIR="$ADM_ROOT/hooks"
+TMP_DIR="$ADM_ROOT/tmp"
+PROFILE_DIR="$CFG_DIR/profiles"
+UPDATE_DIR="$CFG_DIR/updates"
+
+LOG_FILE="$LOG_DIR/adm-init.log"
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+# -------------------------
+# CORES E SPINNER
+# -------------------------
+CLR_RESET='\e[0m'
+CLR_MAGENTA='\e[95m'
+CLR_GREEN='\e[92m'
+CLR_CYAN='\e[96m'
+CLR_YELLOW='\e[93m'
+CLR_RED='\e[91m'
+
+spinner_pid=""
+
+start_spinner() {
+    local message="$1"
+    local spin_chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    local i=0
+    printf "%b%s%b" "$CLR_CYAN" "$(date +'%H:%M:%S')" "$CLR_RESET"
+    printf " %b%s%b\n" "$CLR_MAGENTA" "=> $message" "$CLR_RESET"
+    (
+        while :; do
+            printf "\r%b[%s]%b %s" "$CLR_GREEN" "${spin_chars:i++%${#spin_chars}:1}" "$CLR_RESET" "$message"
+            sleep 0.1
+        done
+    ) &
+    spinner_pid=$!
+}
+
+stop_spinner() {
+    local status=$1
+    if [[ -n "$spinner_pid" ]]; then
+        kill "$spinner_pid" &>/dev/null || true
+        wait "$spinner_pid" 2>/dev/null || true
+        spinner_pid=""
+    fi
+    if [[ "$status" -eq 0 ]]; then
+        printf "\r%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "Concluído."
+    else
+        printf "\r%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "Falhou."
+    fi
+}
+
+timestamp() { date '+%H:%M:%S'; }
+
+# -------------------------
+# FUNÇÕES DE UTILIDADE
+# -------------------------
+log_info()   { printf "%b%s%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$1"; }
+log_warn()   { printf "%b%s%b %b!%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$1"; }
+log_error()  { printf "%b%s%b %bERROR:%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$1"; }
+
+check_dependencies() {
+    local missing=()
+    local deps=(bash tar xz gzip curl wget git rsync make awk sed grep)
+    for d in "${deps[@]}"; do
+        command -v "$d" >/dev/null 2>&1 || missing+=("$d")
+    done
+    if ((${#missing[@]})); then
+        log_error "Dependências ausentes: ${missing[*]}"
+        exit 1
+    fi
+}
+
+create_structure() {
+    start_spinner "Criando estrutura de diretórios..."
+    mkdir -p \
+        "$CFG_DIR" "$SRC_DIR" "$PATCH_DIR" "$CACHE_DIR" "$BUILD_DIR" \
+        "$ROOTFS_DIR" "$PKG_DIR" "$LOG_DIR" "$HOOK_DIR/pre" "$HOOK_DIR/post" \
+        "$TMP_DIR" "$PROFILE_DIR" "$UPDATE_DIR"
+    sleep 1
+    stop_spinner 0
+}
+
+generate_build_conf() {
+    if [[ ! -f "$CFG_DIR/build.conf" ]]; then
+        cat > "$CFG_DIR/build.conf" <<EOF
+# ===================================================
+#  ADM BUILD CONFIGURATION
+# ===================================================
+ADM_ROOT="$ADM_ROOT"
+PROFILE="standard"
+JOBS=$(nproc)
+DELIM="|"
+SOURCES_LIST_FILE="$CFG_DIR/sources.list"
+CACHE_TTL_DAYS=90
+TARGET_ARCH="$(uname -m)"
+INIT_SYSTEM="systemd"
+PACKAGE_FORMAT="tar.xz"
+EOF
+        log_info "Arquivo criado: $CFG_DIR/build.conf"
+    else
+        log_info "Arquivo existente: $CFG_DIR/build.conf"
+    fi
+}
+
+generate_sources_list() {
+    if [[ ! -f "$CFG_DIR/sources.list" ]]; then
+        cat > "$CFG_DIR/sources.list" <<EOF
+# pkg_id | version | url | sha256 | build-deps | type
+# Exemplo:
+# bash | 5.2.32 | https://ftp.gnu.org/gnu/bash/bash-5.2.32.tar.gz | <sha256> | - | core
+EOF
+        log_info "Arquivo criado: $CFG_DIR/sources.list"
+    else
+        log_info "Arquivo existente: $CFG_DIR/sources.list"
+    fi
+}
+
+generate_profiles() {
+    start_spinner "Gerando perfis de otimização..."
+    cat > "$PROFILE_DIR/standard.conf" <<'EOF'
+CFLAGS="-O2 -g"
+CXXFLAGS="-O2 -g"
+LDFLAGS=""
+STRIP="no"
+EOF
+
+    cat > "$PROFILE_DIR/conservative.conf" <<'EOF'
+CFLAGS="-O2 -pipe -fstack-protector-strong"
+CXXFLAGS="-O2 -pipe -fstack-protector-strong"
+LDFLAGS="-Wl,-O1"
+STRIP="partial"
+EOF
+
+    cat > "$PROFILE_DIR/aggressive.conf" <<'EOF'
+CFLAGS="-O3 -march=native -flto -fuse-linker-plugin"
+CXXFLAGS="-O3 -march=native -flto -fuse-linker-plugin"
+LDFLAGS="-flto"
+STRIP="yes"
+EOF
+    sleep 1
+    stop_spinner 0
+}
+
+generate_hooks() {
+    start_spinner "Gerando hooks padrão..."
+    cat > "$HOOK_DIR/pre/00-global.sh" <<'EOF'
+#!/usr/bin/env bash
+# Hook global pré-etapas
+echo "(hook) Global pre-hook executado"
+EOF
+    chmod +x "$HOOK_DIR/pre/00-global.sh"
+
+    cat > "$HOOK_DIR/post/00-global.sh" <<'EOF'
+#!/usr/bin/env bash
+# Hook global pós-etapas
+echo "(hook) Global post-hook executado"
+EOF
+    chmod +x "$HOOK_DIR/post/00-global.sh"
+    sleep 1
+    stop_spinner 0
+}
+
+validate_structure() {
+    start_spinner "Validando estrutura e permissões..."
+    local required=("$CFG_DIR" "$SRC_DIR" "$BUILD_DIR" "$ROOTFS_DIR" "$PKG_DIR" "$LOG_DIR")
+    for d in "${required[@]}"; do
+        [[ -d "$d" ]] || { log_error "Diretório ausente: $d"; exit 1; }
+        [[ -w "$d" ]] || { log_error "Sem permissão de escrita: $d"; exit 1; }
+    done
+    sleep 1
+    stop_spinner 0
+}
+
+show_summary() {
+    echo
+    echo -e "${CLR_MAGENTA}================ ADM INIT SUMMARY ================${CLR_RESET}"
+    echo -e "${CLR_GREEN}Raiz:${CLR_RESET}       $ADM_ROOT"
+    echo -e "${CLR_GREEN}Perfil:${CLR_RESET}     $(grep '^PROFILE' $CFG_DIR/build.conf | cut -d'=' -f2 | tr -d '\"')"
+    echo -e "${CLR_GREEN}CPU:${CLR_RESET}        $(nproc) núcleos"
+    echo -e "${CLR_GREEN}Arquitetura:${CLR_RESET} $(uname -m)"
+    echo -e "${CLR_GREEN}Configuração:${CLR_RESET} $CFG_DIR/build.conf"
+    echo -e "${CLR_MAGENTA}=================================================${CLR_RESET}"
+    echo
+}
+
+main() {
+    log_info "Iniciando adm-init..."
+    check_dependencies
+    create_structure
+    generate_build_conf
+    generate_sources_list
+    generate_profiles
+    generate_hooks
+    validate_structure
+    show_summary
+    log_info "adm-init concluído com sucesso."
+}
+
+main "$@"
