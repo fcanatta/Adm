@@ -1,0 +1,805 @@
+#!/usr/bin/env bash
+# ================================================================
+# adm-build v1.0 - Parte 1/3
+# Sistema de build universal para o framework ADM
+# Suporte a múltiplos compiladores, linguagens e perfis de otimização.
+# ================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+BUILD_DIR="$ADM_ROOT/build"
+SRC_DIR="$ADM_ROOT/src"
+LOG_DIR="$ADM_ROOT/logs"
+PKG_DIR="$ADM_ROOT/packages"
+PROFILE_DIR="$ADM_ROOT/cfg/profiles"
+HOOK_DIR="$ADM_ROOT/hooks"
+
+mkdir -p "$BUILD_DIR" "$LOG_DIR" "$PKG_DIR" "$PROFILE_DIR" "$HOOK_DIR/pre/build" "$HOOK_DIR/post/build"
+
+# ---------------------------
+# CORES E FORMATACAO
+# ---------------------------
+CLR_RESET='\e[0m'
+CLR_MAGENTA='\e[95m'
+CLR_GREEN='\e[92m'
+CLR_CYAN='\e[96m'
+CLR_YELLOW='\e[93m'
+CLR_RED='\e[91m'
+
+timestamp(){ date '+%H:%M:%S'; }
+
+headline() { printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$1"; }
+short_ok(){ printf "%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$1"; }
+short_fail(){ printf "%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$1"; }
+short_info(){ printf "%b[%s]%b %s\n" "$CLR_GREEN" "$(timestamp)" "$CLR_RESET" "$1"; }
+short_warn(){ printf "%b[!]%b %s\n" "$CLR_YELLOW" "$CLR_RESET" "$1"; }
+
+# ---------------------------
+# SPINNER
+# ---------------------------
+__frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+__sp_pid=""
+start_spinner(){
+    local msg="${1:-Trabalhando...}"
+    printf "%b%s%b %b=>%b %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$msg"
+    (
+        i=0
+        while :; do
+            printf "\r%b %s %b %s" "$CLR_GREEN" "${__frames[i % ${#__frames[@]}]}" "$CLR_RESET" "$msg"
+            i=$((i+1))
+            sleep 0.12
+        done
+    ) &
+    __sp_pid=$!
+}
+stop_spinner(){
+    local code=${1:-0} msg="${2:-Concluído}"
+    if [[ -n "$__sp_pid" ]]; then
+        kill "$__sp_pid" >/dev/null 2>&1 || true
+        wait "$__sp_pid" 2>/dev/null || true
+        __sp_pid=""
+    fi
+    if [[ "$code" -eq 0 ]]; then
+        printf "\r%b[✔]%b %s\n" "$CLR_GREEN" "$CLR_RESET" "$msg"
+    else
+        printf "\r%b[✖]%b %s\n" "$CLR_RED" "$CLR_RESET" "$msg"
+    fi
+}
+
+# ---------------------------
+# LOGGING
+# ---------------------------
+PKG="$1"
+LOG_OUT="$LOG_DIR/${PKG}.build.out"
+LOG_ERR="$LOG_DIR/${PKG}.build.err"
+: >"$LOG_OUT"
+: >"$LOG_ERR"
+
+log() { printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_OUT"; }
+log_err() { printf "%s %s\n" "$(timestamp)" "$*" >>"$LOG_ERR"; }
+
+# ---------------------------
+# PERFIL DE OTIMIZAÇÃO
+# ---------------------------
+PROFILE=${PROFILE:-standard}
+PROFILE_FILE="$PROFILE_DIR/$PROFILE.profile"
+
+if [[ ! -f "$PROFILE_FILE" ]]; then
+    short_warn "Perfil '$PROFILE' não encontrado. Usando padrão."
+    cat >"$PROFILE_FILE" <<'EOF'
+# Perfil padrão (standard)
+export CFLAGS="-O2 -pipe"
+export CXXFLAGS="-O2 -pipe"
+export LDFLAGS=""
+export MAKEFLAGS="-j$(nproc)"
+export RUSTFLAGS="-C opt-level=2"
+export GOFLAGS="-v"
+EOF
+fi
+
+# shellcheck disable=SC1090
+source "$PROFILE_FILE"
+headline "Perfil de otimização: $PROFILE"
+
+# ---------------------------
+# CHECAGEM DE FERRAMENTAS
+# ---------------------------
+check_tool() {
+    local cmd="$1" pkg="$2"
+    if ! command -v "$cmd" &>/dev/null; then
+        short_warn "Ferramenta '$cmd' necessária para $pkg não encontrada."
+        log_err "FERRAMENTA AUSENTE: $cmd"
+        return 1
+    fi
+}
+check_tool gcc "$PKG"
+check_tool make "$PKG"
+check_tool strip "$PKG"
+
+# ---------------------------
+# PREPARAÇÃO DE AMBIENTE
+# ---------------------------
+PKG_SRC_DIR="$SRC_DIR/$PKG"
+PKG_BUILD_DIR="$BUILD_DIR/$PKG"
+PKG_DESTDIR="$PKG_BUILD_DIR/dest"
+
+safe_clean() {
+    rm -rf "$PKG_BUILD_DIR" || true
+    mkdir -p "$PKG_BUILD_DIR" "$PKG_DESTDIR"
+}
+safe_clean
+
+setup_build_env() {
+    export PATH="/usr/local/bin:/usr/bin:/bin"
+    export PKG_CONFIG_PATH="/usr/lib/pkgconfig:/usr/local/lib/pkgconfig"
+    export LD_LIBRARY_PATH="/usr/local/lib:/usr/lib"
+    export CFLAGS CXXFLAGS LDFLAGS MAKEFLAGS RUSTFLAGS GOFLAGS
+}
+setup_build_env
+
+# ---------------------------
+# HOOKS
+# ---------------------------
+apply_hooks() {
+    local stage="$1"
+    local hookdir="$HOOK_DIR/$stage/build"
+    if [[ -d "$hookdir" ]]; then
+        for hook in "$hookdir"/*.sh; do
+            [[ -x "$hook" ]] || continue
+            short_info "Executando hook: $(basename "$hook")"
+            "$hook" "$PKG" >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+                short_warn "Hook falhou: $(basename "$hook")"
+                log_err "Hook $hook falhou"
+            }
+        done
+    fi
+}
+
+# ---------------------------
+# INÍCIO
+# ---------------------------
+headline "Iniciando build de: $PKG"
+apply_hooks pre
+start_spinner "Detectando sistema de build..."
+# ================================================================
+
+# --- safe state helpers (namespaced to avoid conflicts) ---
+adm_build_state_file() { echo "$BUILD_DIR/$PKG/.state"; }
+adm_build_set_state() {
+    local st="$1"
+    mkdir -p "$BUILD_DIR/$PKG"
+    echo "$st" > "$(adm_build_state_file)"
+    # also log to main logs if desired
+    log "STATE -> $st"
+}
+
+# --- helper: run a command capturing stdout/stderr to logs and return status ---
+run_cmd() {
+    # usage: run_cmd "desc" command...
+    local desc="$1"; shift
+    log "CMD: $*"
+    # run command, append stdout to LOG_OUT and stderr to LOG_ERR
+    if "$@" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+        log "OK: $desc"
+        return 0
+    else
+        log_err "FAIL: $desc"
+        # capture tail of log to show brief message to user
+        printf "\n%b%s%b %bERROR:%b %s failed. Últimas linhas do log:\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$desc"
+        tail -n 12 "$LOG_ERR" | sed 's/^/  /'
+        return 1
+    fi
+}
+
+# --- Detect build system by inspecting PKG_SRC_DIR ---
+detect_build_system() {
+    # returns one of: autotools, cmake, meson, make, cargo, go, node, python, maven, gradle, zig, unknown
+    if [[ -f "$PKG_SRC_DIR/configure" || -f "$PKG_SRC_DIR/configure.ac" || -f "$PKG_SRC_DIR/configure.in" ]]; then
+        echo "autotools"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/CMakeLists.txt" ]]; then
+        echo "cmake"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/meson.build" ]]; then
+        echo "meson"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/Cargo.toml" ]]; then
+        echo "cargo"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/go.mod" || $(find "$PKG_SRC_DIR" -maxdepth 2 -name '*.go' | wc -l) -gt 0 ]]; then
+        echo "go"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/package.json" ]]; then
+        echo "node"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/setup.py" || -f "$PKG_SRC_DIR/pyproject.toml" ]]; then
+        echo "python"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/pom.xml" ]]; then
+        echo "maven"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/build.gradle" || -f "$PKG_SRC_DIR/gradlew" ]]; then
+        echo "gradle"; return
+    fi
+    if [[ -f "$PKG_SRC_DIR/build.zig" || -f "$PKG_SRC_DIR/zig-cache" ]]; then
+        echo "zig"; return
+    fi
+    # Makefile fallback
+    if [[ -f "$PKG_SRC_DIR/Makefile" || -f "$PKG_SRC_DIR/GNUmakefile" ]]; then
+        echo "make"; return
+    fi
+    echo "unknown"
+}
+
+# --- prepare a clean build directory and copy/extract source tree there ---
+prepare_build_tree() {
+    # We'll copy sources into build dir to avoid contaminating src
+    rm -rf "$PKG_BUILD_DIR/src" || true
+    mkdir -p "$PKG_BUILD_DIR/src"
+    # prefer if user has already extracted into BUILD_DIR/$PKG (adm-extract), else try SRC_DIR
+    if [[ -d "$BUILD_DIR/$PKG" && -n "$(ls -A "$BUILD_DIR/$PKG" 2>/dev/null)" ]]; then
+        # copy everything except dest and old build dirs
+        rsync -a --exclude=dest --exclude=*.build.* "$BUILD_DIR/$PKG/" "$PKG_BUILD_DIR/src/" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+    elif [[ -d "$PKG_SRC_DIR" ]]; then
+        rsync -a "$PKG_SRC_DIR/" "$PKG_BUILD_DIR/src/" >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+            log_err "Failed copying source tree from $PKG_SRC_DIR"
+            return 1
+        }
+    else
+        log_err "Source tree not found for $PKG (expected $PKG_SRC_DIR)"
+        return 1
+    fi
+    return 0
+}
+
+# --- run tests (best-effort) ---
+run_tests() {
+    local bsystem="$1"
+    local ret=0
+    local test_log="$LOG_DIR/${PKG}.test.out"
+    : >"$test_log"
+    case "$bsystem" in
+        autotools|make)
+            if [[ -f "$PKG_BUILD_DIR/src/Makefile" ]]; then
+                start_spinner "Running 'make check' for $PKG"
+                if make -C "$PKG_BUILD_DIR/src" check >>"$test_log" 2>&1; then
+                    stop_spinner 0 "Tests passed"
+                else
+                    stop_spinner 1 "Tests failed (see $test_log)"
+                    ret=1
+                fi
+            fi
+            ;;
+        cmake)
+            # if build dir exists
+            if [[ -d "$PKG_BUILD_DIR/build" ]]; then
+                start_spinner "Running ctest for $PKG"
+                if ctest --test-dir "$PKG_BUILD_DIR/build" --output-on-failure >>"$test_log" 2>&1; then
+                    stop_spinner 0 "ctest OK"
+                else
+                    stop_spinner 1 "ctest failed"
+                    ret=1
+                fi
+            fi
+            ;;
+        cargo)
+            start_spinner "Running cargo test for $PKG"
+            if (cd "$PKG_BUILD_DIR/src" && cargo test --release >>"$test_log" 2>&1); then
+                stop_spinner 0 "cargo test OK"
+            else
+                stop_spinner 1 "cargo test failed"
+                ret=1
+            fi
+            ;;
+        python)
+            # try pytest if present
+            if command -v pytest >/dev/null 2>&1; then
+                start_spinner "Running pytest for $PKG"
+                if (cd "$PKG_BUILD_DIR/src" && pytest >>"$test_log" 2>&1); then
+                    stop_spinner 0 "pytest OK"
+                else
+                    stop_spinner 1 "pytest failed"
+                    ret=1
+                fi
+            fi
+            ;;
+        go)
+            start_spinner "Running go test for $PKG"
+            if (cd "$PKG_BUILD_DIR/src" && go test ./... >>"$test_log" 2>&1); then
+                stop_spinner 0 "go test OK"
+            else
+                stop_spinner 1 "go test failed"
+                ret=1
+            fi
+            ;;
+        node)
+            if [[ -f "$PKG_BUILD_DIR/src/package.json" ]]; then
+                start_spinner "Running npm test for $PKG"
+                if (cd "$PKG_BUILD_DIR/src" && npm test >>"$test_log" 2>&1); then
+                    stop_spinner 0 "npm test OK"
+                else
+                    stop_spinner 1 "npm test failed"
+                    ret=1
+                fi
+            fi
+            ;;
+        *)
+            # unknown: nothing to run
+            ;;
+    esac
+
+    if [[ $ret -ne 0 ]]; then
+        printf "%b%s%b %bWARNING:%b tests failed for %s (see %s)\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_YELLOW" "$CLR_RESET" "$PKG" "$test_log" >>"$LOG_OUT"
+    else
+        printf "%b%s%b %b=>%b Tests OK for %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$PKG" >>"$LOG_OUT"
+    fi
+    return $ret
+}
+
+# --- internal helpers for install into DESTDIR depending on build system ---
+install_into_destdir() {
+    local bsystem="$1"
+    local dest="$PKG_DESTDIR"
+    case "$bsystem" in
+        autotools)
+            # typical autotools: ./configure && make && make DESTDIR=... install
+            if [[ -f "$PKG_BUILD_DIR/src/configure" ]]; then
+                run_cmd "configure" bash -c "cd '$PKG_BUILD_DIR/src' && ./configure --prefix=/usr" || return 1
+            fi
+            run_cmd "make" bash -c "cd '$PKG_BUILD_DIR/src' && make $MAKEFLAGS" || return 1
+            start_spinner "Installing into dest ($dest)"
+            if bash -c "cd '$PKG_BUILD_DIR/src' && make DESTDIR='$dest' install" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                stop_spinner 0 "Installed into dest"
+            else
+                stop_spinner 1 "Install into dest failed"
+                return 1
+            fi
+            ;;
+        cmake)
+            mkdir -p "$PKG_BUILD_DIR/build"
+            run_cmd "cmake configure" bash -c "cd '$PKG_BUILD_DIR/build' && cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE" || return 1
+            run_cmd "cmake build" bash -c "cd '$PKG_BUILD_DIR/build' && cmake --build . -- -j$(nproc)" || return 1
+            start_spinner "CMake install -> dest"
+            if cmake --install "$PKG_BUILD_DIR/build" --prefix /usr --component . --destdir "$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                stop_spinner 0 "CMake installed to dest"
+            else
+                # fallback: use DESTDIR style using make install
+                if (cd "$PKG_BUILD_DIR/build" && make install DESTDIR="$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                    stop_spinner 0 "Installed to dest via make"
+                else
+                    stop_spinner 1 "Install failed"
+                    return 1
+                fi
+            fi
+            ;;
+        meson)
+            # meson setup/build/install
+            mkdir -p "$PKG_BUILD_DIR/build"
+            run_cmd "meson setup" bash -c "cd '$PKG_BUILD_DIR/src' && meson setup '$PKG_BUILD_DIR/build' --prefix=/usr" || true
+            run_cmd "meson compile" bash -c "cd '$PKG_BUILD_DIR/build' && ninja -j$(nproc)" || return 1
+            start_spinner "Meson install into dest"
+            if ninja -C "$PKG_BUILD_DIR/build" install DESTDIR="$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"; then
+                stop_spinner 0 "Meson installed"
+            else
+                stop_spinner 1 "Meson install failed"
+                return 1
+            fi
+            ;;
+        cargo)
+            # install to a temporary root with --root perhaps
+            start_spinner "cargo install --path . --root $dest"
+            if (cd "$PKG_BUILD_DIR/src" && cargo install --path . --root "$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                stop_spinner 0 "cargo installed to dest"
+            else
+                # as fallback, build and copy binaries
+                if (cd "$PKG_BUILD_DIR/src" && cargo build --release >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                    mkdir -p "$dest/usr/bin"
+                    cp -a "$PKG_BUILD_DIR/src/target/release/"* "$dest/usr/bin/" 2>>"$LOG_ERR" || true
+                    stop_spinner 0 "cargo built and copied to dest"
+                else
+                    stop_spinner 1 "cargo install failed"
+                    return 1
+                fi
+            fi
+            ;;
+        go)
+            start_spinner "go build/install"
+            # build binaries and copy into dest/usr/bin
+            if (cd "$PKG_BUILD_DIR/src" && go build ./... >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                mkdir -p "$dest/usr/bin"
+                # find executables in cwd
+                find "$PKG_BUILD_DIR/src" -maxdepth 1 -type f -perm /111 -exec cp -a {} "$dest/usr/bin/" \; 2>/dev/null || true
+                stop_spinner 0 "go build OK"
+            else
+                stop_spinner 1 "go build failed"
+                return 1
+            fi
+            ;;
+        node)
+            start_spinner "npm install (production) into dest"
+            if (cd "$PKG_BUILD_DIR/src" && npm install --production --prefix "$PKG_BUILD_DIR/src/build_tmp" >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                # move build_tmp to dest/usr/lib/<pkg> or just tar the build result
+                mkdir -p "$dest/usr/lib/$PKG"
+                rsync -a "$PKG_BUILD_DIR/src/build_tmp/" "$dest/usr/lib/$PKG/" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+                stop_spinner 0 "npm installed to dest"
+            else
+                stop_spinner 1 "npm install failed"
+                return 1
+            fi
+            ;;
+        python)
+            start_spinner "python install to dest"
+            if (cd "$PKG_BUILD_DIR/src" && python3 -m pip install --prefix="$PKG_DESTDIR/usr" . >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                stop_spinner 0 "python installed to dest"
+            else
+                stop_spinner 1 "python install failed"
+                return 1
+            fi
+            ;;
+        maven)
+            start_spinner "mvn package"
+            if (cd "$PKG_BUILD_DIR/src" && mvn -DskipTests package >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                # copy artifacts
+                mkdir -p "$dest/usr/share/$PKG"
+                rsync -a "$PKG_BUILD_DIR/src/target/" "$dest/usr/share/$PKG/" >>"$LOG_OUT" 2>>"$LOG_ERR"
+                stop_spinner 0 "maven package OK"
+            else
+                stop_spinner 1 "maven package failed"
+                return 1
+            fi
+            ;;
+        gradle)
+            start_spinner "gradle build"
+            if [[ -f "$PKG_BUILD_DIR/src/gradlew" ]]; then
+                (cd "$PKG_BUILD_DIR/src" && ./gradlew build >>"$LOG_OUT" 2>>"$LOG_ERR") || { stop_spinner 1 "gradle failed"; return 1; }
+            else
+                (cd "$PKG_BUILD_DIR/src" && gradle build >>"$LOG_OUT" 2>>"$LOG_ERR") || { stop_spinner 1 "gradle failed"; return 1; }
+            fi
+            mkdir -p "$dest/usr/share/$PKG"
+            rsync -a "$PKG_BUILD_DIR/src/build/libs/" "$dest/usr/share/$PKG/" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+            stop_spinner 0 "gradle build OK"
+            ;;
+        zig)
+            start_spinner "zig build"
+            if (cd "$PKG_BUILD_DIR/src" && zig build install --prefix /usr --destdir "$dest" >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                stop_spinner 0 "zig build OK"
+            else
+                stop_spinner 1 "zig build failed"
+                return 1
+            fi
+            ;;
+        make)
+            run_cmd "make" bash -c "cd '$PKG_BUILD_DIR/src' && make $MAKEFLAGS" || return 1
+            start_spinner "make install -> dest"
+            if (cd "$PKG_BUILD_DIR/src" && make DESTDIR="$dest" install >>"$LOG_OUT" 2>>"$LOG_ERR"); then
+                stop_spinner 0 "make installed to dest"
+            else
+                stop_spinner 1 "make install failed"
+                return 1
+            fi
+            ;;
+        *)
+            log_err "Unknown build system for $PKG; aborting install step"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# --- strip binaries in DESTDIR ---
+strip_binaries_in_dest() {
+    local dest="$PKG_DESTDIR"
+    if ! command -v strip >/dev/null 2>&1; then
+        short_warn "strip not found; skipping binary stripping"
+        return 0
+    fi
+    start_spinner "Stripping binaries in dest"
+    # find executable files and shared libs
+    find "$dest" -type f \( -perm /111 -o -name '*.so*' -o -name '*.a' \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
+        # do not fail the whole process if strip fails for some file
+        strip --strip-unneeded "$f" >>"$LOG_OUT" 2>>"$LOG_ERR" || true
+    done
+    stop_spinner 0 "Strip complete"
+}
+
+# --- packaging: create .pkg.tar.zst (or .tar.xz fallback) ---
+package_output() {
+    local dest="$PKG_DESTDIR"
+    local version="${VERSION:-unknown}"
+    mkdir -p "$PKG_DIR"
+    local pkgfile="$PKG_DIR/${PKG}-${version}.pkg.tar.zst"
+    if command -v zstd >/dev/null 2>&1; then
+        start_spinner "Creating package (zstd) -> $(basename "$pkgfile")"
+        # create tar streamed to zstd (preserve uid/gid)
+        (cd "$dest" && tar -cf - .) | zstd -19 -T0 -o "$pkgfile" >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+            stop_spinner 1 "Packaging failed"
+            return 1
+        }
+        stop_spinner 0 "Package created: $pkgfile"
+    else
+        # fallback to xz
+        pkgfile="$PKG_DIR/${PKG}-${version}.pkg.tar.xz"
+        start_spinner "Creating package (xz) -> $(basename "$pkgfile")"
+        (cd "$dest" && tar -cJf "$pkgfile" .) >>"$LOG_OUT" 2>>"$LOG_ERR" || {
+            stop_spinner 1 "Packaging failed"
+            return 1
+        }
+        stop_spinner 0 "Package created: $pkgfile"
+    fi
+    # write metadata
+    cat > "$pkgfile.meta" <<EOF
+pkg: $PKG
+version: $version
+created: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+profile: $PROFILE
+EOF
+    printf "%b%s%b %b=>%b Package: %s\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_MAGENTA" "$CLR_RESET" "$pkgfile" >>"$LOG_OUT"
+    return 0
+}
+
+# --- MAIN sequence for building a package ---
+main_build() {
+    # PKG is expected to be present
+    if [[ -z "$PKG" ]]; then
+        short_err "No package specified. Usage: adm-build <pkg>"
+        exit 2
+    fi
+
+    # load optional VERSION from source metadata if available
+    VERSION="$(grep -m1 -Eo '[0-9]+\.[0-9]+(\.[0-9]+)*' <<<"${PKG}" || true)"
+    # prepare tree
+    prepare_build_tree || { adm_build_set_state "FAILED"; exit 1; }
+
+    # detect system
+    local bsys
+    bsys=$(detect_build_system)
+    stop_spinner 0 "Detected build system: $bsys"
+    log "Build system: $bsys"
+
+    adm_build_set_state "BUILDING"
+
+    # run hooks pre-build
+    apply_hooks pre
+
+    # perform install into DESTDIR (configure + build + install)
+    if ! install_into_destdir "$bsys"; then
+        adm_build_set_state "FAILED"
+        short_fail "Build/install failed for $PKG"
+        exit 1
+    fi
+
+    # run tests if configured (best-effort)
+    run_tests "$bsys" || short_warn "Tests failed or not applicable"
+
+    # perform strip
+    strip_binaries_in_dest
+
+    # package result
+    if ! package_output; then
+        adm_build_set_state "FAILED"
+        short_fail "Packaging failed for $PKG"
+        exit 1
+    fi
+
+    # post-build hooks
+    apply_hooks post
+
+    adm_build_set_state "BUILT"
+    short_ok "Build completed for $PKG"
+    return 0
+}
+
+# If script is executed directly, call main_build
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # PKG already read in Part1 as $1
+    main_build
+fi
+
+# ---------------------------
+# TRAPS & TIMING
+# ---------------------------
+START_TS=$(date +%s)
+TMP_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/adm-build.${PKG}.XXXX")"
+cleanup() {
+    # preserve logs but remove temp workdir
+    if [[ -d "$TMP_WORKDIR" ]]; then rm -rf "$TMP_WORKDIR"; fi
+}
+trap 'cleanup' EXIT INT TERM
+
+# ---------------------------
+# CHECK FREE SPACE (basic)
+# ---------------------------
+check_space() {
+    local need_mb=${1:-100}
+    local avail_kb
+    avail_kb=$(df --output=avail -k "$PKG_BUILD_DIR" 2>/dev/null | tail -n1 || echo 0)
+    local avail_mb=$((avail_kb/1024))
+    if [[ "$avail_mb" -lt "$need_mb" ]]; then
+        short_warn "Espaço livre baixo em $(df -h "$PKG_BUILD_DIR" 2>/dev/null | awk 'NR==2{print $4}') — recomendado pelo menos ${need_mb}MB"
+        log_err "LOW SPACE: ${avail_mb}MB available, ${need_mb}MB required"
+    fi
+}
+
+check_space 200
+
+# ---------------------------
+# TOOLCHAIN FALLBACK
+# Try to ensure we have a working compiler toolchain (gcc -> clang -> zig)
+# ---------------------------
+select_compiler() {
+    # prefer gcc if available, else clang, else zig (if package supports)
+    if command -v gcc >/dev/null 2>&1; then
+        CC=gcc
+        CXX=g++
+        COMPILER="gcc"
+    elif command -v clang >/dev/null 2>&1; then
+        CC=clang
+        CXX=clang++
+        COMPILER="clang"
+    else
+        CC=""
+        CXX=""
+        COMPILER="none"
+    fi
+    # zig fallback: when zig available and package uses zig build, handled separately
+    if [[ -z "$CC" && -n "$(command -v zig 2>/dev/null)" ]]; then
+        COMPILER="zig"
+    fi
+    log "Selected compiler: $COMPILER (CC=$CC CXX=$CXX)"
+    export CC CXX
+}
+
+select_compiler
+
+# ---------------------------
+# VERIFY INSTALL: ensure DESTDIR contains something reasonable
+# ---------------------------
+verify_install() {
+    # Check for non-empty destdir
+    if [[ ! -d "$PKG_DESTDIR" ]]; then
+        short_warn "DESTDIR not found: $PKG_DESTDIR"
+        return 1
+    fi
+    local files_count
+    files_count=$(find "$PKG_DESTDIR" -type f 2>/dev/null | wc -l || echo 0)
+    if [[ "$files_count" -eq 0 ]]; then
+        short_warn "No files installed into $PKG_DESTDIR"
+        log_err "VERIFY_INSTALL: no files in destdir"
+        return 1
+    fi
+    # check for typical bin or lib presence
+    local bin_count lib_count
+    bin_count=$(find "$PKG_DESTDIR/usr/bin" -type f 2>/dev/null | wc -l || echo 0)
+    lib_count=$(find "$PKG_DESTDIR/usr/lib" -type f 2>/dev/null | wc -l || echo 0)
+    if (( bin_count + lib_count == 0 )); then
+        # still might be a data-only package (manpages, share)
+        local share_count
+        share_count=$(find "$PKG_DESTDIR/usr/share" -type f 2>/dev/null | wc -l || echo 0)
+        if [[ "$share_count" -eq 0 ]]; then
+            short_warn "Installed files appear empty (no bin/lib/share) in $PKG_DESTDIR"
+            return 2
+        fi
+    fi
+    return 0
+}
+
+# ---------------------------
+# REPORT LAST ERROR SNIPPET
+# ---------------------------
+report_last_error_snippet() {
+    local logfile="$LOG_ERR"
+    if [[ -f "$logfile" ]]; then
+        echo
+        printf "%b%s%b %b=>%b Últimas linhas de erro ( %s ):\n" "$CLR_CYAN" "$(timestamp)" "$CLR_RESET" "$CLR_RED" "$CLR_RESET" "$logfile"
+        tail -n 30 "$logfile" | sed 's/^/  /'
+        echo
+    fi
+}
+
+# ---------------------------
+# POST-BUILD QA: optional quick checks
+# ---------------------------
+post_build_checks() {
+    # check for unresolved symlinks in dest
+    local broken
+    broken=$(find "$PKG_DESTDIR" -xtype l 2>/dev/null | wc -l || echo 0)
+    if [[ "$broken" -gt 0 ]]; then
+        short_warn "Found $broken broken symlinks in package dest"
+        log_err "BROKEN_SYMLINKS: $broken"
+    fi
+
+    # run ldd on binaries to see missing libs (best-effort)
+    if command -v ldd >/dev/null 2>&1; then
+        local misscount=0
+        while IFS= read -r bin; do
+            if ldd "$bin" 2>&1 | grep -q "not found"; then
+                misscount=$((misscount+1))
+                log_err "MISSING_LIB: $bin -> $(ldd "$bin" 2>&1 | grep 'not found' || true)"
+            fi
+        done < <(find "$PKG_DESTDIR" -type f -perm /111 -print 2>/dev/null || true)
+        if [[ "$misscount" -gt 0 ]]; then
+            short_warn "Found $misscount binaries with missing libraries (see logs)"
+        fi
+    fi
+}
+
+# ---------------------------
+# FINAL RESULT & SUMMARY
+# ---------------------------
+finish_with_status() {
+    local rc=$1
+    local msg="${2:-}"
+    local end_ts=$(date +%s)
+    local elapsed=$((end_ts - START_TS))
+    local el_h=$((elapsed/3600)); local el_m=$(( (elapsed%3600)/60 )); local el_s=$((elapsed%60))
+    local elapsed_str="$(printf '%02d:%02d:%02d' "$el_h" "$el_m" "$el_s")"
+
+    if [[ "$rc" -eq 0 ]]; then
+        adm_build_set_state "BUILT"
+        stop_spinner 0 "${msg:-Build OK for $PKG}"
+        short_ok "Build finished: $PKG (time: $elapsed_str). Package in $PKG_DIR"
+        log "BUILD SUCCESS: $PKG time=$elapsed_str pkgdir=$PKG_DIR"
+        echo "Package: $(ls -1 "$PKG_DIR" | grep "^${PKG}-" | tail -n1 2>/dev/null || echo 'none')"
+        exit 0
+    else
+        adm_build_set_state "FAILED"
+        stop_spinner 1 "${msg:-Build FAILED for $PKG}"
+        short_fail "Build failed: $PKG (time: $elapsed_str). See logs: $LOG_ERR and $LOG_OUT"
+        log "BUILD FAILED: $PKG time=$elapsed_str rc=$rc"
+        report_last_error_snippet
+        exit "$rc"
+    fi
+}
+
+# ---------------------------
+# Build process wrapper (with light retries where appropriate)
+# ---------------------------
+# main_flow already implemented in Part2 main_build(); we'll add wrapper improvements here
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    # sanity re-check
+    if [[ -z "$PKG" ]]; then
+        short_err "No package specified."
+        exit 2
+    fi
+
+    # start spinner is already running from Part1; ensure logs exist
+    : >"$LOG_OUT"
+    : >"$LOG_ERR"
+
+    # attempt main build (already defined as main_build in Part2)
+    build_rc=0
+    # try first run
+    if ! main_build; then
+        build_rc=$?
+        # simple retry for transient failures (like network or flaky build systems)
+        if (( build_rc != 0 )) && (( RETRY_COUNT > 0 )); then
+            short_warn "Retrying build (attempt 2 of $((RETRY_COUNT+1))) due to earlier failure"
+            sleep "$RETRY_DELAY"
+            if ! main_build; then
+                build_rc=$?
+            else
+                build_rc=0
+            fi
+        fi
+    fi
+
+    # after build attempt(s), run post checks if successful or partial
+    if [[ "$build_rc" -eq 0 ]]; then
+        # verify install content
+        if ! verify_install; then
+            # verification returned nonzero; mark warning but still may consider built
+            short_warn "Verification reported potential issues"
+            post_build_checks
+            finish_with_status 0 "Build succeeded with warnings"
+        else
+            post_build_checks
+            finish_with_status 0 "Build OK"
+        fi
+    else
+        # failure: show snippet and exit non-zero
+        report_last_error_snippet
+        finish_with_status "$build_rc" "Build failed"
+    fi
+fi
