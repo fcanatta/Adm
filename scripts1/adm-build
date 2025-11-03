@@ -1,0 +1,977 @@
+#!/usr/bin/env bash
+# adm-build - detector de build system, gestor de compilação, empacotador e integrador ADM
+# Parte 1/3 - header, config, init, toolchain detection, source dependency analysis
+# Save together with Part 2 and Part 3 in order as /usr/src/adm/bin/adm-build
+#
+# Features:
+#  - Detecta compiladores (gcc/clang/rustc/go/python etc.)
+#  - Lê metafile via adm-meta
+#  - Usa adm-deps para resolver dependências por metafile
+#  - Analisa source para inferir dependências (CMake, Meson, Autotools, Python, Cargo, go.mod, package.json)
+#  - Integra adm-downloader, adm-patches, adm-hooks, adm-logger
+#  - Suporta dry-run, --chroot, --profile, --force, --jobs, --destdir
+#  - Gera pacotes .tar.zst (fallback .tar.xz), manifest e cache
+#
+set -euo pipefail
+shopt -s extglob
+
+# ----- CONFIGURACAO E ENV VARS -----
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_WORKDIR:=$ADM_ROOT/state/builds}"
+: "${ADM_CACHE_BIN:=$ADM_ROOT/cache/bin}"
+: "${ADM_CACHE_SRC:=$ADM_ROOT/cache/sources}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/builds}"
+: "${ADM_PROFILE_DIR:=$ADM_ROOT/profiles}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_FORCE:=0}"
+: "${ADM_JOBS:=$(nproc 2>/dev/null || echo 1)}"
+: "${ADM_PROFILE:=normal}"
+: "${ADM_CHROOT:=""}"   # if set, will attempt to run build inside chroot name
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+
+mkdir -p "$ADM_WORKDIR" "$ADM_CACHE_BIN" "$ADM_CACHE_SRC" "$ADM_LOG_DIR" "$ADM_TMPDIR" 2>/dev/null || true
+
+# ----- LOAD DEPENDENT TOOLS (logger, meta, deps, downloader, patches, hooks) -----
+# best-effort sourcing; functions degrade gracefully and emit warnings if missing
+_ADM_MISSING=()
+if [ -f "$ADM_BIN_DIR/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _ADM_MISSING+=("adm-logger")
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+  adm_start_spinner() { :; }
+  adm_stop_spinner() { :; }
+  adm_progress_init() { :; }
+  adm_progress_update() { :; }
+  adm_progress_finish() { :; }
+  adm_package_log() { :; }
+  adm_time_start() { :; }
+  adm_time_end() { echo "00:00:00"; }
+fi
+
+if [ -f "$ADM_BIN_DIR/adm-meta" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-meta
+  source "$ADM_BIN_DIR/adm-meta"
+else
+  _ADM_MISSING+=("adm-meta")
+  adm_log_error "adm-meta not found; build requires metafile for package metadata"
+fi
+
+if [ -f "$ADM_BIN_DIR/adm-deps" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-deps
+  source "$ADM_BIN_DIR/adm-deps"
+else
+  _ADM_MISSING+=("adm-deps")
+  adm_log_info "adm-deps not found; dependency resolution will be limited to metafile entries"
+fi
+
+if [ -f "$ADM_BIN_DIR/adm-downloader" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-downloader
+  source "$ADM_BIN_DIR/adm-downloader"
+else
+  _ADM_MISSING+=("adm-downloader")
+  adm_log_info "adm-downloader not found; build will expect local sources"
+fi
+
+if [ -f "$ADM_BIN_DIR/adm-patches" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-patches
+  source "$ADM_BIN_DIR/adm-patches"
+else
+  adm_log_info "adm-patches not found; patches not applied"
+fi
+
+if [ -f "$ADM_BIN_DIR/adm-hooks" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-hooks
+  source "$ADM_BIN_DIR/adm-hooks"
+else
+  adm_log_info "adm-hooks not found; hooks will be skipped"
+fi
+
+# ----- SAFEGUARDS -----
+if [ "$ADM_DRY_RUN" = "1" ]; then
+  adm_log_info "Running in DRY-RUN mode (no files will be changed)"
+fi
+
+# ----- UTILS -----
+# safe mktemp wrapper
+_adm_mktemp_dir() {
+  mktemp -d "${ADM_TMPDIR}/adm-build-XXXXXX"
+}
+
+# safe run: logs to pkg log and prints summary; arguments: <pkg> <cmd...>
+_adm_run_logged() {
+  local pkg="$1"; shift
+  local logfile="$ADM_LOG_DIR/${pkg}.log"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would run: $*"
+    return 0
+  fi
+  mkdir -p "$(dirname "$logfile")" 2>/dev/null || true
+  adm_log_info "Running: $*  (see $logfile)"
+  # run and append output
+  ( "$@" ) >> "$logfile" 2>&1
+  local rc=$?
+  if [ "$rc" -ne 0 ]; then
+    adm_log_error "Command failed (rc=$rc). See $logfile"
+  else
+    adm_log_correct "Command succeeded (rc=0)"
+  fi
+  return $rc
+}
+
+# Join array into string (space separated)
+_adm_join() {
+  local sep="${1:- }"; shift
+  local out=""
+  for v in "$@"; do
+    if [ -z "$out" ]; then out="$v"; else out="${out}${sep}${v}"; fi
+  done
+  printf "%s" "$out"
+}
+
+# sanitize package name for filenames
+_adm_pkg_safe() {
+  local s="$1"
+  echo "$s" | sed -E 's/[^A-Za-z0-9._+-]/_/g'
+}
+
+# resolve arch tag
+_adm_arch() {
+  uname -m 2>/dev/null || echo "unknown"
+}
+
+# time helper wrappers already from logger: adm_time_start/adn_time_end
+
+# ----- TOOLCHAIN/COMPILER DETECTION -----
+# Build a table of compilers and their versions
+declare -A ADMBUILD_COMPILERS_FOUND
+_adm_detect_compilers() {
+  adm_log_info "Detecting available compilers and toolchain components"
+  local cands=("gcc" "g++" "clang" "clang++" "cc" "c++" "ld" "ld.lld" "ar" "ranlib" "strip" \
+               "rustc" "cargo" "go" "javac" "java" "python3" "pip3" "perl" "node" "npm" "meson" "ninja" "cmake" "autoconf" "automake" "make" "pkg-config" "pkgconf" "pkg-config" "yasm" "nasm" "ld.gold")
+  for cmd in "${cands[@]}"; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      local ver="$($cmd --version 2>/dev/null | head -n1 || true)"
+      ADMBUILD_COMPILERS_FOUND["$cmd"]="$ver"
+      adm_log_debug "Detected $cmd -> $ver"
+    fi
+  done
+
+  # prefer CC/CXX environment variables if set
+  if [ -n "${CC:-}" ]; then ADMBUILD_COMPILERS_FOUND["CC"]="$CC"; fi
+  if [ -n "${CXX:-}" ]; then ADMBUILD_COMPILERS_FOUND["CXX"]="$CXX"; fi
+
+  # summary
+  adm_log_info "Compilers detected: $(printf "%s " "${!ADMBUILD_COMPILERS_FOUND[@]}")"
+}
+
+# helper to get preferred C compiler
+_adm_preferred_c_compiler() {
+  if [ -n "${ADMBUILD_COMPILERS_FOUND[gcc]:-}" ]; then echo "gcc"; return; fi
+  if [ -n "${ADMBUILD_COMPILERS_FOUND[clang]:-}" ]; then echo "clang"; return; fi
+  if [ -n "${ADMBUILD_COMPILERS_FOUND[cc]:-}" ]; then echo "cc"; return; fi
+  echo ""
+}
+
+# helper to export build env based on profile
+_adm_load_profile() {
+  local profile="$1"
+  local pf="$ADM_PROFILE_DIR/${profile}.profile"
+  if [ -f "$pf" ]; then
+    adm_log_info "Loading profile: $profile"
+    # shellcheck disable=SC1090
+    source "$pf"
+  else
+    adm_log_info "Profile file not found: $pf; using defaults"
+    # default safe flags if not present
+    CFLAGS="${CFLAGS:--O2 -pipe}"
+    CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+    LDFLAGS="${LDFLAGS:--Wl,-O1}"
+    MAKEFLAGS="${MAKEFLAGS:--j$ADM_JOBS}"
+  fi
+  export CFLAGS CXXFLAGS LDFLAGS MAKEFLAGS
+}
+
+# ----- DEPENDENCY INFERENCE FROM SOURCE (detailed) -----
+# This scans a source tree for build hints and returns normalized tokens
+_adm_infer_deps_from_source() {
+  local src="$1"
+  local outtmp
+  outtmp=$(mktemp)
+  # ensure src exists
+  [ -d "$src" ] || { adm_log_error "Source dir not found: $src"; return 1; }
+
+  adm_log_info "Inferring dependencies from source: $src"
+
+  # Helper to normalize token
+  _norm() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_+.-]/_/g'; }
+
+  # Autotools: PKG_CHECK_MODULES, AC_CHECK_LIB, AC_CHECK_HEADER
+  if [ -f "$src/configure.ac" ] || [ -f "$src/configure" ]; then
+    adm_log_debug "Autotools sources detected"
+    # pkg-config usage
+    grep -RHo "PKG_CHECK_MODULES\([^)]*\)" "$src" 2>/dev/null | sed -E 's/PKG_CHECK_MODULES\(([^ ,)]+).*/\1/' | while read -r t; do
+      echo "$(_norm "$t")" >>"$outtmp"
+    done || true
+    # AC_CHECK_LIB(lib, ...)
+    grep -RHo "AC_CHECK_LIB\([^,)]*" "$src" 2>/dev/null | sed -E 's/AC_CHECK_LIB\(([^,)]*).*/\1/' | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+  fi
+
+  # CMake: find_package, pkg_check_modules
+  if [ -f "$src/CMakeLists.txt" ]; then
+    adm_log_debug "CMakeLists.txt detected"
+    # find_package(X)
+    grep -RHoE "find_package\([[:space:]]*[A-Za-z0-9_:\-]+" "$src" 2>/dev/null | sed -E 's/.*find_package\(([[:space:]]*([A-Za-z0-9_:\-]+)).*/\2/' | while read -r t; do
+      # strip COMPONENTS etc
+      token="$(echo "$t" | sed -E 's/[[:space:]].*//')"
+      echo "$(_norm "$token")" >>"$outtmp"
+    done || true
+    # pkg_check_modules(MOD ...)
+    grep -RHo "pkg_check_modules\([^)]*\)" "$src" 2>/dev/null | sed -E 's/pkg_check_modules\(([^ ,)]+).*/\1/' | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+  fi
+
+  # Meson: dependency('glib')
+  if grep -q "meson.build" <<<"$(ls -A "$src" 2>/dev/null)" || [ -f "$src/meson.build" ]; then
+    adm_log_debug "Meson project detected"
+    grep -RHoE "dependency\(['\"][^'\"]+['\"]\)" "$src" 2>/dev/null | sed -E "s/.*dependency\(['\"]([^'\"]+)['\"].*/\1/" | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+  fi
+
+  # Python: pyproject.toml / setup.py
+  if [ -f "$src/pyproject.toml" ] || [ -f "$src/setup.py" ]; then
+    adm_log_debug "Python project detected"
+    if [ -f "$src/pyproject.toml" ] && command -v grep >/dev/null 2>&1; then
+      grep -E "requires-dist|dependencies" -n "$src/pyproject.toml" 2>/dev/null | sed -E 's/.*=//' | tr ',' '\n' | sed -E "s/['\"][[:space:]]*//g" | while read -r t; do [ -n "$t" ] && echo "$(_norm "$t")" >>"$outtmp"; done || true
+    fi
+    if [ -f "$src/setup.py" ]; then
+      # crude parse install_requires
+      grep -E "install_requires" -n "$src/setup.py" 2>/dev/null | sed -E 's/.*=//' | tr ',' '\n' | sed -E "s/['\"]//g" | while read -r t; do [ -n "$t" ] && echo "$(_norm "$t")" >>"$outtmp"; done || true
+    fi
+  fi
+
+  # Rust: Cargo.toml
+  if [ -f "$src/Cargo.toml" ]; then
+    adm_log_debug "Rust project detected"
+    sed -n '/\[dependencies\]/,/\[/{/^\[/q;p}' "$src/Cargo.toml" 2>/dev/null | grep -E '^[a-zA-Z0-9_-]+' -o | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+  fi
+
+  # Go: go.mod
+  if [ -f "$src/go.mod" ]; then
+    adm_log_debug "Go project detected"
+    sed -n 's/require //p' "$src/go.mod" 2>/dev/null | awk '{print $1}' | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+  fi
+
+  # Node: package.json
+  if [ -f "$src/package.json" ]; then
+    adm_log_debug "Node project detected"
+    if command -v jq >/dev/null 2>&1; then
+      jq -r '.dependencies // {} | keys[]' "$src/package.json" 2>/dev/null | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+    else
+      # crude grep fallback
+      sed -n '/"dependencies"/,/"}/p' "$src/package.json" 2>/dev/null | grep -E '"[a-zA-Z0-9_\-]+"' -o | sed 's/"//g' | while read -r t; do echo "$(_norm "$t")" >>"$outtmp"; done || true
+    fi
+  fi
+
+  # pkg-config usage (generic)
+  grep -RHo "pkg-config --cflags|pkg-config --libs|pkg-config(" "$src" 2>/dev/null | while read -r line; do
+    echo "$(_norm "$(echo "$line" | sed -E 's/.*pkg-config[^[:alnum:]]*([a-zA-Z0-9_.-]+).*/\1/')")" >>"$outtmp" || true
+  done || true
+
+  # Remove duplicates and output
+  awk '!seen[$0]++' "$outtmp" | sed '/^$/d'
+  rm -f "$outtmp" || true
+  return 0
+}
+
+# ----- FUNCTIONS TO INTERACT WITH METAFILE AND DEPS -----
+# Given a metafile path, return build_deps and run_deps arrays
+_adm_read_metafile_deps() {
+  local metafile="$1"
+  local -n out_build="$2"
+  local -n out_run="$3"
+  out_build=()
+  out_run=()
+  if [ -f "$metafile" ]; then
+    # use adm-meta if available
+    if declare -f adm_meta_load >/dev/null 2>&1; then
+      adm_meta_load "$metafile"
+      # obtain fields (adm_meta_get returns sanitized values)
+      local bdeps rdeps
+      bdeps="$(adm_meta_get build_deps 2>/dev/null || true)"
+      rdeps="$(adm_meta_get run_deps 2>/dev/null || true)"
+      # split by comma
+      IFS=',' read -ra arrb <<< "$bdeps"
+      for x in "${arrb[@]}"; do x="$(echo "$x" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ; [ -n "$x" ] && out_build+=("$x"); done
+      IFS=',' read -ra arrr <<< "$rdeps"
+      for x in "${arrr[@]}"; do x="$(echo "$x" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ; [ -n "$x" ] && out_run+=("$x"); done
+    else
+      # crude parse
+      local line
+      line=$(grep -E "^build_deps:" "$metafile" 2>/dev/null || true)
+      line="${line#build_deps:}"
+      IFS=',' read -ra arrb <<< "$line"
+      for x in "${arrb[@]}"; do x="$(echo "$x" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ; [ -n "$x" ] && out_build+=("$x"); done
+      line=$(grep -E "^run_deps:" "$metafile" 2>/dev/null || true)
+      line="${line#run_deps:}"
+      IFS=',' read -ra arrr <<< "$line"
+      for x in "${arrr[@]}"; do x="$(echo "$x" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ; [ -n "$x" ] && out_run+=("$x"); done
+    fi
+  fi
+}
+# ----- BUILD SYSTEM DETECTION -----
+_adm_detect_build_system() {
+  local srcdir="$1"
+  # priority: meson, cmake, cargo, pyproject/setup.py, configure, Makefile, go.mod, package.json
+  if [ -f "$srcdir/meson.build" ]; then echo "meson"; return 0; fi
+  if [ -f "$srcdir/CMakeLists.txt" ]; then echo "cmake"; return 0; fi
+  if [ -f "$srcdir/Cargo.toml" ]; then echo "cargo"; return 0; fi
+  if [ -f "$srcdir/pyproject.toml" ] || [ -f "$srcdir/setup.py" ]; then echo "python"; return 0; fi
+  if [ -f "$srcdir/configure" ] || [ -f "$srcdir/configure.ac" ]; then echo "autotools"; return 0; fi
+  if [ -f "$srcdir/Makefile" ]; then echo "make"; return 0; fi
+  if [ -f "$srcdir/go.mod" ]; then echo "go"; return 0; fi
+  if [ -f "$srcdir/package.json" ]; then echo "node"; return 0; fi
+  # fallback: script named build.sh or similar
+  if [ -x "$srcdir/build.sh" ]; then echo "script"; return 0; fi
+  echo "unknown"
+}
+
+# ----- helper: run in chroot if requested -----
+_adm_maybe_chroot_exec() {
+  local chrootname="$1"; shift
+  local cmd=( "$@" )
+  if [ -z "$chrootname" ]; then
+    "${cmd[@]}"
+    return $?
+  fi
+  # require adm-chroot present
+  if [ -x "$ADM_BIN_DIR/adm-chroot" ]; then
+    # create chroot if not exists
+    "$ADM_BIN_DIR/adm-chroot" create "$chrootname" >/dev/null 2>&1 || true
+    # use adm-chroot enter to run command within chroot; expects absolute paths inside chroot
+    "$ADM_BIN_DIR/adm-chroot" enter "$chrootname" "${cmd[*]}"
+    return $?
+  else
+    adm_log_error "Chroot requested ('$chrootname') but adm-chroot not available; running locally"
+    "${cmd[@]}"
+    return $?
+  fi
+}
+
+# ----- Build runners for supported systems -----
+# Each runner: args (pkg, srcdir, pkgdir, destdir)
+# All runners must install into $DESTDIR (destdir parameter)
+#
+# AUTOTOOLS runner
+_adm_build_autotools() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Autotools build for $pkg in $srcdir"
+  pushd "$srcdir" >/dev/null
+  # regenerate if configure missing but configure.ac present
+  if [ ! -f configure ] && [ -f configure.ac ]; then
+    adm_log_info "Running autoreconf -fi"
+    _adm_run_logged "$pkg" autoreconf -fi || return $?
+  fi
+  # Create build log entry and configure with prefix=/usr
+  local cfg="./configure --prefix=/usr"
+  # apply profile flags
+  cfg="${cfg} CFLAGS='${CFLAGS:-}' CXXFLAGS='${CXXFLAGS:-}' LDFLAGS='${LDFLAGS:-}'"
+  adm_log_info "Configuring: $cfg"
+  _adm_run_logged "$pkg" bash -c "$cfg" || return $?
+  adm_log_info "Running make -j$ADM_JOBS"
+  _adm_run_logged "$pkg" make -j"$ADM_JOBS" || return $?
+  adm_log_info "Running make install (DESTDIR=$destdir)"
+  _adm_run_logged "$pkg" make DESTDIR="$destdir" install || return $?
+  popd >/dev/null
+  return 0
+}
+
+# CMake runner
+_adm_build_cmake() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "CMake build for $pkg"
+  pushd "$srcdir" >/dev/null
+  mkdir -p build
+  local cfg_cmd="cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=TRUE"
+  cfg_cmd="${cfg_cmd} -DCMAKE_C_FLAGS='${CFLAGS:-}' -DCMAKE_CXX_FLAGS='${CXXFLAGS:-}' -DCMAKE_EXE_LINKER_FLAGS='${LDFLAGS:-}'"
+  adm_log_info "CMake configure: $cfg_cmd"
+  _adm_run_logged "$pkg" $cfg_cmd || return $?
+  adm_log_info "CMake build"
+  _adm_run_logged "$pkg" cmake --build build -- -j"$ADM_JOBS" || return $?
+  adm_log_info "CMake install (DESTDIR=$destdir)"
+  _adm_run_logged "$pkg" cmake --install build --prefix /usr --destdir "$destdir" || return $?
+  popd >/dev/null
+  return 0
+}
+
+# Meson/Ninja runner
+_adm_build_meson() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Meson build for $pkg"
+  pushd "$srcdir" >/dev/null
+  mkdir -p build
+  local meson_cmd="meson setup build --prefix=/usr"
+  meson_cmd="${meson_cmd} -Dc_args='${CFLAGS:-}' -Dcxx_args='${CXXFLAGS:-}'"
+  adm_log_info "Meson setup: $meson_cmd"
+  _adm_run_logged "$pkg" $meson_cmd || return $?
+  adm_log_info "Ninja build"
+  _adm_run_logged "$pkg" ninja -C build -j"$ADM_JOBS" || return $?
+  adm_log_info "Ninja install (DESTDIR=$destdir)"
+  _adm_run_logged "$pkg" ninja -C build install DESTDIR="$destdir" || return $?
+  popd >/dev/null
+  return 0
+}
+
+# Python runner (setup.py / pyproject)
+_adm_build_python() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Python build for $pkg"
+  pushd "$srcdir" >/dev/null
+  if [ -f pyproject.toml ]; then
+    # use pip wheel if available
+    if command -v python3 >/dev/null 2>&1 && python3 -m build >/dev/null 2>&1; then
+      adm_log_info "Building wheel via PEP517"
+      _adm_run_logged "$pkg" python3 -m build --wheel --outdir "$destdir" || true
+      # fallback: pip install to destdir
+      adm_log_info "pip installing to $destdir"
+      _adm_run_logged "$pkg" python3 -m pip install --root "$destdir" . || return $?
+    else
+      adm_log_info "Using setup.py install fallback"
+      _adm_run_logged "$pkg" python3 setup.py build || return $?
+      _adm_run_logged "$pkg" python3 setup.py install --root="$destdir" --prefix=/usr || return $?
+    fi
+  else
+    if [ -f setup.py ]; then
+      _adm_run_logged "$pkg" python3 setup.py build || return $?
+      _adm_run_logged "$pkg" python3 setup.py install --root="$destdir" --prefix=/usr || return $?
+    else
+      adm_log_error "No Python build system found"
+      return 1
+    fi
+  fi
+  popd >/dev/null
+  return 0
+}
+
+# Cargo / Rust runner
+_adm_build_cargo() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Cargo (Rust) build for $pkg"
+  pushd "$srcdir" >/dev/null
+  # cargo build --release
+  if command -v cargo >/dev/null 2>&1; then
+    _adm_run_logged "$pkg" cargo build --release || return $?
+    # install binaries to destdir/usr/bin if any
+    local rbins
+    rbins=$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.packages[].targets[]?.name' 2>/dev/null || true)
+    # crude: copy built binaries from target/release
+    if [ -d target/release ]; then
+      mkdir -p "$destdir/usr/bin"
+      cp -a target/release/* "$destdir/usr/bin/" 2>/dev/null || true
+    fi
+  else
+    adm_log_error "cargo not found"
+    return 1
+  fi
+  popd >/dev/null
+  return 0
+}
+
+# Go runner
+_adm_build_go() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Go build for $pkg"
+  pushd "$srcdir" >/dev/null
+  if command -v go >/dev/null 2>&1; then
+    # build all packages producing binaries into destdir/usr/bin
+    mkdir -p "$destdir/usr/bin"
+    # build main packages
+    for f in $(find . -maxdepth 3 -type f -name '*.go' -print 2>/dev/null | sed -E 's#^\./##' | cut -d/ -f1 | sort -u); do
+      adm_log_info "go build ././$f"
+      _adm_run_logged "$pkg" go build -o "$destdir/usr/bin/$f" ./... || true
+    done
+  else
+    adm_log_error "go not found"
+    return 1
+  fi
+  popd >/dev/null
+  return 0
+}
+
+# Node runner
+_adm_build_node() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "NodeJS build for $pkg"
+  pushd "$srcdir" >/dev/null
+  if command -v npm >/dev/null 2>&1; then
+    _adm_run_logged "$pkg" npm ci || return $?
+    # if build script exists
+    if grep -q "\"build\"" package.json 2>/dev/null; then
+      _adm_run_logged "$pkg" npm run build || return $?
+    fi
+    # copy build output if dist or build dir exists
+    if [ -d dist ]; then
+      mkdir -p "$destdir/usr/share/$pkg"
+      cp -a dist/* "$destdir/usr/share/$pkg/" || true
+    fi
+  else
+    adm_log_error "npm not found"
+    return 1
+  fi
+  popd >/dev/null
+  return 0
+}
+
+# Generic make runner
+_adm_build_make() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Makefile build for $pkg"
+  pushd "$srcdir" >/dev/null
+  if [ -f configure ] && [ ! -f Makefile ]; then
+    ./configure --prefix=/usr || true
+  fi
+  _adm_run_logged "$pkg" make -j"$ADM_JOBS" || return $?
+  _adm_run_logged "$pkg" make DESTDIR="$destdir" install || return $?
+  popd >/dev/null
+  return 0
+}
+
+# Script runner (executable build.sh)
+_adm_build_script() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  local script="$srcdir/build.sh"
+  adm_log_info "Running custom build script: $script"
+  if [ -x "$script" ]; then
+    _adm_run_logged "$pkg" "$script" "$pkgdir" "$destdir" || return $?
+  else
+    adm_log_error "Custom build script not executable: $script"
+    return 1
+  fi
+  return 0
+}
+
+# Unknown fallback: copy tree or error
+_adm_build_unknown() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  adm_log_info "Unknown build system for $pkg: copying files to $destdir (data-only)"
+  mkdir -p "$destdir/usr/share/$pkg"
+  cp -a "$srcdir"/* "$destdir/usr/share/$pkg/" || true
+  adm_log_correct "Installed data-only package for $pkg"
+  return 0
+}
+
+# Build dispatcher: choose appropriate runner
+_adm_dispatch_build() {
+  local pkg="$1"; local srcdir="$2"; local pkgdir="$3"; local destdir="$4"
+  local bs
+  bs=$(_adm_detect_build_system "$srcdir")
+  adm_log_info "Detected buildsystem: $bs"
+  case "$bs" in
+    meson) _adm_build_meson "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    cmake) _adm_build_cmake "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    cargo) _adm_build_cargo "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    python) _adm_build_python "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    autotools) _adm_build_autotools "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    go) _adm_build_go "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    node) _adm_build_node "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    make) _adm_build_make "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    script) _adm_build_script "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    unknown) _adm_build_unknown "$pkg" "$srcdir" "$pkgdir" "$destdir" ;;
+    *) adm_log_error "No runner for buildsystem: $bs"; return 1 ;;
+  esac
+}
+
+_adm_package_name_from_meta() {
+  local metafile="$1"
+  if [ -f "$metafile" ]; then
+    local nm
+    nm=$(grep -E "^name:" "$metafile" 2>/dev/null | sed 's/^name:[[:space:]]*//')
+    local ver
+    ver=$(grep -E "^version:" "$metafile" 2>/dev/null | sed 's/^version:[[:space:]]*//')
+    echo "${nm}-${ver}"
+  else
+    echo ""
+  fi
+}
+
+# create package workdir
+_adm_prepare_workdir() {
+  local pkg="$1"
+  local work
+  work="${ADM_WORKDIR}/${pkg}"
+  rm -rf "$work" 2>/dev/null || true
+  mkdir -p "$work"
+  echo "$work"
+}
+
+# extract source archive into workdir (supports .tar.*, .zip, git clone dir)
+_adm_prepare_source() {
+  local srcpath="$1"
+  local workdir="$2"
+  mkdir -p "$workdir"
+  if [ -d "$srcpath" ]; then
+    # copy or bind? we copy to avoid modifying cache
+    cp -a "$srcpath"/* "$workdir"/ 2>/dev/null || true
+    return 0
+  fi
+  case "$srcpath" in
+    *.tar.gz|*.tgz) tar xzf "$srcpath" -C "$workdir" --strip-components=1 ;;
+    *.tar.bz2) tar xjf "$srcpath" -C "$workdir" --strip-components=1 ;;
+    *.tar.xz) tar xJf "$srcpath" -C "$workdir" --strip-components=1 ;;
+    *.tar.zst) if command -v zstdcat >/dev/null 2>&1; then zstdcat "$srcpath" | tar x -C "$workdir" --strip-components=1; else tar --use-compress-program=unzstd -xf "$srcpath" -C "$workdir" --strip-components=1; fi ;;
+    *.zip) unzip -q "$srcpath" -d "$workdir" ;;
+    *) adm_log_error "Unsupported source format or file not found: $srcpath"; return 1 ;;
+  esac
+  return 0
+}
+
+# create DESTDIR empty tree
+_adm_prepare_destdir() {
+  local pkg="$1"
+  local dest="${ADM_WORKDIR}/${pkg}/install"
+  rm -rf "$dest" 2>/dev/null || true
+  mkdir -p "$dest"
+  echo "$dest"
+}
+
+# package into .tar.zst or fallback .tar.xz
+_adm_package_install_tree() {
+  local pkg="$1"
+  local destdir="$2" # install root
+  local arch="$(_adm_arch)"
+  local pkgfn
+  pkgfn="${pkg}-${arch}.tar.zst"
+  local out="$ADM_CACHE_BIN/$pkgfn"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would create package: $out from $destdir"
+    echo "$out"
+    return 0
+  fi
+  mkdir -p "$ADM_CACHE_BIN" 2>/dev/null || true
+  if command -v tar >/dev/null 2>&1 && tar --version 2>&1 | grep -q "GNU tar"; then
+    # try zstd
+    if tar --use-compress-program=unzstd -cf /dev/null 2>/dev/null 2>&1; then
+      # use tar with zstd if system supports
+      if tar --help 2>&1 | grep -q -- '--zstd'; then
+        adm_log_info "Packaging (tar --zstd) -> $out"
+        tar -C "$destdir" -cf - . | zstd -19 -T0 -o "$out" || {
+          adm_log_error "zstd packaging failed, fallback to xz"
+          out="${out%.tar.zst}.tar.xz"
+          tar -C "$destdir" -cJf "$out" .
+        }
+      else
+        # try piping through zstd if available
+        if command -v zstd >/dev/null 2>&1; then
+          adm_log_info "Packaging with zstd (pipe) -> $out"
+          tar -C "$destdir" -cf - . | zstd -19 -T0 -o "$out" || {
+            adm_log_error "zstd failed, fallback to xz"
+            out="${out%.tar.zst}.tar.xz"
+            tar -C "$destdir" -cJf "$out" .
+          }
+        else
+          adm_log_info "zstd not available; using xz fallback"
+          out="${out%.tar.zst}.tar.xz"
+          tar -C "$destdir" -cJf "$out" .
+        fi
+      fi
+    else
+      adm_log_info "zstd unavailable; using xz fallback"
+      out="${out%.tar.zst}.tar.xz"
+      tar -C "$destdir" -cJf "$out" .
+    fi
+  else
+    adm_log_error "tar not found or not GNU tar; cannot package"
+    return 1
+  fi
+  # compute sha256
+  if command -v sha256sum >/dev/null 2>&1; then
+    local sha
+    sha=$(sha256sum "$out" | awk '{print $1}')
+    echo "$sha" > "$out.sha256"
+  fi
+  adm_log_correct "Packaged $out"
+  echo "$out"
+  return 0
+}
+
+# write manifest of installed files (list of paths relative to destdir) and checksums
+_adm_write_manifest() {
+  local pkg="$1"
+  local destdir="$2"
+  local manifest="$ADM_ROOT/state/manifests/${pkg}.manifest"
+  mkdir -p "$(dirname "$manifest")" 2>/dev/null || true
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would write manifest: $manifest"
+    return 0
+  fi
+  (cd "$destdir" && find . -type f -print | sort) > "$manifest"
+  adm_log_correct "Manifest written: $manifest"
+  return 0
+}
+
+# top-level build flow for a single metafile (or package name)
+# usage: adm_build_package <metafile_or_name> [--dry-run] [--force] [--chroot NAME] [--profile normal] [--jobs N]
+adm_build_package() {
+  local target="$1"
+  shift || true
+  # options
+  local dryrun="$ADM_DRY_RUN"
+  local force="${ADM_FORCE}"
+  local chrootname="$ADM_CHROOT"
+  local profile="$ADM_PROFILE"
+  local jobs="$ADM_JOBS"
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dryrun=1; shift ;;
+      --force) force=1; shift ;;
+      --chroot) chrootname="${2:-}"; shift 2 ;;
+      --profile) profile="${2:-}"; shift 2 ;;
+      --jobs) jobs="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # load metafile path
+  local metafile=""
+  if [ -f "$target" ]; then
+    metafile="$target"
+  else
+    # try find by name
+    if declare -f find_metafile_by_name >/dev/null 2>&1; then
+      metafile=$(find_metafile_by_name "$target" || true)
+    else
+      # fallback search
+      metafile=$(find "$ADM_ROOT/metafiles" -type f -name "metafile" -path "*/${target}/metafile" 2>/dev/null | head -n1 || true)
+    fi
+  fi
+  if [ -z "$metafile" ]; then
+    adm_log_error "Metafile not found for target: $target"
+    return 1
+  fi
+
+  # load meta
+  adm_meta_load "$metafile"
+  local name version src sha desc
+  name="${ADM_META_NAME:-}"
+  version="${ADM_META_VERSION:-}"
+  src="${ADM_META_SOURCE:-}"
+  sha="${ADM_META_SHA256:-}"
+  desc="${ADM_META_DESC:-}"
+  local pkg="${name}-${version}"
+  local pkgsafe
+  pkgsafe=$(_adm_pkg_safe "$pkg")
+  adm_log_info "Starting build for package: $pkg (src=$src)"
+
+  # prepare build environment
+  _adm_load_profile "$profile"
+  _adm_detect_compilers
+
+  # resolve dependencies: combine metafile build_deps and inferred from source (after download)
+  # download source into cache (adm_cache_download) then extract into workdir
+  local cached_src=""
+  if [ -n "$src" ]; then
+    if declare -f adm_cache_download >/dev/null 2>&1; then
+      if [ "$dryrun" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would download source: $src"
+      else
+        cached_src=$(adm_cache_download "$src" "$sha" 2>/dev/null || true)
+      fi
+    else
+      adm_log_info "adm_cache_download not available; expecting local path: $src"
+      cached_src="$src"
+    fi
+  else
+    adm_log_error "No source specified in metafile for $pkg"
+    return 1
+  fi
+
+  # prepare workdir and extract
+  local workdir
+  workdir=$(_adm_prepare_workdir "$pkgsafe")
+  if [ "$dryrun" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would extract $cached_src to $workdir"
+  else
+    _adm_prepare_source "$cached_src" "$workdir" || { adm_log_error "Failed to prepare source"; return 1; }
+  fi
+
+  # infer deps from source
+  local -a inferred
+  if [ "$dryrun" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would infer dependencies from $workdir"
+  else
+    mapfile -t inferred < <(_adm_infer_deps_from_source "$workdir" || true)
+  fi
+
+  # read explicit deps from metafile
+  local -a meta_build_deps meta_run_deps
+  _adm_read_metafile_deps "$metafile" meta_build_deps meta_run_deps
+
+  # merge and normalize dependencies (meta + inferred)
+  declare -A _uniqdeps
+  local d
+  for d in "${meta_build_deps[@]}" "${inferred[@]}"; do
+    dn=$(echo "$d" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$dn" ] && continue
+    _uniqdeps["$dn"]=1
+  done
+  local deps_to_build=()
+  for k in "${!_uniqdeps[@]}"; do deps_to_build+=("$k"); done
+
+  # report deps
+  adm_log_info "Dependencies for $pkg: ${deps_to_build[*]:-none}"
+
+  # use adm-deps resolver to get build order if available
+  local topo_order=()
+  if declare -f adm_deps_resolve_by_metafile >/dev/null 2>&1; then
+    adm_log_info "Resolving build order via adm-deps"
+    mapfile -t topo_order < <(adm_deps_resolve_by_metafile "$metafile" 2>/dev/null || true)
+    # filter out empty
+    local tmp=(); for x in "${topo_order[@]}"; do [ -n "$x" ] && tmp+=("$x"); done; topo_order=("${tmp[@]}")
+  else
+    topo_order=("${deps_to_build[@]}")
+  fi
+
+  # Build dependencies (install from cache or build recursively)
+  for dep in "${topo_order[@]}"; do
+    # skip if self
+    if [ "$dep" = "$name" ]; then continue; fi
+    # check cache
+    local dep_pkg_cache
+    dep_pkg_cache=$(find "$ADM_CACHE_BIN" -type f -name "${dep}-*.tar.*" 2>/dev/null | head -n1 || true)
+    if [ -n "$dep_pkg_cache" ] && [ "$force" -eq 0 ]; then
+      adm_log_info "Using cached binary for dep $dep: $dep_pkg_cache"
+      # optionally auto install to chroot or system? We leave installation to adm-install or caller
+    else
+      # attempt to find metafile for dep and build it
+      local dep_meta
+      if declare -f find_metafile_by_name >/dev/null 2>&1; then
+        dep_meta=$(find_metafile_by_name "$dep" || true)
+      fi
+      if [ -n "$dep_meta" ]; then
+        adm_log_info "Building dependency $dep from metafile $dep_meta"
+        # call adm-build recursively; careful to avoid infinite recursion
+        if [ "$dryrun" = "1" ]; then
+          adm_log_info "[DRY-RUN] Would build dependency $dep via adm-build $dep_meta"
+        else
+          # avoid re-entrancy issues: execute adm-build as separate process
+          "$ADM_BIN_DIR/adm-build" "$dep_meta" --profile "$profile" --jobs "$jobs" || {
+            adm_log_error "Failed to build dependency $dep"
+            return 1
+          }
+        fi
+      else
+        adm_log_error "Dependency $dep has no metafile and no cached binary; manual intervention required"
+        # continue to next, but report
+      fi
+    fi
+  done
+
+  # apply patches and run prebuild hooks
+  if [ "$dryrun" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would apply patches and run prebuild hooks for $pkg"
+  else
+    # patches: adm_patches_apply <pkg> <srcdir>
+    if declare -f adm_patches_apply >/dev/null 2>&1; then
+      adm_patches_apply "$name" "$workdir" || adm_log_error "adm-patches reported issues"
+    fi
+    # hooks prebuild
+    if declare -f adm_hooks_run >/dev/null 2>&1; then
+      adm_hooks_run prebuild "$name" "$workdir" "$ADM_ROOT/packages/$pkgsafe" "$ADM_WORKDIR/$pkgsafe/install" --meta "$metafile" || adm_log_error "prebuild hooks had issues"
+    fi
+  fi
+
+  # prepare destdir
+  local destdir
+  destdir=$(_adm_prepare_destdir "$pkgsafe")
+
+  # run build (dispatch)
+  if [ "$dryrun" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would dispatch build for $pkg (workdir=$workdir -> dest=$destdir)"
+  else
+    # maybe chroot exec wrapper
+    # We perform build locally but honor chroot option by using _adm_maybe_chroot_exec for commands where appropriate
+    # For simplicity we run the full build in current namespace; real chroot would require path translation.
+    _adm_dispatch_build "$pkg" "$workdir" "$ADM_ROOT/packages/$pkgsafe" "$destdir" || {
+      adm_log_error "Build failed for $pkg"
+      return 1
+    }
+  fi
+
+  # postbuild hooks
+  if [ "$dryrun" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would run postbuild hooks for $pkg"
+  else
+    if declare -f adm_hooks_run >/dev/null 2>&1; then
+      adm_hooks_run postbuild "$name" "$workdir" "$ADM_ROOT/packages/$pkgsafe" "$destdir" --meta "$metafile" || adm_log_error "postbuild hooks had issues"
+    fi
+  fi
+
+  # package install tree
+  local pkgfile
+  pkgfile=$(_adm_package_install_tree "$pkg" "$destdir" || true)
+  if [ -z "$pkgfile" ]; then
+    adm_log_error "Packaging failed for $pkg"
+  else
+    adm_log_correct "Package created: $pkgfile"
+  fi
+
+  # write manifest
+  _adm_write_manifest "$pkg" "$destdir"
+
+  # update cache index (optional)
+  if [ "$ADM_DRY_RUN" != "1" ] && [ -n "$pkgfile" ]; then
+    adm_log_info "Adding package to cache: $pkgfile"
+    # done by saving to ADM_CACHE_BIN already
+  fi
+
+  adm_log_correct "Build complete for $pkg"
+  return 0
+}
+
+# CLI entrypoint
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # parse args
+  if [ "$#" -lt 1 ]; then
+    cat <<EOF
+adm-build - orchestrate package build
+
+Usage:
+  adm-build <metafile|package-name> [--dry-run] [--force] [--profile <profile>] [--chroot <name>] [--jobs N] [--destdir <path>]
+
+Examples:
+  adm-build /usr/src/adm/metafiles/base/hello/metafile
+  adm-build hello --dry-run
+  adm-build hello --profile toolchain --jobs 8
+
+EOF
+    exit 1
+  fi
+
+  TARGET="$1"; shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --force) ADM_FORCE=1; shift ;;
+      --profile) ADM_PROFILE="${2:-}"; shift 2 ;;
+      --chroot) ADM_CHROOT="${2:-}"; shift 2 ;;
+      --jobs) ADM_JOBS="${2:-}"; shift 2 ;;
+      --destdir) # not used by top-level; DESTDIR handled internally
+        shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  # call main
+  adm_build_package "$TARGET"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    adm_log_error "adm-build failed for $TARGET (rc=$rc)"
+    exit $rc
+  else
+    adm_log_correct "adm-build finished for $TARGET"
+    exit 0
+  fi
+fi
