@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# adm-logger - logging, spinner and progress utilities for ADM
+# Place in /usr/src/adm/bin/adm-logger and chmod +x
+# Usage: source /usr/src/adm/bin/adm-logger
+#
+# Exports functions:
+#   adm_log_info "message"
+#   adm_log_correct "message"
+#   adm_log_error "message"
+#   adm_log_debug "message"
+#   adm_start_spinner "message"
+#   adm_stop_spinner
+#   adm_progress_init total_steps label
+#   adm_progress_update current_step
+#   adm_progress_finish
+#
+# Environment variables:
+#   ADM_ROOT (default /usr/src/adm)
+#   ADM_LOGFILE (default $ADM_ROOT/logs/adm.log)
+#   ADM_DRY_RUN (if set to 1, avoid writing files)
+#   ADM_VERBOSE (0|1)
+
+set -euo pipefail
+
+# defaults
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_LOGFILE:=$ADM_ROOT/logs/adm.log}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_VERBOSE:=1}"
+
+# ensure dirs exist (but do not create if dry-run)
+if [ "${ADM_DRY_RUN}" != "1" ]; then
+  mkdir -p "$ADM_ROOT/logs" 2>/dev/null || true
+fi
+
+# Colors
+if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
+  BOLD='\033[1m'
+  PINK='\033[1;35m'   # timestamp / main lines
+  YELLOW='\033[1;33m' # correct / success
+  RED='\033[0;31m'    # error
+  BLUE='\033[1;34m'   # info
+  GRAY='\033[0;37m'
+  RESET='\033[0m'
+else
+  BOLD=''; PINK=''; YELLOW=''; RED=''; BLUE=''; GRAY=''; RESET=''
+fi
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+# internal: write to logfile (if allowed)
+_adm_logfile_write() {
+  local lvl="$1"; shift
+  local msg="$*"
+  if [ "${ADM_DRY_RUN}" != "1" ]; then
+    mkdir -p "$(dirname "$ADM_LOGFILE")" 2>/dev/null || true
+    printf "[%s] [%s] %s\n" "$(timestamp)" "$lvl" "$msg" >> "$ADM_LOGFILE"
+  fi
+}
+
+# public logging functions
+adm_log_info() {
+  local msg="$*"
+  if [ "$ADM_VERBOSE" -eq 1 ]; then
+    printf "%b%s %b%s%b\n" "${BOLD}${PINK}" "$(timestamp)" "${BLUE}" " $msg" "${RESET}"
+  fi
+  _adm_logfile_write "INFO" "$msg"
+}
+
+adm_log_correct() {
+  local msg="$*"
+  if [ "$ADM_VERBOSE" -eq 1 ]; then
+    printf "%b%s %b%s%b\n" "${BOLD}${PINK}" "$(timestamp)" "${YELLOW}" " [Correct] $msg" "${RESET}"
+  fi
+  _adm_logfile_write "OK" "$msg"
+}
+
+adm_log_error() {
+  local msg="$*"
+  printf "%b%s %b%s%b\n" "${BOLD}${PINK}" "$(timestamp)" "${RED}" " [ERROR] $msg" "${RESET}" >&2
+  _adm_logfile_write "ERROR" "$msg"
+}
+
+adm_log_debug() {
+  local msg="$*"
+  # Debug only when ADM_VERBOSE is >1
+  if [ "${ADM_VERBOSE:-1}" -ge 2 ]; then
+    printf "%b%s %b%s%b\n" "${BOLD}${PINK}" "$(timestamp)" "${GRAY}" " [DEBUG] $msg" "${RESET}"
+    _adm_logfile_write "DEBUG" "$msg"
+  fi
+}
+
+# spinner management (background safe)
+_ADM_SPINNER_PID=0
+_ADM_SPINNER_STATE_FILE="${ADM_ROOT}/state/.adm_spinner_pid"
+_adm_spinner_cleanup() {
+  if [ "${_ADM_SPINNER_PID:-0}" -ne 0 ]; then
+    kill "${_ADM_SPINNER_PID}" >/dev/null 2>&1 || true
+    wait "${_ADM_SPINNER_PID}" 2>/dev/null || true
+    _ADM_SPINNER_PID=0
+  fi
+  [ -f "${_ADM_SPINNER_STATE_FILE}" ] && rm -f "${_ADM_SPINNER_STATE_FILE}" || true
+}
+trap _adm_spinner_cleanup EXIT INT TERM
+
+adm_start_spinner() {
+  local msg="${1:-Working...}"
+  # do not start spinner in non-tty or when NO_COLOR set
+  if [ ! -t 1 ] || [ "${NO_COLOR:-0}" = "1" ]; then
+    printf "%s " "$msg"
+    return 0
+  fi
+  # if already running, ignore
+  if [ "${_ADM_SPINNER_PID:-0}" -ne 0 ]; then
+    return 0
+  fi
+  printf "%b%s %b%s%b " "${BOLD}${PINK}" "$(timestamp)" "${BLUE}" "$msg" "${RESET}"
+  # spinner loop in background
+  (
+    trap "" HUP INT TERM
+    local chars='/-\|'
+    while :; do
+      for c in $(echo "$chars" | sed -e 's/\(.\)/\1 /g'); do
+        printf '\b%s' "$c"
+        sleep 0.12
+      done
+    done
+  ) &
+  _ADM_SPINNER_PID=$!
+  echo "${_ADM_SPINNER_PID}" > "${_ADM_SPINNER_STATE_FILE}"
+}
+
+adm_stop_spinner() {
+  # Stop spinner if running
+  if [ -f "${_ADM_SPINNER_STATE_FILE}" ]; then
+    local pid
+    pid=$(cat "${_ADM_SPINNER_STATE_FILE}" 2>/dev/null || true)
+    if [ -n "$pid" ]; then
+      kill "$pid" >/dev/null 2>&1 || true
+      wait "$pid" 2>/dev/null || true
+    fi
+    rm -f "${_ADM_SPINNER_STATE_FILE}" || true
+  fi
+  # Also use internal pid if set
+  if [ "${_ADM_SPINNER_PID:-0}" -ne 0 ]; then
+    kill "${_ADM_SPINNER_PID}" >/dev/null 2>&1 || true
+    wait "${_ADM_SPINNER_PID}" 2>/dev/null || true
+    _ADM_SPINNER_PID=0
+  fi
+  # finish line
+  printf "\b \n"
+}
+
+# Progress bar utilities (works in % or steps)
+# Usage: adm_progress_init total_steps "label"
+#        adm_progress_update current_step
+#        adm_progress_finish
+_ADM_PROGRESS_TOTAL=0
+_ADM_PROGRESS_LABEL=""
+adm_progress_init() {
+  local total="${1:-100}"
+  local label="${2:-Progress}"
+  _ADM_PROGRESS_TOTAL="$total"
+  _ADM_PROGRESS_LABEL="$label"
+  # print header
+  if [ "$ADM_VERBOSE" -eq 1 ]; then
+    printf "%b%s %b%s: %b\n" "${BOLD}${PINK}" "$(timestamp)" "${BLUE}" "$label" "${RESET}"
+  fi
+  _adm_progress_render 0
+}
+
+_adm_progress_render() {
+  local percent="$1"
+  local width=36
+  local filled=$(( (percent * width) / 100 ))
+  local empty=$(( width - filled ))
+  printf "["
+  local i
+  for ((i=0;i<filled;i++)); do printf "#"; done
+  for ((i=0;i<empty;i++)); do printf "-"; done
+  printf "] %3d%%\r" "$percent"
+  if [ "$percent" -ge 100 ]; then printf "\n"; fi
+}
+
+adm_progress_update() {
+  local step="$1"
+  if [ "$_ADM_PROGRESS_TOTAL" -le 0 ]; then
+    return 1
+  fi
+  local percent=$(( (step * 100) / _ADM_PROGRESS_TOTAL ))
+  if [ "$percent" -lt 0 ]; then percent=0; fi
+  if [ "$percent" -gt 100 ]; then percent=100; fi
+  _adm_progress_render "$percent"
+}
+
+adm_progress_finish() {
+  _adm_progress_render 100
+  _ADM_PROGRESS_TOTAL=0
+  _ADM_PROGRESS_LABEL=""
+}
+
+# small helper to time a block: adm_time_start <label>; adm_time_end <label>
+declare -A _ADM_TIMERS
+adm_time_start() {
+  local label="${1:-task}"
+  _ADM_TIMERS["$label"]=$(date +%s)
+}
+adm_time_end() {
+  local label="${1:-task}"
+  local start=${_ADM_TIMERS["$label"]:-0}
+  if [ "$start" -eq 0 ]; then
+    echo "00:00:00"
+    return 0
+  fi
+  local now=$(date +%s)
+  local diff=$((now - start))
+  printf "%02d:%02d:%02d" $((diff/3600)) $(((diff%3600)/60)) $((diff%60))
+}
+
+# helper: safe write to package-specific log
+adm_package_log() {
+  local pkg="$1"; shift
+  local line="$*"
+  local pkglog="$ADM_ROOT/logs/builds/${pkg}.log"
+  if [ "${ADM_DRY_RUN}" != "1" ]; then
+    mkdir -p "$(dirname "$pkglog")" 2>/dev/null || true
+    printf "[%s] %s\n" "$(timestamp)" "$line" >> "$pkglog"
+  fi
+}
+
+# export functions for scripts that source this file
+export -f adm_log_info adm_log_correct adm_log_error adm_log_debug \
+  adm_start_spinner adm_stop_spinner adm_progress_init adm_progress_update adm_progress_finish \
+  adm_time_start adm_time_end adm_package_log
+
+# End of adm-logger
