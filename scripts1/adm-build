@@ -321,6 +321,10 @@ _adm_read_metafile_deps() {
     fi
   fi
 }
+# End of Part 1/3
+# adm-build - Parte 2/3 - build system detection and build runners
+# (Append to Part 1/3 content)
+#
 # ----- BUILD SYSTEM DETECTION -----
 _adm_detect_build_system() {
   local srcdir="$1"
@@ -583,6 +587,10 @@ _adm_dispatch_build() {
   esac
 }
 
+# End of Part 2/3
+# adm-build - Parte 3/3 - orchestration, packaging, manifest and main CLI
+# (Append to parts 1 and 2)
+#
 _adm_package_name_from_meta() {
   local metafile="$1"
   if [ -f "$metafile" ]; then
@@ -975,3 +983,5 @@ EOF
     exit 0
   fi
 fi
+
+# End of adm-build (all parts)
