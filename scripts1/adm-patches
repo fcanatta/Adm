@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# adm-patches - automatic patch manager for ADM
+# Location: /usr/src/adm/bin/adm-patches
+#
+# Applies patches automatically from:
+#   /usr/src/adm/patches/<pkg>/*.patch
+#   /usr/src/adm/packages/<pkg>*/patches/*.patch
+#
+# Functions:
+#   adm_patches_apply <pkg_name> <srcdir>
+#   adm_patches_list <pkg_name>
+#   adm_patches_verify <pkg_name>
+#
+# CLI usage:
+#   adm-patches apply <pkg> <srcdir>
+#   adm-patches list <pkg>
+#   adm-patches verify <pkg>
+#   adm-patches show <pkg>
+#
+set -euo pipefail
+
+# Load logger
+if [ -x "/usr/src/adm/bin/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source /usr/src/adm/bin/adm-logger
+else
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+fi
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_LOG_PATCHES:=$ADM_ROOT/logs/patches}"
+
+mkdir -p "$ADM_LOG_PATCHES" 2>/dev/null || true
+
+# Internal: find patches for a package
+_find_patches_for_pkg() {
+  local pkg="$1"
+  local patches=()
+  # system patches
+  if [ -d "$ADM_ROOT/patches/$pkg" ]; then
+    while IFS= read -r f; do patches+=("$f"); done < <(find "$ADM_ROOT/patches/$pkg" -type f -name '*.patch' | sort)
+  fi
+  # local patches
+  if [ -d "$ADM_ROOT/packages" ]; then
+    while IFS= read -r f; do patches+=("$f"); done < <(find "$ADM_ROOT/packages" -type f -path "*/${pkg}*/patches/*.patch" | sort)
+  fi
+  printf "%s\n" "${patches[@]}" || true
+}
+
+# Internal: verify sha256 if .sha256 file exists
+_verify_patch_sha() {
+  local patch="$1"
+  local sha_file="${patch}.sha256"
+  if [ -f "$sha_file" ]; then
+    local expected
+    expected=$(cat "$sha_file" | awk '{print $1}')
+    local actual
+    actual=$(sha256sum "$patch" | awk '{print $1}')
+    if [ "$expected" != "$actual" ]; then
+      adm_log_error "Checksum mismatch for patch: $(basename "$patch")"
+      return 1
+    fi
+    adm_log_correct "Checksum verified: $(basename "$patch")"
+  fi
+  return 0
+}
+
+# List available patches
+adm_patches_list() {
+  local pkg="$1"
+  local patches
+  patches=$(_find_patches_for_pkg "$pkg")
+  if [ -z "$patches" ]; then
+    adm_log_info "No patches found for $pkg"
+    return 0
+  fi
+  adm_log_info "Found patches for $pkg:"
+  echo "$patches"
+}
+
+# Apply all patches for pkg on a given srcdir
+adm_patches_apply() {
+  local pkg="$1"
+  local srcdir="$2"
+  local mode="${3:-apply}"  # or reverse
+
+  [ -d "$srcdir" ] || { adm_log_error "Invalid source directory: $srcdir"; return 1; }
+
+  local patchlist
+  patchlist=$(_find_patches_for_pkg "$pkg" || true)
+  if [ -z "$patchlist" ]; then
+    adm_log_info "No patches to apply for $pkg"
+    return 0
+  fi
+
+  adm_log_info "Applying patches for $pkg into $srcdir"
+  local applied_file="$srcdir/.adm-applied-patches"
+  mkdir -p "$(dirname "$applied_file")"
+
+  local count=0
+  for patch in $patchlist; do
+    count=$((count+1))
+    local name
+    name=$(basename "$patch")
+    adm_log_info "[$count] Processing patch: $name"
+
+    _verify_patch_sha "$patch" || {
+      adm_log_error "Skipping invalid patch $name"
+      continue
+    }
+
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would apply patch: $name"
+      continue
+    fi
+
+    # avoid reapplying same patch
+    if grep -qF "$name" "$applied_file" 2>/dev/null; then
+      adm_log_info "Skipping already applied patch: $name"
+      continue
+    fi
+
+    pushd "$srcdir" >/dev/null 2>&1
+    if [ "$mode" = "reverse" ]; then
+      patch -R -p1 < "$patch" || adm_log_error "Failed to reverse patch: $name"
+      adm_log_correct "Reversed patch: $name"
+    else
+      if patch -p1 --backup --suffix=".adm.bak" < "$patch"; then
+        adm_log_correct "Applied patch: $name"
+        echo "$name" >> "$applied_file"
+      else
+        adm_log_error "Failed to apply patch: $name"
+        adm_log_info "Attempting dry-run to debug..."
+        patch --dry-run -p1 < "$patch" || true
+        adm_log_error "Manual fix may be required for: $name"
+      fi
+    fi
+    popd >/dev/null 2>&1
+  done
+
+  adm_log_correct "All applicable patches processed for $pkg"
+  return 0
+}
+
+# Verify only
+adm_patches_verify() {
+  local pkg="$1"
+  local patches
+  patches=$(_find_patches_for_pkg "$pkg")
+  [ -z "$patches" ] && { adm_log_info "No patches for $pkg"; return 0; }
+  adm_log_info "Verifying checksums for $pkg"
+  for p in $patches; do
+    _verify_patch_sha "$p" || return 1
+  done
+  adm_log_correct "All patch checksums OK for $pkg"
+  return 0
+}
+
+# Show patches content
+adm_patches_show() {
+  local pkg="$1"
+  local patches
+  patches=$(_find_patches_for_pkg "$pkg")
+  [ -z "$patches" ] && { adm_log_info "No patches for $pkg"; return 0; }
+  for p in $patches; do
+    echo "===== $p ====="
+    head -n 20 "$p" || true
+    echo
+  done
+}
+
+# CLI
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    list)
+      pkg="${1:-}"
+      [ -z "$pkg" ] && { echo "Usage: adm-patches list <pkg>"; exit 1; }
+      adm_patches_list "$pkg"
+      ;;
+    apply)
+      pkg="${1:-}"
+      src="${2:-}"
+      [ -z "$pkg" ] || [ -z "$src" ] && { echo "Usage: adm-patches apply <pkg> <srcdir>"; exit 1; }
+      adm_patches_apply "$pkg" "$src"
+      ;;
+    reverse)
+      pkg="${1:-}"
+      src="${2:-}"
+      [ -z "$pkg" ] || [ -z "$src" ] && { echo "Usage: adm-patches reverse <pkg> <srcdir>"; exit 1; }
+      adm_patches_apply "$pkg" "$src" "reverse"
+      ;;
+    verify)
+      pkg="${1:-}"
+      [ -z "$pkg" ] && { echo "Usage: adm-patches verify <pkg>"; exit 1; }
+      adm_patches_verify "$pkg"
+      ;;
+    show)
+      pkg="${1:-}"
+      [ -z "$pkg" ] && { echo "Usage: adm-patches show <pkg>"; exit 1; }
+      adm_patches_show "$pkg"
+      ;;
+    help|*)
+      cat <<EOF
+adm-patches - automatic patch handler for ADM
+
+Usage:
+  adm-patches list <pkg>           List patches available
+  adm-patches apply <pkg> <srcdir> Apply all patches
+  adm-patches reverse <pkg> <srcdir> Revert patches
+  adm-patches verify <pkg>         Verify SHA256 checksums
+  adm-patches show <pkg>           Preview patches
+
+Environment:
+  ADM_ROOT (default /usr/src/adm)
+  ADM_DRY_RUN=1 to simulate
+
+EOF
+      ;;
+  esac
+fi
+
+# Export for use by adm-build
+export -f adm_patches_apply adm_patches_list adm_patches_verify
