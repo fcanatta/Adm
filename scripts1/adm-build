@@ -565,8 +565,8 @@ _adm_build_go() {
   adm_time_start_pack "$pkg" "install"
   if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
     # UNCOMMENT FOR REAL EXECUTION (in chroot only):
-    # _adm_chroot_exec "$chrootname" bash -lc "mkdir -p '$destdir/usr/bin' && cp -a '$src'/* '$destdir/usr/bin/' 2>/dev/null || true"
-    _adm_chroot_exec "$chrootname" bash -lc "echo '[SIM] cp -a $src/* -> $destdir/usr/bin/'" || return $?
+    # _adm_chroot_exec "$chrootname" bash -lc "mkdir -p '$destdir/usr/bin' && find "$src" -maxdepth 1 -type f -executable -exec cp {} "$destdir/usr/bin/" \; 2>/dev/null || true"
+    _adm_chroot_exec "$chrootname" bash -lc "echo '[SIM] find "$src" -maxdepth 1 -type f -executable -exec cp {} "$destdir/usr/bin/" \;'" || return $?
   else
     adm_log_info "[SIMULATION] Would copy Go binaries to $destdir/usr/bin inside chroot"
   fi
