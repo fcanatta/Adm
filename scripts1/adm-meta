@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# adm-meta - parser e validador de metafiles para o sistema ADM
+# ---------------------------------------------------------------
+# Lê e valida arquivos /usr/src/adm/metafiles/<categoria>/<programa>/metafile
+# e exporta variáveis NAME, VERSION, SOURCE, SHA256, DESC, BUILD_DEPS, RUN_DEPS, UPSTREAM
+#
+# Funções públicas:
+#   adm_meta_load <metafile_path>          # carrega e valida um metafile
+#   adm_meta_show                          # mostra variáveis carregadas
+#   adm_meta_get <key>                     # retorna valor de uma chave
+#   adm_meta_find <program_name>           # encontra o caminho do metafile
+#   adm_meta_validate <metafile_path>      # valida formato
+#
+# Saídas de erro sempre com log via adm-logger se disponível.
+# Uso interno em adm-build, adm-install, adm-deps.
+
+set -euo pipefail
+
+# Carregar logger se existir
+if [ -x "/usr/src/adm/bin/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source /usr/src/adm/bin/adm-logger
+else
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+fi
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_DRY_RUN:=0}"
+
+# Campos obrigatórios
+ADM_META_REQUIRED=(name version source sha256)
+
+# Variáveis globais carregadas
+ADM_META_NAME=""
+ADM_META_VERSION=""
+ADM_META_SOURCE=""
+ADM_META_SHA256=""
+ADM_META_DESC=""
+ADM_META_BUILD_DEPS=""
+ADM_META_RUN_DEPS=""
+ADM_META_UPSTREAM=""
+
+# Internal: trim whitespace
+_adm_meta_trim() {
+  sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Internal: sanitize field value
+_adm_meta_sanitize() {
+  local val="$1"
+  echo "$val" | tr -cd '[:alnum:].:/,_+@#%~=-' | sed 's/[[:space:]]\+/ /g'
+}
+
+# Internal: print and exit on error
+_adm_meta_fail() {
+  local msg="$1"
+  adm_log_error "$msg"
+  exit 1
+}
+
+# ------------------------------------------------------------
+# adm_meta_validate <metafile_path>
+# ------------------------------------------------------------
+adm_meta_validate() {
+  local metafile="$1"
+  [ -f "$metafile" ] || _adm_meta_fail "Metafile não encontrado: $metafile"
+
+  local missing=0
+  for field in "${ADM_META_REQUIRED[@]}"; do
+    if ! grep -qE "^${field}:" "$metafile"; then
+      adm_log_error "Campo obrigatório ausente: ${field}"
+      missing=1
+    fi
+  done
+  if [ "$missing" -ne 0 ]; then
+    _adm_meta_fail "Metafile inválido (faltando campos obrigatórios)"
+  fi
+  adm_log_correct "Metafile válido: $metafile"
+}
+
+# ------------------------------------------------------------
+# adm_meta_load <metafile_path>
+# ------------------------------------------------------------
+adm_meta_load() {
+  local metafile="$1"
+  [ -f "$metafile" ] || _adm_meta_fail "Arquivo metafile não encontrado: $metafile"
+
+  adm_log_info "Carregando metadados de $metafile"
+  adm_meta_validate "$metafile"
+
+  # Limpar valores anteriores
+  ADM_META_NAME=""; ADM_META_VERSION=""; ADM_META_SOURCE=""
+  ADM_META_SHA256=""; ADM_META_DESC=""
+  ADM_META_BUILD_DEPS=""; ADM_META_RUN_DEPS=""
+  ADM_META_UPSTREAM=""
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ ^# ]] && continue
+    [[ -z "$line" ]] && continue
+    local key="${line%%:*}"
+    local value="${line#*:}"
+    key=$(_adm_meta_trim <<<"$key")
+    value=$(_adm_meta_trim <<<"$value")
+    value=$(_adm_meta_sanitize "$value")
+    case "$key" in
+      name) ADM_META_NAME="$value" ;;
+      version) ADM_META_VERSION="$value" ;;
+      source) ADM_META_SOURCE="$value" ;;
+      sha256) ADM_META_SHA256="$value" ;;
+      desc) ADM_META_DESC="$value" ;;
+      build_deps) ADM_META_BUILD_DEPS="$value" ;;
+      run_deps) ADM_META_RUN_DEPS="$value" ;;
+      upstream) ADM_META_UPSTREAM="$value" ;;
+      *) adm_log_debug "Campo desconhecido ignorado: $key" ;;
+    esac
+  done < "$metafile"
+
+  # Checar obrigatórios não vazios
+  for field in "${ADM_META_REQUIRED[@]}"; do
+    local var="ADM_META_${field^^}"
+    if [ -z "${!var:-}" ]; then
+      _adm_meta_fail "Campo ${field} vazio no metafile"
+    fi
+  done
+
+  adm_log_correct "Metadados carregados: ${ADM_META_NAME}-${ADM_META_VERSION}"
+}
+
+# ------------------------------------------------------------
+# adm_meta_get <key>
+# ------------------------------------------------------------
+adm_meta_get() {
+  local key="${1:-}"
+  case "$key" in
+    name) echo "$ADM_META_NAME" ;;
+    version) echo "$ADM_META_VERSION" ;;
+    source) echo "$ADM_META_SOURCE" ;;
+    sha256) echo "$ADM_META_SHA256" ;;
+    desc) echo "$ADM_META_DESC" ;;
+    build_deps) echo "$ADM_META_BUILD_DEPS" ;;
+    run_deps) echo "$ADM_META_RUN_DEPS" ;;
+    upstream) echo "$ADM_META_UPSTREAM" ;;
+    *) adm_log_error "Chave inválida: $key"; return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------
+# adm_meta_show
+# ------------------------------------------------------------
+adm_meta_show() {
+  echo "name:       $ADM_META_NAME"
+  echo "version:    $ADM_META_VERSION"
+  echo "source:     $ADM_META_SOURCE"
+  echo "sha256:     $ADM_META_SHA256"
+  echo "desc:       $ADM_META_DESC"
+  echo "build_deps: $ADM_META_BUILD_DEPS"
+  echo "run_deps:   $ADM_META_RUN_DEPS"
+  echo "upstream:   $ADM_META_UPSTREAM"
+}
+
+# ------------------------------------------------------------
+# adm_meta_find <program_name>
+# ------------------------------------------------------------
+adm_meta_find() {
+  local prog="$1"
+  local found=""
+  if [ -d "${ADM_ROOT}/metafiles" ]; then
+    found=$(find "${ADM_ROOT}/metafiles" -type f -name "metafile" -path "*/${prog}/metafile" | head -n1 || true)
+  fi
+  if [ -z "$found" ]; then
+    adm_log_error "Metafile para ${prog} não encontrado em ${ADM_ROOT}/metafiles/"
+    return 1
+  fi
+  echo "$found"
+}
+
+# ------------------------------------------------------------
+# CLI wrapper (optional)
+# ------------------------------------------------------------
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # modo CLI
+  cmd="${1:-help}"
+  case "$cmd" in
+    load)
+      metafile="${2:-}"
+      [ -z "$metafile" ] && { echo "Uso: adm-meta load <metafile>"; exit 1; }
+      adm_meta_load "$metafile"
+      adm_meta_show
+      ;;
+    find)
+      name="${2:-}"
+      [ -z "$name" ] && { echo "Uso: adm-meta find <programa>"; exit 1; }
+      adm_meta_find "$name"
+      ;;
+    validate)
+      metafile="${2:-}"
+      [ -z "$metafile" ] && { echo "Uso: adm-meta validate <metafile>"; exit 1; }
+      adm_meta_validate "$metafile"
+      ;;
+    show)
+      adm_meta_show ;;
+    get)
+      key="${2:-}"
+      [ -z "$key" ] && { echo "Uso: adm-meta get <chave>"; exit 1; }
+      adm_meta_get "$key"
+      ;;
+    *)
+      echo "adm-meta - utilitário de metadados"
+      echo "Uso: adm-meta <comando> [args]"
+      echo "Comandos:"
+      echo "  load <metafile>     Carrega e mostra metadados"
+      echo "  validate <metafile> Valida formato"
+      echo "  find <programa>     Busca metafile por nome"
+      echo "  get <chave>         Mostra valor da chave"
+      echo "  show                Mostra metadados carregados"
+      ;;
+  esac
+fi
+
+# Exportar funções para uso por outros scripts
+export -f adm_meta_load adm_meta_validate adm_meta_show adm_meta_find adm_meta_get
