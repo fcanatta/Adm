@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# adm-hooks - executor de hooks para ADM
+# Local: /usr/src/adm/bin/adm-hooks
+#
+# Responsabilidades:
+#  - Executar hooks globais: /usr/src/adm/hooks/<etapa>.d/*
+#  - Executar hooks locais:   packages/<pkg>/hooks/<etapa>
+#  - Passar contexto via ENV: ADM_PKG, ADM_PKGDIR, ADM_SRCDIR, ADM_INSTDIR, ADM_META
+#  - Registrar saída em logs: /usr/src/adm/logs/hooks/<pkg>-<etapa>.log
+#  - Suporte: --dry-run, --continue-on-error, --stop-on-error
+#  - Funções exportáveis:
+#      adm_hooks_run <etapa> <pkg> <srcdir> <pkgdir> <instdir> [--meta <metafile>] [--continue-on-error]
+#
+set -euo pipefail
+
+# Load logger if available
+if [ -x "/usr/src/adm/bin/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source /usr/src/adm/bin/adm-logger
+else
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+  adm_start_spinner() { :; }
+  adm_stop_spinner() { :; }
+fi
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_HOOKS_GLOBAL_DIR:=$ADM_ROOT/hooks}"
+: "${ADM_LOG_HOOKS:=$ADM_ROOT/logs/hooks}"
+
+mkdir -p "$ADM_LOG_HOOKS" 2>/dev/null || true
+
+# Valid hook stages
+ADM_HOOK_STAGES=("prebuild" "postbuild" "preinstall" "postinstall")
+
+# helper: is valid stage?
+_is_valid_stage() {
+  local s="$1"
+  for v in "${ADM_HOOK_STAGES[@]}"; do
+    [ "$v" = "$s" ] && return 0
+  done
+  return 1
+}
+
+# helper: list global hooks for stage
+_global_hooks_for_stage() {
+  local stage="$1"
+  local dir="$ADM_HOOKS_GLOBAL_DIR/${stage}.d"
+  if [ -d "$dir" ]; then
+    find "$dir" -maxdepth 1 -type f -executable | sort || true
+  fi
+}
+
+# helper: local hook path
+_local_hook_path() {
+  # packages/<pkg>*/hooks/<stage>
+  local pkg="$1"; local stage="$2"
+  # prefer exact match package dir under packages/
+  # we expect caller to give pkgdir too; when only pkg provided we search
+  if [ -d "$ADM_ROOT/packages" ] && [ -d "$ADM_ROOT/packages/${pkg}" ]; then
+    echo "$ADM_ROOT/packages/${pkg}/hooks/${stage}"
+  else
+    # try pattern
+    local f
+    f=$(find "$ADM_ROOT/packages" -maxdepth 2 -type f -path "*/${pkg}*/hooks/${stage}" 2>/dev/null | head -n1 || true)
+    if [ -n "$f" ]; then echo "$f"; return 0; fi
+    # also allow scripts inside hooks/ directory
+    local d
+    d=$(find "$ADM_ROOT/packages" -maxdepth 2 -type d -path "*/${pkg}*/hooks" 2>/dev/null | head -n1 || true)
+    if [ -n "$d" ] && [ -f "$d/$stage" ]; then
+      echo "$d/$stage"
+      return 0
+    fi
+    echo ""
+  fi
+}
+
+# Run a single hook file with env context
+# Usage: _run_hook_file <hook_file> <logfile> <env...>
+_run_hook_file() {
+  local hook_file="$1"
+  local logfile="$2"
+  shift 2
+  local envs=("$@")
+  # Build env string for log header
+  local hdr="HOOK: $(basename "$hook_file")"
+  adm_log_info "$hdr - starting"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would execute hook: $hook_file"
+    echo "[DRY-RUN] $hook_file" >> "$logfile"
+    return 0
+  fi
+
+  # run hook in subshell with provided envs
+  (
+    set -euo pipefail
+    # export provided env variables
+    for e in "${envs[@]}"; do
+      # e format KEY=VALUE
+      export "$e"
+    done
+    # ensure hook is executable; if not, try sh interpreter
+    if [ -x "$hook_file" ]; then
+      "$hook_file"
+    else
+      /bin/sh "$hook_file"
+    fi
+  ) >> "$logfile" 2>&1
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    adm_log_correct "Hook $(basename "$hook_file") finished (rc=0)"
+  else
+    adm_log_error "Hook $(basename "$hook_file") failed (rc=$rc). See $logfile"
+  fi
+  return $rc
+}
+
+# Run all hooks for a stage for a given package
+# Usage: adm_hooks_run <stage> <pkg> <srcdir> <pkgdir> <instdir> [--meta <metafile>] [--continue-on-error]
+adm_hooks_run() {
+  local stage="${1:-}"
+  local pkg="${2:-}"
+  local srcdir="${3:-}"
+  local pkgdir="${4:-}"
+  local instdir="${5:-}"
+  shift 5 || true
+
+  local metafile=""
+  local continue_on_error=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --meta) metafile="${2:-}"; shift 2 ;;
+      --continue-on-error) continue_on_error=1; shift ;;
+      --stop-on-error) continue_on_error=0; shift ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  if ! _is_valid_stage "$stage"; then
+    adm_log_error "Invalid hook stage: $stage"
+    return 1
+  fi
+
+  # prepare logfile
+  local logbase="$ADM_LOG_HOOKS/${pkg}-${stage}.log"
+  mkdir -p "$(dirname "$logbase")" 2>/dev/null || true
+  if [ "$ADM_DRY_RUN" != "1" ]; then
+    : > "$logbase" || true
+  fi
+
+  adm_log_info "Running hooks stage='$stage' pkg='$pkg' srcdir='$srcdir' pkgdir='$pkgdir' instdir='$instdir' meta='$metafile'"
+
+  # environment variables passed to hooks
+  local envs=()
+  envs+=("ADM_PKG=$pkg")
+  envs+=("ADM_PKGDIR=$pkgdir")
+  envs+=("ADM_SRCDIR=$srcdir")
+  envs+=("ADM_INSTDIR=$instdir")
+  envs+=("ADM_META=$metafile")
+  envs+=("ADM_ROOT=$ADM_ROOT")
+  envs+=("ADM_DRY_RUN=$ADM_DRY_RUN")
+
+  # 1) run global hooks (directory /usr/src/adm/hooks/<stage>.d/*.sh)
+  local gh_dir="$ADM_HOOKS_GLOBAL_DIR/${stage}.d"
+  if [ -d "$gh_dir" ]; then
+    adm_log_info "Executing global hooks in $gh_dir"
+    while IFS= read -r hookf; do
+      [ -z "$hookf" ] && continue
+      # skip non-files
+      [ -f "$hookf" ] || continue
+      # run
+      _run_hook_file "$hookf" "$logbase" "${envs[@]}"
+      local rc=$?
+      if [ $rc -ne 0 ] && [ "$continue_on_error" -eq 0 ]; then
+        adm_log_error "Global hook failed: $hookf (rc=$rc). Aborting stage $stage."
+        return $rc
+      fi
+    done < <(find "$gh_dir" -maxdepth 1 -type f -executable | sort 2>/dev/null || true)
+  else
+    adm_log_debug "No global hooks dir: $gh_dir"
+  fi
+
+  # 2) run package-specific hook(s)
+  # package hook can be: packages/<pkg>/hooks/<stage> (script) or packages/<pkg>/hooks/<stage>.d/*
+  local pkg_hooks_dir
+  if [ -d "$pkgdir/hooks" ]; then
+    pkg_hooks_dir="$pkgdir/hooks"
+  else
+    # try find pattern
+    pkg_hooks_dir=$(find "$ADM_ROOT/packages" -maxdepth 2 -type d -path "*/${pkg}*/hooks" 2>/dev/null | head -n1 || true)
+  fi
+
+  if [ -n "$pkg_hooks_dir" ] && [ -d "$pkg_hooks_dir" ]; then
+    # first single-stage script: hooks/<stage>
+    if [ -f "$pkg_hooks_dir/$stage" ]; then
+      adm_log_info "Executing package hook: $pkg_hooks_dir/$stage"
+      _run_hook_file "$pkg_hooks_dir/$stage" "$logbase" "${envs[@]}"
+      local rc=$?
+      if [ $rc -ne 0 ] && [ "$continue_on_error" -eq 0 ]; then
+        adm_log_error "Package hook failed: $pkg_hooks_dir/$stage (rc=$rc). Aborting."
+        return $rc
+      fi
+    fi
+    # then staged dir: hooks/<stage>.d/*
+    if [ -d "$pkg_hooks_dir/${stage}.d" ]; then
+      adm_log_info "Executing package hook dir: $pkg_hooks_dir/${stage}.d"
+      while IFS= read -r pf; do
+        [ -z "$pf" ] && continue
+        [ -f "$pf" ] || continue
+        _run_hook_file "$pf" "$logbase" "${envs[@]}"
+        local rc=$?
+        if [ $rc -ne 0 ] && [ "$continue_on_error" -eq 0 ]; then
+          adm_log_error "Package hook failed: $pf (rc=$rc). Aborting."
+          return $rc
+        fi
+      done < <(find "$pkg_hooks_dir/${stage}.d" -maxdepth 1 -type f -executable | sort 2>/dev/null || true)
+    fi
+  else
+    adm_log_debug "No package hooks for $pkg"
+  fi
+
+  adm_log_correct "Hooks stage '$stage' completed for package '$pkg' (log: $logbase)"
+  return 0
+}
+
+# CLI usage
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    run)
+      stage="${1:-}"; pkg="${2:-}"; srcdir="${3:-}"; pkgdir="${4:-}"; instdir="${5:-}"
+      if [ -z "$stage" ] || [ -z "$pkg" ] || [ -z "$srcdir" ]; then
+        echo "Usage: adm-hooks run <stage> <pkg> <srcdir> <pkgdir> <instdir> [--meta <metafile>] [--continue-on-error] [--dry-run]"
+        exit 1
+      fi
+      # pass through remaining args
+      adm_hooks_run "$stage" "$pkg" "$srcdir" "$pkgdir" "$instdir" "$@"
+      ;;
+    list)
+      stage="${1:-}"; pkg="${2:-}"
+      [ -z "$stage" ] && { echo "Usage: adm-hooks list <stage> <pkg>"; exit 1; }
+      gh_dir="$ADM_HOOKS_GLOBAL_DIR/${stage}.d"
+      echo "Global hooks in: $gh_dir"
+      find "$gh_dir" -maxdepth 1 -type f -executable 2>/dev/null || true
+      if [ -n "$pkg" ]; then
+        local pkg_hooks
+        pkg_hooks=$(find "$ADM_ROOT/packages" -maxdepth 2 -type d -path "*/${pkg}*/hooks" 2>/dev/null | head -n1 || true)
+        echo "Package hooks dir: $pkg_hooks"
+        [ -n "$pkg_hooks" ] && find "$pkg_hooks" -maxdepth 1 -type f -executable 2>/dev/null || true
+      fi
+      ;;
+    help|*)
+      cat <<EOF
+adm-hooks - run hooks for ADM packages
+
+Usage:
+  adm-hooks run <stage> <pkg> <srcdir> <pkgdir> <instdir> [--meta <metafile>] [--continue-on-error] [--dry-run]
+  adm-hooks list <stage> [pkg]
+  adm-hooks help
+
+Stages:
+  prebuild, postbuild, preinstall, postinstall
+
+Environment:
+  ADM_ROOT (default /usr/src/adm)
+  ADM_DRY_RUN=1 to simulate
+
+Hooks:
+  - Global hooks: $ADM_HOOKS_GLOBAL_DIR/<stage>.d/*
+  - Package hooks: packages/<pkg>/hooks/<stage> and packages/<pkg>/hooks/<stage>.d/*
+
+Hooks receive these environment variables:
+  ADM_PKG, ADM_PKGDIR, ADM_SRCDIR, ADM_INSTDIR, ADM_META, ADM_ROOT, ADM_DRY_RUN
+
+EOF
+      ;;
+  esac
+fi
+
+# Export functions
+export -f adm_hooks_run _run_hook_file _global_hooks_for_stage _local_hook_path
+
+# End of adm-hooks
