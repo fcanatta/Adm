@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# adm-deps - dependency resolver and heuristic advisor for ADM
+# Location: /usr/src/adm/bin/adm-deps
+# Usage (examples):
+#   adm-deps resolve /usr/src/adm/metafiles/base/hello/metafile
+#   adm-deps resolve-by-name hello
+#   adm-deps suggest /usr/src/adm/packages/hello-1.0
+#   adm-deps show-graph /usr/src/adm/metafiles/base/hello/metafile
+#
+# Exports functions:
+#   adm_deps_resolve_by_metafile <metafile>     -> prints topo-sorted package names
+#   adm_deps_resolve_by_name <name>            -> finds metafile and resolves
+#   adm_deps_suggest_from_source <sourcedir>   -> prints suggestions
+#
+set -euo pipefail
+
+# Load logger if present
+if [ -x "/usr/src/adm/bin/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source /usr/src/adm/bin/adm-logger
+else
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+  adm_log_debug() { echo "[DEBUG]" "$@"; }
+fi
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_METAFILES_DIR:=$ADM_ROOT/metafiles}"
+: "${ADM_LOG_DEPS:=$ADM_ROOT/logs/deps}"
+mkdir -p "$ADM_LOG_DEPS" 2>/dev/null || true
+
+# Basic helpers
+_trim() { sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+
+# normalize dependency token (lowercase, remove version tokens in parentheses)
+_normalize_dep() {
+  local d="$1"
+  d="$(echo "$d" | tr '[:upper:]' '[:lower:]')"
+  # remove version hints like >=1.2, (=1.2), [optional] and parentheses
+  d="$(echo "$d" | sed -E 's/[\(\[][^)\]]*[\)\]]//g' | sed -E 's/[<>~=,].*$//')"
+  d="$(echo "$d" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  echo "$d"
+}
+
+# find metafile path by package name (search categories)
+find_metafile_by_name() {
+  local name="$1"
+  if [ -d "$ADM_METAFILES_DIR" ]; then
+    find "$ADM_METAFILES_DIR" -type f -name "metafile" -path "*/${name}/*" 2>/dev/null | head -n1 || true
+  else
+    echo ""    # none
+  fi
+}
+
+# parse build_deps/run_deps from a metafile path
+parse_deps_from_metafile() {
+  local metafile="$1"
+  local key="$2" # build_deps or run_deps
+  if [ ! -f "$metafile" ]; then
+    return 1
+  fi
+  # extract line, remove 'build_deps:' prefix, split by commas
+  local line
+  line=$(grep -E "^${key}:" "$metafile" 2>/dev/null || true)
+  line="${line#${key}:}"
+  line="$(echo "$line" | _trim)"
+  if [ -z "$line" ]; then
+    return 0
+  fi
+  # split by comma
+  IFS=',' read -ra arr <<< "$line"
+  for it in "${arr[@]}"; do
+    it="$(echo "$it" | _trim)"
+    [ -z "$it" ] && continue
+    echo "$(_normalize_dep "$it")"
+  done
+}
+
+# build adjacency list for dependencies
+# input: list of metafile paths (or program names)
+# output: prints nodes and edges; also populates associative arrays
+declare -A _ADM_DEPS_NODE_EXISTS
+declare -A _ADM_DEPS_ADJ # adjacency: key -> space-separated children
+declare -A _ADM_DEPS_META_FOR_NODE
+
+_add_node() {
+  local node="$1"
+  _ADM_DEPS_NODE_EXISTS["$node"]=1
+  # if meta known, keep
+}
+
+_add_edge() {
+  local src="$1"; local dst="$2"
+  # ensure existence
+  _add_node "$src"
+  _add_node "$dst"
+  local prev="${_ADM_DEPS_ADJ[$src]:-}"
+  # avoid duplicates
+  case " $prev " in
+    *" $dst "*) : ;; # already present
+    *) _ADM_DEPS_ADJ[$src]="${prev:+$prev }$dst" ;;
+  esac
+}
+
+# Attempt to map token to metafile context
+_resolve_token_to_meta() {
+  local token="$1"
+  # token may be like "glib" or "glib-2.0"
+  local meta
+  meta=$(find_metafile_by_name "$token" || true)
+  if [ -n "$meta" ]; then
+    echo "$meta"
+    return 0
+  fi
+  # fallback: try prefix match in categories
+  if [ -d "$ADM_METAFILES_DIR" ]; then
+    meta=$(find "$ADM_METAFILES_DIR" -type f -name "metafile" 2>/dev/null | while read -r mf; do
+      nm=$(grep -E '^name:' "$mf" 2>/dev/null | sed 's/^name:[[:space:]]*//')
+      if [ "$nm" = "$token" ]; then echo "$mf"; break; fi
+    done || true)
+  fi
+  if [ -n "$meta" ]; then
+    echo "$meta"
+    return 0
+  fi
+  return 1
+}
+
+# build graph starting from a given metafile
+# usage: build_graph_from_metafile /path/to/metafile
+build_graph_from_metafile() {
+  local start_meta="$1"
+  if [ ! -f "$start_meta" ]; then
+    adm_log_error "metafile not found: $start_meta"
+    return 1
+  fi
+
+  # clear previous
+  _ADM_DEPS_NODE_EXISTS=()
+  _ADM_DEPS_ADJ=()
+  _ADM_DEPS_META_FOR_NODE=()
+
+  # queue BFS of metas
+  local -a queue
+  queue=("$start_meta")
+  local idx=0
+  while [ "$idx" -lt "${#queue[@]}" ]; do
+    local meta="${queue[$idx]}"
+    idx=$((idx+1))
+    # load name
+    local name
+    name=$(grep -E "^name:" "$meta" 2>/dev/null | sed 's/^name:[[:space:]]*//' | _trim || true)
+    if [ -z "$name" ]; then
+      adm_log_error "metafile missing name: $meta"
+      continue
+    fi
+    name=$(_normalize_dep "$name")
+    _ADM_DEPS_META_FOR_NODE["$name"]="$meta"
+    _add_node "$name"
+
+    # get build_deps
+    while read -r dep; do
+      [ -z "$dep" ] && continue
+      dep_norm="$(_normalize_dep "$dep")"
+      # attempt to find metafile for dep
+      dep_meta=$(_resolve_token_to_meta "$dep_norm" || true)
+      if [ -n "$dep_meta" ]; then
+        _ADM_DEPS_META_FOR_NODE["$dep_norm"]="$dep_meta"
+        _add_edge "$name" "$dep_norm"
+        # enqueue if not processed
+        if [ -z "${_ADM_DEPS_NODE_EXISTS[$dep_norm]:-}" ]; then
+          queue+=("$dep_meta")
+        fi
+      else
+        # still create node; edge to unresolved token (will be reported)
+        _add_edge "$name" "$dep_norm"
+      fi
+    done < <(parse_deps_from_metafile "$meta" "build_deps" || true)
+  done
+
+  # print summary
+  adm_log_info "Dependency graph built for $(basename "$start_meta")"
+  return 0
+}
+
+# Topological sort (Kahn's algorithm)
+_topo_sort() {
+  # compute in-degree
+  declare -A indeg
+  for n in "${!_ADM_DEPS_NODE_EXISTS[@]}"; do indeg["$n"]=0; done
+  for src in "${!_ADM_DEPS_ADJ[@]}"; do
+    for dst in ${_ADM_DEPS_ADJ[$src]}; do
+      indeg["$dst"]=$(( ${indeg["$dst"]:-0} + 1 ))
+    done
+  done
+  # queue nodes with indeg 0
+  local -a q
+  for n in "${!indeg[@]}"; do
+    if [ "${indeg[$n]}" -eq 0 ]; then q+=("$n"); fi
+  done
+  local -a order
+  while [ "${#q[@]}" -ne 0 ]; do
+    local n="${q[0]}"
+    q=("${q[@]:1}")
+    order+=("$n")
+    for m in ${_ADM_DEPS_ADJ[$n]:-}; do
+      indeg["$m"]=$((indeg["$m"] - 1))
+      if [ "${indeg[$m]}" -eq 0 ]; then
+        q+=("$m")
+      fi
+    done
+  done
+
+  # check if all nodes processed
+  if [ "${#order[@]}" -ne "${#_ADM_DEPS_NODE_EXISTS[@]}" ]; then
+    # find cycle nodes
+    local -a cyc
+    for n in "${!_ADM_DEPS_NODE_EXISTS[@]}"; do
+      skip=0
+      for p in "${order[@]}"; do
+        if [ "$n" = "$p" ]; then skip=1; break; fi
+      done
+      [ "$skip" -eq 0 ] && cyc+=("$n")
+    done
+    adm_log_error "Cycle detected or unresolved deps: ${cyc[*]}"
+    return 2
+  fi
+
+  # print order (reverse so dependencies first)
+  # We actually want dependencies built before dependents: order is fine as is
+  printf "%s\n" "${order[@]}"
+  return 0
+}
+
+# show graph in a simple text form and write to log file
+show_graph() {
+  local metafile="$1"
+  [ -f "$metafile" ] || { adm_log_error "metafile not found: $metafile"; return 1; }
+  build_graph_from_metafile "$metafile" || return 1
+  local out="$ADM_LOG_DEPS/graph-$(basename "$metafile").txt"
+  {
+    echo "Graph for: $metafile"
+    for src in "${!_ADM_DEPS_ADJ[@]}"; do
+      echo "$src -> ${_ADM_DEPS_ADJ[$src]}"
+    done
+  } > "$out"
+  adm_log_correct "Graph written to $out"
+  # also print to stdout
+  for src in "${!_ADM_DEPS_ADJ[@]}"; do
+    echo "$src -> ${_ADM_DEPS_ADJ[$src]}"
+  done
+}
+
+# Public wrapper: resolve_by_metafile
+adm_deps_resolve_by_metafile() {
+  local metafile="$1"
+  build_graph_from_metafile "$metafile" || return $?
+  _topo_sort || return $?
+}
+
+# Public wrapper: resolve_by_name
+adm_deps_resolve_by_name() {
+  local name="$1"
+  local meta
+  meta=$(find_metafile_by_name "$name" || true)
+  if [ -z "$meta" ]; then
+    adm_log_error "Metafile for $name not found"
+    return 1
+  fi
+  adm_deps_resolve_by_metafile "$meta"
+}
+
+# Heuristics: infer deps from source dir
+# Supports: configure.ac / configure, CMakeLists.txt, meson.build, pyproject.toml/setup.py, Cargo.toml, go.mod, package.json
+infer_deps_from_source() {
+  local srcdir="$1"
+  local outfile="${ADM_LOG_DEPS}/suggest-$(basename "$srcdir")-$(date +%s).txt"
+  mkdir -p "$(dirname "$outfile")" 2>/dev/null || true
+  adm_log_info "Analyzing source for hints: $srcdir"
+  > "$outfile" || true
+
+  # Autotools: look for PKG_CHECK_MODULES, AC_CHECK_LIB, AC_CHECK_HEADER
+  if [ -f "$srcdir/configure.ac" ] || [ -f "$srcdir/configure" ]; then
+    adm_log_debug "Autotools detected"
+    grep -Eo "PKG_CHECK_MODULES\([^)]*\)" "$srcdir" 2>/dev/null | sed -E 's/PKG_CHECK_MODULES\(([^ ]*).*/\1/' | while read -r m; do
+      m="$(echo "$m" | tr -d \")"
+      echo "suggest: $m (from PKG_CHECK_MODULES)" >> "$outfile"
+    done || true
+    grep -Eo "AC_CHECK_LIB\([^,)]*" "$srcdir" 2>/dev/null | sed -E 's/AC_CHECK_LIB\(([^,)]*).*/\1/' | while read -r m; do
+      echo "suggest-lib: $m (from AC_CHECK_LIB)" >> "$outfile"
+    done || true
+  fi
+
+  # CMake: find_package, pkg_check_modules
+  if [ -f "$srcdir/CMakeLists.txt" ]; then
+    adm_log_debug "CMake detected"
+    grep -E "find_package|pkg_check_modules" -n "$srcdir/CMakeLists.txt" 2>/dev/null | sed -E "s/.*(find_package|pkg_check_modules)[[:space:]]*\((.*)\).*/\\2/" | tr -s ' ' '\n' | while read -r token; do
+      token="$(echo "$token" | sed -E 's/[^a-zA-Z0-9_\-]/ /g' | awk '{print $1}' || true)"
+      [ -z "$token" ] && continue
+      echo "suggest: $token (from CMakeLists)" >> "$outfile"
+    done || true
+  fi
+
+  # Meson: dependency('name')
+  if grep -qE "meson.build" <<< "$(ls -A "$srcdir" 2>/dev/null)" || [ -f "$srcdir/meson.build" ]; then
+    adm_log_debug "Meson detected"
+    grep -RHo "dependency\s*\(\s*'[^']+'\s*\)" "$srcdir" 2>/dev/null | sed -E "s/.*dependency\s*\(\s*'([^']+)'.*/\\1/" | sort -u | while read -r dep; do
+      echo "suggest: $dep (from meson.build)" >> "$outfile"
+    done || true
+  fi
+
+  # Python: pyproject.toml or setup.py
+  if [ -f "$srcdir/pyproject.toml" ] || [ -f "$srcdir/setup.py" ]; then
+    adm_log_debug "Python project detected"
+    if [ -f "$srcdir/pyproject.toml" ]; then
+      grep -E "requires-dist|dependencies" -n "$srcdir/pyproject.toml" 2>/dev/null | sed -E 's/.*=//' | sed -E 's/[][]//g' | tr ',' '\n' | while read -r p; do
+        p="$(echo "$p" | sed -E 's/[" ]//g' | _trim)"
+        [ -z "$p" ] && continue
+        echo "suggest-py: $p (from pyproject.toml)" >> "$outfile"
+      done || true
+    fi
+    if [ -f "$srcdir/setup.py" ]; then
+      grep -E "install_requires|requires" -n "$srcdir/setup.py" 2>/dev/null | sed -E 's/.*=//' | tr ',' '\n' | while read -r p; do
+        p="$(echo "$p" | sed -E "s/['\"]//g" | _trim)"
+        [ -z "$p" ] && continue
+        echo "suggest-py: $p (from setup.py)" >> "$outfile"
+      done || true
+    fi
+  fi
+
+  # Rust: Cargo.toml
+  if [ -f "$srcdir/Cargo.toml" ]; then
+    adm_log_debug "Rust project detected"
+    grep -E "^\[dependencies\]|^\[build-dependencies\]" -n "$srcdir/Cargo.toml" 2>/dev/null >/dev/null && {
+      sed -n '/^\[dependencies\]/, /^\[/{/^\[/q;p}' "$srcdir/Cargo.toml" 2>/dev/null | grep -E "^[a-zA-Z0-9_\-]" | awk -F'=' '{print $1}' | sed 's/[[:space:]]//g' | while read -r dep; do
+        [ -z "$dep" ] && continue
+        echo "suggest-rust: $dep (from Cargo.toml)" >> "$outfile"
+      done || true
+    }
+  fi
+
+  # Go: go.mod
+  if [ -f "$srcdir/go.mod" ]; then
+    adm_log_debug "Go project detected"
+    sed -n 's/^require //p' "$srcdir/go.mod" 2>/dev/null | awk '{print $1}' | while read -r m; do
+      [ -z "$m" ] && continue
+      echo "suggest-go: $m (from go.mod)" >> "$outfile"
+    done || true
+  fi
+
+  # Node: package.json
+  if [ -f "$srcdir/package.json" ]; then
+    adm_log_debug "Node project detected"
+    # try to extract dependencies using jq if available, otherwise crude grep
+    if command -v jq >/dev/null 2>&1; then
+      jq -r '.dependencies // {} | keys[]' "$srcdir/package.json" 2>/dev/null | while read -r m; do echo "suggest-node: $m (from package.json)" >> "$outfile"; done || true
+    else
+      grep -E '"dependencies"|"devDependencies"' -n "$srcdir/package.json" 2>/dev/null >/dev/null && {
+        sed -n '/"dependencies"/,/"}/p' "$srcdir/package.json" 2>/dev/null | grep -E '"[a-zA-Z0-9_\-]+"' -o | sed 's/"//g' | while read -r m; do echo "suggest-node: $m (from package.json)" >> "$outfile"; done || true
+      }
+    fi
+  fi
+
+  # generic heuristics: pkg-config references in source
+  grep -RHo "pkg-config --cflags|pkg-config\([^)]+\)|PKG_CHECK_MODULES" "$srcdir" 2>/dev/null | while read -r l; do
+    echo "suggest-generic: $l" >> "$outfile"
+  done || true
+
+  adm_log_correct "Suggestion analysis written to $outfile"
+  cat "$outfile"
+  return 0
+}
+
+# suggest wrapper for a package dir
+adm_deps_suggest_from_source() {
+  local src="$1"
+  if [ -z "$src" ] || [ ! -d "$src" ]; then
+    adm_log_error "Source directory not found: $src"
+    return 1
+  fi
+  infer_deps_from_source "$src"
+}
+
+# CLI
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    resolve)
+      meta="${1:-}"
+      if [ -z "$meta" ]; then
+        adm_log_error "Usage: adm-deps resolve <metafile>"
+        exit 1
+      fi
+      adm_deps_resolve_by_metafile "$meta" || exit $?
+      ;;
+    resolve-by-name)
+      name="${1:-}"
+      if [ -z "$name" ]; then
+        adm_log_error "Usage: adm-deps resolve-by-name <name>"
+        exit 1
+      fi
+      adm_deps_resolve_by_name "$name" || exit $?
+      ;;
+    show-graph)
+      meta="${1:-}"
+      [ -z "$meta" ] && { adm_log_error "Usage: adm-deps show-graph <metafile>"; exit 1; }
+      show_graph "$meta" || exit $?
+      ;;
+    suggest)
+      src="${1:-}"
+      [ -z "$src" ] && { adm_log_error "Usage: adm-deps suggest <source-dir>"; exit 1; }
+      adm_deps_suggest_from_source "$src" || exit $?
+      ;;
+    help|*)
+      cat <<EOF
+adm-deps - dependency resolver and heuristic advisor
+
+Commands:
+  resolve <metafile>         Build dependency order (topo) for metafile
+  resolve-by-name <name>     Find metafile and resolve order
+  show-graph <metafile>      Print and log graph
+  suggest <source-dir>       Heuristic suggestions from source files
+  help
+
+Examples:
+  adm-deps resolve /usr/src/adm/metafiles/base/hello/metafile
+  adm-deps resolve-by-name gtk
+  adm-deps suggest /usr/src/adm/packages/hello-1.0
+EOF
+      exit 0
+      ;;
+  esac
+fi
+
+# Exporting functions so other scripts can source this file
+export -f find_metafile_by_name parse_deps_from_metafile build_graph_from_metafile \
+  adm_deps_resolve_by_metafile adm_deps_resolve_by_name adm_deps_suggest_from_source
+
+# End of adm-deps
