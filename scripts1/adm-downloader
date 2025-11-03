@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# adm-downloader - download manager for ADM
+# Location: /usr/src/adm/bin/adm-downloader
+# Makes parallel downloads with cache and sha256 verification.
+#
+# Exports functions:
+#   adm_download_urls_parallel <parallel> <url1> [url2 ...]
+#   adm_download_url <url> <dest> [expected_sha256]
+#   adm_verify_sha256 <file> <sha256>
+#
+# CLI usage: adm-downloader [--parallel N] [--force] [--dry-run] <url|path> ...
+#
+set -euo pipefail
+
+# Load adm-logger if exists
+if [ -x "/usr/src/adm/bin/adm-logger" ]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source /usr/src/adm/bin/adm-logger
+else
+  adm_log_info() { echo "[INFO]" "$@"; }
+  adm_log_error() { echo "[ERROR]" "$@" >&2; }
+  adm_log_correct() { echo "[OK]" "$@"; }
+  adm_start_spinner() { :; }
+  adm_stop_spinner() { :; }
+  adm_progress_init() { :; }
+  adm_progress_update() { :; }
+  adm_progress_finish() { :; }
+  adm_package_log() { :; }
+fi
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_CACHE_DIR:=$ADM_ROOT/cache/sources}"
+: "${ADM_DOWNLOAD_RETRIES:=3}"
+: "${ADM_DOWNLOAD_TIMEOUT:=300}"   # seconds
+: "${ADM_PARALLEL:=4}"
+
+mkdir -p "$ADM_CACHE_DIR" 2>/dev/null || true
+
+# Helpers
+_is_url() {
+  case "$1" in
+    http://*|https://*|ftp://*|git://*|ssh://*|file://*|*.git) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_filename_from_url() {
+  local url="$1"
+  # trim query params
+  local tmp="${url%%\?*}"
+  # if ends with /, use host-timestamp
+  if [[ "$tmp" =~ /$ ]]; then
+    printf "%s-%s" "$(echo "$tmp" | sed -E 's#[:/]+#-#g' | sed -E 's#-+$##')" "$(date +%s)"
+    return
+  fi
+  # basename
+  local base
+  base=$(basename "$tmp")
+  # if looks empty, fallback
+  if [ -z "$base" ] || [ "$base" = "/" ]; then
+    printf "%s-%s" "$(echo "$tmp" | sed -E 's#[:/]+#-#g')" "$(date +%s)"
+  else
+    printf "%s" "$base"
+  fi
+}
+
+# verify sha256
+adm_verify_sha256() {
+  local file="$1"
+  local want="$2"
+  if [ ! -f "$file" ]; then
+    adm_log_error "File not found for checksum: $file"
+    return 1
+  fi
+  if ! command -v sha256sum >/dev/null 2>&1; then
+    adm_log_error "sha256sum not available to verify $file"
+    return 2
+  fi
+  local got
+  got=$(sha256sum "$file" | awk '{print $1}')
+  if [ "$got" != "$want" ]; then
+    adm_log_error "sha256 mismatch for $file (got $got, want $want)"
+    return 1
+  fi
+  adm_log_correct "Checksum OK: $(basename "$file")"
+  return 0
+}
+
+# low-level single URL download (uses curl or wget). If expected sha256 provided, validate.
+# Usage: adm_download_url <url> <dest> [expected_sha256]
+adm_download_url() {
+  local url="$1"
+  local dest="$2"
+  local expected_sha256="${3:-}"
+  local tries="${ADM_DOWNLOAD_RETRIES}"
+  local tmpfile="${dest}.part"
+  local success=1
+
+  # If file already exists and sha matches, skip unless force
+  if [ -f "$dest" ] && [ -n "$expected_sha256" ]; then
+    if adm_verify_sha256 "$dest" "$expected_sha256"; then
+      adm_log_info "Using cached file: $dest"
+      return 0
+    else
+      adm_log_info "Cached file checksum mismatch, will re-download: $dest"
+    fi
+  elif [ -f "$dest" ] && [ "${FORCE_DOWNLOAD:-0}" -eq 0 ]; then
+    adm_log_info "Using existing file (no checksum provided): $dest"
+    return 0
+  fi
+
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would download: $url -> $dest"
+    return 0
+  fi
+
+  while [ "$tries" -gt 0 ]; do
+    tries=$((tries-1))
+    adm_log_info "Downloading: $url (to $dest), attempts left: $tries"
+    rm -f "$tmpfile" 2>/dev/null || true
+
+    if command -v curl >/dev/null 2>&1; then
+      # Use curl with progress bar, timeout and retry
+      # We let curl show progress; prefix output with filename for clarity
+      # Use --fail to return non-zero for HTTP errors
+      # Use --retry to attempt transient errors (curl internal)
+      CURL_OPTS=(--fail --location --connect-timeout 20 --max-time "$ADM_DOWNLOAD_TIMEOUT" --retry 3 --retry-delay 2 --compressed -o "$tmpfile")
+      # show progress bar for tty
+      if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
+        # use curl's progress meter (non-verbose)
+        if curl "${CURL_OPTS[@]}" "$url"; then
+          mv -f "$tmpfile" "$dest"
+          success=0
+          break
+        fi
+      else
+        # non-interactive
+        if curl -sS "${CURL_OPTS[@]}" "$url"; then
+          mv -f "$tmpfile" "$dest"
+          success=0
+          break
+        fi
+      fi
+    elif command -v wget >/dev/null 2>&1; then
+      # wget fallback
+      WGET_OPTS=(--timeout=20 --tries=3 -O "$tmpfile")
+      if [ -t 1 ] && [ "${NO_COLOR:-0}" != "1" ]; then
+        if wget "${WGET_OPTS[@]}" "$url"; then
+          mv -f "$tmpfile" "$dest"
+          success=0
+          break
+        fi
+      else
+        if wget -q "${WGET_OPTS[@]}" "$url"; then
+          mv -f "$tmpfile" "$dest"
+          success=0
+          break
+        fi
+      fi
+    else
+      adm_log_error "Nenhum downloader (curl/wget) disponível para baixar $url"
+      return 2
+    fi
+
+    adm_log_error "Falha no download de $url (tentativas restantes: $tries)"
+    sleep 1
+  done
+
+  if [ "$success" -ne 0 ]; then
+    adm_log_error "Download final falhou: $url"
+    return 1
+  fi
+
+  # verify sha if provided
+  if [ -n "$expected_sha256" ]; then
+    if ! adm_verify_sha256 "$dest" "$expected_sha256"; then
+      adm_log_error "Checksum failed after download: $dest"
+      rm -f "$dest" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  adm_log_correct "Downloaded: $(basename "$dest")"
+  return 0
+}
+
+# support git clone: adm_clone_git <repo_url> <destdir>
+adm_clone_git() {
+  local repo="$1"
+  local dest="$2"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would git clone $repo -> $dest"
+    return 0
+  fi
+  if ! command -v git >/dev/null 2>&1; then
+    adm_log_error "git not available to clone $repo"
+    return 2
+  fi
+  adm_log_info "Cloning git repo: $repo -> $dest"
+  rm -rf "$dest" 2>/dev/null || true
+  git clone --depth 1 "$repo" "$dest" || {
+    adm_log_error "git clone failed for $repo"
+    return 1
+  }
+  adm_log_correct "Cloned $repo"
+  return 0
+}
+
+# wrapper to download a URL into cache dir and return path
+# adm_cache_download <url> [expected_sha256]
+adm_cache_download() {
+  local url="$1"
+  local expected_sha256="${2:-}"
+  local fname
+  fname=$(_filename_from_url "$url")
+  local dest="$ADM_CACHE_DIR/$fname"
+
+  # If git repo
+  if [[ "$url" =~ \.git$ ]] || [[ "$url" =~ ^git:// ]] || [[ "$url" =~ ^ssh:// ]] ; then
+    # create a directory per repo
+    local repoid
+    repoid=$(echo "$url" | sed -E 's#[:/]+#-#g' | sed -E 's#-+$##')
+    dest="$ADM_CACHE_DIR/git-$repoid"
+    if [ -d "$dest" ] && [ "${FORCE_DOWNLOAD:-0}" -eq 0 ]; then
+      adm_log_info "Using cached git clone: $dest"
+      echo "$dest"
+      return 0
+    fi
+    adm_clone_git "$url" "$dest" || return 1
+    echo "$dest"
+    return 0
+  fi
+
+  # If file already exists and checksum matches (or no checksum but file present)
+  if [ -f "$dest" ] && [ "${FORCE_DOWNLOAD:-0}" -eq 0 ]; then
+    if [ -n "$expected_sha256" ]; then
+      if adm_verify_sha256 "$dest" "$expected_sha256"; then
+        adm_log_info "Cache hit: $dest"
+        echo "$dest"
+        return 0
+      else
+        adm_log_info "Cache checksum mismatch, re-downloading: $dest"
+        rm -f "$dest" || true
+      fi
+    else
+      adm_log_info "Cache hit (no checksum provided): $dest"
+      echo "$dest"
+      return 0
+    fi
+  fi
+
+  # ensure directory
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would download $url to $dest"
+    echo "$dest"
+    return 0
+  fi
+  mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  adm_download_url "$url" "$dest" "$expected_sha256" || return 1
+  echo "$dest"
+}
+
+# Parallel downloader for many URLs
+# adm_download_urls_parallel <parallel> <url1> [url2 ...]
+adm_download_urls_parallel() {
+  local parallel="${1:-$ADM_PARALLEL}"
+  shift || true
+  local urls=("$@")
+
+  if [ "${#urls[@]}" -eq 0 ]; then
+    adm_log_error "No URLs provided to adm_download_urls_parallel"
+    return 1
+  fi
+
+  adm_log_info "Starting parallel download of ${#urls[@]} files (parallel=${parallel})"
+
+  # internal worker to process a single entry: supports "url||sha256" input
+  _worker() {
+    local entry="$1"
+    local url="${entry%%||*}"
+    local want="${entry#*||}"
+    if [ "$want" = "$entry" ]; then want=""; fi
+    adm_cache_download "$url" "$want" || return 1
+  }
+
+  export -f _worker adm_cache_download adm_download_url adm_clone_git adm_verify_sha256 \
+    adm_log_info adm_log_error adm_log_correct adm_log_debug
+  export ADM_CACHE_DIR ADM_DRY_RUN FORCE_DOWNLOAD ADM_DOWNLOAD_RETRIES ADM_DOWNLOAD_TIMEOUT
+
+  # Prepare entries
+  local entries=()
+  local u
+  for u in "${urls[@]}"; do
+    entries+=("$u")
+  done
+
+  # If xargs with -P is available, use it (more portable)
+  if command -v xargs >/dev/null 2>&1; then
+    # Create a temporary file with lines
+    local tmpfile
+    tmpfile=$(mktemp)
+    for e in "${entries[@]}"; do
+      printf "%s\n" "$e" >> "$tmpfile"
+    done
+    # Use xargs -P
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would run parallel downloads via xargs -P ${parallel}"
+      rm -f "$tmpfile"
+      return 0
+    fi
+    xargs -a "$tmpfile" -I{} -P "$parallel" bash -c '_worker "{}"' || {
+      rm -f "$tmpfile"
+      adm_log_error "Some parallel downloads failed"
+      return 1
+    }
+    rm -f "$tmpfile"
+  else
+    # fallback: background jobs limited to $parallel
+    local in_flight=0
+    for e in "${entries[@]}"; do
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would download: $e"
+        continue
+      fi
+      _worker "$e" &
+      in_flight=$((in_flight+1))
+      if [ "$in_flight" -ge "$parallel" ]; then
+        wait -n || true
+        in_flight=$((in_flight-1))
+      fi
+    done
+    wait || true
+  fi
+
+  adm_log_correct "Parallel download finished"
+  return 0
+}
+
+# CLI entrypoint
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # parse args
+  PARALLEL="$ADM_PARALLEL"
+  FORCE_DOWNLOAD=0
+  show_help=0
+  urls=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help) show_help=1; shift ;;
+      -p|--parallel) PARALLEL="${2:-}"; shift 2 ;;
+      --force) FORCE_DOWNLOAD=1; shift ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --sha256) # next arg pairs: url sha256
+        url="${2:-}"; sha="${3:-}"
+        if [ -z "$sha" ] || [ -z "$url" ]; then
+          adm_log_error "--sha256 requires two arguments: <url> <sha256>"
+          exit 1
+        fi
+        urls+=("${url}||${sha}")
+        shift 3
+        ;;
+      *) urls+=("$1"); shift ;;
+    esac
+  done
+
+  if [ "$show_help" -eq 1 ] || [ "${#urls[@]}" -eq 0 ]; then
+    cat <<EOF
+adm-downloader - download files into ADM cache with verification
+
+Usage:
+  adm-downloader [--parallel N] [--force] [--dry-run] <url1> [url2 ...]
+  adm-downloader --sha256 <url> <sha256>  (pairs)
+
+Options:
+  -p, --parallel N   Number of parallel downloads (default $ADM_PARALLEL)
+  --force            Force re-download even if cached
+  --dry-run          Show what would be done without writing files
+  --sha256 url sha   Provide expected sha256 for verification
+  -h, --help         Show this help
+
+Examples:
+  adm-downloader -p 6 https://ftp.gnu.org/gnu/bash/bash-5.2.tar.gz
+  adm-downloader --sha256 https://example.com/foo.tar.gz abcdef1234...
+EOF
+    exit 0
+  fi
+
+  FORCE_DOWNLOAD="${FORCE_DOWNLOAD:-0}"
+  export FORCE_DOWNLOAD
+
+  # run parallel downloads
+  adm_download_urls_parallel "$PARALLEL" "${urls[@]}" || exit 1
+  exit 0
+fi
