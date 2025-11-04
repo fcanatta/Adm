@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel-headers post-install
+# - Verifica estrutura final dos headers instalados e registra versão.
+# - Garante presença de include/linux/version.h.
+# - Remove arquivos temporários e empacota headers.
+#
+set -euo pipefail
+
+echo "🔧 [linux-kernel-headers post-install] Verificando instalação..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/kernel-headers.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/linux-headers-destdir}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+PKG_NAME="linux-kernel-headers-${VERSION:-$(date +%Y%m%d)}"
+
+mkdir -p "$CACHE_DIR"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria estrutura em $DESTDIR/usr/include"
+  exit 0
+fi
+
+# 1️⃣ Verificar estrutura básica
+if [ ! -f "$DESTDIR/usr/include/linux/version.h" ]; then
+  echo "❌ Header principal ausente: linux/version.h"
+  echo "[`date -u`] version.h missing" >> "$ADM_LOG"
+  exit 1
+fi
+
+# 2️⃣ Registrar versão
+kernel_ver="$(grep UTS_RELEASE "$DESTDIR/usr/include/linux/version.h" | awk '{print $3}' | tr -d '"' || echo unknown)"
+echo "✔️  Versão detectada: $kernel_ver"
+echo "$kernel_ver" > "$DESTDIR/usr/include/linux/.kernel_version"
+
+# 3️⃣ Empacotar headers
+tarball="${CACHE_DIR}/${PKG_NAME}.tar.xz"
+tar -C "$DESTDIR/usr/include" -cJf "$tarball" . || {
+  echo "❌ Falha ao empacotar headers."
+  exit 1
+}
+sha256sum "$tarball" > "${tarball}.sha256" || true
+
+echo "[`date -u`] headers packaged $tarball" >> "$ADM_LOG"
+echo "✅ [post-install] Headers verificados e empacotados."
