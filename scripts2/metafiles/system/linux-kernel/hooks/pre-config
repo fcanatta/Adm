@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel pre-config
+# Gera automaticamente o .config do kernel conforme o perfil de build.
+# Pode usar make defconfig, localmodconfig ou allmodconfig.
+#
+set -euo pipefail
+
+echo "⚙️ [linux-kernel pre-config] Gerando configuração automática..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-preconfig.log}"
+SRC_DIR="${SRC_DIR:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+
+mkdir -p "$(dirname "$ADM_LOG")" || true
+echo "[`date -u`] pre-config start (profile=${ADM_PROFILE})" >> "$ADM_LOG"
+
+# 1️⃣ Detectar perfil
+case "$ADM_PROFILE" in
+  none)
+    CONFIG_TYPE="defconfig"
+    ;;
+  normal)
+    CONFIG_TYPE="localmodconfig"
+    ;;
+  extreme)
+    CONFIG_TYPE="allmodconfig"
+    ;;
+  *)
+    CONFIG_TYPE="defconfig"
+    ;;
+esac
+
+echo "📄 Configuração: $CONFIG_TYPE (perfil: $ADM_PROFILE)"
+echo "[`date -u`] config_type=$CONFIG_TYPE" >> "$ADM_LOG"
+
+# 2️⃣ Executar comando de configuração
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria: make $CONFIG_TYPE"
+  exit 0
+fi
+
+if ! make -C "$SRC_DIR" "$CONFIG_TYPE" > "$BUILD_DIR/config.log" 2>&1; then
+  echo "❌ make $CONFIG_TYPE falhou — ver build/config.log"
+  tail -n 50 "$BUILD_DIR/config.log" || true
+  exit 1
+fi
+
+# 3️⃣ Mostrar resumo de config
+grep -E '^CONFIG_' "$SRC_DIR/.config" | wc -l | xargs echo "✔️  Linhas de configuração geradas:"
+
+echo "[`date -u`] pre-config done" >> "$ADM_LOG"
+echo "✅ [linux-kernel pre-config] Configuração gerada com sucesso."
