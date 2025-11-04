@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# ADM post-build hook for Linux kernel
+# Installs modules and headers
+
+adm_log_info "[HOOK post-build] Installing kernel modules and headers..."
+
+DESTDIR="${DESTDIR:-/usr/local}"
+make modules_install INSTALL_MOD_PATH="$DESTDIR" || adm_log_err "Module install failed"
+make headers_install INSTALL_HDR_PATH="$DESTDIR/usr" || adm_log_err "Header install failed"
+
+adm_log_ok "[HOOK post-build] Linux kernel build and install complete."
