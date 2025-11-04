@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# ADM HOOK: GCC post-install
+# Ajusta symlinks e registra a versão instalada
+
+set -euo pipefail
+
+echo "🔧 [GCC post-install] Ajustando links e registrando versão..."
+
+DESTDIR="${DESTDIR:-/usr/src/adm/tmp/gcc-destdir}"
+PREFIX="${PREFIX:-/usr}"
+
+# Criar links simbólicos padrão
+ln -sf gcc "$DESTDIR/$PREFIX/bin/cc"
+ln -sf g++ "$DESTDIR/$PREFIX/bin/c++"
+ln -sf cpp "$DESTDIR/$PREFIX/bin/cpp"
+
+# Detectar versão instalada
+if [ -x "$DESTDIR/$PREFIX/bin/gcc" ]; then
+  ver="$("$DESTDIR/$PREFIX/bin/gcc" -dumpversion || echo unknown)"
+  echo "$ver" > "$DESTDIR/$PREFIX/lib/gcc/version"
+  echo "✔️  GCC versão registrada: $ver"
+fi
+
+# Registrar log
+echo "[`date -u`] GCC $ver instalado em $DESTDIR" >> "${ADM_LOG:-/usr/src/adm/logs/gcc-install.log}"
+
+# Opcional: limpar arquivos temporários
+find "$DESTDIR" -name '*.la' -delete 2>/dev/null || true
+echo "🧹 Arquivos *.la removidos (limpeza opcional)"
+
+echo "✅ [GCC post-install] Finalizado com sucesso"
