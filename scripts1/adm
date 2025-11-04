@@ -1,0 +1,949 @@
+#!/usr/bin/env bash
+# adm - ADM CLI controller (Part 1/3)
+# Loads ADM modules (via source) and exposes a unified CLI.
+# This file is Part 1/3 (initialization, logger, loader, basic queries and metafile creation helpers).
+# Combine Parts 1/3 + 2/3 + 3/3 to form the final /usr/src/adm/bin/adm executable.
+#
+# Mode: integrated (sources module files under ADM_ROOT/bin)
+# Safety: dry-run by default; destructive operations require ADM_ALLOW_EXECUTION=1 and/or flags.
+set -euo pipefail
+shopt -s extglob
+
+# ------------------------
+# Use global ADM variables if present, else reasonable defaults
+# ------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=${ADM_ROOT}/bin}"
+: "${ADM_METAFILES_DIR:=${ADM_ROOT}/metafiles}"
+: "${ADM_LOG_DIR:=${ADM_ROOT}/logs}"
+: "${ADM_CACHE_DIR:=${ADM_ROOT}/cache}"
+: "${ADM_CHROOTS_DIR:=${ADM_ROOT}/chroots}"
+: "${ADM_TMPDIR:=${ADM_ROOT}/tmp}"
+: "${ADM_DRY_RUN:=1}"               # default simulate
+: "${ADM_ALLOW_EXECUTION:=0}"       # set to 1 to allow real actions (still requires uncommented code in modules)
+: "${ADM_VERBOSE:=1}"               # 2 = debug
+: "${ADM_COLOR:=1}"                 # 0 disable color
+: "${ADM_JOBS:=$(nproc 2>/dev/null || echo 1)}"
+
+# Ensure base directories exist (safe)
+mkdir -p "$ADM_ROOT" "$ADM_BIN_DIR" "$ADM_METAFILES_DIR" "$ADM_LOG_DIR" "$ADM_CACHE_DIR" "$ADM_TMPDIR" "$ADM_CHROOTS_DIR" 2>/dev/null || true
+
+export ADM_ROOT ADM_BIN_DIR ADM_METAFILES_DIR ADM_LOG_DIR ADM_CACHE_DIR ADM_CHROOTS_DIR ADM_TMPDIR ADM_DRY_RUN ADM_ALLOW_EXECUTION ADM_VERBOSE ADM_COLOR ADM_JOBS
+
+# ------------------------
+# Logging utilities (consistent with adm-logger)
+# ------------------------
+_adm_cli_color() {
+  [ "${ADM_COLOR:-1}" -eq 1 ] || return 0
+  case "$1" in
+    magenta) printf '\033[1;35m' ;;
+    yellow)  printf '\033[1;33m' ;;
+    red)     printf '\033[1;31m' ;;
+    cyan)    printf '\033[0;36m' ;;
+    green)   printf '\033[0;32m' ;;
+    reset)   printf '\033[0m' ;;
+    *)       printf '' ;;
+  esac
+}
+
+_adm_cli_now() { date '+%Y-%m-%d %H:%M:%S'; }
+
+adm_log_title() {
+  _adm_cli_color magenta
+  printf "%s %s\n" "$(_adm_cli_now)" "$*"
+  _adm_cli_color reset
+}
+adm_log_info() {
+  _adm_cli_color cyan
+  printf "%s %s\n" "$(_adm_cli_now)" "[INFO] $*"
+  _adm_cli_color reset
+}
+adm_log_ok() {
+  _adm_cli_color yellow
+  printf "%s %s\n" "$(_adm_cli_now)" "[OK]   $*"
+  _adm_cli_color reset
+}
+adm_log_err() {
+  _adm_cli_color red
+  printf "%s %s\n" "$(_adm_cli_now)" "[ERR]  $*" >&2
+  _adm_cli_color reset
+}
+adm_log_dbg() {
+  if [ "${ADM_VERBOSE:-1}" -ge 2 ]; then
+    printf "%s [DBG] %s\n" "$(_adm_cli_now)" "$*"
+  fi
+}
+
+# log to file and stdout for a command
+_adm_cli_log_to_file() {
+  local stage="${1:-adm-cli}"
+  shift
+  local lf="$ADM_LOG_DIR/${stage}.log"
+  mkdir -p "$(dirname "$lf")" 2>/dev/null || true
+  printf "%s %s\n" "$(_adm_cli_now)" "$*" >> "$lf" 2>/dev/null || true
+  adm_log_info "$*"
+}
+
+# ------------------------
+# Spinner (lightweight) - used across commands
+# ------------------------
+_adm_cli_spinner_pid=""
+_adm_cli_spinner_stopfile=""
+
+_adm_cli__spinner_loop() {
+  local msg="$1"
+  local interval=0.08
+  local chars='|/-\'
+  local i=0
+  _adm_cli_color magenta
+  while [ ! -f "$_adm_cli_spinner_stopfile" ]; do
+    local c="${chars:i%${#chars}:1}"
+    printf "\r%s %b %s [%s]" "$(_adm_cli_now)" "\033[1;35m$msg\033[0m" "" "$c"
+    sleep "$interval"
+    ((i++))
+  done
+  printf "\r"
+  _adm_cli_color reset
+}
+spinner_start() {
+  local msg="$1"
+  _adm_cli_spinner_stopfile="$(mktemp -p "$ADM_TMPDIR" adm-spinner.XXXX)"
+  ( _adm_cli__spinner_loop "$msg" ) &
+  _adm_cli_spinner_pid=$!
+  disown "$_adm_cli_spinner_pid" 2>/dev/null || true
+}
+spinner_stop() {
+  local rc="${1:-0}"
+  if [ -n "$_adm_cli_spinner_stopfile" ] && [ -f "$_adm_cli_spinner_stopfile" ]; then
+    touch "$_adm_cli_spinner_stopfile"
+    sleep 0.02
+    rm -f "$_adm_cli_spinner_stopfile" 2>/dev/null || true
+  fi
+  if [ -n "$_adm_cli_spinner_pid" ]; then
+    kill -0 "$_adm_cli_spinner_pid" 2>/dev/null || true
+    unset _adm_cli_spinner_pid
+  fi
+  if [ "$rc" -eq 0 ]; then adm_log_ok "Done"; else adm_log_err "Failed (rc=$rc)"; fi
+}
+
+# ------------------------
+# Module loader
+# Try to source modules from ADM_BIN_DIR (adm-meta, adm-deps, adm-build, adm-install, adm-update, adm-uninstall, adm-clean, adm-hooks, adm-patcher, adm-logger, adm-downloader, adm-bootstrap, adm-chroot)
+# We source if present and executable/readable. Non-fatal if some modules missing (commands will fail gracefully).
+# ------------------------
+_adm_cli_modules=(
+  adm-logger adm-meta adm-deps adm-downloader adm-patcher adm-hooks
+  adm-build adm-install adm-uninstall adm-update adm-clean adm-bootstrap adm-chroot
+)
+
+_adm_cli_loaded_modules=()
+
+_adm_cli_try_source() {
+  local file="$1"
+  if [ -f "$file" ]; then
+    # shellcheck disable=SC1090
+    source "$file"
+    adm_log_dbg "Sourced $file"
+    return 0
+  fi
+  return 1
+}
+
+_adm_cli_load_all_modules() {
+  adm_log_info "Loading ADM modules from $ADM_BIN_DIR"
+  for m in "${_adm_cli_modules[@]}"; do
+    local path="$ADM_BIN_DIR/$m"
+    if _adm_cli_try_source "$path"; then
+      _adm_cli_loaded_modules+=("$m")
+    else
+      # also accept -sh or .sh suffix
+      if _adm_cli_try_source "${path}.sh"; then
+        _adm_cli_loaded_modules+=("${m}.sh")
+      else
+        adm_log_dbg "Module not found (ok to be missing): $path"
+      fi
+    fi
+  done
+  adm_log_ok "Modules loaded: ${_adm_cli_loaded_modules[*]:-none}"
+}
+
+# load modules now (safe to be called early)
+_adm_cli_load_all_modules
+
+# ------------------------
+# Utilities: find metafile path for category/name
+# ------------------------
+_adm_cli_metafile_path() {
+  local category="$1" name="$2"
+  printf "%s/%s/%s/metafile" "$ADM_METAFILES_DIR" "$category" "$name"
+}
+
+_adm_cli_metadir() {
+  local category="$1" name="$2"
+  printf "%s/%s/%s" "$ADM_METAFILES_DIR" "$category" "$name"
+}
+
+# ------------------------
+# Create a new metafile skeleton and directories
+# adm --create-metafile <category> <name> [--source <url>] [--version <v>] [--sha256 <sha>] [--desc <desc>]
+# Creates:
+#   $ADM_METAFILES_DIR/<category>/<name>/metafile
+#   $ADM_METAFILES_DIR/<category>/<name>/hooks/
+#   $ADM_METAFILES_DIR/<category>/<name>/patches/
+# Behavior: safe (dry-run default); will not overwrite existing metafile unless --force
+# ------------------------
+_adm_cli_create_metafile() {
+  local category="$1" name="$2"; shift 2
+  local src="" ver="" sha="" desc="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) src="$2"; shift 2 ;;
+      --version) ver="$2"; shift 2 ;;
+      --sha256) sha="$2"; shift 2 ;;
+      --desc) desc="$2"; shift 2 ;;
+      --force) force=1; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  if [ -z "$category" ] || [ -z "$name" ]; then
+    adm_log_err "create-metafile requires <category> and <name>"
+    return 2
+  fi
+
+  local d
+  d=$(_adm_cli_metadir "$category" "$name")
+  local mf
+  mf=$(_adm_cli_metafile_path "$category" "$name")
+
+  if [ -f "$mf" ] && [ "$force" -ne 1 ]; then
+    adm_log_err "Metafile already exists: $mf (use --force to overwrite)"
+    return 1
+  fi
+
+  adm_log_info "Creating metafile skeleton at $d"
+  if [ "$ADM_DRY_RUN" -eq 1 ]; then
+    adm_log_info "[DRY-RUN] Would mkdir -p $d/hooks $d/patches"
+    adm_log_info "[DRY-RUN] Would create metafile $mf"
+    return 0
+  fi
+
+  # real execution (guarded by ADM_ALLOW_EXECUTION also)
+  if [ "$ADM_ALLOW_EXECUTION" -ne 1 ]; then
+    adm_log_err "Real execution disabled. Set ADM_ALLOW_EXECUTION=1 to perform filesystem changes."
+    return 3
+  fi
+
+  mkdir -p "$d/hooks" "$d/patches"
+  # create default metafile content
+  {
+    echo "name: $name"
+    echo "version: ${ver:-0.0}"
+    if [ -n "$src" ]; then echo "source: $src"; fi
+    if [ -n "$sha" ]; then echo "sha256: $sha"; fi
+    echo "desc: ${desc:-No description}"
+    echo "build_deps:"
+    echo "run_deps:"
+    echo "upstream: ${src:-}"
+  } > "$mf"
+  adm_log_ok "Metafile created: $mf"
+  return 0
+}
+
+# ------------------------
+# Search metafiles by name or pattern
+# adm search <pattern>
+# ------------------------
+_adm_cli_search_meta() {
+  local pattern="$1"
+  if [ -z "$pattern" ]; then
+    adm_log_err "search requires a pattern"
+    return 2
+  fi
+  adm_log_info "Searching metafiles for pattern: $pattern"
+  # find category/name combinations
+  local results=()
+  while IFS= read -r -d '' file; do
+    # file like /.../metafiles/<category>/<name>/metafile
+    local rel="${file#${ADM_METAFILES_DIR}/}"
+    local category name
+    category=$(printf "%s" "$rel" | cut -d'/' -f1)
+    name=$(printf "%s" "$rel" | cut -d'/' -f2)
+    if printf "%s\n" "$name" | grep -Ei -- "$pattern" >/dev/null 2>&1; then
+      results+=("$category/$name")
+    fi
+  done < <(find "$ADM_METAFILES_DIR" -mindepth 3 -maxdepth 3 -type f -name metafile -print0 2>/dev/null)
+
+  if [ "${#results[@]}" -eq 0 ]; then
+    adm_log_info "No packages matched."
+    return 0
+  fi
+  for r in "${results[@]}"; do adm_log_info " - $r"; done
+  return 0
+}
+
+# ------------------------
+# Show detailed info about a package: adm info <category> <name>
+# ------------------------
+_adm_cli_info() {
+  local category="$1" name="$2"
+  if [ -z "$category" ] || [ -z "$name" ]; then
+    adm_log_err "info requires <category> <name>"
+    return 2
+  fi
+  local mf
+  mf=$(_adm_cli_metafile_path "$category" "$name")
+  if [ ! -f "$mf" ]; then
+    adm_log_err "Metafile not found: $mf"
+    return 1
+  fi
+  adm_log_info "Reading metafile: $mf"
+  # show contents with some formatting
+  adm_log_title "Package: $category/$name"
+  sed -n '1,200p' "$mf" | sed 's/^/  /'
+  adm_log_ok "End of metafile"
+  return 0
+}
+
+# ------------------------
+# Show dependency tree using adm-deps if available
+# adm deps <category> <name>
+# ------------------------
+_adm_cli_deps() {
+  local category="$1" name="$2"
+  if [ -z "$category" ] || [ -z "$name" ]; then
+    adm_log_err "deps requires <category> <name>"
+    return 2
+  fi
+  local mf=$(_adm_cli_metafile_path "$category" "$name")
+  if [ ! -f "$mf" ]; then adm_log_err "Metafile not found: $mf"; return 1; fi
+
+  # prefer adm-deps exported function if available
+  if declare -f adm_deps_resolve >/dev/null 2>&1; then
+    adm_log_info "Using adm_deps_resolve function from adm-deps module"
+    adm_deps_resolve "$mf"
+    return $?
+  fi
+
+  # fallback: print build_deps and run_deps lines
+  adm_log_info "adm-deps module not found; fallback to printing metafile deps"
+  awk '/^build_deps:/{p=1;next}/^run_deps:/{p=2;next}/^upstream/{p=0} p==1{print "  build: "$0} p==2{print "  run: "$0}' "$mf" | sed 's/^/  /'
+  return 0
+}
+
+# ------------------------
+# CLI help (basic) and dispatcher for Part 1 commands
+# ------------------------
+_adm_cli_help_part1() {
+  cat <<EOF
+adm - ADM unified CLI (Part 1/3)
+
+Basic commands:
+  search <pattern>                 - search packages (metafiles)
+  info <category> <name>           - show metafile content
+  deps <category> <name>           - show dependency graph (uses adm-deps if available)
+  --create-metafile <cat> <name>   - create skeleton metafile + hooks + patches (see flags)
+  help                             - show this help (part1)
+
+Global flags (before commands):
+  --dry-run          (default)     - simulate actions
+  --force                          - allow destructive actions where applicable
+  --no-color                       - disable colored output
+  --verbose                        - increase verbosity (repeat for more)
+  --jobs N                         - set parallel jobs for builds/install
+EOF
+}
+
+# ------------------------
+# Parse global flags (before command) - affects behavior of subcommands
+# ------------------------
+_adm_cli_parse_global_flags() {
+  # Called by main dispatcher before command execution
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --force) ADM_ALLOW_EXECUTION=1; shift ;;
+      --no-color) ADM_COLOR=0; shift ;;
+      --verbose) ADM_VERBOSE=$((ADM_VERBOSE+1)); shift ;;
+      --jobs) ADM_JOBS="$2"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  export ADM_DRY_RUN ADM_ALLOW_EXECUTION ADM_COLOR ADM_VERBOSE ADM_JOBS
+  return 0
+}
+
+# ------------------------
+# Helpers: run module function if present, else call binary script
+# _adm_cli_call(module_name, function_name, args...)
+# returns exit code of the executed action
+# ------------------------
+_adm_cli_call() {
+  local module="$1"; shift
+  local func="$1"; shift || true
+  local args=("$@")
+  local modfunc="${func}"
+  local script="$ADM_BIN_DIR/${module}"
+  local scriptsh="$script.sh"
+  local rc=0
+
+  adm_log_dbg "Dispatch: module=$module func=$func args=${args[*]:-}"
+
+  # prefer function if exported by sourced module
+  if [ -n "$func" ] && declare -f "$func" >/dev/null 2>&1; then
+    adm_log_info "Calling function: $func ${args[*]:-}"
+    if [ "$ADM_DRY_RUN" -eq 1 ]; then
+      adm_log_info "[DRY-RUN] Would call function $func in current shell"
+      return 0
+    fi
+    if [ "$ADM_ALLOW_EXECUTION" -ne 1 ]; then
+      adm_log_info "[SIMULATION] Execution disabled (ADM_ALLOW_EXECUTION=0) for $func"
+      return 0
+    fi
+    # call it
+    "$func" "${args[@]}"
+    rc=$?
+    return $rc
+  fi
+
+  # fallback: try to call script binary in ADM_BIN_DIR
+  if [ -x "$script" ]; then
+    adm_log_info "Calling script: $script ${args[*]:-}"
+    if [ "$ADM_DRY_RUN" -eq 1 ]; then
+      adm_log_info "[DRY-RUN] Would exec $script ${args[*]:-}"
+      return 0
+    fi
+    if [ "$ADM_ALLOW_EXECUTION" -ne 1 ]; then
+      adm_log_info "[SIMULATION] Execution disabled (ADM_ALLOW_EXECUTION=0) for $script"
+      return 0
+    fi
+    "$script" "${args[@]}"
+    rc=$?
+    return $rc
+  fi
+
+  # final fallback: try script.sh
+  if [ -x "$scriptsh" ]; then
+    adm_log_info "Calling script: $scriptsh ${args[*]:-}"
+    if [ "$ADM_DRY_RUN" -eq 1 ]; then
+      adm_log_info "[DRY-RUN] Would exec $scriptsh ${args[*]:-}"
+      return 0
+    fi
+    if [ "$ADM_ALLOW_EXECUTION" -ne 1 ]; then
+      adm_log_info "[SIMULATION] Execution disabled (ADM_ALLOW_EXECUTION=0) for $scriptsh"
+      return 0
+    fi
+    "$scriptsh" "${args[@]}"
+    rc=$?
+    return $rc
+  fi
+
+  adm_log_err "Module or script not found for $module"
+  return 127
+}
+
+# ------------------------
+# Build orchestration
+# adm build <category>/<name> [--chroot <stage>] [--profile <p>] [--jobs N] [--dry-run] [--no-package]
+# Supports passing through to adm-build or adm_build_package function if present.
+# ------------------------
+_adm_cli_build() {
+  local pkg="$1"; shift || true
+  local chroot="" profile="" jobs="$ADM_JOBS" extra=()
+
+  # parse args
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --chroot) chroot="$2"; shift 2 ;;
+      --profile) profile="$2"; shift 2 ;;
+      --jobs) jobs="$2"; shift 2 ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --no-package) extra+=("--no-package"); shift ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then adm_log_err "build requires category/name"; return 2; fi
+
+  adm_log_title "Build: $pkg (chroot=${chroot:-none} profile=${profile:-default} jobs=$jobs)"
+  _adm_cli_log_to_file "build" "Start build: $pkg"
+
+  # resolve metafile path
+  local category name mf
+  category=${pkg%%/*}
+  name=${pkg#*/}
+  mf="$(_adm_cli_metafile_path "$category" "$name")"
+  if [ ! -f "$mf" ]; then
+    adm_log_err "Metafile not found: $mf"
+    return 1
+  fi
+
+  # optionally resolve deps first using adm-deps
+  if declare -f adm_deps_resolve >/dev/null 2>&1; then
+    adm_log_info "Resolving dependencies via adm-deps"
+    if [ "$ADM_DRY_RUN" -eq 1 ]; then
+      adm_log_info "[DRY-RUN] Would resolve deps for $pkg"
+    else
+      adm_deps_resolve "$mf"
+      if [ $? -ne 0 ]; then adm_log_err "Dependency resolution failed"; return 1; fi
+    fi
+  fi
+
+  # call adm-build: prefer function adm_build_pkg or adm-build script
+  local build_func="adm_build_package"
+  if declare -f "$build_func" >/dev/null 2>&1; then
+    _adm_cli_call adm-build "$build_func" "$mf" --chroot "${chroot:-}" --profile "${profile:-}" --jobs "$jobs" "${extra[@]}"
+    return $?
+  fi
+
+  # fallback to script
+  _adm_cli_call adm-build "" "$mf" --chroot "${chroot:-}" --profile "${profile:-}" --jobs "$jobs" "${extra[@]}"
+  return $?
+}
+
+# ------------------------
+# Install orchestration
+# adm install <category>/<name> [--bin] [--destdir <path>] [--chroot <stage>] [--jobs N]
+# ------------------------
+_adm_cli_install() {
+  local pkg="$1"; shift || true
+  local binflag=0 destdir="" chroot="" jobs="$ADM_JOBS" extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bin) binflag=1; shift ;;
+      --destdir) destdir="$2"; shift 2 ;;
+      --chroot) chroot="$2"; shift 2 ;;
+      --jobs) jobs="$2"; shift 2 ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then adm_log_err "install requires category/name"; return 2; fi
+  adm_log_title "Install: $pkg (bin=$binflag destdir=${destdir:-system} chroot=${chroot:-none})"
+  _adm_cli_log_to_file "install" "Start install: $pkg"
+
+  local category=${pkg%%/*}
+  local name=${pkg#*/}
+  local mf="$(_adm_cli_metafile_path "$category" "$name")"
+  if [ ! -f "$mf" ]; then adm_log_err "Metafile not found: $mf"; return 1; fi
+
+  # prefer function adm_install_pkg if available
+  if declare -f adm_install_package >/dev/null 2>&1; then
+    _adm_cli_call adm-install adm_install_package "$mf" --bin "$binflag" --destdir "$destdir" --chroot "$chroot" --jobs "$jobs" "${extra[@]}"
+    return $?
+  fi
+
+  # fallback to script call
+  _adm_cli_call adm-install "" "$mf" --bin "$binflag" --destdir "$destdir" --chroot "$chroot" --jobs "$jobs" "${extra[@]}"
+  return $?
+}
+
+# ------------------------
+# Uninstall orchestration
+# adm uninstall <category>/<name> [--orphans] [--force]
+# ------------------------
+_adm_cli_uninstall() {
+  local pkg="$1"; shift || true
+  local orphans=0 force=0 extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --orphans) orphans=1; shift ;;
+      --force) force=1; shift ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+
+  if [ -z "$pkg" ]; then adm_log_err "uninstall requires category/name"; return 2; fi
+  adm_log_title "Uninstall: $pkg (orphans=$orphans force=$force)"
+  _adm_cli_log_to_file "uninstall" "Start uninstall: $pkg"
+
+  if declare -f adm_uninstall_package >/dev/null 2>&1; then
+    _adm_cli_call adm-uninstall adm_uninstall_package "$pkg" --orphans "$orphans" --force "$force" "${extra[@]}"
+    return $?
+  fi
+
+  _adm_cli_call adm-uninstall "" "$pkg" --orphans "$orphans" --force "$force" "${extra[@]}"
+  return $?
+}
+
+# ------------------------
+# Update orchestration
+# adm update <category>/<name|--all> [--deps-first] [--create-metafile]
+# ------------------------
+_adm_cli_update() {
+  local target="$1"; shift || true
+  local deps_first=0 create_meta=0 extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --deps-first) deps_first=1; shift ;;
+      --create-metafile) create_meta=1; shift ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then adm_log_err "update requires a target (category/name or --all)"; return 2; fi
+  adm_log_title "Update: $target (deps_first=$deps_first create_meta=$create_meta)"
+  _adm_cli_log_to_file "update" "Start update: $target"
+
+  # If update module function present
+  if declare -f adm_update_package >/dev/null 2>&1; then
+    _adm_cli_call adm-update adm_update_package "$target" --deps-first "$deps_first" --create-metafile "$create_meta" "${extra[@]}"
+    return $?
+  fi
+
+  _adm_cli_call adm-update "" "$target" --deps-first "$deps_first" --create-metafile "$create_meta" "${extra[@]}"
+  return $?
+}
+
+# ------------------------
+# Clean orchestration
+# adm clean [--cache] [--logs] [--chroots] [--deep] [--dry-run]
+# ------------------------
+_adm_cli_clean() {
+  local cache=0 logs=0 chroots=0 deep=0 extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cache) cache=1; shift ;;
+      --logs) logs=1; shift ;;
+      --chroots) chroots=1; shift ;;
+      --deep) deep=1; shift ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      *) extra+=("$1"); shift ;;
+    esac
+  done
+
+  adm_log_title "Clean: cache=$cache logs=$logs chroots=$chroots deep=$deep"
+  _adm_cli_log_to_file "clean" "Start clean: cache=$cache logs=$logs chroots=$chroots deep=$deep"
+
+  if declare -f adm_clean >/dev/null 2>&1; then
+    _adm_cli_call adm-clean adm_clean --cache "$cache" --logs "$logs" --chroots "$chroots" --deep "$deep" "${extra[@]}"
+    return $?
+  fi
+
+  _adm_cli_call adm-clean "" --cache "$cache" --logs "$logs" --chroots "$chroots" --deep "$deep" "${extra[@]}"
+  return $?
+}
+
+# ------------------------
+# Bootstrap orchestration
+# adm bootstrap create <stage> [--from <stageN>] [--profile <p>] [--no-snapshot]
+# adm bootstrap build <stage> --phase stage0|stage1|...
+# adm bootstrap resume <stage>
+# ------------------------
+_adm_cli_bootstrap() {
+  local sub="$1"; shift || true
+  case "$sub" in
+    create)
+      local stage="$1"; shift
+      local from="" profile="" nosnap=0 extra=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from) from="$2"; shift 2 ;;
+          --profile) profile="$2"; shift 2 ;;
+          --no-snapshot) nosnap=1; shift ;;
+          *) extra+=("$1"); shift ;;
+        esac
+      done
+      if [ -z "$stage" ]; then adm_log_err "bootstrap create requires stage"; return 2; fi
+      adm_log_title "Bootstrap create: $stage from=$from profile=${profile:-default}"
+      _adm_cli_log_to_file "bootstrap" "create $stage from=$from profile=${profile:-default}"
+      if declare -f _adm_bootstrap_create_stage_from_chroot >/dev/null 2>&1; then
+        _adm_bootstrap_create_stage_from_chroot "$stage" "$from"
+        return $?
+      fi
+      # fallback to calling adm-bootstrap script
+      _adm_cli_call adm-bootstrap "" create "$stage" --from "$from" --profile "$profile"
+      return $?
+      ;;
+    build)
+      local stage="$1"; shift
+      local phase=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --phase) phase="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      if [ -z "$stage" ]; then adm_log_err "bootstrap build requires stage"; return 2; fi
+      adm_log_title "Bootstrap build: $stage phase=${phase:-stage0}"
+      _adm_cli_log_to_file "bootstrap" "build $stage phase=${phase:-stage0}"
+      _adm_cli_call adm-bootstrap "" build "$stage" --phase "${phase:-stage0}"
+      return $?
+      ;;
+    resume)
+      local stage="$1"
+      if [ -z "$stage" ]; then adm_log_err "bootstrap resume requires stage"; return 2; fi
+      adm_log_title "Bootstrap resume: $stage"
+      _adm_cli_call adm-bootstrap "" resume "$stage"
+      return $?
+      ;;
+    *)
+      adm_log_err "Unknown bootstrap subcommand: $sub"
+      return 2
+      ;;
+  esac
+}
+
+# ------------------------
+# chroot wrapper
+# adm chroot create|enter|destroy|snapshot|list|status ...
+# ------------------------
+_adm_cli_chroot() {
+  local sub="$1"; shift || true
+  case "$sub" in
+    create|snapshot|enter|destroy|list|status|exists)
+      # forward everything to adm-chroot script or functions
+      _adm_cli_call adm-chroot "" "$sub" "$@"
+      return $?
+      ;;
+    *)
+      adm_log_err "Unknown chroot command: $sub"
+      return 2
+      ;;
+  esac
+}
+
+# ------------------------
+# Orchestrator: process command and dispatch to the implementations above
+# Called by main dispatcher (Part 3 will wire main)
+# ------------------------
+_adm_cli_dispatch() {
+  local cmd="$1"; shift || true
+  case "$cmd" in
+    search) _adm_cli_search_meta "$@" ;;
+    info) _adm_cli_info "$@" ;;
+    deps) _adm_cli_deps "$@" ;;
+    --create-metafile|-create-metafile|create-metafile) _adm_cli_create_metafile "$@" ;;
+    build) _adm_cli_build "$@" ;;
+    install) _adm_cli_install "$@" ;;
+    uninstall) _adm_cli_uninstall "$@" ;;
+    update) _adm_cli_update "$@" ;;
+    clean) _adm_cli_clean "$@" ;;
+    bootstrap) _adm_cli_bootstrap "$@" ;;
+    chroot) _adm_cli_chroot "$@" ;;
+    *)
+      adm_log_err "Unknown command: $cmd"
+      return 2
+      ;;
+  esac
+  return $?
+}
+
+# ------------------------
+# Help / usage - comprehensive (merges part1 and part2 commands)
+# ------------------------
+_adm_cli_help_full() {
+  cat <<'EOF'
+adm - ADM unified CLI controller
+Version: '"$ADM_CLI_VERSION"'
+
+Usage:
+  adm [global-flags] <command> [args...]
+
+Global flags (apply before command):
+  --dry-run            simulate actions (default)
+  --force              allow destructive operations (sets ADM_ALLOW_EXECUTION=1)
+  --no-color           disable color output
+  --verbose            increase verbosity (repeatable)
+  --jobs N             set parallel jobs count
+  --help, -h           show this help
+  --version, -v        show version
+
+Basic commands (Part1):
+  search <pattern>                         - search packages (metafiles)
+  info <category> <name>                   - show metafile content
+  deps <category> <name>                   - show dependency tree
+
+Metafile management:
+  --create-metafile <category> <name> [--source <url>] [--version <v>] [--sha256 <sha>] [--desc <desc>] [--force]
+                                           - create skeleton metafile with hooks/patches dirs
+
+Build & packaging:
+  build <category/name> [--chroot <stage>] [--profile <p>] [--jobs N] [--no-package]
+  install <category/name> [--bin] [--destdir <path>] [--chroot <stage>] [--jobs N]
+  uninstall <category/name> [--orphans] [--force]
+
+Update & maintenance:
+  update <category/name|--all> [--deps-first] [--create-metafile]
+  clean [--cache] [--logs] [--chroots] [--deep]
+
+Bootstrap & chroot:
+  bootstrap create <stage> [--from <stage>] [--profile <p>] [--no-snapshot]
+  bootstrap build <stage> [--phase stage0|stage1|stage2|stage3]
+  bootstrap resume <stage>
+  chroot <create|enter|destroy|snapshot|list|status|exists> [...]
+
+Other:
+  init                 - initialize ADM environment (adm_chroot_init_env)
+  cleanup              - remove temporary locks and spinner files
+  bootstrap-create     - alias for bootstrap create
+  bootstrap-destroy    - alias for bootstrap destroy
+
+Interactive mode:
+  Run `adm` with no args to open an interactive text menu.
+
+Notes:
+  - Modules are loaded from $ADM_BIN_DIR when available.
+  - By default ADM_DRY_RUN=1 so no destructive actions happen unless you set --force or ADM_ALLOW_EXECUTION=1.
+  - For CI automation, set ADM_ALLOW_EXECUTION=1 and --jobs appropriately.
+EOF
+}
+
+# ------------------------
+# Validate environment quick check (call modules' checks if present)
+# ------------------------
+_adm_cli_quick_check() {
+  adm_log_dbg "Running quick environment checks..."
+  if declare -f _adm_chroot_check_tools >/dev/null 2>&1; then
+    _adm_chroot_check_tools || return 1
+  fi
+  # prefer module-specific checks if available
+  if declare -f adm_check_environment >/dev/null 2>&1; then
+    adm_check_environment || return 1
+  fi
+  adm_log_ok "Quick checks passed."
+  return 0
+}
+
+# ------------------------
+# Interactive menu (safe)
+# ------------------------
+_adm_cli_interactive() {
+  adm_log_title "ADM Interactive Menu (dry-run=$ADM_DRY_RUN allow=$ADM_ALLOW_EXECUTION)"
+  PS3=$'\nSelect command (or 0 to exit): '
+  local choices=("Search package" "Info package" "Build package" "Install package" "Uninstall package" "Update package" "Clean environment" "Bootstrap" "Chroot manager" "Create metafile" "Exit")
+  select opt in "${choices[@]}"; do
+    case "$REPLY" in
+      1)
+        read -rp "Pattern: " pat
+        _adm_cli_search_meta "$pat"; break
+        ;;
+      2)
+        read -rp "Category: " cat; read -rp "Name: " name
+        _adm_cli_info "$cat" "$name"; break
+        ;;
+      3)
+        read -rp "Package (cat/name): " pkg
+        read -rp "Chroot (optional): " ch; _adm_cli_build "$pkg" --chroot "$ch"; break
+        ;;
+      4)
+        read -rp "Package (cat/name): " pkg
+        _adm_cli_install "$pkg"; break
+        ;;
+      5)
+        read -rp "Package (cat/name): " pkg
+        _adm_cli_uninstall "$pkg"; break
+        ;;
+      6)
+        read -rp "Package (cat/name or --all): " tgt
+        _adm_cli_update "$tgt"; break
+        ;;
+      7)
+        read -rp "Options (--cache/--logs/--chroots/--deep): " opts
+        _adm_cli_clean $opts; break
+        ;;
+      8)
+        echo "Bootstrap subcommands: create/build/resume"
+        read -rp "Subcommand and args: " sub args
+        set -- $sub $args
+        _adm_cli_bootstrap "$@"; break
+        ;;
+      9)
+        echo "Chroot command (create|enter|destroy|snapshot|list|status|exists)"
+        read -rp "Cmd and args: " sub args
+        set -- $sub $args
+        _adm_cli_chroot "$@"; break
+        ;;
+      10)
+        read -rp "Category: " cat; read -rp "Name: " name
+        read -rp "Source URL (optional): " src
+        _adm_cli_create_metafile "$cat" "$name" --source "$src"
+        break
+        ;;
+      11|0)
+        adm_log_info "Exiting interactive menu."; break
+        ;;
+      *)
+        adm_log_err "Invalid selection";;
+    esac
+  done
+}
+
+# ------------------------
+# Main dispatcher entry (when executed)
+# - parse global flags (from Part1 parser)
+# - dispatch commands to _adm_cli_dispatch
+# ------------------------
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  # no-args -> interactive
+  if [ $# -eq 0 ]; then
+    _adm_cli_interactive
+    exit 0
+  fi
+
+  # parse global flags (Part1 function)
+  _adm_cli_parse_global_flags "$@"
+  # shift parsed flags (we need to remove them before dispatch)
+  # Simpler approach: reparse manually to find first non-flag token
+  # (global flags are recognized by _adm_cli_parse_global_flags and exported variables)
+  # Find index of command:
+  cmd_index=1
+  # iterate through args to find first non-global token
+  while [ $cmd_index -le $# ]; do
+    eval "arg=\${$cmd_index}"
+    case "$arg" in
+      --dry-run|--force|--no-color|--verbose|--jobs) # flags with possible value require handling
+        if [ "$arg" = "--jobs" ]; then cmd_index=$((cmd_index + 2)); else cmd_index=$((cmd_index + 1)); fi
+        ;;
+      --)
+        cmd_index=$((cmd_index + 1)); break ;;
+      *) break ;;
+    esac
+  done
+
+  # extract command and rest
+  # Build ARGS array manually
+  ARGS=("$@")
+  # Determine command position (first non-global token)
+  # We'll search from start
+  cmd_pos=0
+  for i in "${!ARGS[@]}"; do
+    a="${ARGS[$i]}"
+    case "$a" in
+      --dry-run|--force|--no-color|--verbose) continue ;;
+      --jobs) i=$((i+1)); continue ;;
+      --) cmd_pos=$((i+1)); break ;;
+      *) cmd_pos=$i; break ;;
+    esac
+  done
+  if [ "$cmd_pos" -eq 0 ]; then cmd_pos=0; fi
+
+  # Extract command and its args
+  cmd="${ARGS[$cmd_pos]}"
+  # Build args slice
+  rest=()
+  for j in $(seq $((cmd_pos+1)) $(( ${#ARGS[@]} - 1 )) ); do
+    rest+=("${ARGS[$j]}")
+  done
+
+  # If parsing failed, fallback to simple approach
+  if [ -z "$cmd" ]; then
+    cmd="${ARGS[0]}"
+    rest=("${ARGS[@]:1}")
+  fi
+
+  # Dispatch
+  case "$cmd" in
+    -h|--help|help) _adm_cli_help_full; exit 0 ;;
+    -v|--version|version) printf "adm CLI %s\n" "$ADM_CLI_VERSION"; exit 0 ;;
+    *)
+      # call dispatcher
+      _adm_cli_dispatch "$cmd" "${rest[@]}"
+      rc=$?
+      if [ $rc -ne 0 ]; then adm_log_err "Command '$cmd' failed with code $rc"; fi
+      exit $rc
+      ;;
+  esac
+fi
