@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: rust post-build
+# - Valida a compilação e prepara os artefatos para empacotamento.
+# - Respeita DRY_RUN e gera logs.
+#
+set -euo pipefail
+
+echo "🔍 [rust post-build] Verificando resultado..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/rust-build.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+DIST_DIR="${DIST_DIR:-${BUILD_DIR}/dist}"
+PKG_NAME="rust-${VERSION:-$(date +%Y%m%d)}"
+PKG_CACHE="${ADM_ROOT}/cache"
+
+mkdir -p "$PKG_CACHE" || true
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria binários em ${BUILD_DIR}"
+  exit 0
+fi
+
+if [ ! -d "$BUILD_DIR" ]; then
+  echo "❌ Diretório de build ausente ($BUILD_DIR)"
+  exit 1
+fi
+
+if ! find "$BUILD_DIR" -type f -name rustc >/dev/null 2>&1; then
+  echo "⚠️  Nenhum binário 'rustc' encontrado — build pode ter falhado."
+fi
+
+mkdir -p "$DIST_DIR"
+tar -C "$BUILD_DIR" -cJf "${PKG_CACHE}/${PKG_NAME}.tar.xz" .
+sha256sum "${PKG_CACHE}/${PKG_NAME}.tar.xz" > "${PKG_CACHE}/${PKG_NAME}.sha256"
+
+echo "[`date -u`] packaged: ${PKG_NAME}.tar.xz" >> "$ADM_LOG"
+echo "✅ [rust post-build] Empacotamento concluído."
