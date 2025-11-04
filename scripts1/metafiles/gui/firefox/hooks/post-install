@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# ADM post-install hook for Mozilla Firefox
+# Executed after the package is fully installed into the target root (not during build)
+# Purpose: create symlinks, update desktop entries, rebuild icon cache, etc.
+
+adm_log_info "[HOOK post-install] Running post-install actions for Firefox..."
+
+DESTDIR="${DESTDIR:-/usr/local}"
+
+# Ensure binaries are linked properly
+if [ -x "$DESTDIR/usr/lib/firefox/firefox" ]; then
+  mkdir -p "$DESTDIR/usr/bin"
+  ln -sf "../lib/firefox/firefox" "$DESTDIR/usr/bin/firefox"
+  adm_log_ok "[HOOK post-install] Linked /usr/bin/firefox → /usr/lib/firefox/firefox"
+fi
+
+# Install .desktop launcher
+mkdir -p "$DESTDIR/usr/share/applications"
+cat > "$DESTDIR/usr/share/applications/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox Web Browser
+GenericName=Web Browser
+Exec=/usr/bin/firefox %u
+Icon=firefox
+Type=Application
+Categories=Network;WebBrowser;
+StartupNotify=true
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+EOF
+adm_log_ok "[HOOK post-install] Created desktop entry."
+
+# Rebuild icon cache if gtk-update-icon-cache exists
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -qf "$DESTDIR/usr/share/icons/hicolor" || true
+  adm_log_ok "[HOOK post-install] Updated GTK icon cache."
+fi
+
+# Update desktop database if available
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q "$DESTDIR/usr/share/applications" || true
+  adm_log_ok "[HOOK post-install] Updated desktop database."
+fi
+
+# Rebuild MIME database if present
+if command -v update-mime-database >/dev/null 2>&1; then
+  update-mime-database -q "$DESTDIR/usr/share/mime" || true
+  adm_log_ok "[HOOK post-install] Updated MIME database."
+fi
+
+adm_log_ok "[HOOK post-install] Firefox installation finalized successfully."
