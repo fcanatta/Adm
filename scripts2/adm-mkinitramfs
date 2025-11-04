@@ -1,0 +1,1311 @@
+#!/usr/bin/env bash
+#
+# adm-mkinitramfs 
+# --------------------------
+# Cria scaffolding, validações e funções principais para montar um initramfs seguro.
+# Esta parte prepara a árvore, coleta binários, copia libs, detecta kernel/modules,
+# gera /init template e escreve meta + relatório. Não sobrescreve /boot sem confirmação.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----- Header / Defaults -----
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_BOOT_DIR="${ADM_BOOT_DIR:-/boot}"
+ADM_INITRAMFS_DIR="${ADM_TMP}/initramfs-${TS}"
+ADM_WORKDIR="${ADM_TMP}/adm-mkinitramfs-work-${TS}"
+LOGFILE_DEFAULT="${ADM_LOGS}/adm-mkinitramfs-${TS}.log"
+REPORT_JSON_DEFAULT="${ADM_TMP}/adm-mkinitramfs-report-${TS}.json"
+
+# runtime flags
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+OUTPUT="${ADM_BOOT_DIR}/initramfs-<kernel>.img"   # placeholder template; will be replaced
+PROFILE="normal"   # none|normal|extreme
+COMPRESS="gzip"    # gzip|xz|zstd
+KERNEL_VER=""
+KEEP_TEMP=0
+INCLUDE_MODULES_ALL=0
+
+# derived at runtime
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+REPORT_JSON="${REPORT_JSON:-$REPORT_JSON_DEFAULT}"
+
+# load adm.conf if present (non-fatal)
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+# create dirs (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_LOGS" "$ADM_TMP" "$ADM_WORKDIR" 2>/dev/null || true
+fi
+
+### ----- Colors & Icons -----
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"; CLR_GREEN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"; CLR_BLUE="$(tput setaf 4)"; CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+ICON_OK="✔️"; ICON_INFO="ℹ️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_WORK="⚙️"
+
+log_to_file() { [ -n "${LOGFILE:-}" ] && printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; [ "$VERBOSE" -eq 1 ] && log_to_file "[VERB]" "$1"; }
+
+### ----- Spinner (safe) -----
+_spinner_pid=""
+_spinner_cleanup() { if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then kill "$_spinner_pid" >/dev/null 2>&1 || true; wait "$_spinner_pid" 2>/dev/null || true; fi; _spinner_pid=""; }
+spinner_start() {
+  local msg="$1"; [ "$DRY_RUN" -eq 1 ] && info "(dry-run) $msg" && return 0
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  ( local i=0 chars='|/-\' ; while :; do printf "\b%s" "${chars:i++%${#chars}:1}"; sleep 0.12; done ) &
+  _spinner_pid=$!; trap _spinner_cleanup EXIT
+}
+spinner_stop() { local okmsg="${1:-Done}"; if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi; _spinner_cleanup; printf "\b"; ok "$okmsg"; trap - EXIT; }
+
+### ----- Safe-run wrapper -----
+safe_run() {
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $desc"; [ "$VERBOSE" -eq 1 ] && printf "  Simulated: %s\n" "$*"; return 0; fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then log_to_file "[CMD-OK]" "$desc"; return 0; else local rc=$?; log_to_file "[CMD-FAIL]" "$desc rc=$rc"; return $rc; fi
+}
+
+### ----- Retry w/ backoff -----
+_retry_with_backoff() {
+  local tries="${1:-3}"; shift
+  local attempt=0 rc=0
+  while [ "$attempt" -lt "$tries" ]; do
+    if "$@"; then return 0; fi
+    rc=$?; attempt=$((attempt+1))
+    local sleep_for=$((2 ** attempt))
+    warn "Tentativa $attempt/$tries falhou (rc=$rc). Aguardando ${sleep_for}s..."
+    sleep "$sleep_for"
+  done
+  return $rc
+}
+
+### ----- Tool checks -----
+HAS_LDD=0; HAS_READLINK=0; HAS_FIND=0; HAS_TAR=0; HAS_CP=0; HAS_MKDIR=0; HAS_SHA256SUM=0
+_check_tools() {
+  command -v ldd >/dev/null 2>&1 && HAS_LDD=1
+  command -v readlink >/dev/null 2>&1 && HAS_READLINK=1
+  command -v find >/dev/null 2>&1 && HAS_FIND=1
+  command -v tar >/dev/null 2>&1 && HAS_TAR=1
+  command -v cp >/dev/null 2>&1 && HAS_CP=1
+  command -v mkdir >/dev/null 2>&1 && HAS_MKDIR=1
+  command -v sha256sum >/dev/null 2>&1 && HAS_SHA256SUM=1
+  verbose "Tools: ldd=$HAS_LDD readlink=$HAS_READLINK find=$HAS_FIND tar=$HAS_TAR sha256=$HAS_SHA256SUM"
+}
+_check_tools
+
+### ----- Safety helpers -----
+path_real() { readlink -f "$1" 2>/dev/null || printf '%s' "$1"; }
+path_within_adm() {
+  local p="$(path_real "$1")" admroot="$(path_real "$ADM_ROOT")"
+  case "$p" in "$admroot"/*|"$admroot") return 0 ;; esac
+  return 1
+}
+ensure_writable_dir() {
+  local d="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) ensure dir $d"; return 0; fi
+  mkdir -p "$d" 2>/dev/null || { err "Falha ao criar diretório: $d"; return 1; }
+  if [ ! -w "$d" ]; then err "Diretório não gravável: $d"; return 2; fi
+  return 0
+}
+ensure_space_mb() {
+  local dir="${1:-/}" need_mb="${2:-50}"
+  local avail_kb; avail_kb="$(df -P "$dir" 2>/dev/null | awk 'END{print $4}' || echo 0)"
+  local avail_mb=$((avail_kb/1024))
+  if [ "$avail_mb" -lt "$need_mb" ]; then err "Espaço insuficiente em $dir: ${avail_mb}MB < requerido ${need_mb}MB"; return 1; fi
+  return 0
+}
+
+### ----- Report scaffolding -----
+_report_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) init report scaffold"; return 0; fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","kernel":"%s","profile":"%s","actions":[],"errors":[]}' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$KERNEL_VER" "$PROFILE" >"$REPORT_JSON" || true
+  log_to_file "[REPORT]" "init $REPORT_JSON"
+}
+_report_add_action() {
+  local k="$1" a="$2" d="$3"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; k=sys.argv[2]; a=sys.argv[3]; d=sys.argv[4]
+dct=json.load(open(f)); dct.setdefault('actions',[]).append({'when':__import__('time').time(),'kernel':k,'action':a,'details':d})
+open(f,'w').write(json.dumps(dct,indent=2))
+PY
+  fi
+}
+_report_add_error() {
+  local m="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; m=sys.argv[2]
+d=json.load(open(f)); d.setdefault('errors',[]).append({'when':__import__('time').time(),'msg':m})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+### ----- Kernel detection -----
+detect_kernel_version() {
+  # If user provided KERNEL_VER, validate it exists under /lib/modules or /usr/src/linux
+  if [ -n "${KERNEL_VER:-}" ]; then
+    verbose "KERNEL_VER fornecido: $KERNEL_VER"
+    if [ -d "/lib/modules/$KERNEL_VER" ] || [ -d "/usr/src/linux-$KERNEL_VER" ] || [ -d "/usr/src/linux" ]; then
+      echo "$KERNEL_VER"
+      return 0
+    else
+      err "KERNEL_VER $KERNEL_VER não encontrado em /lib/modules ou /usr/src"
+      return 2
+    fi
+  fi
+  # detect running kernel
+  if [ -f /proc/version ] && command -v uname >/dev/null 2>&1; then
+    local kv; kv="$(uname -r 2>/dev/null || true)"
+    if [ -n "$kv" ]; then
+      echo "$kv"
+      return 0
+    fi
+  fi
+  # fallback: first dir under /lib/modules
+  if [ -d /lib/modules ]; then
+    local candidate
+    candidate="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1 || true)"
+    if [ -n "$candidate" ]; then
+      echo "$candidate"; return 0
+    fi
+  fi
+  err "Não foi possível detectar versão do kernel automaticamente"
+  return 1
+}
+
+### ----- Prepare initramfs tree -----
+prepare_initramfs_tree() {
+  local dest="${1:-$ADM_INITRAMFS_DIR}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) criar estrutura em $dest"; return 0; fi
+  # ensure enough disk
+  ensure_space_mb "$ADM_TMP" 100 || { _report_add_error "low_space_tmp"; return 2; }
+  # remove existing if any (only in temp area)
+  rm -rf "$dest" 2>/dev/null || true
+  mkdir -p "$dest"/{bin,sbin,usr/bin,usr/sbin,lib,lib64,proc,sys,dev,run,etc,boot} || { err "Falha ao criar estrutura $dest"; return 3; }
+  # ensure dev nodes
+  if [ ! -e "$dest/dev/null" ]; then
+    # create minimal device nodes if running as root (optional)
+    if [ "$(id -u)" -eq 0 ]; then
+      mknod -m 666 "$dest/dev/null" c 1 3 2>/dev/null || true
+      mknod -m 666 "$dest/dev/zero" c 1 5 2>/dev/null || true
+      mknod -m 666 "$dest/dev/tty" c 5 0 2>/dev/null || true
+    fi
+  fi
+  ok "Estrutura initramfs criada em $dest"
+  _report_add_action "$KERNEL_VER" "prepare-tree" "$dest"
+  return 0
+}
+
+### ----- Copy binary safely -----
+_copy_binary_and_deps() {
+  # args: src_absolute_path dest_root
+  local src="$1" destroot="$2"
+  if [ -z "$src" ] || [ -z "$destroot" ]; then err "_copy_binary_and_deps: parâmetros inválidos"; return 2; fi
+  if [ ! -x "$src" ] && [ ! -f "$src" ]; then warn "Binário inexistente: $src"; return 3; fi
+
+  local rel destpath dir
+  rel="$(basename "$src")"   # we'll place under /bin or /sbin depending caller
+  dir="$(dirname "$src")"
+  destpath="${destroot}/$(basename "$src")"
+  # copy binary
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) copiar $src -> $destpath"
+  else
+    cp -a --preserve=mode,timestamps "$src" "$destpath" 2>>"$LOGFILE" || { err "Falha ao copiar $src -> $destpath"; return 4; }
+    ok "Copiado $src -> $destpath"
+  fi
+
+  # copy shared libs if ldd available and binary is ELF dynamic
+  if [ "$HAS_LDD" -eq 1 ] && file "$src" 2>/dev/null | grep -q 'ELF'; then
+    # collect lib paths
+    local libs
+    libs="$(ldd "$src" 2>/dev/null | awk '/=>/ {print $(NF-1)} /ld-linux/ {print $1}' | grep '^/' || true)"
+    for lib in $libs; do
+      # handle symlinks: copy target and symlink chain
+      if [ -z "$lib" ] || [ ! -e "$lib" ]; then
+        warn "Biblioteca não encontrada para $src: $lib (ignorada)"
+        continue
+      fi
+      local libdest_dir
+      libdest_dir="$(dirname "$destroot/${lib#/}")"
+      if [ "$DRY_RUN" -eq 1 ]; then
+        info "(dry-run) copiar lib $lib -> $libdest_dir/"
+        continue
+      fi
+      mkdir -p "$libdest_dir" 2>/dev/null || true
+      # copy file and preserve symlinks by copying file and re-creating symlink if needed
+      if cp -a --preserve=mode,timestamps "$lib" "$libdest_dir/" 2>>"$LOGFILE"; then
+        ok "Copiada lib $lib -> $libdest_dir/"
+      else
+        warn "Falha ao copiar lib $lib"
+      fi
+      # replicate symlink chain (if lib is symlink)
+      if [ -L "$lib" ]; then
+        local target
+        target="$(readlink "$lib" 2>/dev/null || true)"
+        if [ -n "$target" ]; then
+          # create symlink in dest
+          local symlink_name
+          symlink_name="$(basename "$lib")"
+          ( cd "$libdest_dir" && ln -sf "$target" "$symlink_name" ) 2>/dev/null || true
+        fi
+      fi
+    done
+  else
+    verbose "ldd ausente ou arquivo não ELF; pulando cópia automática de libs para $src"
+  fi
+  return 0
+}
+
+### ----- Collect essential binaries -----
+# returns a newline-separated list (stdout) of absolute paths to include
+collect_essential_bins() {
+  # Candidates (prioritized)
+  local cand=(/bin/busybox /usr/bin/busybox /sbin/busybox /bin/sh /bin/mount /bin/umount /sbin/modprobe /sbin/udevd /sbin/fsck /sbin/swapon /sbin/cryptsetup /sbin/lvm /sbin/dmsetup)
+  local result=()
+  for c in "${cand[@]}"; do
+    if [ -x "$c" ]; then result+=("$c"); fi
+  done
+  # If busybox exists, prefer busybox (it provides many applets)
+  if [ "${#result[@]}" -eq 0 ]; then
+    # fallback: find common util binaries
+    for b in sh mount umount modprobe mountpoint lsblk udevadm awk sed grep cut tar; do
+      if command -v "$b" >/dev/null 2>&1; then
+        result+=("$(command -v "$b")")
+      fi
+    done
+  fi
+  # Remove duplicates and print
+  if [ "${#result[@]}" -gt 0 ]; then
+    printf "%s\n" "${result[@]}" | awk '!seen[$0]++'
+    return 0
+  fi
+  return 1
+}
+
+### ----- Copy essentials into tree -----
+populate_tree_with_bins() {
+  local destroot="${1:-$ADM_INITRAMFS_DIR}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) populate_tree_with_bins into $destroot"; return 0; fi
+  ensure_writable_dir "$destroot/bin" || return 2
+  ensure_writable_dir "$destroot/sbin" || return 2
+  mapfile -t bins < <(collect_essential_bins || true)
+  if [ "${#bins[@]}" -eq 0 ]; then warn "Nenhum binário essencial encontrado para incluir"; return 1; fi
+  for b in "${bins[@]}"; do
+    local name
+    name="$(basename "$b")"
+    # decide dest: busybox -> /bin, others -> /sbin or /bin heuristics
+    local destdir="$destroot/bin"
+    if printf '%s' "$b" | grep -qE '/s?bin/'; then destdir="$destroot/sbin"; fi
+    _copy_binary_and_deps "$b" "$destdir" || warn "Falha ao copiar bin $b"
+    _report_add_action "$KERNEL_VER" "copied-bin" "$b"
+  done
+  return 0
+}
+
+### ----- Modules detection -----
+collect_kernel_modules() {
+  # If PROFILE=extreme include all modules; otherwise detect common ones
+  local kv="$1"
+  local modules_dir="/lib/modules/${kv}"
+  if [ -z "$kv" ] || [ ! -d "$modules_dir" ]; then
+    warn "collect_kernel_modules: modules dir não encontrado para $kv"
+    return 1
+  fi
+  local outfile="${ADM_WORKDIR}/modules-to-include.txt"
+  rm -f "$outfile" 2>/dev/null || true
+  if [ "$PROFILE" = "extreme" ] || [ "$INCLUDE_MODULES_ALL" -eq 1 ]; then
+    find "$modules_dir" -type f -name '*.ko*' -printf '%P\n' | sort -u >"$outfile"
+  else
+    # heuristics: include block, fs, pci, usb, nvme, ahci, virtio, scsi, dm mod
+    local patterns="block fs pci usb nvme ahci virtio scsi dm"
+    for p in $patterns; do
+      find "$modules_dir" -type f -name "*${p}*.ko*" -printf '%P\n' >>"$outfile" 2>/dev/null || true
+    done
+    sort -u "$outfile" -o "$outfile" 2>/dev/null || true
+  fi
+  [ -f "$outfile" ] && printf "%s\n" "$outfile"
+  return 0
+}
+
+### ----- Generate /init template -----
+generate_init_script() {
+  local destroot="${1:-$ADM_INITRAMFS_DIR}"
+  local init="${destroot}/init"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) generate /init at $init"; return 0; fi
+  cat >"$init" <<'INITSH'
+#!/bin/sh
+# Minimal init for initramfs generated by adm-mkinitramfs
+# This script aims to be portable and minimal; further customization via hooks.
+set -e
+# bring up basic mounts
+mount -t proc proc /proc || true
+mount -t sysfs sysfs /sys || true
+mount -t devtmpfs devtmpfs /dev || true
+
+# Informational
+echo "=== adm initramfs ==="
+echo "Kernel: $(uname -r 2>/dev/null || echo unknown)"
+echo "Start time: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+# Run pre-init hooks if present
+HOOK_DIR="/lib/init-hooks/pre-init"
+if [ -d "$HOOK_DIR" ]; then
+  for h in "$HOOK_DIR"/*; do
+    [ -x "$h" ] && echo "Running hook: $h" && "$h" || echo "Hook failed: $h"
+  done
+fi
+
+# Bring up udev if available
+if command -v udevadm >/dev/null 2>&1; then
+  mkdir -p /run/udev
+  udevadm control --start || true
+  udevadm trigger || true
+fi
+
+# Simple root detection: prefer root= parameter on cmdline, else try /dev/sda1 or LABEL/UUID (basic)
+ROOTDEV=""
+for x in $(cat /proc/cmdline); do
+  case "$x" in root=*) ROOTDEV="${x#root=}"; break ;; esac
+done
+if [ -z "$ROOTDEV" ]; then
+  # basic fallback tries
+  for d in /dev/sda1 /dev/vda1 /dev/nvme0n1p1; do
+    [ -b "$d" ] && { ROOTDEV="$d"; break; }
+  done
+fi
+
+if [ -n "$ROOTDEV" ]; then
+  echo "Trying root device: $ROOTDEV"
+  # attempt to mount read-only then switch_root
+  mkdir -p /newroot
+  if mount "$ROOTDEV" /newroot 2>/dev/null; then
+    echo "Mounted $ROOTDEV -> /newroot"
+    # run post-init hooks
+    HOOK_DIR2="/lib/init-hooks/post-init"
+    if [ -d "$HOOK_DIR2" ]; then
+      for h in "$HOOK_DIR2"/*; do
+        [ -x "$h" ] && echo "Running post-init hook: $h" && "$h" || echo "Post hook failed: $h"
+      done
+    fi
+    exec switch_root /newroot /sbin/init || exec chroot /newroot /sbin/init
+  else
+    echo "Failed to mount $ROOTDEV; dropping to busybox shell"
+    exec /bin/sh
+  fi
+else
+  echo "No root device found; dropping to shell"
+  exec /bin/sh
+fi
+INITSH
+  chmod +x "$init" || true
+  ok "Script /init gerado em $init"
+  _report_add_action "$KERNEL_VER" "generated-init" "$init"
+  return 0
+}
+
+### ----- Write metadata & manifest for initramfs build -----
+write_init_meta() {
+  local outdir="${1:-$ADM_INITRAMFS_DIR}"
+  local meta="${outdir}/.initramfs.meta"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) escrever meta $meta"; return 0; fi
+  printf "kernel: %s\nprofile: %s\ncompress: %s\ngenerated_at: %s\n" "${KERNEL_VER:-unknown}" "$PROFILE" "$COMPRESS" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$meta"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then
+    sha256sum "$meta" >"${meta}.sha256" 2>/dev/null || true
+  fi
+  ok "Meta escrita: $meta"
+  _report_add_action "$KERNEL_VER" "wrote-meta" "$meta"
+  return 0
+}
+
+### ----- Usage / Arg parsing -----
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options]
+
+Options:
+  --kernel <version>       Kernel version to use (default: detected)
+  --profile <none|normal|extreme>   initramfs profile (default: normal)
+  --compress <gzip|xz|zstd>         Compression algorithm (default: gzip)
+  --output <path>          Output file for final image (default: ${OUTPUT})
+  --force                  Force actions / overwrite prompts
+  --dry-run                Simula tudo sem gravar
+  --verbose, -v            Verbose
+  --keep-temp              Preserve temporary tree for inspection
+  --help                   Show this help
+EOF
+  exit 1
+}
+
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kernel) shift; KERNEL_VER="${1:-}"; shift ;;
+    --profile) shift; PROFILE="${1:-$PROFILE}"; shift ;;
+    --compress) shift; COMPRESS="${1:-$COMPRESS}"; shift ;;
+    --output) shift; OUTPUT="${1:-$OUTPUT}"; shift ;;
+    --force) FORCE=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --keep-temp) KEEP_TEMP=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Opção desconhecida: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+# finalize settings
+if [ -n "$KERNEL_VER" ]; then verbose "Kernel forced: $KERNEL_VER"; fi
+KERNEL_VER="$(detect_kernel_version || true)"
+[ -z "$KERNEL_VER" ] && err "KERNEL_VER não definido; abortando." && exit 2
+OUTPUT="${OUTPUT//<kernel>/$KERNEL_VER}"
+
+info "adm-mkinitramfs (parte1) iniciado: kernel=$KERNEL_VER profile=$PROFILE compress=$COMPRESS dry-run=$DRY_RUN"
+
+_report_init
+
+### ----- Quick checks -----
+# ensure workdir writable
+if ! ensure_writable_dir "$ADM_WORKDIR"; then err "Workdir não gravável: $ADM_WORKDIR"; exit 3; fi
+# ensure initramfs temp tree path is clean
+if [ -d "$ADM_INITRAMFS_DIR" ] && [ "$DRY_RUN" -eq 0 ]; then
+  warn "Diretório temporário $ADM_INITRAMFS_DIR já existe; removendo antigo"
+  rm -rf "$ADM_INITRAMFS_DIR" 2>/dev/null || { err "Falha ao limpar $ADM_INITRAMFS_DIR"; exit 4; }
+fi
+
+### ----- Execution Plan (PART 1) -----
+# 1) Prepare tree
+# 2) Collect essential binaries and copy them with deps
+# 3) Collect modules list and record it
+# 4) Generate /init script template
+# 5) Write meta and report, keep tree for PART 2/3
+
+spinner_start "Preparando árvore initramfs em $ADM_INITRAMFS_DIR"
+if ! prepare_initramfs_tree "$ADM_INITRAMFS_DIR"; then spinner_stop "Falha"; err "Erro preparando árvore"; exit 5; fi
+spinner_stop "Árvore pronta"
+
+spinner_start "Populando árvore com binários essenciais"
+if ! populate_tree_with_bins "$ADM_INITRAMFS_DIR"; then spinner_stop "Aviso"; warn "População parcial"; fi
+spinner_stop "Binários populados (ou simulados)"
+
+spinner_start "Detectando módulos para kernel $KERNEL_VER"
+modlist_file="$(collect_kernel_modules "$KERNEL_VER" 2>/dev/null || true)"
+if [ -n "$modlist_file" ] && [ -f "$modlist_file" ]; then
+  ok "Lista de módulos gerada: $modlist_file"
+  _report_add_action "$KERNEL_VER" "modules-collected" "$modlist_file"
+else
+  warn "Nenhuma lista de módulos gerada (verifique PROFILE ou kernel path)"
+fi
+spinner_stop "Módulos detectados"
+
+spinner_start "Gerando script /init"
+if ! generate_init_script "$ADM_INITRAMFS_DIR"; then spinner_stop "Fail"; err "Falha ao gerar /init"; exit 6; fi
+spinner_stop "Script /init criado"
+
+spinner_start "Escrevendo metadata"
+if ! write_init_meta "$ADM_INITRAMFS_DIR"; then spinner_stop "Warn"; warn "Falha ao escrever meta"; fi
+spinner_stop "Meta escrita"
+
+# final summary for PART 1
+echo
+printf "%b PARTE 1/3 de adm-mkinitramfs concluída.%b\n" "${CLR_GREEN}" "${CLR_RESET}"
+printf "Árvore temporária: %s\n" "$ADM_INITRAMFS_DIR"
+printf "Saída planejada (não criada nesta parte): %s\n" "$OUTPUT"
+printf "Log: %s\n" "$LOGFILE"
+printf "Relatório JSON: %s\n" "$REPORT_JSON"
+if [ "$KEEP_TEMP" -eq 1 ]; then printf "Temp preserved for inspection.\n"; else printf "Temp will be used by PART 2/3 to assemble/compress image.\n"; fi
+
+# store some variables for PART 2/3 via a small state file
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_WORKDIR" 2>/dev/null || true
+  cat >"${ADM_WORKDIR}/mkinitramfs.state" <<ST
+ADM_INITRAMFS_DIR=${ADM_INITRAMFS_DIR}
+KERNEL_VER=${KERNEL_VER}
+PROFILE=${PROFILE}
+COMPRESS=${COMPRESS}
+OUTPUT=${OUTPUT}
+TS=${TS}
+ST
+  ok "State file escrito: ${ADM_WORKDIR}/mkinitramfs.state"
+fi
+
+exit 0
+#!/usr/bin/env bash
+#
+# adm-mkinitramfs (PARTE 2/3)
+# --------------------------
+# Empacota a árvore gerada pela PARTE 1/3:
+#  - inclui módulos do kernel (copiar .ko* para lib/modules/<kv>/)
+#  - executa depmod dentro da tree (se disponível) para gerar modules.dep
+#  - gera cpio (initramfs) e comprime com gzip/xz/zstd
+#  - calcula sha256 e escreve meta + report
+#  - com opção --install -> instala em /boot (com backup e confirmação)
+#
+# Segurança:
+#  - Respeita --dry-run (não altera /boot sem confirmação)
+#  - Operações destrutivas marcadas com ## RISCO:
+#  - Muitos checks e rollback parcial se algo falhar
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----- load PART1 state -----
+# Expect ADM_WORKDIR and mkinitramfs.state to exist (created by PART 1)
+STATE_FILE="${ADM_WORKDIR:-/usr/src/adm/tmp}/mkinitramfs.state"
+if [ ! -f "$STATE_FILE" ]; then
+  err "State file não encontrado: $STATE_FILE. Execute PARTE 1/3 antes (adm-mkinitramfs parte1)."
+  exit 2
+fi
+# shellcheck disable=SC1090
+source "$STATE_FILE" || { err "Falha ao carregar estado: $STATE_FILE"; exit 3; }
+
+### ----- reuse variables from PART1 (or override) -----
+ADM_INITRAMFS_DIR="${ADM_INITRAMFS_DIR:-$ADM_TMP/initramfs-${TS}}"
+KERNEL_VER="${KERNEL_VER:-$(detect_kernel_version || true)}"
+PROFILE="${PROFILE:-normal}"
+COMPRESS="${COMPRESS:-gzip}"
+OUTPUT="${OUTPUT:-${ADM_BOOT_DIR}/initramfs-${KERNEL_VER}.img}"
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+VERBOSE="${VERBOSE:-0}"
+KEEP_TEMP="${KEEP_TEMP:-0}"
+LOGFILE="${LOGFILE:-${ADM_LOGS}/adm-mkinitramfs-${TS}.log}"
+REPORT_JSON="${REPORT_JSON:-${ADM_TMP}/adm-mkinitramfs-report-${TS}.json}"
+
+# tool checks
+command -v cpio >/dev/null 2>&1 || { err "cpio não disponível; necessário para criar initramfs"; exit 4; }
+HAS_DEPENDENT_DEPMOD=0; command -v depmod >/dev/null 2>&1 && HAS_DEPENDENT_DEPMOD=1
+command -v gzip >/dev/null 2>&1 || true
+command -v xz >/dev/null 2>&1 || true
+command -v zstd >/dev/null 2>&1 || true
+command -v sha256sum >/dev/null 2>&1 || true
+
+# helper logs (re-use)
+log_to_file "[PART2]" "start"
+
+### ----- Flags / args parsing for PART2 -----
+# Accept a few overrides in invocation of PART 2 directly
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --install) INSTALL_TO_BOOT=1; shift ;;
+    --no-install) INSTALL_TO_BOOT=0; shift ;;
+    --backup) BACKUP_BOOT=1; shift ;;
+    --no-backup) BACKUP_BOOT=0; shift ;;
+    --keep-temp) KEEP_TEMP=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --compress) shift; COMPRESS="${1:-$COMPRESS}"; shift ;;
+    --output) shift; OUTPUT="${1:-$OUTPUT}"; shift ;;
+    --help|-h) echo "Usage part2 args: --install --backup --dry-run --compress <gzip|xz|zstd> --output <file>"; exit 0 ;;
+    --) shift; break ;;
+    -*) err "Opção desconhecida para PARTE2: $1"; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+### ----- safety checks -----
+if [ ! -d "$ADM_INITRAMFS_DIR" ]; then
+  err "Árvore initramfs não encontrada: $ADM_INITRAMFS_DIR (execute PARTE1 primeiro)"
+  exit 5
+fi
+if [ -z "$KERNEL_VER" ]; then
+  KERNEL_VER="$(detect_kernel_version || true)"
+  [ -z "$KERNEL_VER" ] && err "KERNEL_VER indefinido" && exit 6
+fi
+
+info "PARTE 2/3 iniciado: kernel=$KERNEL_VER compress=$COMPRESS output=$OUTPUT dry-run=$DRY_RUN"
+
+### ----- helpers -----
+safe_mkdir() { [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) mkdir -p $1" && return 0; mkdir -p "$1" || { err "mkdir failed: $1"; return 1; } }
+_safe_cp() { [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) cp $*" && return 0; cp -a --preserve=mode,timestamps "$@" || return 1; }
+
+### ----- copy kernel modules into initramfs tree -----
+# Copy modules from /lib/modules/<KERNEL_VER> into ${ADM_INITRAMFS_DIR}/lib/modules/<KERNEL_VER> preserving relative tree
+copy_kernel_modules_into_tree() {
+  local src="/lib/modules/${KERNEL_VER}"
+  local dst="${ADM_INITRAMFS_DIR}/lib/modules/${KERNEL_VER}"
+  if [ ! -d "$src" ]; then
+    warn "Diretório de módulos não encontrado em $src; pulando inclusão de módulos"
+    return 0
+  fi
+  safe_mkdir "$dst" || return 2
+
+  spinner_start "Copiando módulos do kernel ($KERNEL_VER) para árvore initramfs"
+  # copy all .ko* files selected in previous module list if present; prefer the modules-to-include.txt in ADM_WORKDIR
+  local module_list="${ADM_WORKDIR}/modules-to-include.txt"
+  if [ -f "$module_list" ]; then
+    while IFS= read -r rel || [ -n "$rel" ]; do
+      [ -z "$rel" ] && continue
+      local srcfile="${src}/${rel}"
+      if [ ! -e "$srcfile" ]; then
+        warn "Módulo listado ausente: $srcfile (ignorado)"
+        continue
+      fi
+      local destdir
+      destdir="$(dirname "${dst}/${rel}")"
+      safe_mkdir "$destdir" || { spinner_stop "Fail"; return 3; }
+      if ! _safe_cp "$srcfile" "$destdir/"; then
+        warn "Falha ao copiar $srcfile"
+      else
+        verbose "copied $srcfile -> $destdir/"
+      fi
+    done <"$module_list"
+  else
+    # fallback: copy a minimal set based on profile heuristics (block/usb/virtio/fs)
+    local patterns="block fs pci usb nvme ahci virtio scsi dm"
+    for p in $patterns; do
+      find "$src" -type f -name "*${p}*.ko*" -exec sh -c 'd=$(dirname "$1"); destdir="'"$dst"'/${d#'"$src"'}"; mkdir -p "$destdir"; cp -a "$1" "$destdir/"' _ {} \; 2>/dev/null || true
+    done
+  fi
+  spinner_stop "Módulos copiados"
+  _report_add_action "$KERNEL_VER" "modules-copied" "$dst"
+  return 0
+}
+
+### ----- run depmod (generate modules.dep) inside the tree -----
+# prefer depmod -b <initramfs_root> <kernel_version> if available
+generate_modules_dep() {
+  local root="$ADM_INITRAMFS_DIR"
+  if [ "$HAS_DEPENDENT_DEPMOD" -eq 1 ]; then
+    spinner_start "Gerando modules.dep (depmod)"
+    if [ "$DRY_RUN" -eq 1 ]; then spinner_stop "(dry-run) depmod"; _report_add_action "$KERNEL_VER" "depmod" "skipped(dry)"; return 0; fi
+    if depmod -b "$root" "$KERNEL_VER" >/dev/null 2>&1; then
+      spinner_stop "modules.dep gerado via depmod"
+      _report_add_action "$KERNEL_VER" "depmod" "ok"
+      return 0
+    else
+      spinner_stop "depmod falhou"
+      warn "depmod falhou; tentando fallback para gerar modules.dep"
+    fi
+  fi
+
+  # fallback: generate basic modules.dep by scanning .ko files for dependencies using modinfo (best-effort)
+  spinner_start "Gerando modules.dep (fallback)"
+  local modules_dir="${root}/lib/modules/${KERNEL_VER}"
+  if [ ! -d "$modules_dir" ]; then
+    spinner_stop "Nenhum módulo para modules.dep"
+    return 0
+  fi
+  local depfile="${modules_dir}/modules.dep"
+  rm -f "$depfile" 2>/dev/null || true
+  # create entries: <module.ko>: <deps>
+  find "$modules_dir" -type f -name '*.ko*' -print0 2>/dev/null | while IFS= read -r -d '' ko; do
+    local modname
+    modname="$(basename "$ko")"
+    # try modinfo to get depends
+    local deps=""
+    if command -v modinfo >/dev/null 2>&1; then
+      deps="$(modinfo -F depends "$ko" 2>/dev/null || true)"
+      deps="$(printf '%s' "$deps" | tr ',' ' ' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    fi
+    printf "%s:%s\n" "$modname" "${deps}" >>"$depfile"
+  done
+  spinner_stop "modules.dep gerado (fallback)"
+  _report_add_action "$KERNEL_VER" "modules.dep" "$depfile"
+  return 0
+}
+
+### ----- Run pre-pack hooks -----
+run_initramfs_pack_hooks() {
+  local hook_dir="${ADM_ROOT}/metafiles/system/initramfs/hooks/pack-pre"
+  if [ -d "$hook_dir" ]; then
+    for h in "$hook_dir"/*; do
+      [ -x "$h" ] || continue
+      info "Executando hook pack-pre: $h"
+      if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) $h"; continue; fi
+      if ! "$h" >>"$LOGFILE" 2>&1; then
+        warn "Hook $h falhou (continuando)"
+        _report_add_error "hook-pack-pre-failed:$h"
+      else
+        _report_add_action "$KERNEL_VER" "hook-pack-pre" "$h"
+      fi
+    done
+  fi
+}
+
+### ----- Create the initramfs cpio archive and compress -----
+create_initramfs_archive() {
+  local root="$ADM_INITRAMFS_DIR"
+  local out="$OUTPUT"
+  local tmp_out="${out}.tmp"
+  local compress="$COMPRESS"
+
+  info "Criando cpio (initramfs) e comprimindo ($compress) -> $out"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) cpio + $compress to $out"
+    _report_add_action "$KERNEL_VER" "create-archive" "skipped(dry-run)"
+    return 0
+  fi
+
+  # ensure parent dir writable
+  ensure_writable_dir "$(dirname "$out")" || { err "Diretório saída não gravável: $(dirname "$out")"; return 2; }
+
+  # create cpio stream from tree root (preserve permissions, devices)
+  # Use find | cpio -o -H newc
+  spinner_start "Gerando cpio (this may take a while)"
+  if find "$root" -mindepth 1 -print0 | cpio --null -ov --format=newc >"${tmp_out}.cpio" 2>>"$LOGFILE"; then
+    spinner_stop "cpio criado (uncompressed)"
+  else
+    spinner_stop "cpio falhou"
+    err "Falha ao criar cpio"
+    return 3
+  fi
+
+  # compress tmp_out.cpio -> tmp_out.<ext>
+  case "$compress" in
+    gzip)
+      if gzip -c "${tmp_out}.cpio" >"${tmp_out}.gz"; then
+        mv -f "${tmp_out}.gz" "$out"
+        rm -f "${tmp_out}.cpio"
+        ok "Arquivo initramfs criado (gzip): $out"
+      else
+        err "gzip falhou"
+        return 4
+      fi
+      ;;
+    xz)
+      if xz -c -z -9 "${tmp_out}.cpio" >"${tmp_out}.xz"; then
+        mv -f "${tmp_out}.xz" "$out"
+        rm -f "${tmp_out}.cpio"
+        ok "Arquivo initramfs criado (xz): $out"
+      else
+        err "xz falhou"
+        return 5
+      fi
+      ;;
+    zstd)
+      if zstd -c -19 "${tmp_out}.cpio" -o "${tmp_out}.zst"; then
+        mv -f "${tmp_out}.zst" "$out"
+        rm -f "${tmp_out}.cpio"
+        ok "Arquivo initramfs criado (zstd): $out"
+      else
+        err "zstd falhou"
+        return 6
+      fi
+      ;;
+    *)
+      err "Algoritmo de compressão desconhecido: $compress"
+      return 7
+      ;;
+  esac
+
+  # compute sha256
+  if command -v sha256sum >/dev/null 2>&1; then
+    local sha
+    sha="$(sha256sum "$out" | awk '{print $1}')"
+    printf "%s  %s\n" "$sha" "$(basename "$out")" >"${out}.sha256" 2>/dev/null || true
+    _report_add_action "$KERNEL_VER" "sha" "${out}.sha256"
+  fi
+
+  return 0
+}
+
+### ----- Install initramfs into /boot (with backup) -----
+install_initramfs_to_boot() {
+  local outfile="$OUTPUT"
+  local bootdir="${ADM_BOOT_DIR:-/boot}"
+  local basename_out
+  basename_out="$(basename "$outfile")"
+
+  # verify out exists
+  if [ ! -f "$outfile" ]; then err "Arquivo initramfs não encontrado: $outfile"; return 2; fi
+
+  # backup existing target (if exists)
+  local target="${bootdir}/${basename_out}"
+  if [ -f "$target" ]; then
+    local backup="${target}.bak-${TS}"
+    ## RISCO: mover arquivo em /boot (necessário para rollback)
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) moveria $target -> $backup"
+    else
+      if ! mv -f "$target" "$backup" 2>>"$LOGFILE"; then
+        err "Falha ao fazer backup do initramfs existente: $target -> $backup"
+        return 3
+      fi
+      ok "Backup de /boot realizado: $backup"
+      _report_add_action "$KERNEL_VER" "boot-backup" "$backup"
+    fi
+  fi
+
+  # copy outfile to /boot
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) copiar $outfile -> $bootdir/"
+  else
+    if ! cp -a --preserve=mode,timestamps "$outfile" "$bootdir/"; then
+      err "Falha ao copiar initramfs para $bootdir/"
+      return 4
+    fi
+    ok "Initramfs instalado em $bootdir/$basename_out"
+    _report_add_action "$KERNEL_VER" "installed" "$bootdir/$basename_out"
+  fi
+
+  # update symlink latest
+  local symlink="${bootdir}/initramfs.img"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) ln -sf $basename_out $symlink"
+  else
+    ln -sf "$basename_out" "$symlink" 2>/dev/null || true
+    ok "Symlink atualizado: $symlink -> $basename_out"
+  fi
+  return 0
+}
+
+### ----- post-pack hooks -----
+run_pack_post_hooks() {
+  local hook_dir="${ADM_ROOT}/metafiles/system/initramfs/hooks/pack-post"
+  if [ -d "$hook_dir" ]; then
+    for h in "$hook_dir"/*; do
+      [ -x "$h" ] || continue
+      info "Executando hook pack-post: $h"
+      if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) $h"; continue; fi
+      if ! "$h" >>"$LOGFILE" 2>&1; then
+        warn "Hook $h falhou (continuando)"
+        _report_add_error "hook-pack-post-failed:$h"
+      else
+        _report_add_action "$KERNEL_VER" "hook-pack-post" "$h"
+      fi
+    done
+  fi
+}
+
+### ----- main sequence for PART2 -----
+main_part2() {
+  # 1) copy modules
+  if ! copy_kernel_modules_into_tree; then err "Erro copiando módulos"; return 10; fi
+
+  # 2) generate modules.dep / depmod
+  if ! generate_modules_dep; then warn "modules.dep generation errored (nonfatal)"; fi
+
+  # 3) run pre-pack hooks
+  run_initramfs_pack_hooks
+
+  # 4) create archive and compress
+  if ! create_initramfs_archive; then err "Falha criando archive"; return 11; fi
+
+  # 5) run post-pack hooks
+  run_pack_post_hooks
+
+  # 6) optionally install to /boot (requires explicit confirmation)
+  if [ "${INSTALL_TO_BOOT:-0}" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) instalaria para /boot"
+    else
+      if [ "$FORCE" -ne 1 ]; then
+        if ! confirm_prompt "Instalar initramfs em ${ADM_BOOT_DIR}? (overwrite backup will be created)"; then
+          warn "Instalação abortada pelo usuário"
+        else
+          install_initramfs_to_boot || warn "Falha na instalação para /boot"
+        fi
+      else
+        install_initramfs_to_boot || warn "Falha na instalação para /boot"
+      fi
+    fi
+  else
+    verbose "INSTALL_TO_BOOT não habilitado; não instalando"
+  fi
+
+  # 7) finalize: write final metadata and report
+  if command -v sha256sum >/dev/null 2>&1 && [ -f "$OUTPUT" ]; then
+    local sha
+    sha="$(sha256sum "$OUTPUT" | awk '{print $1}')"
+    printf "sha256: %s\nfile: %s\nkernel: %s\nprofile: %s\n" "$sha" "$(basename "$OUTPUT")" "$KERNEL_VER" "$PROFILE" >"${OUTPUT}.meta" 2>/dev/null || true
+    ok "Meta final escrita: ${OUTPUT}.meta"
+    _report_add_action "$KERNEL_VER" "final-meta" "${OUTPUT}.meta"
+  fi
+
+  # 8) cleanup unless KEEP_TEMP
+  if [ "$KEEP_TEMP" -eq 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    verbose "Removendo árvore temporária $ADM_INITRAMFS_DIR (KEEP_TEMP=0)"
+    rm -rf "$ADM_INITRAMFS_DIR" 2>/dev/null || warn "Falha ao remover árvore temporária; verifique permissões"
+  else
+    verbose "Preservando árvore temporária: $ADM_INITRAMFS_DIR"
+  fi
+
+  ok "PARTE 2/3 concluída"
+  return 0
+}
+
+### ----- Run main and handle errors gracefully -----
+_main_rc=0
+if ! main_part2; then
+  _main_rc=$?
+  err "PARTE 2/3 falhou com rc=$_main_rc"
+  _report_add_error "part2-failed:rc=$_main_rc"
+  # Attempt to cleanup partial compressed files
+  if [ -f "${OUTPUT}.tmp" ]; then rm -f "${OUTPUT}.tmp" 2>/dev/null || true; fi
+  exit "$_main_rc"
+fi
+
+# write short summary to stdout
+echo
+printf "%b PARTE 2/3 de adm-mkinitramfs concluída.%b\n" "${CLR_GREEN}" "${CLR_RESET}"
+printf "Imagem final: %s\n" "$OUTPUT"
+if [ -f "${OUTPUT}.sha256" ]; then printf "SHA: %s\n" "$(awk '{print $1}' "${OUTPUT}.sha256")"; fi
+printf "Log: %s\n" "$LOGFILE"
+printf "Report: %s\n" "$REPORT_JSON"
+
+exit 0
+#!/usr/bin/env bash
+#
+# adm-mkinitramfs (PARTE 3/3)
+# --------------------------
+# Instalação segura em /boot, integração com GRUB, rollback automático, integração com adm-build,
+# comandos auxiliares: --install --update-grub --rollback-last --restore <backup> --integrate-adm-build
+#
+# Requer PART 1/3 e PART 2/3 executadas (estado em ${ADM_WORKDIR}/mkinitramfs.state e saída em $OUTPUT).
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# --- Basic environment (reuse or fallback) ---
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_BOOT_DIR="${ADM_BOOT_DIR:-/boot}"
+ADM_WORKDIR="${ADM_WORKDIR:-$ADM_TMP}"
+LOGFILE="${LOGFILE:-${ADM_LOGS}/adm-mkinitramfs-${TS_NOW}.log}"
+REPORT_JSON="${REPORT_JSON:-${ADM_TMP}/adm-mkinitramfs-report-${TS_NOW}.json}"
+
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+VERBOSE="${VERBOSE:-0}"
+INSTALL_TO_BOOT="${INSTALL_TO_BOOT:-0}"
+UPDATE_GRUB_AFTER="${UPDATE_GRUB_AFTER:-0}"
+
+# try to source existing state from PART1 if present
+STATE_FILE="${ADM_WORKDIR}/mkinitramfs.state"
+if [ -f "$STATE_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$STATE_FILE" || true
+fi
+
+# if OUTPUT not set, try common fallback
+OUTPUT="${OUTPUT:-${ADM_BOOT_DIR}/initramfs-${KERNEL_VER:-$(uname -r)}.img}"
+
+# colors
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"; CLR_GREEN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YELLOW="$(tput setaf 3)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"
+
+# helper logs
+log() { [ -n "${LOGFILE:-}" ] && printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info() { printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RESET}"; log "[INFO]" "$1"; }
+ok()   { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "${CLR_RESET}"; log "[OK]" "$1"; }
+warn() { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "${CLR_RESET}"; log "[WARN]" "$1"; }
+err()  { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "${CLR_RESET}" >&2; log "[ERROR]" "$1"; }
+
+# safety wrappers reused
+ensure_writable_dir() {
+  local d="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) ensure dir $d"; return 0; fi
+  mkdir -p "$d" 2>/dev/null || { err "Falha ao criar diretório: $d"; return 1; }
+  [ -w "$d" ] || { err "Diretório não gravável: $d"; return 2; }
+  return 0
+}
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "%s\n" "$1"; log "[VERB]" "$1"; }
+
+# Acquire lock for /boot changes
+BOOT_LOCK="${ADM_TMP}/adm-mkinitramfs-boot.lock"
+_acquire_boot_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire boot lock"; return 0; fi
+  exec 9>"$BOOT_LOCK"
+  if ! flock -n 9; then
+    err "Outra operação em /boot está em andamento (lock: $BOOT_LOCK)"; return 1
+  fi
+  printf "%s\n" "$$" >"${BOOT_LOCK}.pid" 2>/dev/null || true
+  return 0
+}
+_release_boot_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) release boot lock"; return 0; fi
+  rm -f "${BOOT_LOCK}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+  return 0
+}
+
+# helpers for backups and rollback
+_last_backup_of() {
+  local target="$1"
+  # find latest backup file matching target.bak-*
+  find "${ADM_BOOT_DIR}" -maxdepth 1 -type f -name "$(basename "$target").bak-*" -printf '%T@ %p\n' 2>/dev/null \
+    | sort -nr | head -n1 | awk '{print $2}' || true
+}
+
+_make_boot_backup() {
+  local target="$1"
+  local ts="${TS_NOW}"
+  local base="$(basename "$target")"
+  local backup="${target}.bak-${ts}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) backup $target -> $backup"; return 0; fi
+  if [ ! -f "$target" ]; then verbose "Arquivo alvo não existe, nada a backup: $target"; return 0; fi
+  if ! cp -a --preserve=mode,timestamps "$target" "$backup"; then
+    err "Falha ao criar backup de $target -> $backup"; return 1
+  fi
+  ok "Backup criado: $backup"
+  log "[BOOT-BACKUP]" "$target -> $backup"
+  printf "%s" "$backup"
+  return 0
+}
+
+_restore_backup_file() {
+  local backup="$1" target="$2"
+  ## RISCO: operação que sobrescreve arquivo em /boot
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) mv $backup -> $target"; return 0; fi
+  if [ ! -f "$backup" ]; then err "Backup não encontrado: $backup"; return 1; fi
+  if ! mv -f "$backup" "$target"; then err "Falha ao restaurar $backup -> $target"; return 2; fi
+  ok "Restaurado: $target from $backup"
+  log "[BOOT-RESTORE]" "$backup -> $target"
+  return 0
+}
+
+# GRUB integration: detect available command to update config
+detect_grub_updater() {
+  if command -v update-grub >/dev/null 2>&1; then echo "update-grub"; return 0; fi
+  if command -v grub-mkconfig >/dev/null 2>&1; then echo "grub-mkconfig"; return 0; fi
+  if command -v grub2-mkconfig >/dev/null 2>&1; then echo "grub2-mkconfig"; return 0; fi
+  # no known tool
+  return 1
+}
+
+_update_grub_menu() {
+  local updater
+  updater="$(detect_grub_updater || true)"
+  if [ -z "$updater" ]; then warn "Nenhuma ferramenta grub encontrada para atualizar menu (update-grub/grub-mkconfig)"; return 1; fi
+  info "Atualizando menu do GRUB com: $updater"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $updater"; return 0; fi
+  case "$updater" in
+    update-grub) if update-grub >/dev/null 2>&1; then ok "update-grub executado"; return 0; fi ;;
+    grub-mkconfig) if grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1; then ok "grub-mkconfig executado"; return 0; fi ;;
+    grub2-mkconfig) if grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1; then ok "grub2-mkconfig executado"; return 0; fi ;;
+  esac
+  warn "Atualização do GRUB retornou não-zero; ver logs"
+  return 2
+}
+
+# rollback helper: restore latest backup of a given filename (basename)
+rollback_last_initramfs() {
+  local basename_out
+  basename_out="$(basename "$OUTPUT")"
+  local last
+  last="$(_last_backup_of "${ADM_BOOT_DIR}/${basename_out}" || true)"
+  if [ -z "$last" ]; then warn "Nenhum backup encontrado para ${basename_out}"; return 1; fi
+  info "Rollback: restaurando $last -> ${ADM_BOOT_DIR}/${basename_out}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) restore $last"; return 0; fi
+  _acquire_boot_lock || { err "Não foi possível adquirir lock de /boot"; return 2; }
+  if _restore_backup_file "$last" "${ADM_BOOT_DIR}/${basename_out}"; then
+    ok "Rollback realizado com sucesso"
+    _release_boot_lock || true
+    # optionally update grub
+    if [ "$UPDATE_GRUB_AFTER" -eq 1 ]; then _update_grub_menu || warn "Falha ao atualizar grub após rollback"; fi
+    return 0
+  else
+    warn "Falha no rollback"
+    _release_boot_lock || true
+    return 3
+  fi
+}
+
+# integration with adm-build: create small "post-kernel-build" hook that triggers adm-mkinitramfs --install --update-grub
+install_adm_build_integration() {
+  local hookdir="${ADM_ROOT}/hooks/kernel-post-build"
+  local hookfile="${hookdir}/adm-mkinitramfs-post.sh"
+  mkdir -p "$hookdir" 2>/dev/null || true
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) criar hook $hookfile"
+    return 0
+  fi
+  cat >"$hookfile" <<'HOOK'
+#!/usr/bin/env bash
+# Hook automatically created by adm-mkinitramfs to update initramfs after kernel build.
+# This hook executes adm-mkinitramfs to create and install initramfs for the built kernel.
+# It intentionally uses adm-mkinitramfs in non-interactive mode; ensure adm.conf is configured.
+exec /usr/src/adm/scripts/adm-mkinitramfs --install --update-grub --force --quiet
+HOOK
+  chmod +x "$hookfile" || true
+  ok "Hook instalado: $hookfile"
+  log "[INTEGRATION]" "hook installed $hookfile"
+  return 0
+}
+
+# CLI parsing for PART3
+POSITIONAL=()
+CMD=""
+ROLLBACK_LAST=0
+RESTORE_PATH=""
+INTEGRATE_ADM_BUILD=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --install) INSTALL_TO_BOOT=1; shift ;;
+    --no-install) INSTALL_TO_BOOT=0; shift ;;
+    --update-grub) UPDATE_GRUB_AFTER=1; shift ;;
+    --rollback-last) ROLLBACK_LAST=1; shift ;;
+    --restore) shift; RESTORE_PATH="$1"; shift ;;
+    --integrate-adm-build) INTEGRATE_ADM_BUILD=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --help|-h) CMD=usage; shift ;;
+    --quiet) VERBOSE=0; shift ;;
+    --) shift; break ;;
+    -*) err "Opção desconhecida: $1"; exit 2 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+if [ "${CMD:-}" = "usage" ]; then
+  cat <<EOF
+Usage (PART3): $SCRIPT_NAME [--install] [--update-grub] [--rollback-last] [--restore <backup>] [--integrate-adm-build] [--force] [--dry-run]
+ - --install           : copy output image to ${ADM_BOOT_DIR} (requires confirmation or --force)
+ - --update-grub       : run grub update after install
+ - --rollback-last     : restore last backup for this initramfs (safe)
+ - --restore <path>    : restore specific backup path to target location (dangerous)
+ - --integrate-adm-build : install a post-kernel-build hook in adm-build
+ - --force             : non-interactive, assume yes
+ - --dry-run           : simulate
+EOF
+  exit 0
+fi
+
+# If asked to rollback last backup
+if [ "$ROLLBACK_LAST" -eq 1 ]; then
+  rollback_last_initramfs
+  exit $?
+fi
+
+# If asked to restore specific backup
+if [ -n "$RESTORE_PATH" ]; then
+  # determine target from RESTORE_PATH basename heuristic (if user passed full path, must be under /boot)
+  local target="$(basename "$OUTPUT")"
+  local target_path="${ADM_BOOT_DIR}/${target}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) restoring $RESTORE_PATH -> $target_path"; exit 0; fi
+  if [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    read -r -p "Restauração irá sobrescrever ${target_path}. Prosseguir? [y/N]: " ans
+    case "$ans" in y|Y|yes|YES) ;; *) warn "Restauração cancelada"; exit 1 ;; esac
+  fi
+  _acquire_boot_lock || { err "Não foi possível adquirir lock"; exit 2; }
+  if _restore_backup_file "$RESTORE_PATH" "$target_path"; then
+    ok "Restore finalizado"
+    _release_boot_lock || true
+    if [ "$UPDATE_GRUB_AFTER" -eq 1 ]; then _update_grub_menu || warn "Falha ao atualizar grub após restore"; fi
+    exit 0
+  else
+    _release_boot_lock || true
+    exit 3
+  fi
+fi
+
+# If integration requested
+if [ "$INTEGRATE_ADM_BUILD" -eq 1 ]; then
+  install_adm_build_integration || warn "Falha ao instalar integração com adm-build"
+  exit $?
+fi
+
+# Normal install path: install output to /boot
+if [ "${INSTALL_TO_BOOT:-0}" -eq 1 ]; then
+  # sanity checks
+  if [ ! -f "$OUTPUT" ]; then err "Arquivo de initramfs não encontrado: $OUTPUT (execute PART2)"; exit 2; fi
+  ensure_writable_dir "$ADM_BOOT_DIR" || exit 3
+  _acquire_boot_lock || exit 4
+
+  local target="${ADM_BOOT_DIR}/$(basename "$OUTPUT")"
+  # create backup if exists
+  if [ -f "$target" ]; then
+    local backup
+    backup="$(_make_boot_backup "$target" || true)"
+    if [ -z "$backup" ]; then
+      warn "Não foi possível criar backup do arquivo existente; abortando instalação"
+      _release_boot_lock || true
+      exit 5
+    fi
+  fi
+
+  # confirm if not forced
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) copiar $OUTPUT -> $ADM_BOOT_DIR/"; else
+    if [ "$FORCE" -ne 1 ]; then
+      read -r -p "Instalar $OUTPUT em ${ADM_BOOT_DIR}? (irá criar backup se necessário) [y/N]: " ans
+      case "$ans" in y|Y|yes|YES) ;; *) warn "Instalação cancelada"; _release_boot_lock || true; exit 1 ;; esac
+    fi
+    if cp -a --preserve=mode,timestamps "$OUTPUT" "$ADM_BOOT_DIR/"; then
+      ok "Arquivo copiado para ${ADM_BOOT_DIR}/"
+      log "[BOOT-INSTALL]" "$OUTPUT -> ${ADM_BOOT_DIR}/"
+      # update symlink
+      ln -sf "$(basename "$OUTPUT")" "${ADM_BOOT_DIR}/initramfs.img" 2>/dev/null || true
+    else
+      err "Falha ao copiar $OUTPUT -> ${ADM_BOOT_DIR}/ (tentando rollback)"
+      # attempt rollback if backup exists
+      if [ -n "${backup:-}" ]; then _restore_backup_file "$backup" "$target" || warn "Rollback falhou"; fi
+      _release_boot_lock || true
+      exit 6
+    fi
+  fi
+
+  # optionally update grub
+  if [ "$UPDATE_GRUB_AFTER" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) update-grub requested"; else
+      if _update_grub_menu; then ok "GRUB atualizado"; else warn "Atualização do GRUB falhou"; fi
+    fi
+  fi
+
+  _release_boot_lock || true
+  ok "Instalação finalizada. Verifique /boot e GRUB."
+  exit 0
+fi
+
+# If nothing specified: print brief status/help
+cat <<EOF
+adm-mkinitramfs PART3 helper
+ - Default OUTPUT: $OUTPUT
+ - To install: run with --install [--update-grub] [--force]
+ - To rollback last: --rollback-last
+ - To restore specific backup: --restore <path>
+ - To integrate with adm-build: --integrate-adm-build
+ - Always test with --dry-run first!
+Log: $LOGFILE
+EOF
+
+exit 0Mas ele sai do 4 ou ficaram 4, não fica na cama, ah, não aquele candão, eu deixei a luz na cozinha cedo, ele ia na cozinha voltava brincava, voltava, e eu com medo eu não é gozado, você me deixa dormir, ou não, aí fica me batendo na cara boa bota, esse caramba eu falo caramba, Lucas. Bate devagar meu.
