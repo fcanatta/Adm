@@ -1,0 +1,13 @@
+description: GNU C Library (glibc) - the standard C library used by the GNU system and most other modern Unix-like systems.
+name: glibc
+version: 2.40
+license: LGPL-2.1-or-later
+url: https://www.gnu.org/software/libc/
+build: 1
+source: https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
+source: https://ftpmirror.gnu.org/libc/glibc-2.40.tar.xz
+source: git+https://sourceware.org/git/glibc.git#glibc-2.40
+sha256sum: 3b20b7a58c53694b6d83a5e38833bbd9f5e4152214b12a9a3a5c621d83b573ad
+build_deps: gcc, binutils, make, bash, sed, python3, texinfo, gawk, patch, bison, perl, zstd
+run_deps: linux-headers, tzdata, bash
+opt_deps: gdb, valgrind, audit
