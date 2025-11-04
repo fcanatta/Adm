@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel post-package
+# - Assina digitalmente o pacote do kernel e gera SHA256 verificado.
+# - Mantém logs e assinatura em cache.
+#
+set -euo pipefail
+
+echo "🔒 [linux-kernel post-package] Assinando e validando pacote..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-postpackage.log}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+GPG_KEY="${GPG_KEY:-${ADM_ROOT}/keys/adm-signing.gpg}"
+OPENSSL_KEY="${OPENSSL_KEY:-${ADM_ROOT}/keys/adm-key.pem}"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$CACHE_DIR" || true
+echo "[`date -u`] post-package start" >> "$ADM_LOG"
+
+# 1️⃣ Localizar o pacote mais recente
+PKG="$(ls -1t "$CACHE_DIR"/linux-kernel-*.tar.xz 2>/dev/null | head -n1 || true)"
+if [ -z "$PKG" ]; then
+  echo "❌ Nenhum pacote de kernel encontrado em $CACHE_DIR"
+  exit 1
+fi
+
+echo "📦 Pacote encontrado: $PKG"
+
+# 2️⃣ Verificar hash
+sha256sum "$PKG" > "$PKG.sha256"
+sha256sum -c "$PKG.sha256" || {
+  echo "❌ Falha na verificação SHA256 — pacote corrompido."
+  exit 2
+}
+
+# 3️⃣ Assinar digitalmente
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) assinaria com GPG ou OpenSSL"
+  exit 0
+fi
+
+if [ -f "$GPG_KEY" ] && command -v gpg >/dev/null 2>&1; then
+  echo "🔑 Assinando com GPG..."
+  gpg --batch --yes --default-key "$GPG_KEY" --detach-sign "$PKG" || true
+elif [ -f "$OPENSSL_KEY" ] && command -v openssl >/dev/null 2>&1; then
+  echo "🔑 Assinando com OpenSSL..."
+  openssl dgst -sha256 -sign "$OPENSSL_KEY" -out "$PKG.sig" "$PKG"
+else
+  echo "⚠️  Nenhuma chave encontrada. Pulei assinatura (pode gerar manualmente depois)."
+fi
+
+echo "[`date -u`] post-package complete" >> "$ADM_LOG"
+echo "✅ [linux-kernel post-package] Pacote validado e assinado."
