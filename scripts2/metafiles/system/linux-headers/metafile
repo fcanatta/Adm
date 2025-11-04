@@ -1,0 +1,12 @@
+description: Linux Kernel Headers — the stable kernel header files for building modules and user-space interfaces against the Linux kernel.
+name: linux-kernel-headers
+version: 6.7.11
+license: GPL-2.0 (only)
+url: https://www.kernel.org/
+build: 1
+source: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.7.11.tar.xz
+source: git+https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git#v6.7.11
+sha256sum: <INSERT_SHA256_OF_linux-6.7.11.tar.xz>
+build_deps: gcc, make, flex, bison
+run_deps: none
+opt_deps: none
