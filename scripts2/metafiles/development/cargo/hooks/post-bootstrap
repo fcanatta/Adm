@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo post-bootstrap
+# - Valida o funcionamento do Cargo bootstrap após o pre-bootstrap.
+# - Compila e roda um projeto de teste, registra versão e faz limpeza segura.
+# - Compatível com DRY_RUN e aborta em caso de falhas.
+#
+# ⚠️ Este script opera APENAS dentro de /usr/src/adm/toolchains
+#     e nunca modifica o sistema real (/usr, /bin, etc.)
+#
+set -euo pipefail
+
+echo "🔧 [cargo post-bootstrap] Validando toolchain Cargo bootstrap..."
+
+# Variáveis principais
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/cargo-bootstrap.log}"
+BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${ADM_ROOT}/toolchains/cargo-bootstrap}"
+TEST_DIR="${TEST_DIR:-${BOOTSTRAP_DIR}/.test}"
+VERSION_FILE="${BOOTSTRAP_DIR}/version"
+
+CARGO_BIN="${BOOTSTRAP_DIR}/bin/cargo"
+CARGO_HOME="${ADM_ROOT}/cache/cargo-home"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$TEST_DIR" "$CARGO_HOME" || true
+echo "[`date -u`] cargo post-bootstrap start" >> "$ADM_LOG"
+
+# 1️⃣ Validar existência do binário Cargo
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria $CARGO_BIN"
+else
+  if [ ! -x "$CARGO_BIN" ]; then
+    echo "❌ Cargo bootstrap não encontrado em $CARGO_BIN"
+    echo "[`date -u`] cargo bootstrap missing binary" >> "$ADM_LOG"
+    exit 2
+  fi
+fi
+
+# 2️⃣ Registrar versão
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) registraria versão em $VERSION_FILE"
+else
+  ver="$($CARGO_BIN --version || echo 'desconhecida')"
+  echo "$ver" > "$VERSION_FILE"
+  echo "✔️  Cargo detectado: $ver"
+  echo "[`date -u`] cargo version: $ver" >> "$ADM_LOG"
+fi
+
+# 3️⃣ Criar e compilar um projeto de teste
+echo "⚙️  Criando projeto de teste (cargo new)..."
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria cargo new --bin hello_test"
+else
+  pushd "$TEST_DIR" >/dev/null
+  rm -rf hello_test || true
+  "$CARGO_BIN" new --bin hello_test --quiet
+  cd hello_test
+
+  echo "🏗️  Compilando projeto de teste..."
+  if ! "$CARGO_BIN" build --release > build.log 2>&1; then
+    echo "❌ Falha ao compilar projeto de teste."
+    tail -n 30 build.log || true
+    echo "[`date -u`] cargo test build failed" >> "$ADM_LOG"
+    popd >/dev/null
+    exit 1
+  fi
+
+  echo "🚀 Executando binário de teste..."
+  if ! ./target/release/hello_test >/dev/null 2>&1; then
+    echo "❌ Binário de teste falhou na execução."
+    echo "[`date -u`] cargo test run failed" >> "$ADM_LOG"
+    popd >/dev/null
+    exit 2
+  fi
+
+  echo "✔️  Cargo bootstrap test OK."
+  echo "[`date -u`] cargo bootstrap test OK" >> "$ADM_LOG"
+  popd >/dev/null
+fi
+
+# 4️⃣ Limpeza de toolchains antigos
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) limparia toolchains Cargo antigos"
+else
+  echo "🧹 Limpando toolchains Cargo antigos..."
+  find "${ADM_ROOT}/toolchains" -maxdepth 1 -type d -name 'cargo-*' ! -path "$BOOTSTRAP_DIR" -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# 5️⃣ Registro de conclusão
+echo "✅ [cargo post-bootstrap] Cargo bootstrap verificado com sucesso."
+echo "[`date -u`] cargo post-bootstrap complete" >> "$ADM_LOG"
