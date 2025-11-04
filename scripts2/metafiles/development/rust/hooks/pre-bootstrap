@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: rust pre-bootstrap
+# - Prepara toolchain de bootstrap (stage0) para compilar o Rust a partir do zero.
+# - Baixa binários oficiais ou usa toolchain local, valida SHA256, configura PATH e vars.
+# - Compatível com LFS/ADM. Respeita DRY_RUN e aborta se operações inseguras.
+#
+set -euo pipefail
+
+echo "🦀 [rust pre-bootstrap] Inicializando ambiente bootstrap..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/rust-bootstrap.log}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${ADM_ROOT}/toolchains/rust-bootstrap}"
+ARCH="$(uname -m)"
+OS="unknown-linux-gnu"
+RUST_STAGE0_VERSION="${RUST_STAGE0_VERSION:-1.84.1}"
+RUST_STAGE0_URL="https://static.rust-lang.org/dist/rust-${RUST_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz"
+RUST_STAGE0_SHA256_URL="https://static.rust-lang.org/dist/rust-${RUST_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz.sha256"
+RUST_STAGE0_ARCHIVE="${CACHE_DIR}/rust-${RUST_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz"
+RUST_STAGE0_SUM="${CACHE_DIR}/rust-${RUST_STAGE0_VERSION}-${ARCH}-${OS}.sha256"
+
+mkdir -p "$CACHE_DIR" "$BOOTSTRAP_DIR" "$(dirname "$ADM_LOG")"
+echo "[`date -u`] rust pre-bootstrap start" >> "$ADM_LOG"
+
+# 1️⃣ Verificar se já existe toolchain bootstrap funcional
+if command -v rustc >/dev/null 2>&1; then
+  echo "✔️ Toolchain Rust já detectado: $(rustc --version)"
+  echo "[`date -u`] rust bootstrap skipped (existing toolchain)" >> "$ADM_LOG"
+  exit 0
+fi
+
+# 2️⃣ Baixar stage0 se não existir no cache
+if [ ! -f "$RUST_STAGE0_ARCHIVE" ]; then
+  echo "📥 Baixando stage0 Rust ${RUST_STAGE0_VERSION}..."
+  echo "    → $RUST_STAGE0_URL"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "(dry-run) pularia download do stage0"
+  else
+    curl -L --fail -o "$RUST_STAGE0_ARCHIVE" "$RUST_STAGE0_URL"
+    curl -L --fail -o "$RUST_STAGE0_SUM" "$RUST_STAGE0_SHA256_URL" || true
+  fi
+else
+  echo "ℹ️  Stage0 já em cache: $RUST_STAGE0_ARCHIVE"
+fi
+
+# 3️⃣ Validar SHA256 do stage0
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$RUST_STAGE0_SUM" ]; then
+  echo "🔒 Verificando SHA256..."
+  EXPECTED_SHA="$(awk '{print $1}' "$RUST_STAGE0_SUM" | head -n1)"
+  GOT_SHA="$(sha256sum "$RUST_STAGE0_ARCHIVE" | awk '{print $1}')"
+  if [ "$EXPECTED_SHA" != "$GOT_SHA" ]; then
+    echo "❌ SHA256 incorreto para $RUST_STAGE0_ARCHIVE"
+    echo "Esperado: $EXPECTED_SHA"
+    echo "Obtido:   $GOT_SHA"
+    echo "[`date -u`] SHA256 mismatch" >> "$ADM_LOG"
+    exit 2
+  fi
+  echo "✔️  SHA256 válido."
+else
+  echo "⚠️  SHA256 não validado (modo dry-run ou sum ausente)"
+fi
+
+# 4️⃣ Extrair stage0
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) extrairia $RUST_STAGE0_ARCHIVE → $BOOTSTRAP_DIR"
+else
+  echo "📦 Extraindo bootstrap toolchain para $BOOTSTRAP_DIR..."
+  tar -xJf "$RUST_STAGE0_ARCHIVE" -C "$BOOTSTRAP_DIR" --strip-components=1
+fi
+
+# 5️⃣ Instalar stage0 (em ambiente isolado no ADM tree)
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria ./install.sh --prefix=$BOOTSTRAP_DIR"
+else
+  pushd "$BOOTSTRAP_DIR" >/dev/null
+  if [ -x "./install.sh" ]; then
+    ./install.sh --prefix="$BOOTSTRAP_DIR" > install.log 2>&1 || {
+      echo "❌ Falha na instalação do stage0. Veja install.log"
+      tail -n 50 install.log
+      exit 1
+    }
+  else
+    echo "⚠️  Script install.sh não encontrado. Verifique o tarball."
+  fi
+  popd >/dev/null
+fi
+
+# 6️⃣ Configurar PATH e variáveis
+export PATH="$BOOTSTRAP_DIR/bin:$PATH"
+export RUSTC_BOOTSTRAP=1
+export RUSTC="$BOOTSTRAP_DIR/bin/rustc"
+export CARGO="$BOOTSTRAP_DIR/bin/cargo"
+echo "PATH atualizado: $PATH"
+echo "Rust bootstrap disponível: $($RUSTC --version 2>/dev/null || echo 'não detectado')"
+
+# Registrar no log e exportar env
+{
+  echo "[`date -u`] rust stage0 installed → $BOOTSTRAP_DIR"
+  echo "PATH=$PATH"
+  echo "RUSTC_BOOTSTRAP=$RUSTC_BOOTSTRAP"
+} >> "$ADM_LOG"
+
+echo "✅ [rust pre-bootstrap] Ambiente pronto (stage0 toolchain)."
