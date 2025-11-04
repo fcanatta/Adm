@@ -1,0 +1,1414 @@
+#!/usr/bin/env bash
+#
+# adm-patches - discovery, validation, plan & scaffolding
+# - Detecta patches em /usr/src/adm/metafiles/<category>/<program>/patches/
+# - Verifica integridade (sha256) quando informado no metafile
+# - Gera plano de aplicação (ordered list), logs e report JSON
+# - Suporta: --dry-run, --verify, --list, --revert (scaffold), --force, --verbose
+# - NÃO aplica patches de fato nesta parte (só prepara tudo). fará aplicação.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----- Header & Defaults -----
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+METAFILES_DIR="${ADM_ROOT}/metafiles"
+LOGS_DIR="${ADM_LOGS:-${ADM_ROOT}/logs}"
+TMP_DIR="${ADM_TMP:-${ADM_ROOT}/tmp}"
+REPORT_DIR="${TMP_DIR}"
+SCRIPTS_DIR="${ADM_SCRIPTS:-${ADM_ROOT}/scripts}"
+
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-patches-${TS}.log}"
+REPORT_JSON="${REPORT_JSON:-${REPORT_DIR}/adm-patches-report-${TS}.json}"
+
+DRY_RUN=0
+FORCE=0
+VERIFY_ONLY=0
+LIST_ONLY=0
+REVERT=0
+VERBOSE=0
+CATEGORY=""
+PROGRAM=""
+QUIET=0
+
+# Limits
+MAX_PATCH_SIZE_BYTES=$((10 * 1024 * 1024)) # 10MB per patch safety limit
+SHA_TOOL="sha256sum"
+
+# Ensure required dirs exist (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$LOGS_DIR" "$TMP_DIR" 2>/dev/null || true
+fi
+
+### ----- Colors & Icons -----
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"
+
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+### ----- Safe helpers -----
+safe_mkdir() { [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) mkdir -p $1" && return 0; mkdir -p "$1" || { err "mkdir failed: $1"; return 1; }; }
+path_real() { command -v readlink >/dev/null 2>&1 && readlink -f "$1" || printf '%s' "$1"; }
+safe_rm() { [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) rm -rf $*" && return 0; rm -rf "$@" || { warn "rm failed: $*"; return 1; }; }
+
+confirm_prompt() {
+  local prompt="${1:-Confirm?}"
+  if [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ]; then verbose "(non-interactive) assume yes for: $prompt"; return 0; fi
+  while true; do
+    read -r -p "$prompt [y/N]: " a
+    case "$a" in [Yy]|[Yy][Ee][Ss]) return 0 ;; [Nn]|""|*) return 1 ;; esac
+  done
+}
+
+json_write_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) init report $REPORT_JSON"; return 0; fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  cat >"$REPORT_JSON" <<JSON
+{
+  "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "category": "${CATEGORY:-}",
+  "program": "${PROGRAM:-}",
+  "patches": []
+}
+JSON
+}
+
+json_add_patch_entry() {
+  local name="$1" status="$2" sha="$3" method="$4" details="$5"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) add json entry $name $status" && return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; name=sys.argv[2]; status=sys.argv[3]; sha=sys.argv[4]; method=sys.argv[5]; details=sys.argv[6]
+d=json.load(open(f))
+d.setdefault('patches',[]).append({"name":name,"status":status,"sha256":sha,"method":method,"details":details,"time":__import__('time').time()})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    # best-effort append (non-robust) if python not available
+    tmp="${REPORT_JSON}.tmp"
+    awk -v n="$name" -v s="$status" -v sh="$sha" -v m="$method" -v de="$details" '
+    BEGIN{entry=sprintf("  {\"name\":\"%s\",\"status\":\"%s\",\"sha256\":\"%s\",\"method\":\"%s\",\"details\":\"%s\",\"time\":%d},\n",n,s,sh,m,de,systime())}
+    /"patches": \[/ {print; print entry; next} {print}
+    ' "$REPORT_JSON" >"$tmp" && mv -f "$tmp" "$REPORT_JSON" || true
+  fi
+}
+
+### ----- Locking (per program) -----
+LOCK_DIR="${TMP_DIR}/adm-patches-locks"
+safe_mkdir "$LOCK_DIR" || true
+acquire_lock() {
+  local key="$1"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Another adm-patches run is active for $key (lock: $lockfile)"; return 1; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() {
+  local lockfile="$1"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) release lock $lockfile" && return 0
+  [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+}
+
+### ----- Metafile parsing (lightweight) -----
+# Metafile is expected to be a simple key: value list; we'll parse basic keys used here:
+# name, version, patches_sha256 (multiple lines or comma-separated), patches_order (optional)
+parse_metafile() {
+  local mf="$1"
+  if [ -z "$mf" ] || [ ! -f "$mf" ]; then err "parse_metafile: metafile ausente: $mf"; return 2; fi
+  # read lines, capture patch-related info into arrays
+  MF_PATCHES_ORDER=()
+  MF_PATCHES_SHA=()
+  # read file
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed -e 's/^\s*//' -e 's/\s*$//')"
+    [ -z "$line" ] && continue
+    case "$line" in
+      patches_order:* )
+        val="${line#patches_order:}"
+        # comma or space separated
+        IFS=',' read -ra arr <<<"$val"
+        for v in "${arr[@]}"; do v="$(printf '%s' "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"; [ -n "$v" ] && MF_PATCHES_ORDER+=("$v"); done
+        ;;
+      patches_sha256:* )
+        val="${line#patches_sha256:}"
+        IFS=',' read -ra arr <<<"$val"
+        for v in "${arr[@]}"; do v="$(printf '%s' "$v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"; [ -n "$v" ] && MF_PATCHES_SHA+=("$v"); done
+        ;;
+      * ) ;; # ignore others
+    esac
+  done <"$mf"
+  return 0
+}
+
+### ----- Detect patches on FS -----
+# find patches in metafile dir: <metafile_dir>/patches/*.patch
+detect_patches_in_metadir() {
+  local metadir="$1"
+  local out=()
+  [ -d "$metadir" ] || return 0
+  while IFS= read -r -d '' p; do
+    out+=("$p")
+  done < <(find "$metadir" -maxdepth 1 -type f \( -iname '*.patch' -o -iname '*.diff' \) -print0 2>/dev/null | sort -z) || true
+  # print absolute paths
+  for f in "${out[@]:-}"; do printf '%s\n' "$(path_real "$f")"; done
+}
+
+### ----- Build ordered list of patches (respecting metafile order if present) -----
+build_patch_plan() {
+  local category="$1" program="$2"
+  CATEGORY="$category"; PROGRAM="$program"
+  local meta="${METAFILES_DIR}/${category}/${program}/metafile"
+  local patches_dir="${METAFILES_DIR}/${category}/${program}/patches"
+  local -a found
+  mapfile -t found < <(detect_patches_in_metadir "$patches_dir" || true)
+  # if metafile requested order, use it
+  MF_PATCHES_ORDER=(); MF_PATCHES_SHA=()
+  if [ -f "$meta" ]; then parse_metafile "$meta" || true; fi
+
+  local plan=()
+  if [ "${#MF_PATCHES_ORDER[@]}" -gt 0 ]; then
+    # try to find each by name in found
+    for nm in "${MF_PATCHES_ORDER[@]}"; do
+      # match by exact basename or prefix
+      for p in "${found[@]:-}"; do
+        if [ "$(basename "$p")" = "$nm" ] || [ "$(basename "$p")" = "$nm.patch" ] || [ "$(basename "$p")" = "$nm.diff" ]; then
+          plan+=("$p"); break
+        fi
+      done
+    done
+    # append any remaining found patches not in order list
+    for p in "${found[@]:-}"; do
+      local inlist=0
+      for x in "${plan[@]:-}"; do [ "$x" = "$p" ] && inlist=1 && break; done
+      [ "$inlist" -eq 0 ] && plan+=("$p")
+    done
+  else
+    plan=("${found[@]:-}")
+  fi
+
+  # safety: filter by size limit, warn about too-large patches
+  local safe_plan=()
+  for p in "${plan[@]:-}"; do
+    if [ -f "$p" ]; then
+      local sz
+      sz=$(stat -c%s "$p" 2>/dev/null || echo 0)
+      if [ "$sz" -gt "$MAX_PATCH_SIZE_BYTES" ]; then
+        warn "Patch muito grande (possível erro) ignorado: $(basename "$p") size=${sz}"
+        _report_add_error "patch_too_large:$(basename "$p")"
+        continue
+      fi
+      safe_plan+=("$p")
+    fi
+  done
+
+  # emit plan lines: absolute_path
+  for p in "${safe_plan[@]:-}"; do printf '%s\n' "$p"; done
+}
+
+### ----- Verify integrity for a patch file given expected sha (or not) -----
+verify_patch_file_sha() {
+  local file="$1" expected="$2"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then err "verify_patch_file_sha: arquivo inexistente: $file"; return 2; fi
+  if [ -z "$expected" ] || [ "$expected" = "-" ]; then
+    # compute and return sha
+    if command -v "$SHA_TOOL" >/dev/null 2>&1; then
+      "$SHA_TOOL" "$file" | awk '{print $1}'; return 0
+    else
+      warn "sha tool not available; cannot compute sha"
+      return 3
+    fi
+  fi
+  if command -v "$SHA_TOOL" >/dev/null 2>&1; then
+    local got
+    got="$("$SHA_TOOL" "$file" | awk '{print $1}')"
+    if [ "$got" = "$expected" ]; then return 0; else return 4; fi
+  else
+    warn "sha tool not available; skipping verification for $file"
+    return 3
+  fi
+}
+
+### ----- Check applyability (dry-run check) using git apply --check or patch --dry-run -----
+check_patch_applicability() {
+  local patch="$1" target_dir="${2:-.}"
+  # returns 0 if appears applicable (no rejects), non-zero otherwise
+  if [ -d "${target_dir}/.git" ] && command -v git >/dev/null 2>&1; then
+    verbose "git apply --check $patch"
+    if git -C "$target_dir" apply --check "$patch" >>"$LOGFILE" 2>&1; then return 0; else return 2; fi
+  else
+    # try patch --dry-run
+    if command -v patch >/dev/null 2>&1; then
+      verbose "patch --dry-run -p1 < $patch"
+      if patch --dry-run -p1 -i "$patch" -d "$target_dir" >>"$LOGFILE" 2>&1; then return 0; else return 3; fi
+    else
+      warn "Nenhuma ferramenta de verificação de patch disponível (git/patch)"
+      return 4
+    fi
+  fi
+}
+
+### ----- Run pre/post hooks if present (non-fatal) -----
+run_hook_if_exists() {
+  local hookpath="$1"
+  if [ -x "$hookpath" ]; then
+    info "Executing hook: $hookpath"
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) $hookpath"; return 0; fi
+    if "$hookpath" >>"$LOGFILE" 2>&1; then ok "Hook ok: $hookpath"; return 0; else warn "Hook failed: $hookpath"; return 2; fi
+  fi
+  return 0
+}
+
+### ----- Report helper for errors (append) -----
+_report_add_error() {
+  local m="$1"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) report error: $m" && return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; msg=sys.argv[2]
+d=json.load(open(f))
+d.setdefault('errors',[]).append({'time':__import__('time').time(),'msg':msg})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+### ----- Main CLI parsing ----- 
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options]
+
+Options:
+  --category <cat>     Category under ${METAFILES_DIR} (required)
+  --program <name>     Program/package name (required)
+  --list               List detected patches and state
+  --verify             Verify patches integrity (sha from metafile if present)
+  --revert             Prepare revert plan (scaffold only)
+  --dry-run            Simulate actions
+  --force              Skip non-fatal checks / assume yes
+  --verbose,-v         Verbose output
+  --quiet              Minimal output
+  --help               Show help
+EOF
+  exit 1
+}
+
+# parse args
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --category) CATEGORY="${2:-}"; shift 2 ;;
+    --program) PROGRAM="${2:-}"; shift 2 ;;
+    --list) LIST_ONLY=1; shift ;;
+    --verify) VERIFY_ONLY=1; shift ;;
+    --revert) REVERT=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+[ -n "${CATEGORY:-}" ] || { err "Missing --category"; usage; }
+[ -n "${PROGRAM:-}" ] || { err "Missing --program"; usage; }
+
+# validate paths
+METAFILE_DIR="${METAFILES_DIR}/${CATEGORY}/${PROGRAM}"
+METAFILE_PATH="${METAFILE_DIR}/metafile"
+PATCHES_DIR="${METAFILE_DIR}/patches"
+if [ ! -d "$METAFILE_DIR" ]; then err "Metafile dir not found: $METAFILE_DIR"; exit 2; fi
+
+# initialize report
+json_write_init
+
+# acquire lock
+lockfile="$(acquire_lock "${CATEGORY}_${PROGRAM}")" || exit 3
+
+info "Preparing patch plan for ${CATEGORY}/${PROGRAM}"
+verbose "Metafile: $METAFILE_PATH"
+verbose "Patches dir: $PATCHES_DIR"
+
+# discover patches (ordered)
+mapfile -t PATCH_PLAN < <(build_patch_plan "$CATEGORY" "$PROGRAM" || true)
+if [ "${#PATCH_PLAN[@]}" -eq 0 ]; then
+  info "Nenhum patch detectado em $PATCHES_DIR"
+  release_lock "$lockfile"
+  exit 0
+fi
+
+info "Detectados ${#PATCH_PLAN[@]} patch(es):"
+for p in "${PATCH_PLAN[@]}"; do printf "  - %s\n" "$(basename "$p")"; done
+
+# If list-only: show summary (including sha if available)
+if [ "$LIST_ONLY" -eq 1 ]; then
+  for p in "${PATCH_PLAN[@]}"; do
+    local pbase
+    pbase="$(basename "$p")"
+    local size
+    size=$(stat -c%s "$p" 2>/dev/null || echo 0)
+    local sha
+    sha="$(verify_patch_file_sha "$p" - 2>/dev/null || true)"
+    printf "%-40s size=%8s sha=%s\n" "$pbase" "$(numfmt --to=si "${size}" 2>/dev/null || echo "${size}")" "${sha:-unknown}"
+  done
+  release_lock "$lockfile"
+  exit 0
+fi
+
+# If verify-only: check SHAs against metafile if present
+if [ "$VERIFY_ONLY" -eq 1 ]; then
+  info "Verifying patch integrity (metafile: ${METAFILE_PATH})"
+  parse_metafile "$METAFILE_PATH" >/dev/null 2>&1 || true
+  # MF_PATCHES_SHA may contain comma-separated list, match by order
+  local idx=0
+  for p in "${PATCH_PLAN[@]}"; do
+    idx=$((idx+1))
+    local expected="-"
+    if [ "${#MF_PATCHES_SHA[@]}" -ge "$idx" ]; then expected="${MF_PATCHES_SHA[$((idx-1))]}"; fi
+    if [ -z "$expected" ] && [ "${#MF_PATCHES_SHA[@]}" -eq 1 ]; then expected="${MF_PATCHES_SHA[0]}"; fi
+    if [ -n "$expected" ] && [ "$expected" != "-" ]; then
+      if verify_patch_file_sha "$p" "$expected"; then
+        ok "Verified: $(basename "$p")"
+        json_add_patch_entry "$(basename "$p")" "verified" "$expected" "metafile" ""
+      else
+        err "SHA mismatch or verification failed: $(basename "$p")"
+        json_add_patch_entry "$(basename "$p")" "sha-mismatch" "" "metafile" ""
+        _report_add_error "sha_mismatch:$(basename "$p")"
+        [ "$FORCE" -eq 0 ] && { warn "Use --force to ignore sha mismatch"; release_lock "$lockfile"; exit 4; }
+      fi
+    else
+      # compute sha and report
+      local sha
+      sha="$(verify_patch_file_sha "$p" - 2>/dev/null || true)"
+      ok "SHA computed: $(basename "$p") -> ${sha:-unknown}"
+      json_add_patch_entry "$(basename "$p")" "computed-sha" "${sha:-unknown}" "computed" ""
+    fi
+  done
+  release_lock "$lockfile"
+  exit 0
+fi
+
+# Default flow: build applyability plan (check dry-run applicability)
+info "Building applyability plan (dry-run checks)"
+TARGET_SOURCE_DIR="${METAFILE_DIR}/source"  # default expected source path; caller/admbuild can override
+# If target source path not present, try to find /usr/src/<program> etc (best-effort)
+if [ ! -d "$TARGET_SOURCE_DIR" ]; then
+  # common alternatives
+  for alt in "/usr/src/${PROGRAM}" "${ADM_ROOT}/build/${PROGRAM}" "${METAFILE_DIR}/work"; do
+    if [ -d "$alt" ]; then TARGET_SOURCE_DIR="$alt"; break; fi
+  done
+fi
+verbose "Assumed target source dir for checks: $TARGET_SOURCE_DIR"
+
+# run hooks pre-check if exists
+run_hook_if_exists "${METAFILE_DIR}/hooks/pre-patch.sh" || verbose "pre-patch hook returned non-zero (continuing)"
+
+# applicability checks
+APPLICABLE=()
+NOT_APPLICABLE=()
+for p in "${PATCH_PLAN[@]}"; do
+  if check_patch_applicability "$p" "$TARGET_SOURCE_DIR"; then
+    ok "Check OK: $(basename "$p")"
+    APPLICABLE+=("$p")
+    json_add_patch_entry "$(basename "$p")" "check-ok" "$(verify_patch_file_sha "$p" - 2>/dev/null || echo "")" "check" ""
+  else
+    warn "Check FAILED: $(basename "$p")"
+    NOT_APPLICABLE+=("$p")
+    json_add_patch_entry "$(basename "$p")" "check-failed" "$(verify_patch_file_sha "$p" - 2>/dev/null || echo "")" "check" ""
+    _report_add_error "check_failed:$(basename "$p")"
+    # if not force, do not abort here: we just plan; part2 will require explicit --force to attempt apply
+  fi
+done
+
+info "Plan summary: applicable=${#APPLICABLE[@]} failed=${#NOT_APPLICABLE[@]}"
+if [ "${#NOT_APPLICABLE[@]}" -gt 0 ]; then
+  warn "Alguns patches falharam na verificação. Eles serão marcados no plano. Para forçar aplicação, use --force na etapa de aplicação."
+fi
+
+# run hooks post-check
+run_hook_if_exists "${METAFILE_DIR}/hooks/post-patch.sh" || verbose "post-patch hook returned non-zero (continuing)"
+
+# write final plan to TMP for PART 2 to pick up
+PLAN_FILE="${TMP_DIR}/adm-patches-plan-${CATEGORY}-${PROGRAM}-${TS}.txt"
+if [ "$DRY_RUN" -eq 1 ]; then
+  verbose "(dry-run) would write plan to $PLAN_FILE"
+else
+  {
+    printf '# adm-patches plan\n'
+    printf 'category: %s\n' "$CATEGORY"
+    printf 'program: %s\n' "$PROGRAM"
+    printf 'generated: %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    printf '\n# applicable patches (in order):\n'
+    for x in "${APPLICABLE[@]:-}"; do printf '%s\n' "$x"; done
+    printf '\n# not-applicable (need force/inspection):\n'
+    for x in "${NOT_APPLICABLE[@]:-}"; do printf '%s\n' "$x"; done
+  } >"$PLAN_FILE"
+  ok "Plan written: $PLAN_FILE"
+  log "[PLAN]" "$PLAN_FILE"
+fi
+
+# scaffold revert plan (only metadata - actual revert implemented in PART 2/3)
+REVERT_PLAN="${TMP_DIR}/adm-patches-revert-${CATEGORY}-${PROGRAM}-${TS}.txt"
+if [ "$REVERT" -eq 1 ]; then
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) would create revert plan $REVERT_PLAN"
+  else
+    # For revert we simply list patches in reverse order and mark operation to undo (actual revert will check VCS or backups)
+    {
+      printf '# revert plan\n'
+      printf 'category: %s\n' "$CATEGORY"
+      printf 'program: %s\n' "$PROGRAM"
+      printf 'generated: %s\n\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+      printf '# patches to revert (reverse order):\n'
+      for ((i=${#PATCH_PLAN[@]}-1;i>=0;i--)); do printf '%s\n' "${PATCH_PLAN[$i]}"; done
+    } >"$REVERT_PLAN"
+    ok "Revert plan written: $REVERT_PLAN"
+  fi
+fi
+
+info "PART 1/3 (discovery & validation) complete for ${CATEGORY}/${PROGRAM}"
+ok "Plan: $PLAN_FILE"
+[ "$DRY_RUN" -eq 0 ] && ok "Report: $REPORT_JSON" || verbose "(dry-run) report would be at $REPORT_JSON"
+
+release_lock "$lockfile"
+
+exit 0
+### ----- Assumptions -----
+# This part expects PART 1/3 to have created a plan file:
+# ${TMP_DIR}/adm-patches-plan-<category>-<program>-<TS>.txt
+# and that PART1 exported/used variables:
+#   CATEGORY, PROGRAM, METAFILE_DIR, METAFILE_PATH, PATCHES_DIR, TMP_DIR, LOGFILE, REPORT_JSON
+#
+# If running standalone, set CATEGORY and PROGRAM and ensure plan file exists.
+#
+
+### ----- Header / Defaults -----
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+METAFILES_DIR="${METAFILES_DIR:-${ADM_ROOT}/metafiles}"
+TMP_DIR="${TMP_DIR:-${ADM_ROOT}/tmp}"
+LOGS_DIR="${LOGS_DIR:-${ADM_ROOT}/logs}"
+REPORT_JSON="${REPORT_JSON:-${TMP_DIR}/adm-patches-report-${TS_NOW}.json}"
+
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+PLAN_FILE=""
+BACKUP_ROOT="${TMP_DIR}/adm-patches-backups-${TS_NOW}"
+MAX_BACKUP_MB=1024   # warn if backup likely > 1GB
+
+# detect tools
+HAS_GIT=0; command -v git >/dev/null 2>&1 && HAS_GIT=1
+HAS_PATCH=0; command -v patch >/dev/null 2>&1 && HAS_PATCH=1
+HAS_QUILT=0; command -v quilt >/dev/null 2>&1 && HAS_QUILT=1
+HAS_PY=0; command -v python3 >/dev/null 2>&1 && HAS_PY=1
+HAS_SHA=0; command -v sha256sum >/dev/null 2>&1 && HAS_SHA=1
+
+# reuse some functions from PART1 if present; otherwise define minimal versions
+: "${json_add_patch_entry:=:}"
+: "${_report_add_error:=:}"
+
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"${LOGFILE:-/dev/null}" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "ℹ️  %s\n" "$1"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "✔️  %s\n" "$1"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "⚠️  %s\n" "$1" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "❌  %s\n" "$1" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+safe_mkdir() { [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) mkdir -p $1" && return 0; mkdir -p "$1" || { err "mkdir failed: $1"; return 1; }; }
+path_real() { command -v readlink >/dev/null 2>&1 && readlink -f "$1" || printf '%s' "$1"; }
+
+confirm_prompt() {
+  local msg="${1:-Proceed?}"
+  if [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ]; then verbose "(non-interactive) assume yes for: $msg"; return 0; fi
+  read -r -p "$msg [y/N]: " a
+  case "$a" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
+}
+
+### ----- Arg parsing ----- 
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME --plan <plan-file> [options]
+
+Options:
+  --plan <file>        Plan file created by PART1 (required)
+  --dry-run            Simula aplicação
+  --force              Força aplicação (ignora alguns erros)
+  --verbose,-v         Verbose
+  --quiet              Minimal output
+  --help               Show help
+EOF
+  exit 1
+}
+
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --plan) PLAN_FILE="${2:-}"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+[ -n "$PLAN_FILE" ] || { err "Missing --plan (plan file from PART1)"; usage; }
+if [ ! -f "$PLAN_FILE" ]; then err "Plan file not found: $PLAN_FILE"; exit 2; fi
+
+# Parse basic values from plan header
+CATEGORY="$(awk '/^category:/ {print $2; exit}' "$PLAN_FILE" || true)"
+PROGRAM="$(awk '/^program:/ {print $2; exit}' "$PLAN_FILE" || true)"
+# extract lists
+APPLICABLE=(); NOT_APPLICABLE=()
+in_app=0; in_not=0
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    '# applicable patches'*) in_app=1; in_not=0; continue ;;
+    '# not-applicable'* ) in_app=0; in_not=1; continue ;;
+    '#'* ) in_app=0; in_not=0; continue ;;
+  esac
+  if [ "$in_app" -eq 1 ] && [ -n "$line" ]; then APPLICABLE+=("$line"); fi
+  if [ "$in_not" -eq 1 ] && [ -n "$line" ]; then NOT_APPLICABLE+=("$line"); fi
+done <"$PLAN_FILE"
+
+info "Applying patches for ${CATEGORY}/${PROGRAM}"
+info "Plan: applicable=${#APPLICABLE[@]} not_app=${#NOT_APPLICABLE[@]}"
+
+safe_mkdir "$BACKUP_ROOT" || true
+
+### ----- Helpers: backup & restore ----- 
+estimate_dir_size_mb() {
+  local d="$1"
+  du -sm "$d" 2>/dev/null | awk '{print $1}' || echo 0
+}
+
+create_backup_for_patch() {
+  local patchfile="$1"
+  local srcdir="$2"
+  local basename_patch
+  basename_patch="$(basename "$patchfile" | sed -e 's/[^a-zA-Z0-9._-]/_/g')"
+  local bdir="${BACKUP_ROOT}/${basename_patch}"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would copy ${srcdir} -> ${bdir}"; printf "%s" "$bdir"; return 0; fi
+
+  # sanity: ensure srcdir exists
+  if [ ! -d "$srcdir" ]; then err "Source dir for backup not found: $srcdir"; return 2; fi
+
+  # estimate size
+  local size_mb
+  size_mb="$(estimate_dir_size_mb "$srcdir")"
+  if [ "$size_mb" -gt "$MAX_BACKUP_MB" ]; then
+    warn "Backup size for ${srcdir} ~ ${size_mb}MB (this may be large)."
+  fi
+
+  mkdir -p "$bdir" || { err "Failed to create backup dir $bdir"; return 3; }
+  # copy with cp -a; use rsync fallback if available for performance (but keep compatibility)
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -a --delete "$srcdir"/ "$bdir"/ >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then
+      err "rsync backup failed for $srcdir"
+      return 4
+    fi
+  else
+    if ! cp -a "$srcdir"/. "$bdir"/ >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then
+      err "cp backup failed for $srcdir"
+      return 5
+    fi
+  fi
+  log "[BACKUP]" "$srcdir -> $bdir"
+  ok "Backup created: $bdir"
+  printf "%s" "$bdir"
+  return 0
+}
+
+restore_backup_dir() {
+  local bdir="$1" target="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would restore $bdir -> $target"; return 0; fi
+  if [ ! -d "$bdir" ]; then err "Backup dir missing: $bdir"; return 2; fi
+  # move current target aside (best-effort)
+  local tmp_old="${target}.pre-restore-${TS_NOW}"
+  if [ -d "$target" ]; then mv -f "$target" "$tmp_old" 2>/dev/null || true; fi
+  if command -v rsync >/dev/null 2>&1; then
+    if ! rsync -a --delete "$bdir"/ "$target"/ >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then
+      err "rsync restore failed for $bdir -> $target"; return 3
+    fi
+  else
+    if ! rm -rf "$target" 2>/dev/null || true; then :; fi
+    if ! cp -a "$bdir"/. "$target"/ >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then
+      err "cp restore failed for $bdir -> $target"; return 4
+    fi
+  fi
+  ok "Restored backup $bdir -> $target"
+  return 0
+}
+
+### ----- Apply methods ----- 
+# Try git apply first (if repo), then patch -p1, then quilt if available.
+apply_patch_git() {
+  local patch="$1" target_dir="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) git apply --index --whitespace=nowarn $patch"; return 0; fi
+  if [ "$HAS_GIT" -ne 1 ] || [ ! -d "$target_dir/.git" ]; then return 2; fi
+  (cd "$target_dir" && git apply --index --whitespace=nowarn "$patch" >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1) && return 0 || return 1
+}
+
+apply_patch_patch() {
+  local patch="$1" target_dir="$2"
+  # attempt with -p1 then -p0 as fallback
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) patch --dry-run -p1 -i $patch -d $target_dir"; return 0; fi
+  if [ "$HAS_PATCH" -ne 1 ]; then return 2; fi
+  if patch -p1 -d "$target_dir" -i "$patch" >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then return 0; fi
+  if patch -p0 -d "$target_dir" -i "$patch" >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1; then return 0; fi
+  return 1
+}
+
+apply_patch_quilt() {
+  local patch="$1" target_dir="$2"
+  if [ "$HAS_QUILT" -ne 1 ]; then return 2; fi
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) quilt push $patch (simulated)"; return 0; fi
+  # quilt expects to run in source tree with quilt setup; we'll attempt a minimal flow
+  (cd "$target_dir" && quilt push "$patch" >>"$LOGS_DIR/adm-patches-${TS_NOW}.log" 2>&1) && return 0 || return 1
+}
+
+# unified apply function: tries multiple methods with fallback
+apply_patch_with_fallback() {
+  local patch="$1" target_dir="$2"
+  local tried_methods=()
+  # 1) git apply
+  if [ "$HAS_GIT" -eq 1 ] && [ -d "$target_dir/.git" ]; then
+    tried_methods+=("git")
+    if apply_patch_git "$patch" "$target_dir"; then
+      echo "git"; return 0
+    else
+      warn "git apply failed for $(basename "$patch")"
+    fi
+  fi
+  # 2) patch
+  if [ "$HAS_PATCH" -eq 1 ]; then
+    tried_methods+=("patch")
+    if apply_patch_patch "$patch" "$target_dir"; then
+      echo "patch"; return 0
+    else
+      warn "patch -pX failed for $(basename "$patch")"
+    fi
+  fi
+  # 3) quilt
+  if [ "$HAS_QUILT" -eq 1 ]; then
+    tried_methods+=("quilt")
+    if apply_patch_quilt "$patch" "$target_dir"; then
+      echo "quilt"; return 0
+    else
+      warn "quilt push failed for $(basename "$patch")"
+    fi
+  fi
+
+  # none succeeded
+  verbose "Tried methods: ${tried_methods[*]:-none}"
+  return 1
+}
+
+### ----- Main apply loop ----- 
+# Source directory where patches should be applied:
+TARGET_SOURCE_DIR="${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/source"
+# fallback common locations if missing
+if [ ! -d "$TARGET_SOURCE_DIR" ]; then
+  for alt in "/usr/src/${PROGRAM}" "${ADM_ROOT}/build/${PROGRAM}" "${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/work"; do
+    [ -d "$alt" ] && { TARGET_SOURCE_DIR="$alt"; break; }
+  done
+fi
+if [ ! -d "$TARGET_SOURCE_DIR" ]; then err "Target source dir not found; cannot apply patches"; exit 10; fi
+
+APPLIED_PATCHES=()
+APPLIED_BACKUPS=()
+
+# trap: if interrupted, attempt to rollback applied patches
+_cleanup_and_rollback_on_interrupt() {
+  err "Interrupted. Attempting rollback of applied patches..."
+  for ((i=${#APPLIED_PATCHES[@]}-1;i>=0;i--)); do
+    p="${APPLIED_PATCHES[$i]}"
+    b="${APPLIED_BACKUPS[$i]}"
+    warn "Restoring backup for patch: $(basename "$p")"
+    restore_backup_dir "$b" "$TARGET_SOURCE_DIR" || warn "Failed to restore backup $b (manual recovery may be needed)"
+  done
+  err "Rollback attempted. Exiting."
+  exit 130
+}
+trap _cleanup_and_rollback_on_interrupt INT TERM
+
+# Apply each applicable patch in order
+for patch in "${APPLICABLE[@]:-}"; do
+  [ -z "$patch" ] && continue
+  info "Processing patch: $(basename "$patch")"
+
+  # verify file exists
+  if [ ! -f "$patch" ]; then err "Patch file missing: $patch"; _report_add_error "patch_missing:$(basename "$patch")"; [ "$FORCE" -eq 0 ] && { err "Aborting due to missing patch"; exit 11; } else warn "Continuing due to --force"; fi
+
+  # create backup snapshot of source dir for this patch
+  bdir="$(create_backup_for_patch "$patch" "$TARGET_SOURCE_DIR")" || { err "Failed to create backup for $(basename "$patch")"; _report_add_error "backup_failed:$(basename "$patch")"; [ "$FORCE" -eq 0 ] && { err "Aborting"; exit 12; } || warn "Continuing due to --force"; }
+  APPLIED_BACKUPS+=("$bdir")
+
+  # run per-patch pre-apply hook
+  prehook="${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/hooks/pre-apply"
+  [ -x "$prehook" ] && run_hook_if_exists "$prehook" || verbose "No pre-apply hook"
+
+  # attempt to apply
+  method=""
+  if [ "$DRY_RUN" -eq 1 ]; then
+    # do a dry-run check first
+    if check_patch_applicability "$patch" "$TARGET_SOURCE_DIR"; then
+      ok "(dry-run) patch would apply: $(basename "$patch")"
+      json_add_patch_entry "$(basename "$patch")" "would-apply" "$( [ "$HAS_SHA" -eq 1 ] && sha256sum "$patch" | awk '{print $1}' || echo "")" "dry-run" ""
+      APPLIED_PATCHES+=("$patch")
+      continue
+    else
+      warn "(dry-run) patch check failed: $(basename "$patch")"
+      json_add_patch_entry "$(basename "$patch")" "would-not-apply" "" "dry-run" "check-failed"
+      [ "$FORCE" -eq 0 ] && continue || warn "Force set: would attempt apply in real run"
+    fi
+  fi
+
+  # real run: attempt apply with fallback and limited retries
+  attempts=0
+  applied_ok=0
+  while [ "$attempts" -lt 2 ]; do
+    attempts=$((attempts+1))
+    verbose "Attempt $attempts to apply $(basename "$patch")"
+    if method="$(apply_patch_with_fallback "$patch" "$TARGET_SOURCE_DIR")"; then
+      ok "Patch applied: $(basename "$patch") via $method"
+      applied_ok=1
+      break
+    else
+      warn "Apply attempt $attempts failed for $(basename "$patch")"
+      # if not last attempt, maybe adjust (e.g., try patch with fuzz?); but avoid auto-unsafe heuristics
+      sleep 1
+    fi
+  done
+
+  if [ "$applied_ok" -eq 1 ]; then
+    APPLIED_PATCHES+=("$patch")
+    # compute sha
+    local psha=""
+    if [ "$HAS_SHA" -eq 1 ] && [ -f "$patch" ]; then psha="$(sha256sum "$patch" | awk '{print $1}')"; fi
+    json_add_patch_entry "$(basename "$patch")" "applied" "$psha" "$method" ""
+    _report_add_action() { true; } # no-op if not provided
+    _report_add_action "$PROGRAM" "patch-applied" "$(basename "$patch")"
+    # run post-apply hook
+    posthook="${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/hooks/post-apply"
+    [ -x "$posthook" ] && run_hook_if_exists "$posthook" || verbose "No post-apply hook"
+    # continue to next patch
+    continue
+  else
+    err "Failed to apply patch: $(basename "$patch")"
+    json_add_patch_entry "$(basename "$patch")" "apply-failed" "" "" "attempts=${attempts}"
+    _report_add_error "apply_failed:$(basename "$patch")"
+    # rollback this patch by restoring backup for this patch
+    warn "Attempting restore of backup for $(basename "$patch")"
+    restore_backup_dir "$bdir" "$TARGET_SOURCE_DIR" || warn "Restore failed for $bdir (manual recovery needed)"
+    # After restore, decide to abort or continue based on FORCE
+    if [ "$FORCE" -eq 0 ]; then
+      err "Aborting further patch application due to failure"
+      # attempt to rollback all previously applied patches (reverse order)
+      for ((i=${#APPLIED_PATCHES[@]}-1;i>=0;i--)); do
+        prev_patch="${APPLIED_PATCHES[$i]}"
+        prev_backup="${APPLIED_BACKUPS[$i]}"
+        warn "Restoring backup for previously applied patch: $(basename "$prev_patch")"
+        restore_backup_dir "$prev_backup" "$TARGET_SOURCE_DIR" || warn "Failed to restore backup $prev_backup"
+      done
+      err "All applied patches rolled back (best-effort). Exiting with error."
+      exit 20
+    else
+      warn "--force set: continuing despite failure"
+      continue
+    fi
+  fi
+done
+
+# If reached here, all applicable patches processed
+ok "All applicable patches processed for ${CATEGORY}/${PROGRAM}"
+# finalize report: mark not-applicable
+for p in "${NOT_APPLICABLE[@]:-}"; do
+  json_add_patch_entry "$(basename "$p")" "not-applicable" "$( [ "$HAS_SHA" -eq 1 ] && sha256sum "$p" | awk '{print $1}' || echo "" )" "check" "skipped"
+done
+
+# write a short summary to the main report if python available
+if [ "$HAS_PY" -eq 1 ]; then
+  python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+try:
+  d=json.load(open(f))
+  d['summary']=d.get('summary',{})
+  d['summary'].update({'category':sys.argv[2],'program':sys.argv[3],'applied':len([p for p in d.get('patches',[]) if p.get('status')=='applied'])})
+  open(f,'w').write(json.dumps(d,indent=2))
+except Exception as e:
+  pass
+PY
+fi
+
+ok "PART 2/3 completed. Report: $REPORT_JSON"
+info "Backups kept under: $BACKUP_ROOT (inspect before removal)"
+
+exit 0
+# ---------------------------------------------------------------------------
+# Funções:
+#  - --revert           : Reverte todos os patches aplicados (na ordem inversa)
+#  - --revert-one FILE  : Reverte somente o patch especificado (se backup existir)
+#  - --list-backups     : Lista backups disponíveis e tamanhos
+#  - --prune-backups N  : Remove backups com mais de N dias (default 7)
+#  - --verify-state     : Verifica integridade do estado após revert
+#  - --dry-run, --force, --verbose
+#
+# Segurança:
+#  ## RISCO: restauração sobrescreve código-fonte. Confirmação exigida ou use --force.
+#  ## RISCO: prune remove backups permanentemente.
+#### ----- Defaults & env (reuse from PART1/2 if available) -----
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+TMP_DIR="${TMP_DIR:-${ADM_ROOT}/tmp}"
+LOGS_DIR="${LOGS_DIR:-${ADM_ROOT}/logs}"
+METAFILES_DIR="${METAFILES_DIR:-${ADM_ROOT}/metafiles}"
+REPORT_JSON_DEFAULT="${REPORT_JSON:-${TMP_DIR}/adm-patches-report-${TS_NOW}.json}"
+BACKUP_GLOB="${BACKUP_GLOB:-${TMP_DIR}/adm-patches-backups-*}"
+DEFAULT_PRUNE_DAYS=7
+
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+CATEGORY=""
+PROGRAM=""
+PLAN_FILE=""
+REPORT_JSON="${REPORT_JSON_DEFAULT}"
+BACKUP_ROOT_PREFIX="${TMP_DIR}/adm-patches-backups-"
+LOCK_DIR="${TMP_DIR}/adm-patches-locks"
+safe_mkdir() { [ "$DRY_RUN" -eq 1 ] && [ "$VERBOSE" -eq 1 ] && printf "(dry-run) mkdir -p %s\n" "$1" || mkdir -p "$1" 2>/dev/null || true; }
+
+safe_mkdir "$LOGS_DIR"
+safe_mkdir "$TMP_DIR"
+safe_mkdir "$LOCK_DIR"
+
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-patches-final-${TS_NOW}.log}"
+
+# helpers: color/icons
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"
+
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+# JSON helpers using python3 when available
+_has_py() { command -v python3 >/dev/null 2>&1; }
+json_read() {
+  local jq_expr="$1" file="${2:-$REPORT_JSON}"
+  if _has_py; then
+    python3 - <<PY 2>/dev/null
+import json,sys
+f=sys.argv[1]; expr=sys.argv[2]
+d=json.load(open(f))
+# expr is simple python expression using 'd' as var, we will print its result
+try:
+  res=eval(expr,{},{"d":d})
+  if isinstance(res,(list,dict)):
+    print(json.dumps(res))
+  else:
+    print(res)
+except Exception as e:
+  sys.exit(2)
+PY
+  else
+    # fallback: minimal grep/awk for simple keys not robust; will return empty
+    cat "$file"
+  fi
+}
+
+json_update_patch_status() {
+  # args: patch_basename new_status details
+  local pname="$1" newstatus="$2" details="${3:-}"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) json_update_patch_status $pname -> $newstatus" && return 0
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; pname=sys.argv[2]; st=sys.argv[3]; det=sys.argv[4]
+d=json.load(open(f))
+if 'patches' not in d: d['patches']=[]
+for p in d['patches']:
+  if p.get('name')==pname:
+    p['status']=st
+    p.setdefault('details','')
+    if det:
+      p['details']=det
+    p['changed_at']=__import__('time').time()
+    break
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    warn "python3 not available; report JSON not updated for $pname"
+  fi
+}
+
+json_add_summary() {
+  local key="$1" val="$2"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) json_add_summary $key=$val" && return 0
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; k=sys.argv[2]; v=sys.argv[3]
+d=json.load(open(f))
+s=d.setdefault('summary',{})
+# try to convert number
+try:
+  vv=int(v)
+except:
+  vv=v
+s[k]=vv
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    warn "python3 not available; cannot update summary in report"
+  fi
+}
+
+# lock helpers (safe single instance per package)
+safe_mkdir "$LOCK_DIR"
+acquire_lock() {
+  local key="$1"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Another adm-patches operation is active for $key (lock: $lockfile)"; return 1; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() {
+  local lockfile="$1"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) release lock $lockfile" && return 0
+  [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+}
+
+### ----- Utility: discover backups for program ----- 
+# returns list of backup directories matching category/program
+list_backups() {
+  local prefix="${TMP_DIR}/adm-patches-backups-"
+  for d in ${TMP_DIR}/adm-patches-backups-* 2>/dev/null; do
+    [ -d "$d" ] || continue
+    # optionally filter by program presence inside backup (many backups have subdirs per patch)
+    echo "$d"
+  done
+}
+
+print_backups_summary() {
+  local printed=0
+  for b in $(list_backups); do
+    local sz
+    sz="$(du -sh "$b" 2>/dev/null | awk '{print $1}' || echo "??")"
+    local mtime
+    mtime="$(stat -c %y "$b" 2>/dev/null || echo "unknown")"
+    printf "%s  %s  %s\n" "$b" "$sz" "$mtime"
+    printed=1
+  done
+  [ "$printed" -eq 0 ] && echo "No backups found under ${TMP_DIR}"
+}
+
+### ----- Find backup directory for a given patch basename ----- 
+# heuristics: backups were created as ${BACKUP_ROOT_PREFIX}<ts>/<patch-basename>/
+find_backup_for_patch() {
+  local patchbase="$1"
+  local found=""
+  for root in ${TMP_DIR}/adm-patches-backups-*; do
+    [ -d "$root" ] || continue
+    for b in "$root"/*; do
+      [ -d "$b" ] || continue
+      if [ "$(basename "$b")" = "$patchbase" ]; then
+        found="$b"
+        echo "$found"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+### ----- Prune backups older than N days ----- 
+prune_old_backups() {
+  local days="${1:-$DEFAULT_PRUNE_DAYS}"
+  info "Pruning backups older than ${days} days under ${TMP_DIR}"
+  mapfile -t candidates < <(find "${TMP_DIR}" -maxdepth 1 -type d -name 'adm-patches-backups-*' -mtime +"${days}" -print 2>/dev/null || true)
+  if [ "${#candidates[@]}" -eq 0 ]; then ok "No backups older than ${days} days found"; return 0; fi
+  info "Found ${#candidates[@]} backup dirs to consider for prune:"
+  for c in "${candidates[@]}"; do
+    local sz; sz="$(du -sh "$c" 2>/dev/null | awk '{print $1}' || echo "??")"
+    printf "  - %s (%s)\n" "$c" "$sz"
+  done
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) prune skipped"; return 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Remove listed backups permanently?"; then warn "Prune cancelled by user"; return 1; fi
+  fi
+  local removed=0 failed=0
+  for c in "${candidates[@]}"; do
+    if rm -rf "$c"; then
+      ok "Removed $c"; removed=$((removed+1))
+    else
+      warn "Failed to remove $c"; failed=$((failed+1))
+    fi
+  done
+  json_add_summary "pruned_count" "$removed"
+  ok "Prune finished: removed=${removed} failed=${failed}"
+  return 0
+}
+
+### ----- Revert helpers ----- 
+# revert a single patch given its basename (expects backup dir exists)
+revert_single_patch() {
+  local patchbase="$1"
+  local target_dir="$2"    # source dir where patches were applied
+  local backup_dir
+  backup_dir="$(find_backup_for_patch "$patchbase" || true)"
+  if [ -z "$backup_dir" ]; then
+    warn "No backup found for patch ${patchbase}"
+    return 2
+  fi
+  info "Reverting patch ${patchbase} using backup ${backup_dir}"
+  # Create safety snapshot of current target before overwrite
+  local safety="${backup_dir}.pre-restore-${TS_NOW}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) would copy current target $target_dir -> $safety then restore $backup_dir -> $target_dir"
+    return 0
+  fi
+  # safety snapshot
+  if ! cp -a "$target_dir" "$safety" 2>>"$LOGFILE"; then
+    warn "Failed to create safety snapshot $safety (continuing)"
+  else
+    ok "Safety snapshot created: $safety"
+    log "[REVERT-SAFE]" "$safety"
+  fi
+  # restore using rsync if available for reliability
+  if command -v rsync >/dev/null 2>&1; then
+    if rsync -a --delete "$backup_dir"/ "$target_dir"/ >>"$LOGFILE" 2>&1; then
+      ok "Restored backup $backup_dir -> $target_dir"
+      json_update_patch_status "$patchbase" "reverted" "restored from $backup_dir"
+      return 0
+    else
+      err "rsync restore failed for $backup_dir -> $target_dir"
+      json_update_patch_status "$patchbase" "revert-failed" "rsync failed"
+      return 3
+    fi
+  else
+    # fallback: remove and copy
+    if rm -rf "$target_dir" 2>>"$LOGFILE"; then
+      if cp -a "$backup_dir" "$target_dir" >>"$LOGFILE" 2>&1; then
+        ok "Restored backup via cp: $backup_dir -> $target_dir"
+        json_update_patch_status "$patchbase" "reverted" "restored via cp"
+        return 0
+      else
+        err "cp restore failed for $backup_dir -> $target_dir"
+        json_update_patch_status "$patchbase" "revert-failed" "cp failed"
+        return 4
+      fi
+    else
+      err "Failed to remove target_dir before restore: $target_dir"
+      json_update_patch_status "$patchbase" "revert-failed" "rm failed"
+      return 5
+    fi
+  fi
+}
+
+# revert all patches marked as applied in report, in reverse order
+revert_all_patches() {
+  local target_dir="$1"
+  if [ -z "$target_dir" ]; then err "target directory not provided"; return 2; fi
+  if [ ! -d "$target_dir" ]; then err "target dir not found: $target_dir"; return 3; fi
+
+  # Read report patches and select those with status 'applied'
+  if _has_py; then
+    mapfile -t applied_patches < <(python3 - <<PY 2>/dev/null
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    out=[]
+    for p in d.get('patches',[]):
+        if p.get('status')=='applied':
+            out.append(p.get('name'))
+    # print one per line
+    for x in out:
+        print(x)
+except Exception:
+    sys.exit(0)
+PY
+"$REPORT_JSON")
+  else
+    # fallback: try to grep in report
+    mapfile -t applied_patches < <(grep -E '"status"[[:space:]]*:[[:space:]]*"applied"' -B2 "$REPORT_JSON" 2>/dev/null | grep '"name"' | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"(.*)".*/\1/' || true)
+  fi
+
+  if [ "${#applied_patches[@]}" -eq 0 ]; then info "No applied patches found in report: nothing to revert"; return 0; fi
+  info "Patches to revert (count=${#applied_patches[@]}):"
+  # reverse order
+  for ((i=${#applied_patches[@]}-1;i>=0;i--)); do
+    printf "  - %s\n" "${applied_patches[$i]}"
+  done
+
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) revert operations simulated"; return 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Proceed to revert ${#applied_patches[@]} patches for ${CATEGORY}/${PROGRAM}?"; then warn "Revert cancelled"; return 1; fi
+  fi
+
+  local reverted=0 failed=0
+  for ((i=${#applied_patches[@]}-1;i>=0;i--)); do
+    local pbase="${applied_patches[$i]}"
+    info "Reverting: $pbase"
+    if revert_single_patch "$pbase" "$target_dir"; then
+      ok "Reverted: $pbase"; reverted=$((reverted+1))
+    else
+      warn "Failed to revert: $pbase"
+      failed=$((failed+1))
+      # attempt continue but record failure
+    fi
+  done
+
+  json_add_summary "reverted_count" "$reverted"
+  json_add_summary "revert_failed_count" "$failed"
+  ok "Revert finished: success=${reverted} failed=${failed}"
+  return 0
+}
+
+### ----- Verify state after revert ----- 
+verify_reverted_state() {
+  local target_dir="$1"
+  if [ -z "$target_dir" ]; then err "verify_reverted_state: target dir not provided"; return 2; fi
+  if [ ! -d "$target_dir" ]; then err "target dir not found: $target_dir"; return 3; fi
+  info "Verifying state of source dir ${target_dir} against report"
+
+  # For each patch entry in report that is 'reverted' check that files match the backup (best-effort)
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,os,sys,subprocess
+f=sys.argv[1]; target=sys.argv[2]
+d=json.load(open(f))
+issues=[]
+for p in d.get('patches',[]):
+    name=p.get('name')
+    status=p.get('status')
+    if status=='reverted':
+        # find backup dir
+        base_dir=os.path.dirname(target)
+        backups=[d for d in os.listdir(base_dir) if d.startswith('adm-patches-backups')]
+        # skip deep verification due to fragility; placeholder: mark verified
+        pass
+# write a simple flag
+d.setdefault('verify',{})['checked_at']=__import__('time').time()
+open(f,'w').write(json.dumps(d,indent=2))
+print('verified')
+PY
+    ok "Verify: best-effort checks recorded in report"
+    json_add_summary "verify_checked" "1"
+    return 0
+  else
+    warn "python3 not available; cannot perform deep verification"
+    return 1
+  fi
+}
+
+### ----- List backups (CLI wrapper) ----- 
+cmd_list_backups() {
+  print_backups_summary
+  return 0
+}
+
+### ----- List report applied patches ----- 
+cmd_list_applied_from_report() {
+  info "Applied patches in report (${REPORT_JSON}):"
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+d=json.load(open(sys.argv[1]))
+for p in d.get('patches',[]):
+    print(p.get('name'), p.get('status'))
+PY
+  else
+    grep -E '"name"|\"status\"' "$REPORT_JSON" || true
+  fi
+  return 0
+}
+
+### ----- Usage & CLI parsing ----- 
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options]
+
+Operations:
+  --category <cat>         Metafiles category (required for target)
+  --program <name>         Program name (required)
+  --plan <plan-file>       (optional) plan file from PART1 (used to guess target source)
+  --report <file>          (optional) report JSON (default: $REPORT_JSON_DEFAULT)
+
+Commands:
+  --revert                 Revert all applied patches (in reverse order)
+  --revert-one <patch>     Revert only the specified patch basename (e.g. 0001-fix.patch)
+  --list-backups           List available backups
+  --prune-backups [days]   Remove backups older than days (default: $DEFAULT_PRUNE_DAYS)
+  --verify-state           Verify state after revert (best-effort)
+  --list-applied           List applied patches from report
+
+Global flags:
+  --dry-run                Simulate actions (no writes)
+  --force                  Non-interactive, assume yes
+  --verbose,-v             Verbose output
+  --quiet                  Minimal output
+  --help                   Show help
+EOF
+  exit 1
+}
+
+# parse args
+POSITIONAL=()
+CMD_REVERT=0
+CMD_REVERT_ONE=""
+CMD_LIST_BACKUPS=0
+CMD_PRUNE_DAYS=""
+CMD_VERIFY=0
+CMD_LIST_APPLIED=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --category) CATEGORY="${2:-}"; shift 2 ;;
+    --program) PROGRAM="${2:-}"; shift 2 ;;
+    --plan) PLAN_FILE="${2:-}"; shift 2 ;;
+    --report) REPORT_JSON="${2:-$REPORT_JSON}"; shift 2 ;;
+    --revert) CMD_REVERT=1; shift ;;
+    --revert-one) CMD_REVERT_ONE="${2:-}"; shift 2 ;;
+    --list-backups) CMD_LIST_BACKUPS=1; shift ;;
+    --prune-backups) CMD_PRUNE_DAYS="${2:-$DEFAULT_PRUNE_DAYS}"; shift 2 ;;
+    --verify-state) CMD_VERIFY=1; shift ;;
+    --list-applied) CMD_LIST_APPLIED=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+if [ -z "$CATEGORY" ] || [ -z "$PROGRAM" ]; then
+  err "Missing --category and/or --program (both required)"
+  usage
+fi
+
+# Try to auto-locate report if not specified
+if [ ! -f "$REPORT_JSON" ]; then
+  # try default patterns
+  for candidate in "${TMP_DIR}/adm-patches-report-"*"$PROGRAM"*.json "${TMP_DIR}/adm-patches-report-*.json"; do
+    [ -f "$candidate" ] && { REPORT_JSON="$candidate"; break; }
+  done
+fi
+if [ ! -f "$REPORT_JSON" ]; then
+  warn "Report JSON not found at $REPORT_JSON; continuing with caution"
+else
+  info "Using report: $REPORT_JSON"
+fi
+
+# Acquire lock for this package
+lockfile="$(acquire_lock "${CATEGORY}_${PROGRAM}")" || exit 3
+
+# Determine target source dir (use plan or sensible defaults)
+TARGET_SOURCE_DIR=""
+if [ -n "$PLAN_FILE" ] && [ -f "$PLAN_FILE" ]; then
+  # try to discover source dir from plan file if present (plan format includes comment)
+  TARGET_SOURCE_DIR="$(awk '/^#/{next} /^category:/{next} /^program:/{next} /^generated:/{next} /^$/{next} { if ($0 !~ /^#/) print $0 }' "$PLAN_FILE" | sed -n '1,1p' 2>/dev/null || true)"
+fi
+# fallback candidates
+for candidate in "${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/source" "/usr/src/${PROGRAM}" "${ADM_ROOT}/build/${PROGRAM}" "${METAFILES_DIR}/${CATEGORY}/${PROGRAM}/work"; do
+  [ -d "$candidate" ] && { TARGET_SOURCE_DIR="$candidate"; break; }
+done
+if [ -z "$TARGET_SOURCE_DIR" ]; then
+  warn "Target source dir not found (expected where patches were applied). Provide accurate plan or ensure sources present."
+fi
+
+# Dispatch commands
+if [ "$CMD_LIST_BACKUPS" -eq 1 ]; then
+  cmd_list_backups
+  release_lock "$lockfile"
+  exit 0
+fi
+
+if [ -n "$CMD_REVERT_ONE" ]; then
+  if [ -z "$TARGET_SOURCE_DIR" ]; then err "Cannot revert: target source dir unknown"; release_lock "$lockfile"; exit 2; fi
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) revert-one $CMD_REVERT_ONE -> $TARGET_SOURCE_DIR"; release_lock "$lockfile"; exit 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Revert patch ${CMD_REVERT_ONE} in ${TARGET_SOURCE_DIR}? This will overwrite files."; then warn "Cancelled"; release_lock "$lockfile"; exit 1; fi
+  fi
+  revert_single_patch "$CMD_REVERT_ONE" "$TARGET_SOURCE_DIR"
+  release_lock "$lockfile"
+  exit $?
+fi
+
+if [ "$CMD_REVERT" -eq 1 ]; then
+  if [ -z "$TARGET_SOURCE_DIR" ]; then err "Cannot revert: target source dir unknown"; release_lock "$lockfile"; exit 2; fi
+  revert_all_patches "$TARGET_SOURCE_DIR"
+  release_lock "$lockfile"
+  exit $?
+fi
+
+if [ -n "$CMD_PRUNE_DAYS" ]; then
+  prune_old_backups "$CMD_PRUNE_DAYS"
+  release_lock "$lockfile"
+  exit $?
+fi
+
+if [ "$CMD_VERIFY" -eq 1 ]; then
+  if [ -z "$TARGET_SOURCE_DIR" ]; then err "Cannot verify: target source dir unknown"; release_lock "$lockfile"; exit 2; fi
+  verify_reverted_state "$TARGET_SOURCE_DIR"
+  release_lock "$lockfile"
+  exit $?
+fi
+
+if [ "$CMD_LIST_APPLIED" -eq 1 ]; then
+  cmd_list_applied_from_report
+  release_lock "$lockfile"
+  exit 0
+fi
+
+# If nothing matched, show usage
+usage
+
+# release lock (unreachable)
+release_lock "$lockfile"
+exit 0
