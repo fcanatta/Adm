@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ADM HOOK: GCC post-build
+# Executado após make (antes de instalar)
+# Responsável por rodar testes e validar binários
+
+set -euo pipefail
+
+echo "🔍 [GCC post-build] Validando build..."
+
+# Detectar stage
+ADM_STAGE="${ADM_STAGE:-$(cat /etc/adm-stage 2>/dev/null || echo stage3)}"
+
+# Rodar testes apenas fora de bootstrap
+if [[ "$ADM_STAGE" =~ stage0|stage1 ]]; then
+  echo "ℹ️  Testes desativados para bootstrap (${ADM_STAGE})"
+else
+  echo "⚙️  Executando 'make -k check' (isso pode demorar)"
+  if [ "${DRY_RUN:-0}" -eq 0 ]; then
+    make -k check || echo "⚠️  Alguns testes falharam, continue com cautela"
+  else
+    echo "(dry-run) simulando testes"
+  fi
+fi
+
+# Registrar sumário
+if [ "${DRY_RUN:-0}" -eq 0 ]; then
+  echo "[`date -u`] Testes finalizados para GCC ($ADM_STAGE)" >> "${ADM_LOG:-/usr/src/adm/logs/gcc-build.log}"
+fi
+
+echo "✅ [GCC post-build] Etapa concluída"
