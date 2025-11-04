@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# adm-download - Baixa fontes multimétodo a partir de metafile(s) ou URLs
+#
+# Requisitos (executar como root ou usuário com permissões para /usr/src/adm):
+#   - bash, coreutils
+#   - curl or wget
+#   - git (para repositórios)
+#   - rsync (opcional)
+#   - sha256sum
+#   - zsh/awk/sed/grep (usados no script; POSIX-ish)
+#
+# Aviso importante de segurança:
+# - Este script executa hooks (scripts) fornecidos nos metafiles. Hooks podem executar
+#   comandos arbitrários. Revise hooks antes de permitir execução.
+# - O script manipula arquivos em /usr/src/adm; cuidado se alterar paths para locais sensíveis.
+# - Você assumiu responsabilidade por possíveis danos — ainda assim, use --dry-run para testar.
+#
+# Comportamento:
+# - Lê um ou mais metafiles ou identificadores categoria/programa ou URLs diretas
+# - Para cada entrada extrai as fontes (campo "source" no metafile pode ter múltiplas URLs)
+# - Tenta cada URL até obter uma cópia válida (checksum opcional)
+# - Salva fontes em /usr/src/adm/cache/sources/<categoria>/<name>/<version>/
+# - Gera registro em /usr/src/adm/db/downloads.jsonl
+# - Não empacota (adm-build fará empacotamento)
+#
+# Uso:
+#   adm-download [--dry-run] [--force] [--jobs N] [--timeout SEC] <metafile|cat/prog|URL>...
+#
+set -euo pipefail
+
+### Configuration / defaults
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_BIN="${ADM_ROOT}/bin"
+ADM_LOG="${ADM_ROOT}/logs"
+ADM_DB="${ADM_ROOT}/db"
+ADM_CACHE_SRC="${ADM_ROOT}/cache/sources"
+ADM_METAFILES="${ADM_ROOT}/metafiles"
+ADM_WORK="${ADM_ROOT}/work"
+
+# defaults
+DRY_RUN=false
+FORCE=false
+JOBS=4
+TIMEOUT=300
+VERBOSE=false
+QUIET=false
+NO_HOOKS=false
+CATEGORY_OVERRIDE=""
+OUTPUT_DIR=""
+
+# ensure directories exist (safe: create under ADM_ROOT only)
+mkdir -p "$ADM_BIN" "$ADM_LOG" "$ADM_DB" "$ADM_CACHE_SRC" "$ADM_METAFILES" "$ADM_WORK"
+
+# logfile helper
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+logfile_for() {
+  local name="$1"
+  echo "${ADM_LOG}/adm-download-${name}-$(date +%Y%m%d%H%M%S).log"
+}
+
+# small color helpers
+_noc="$(tput sgr0 2>/dev/null || true)"
+_red="$(tput setaf 1 2>/dev/null || echo '')"
+_grn="$(tput setaf 2 2>/dev/null || echo '')"
+_yel="$(tput setaf 3 2>/dev/null || echo '')"
+_blu="$(tput setaf 4 2>/dev/null || echo '')"
+
+cecho() {
+  local color="$1"; shift
+  if $QUIET; then return 0; fi
+  printf "%b%s%b\n" "$color" "$*" "$_noc"
+}
+info()  { cecho "$_blu" "[INFO] $*"; }
+ok()    { cecho "$_grn" "✔️  $*"; }
+warn()  { cecho "$_yel" "⚠️  $*"; }
+error() { cecho "$_red" "✖️  $*"; }
+
+# spinner for long-running foreground commands
+spinner_start() {
+  # call like: spinner_start "message" & SPIN_PID=$!
+  local msg="$1"
+  printf "%s " "$msg"
+  i=0
+  sp='/-\|'
+  while :; do
+    printf "\b%s" "${sp:i++%${#sp}:1}"
+    sleep 0.08
+  done
+}
+spinner_stop() {
+  # kill spinner process
+  if [ -n "${SPIN_PID-}" ] && kill -0 "$SPIN_PID" >/dev/null 2>&1; then
+    kill "$SPIN_PID" >/dev/null 2>&1 || true
+    wait "$SPIN_PID" 2>/dev/null || true
+    printf "\b"
+  fi
+}
+
+# run command capturing output to logfile, with spinner and return code
+run_cmd_log() {
+  # run_cmd_log <name> <logfile> <command...>
+  local name="$1"; shift
+  local logfile="$1"; shift
+  if $DRY_RUN; then
+    info "DRY-RUN: would run: $*  (log: $logfile)"
+    return 0
+  fi
+  # Run command in subshell, redirect both stdout and stderr
+  # Show spinner in background
+  (
+    # start spinner
+    spinner_start "$name"
+  ) &
+  SPIN_PID=$!
+  # Execute actual command and capture output
+  if "$@" >"$logfile" 2>&1; then
+    spinner_stop
+    ok "$name finished (log: $logfile)"
+    return 0
+  else
+    spinner_stop
+    error "$name failed (see $logfile)"
+    return 1
+  fi
+}
+
+# simple JSONL writer for DB (append)
+db_record() {
+  local json="$1"
+  if $DRY_RUN; then
+    info "DRY-RUN: would append to ${ADM_DB}/downloads.jsonl: $json"
+    return 0
+  fi
+  printf "%s\n" "$json" >> "${ADM_DB}/downloads.jsonl"
+}
+
+# sanitize basename from URL
+basename_from_url() {
+  local url="$1"
+  # remove query string, trailing slash
+  local u="${url%%\?*}"
+  u="${u%/}"
+  # if URL ends with .git, return repository name minus .git
+  if [[ "$u" =~ \.git$ ]]; then
+    local b="$(basename "$u" .git)"
+    printf "%s" "$b"
+    return
+  fi
+  printf "%s" "$(basename "$u")"
+}
+
+# parse simple metafile (key=value lines). Supports multiline source="...".
+# usage: parse_metafile <path> -> sets global assoc METAFILE_VARS[name]=value etc.
+declare -A METAFILE_VARS
+parse_metafile() {
+  local mf="$1"
+  [ -f "$mf" ] || return 1
+  # read lines, handle multiline "source" quoted or newline-separated 'source=' with many entries
+  # We'll source a safe temporary file after sanitizing keys (only allowed keys)
+  local tmp
+  tmp="$(mktemp)"
+  # Allowed keys (prevent arbitrary code execution via metafile): only these keys are read
+  # name,version,build,source,sha256sum,run_deps,build_deps,opt_deps,url,desc,category
+  # We'll convert to format: KEY='value' safely escaping single quotes.
+  # Parse file line by line
+  while IFS= read -r line || [ -n "$line" ]; do
+    # strip leading/trailing whitespace
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    # skip comments and empty
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    if [[ "$line" =~ ^([a-zA-Z_][a-zA-Z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      # if value starts with double quote and does not end, read until closing quote (multiline)
+      if [[ "$val" =~ ^\".*\"$ ]]; then
+        # single line quoted
+        val="${val#\"}"; val="${val%\"}"
+      elif [[ "$val" =~ ^\".*$ ]]; then
+        # multiline: read until we find a closing quote
+        val="${val#\"}"
+        while IFS= read -r cont || [ -n "$cont" ]; do
+          if [[ "$cont" =~ .*\"$ ]]; then
+            cont="${cont%\"}"
+            val="${val}"$'\n'"${cont}"
+            break
+          else
+            val="${val}"$'\n'"${cont}"
+          fi
+        done
+      fi
+      # trim whitespace
+      val="${val#"${val%%[![:space:]]*}"}"
+      val="${val%"${val##*[![:space:]]}"}"
+      # accept only allowed keys
+      case "$key" in
+        name|version|build|source|sha256sum|run_deps|build_deps|opt_deps|url|desc|category)
+          # escape single quotes and write to tmp as KEY='value'
+          esc=$(printf "%s" "$val" | sed "s/'/'\\\\''/g")
+          printf "%s='%s'\n" "$key" "$esc" >> "$tmp"
+          ;;
+        *)
+          warn "Ignoring unknown key in metafile: $key"
+          ;;
+      esac
+    else
+      warn "Skipping invalid line in metafile: $line"
+    fi
+  done < "$mf"
+  # shell-source the tmp to load variables into environment (safe because only allowed keys written)
+  # Use a subshell to capture variables into METAFILE_VARS
+  (
+    # shellcheck disable=SC1090
+    source "$tmp"
+    # print allowed keys in key=value form to stdout so caller can read
+    for k in name version build source sha256sum run_deps build_deps opt_deps url desc category; do
+      v="${!k-}"
+      if [ -n "$v" ]; then
+        printf "%s=%s\n" "$k" "$(printf "%s" "$v" | sed 's/%/%%/g')"
+      fi
+    done
+  ) > "${tmp}.out"
+  while IFS='=' read -r k v; do
+    METAFILE_VARS["$k"]="$v"
+  done < "${tmp}.out"
+  rm -f "$tmp" "${tmp}.out"
+  return 0
+}
+
+# split sources field into array (supports space/newline/comma separated)
+split_sources_field() {
+  local raw="$1"
+  # Replace commas with newlines; then split on whitespace/lines
+  # preserve entries that begin with dir:, git+, sf:, rsync:, ftp:, http(s) etc.
+  # use awk to print non-empty trimmed lines
+  printf "%s" "$raw" | sed 's/,/\'$'\n''/g' | awk '{$1=$1; if(length($0)) print $0}'
+}
+
+# detect protocol/type for a source URL
+detect_type() {
+  local s="$1"
+  if [[ "$s" =~ ^dir: ]]; then echo "dir"; return; fi
+  if [[ "$s" =~ ^git\+ ]]; then echo "git"; return; fi
+  if [[ "$s" =~ \.git$ || "$s" =~ ^git:// ]]; then echo "git"; return; fi
+  if [[ "$s" =~ ^rsync:// ]]; then echo "rsync"; return; fi
+  if [[ "$s" =~ ^sf: ]]; then echo "sf"; return; fi
+  if [[ "$s" =~ ^https?:// ]]; then
+    # if URL ends with archive extensions, treat as archive; otherwise http generic
+    if [[ "$s" =~ \.(tar\.gz|tgz|tar\.bz2|tbz2|tar\.xz|txz|zip|tar\.zst|tar)$ ]]; then
+      echo "http-file"
+    else
+      # could be webpage listing releases; treat as http-file attempt too
+      echo "http-file"
+    fi
+    return
+  fi
+  # fallback: treat as file path if exists, or http-file attempt
+  if [ -e "$s" ]; then echo "local-file"; else echo "http-file"; fi
+}
+
+# download implementations for each type
+download_git() {
+  local url="$1"; local destdir="$2"; local logf="$3"; local version_opt="$4"
+  if $DRY_RUN; then info "DRY-RUN: git clone $url -> $destdir"; return 0; fi
+  mkdir -p "$destdir"
+  # prefer shallow clone of specified tag/branch if provided
+  if [ -n "$version_opt" ]; then
+    run_cmd_log "git-clone" "$logf" git clone --depth 1 --branch "$version_opt" "$url" "$destdir"
+  else
+    # perform shallow clone of default branch
+    run_cmd_log "git-clone" "$logf" git clone --depth 1 "$url" "$destdir"
+  fi
+}
+
+download_http_file() {
+  local url="$1"; local dest="$2"; local logf="$3"
+  if $DRY_RUN; then info "DRY-RUN: curl -L -o $dest $url"; return 0; fi
+  mkdir -p "$(dirname "$dest")"
+  if command -v curl >/dev/null 2>&1; then
+    run_cmd_log "curl" "$logf" curl -L --fail --retry 3 --max-time "$TIMEOUT" -o "$dest" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    run_cmd_log "wget" "$logf" wget -O "$dest" "$url" --timeout="$TIMEOUT"
+  else
+    error "Neither curl nor wget available"
+    return 1
+  fi
+}
+
+download_rsync() {
+  local url="$1"; local dest="$2"; local logf="$3"
+  if $DRY_RUN; then info "DRY-RUN: rsync -a $url $dest"; return 0; fi
+  if ! command -v rsync >/dev/null 2>&1; then
+    error "rsync not found"
+    return 1
+  fi
+  mkdir -p "$dest"
+  # rsync remote:path to dest/
+  run_cmd_log "rsync" "$logf" rsync -a "$url" "$dest"
+}
+
+download_local_dir() {
+  local src="$1"; local dest="$2"; local logf="$3"
+  if $DRY_RUN; then info "DRY-RUN: cp -a $src $dest"; return 0; fi
+  if [ ! -d "$src" ]; then error "Local source directory not found: $src"; return 1; fi
+  mkdir -p "$dest"
+  run_cmd_log "copy" "$logf" cp -a "$src/." "$dest/"
+}
+
+download_sf() {
+  local token="$1"; local dest="$2"; local logf="$3"
+  # token is like project/path or similar. We'll try to form a downloads.sourceforge.net URL.
+  # e.g., sf:project/files/latest/download -> https://downloads.sourceforge.net/project/<project>/<path>
+  if $DRY_RUN; then info "DRY-RUN: sf download $token -> $dest"; return 0; fi
+  mkdir -p "$(dirname "$dest")"
+  local url="https://downloads.sourceforge.net/${token}"
+  if command -v curl >/dev/null 2>&1; then
+    run_cmd_log "curl-sf" "$logf" curl -L --fail --retry 3 --max-time "$TIMEOUT" -o "$dest" "$url"
+  else
+    run_cmd_log "wget-sf" "$logf" wget -O "$dest" "$url" --timeout="$TIMEOUT"
+  fi
+}
+
+# compute sha256 of file or directory (if directory, tar it to a temp stream)
+compute_sha256() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    sha256sum "$path" | awk '{print $1}'
+  elif [ -d "$path" ]; then
+    # if directory, compute hash of tar streamed (deterministic-ish: sorted names)
+    tar -C "$path" -cf - . | sha256sum | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+# choose a target filename in cache for a given source URL and package info
+choose_cache_path() {
+  local category="$1"; local name="$2"; local version="$3"; local src="$4"
+  local base="$(basename_from_url "$src")"
+  if [ -z "$base" ]; then base="${name}-${version}"; fi
+  # sanitize base: replace ? & = with underscores
+  base="$(printf "%s" "$base" | sed 's/[][?&=/:]/_/g')"
+  local destdir="${ADM_CACHE_SRC}/${category}/${name}/${version}"
+  mkdir -p "$destdir"
+  echo "${destdir}/${base}"
+}
+
+# safe execution of hooks
+run_hook_if_exists() {
+  local hooksdir="$1"
+  local stage="$2" # pre-download or post-download
+  local envvars="$3" # additional env vars (string)
+  if $NO_HOOKS; then
+    info "Hooks disabled (--no-hooks); skipping $stage"
+    return 0
+  fi
+  local hookpath="${hooksdir}/${stage}"
+  if [ -x "$hookpath" ]; then
+    info "Executing hook: $hookpath"
+    if $DRY_RUN; then
+      info "DRY-RUN: would run hook $hookpath"
+      return 0
+    fi
+    # Run hook in a subshell with a safe PATH and env
+    (
+      # Limit PATH to common safe tools (avoid arbitrary path from env)
+      PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+      # Optional envvars were passed as "KEY=val KEY2=val2"
+      eval "export $envvars"
+      # set -e safe
+      set -euo pipefail
+      # run with timeout if available
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 120 "$hookpath"
+      else
+        "$hookpath"
+      fi
+    )
+    rc=$?
+    if [ $rc -ne 0 ]; then
+      error "Hook $hookpath failed with exit code $rc"
+      return $rc
+    fi
+  else
+    info "No hook $stage found in $hooksdir"
+  fi
+}
+
+# Main per-package processing function
+process_entry() {
+  local entry="$1" # can be metafile path, category/name, or URL
+  # Determine type:
+  local metafile=""
+  local is_url=false
+  local is_meta=false
+  local category=""
+  local name=""
+  local version=""
+  local build=""
+  local sha256_expected=""
+  local sources_raw=""
+  local desc=""
+  local url_field=""
+  # if entry looks like "category/name", try to find metafile
+  if [[ "$entry" =~ ^[^/]+/[^/]+$ ]]; then
+    category="${entry%%/*}"
+    name="${entry##*/}"
+    metafile="${ADM_METAFILES}/${category}/${name}/metafile"
+    if [ -f "$metafile" ]; then
+      is_meta=true
+    else
+      # maybe category empty; try to find by name in all metafiles (first)
+      metafile="$(find "$ADM_METAFILES" -type f -name "metafile" -path "*/${name}/*" -print -quit || true)"
+      if [ -n "$metafile" ]; then
+        is_meta=true
+        # try to set category from path
+        category="$(echo "$metafile" | awk -F"${ADM_METAFILES}/" '{print $2}' | cut -d'/' -f1)"
+      fi
+    fi
+  fi
+
+  if [ -f "$entry" ] && [ -r "$entry" ] && ! $is_meta; then
+    # explicit metafile path
+    metafile="$entry"; is_meta=true
+    # try to guess category/name from path
+    category="$(echo "$entry" | sed "s|${ADM_METAFILES}/||" | cut -d'/' -f1)"
+    name="$(basename "$(dirname "$entry")")"
+  fi
+
+  if ! $is_meta; then
+    # treat entry as URL (or file path) - create minimal metadata
+    is_url=true
+    sources_raw="$entry"
+    name="$(basename_from_url "$entry")"
+    version="snapshot"
+    build="0"
+    category="${CATEGORY_OVERRIDE:-misc}"
+  fi
+
+  if $is_meta; then
+    # parse metafile into METAFILE_VARS
+    METAFILE_VARS=()
+    parse_metafile "$metafile" || { error "Failed parsing metafile $metafile"; return 1; }
+    name="${METAFILE_VARS[name]:-$name}"
+    version="${METAFILE_VARS[version]:-snapshot}"
+    build="${METAFILE_VARS[build]:-0}"
+    sha256_expected="${METAFILE_VARS[sha256sum]:-}"
+    sources_raw="${METAFILE_VARS[source]:-}"
+    desc="${METAFILE_VARS[desc]:-}"
+    url_field="${METAFILE_VARS[url]:-}"
+    category="${METAFILE_VARS[category]:-$category}"
+  fi
+
+  # allow override of OUTPUT_DIR
+  if [ -n "$OUTPUT_DIR" ]; then
+    ADM_CACHE_SRC="$OUTPUT_DIR"
+  fi
+
+  # resolve sources list
+  mapfile -t sources < <(split_sources_field "$sources_raw")
+
+  # if no sources and it's a url entry treat the entry itself as the single source
+  if [ ${#sources[@]} -eq 0 ] && $is_url; then
+    sources=("$entry")
+  fi
+
+  # prepare target cache dir
+  local target_dir="${ADM_CACHE_SRC}/${category}/${name}/${version}"
+  if ! $DRY_RUN; then mkdir -p "$target_dir"; fi
+
+  local session_name="${name}-${version}-b${build}-$(date +%s)"
+  local logf
+  logf="$(logfile_for "${name}-${version}")"
+
+  info "Processing: ${category}/${name} ${version} (build ${build})"
+  info "Target cache dir: $target_dir"
+  info "Logfile: $logf"
+
+  # run pre-download hook if metafile exists and hooks dir exists
+  if $is_meta; then
+    local hooksdir="$(dirname "$metafile")/hooks"
+    run_hook_if_exists "$hooksdir" "pre-download" "ADM_NAME=${name} ADM_VERSION=${version} ADM_BUILD=${build} ADM_META=${metafile} ADM_WORK=${ADM_WORK} ADM_CACHE_SRC=${ADM_CACHE_SRC}" || {
+      warn "pre-download hook failed"
+      if ! $FORCE; then return 3; else warn "Continuing due to --force"; fi
+    }
+  fi
+
+  # iterate over sources until one works
+  local success=false
+  local chosen_source=""
+  local chosen_local=""
+  local tried=0
+  for src in "${sources[@]}"; do
+    tried=$((tried+1))
+    info "Attempting source [$tried/${#sources[@]}]: $src"
+    local stype
+    stype="$(detect_type "$src")"
+    info "Detected type: $stype"
+    local dest
+    dest="$(choose_cache_path "$category" "$name" "$version" "$src")"
+    # If dest exists and sha matches expected, skip
+    if [ -e "$dest" ] && [ -n "$sha256_expected" ] && ! $FORCE; then
+      local h
+      h="$(compute_sha256 "$dest")"
+      if [ -n "$h" ] && [ "$h" = "$sha256_expected" ]; then
+        ok "Cached source present and checksum matches: $dest"
+        chosen_source="$src"
+        chosen_local="$dest"
+        success=true
+        break
+      else
+        warn "Existing cached file $dest has different checksum; will try re-download (or use --force to override)"
+        if $FORCE; then
+          rm -f "$dest" || true
+        fi
+      fi
+    fi
+
+    # perform download according to type
+    case "$stype" in
+      git)
+        # for git, dest should be a dir
+        if [ -d "$dest" ] && ! $FORCE; then
+          info "Git destination exists: $dest (use --force to re-clone)"
+          chosen_source="$src"; chosen_local="$dest"; success=true; break
+        fi
+        if [[ "$src" =~ ^git\+ ]]; then src="${src#git+}"; fi
+        if ! download_git "$src" "$dest" "$logf" "${version:-}"; then
+          warn "git download failed for $src"
+          continue
+        fi
+        chosen_source="$src"; chosen_local="$dest"; success=true; break
+        ;;
+      rsync)
+        if ! download_rsync "$src" "$dest" "$logf"; then
+          warn "rsync failed for $src"
+          continue
+        fi
+        chosen_source="$src"; chosen_local="$dest"; success=true; break
+        ;;
+      dir)
+        # src is like dir:/path; strip prefix
+        local localpath="${src#dir:}"
+        if ! download_local_dir "$localpath" "$dest" "$logf"; then
+          warn "local dir copy failed for $src"
+          continue
+        fi
+        chosen_source="$src"; chosen_local="$dest"; success=true; break
+        ;;
+      sf)
+        local token="${src#sf:}"
+        local destfile="$dest"
+        if [[ "$destfile" =~ /$ ]]; then destfile="${destfile}/download"; fi
+        if ! download_sf "$token" "$destfile" "$logf"; then
+          warn "sourceforge download failed for $src"
+          continue
+        fi
+        chosen_source="$src"; chosen_local="$destfile"; success=true; break
+        ;;
+      http-file|local-file)
+        local destfile="$dest"
+        if [[ "$destfile" =~ /$ ]]; then destfile="${destfile}/download"; fi
+        if ! download_http_file "$src" "$destfile" "$logf"; then
+          warn "http download failed for $src"
+          continue
+        fi
+        chosen_source="$src"; chosen_local="$destfile"; success=true; break
+        ;;
+      *)
+        warn "Unknown/unsupported type '$stype' for source $src"
+        continue
+        ;;
+    esac
+  done
+
+  if ! $success; then
+    error "All sources failed for ${name}-${version}"
+    # record failure
+    db_record "{\"name\":\"$name\",\"version\":\"$version\",\"category\":\"$category\",\"timestamp\":\"$(timestamp)\",\"status\":\"failed\",\"tried_sources\":$(printf '%s\n' "${sources[@]}" | jq -R -s -c 'split("\n")[:-1]')}"
+    return 1
+  fi
+
+  # At this point chosen_local points to file or dir
+  info "Chosen source: $chosen_source"
+  info "Local copy: $chosen_local"
+
+  # Validate sha256 if expected
+  local sha_ok=true
+  if [ -n "$sha256_expected" ]; then
+    info "Validating sha256 (expected: $sha256_expected)"
+    local got
+    got="$(compute_sha256 "$chosen_local" || true)"
+    if [ -z "$got" ]; then
+      warn "Could not compute sha256 for $chosen_local"
+      sha_ok=false
+    elif [ "$got" != "$sha256_expected" ]; then
+      warn "Checksum mismatch: got $got"
+      sha_ok=false
+    else
+      ok "Checksum valid"
+      sha_ok=true
+    fi
+    if ! $sha_ok && ! $FORCE; then
+      error "Checksum mismatch and --force not set -> abort"
+      db_record "{\"name\":\"$name\",\"version\":\"$version\",\"category\":\"$category\",\"timestamp\":\"$(timestamp)\",\"status\":\"checksum_mismatch\",\"source\":\"$chosen_source\",\"path\":\"$chosen_local\"}"
+      return 4
+    fi
+  else
+    info "No expected sha256 provided; skipping hash validation"
+  fi
+
+  # run post-download hook if exists
+  if $is_meta; then
+    local hooksdir="$(dirname "$metafile")/hooks"
+    run_hook_if_exists "$hooksdir" "post-download" "ADM_NAME=${name} ADM_VERSION=${version} ADM_BUILD=${build} ADM_META=${metafile} ADM_WORK=${ADM_WORK} ADM_CACHE_SRC=${ADM_CACHE_SRC} ADM_SOURCE_DIR=${chosen_local}" || {
+      warn "post-download hook failed"
+      if ! $FORCE; then
+        db_record "{\"name\":\"$name\",\"version\":\"$version\",\"category\":\"$category\",\"timestamp\":\"$(timestamp)\",\"status\":\"posthook_failed\",\"source\":\"$chosen_source\",\"path\":\"$chosen_local\"}"
+        return 3
+      else
+        warn "Continuing due to --force"
+      fi
+    }
+  fi
+
+  # register success in DB (JSONL)
+  # Build JSON array of sources
+  local src_json
+  src_json="$(printf '%s\n' "${sources[@]}" | jq -R -s -c 'split("\n")[:-1]')"
+  # compute final sha if available
+  local final_sha=""
+  if [ -n "$chosen_local" ]; then final_sha="$(compute_sha256 "$chosen_local" || true)"; fi
+  # Build json record (escape fields properly)
+  local json
+  json="$(jq -n --arg name "$name" --arg version "$version" --arg build "$build" --arg ts "$(timestamp)" --argjson sources "$src_json" --arg path "$chosen_local" --arg sha "$final_sha" --arg status "ok" --arg category "$category" '{
+    name:$name,version:$version,build:$build,timestamp:$ts,sources:$sources,local_path:$path,sha256:$sha,status:$status,category:$category
+  }')"
+  db_record "$json"
+
+  ok "Download and registration complete for ${name}-${version}"
+  return 0
+}
+
+# Usage
+usage() {
+  cat <<EOF
+adm-download - baixa fontes multimétodo e registra no cache
+
+Uso:
+  adm-download [opções] <metafile|categoria/programa|URL>...
+
+Opções:
+  -n, --dry-run        Mostrar ações sem executar
+  -f, --force          Forçar re-download mesmo se cache existir
+  --jobs N             Downloads paralelos (não implementado interno por item único processing; use multiplas entradas)
+  --timeout SEC        Timeout por download (default $TIMEOUT)
+  --no-hooks           Não executar hooks pre/post
+  -v, --verbose        Verbose
+  -q, --quiet          Saída mínima
+  --category CAT       Forçar categoria para entradas URL/sem metafile
+  --output-dir PATH    Usar diretório de cache alternativo
+  -h, --help           Mostrar esta ajuda
+EOF
+}
+
+# Parse args
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--dry-run) DRY_RUN=true; shift;;
+    -f|--force) FORCE=true; shift;;
+    --jobs) JOBS="$2"; shift 2;;
+    --timeout) TIMEOUT="$2"; shift 2;;
+    --no-hooks) NO_HOOKS=true; shift;;
+    -v|--verbose) VERBOSE=true; shift;;
+    -q|--quiet) QUIET=true; shift;;
+    --category) CATEGORY_OVERRIDE="$2"; shift 2;;
+    --output-dir) OUTPUT_DIR="$2"; shift 2;;
+    -h|--help) usage; exit 0;;
+    --) shift; break;;
+    -*) error "Unknown option: $1"; usage; exit 2;;
+    *) POSITIONAL+=("$1"); shift;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+if [ ${#POSITIONAL[@]} -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+# iterate over provided entries (we do sequential processing to keep logs clear)
+overall_fail=0
+for ent in "${POSITIONAL[@]}"; do
+  if ! process_entry "$ent"; then
+    warn "Entry failed: $ent"
+    overall_fail=1
+  fi
+done
+
+if [ $overall_fail -eq 0 ]; then
+  ok "All entries processed successfully"
+  exit 0
+else
+  error "Some entries failed (see logs in $ADM_LOG and records in $ADM_DB/downloads.jsonl)"
+  exit 1
+fi
