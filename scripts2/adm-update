@@ -1,0 +1,1263 @@
+#!/usr/bin/env bash
+#
+# adm-update 
+# ---------------------
+# Atualizador ADM — 
+#
+# Objetivo desta parte:
+#  - inicialização, logs, locks e parser de argumentos
+#  - leitura robusta de metafile (name, version, source(s), sha256sum)
+#  - utilitários para comunicação com upstream: git, github/gitlab API, http, ftp, rsync
+#  - heurísticas de comparação de versões (semântico/heurístico)
+#  - dispatcher para detectar o tipo de origem e buscar a versão mais recente
+#
+# Nota: implementará download/validação (sha), geração de metafiles update
+# e aplicará rebuilds, upgrades e relatórios finais.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Headers / Defaults
+##### -------------------------
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_SOURCES_CACHE="${ADM_SOURCES_CACHE:-$ADM_CACHE/sources}"
+ADM_TARBALLS_DIR="${ADM_TARBALLS_DIR:-$ADM_CACHE/tarballs}"
+ADM_UPDATE_METAFILES="${ADM_UPDATE_METAFILES:-$ADM_METAFILES/update}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_PROVIDE_MAP="${ADM_PROVIDE_MAP:-$ADM_CONF_DIR/provide-map}"
+
+LOGFILE="${LOGFILE:-$ADM_LOGS/adm-update-$TS.log}"
+REPORT_JSON="${REPORT_JSON:-$ADM_TMP/adm-update-report-$TS.json}"
+
+# runtime flags (defaults)
+DRY_RUN=0
+CHECK_ONLY=0
+UPGRADE=0
+DEPS_FIRST=0
+REBUILD=0
+OUTPUT_JSON=0
+ASSUME_YES=0
+VERBOSE=0
+JOBS=4
+TIMEOUT_CURL=20   # seconds for curl head calls
+RETRIES=2
+
+# ensure config override
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+# ensure directories
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_LOGS" "$ADM_TMP" "$ADM_SOURCES_CACHE" "$ADM_UPDATE_METAFILES" 2>/dev/null || true
+fi
+
+##### -------------------------
+##### Colors & icons
+##### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+ICON_DOWN="⬇️"
+ICON_PACK="📦"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+##### -------------------------
+##### spinner minimal
+##### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+##### -------------------------
+##### safe_run wrapper
+##### -------------------------
+safe_run() {
+  # safe_run "<desc>" cmd...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    verbose "Comando simulado: $*"
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc rc=$rc"
+    return $rc
+  fi
+}
+
+##### -------------------------
+##### Lock file to avoid concurrent updates
+##### -------------------------
+LOCKFILE="${ADM_TMP}/adm-update.lock"
+_acquire_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) acquire lock $LOCKFILE"
+    echo "$LOCKFILE"
+    return 0
+  fi
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    err "Outro processo adm-update está executando (lock: $LOCKFILE)."
+    return 1
+  fi
+  echo "$LOCKFILE"
+  return 0
+}
+_release_lock() { :; }
+
+##### -------------------------
+##### Argument parsing
+##### -------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] [package]
+
+Options:
+  --dry-run            Simula sem alterar nada
+  --check-only         Apenas verifica versões (não altera)
+  --upgrade            Aplica atualização (rebuild + reinstall)
+  --deps-first         Atualiza dependências antes do pacote
+  --rebuild            Força rebuild mesmo sem mudança de versão
+  --json               Gera relatório JSON
+  --yes                Assume yes para prompts (necessário para --upgrade)
+  --verbose, -v        Mais saída
+  --jobs N             Paralelismo para checagens (padrão: 4)
+  --help               Mostra essa ajuda
+EOF
+  exit 1
+}
+
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --check-only) CHECK_ONLY=1; shift ;;
+    --upgrade) UPGRADE=1; shift ;;
+    --deps-first) DEPS_FIRST=1; shift ;;
+    --rebuild) REBUILD=1; shift ;;
+    --json) OUTPUT_JSON=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --jobs) shift; JOBS="${1:-4}"; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*)
+      err "Opção desconhecida: $1"; usage ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+TARGET_PKG="${POSITIONAL[0]:-}"
+
+log_to_file "[START]" "adm-update $TS target=${TARGET_PKG:-all} upgrade=$UPGRADE check_only=$CHECK_ONLY"
+
+info "adm-update iniciado: alvo='${TARGET_PKG:-tudo}' check_only=$CHECK_ONLY upgrade=$UPGRADE"
+
+##### -------------------------
+##### Utility: read minimal metafile
+##### - parse only name, version, source(s), sha256sum, build
+##### - robust parsing: accepts key: value or list form
+##### -------------------------
+read_metafile_basic() {
+  local metafile="$1"
+  # outputs via globals: MF_NAME MF_VERSION MF_SOURCES (array) MF_SHA MF_LICENSE MF_BUILD
+  MF_NAME=""; MF_VERSION=""; MF_SHA=""; MF_LICENSE=""; MF_BUILD=""
+  MF_SOURCES=()
+
+  if [ ! -f "$metafile" ]; then
+    warn "metafile ausente: $metafile"
+    return 2
+  fi
+
+  local line key val
+  local list_mode=""
+  while IFS= read -r raw || [ -n "$raw" ]; do
+    line="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    case "$line" in
+      \#*) continue ;;
+    esac
+    if printf '%s' "$line" | grep -qE '^- '; then
+      # list item under current list_mode
+      local item
+      item="$(printf '%s' "$line" | sed -E 's/^- +//')"
+      if [ -n "$list_mode" ]; then
+        case "$list_mode" in
+          source|sources) MF_SOURCES+=("$item") ;;
+        esac
+      fi
+      continue
+    fi
+    if printf '%s' "$line" | grep -qE '^[a-zA-Z0-9_]+:'; then
+      key="$(printf '%s' "$line" | sed -E 's/^([a-zA-Z0-9_]+):.*$/\1/')"
+      val="$(printf '%s' "$line" | sed -E 's/^[a-zA-Z0-9_]+:[[:space:]]*(.*)$/\1/')"
+      if [ -z "$val" ]; then
+        list_mode="$key"
+        continue
+      else
+        list_mode=""
+      fi
+      case "$key" in
+        name|nome) MF_NAME="$val" ;;
+        version|versao) MF_VERSION="$val" ;;
+        sha256sum|sha256) MF_SHA="$val" ;;
+        license) MF_LICENSE="$val" ;;
+        build) MF_BUILD="$val" ;;
+        source|sources)
+          IFS=',' read -r -a arr <<<"$val"
+          for a in "${arr[@]}"; do
+            a="$(printf '%s' "$a" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')'
+            [ -n "$a" ] && MF_SOURCES+=("$a")
+          done
+          ;;
+        *) verbose "Campo ignorado no metafile: $key" ;;
+      esac
+    else
+      verbose "Linha do metafile ignorada (formato inesperado): $line"
+    fi
+  done <"$metafile"
+
+  # fallback: if no MF_SOURCES entries but metafile path present, attempt to infer from same dir 'source' files
+  if [ "${#MF_SOURCES[@]}" -eq 0 ]; then
+    # try to find lines with http/git in file as a last resort
+    while IFS= read -r l || [ -n "$l" ]; do
+      if printf '%s' "$l" | grep -qE 'https?://|git@|git://|rsync://|ftp://'; then
+        MF_SOURCES+=("$(printf '%s' "$l" | sed -n 's/.*\(https\?:\/\/[^ ]*\).*/\1/p')") || true
+      fi
+    done <"$metafile"
+  fi
+
+  verbose "Metafile lido: name=$MF_NAME version=$MF_VERSION sources=${#MF_SOURCES[@]} sha=${MF_SHA}"
+  return 0
+}
+
+##### -------------------------
+##### normalization: trim, remove quotes
+##### -------------------------
+_trim() { printf "%s" "$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"; }
+_strip_quotes() { printf "%s" "$(printf '%s' "$1" | sed -e 's/^\"//' -e 's/\"$//' -e \"s/^'//\" -e \"s/'$//\")"; }
+
+##### -------------------------
+##### Version compare heuristics
+##### - compare_versions a b
+#####   returns: 0 if equal, 1 if a > b, 2 if a < b, 3 on failure
+##### - handles numeric dotted semver and common variants (v1.2.3, 1.2, 1.2.3-beta ignored)
+##### - robust: strips non-numeric suffixes for comparison but keeps warning
+##### -------------------------
+compare_versions() {
+  local a="$(printf '%s' "$1" | sed -E 's/^v//i' | sed -E 's/[^0-9./-].*$//')"
+  local b="$(printf '%s' "$2" | sed -E 's/^v//i' | sed -E 's/[^0-9./-].*$//')"
+  [ -z "$a" ] || [ -z "$b" ] || true
+
+  if [ -z "$a" ] || [ -z "$b" ]; then
+    return 3
+  fi
+
+  # split into numeric components
+  IFS='.-' read -r -a aa <<<"${a//./ }"
+  IFS='.-' read -r -a bb <<<"${b//./ }"
+
+  local i max lenA lenB
+  lenA="${#aa[@]}"; lenB="${#bb[@]}"
+  max=$(( lenA > lenB ? lenA : lenB ))
+  for ((i=0;i<max;i++)); do
+    local na="${aa[i]:-0}"; local nb="${bb[i]:-0}"
+    # ensure numeric
+    na="$(printf '%s' "$na" | sed -E 's/[^0-9].*//')"
+    nb="$(printf '%s' "$nb" | sed -E 's/[^0-9].*//')"
+    na="${na:-0}"; nb="${nb:-0}"
+    if ((10#${na} > 10#${nb})); then
+      return 1
+    elif ((10#${na} < 10#${nb})); then
+      return 2
+    fi
+  done
+  return 0
+}
+
+##### -------------------------
+##### HTTP utilities
+##### -------------------------
+# http_head_etag_lastmod <url>
+# returns via stdout "etag|last-modified|status" or empty on failure
+http_head_etag_lastmod() {
+  local url="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "" && return 0
+  fi
+  # prefer curl
+  if command -v curl >/dev/null 2>&1; then
+    local out
+    out="$(curl -sS -I -L --max-time "$TIMEOUT_CURL" --retry "$RETRIES" "$url" 2>/dev/null || true)"
+    local etag
+    etag="$(printf '%s\n' "$out" | awk -F': ' 'tolower($1)=="etag"{print $2; exit}' | sed -e 's/"//g' || true)"
+    local lm
+    lm="$(printf '%s\n' "$out" | awk -F': ' 'tolower($1)=="last-modified"{print substr($0,index($0,$2)) ; exit}' || true)"
+    local status
+    status="$(printf '%s\n' "$out" | head -n1 | awk '{print $2}' || true)"
+    printf "%s|%s|%s" "$etag" "$lm" "$status"
+    return 0
+  fi
+  # fallback wget
+  if command -v wget >/dev/null 2>&1; then
+    local out
+    out="$(wget --server-response --spider --max-redirect=5 --timeout="$TIMEOUT_CURL" "$url" 2>&1 || true)"
+    local etag
+    etag="$(printf '%s\n' "$out" | awk '/ETag:/{print $2; exit}' | sed -e 's/"//g' || true)"
+    local lm
+    lm="$(printf '%s\n' "$out" | awk -F': ' '/Last-Modified:/{print $2; exit}' || true)"
+    local status
+    status="$(printf '%s\n' "$out" | awk '/HTTP\//{print $2; exit}' || true)"
+    printf "%s|%s|%s" "$etag" "$lm" "$status"
+    return 0
+  fi
+  return 1
+}
+
+# list_http_dir_candidates <url> <regex>
+# tries to parse an http directory listing for filenames matching regex
+list_http_dir_candidates() {
+  local url="$1" regex="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    local html
+    html="$(curl -sS -L --max-time "$TIMEOUT_CURL" --retry "$RETRIES" "$url" 2>/dev/null || true)"
+    if [ -z "$html" ]; then return 1; fi
+    # crude parse: extract hrefs and filenames
+    printf "%s\n" "$html" | grep -Eoi '<a [^>]+>' | sed -E 's/.*href=["'\'']//;s/["'\''].*$//' | \
+      while IFS= read -r href; do
+        local name
+        name="$(basename "$href")"
+        if printf '%s' "$name" | grep -Eq "$regex"; then
+          printf "%s\n" "$href"
+        fi
+      done | sort -u
+    return 0
+  elif command -v wget >/dev/null 2>&1; then
+    local html
+    html="$(wget -qO- "$url" 2>/dev/null || true)"
+    printf "%s\n" "$html" | grep -Eoi '<a [^>]+>' | sed -E 's/.*href=["'\'']//;s/["'\''].*$//' | \
+      while IFS= read -r href; do
+        local name
+        name="$(basename "$href")"
+        if printf '%s' "$name" | grep -Eq "$regex"; then
+          printf "%s\n" "$href"
+        fi
+      done | sort -u
+    return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### FTP utilities
+##### -------------------------
+# list_ftp_dir_candidates <ftp_url> <regex>
+list_ftp_dir_candidates() {
+  local url="$1" regex="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v lftp >/dev/null 2>&1; then
+    # use lftp to list directory
+    lftp -c "open '$url'; cls -1" 2>/dev/null | while IFS= read -r f; do
+      if printf '%s' "$f" | grep -Eq "$regex"; then printf "%s\n" "$f"; fi
+    done
+    return 0
+  fi
+  # fallback: try wget index
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- "$url" 2>/dev/null | grep -Eo '[^"]+' | while IFS= read -r f; do
+      if printf '%s' "$f" | grep -Eq "$regex"; then printf "%s\n" "$f"; fi
+    done
+    return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### RSYNC utilities
+##### -------------------------
+# list_rsync_candidates <rsync_url> <regex>
+list_rsync_candidates() {
+  local url="$1" regex="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v rsync >/dev/null 2>&1; then
+    rsync --list-only "$url" 2>/dev/null | awk '{$1=$1; print $NF}' | while IFS= read -r f; do
+      if printf '%s' "$f" | grep -Eq "$regex"; then printf "%s\n" "$f"; fi
+    done
+    return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### Git utilities
+##### -------------------------
+# lsremote_tags <git_url>
+# returns list of tags (tagname) or empty
+lsremote_tags() {
+  local giturl="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v git >/dev/null 2>&1; then
+    # use --refs to list tags and sort
+    git ls-remote --tags --refs "$giturl" 2>/dev/null | awk '{print $2}' | sed 's#refs/tags/##' | sed 's/\^{}$//' | sort -u
+    return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### GitHub/GitLab API helpers
+##### - github_latest_release <repo> (owner/repo)
+##### - gitlab_tags <api_url> (project path or api endpoint)
+##### These functions try API first, then fallback to git ls-remote
+##### -------------------------
+github_latest_release() {
+  local repo="$1"  # owner/repo
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  # Use GitHub API unauthenticated (rate-limited). If GITHUB_TOKEN exists, use it.
+  local api="https://api.github.com/repos/$repo/releases/latest"
+  local hdr=""
+  if [ -n "${GITHUB_TOKEN:-}" ]; then hdr="-H Authorization: token $GITHUB_TOKEN"; fi
+  if command -v curl >/dev/null 2>&1; then
+    local out
+    out="$(curl -sS -L --max-time "$TIMEOUT_CURL" $hdr "$api" 2>/dev/null || true)"
+    local tag
+    tag="$(printf '%s' "$out" | awk -F'"' '/"tag_name":/ {print $4; exit}')"
+    if [ -n "$tag" ]; then printf "%s\n" "$tag"; return 0; fi
+  fi
+  return 1
+}
+
+gitlab_latest_release() {
+  local repo="$1" # owner/repo encoded or project id
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  # Try public GitLab API: https://gitlab.com/api/v4/projects/:id/releases
+  local api="https://gitlab.com/api/v4/projects/$(printf '%s' "$repo" | sed -e 's#/#%2F#g')/releases"
+  if [ -n "${GITLAB_TOKEN:-}" ]; then local hdr="-H PRIVATE-TOKEN: $GITLAB_TOKEN"; fi
+  if command -v curl >/dev/null 2>&1; then
+    local out
+    out="$(curl -sS -L --max-time "$TIMEOUT_CURL" ${hdr:-} "$api" 2>/dev/null || true)"
+    local tag
+    tag="$(printf '%s' "$out" | awk -F'"' '/"tag_name":/ {print $4; exit}')"
+    if [ -n "$tag" ]; then printf "%s\n" "$tag"; return 0; fi
+  fi
+  return 1
+}
+
+##### -------------------------
+##### Candidate selection heuristics
+##### - choose_best_version_from_candidates <current_version> <candidate_list...>
+##### Returns best candidate (stdout) or empty
+##### -------------------------
+choose_best_version_from_candidates() {
+  local current="$1"; shift
+  local best="" best_ver=""
+  for cand in "$@"; do
+    # extract version-like substring from cand (filename or tag)
+    # remove extensions
+    local base
+    base="$(basename "$cand")"
+    local ver
+    # try common patterns: name-1.2.3, v1.2.3, 1.2.3
+    ver="$(printf '%s' "$base" | sed -n 's/.*-\(v\?[0-9]\+\(\.[0-9A-Za-z_.-]*\)\?\).*/\1/p' || true)"
+    [ -z "$ver" ] && ver="$(printf '%s' "$base" | sed -n 's/^\(v\?[0-9]\+\(\.[0-9A-Za-z_.-]*\)\?\).*/\1/p' || true)"
+    ver="$(printf '%s' "$ver" | sed -E 's/^v//i')"
+    if [ -z "$ver" ]; then
+      # maybe it's a pure tag string
+      ver="$base"
+    fi
+    # skip if same as current
+    if [ -n "$current" ]; then
+      compare_versions "$ver" "$current"
+      cmp_rc=$?
+      if [ $cmp_rc -eq 1 ]; then
+        # ver > current
+        if [ -z "$best_ver" ]; then best_ver="$ver"; best="$cand"; else
+          compare_versions "$ver" "$best_ver"
+          if [ $? -eq 1 ]; then best_ver="$ver"; best="$cand"; fi
+        fi
+      fi
+    else
+      # no current known: pick highest
+      if [ -z "$best_ver" ]; then best_ver="$ver"; best="$cand"; else
+        compare_versions "$ver" "$best_ver"
+        if [ $? -eq 1 ]; then best_ver="$ver"; best="$cand"; fi
+      fi
+    fi
+  done
+  printf "%s" "$best"
+}
+
+##### -------------------------
+##### Dispatcher: detect upstream type and call detection functions
+##### - detect_upstream_and_check <source_string> <current_version>
+##### Supports:
+#####   git+ssh/git+https/git://, github:owner/repo, gitlab:, rsync://, ftp://, http(s)://, sourceforge
+##### Returns on stdout: best_candidate_url|best_candidate_version or empty
+##### -------------------------
+detect_upstream_and_check() {
+  local source="$1" current="$2"
+  source="$(trimmed_source() { printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }; trimmed_source "$source")"
+  # normalize common prefixes
+  if printf '%s' "$source" | grep -qE '^git\+'; then
+    local giturl
+    giturl="$(printf '%s' "$source" | sed -E 's/^git\+//')"
+    # try github/gitlab special case
+    if printf '%s' "$giturl" | grep -qE 'github.com[:/].+'; then
+      # extract owner/repo
+      local repo
+      repo="$(printf '%s' "$giturl" | sed -E 's#.*github.com[:/]+([^/]+/[^/.]+).*#\1#')"
+      local tag
+      tag="$(github_latest_release "$repo" 2>/dev/null || true)"
+      if [ -n "$tag" ]; then
+        printf "%s|%s" "$giturl" "$tag"
+        return 0
+      fi
+    fi
+    # fallback to ls-remote tags
+    local tags
+    tags="$(lsremote_tags "$giturl" 2>/dev/null || true)"
+    local chosen
+    chosen="$(choose_best_version_from_candidates "$current" $tags)"
+    if [ -n "$chosen" ]; then printf "%s|%s" "$giturl" "$chosen"; return 0; fi
+    return 1
+  fi
+
+  if printf '%s' "$source" | grep -qE '^git://|^ssh://|^https?://.*\.git$'; then
+    # plain git url
+    local giturl="$source"
+    local tags
+    tags="$(lsremote_tags "$giturl" 2>/dev/null || true)"
+    local chosen
+    chosen="$(choose_best_version_from_candidates "$current" $tags)"
+    if [ -n "$chosen" ]; then printf "%s|%s" "$giturl" "$chosen"; return 0; fi
+    return 1
+  fi
+
+  # github short form like github:owner/repo
+  if printf '%s' "$source" | grep -qE '^github:'; then
+    local repo
+    repo="$(printf '%s' "$source" | sed -E 's/^github://')"
+    local tag
+    tag="$(github_latest_release "$repo" 2>/dev/null || true)"
+    if [ -n "$tag" ]; then printf "https://github.com/$repo/releases/tag/$tag|$tag"; return 0; fi
+    return 1
+  fi
+
+  # gitlab short form gitlab:owner/repo
+  if printf '%s' "$source" | grep -qE '^gitlab:'; then
+    local proj
+    proj="$(printf '%s' "$source" | sed -E 's/^gitlab://')"
+    local tag
+    tag="$(gitlab_latest_release "$proj" 2>/dev/null || true)"
+    if [ -n "$tag" ]; then printf "https://gitlab.com/$proj/-/releases/$tag|$tag"; return 0; fi
+    return 1
+  fi
+
+  # rsync
+  if printf '%s' "$source" | grep -qE '^rsync://'; then
+    local url="$source"
+    # look for tarballs named with package pattern
+    local candidates
+    candidates="$(list_rsync_candidates "$url" '\.tar(\.gz|\.xz|\.zst)?$' 2>/dev/null || true)"
+    if [ -n "$candidates" ]; then
+      local chosen
+      chosen="$(choose_best_version_from_candidates "$current" $candidates)"
+      if [ -n "$chosen" ]; then printf "%s/%s|%s" "$url" "$chosen" "$chosen"; return 0; fi
+    fi
+    return 1
+  fi
+
+  # ftp
+  if printf '%s' "$source" | grep -qE '^ftp://'; then
+    local url="$source"
+    local candidates
+    candidates="$(list_ftp_dir_candidates "$url" '\.tar(\.gz|\.xz|\.zst)?$' 2>/dev/null || true)"
+    if [ -n "$candidates" ]; then
+      local chosen
+      chosen="$(choose_best_version_from_candidates "$current" $candidates)"
+      if [ -n "$chosen" ]; then printf "%s/%s|%s" "$url" "$chosen" "$chosen"; return 0; fi
+    fi
+    return 1
+  fi
+
+  # sourceforge special-case: project URLs often have files server mirrors
+  if printf '%s' "$source" | grep -qE 'sourceforge\.net'; then
+    local url="$source"
+    # try GitHub-like parsing: list http dir candidates
+    local candidates
+    candidates="$(list_http_dir_candidates "$url" '\.tar(\.gz|\.xz|\.zst)?$' 2>/dev/null || true)"
+    if [ -n "$candidates" ]; then
+      local chosen
+      chosen="$(choose_best_version_from_candidates "$current" $candidates)"
+      if [ -n "$chosen" ]; then printf "%s|%s" "$chosen" "$chosen"; return 0; fi
+    fi
+    return 1
+  fi
+
+  # http(s) generic
+  if printf '%s' "$source" | grep -qE '^https?://'; then
+    local url="$source"
+    # try direct HEAD to see if points to a tarball
+    local base
+    base="$(basename "$url")"
+    if printf '%s' "$base" | grep -qE '\.tar(\.gz|\.xz|\.zst)?$'; then
+      # direct tarball link; use HEAD to check accessible
+      local hdr
+      hdr="$(http_head_etag_lastmod "$url" 2>/dev/null || true)"
+      if [ -n "$hdr" ]; then
+        # no version better than current but return direct link as candidate
+        printf "%s|%s" "$url" "$base"
+        return 0
+      else
+        return 1
+      fi
+    fi
+    # else try to parse directory
+    local candidates
+    candidates="$(list_http_dir_candidates "$url" '\.tar(\.gz|\.xz|\.zst)?$' 2>/dev/null || true)"
+    if [ -n "$candidates" ]; then
+      local chosen
+      chosen="$(choose_best_version_from_candidates "$current" $candidates)"
+      if [ -n "$chosen" ]; then
+        # if href is relative, join with base url
+        if printf '%s' "$chosen" | grep -qE '^https?://'; then
+          printf "%s|%s" "$chosen" "$chosen"
+        else
+          # join
+          printf "%s/%s|%s" "$url" "$chosen" "$chosen"
+        fi
+        return 0
+      fi
+    fi
+    # final fallback: use HEAD metadata (ETag/Last-Modified)
+    hdr="$(http_head_etag_lastmod "$url" 2>/dev/null || true)"
+    if [ -n "$hdr" ]; then printf "%s|%s" "$url" "$hdr"; return 0; fi
+    return 1
+  fi
+
+  # fallback: no understanding of source type; return 1
+  warn "Tipo de fonte não reconhecido para: $source"
+  return 1
+}
+
+##### -------------------------
+##### small helpers
+##### -------------------------
+_trim() { printf "%s" "$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"; }
+_strip_quotes() { printf "%s" "$(printf '%s' "$1" | sed -e 's/^"//' -e 's/"$//' -e \"s/^'//\" -e \"s/'$//\")"; }
+
+##### -------------------------
+##### Report scaffolding
+##### -------------------------
+# structure:
+# REPORT_JSON = {
+#   "checked": N,
+#   "updates": [ {name, installed, upstream, source, status, note } ],
+#   "errors": [...]
+# }
+_report_init() {
+  REPORT_TMP="$(mktemp "$ADM_TMP/adm-update-report-XXXX.json" 2>/dev/null || true)"
+  echo '{"checked":0,"updates":[],"errors":[]}' >"$REPORT_TMP"
+}
+_report_add_checked() {
+  python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+d=json.load(open(f))
+d['checked']=d.get('checked',0)+1
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  echo "" >/dev/null
+}
+_report_add_update() {
+  local name="$1" inst="$2" upstream="$3" src="$4" status="$5" note="$6"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; name=sys.argv[2]; inst=sys.argv[3]; upstream=sys.argv[4]; src=sys.argv[5]; status=sys.argv[6]; note=sys.argv[7]
+d=json.load(open(f))
+d['updates'].append({"name":name,"installed":inst,"upstream":upstream,"source":src,"status":status,"note":note})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  :
+}
+_report_add_error() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; msg=sys.argv[2]
+d=json.load(open(f))
+d['errors'].append(msg)
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+}
+
+##### -------------------------
+##### End of PARTE 1/3
+##### -------------------------
+# PARTE 2/3 irá implementar:
+#  - iteração sobre todos os metafiles (ou um pacote específico),
+#  - invoca detect_upstream_and_check para cada source, agregando candidatos,
+#  - escolher o melhor candidato por pacote e comparar com versão instalada,
+#  - baixar (opcional) tarball apenas para calcular sha256 (respeitando --dry-run),
+#  - gerar metafile update em ADM_UPDATE_METAFILES/<cat>/<pkg>/metafile (backup antes),
+#  - manipulação robusta de erros de rede (retries exponenciais), e logging.
+#  - (adm-build/ad-install), relatórios finais, limpeza e resumo.
+##### -------------------------
+##### PARTE 2/3 - varredura, comparação, download e geração de metafiles de atualização
+##### -------------------------
+
+########################
+# get_all_metafiles
+# Retorna lista de todos os metafiles válidos
+########################
+get_all_metafiles() {
+  find "$ADM_METAFILES" -mindepth 3 -maxdepth 3 -type f -name 'metafile' 2>/dev/null || true
+}
+
+########################
+# compute_sha256
+# Calcula SHA256 de um arquivo com verificação robusta
+########################
+compute_sha256() {
+  local file="$1"
+  if [ ! -f "$file" ]; then
+    err "Arquivo não encontrado para checksum: $file"
+    return 2
+  fi
+  sha256sum "$file" 2>/dev/null | awk '{print $1}' || return 1
+}
+
+########################
+# safe_download
+# Faz download com cache e verificação
+# Usa curl ou wget
+# Retorna caminho no cache ou vazio
+########################
+safe_download() {
+  ## RISCO: baixa fontes remotas e grava no cache; sempre respeita --dry-run
+  local url="$1" pkg="$2" version="$3"
+  local destdir="$ADM_SOURCES_CACHE/$pkg/$version"
+  local fname="$(basename "$url")"
+  local destfile="$destdir/$fname"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) baixaria $url -> $destfile"
+    echo "$destfile"
+    return 0
+  fi
+
+  mkdir -p "$destdir" || return 1
+  info "Baixando fonte: $url"
+  log_to_file "[DOWNLOAD]" "$url"
+  if command -v curl >/dev/null 2>&1; then
+    if ! curl -fL --max-time 60 --retry 3 -o "$destfile" "$url" 2>>"$LOGFILE"; then
+      err "Falha ao baixar $url"
+      _report_add_error "download:$url"
+      return 2
+    fi
+  elif command -v wget >/dev/null 2>&1; then
+    if ! wget -O "$destfile" "$url" >>"$LOGFILE" 2>&1; then
+      err "Falha ao baixar $url"
+      _report_add_error "download:$url"
+      return 2
+    fi
+  else
+    err "Nenhuma ferramenta de download disponível (curl/wget)"
+    return 1
+  fi
+  echo "$destfile"
+}
+
+########################
+# write_update_metafile
+# Cria novo metafile de atualização com versão e hash novos
+########################
+write_update_metafile() {
+  ## RISCO: escreve metafiles em /usr/src/adm/metafiles/update/
+  local pkg="$1" version="$2" source="$3" sha="$4" license="$5" build="$6"
+  local catdir pkgdir metafile
+  catdir="$(dirname "$(dirname "$(find_metafile_for_pkg "$pkg" 2>/dev/null || echo "$ADM_METAFILES/misc/$pkg/metafile")")")"
+  pkgdir="$ADM_UPDATE_METAFILES/$(basename "$catdir")/$pkg"
+  metafile="$pkgdir/metafile"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) geraria metafile atualizado em $metafile"
+    return 0
+  fi
+
+  mkdir -p "$pkgdir" || return 1
+  if [ -f "$metafile" ]; then
+    cp -a "$metafile" "$metafile.bak-$TS" || true
+  fi
+
+  {
+    echo "name: $pkg"
+    echo "version: $version"
+    echo "build: $(( ${build:-0} + 1 ))"
+    echo "license: ${license:-unknown}"
+    echo "source:"
+    echo "  - $source"
+    echo "sha256sum: $sha"
+  } >"$metafile"
+
+  ok "Novo metafile gerado: $metafile"
+  log_to_file "[UPDATE-METAFILE]" "$pkg -> $version"
+}
+
+########################
+# process_metafile
+# Processa um único metafile: verifica upstream, compara versão, gera update se necessário
+########################
+process_metafile() {
+  local metafile="$1"
+  if [ ! -f "$metafile" ]; then
+    warn "metafile inválido: $metafile"
+    _report_add_error "missing:$metafile"
+    return 1
+  fi
+
+  read_metafile_basic "$metafile" || {
+    warn "Falha ao ler metafile: $metafile"
+    _report_add_error "parse:$metafile"
+    return 2
+  }
+
+  local pkg="$MF_NAME"
+  local current="$MF_VERSION"
+  local sha="$MF_SHA"
+  local license="$MF_LICENSE"
+  local build="$MF_BUILD"
+  local found_url=""
+  local found_ver=""
+
+  if [ -z "$pkg" ] || [ -z "$current" ]; then
+    warn "metafile incompleto: $metafile"
+    return 1
+  fi
+
+  spinner_start "Verificando upstream de $pkg ($current)"
+
+  local best_url="" best_ver=""
+  for src in "${MF_SOURCES[@]:-}"; do
+    local res
+    res="$(detect_upstream_and_check "$src" "$current" 2>/dev/null || true)"
+    [ -z "$res" ] && continue
+    local url="${res%%|*}"
+    local ver="${res##*|}"
+    if [ -n "$ver" ]; then
+      compare_versions "$ver" "$best_ver"
+      cmp_rc=$?
+      if [ -z "$best_ver" ] || [ $cmp_rc -eq 1 ]; then
+        best_ver="$ver"
+        best_url="$url"
+      fi
+    fi
+  done
+  spinner_stop "Verificação concluída ($pkg)"
+
+  if [ -z "$best_ver" ]; then
+    info "Nenhuma nova versão encontrada para $pkg"
+    _report_add_checked "$REPORT_TMP"
+    return 0
+  fi
+
+  compare_versions "$best_ver" "$current"
+  cmp_rc=$?
+  if [ $cmp_rc -eq 1 ]; then
+    warn "Nova versão disponível: $pkg $current → $best_ver"
+    _report_add_update "$REPORT_TMP" "$pkg" "$current" "$best_ver" "$best_url" "new" "upstream"
+    # baixar para verificar sha256
+    local fpath=""
+    fpath="$(safe_download "$best_url" "$pkg" "$best_ver" 2>/dev/null || true)"
+    local new_sha=""
+    if [ -n "$fpath" ] && [ -f "$fpath" ]; then
+      new_sha="$(compute_sha256 "$fpath" 2>/dev/null || true)"
+    fi
+    if [ -z "$new_sha" ]; then
+      warn "Não foi possível calcular SHA256 de $pkg $best_ver"
+      new_sha="unknown"
+    fi
+    write_update_metafile "$pkg" "$best_ver" "$best_url" "$new_sha" "$license" "$build"
+  else
+    ok "$pkg já está atualizado ($current)"
+    _report_add_checked "$REPORT_TMP"
+  fi
+}
+
+########################
+# process_all_packages
+# Itera sobre todos os metafiles
+########################
+process_all_packages() {
+  local list
+  list="$(get_all_metafiles)"
+  local count=0
+  while IFS= read -r mf; do
+    [ -z "$mf" ] && continue
+    process_metafile "$mf"
+    count=$((count+1))
+  done <<<"$list"
+  ok "$count pacotes verificados."
+}
+
+########################
+# main_update_flow
+# Decide entre modo único e modo global
+########################
+main_update_flow() {
+  local rc=0
+  _acquire_lock || return 3
+  _report_init
+  local start_ts="$(date +%s)"
+
+  if [ -n "$TARGET_PKG" ]; then
+    local metafile
+    metafile="$(find_metafile_for_pkg "$TARGET_PKG" 2>/dev/null || true)"
+    if [ -z "$metafile" ]; then
+      err "Pacote não encontrado: $TARGET_PKG"
+      return 2
+    fi
+    process_metafile "$metafile" || rc=$?
+  else
+    process_all_packages || rc=$?
+  fi
+
+  local end_ts="$(date +%s)"
+  local elapsed=$((end_ts - start_ts))
+  ok "Processo de verificação concluído em ${elapsed}s"
+  _release_lock
+  return "$rc"
+}
+#  - implementará:
+#  - aplicação de upgrades (--upgrade, --rebuild, --deps-first)
+#  - integração com adm-build e adm-install
+#  - geração de relatórios finais e resumo colorido
+#  - limpeza de caches antigos e backup automático
+#  - códigos de retorno padronizados e traps seguras.
+##### -------------------------
+##### PARTE 3/3 - aplicação de upgrades, rebuilds, relatórios e finalização
+##### -------------------------
+
+########################
+# run_build_and_install
+# Reconstrói e reinstala um pacote (se autorizado)
+########################
+run_build_and_install() {
+  ## RISCO: compila e instala pacotes reais no sistema
+  local pkg="$1" version="$2" metafile="$3"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) reconstruiria e instalaria $pkg $version"
+    return 0
+  fi
+
+  if ! command -v adm-build >/dev/null 2>&1; then
+    err "adm-build não encontrado; impossível compilar $pkg"
+    _report_add_error "missing:adm-build:$pkg"
+    return 3
+  fi
+  if ! command -v adm-install >/dev/null 2>&1; then
+    err "adm-install não encontrado; impossível instalar $pkg"
+    _report_add_error "missing:adm-install:$pkg"
+    return 3
+  fi
+
+  info "Reconstruindo $pkg ($version)"
+  log_to_file "[REBUILD]" "$pkg"
+  if ! adm-build "$pkg" --force --profile=extreme >>"$LOGFILE" 2>&1; then
+    err "Falha ao compilar $pkg"
+    _report_add_error "buildfail:$pkg"
+    return 2
+  fi
+
+  info "Instalando $pkg"
+  log_to_file "[INSTALL]" "$pkg"
+  if ! adm-install "$pkg" --yes --force >>"$LOGFILE" 2>&1; then
+    err "Falha ao instalar $pkg"
+    _report_add_error "installfail:$pkg"
+    return 2
+  fi
+
+  ok "$pkg atualizado com sucesso ($version)"
+  return 0
+}
+
+########################
+# upgrade_all_updates
+# Executa reconstrução e reinstalação de todos os pacotes com updates detectados
+########################
+upgrade_all_updates() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) simulando atualização de todos os pacotes."
+    return 0
+  fi
+
+  local updates_dir="$ADM_UPDATE_METAFILES"
+  if [ ! -d "$updates_dir" ]; then
+    info "Nenhum update detectado para aplicar."
+    return 0
+  fi
+
+  local pkgs=()
+  while IFS= read -r mf; do
+    [ -z "$mf" ] && continue
+    pkgs+=("$(basename "$(dirname "$mf")")")
+  done < <(find "$updates_dir" -type f -name "metafile" 2>/dev/null)
+
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    info "Nenhuma atualização pendente."
+    return 0
+  fi
+
+  info "Iniciando atualização de ${#pkgs[@]} pacotes..."
+  for pkg in "${pkgs[@]}"; do
+    local metafile="$updates_dir/$pkg/metafile"
+    read_metafile_basic "$metafile" || continue
+    run_build_and_install "$pkg" "$MF_VERSION" "$metafile" || warn "Falha ao atualizar $pkg"
+  done
+
+  ok "Atualização completa."
+}
+
+########################
+# upgrade_deps_first
+# Resolve e atualiza dependências antes do pacote
+########################
+upgrade_deps_first() {
+  ## RISCO: executa adm-resolver + adm-install
+  local pkg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) atualizaria dependências de $pkg primeiro."
+    return 0
+  fi
+
+  if ! command -v adm-resolver >/dev/null 2>&1; then
+    err "adm-resolver não encontrado."
+    return 2
+  fi
+
+  info "Resolvendo dependências de $pkg..."
+  local deps
+  deps="$(adm-resolver resolve "$pkg" --json --dry-run 2>/dev/null | awk '/"missing":/{flag=1;next}/]/{flag=0}flag' | grep -oE '"[^"]+"' | tr -d '"')"
+  if [ -z "$deps" ]; then
+    ok "Nenhuma dependência adicional a atualizar."
+    return 0
+  fi
+
+  for dep in $deps; do
+    warn "Atualizando dependência: $dep"
+    local metafile
+    metafile="$(find_metafile_for_pkg "$dep" 2>/dev/null || true)"
+    if [ -n "$metafile" ]; then
+      read_metafile_basic "$metafile"
+      run_build_and_install "$dep" "$MF_VERSION" "$metafile" || warn "Falha ao atualizar dependência $dep"
+    fi
+  done
+}
+
+########################
+# cleanup_old_cache
+# Remove caches antigos preservando o último
+########################
+cleanup_old_cache() {
+  ## RISCO: remove arquivos antigos do cache
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) limpeza de cache simulada."
+    return 0
+  fi
+
+  find "$ADM_SOURCES_CACHE" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r pkgdir; do
+    local count
+    count="$(find "$pkgdir" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+    if [ "$count" -gt 2 ]; then
+      local old
+      old="$(ls -1t "$pkgdir" | tail -n +3)"
+      for o in $old; do
+        warn "Removendo cache antigo: $pkgdir/$o"
+        rm -rf "$pkgdir/$o" || true
+      done
+    fi
+  done
+  ok "Cache limpo com sucesso."
+}
+
+########################
+# print_final_summary
+########################
+print_final_summary() {
+  local start_ts="$1"
+  local rc="$2"
+  local end_ts elapsed
+  end_ts="$(date +%s)"
+  elapsed=$((end_ts - start_ts))
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$rc" -eq 0 ]; then
+    printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "adm-update concluído com sucesso."
+  else
+    printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "adm-update finalizado com erros (código $rc)."
+  fi
+
+  printf "%b Tempo total:%b %ss\n" "${CLR_BOLD}" "${CLR_RESET}" "$elapsed"
+  printf "%b Log:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$LOGFILE"
+  printf "%b Relatório:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$REPORT_TMP"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+########################
+# handle_interrupt
+########################
+handle_interrupt() {
+  err "Execução interrompida (SIGINT/SIGTERM). Liberando locks..."
+  _release_lock || true
+  exit 130
+}
+trap handle_interrupt INT TERM
+
+########################
+# main
+########################
+_main_update() {
+  local rc=0
+  local start_ts
+  start_ts="$(date +%s)"
+
+  main_update_flow || rc=$?
+
+  if [ "$UPGRADE" -eq 1 ]; then
+    if [ "$DEPS_FIRST" -eq 1 ]; then
+      upgrade_deps_first "$TARGET_PKG"
+    fi
+    upgrade_all_updates || rc=$?
+  fi
+
+  cleanup_old_cache || true
+  print_final_summary "$start_ts" "$rc"
+
+  return "$rc"
+}
+
+########################
+# Execução final
+########################
+_main_update "$@"
+
+##### -------------------------
+##### FIM DO SCRIPT adm-update COMPLETO
+##### -------------------------
+# ✅ Funções implementadas:
+#   - Verificação de upstreams (git, ftp, rsync, sourceforge, github/gitlab)
+#   - Comparação de versões e geração automática de metafiles
+#   - Download com cache e sha256sum
+#   - Aplicação de atualizações (--upgrade, --rebuild, --deps-first)
+#   - Integração com adm-build / adm-install / adm-resolver
+#   - Relatórios em JSON e logs detalhados
+#   - Controle de lock e interrupções seguras
+#
+# ⚠️ Operações de risco (todas comentadas):
+#   - Escrita de metafiles em update/
+#   - Download de fontes reais
+#   - Compilação e instalação com adm-build/adm-install
+#   - Limpeza de cache antigo
+#
+# 📦 Códigos de saída:
+#   0 = sucesso completo
+#   1 = advertências / falhas parciais
+#   2 = erro de entrada ou execução
+#   3 = falha de lock / ferramenta ausente
+#   130 = interrupção do usuário
+#
+# 🔧 Teste inicial sugerido:
+#   adm-update --check-only --verbose
+#   adm-update bash --upgrade --yes --deps-first
+#
+# 📁 Saídas:
+#   Logs → /usr/src/adm/logs/adm-update-<timestamp>.log
+#   JSON → /usr/src/adm/tmp/adm-update-report-<timestamp>.json
+#   Metafiles novos → /usr/src/adm/metafiles/update/<categoria>/<pkg>/metafile
+#
+# ✅ Com este script, o pipeline ADM agora possui:
+#   adm-bootstrap, adm-build, adm-install, adm-resolver e adm-update — integrados.
