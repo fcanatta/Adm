@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# ADM pre-build hook for GCC
+# Runs before configure/make, ensures deps and dirs ready
+
+adm_log_info "[HOOK pre-build] Preparing environment for GCC..."
+export LANG=C
+export LC_ALL=C
+export MAKEFLAGS="-j${ADM_JOBS:-4}"
+adm_log_info "[HOOK pre-build] Env ready. Source: ${ADM_SRC_DIR:-unknown}"
