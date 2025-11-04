@@ -1,0 +1,12 @@
+description: Cargo — Rust package manager and build tool, part of the official Rust toolchain.
+name: cargo
+version: 1.85.1
+license: MIT OR Apache-2.0
+url: https://doc.rust-lang.org/cargo/
+build: 1
+source: https://static.rust-lang.org/dist/cargo-1.85.1.tar.xz
+source: https://github.com/rust-lang/cargo.git#1.85.1
+sha256sum: <INSERT_SHA256_OF_cargo-1.85.1.tar.xz>
+build_deps: rust, python3, cmake, gcc, clang, llvm, lld, curl, zlib, pkgconfig
+run_deps: glibc, rust, openssl, zlib
+opt_deps: git, ssh, curl, libgit2, pkgconfig
