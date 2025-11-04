@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: Firefox pre-build
+# - Prepara ambiente de build (rust, node, python), cria mozconfig, roda ./mach bootstrap
+# - Detecta ferramentas, cria objdir, ativa ccache se disponível, respeita DRY_RUN
+# - Não executa compilação; apenas prepara ambiente e gera comando de build
+#
+set -euo pipefail
+
+echo "🔧 [firefox pre-build] Iniciando preparação do build..."
+
+# Ambiente e variáveis adm-friendly
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/firefox-build.log}"
+ADM_STAGE="${ADM_STAGE:-stage3}"
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+SRC_DIR="$(pwd)"   # assume que hook é executado no diretório raíz do source firefox
+OBJDIR="${OBJDIR:-${SRC_DIR}/obj-firefox}"
+MOZCONFIG_PATH="${MOZCONFIG_PATH:-${SRC_DIR}/mozconfig}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/firefox-destdir}"
+MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+CCACHE_BIN="$(command -v ccache 2>/dev/null || true)"
+
+echo "[`date -u`] pre-build start" >> "$ADM_LOG"
+
+# 0) Sanity: presença do src (configure-ish for firefox uses mach)
+if [ ! -f "${SRC_DIR}/mach" ]; then
+  echo "❌ Arquivo 'mach' não encontrado no diretório corrente (${SRC_DIR}). Abortando."
+  echo "[`date -u`] pre-build abort: mach not found" >> "$ADM_LOG"
+  exit 1
+fi
+
+# 1) Detectar toolchain mínimo
+missing_tools=()
+for t in gcc clang python3 node npm rustc cargo; do
+  if ! command -v "$t" >/dev/null 2>&1; then
+    missing_tools+=("$t")
+  fi
+done
+
+# Rust toolchain nuances
+if command -v rustup >/dev/null 2>&1; then
+  RUSTUP=1
+else
+  RUSTUP=0
+fi
+
+if [ ${#missing_tools[@]} -ne 0 ]; then
+  echo "⚠️  Ferramentas faltantes (verifique antes de prosseguir): ${missing_tools[*]}"
+  echo "[`date -u`] missing_tools: ${missing_tools[*]}" >> "$ADM_LOG"
+  # Não aborta automaticamente aqui; deixa o adm-build decidir com --force
+fi
+
+# 2) Preparar ccache se disponível
+if [ -n "$CCACHE_BIN" ]; then
+  echo "ℹ️  ccache detectado: $CCACHE_BIN - ativando (se mozconfig suportar)"
+  echo "export CCACHE_DIR=${CCACHE_DIR:-${ADM_ROOT}/cache/ccache}" >> "$ADM_LOG"
+  mkdir -p "${CCACHE_DIR:-${ADM_ROOT}/cache/ccache}" 2>/dev/null || true
+  export CCACHE_DIR="${CCACHE_DIR:-${ADM_ROOT}/cache/ccache}"
+fi
+
+# 3) Criar objdir (objdir é recomendado para Firefox, evita build na fonte)
+mkdir -p "$OBJDIR"
+echo "ℹ️  OBJDIR definido: $OBJDIR"
+echo "[`date -u`] OBJDIR: $OBJDIR" >> "$ADM_LOG"
+
+# 4) Criar mozconfig se não existir (padrão seguro)
+if [ -f "$MOZCONFIG_PATH" ]; then
+  echo "ℹ️  mozconfig existente: $MOZCONFIG_PATH"
+else
+  echo "⚙️  Gerando mozconfig padrão em: $MOZCONFIG_PATH"
+  cat > "$MOZCONFIG_PATH" <<'MOZ'
+# MOZCONFIG gerado pelo adm pre-build
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-firefox
+ac_add_options --enable-application=browser
+ac_add_options --enable-optimize
+ac_add_options --disable-debug
+# desabilite updates automáticos durante build
+ac_add_options --disable-updater
+# ac_add_options --enable-release  # optional manual
+MOZ
+  echo "[`date -u`] mozconfig created" >> "$ADM_LOG"
+fi
+
+# 5) Preparar ambiente Rust/Node: mach bootstrap
+# mach bootstrap will install system deps if run without --no-system-something
+BOOTSTRAP_CMD="./mach bootstrap"
+# Provide non-interactive defaults where possible
+BOOTSTRAP_ARGS=(--no-interactive)
+# For CI / ADM, prefer system packages where possible; allow user to override
+BOOTSTRAP_ARGS+=(--no-checks)  # avoid interactive checks (best-effort)
+
+echo "🏗️  Comando de bootstrap: $BOOTSTRAP_CMD ${BOOTSTRAP_ARGS[*]}"
+echo "[`date -u`] bootstrap: $BOOTSTRAP_CMD ${BOOTSTRAP_ARGS[*]}" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) simulando: $BOOTSTRAP_CMD ${BOOTSTRAP_ARGS[*]}"
+else
+  # use python3 -m pip no local scope? Prefer mach directly
+  # Run within SRC_DIR to ensure environment
+  pushd "$SRC_DIR" >/dev/null
+  if ! ./mach bootstrap "${BOOTSTRAP_ARGS[@]}"; then
+    echo "❌ ./mach bootstrap falhou. Verifique as dependências e logs."
+    echo "[`date -u`] mach bootstrap failed" >> "$ADM_LOG"
+    popd >/dev/null
+    exit 1
+  fi
+  popd >/dev/null
+fi
+
+# 6) Configurar flags de build por perfil
+case "$ADM_PROFILE" in
+  extreme)
+    echo "⚙️  Perfil extreme: -O3 LTO/PGO não configurado automaticamente (PGO requer runs)."
+    export MOZ_BUILD_FLAGS="${MOZ_BUILD_FLAGS:---enable-optimize --enable-strip}"
+    ;;
+  normal)
+    echo "⚙️  Perfil normal: otimizações padrão"
+    export MOZ_BUILD_FLAGS="${MOZ_BUILD_FLAGS:-}"
+    ;;
+  none)
+    echo "⚙️  Perfil none: build mínimo para bootstrap"
+    export MOZ_BUILD_FLAGS="${MOZ_BUILD_FLAGS:---disable-debug --disable-tests}"
+    ;;
+esac
+
+# 7) Registrar ambiente no log
+echo "[`date -u`] pre-build completed. OBJDIR=$OBJDIR, MOZCONFIG=$MOZCONFIG_PATH, DESTDIR=${DESTDIR:-unset}" >> "$ADM_LOG"
+echo "✅ [firefox pre-build] Preparação concluída. Próximo passo: executar o build (./mach build)"
