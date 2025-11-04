@@ -1,0 +1,13 @@
+description: LLVM Compiler Infrastructure — modular and reusable compiler and toolchain technologies (LLVM core, Clang, LLD, libc++).
+name: llvm
+version: 21.1.4
+license: University of Illinois/NCSA Open Source License (and other subcomponents licenses)
+url: https://llvm.org/
+build: 1
+source: https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.4/llvm-project-21.1.4.tar.xz
+source: https://releases.llvm.org/21.1.4/llvm-project-21.1.4.tar.xz
+source: git+https://github.com/llvm/llvm-project.git#llvmorg-21.1.4
+sha256sum: <INSERT_SHA256_OF_llvm-project-21.1.4.tar.xz>
+build_deps: cmake, ninja, python3, perl, gcc, g++, clang, lld, libffi-dev, zlib1g-dev, libedit-dev, swig, libxml2-dev, libncurses-dev, pkg-config
+run_deps: glibc, libstdc++, libedit, zlib, libffi
+opt_deps: compiler-rt, lldb, libc++, polly, flang
