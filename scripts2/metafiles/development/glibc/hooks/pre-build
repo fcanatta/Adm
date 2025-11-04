@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+#
+# ADM hook: glibc pre-build
+# - Create build dir, apply patch, prepare configparms and configure command.
+# - Respects DRY_RUN and writes helpful logs.
+#
+set -euo pipefail
+
+echo "🔧 [glibc pre-build] Starting..."
+
+# env detection: ADM-friendly with LFS fallback
+LFS="${LFS:-${ADM_ROOT:-/usr/src/adm}/lfs}"
+LFS_TGT="${LFS_TGT:-${TARGET_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || true)}}"
+DRY_RUN="${DRY_RUN:-0}"
+ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-build.log}"
+ADM_STAGE="${ADM_STAGE:-stage3}"   # can be set externally (stage0..stage3)
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+
+# RISCO: Creating symlinks into $LFS/lib or $LFS/lib64 must be done carefully
+echo "ℹ️  Detected stage: ${ADM_STAGE}, profile: ${ADM_PROFILE}"
+echo "[`date -u`] pre-build started (stage=${ADM_STAGE})" >> "$ADM_LOG"
+
+# 1) create compatibility symlinks per LFS (safe: only in $LFS)
+if [ "$DRY_RUN" -eq 0 ]; then
+  case "$(uname -m)" in
+    i?86)
+      ln -sfv ld-linux.so.2 "$LFS/lib/ld-lsb.so.3" 2>/dev/null || true
+      ;;
+    x86_64)
+      mkdir -p "$LFS/lib64" 2>/dev/null || true
+      ln -sfv ../lib/ld-linux-x86-64.so.2 "$LFS/lib64/ld-lsb-x86-64.so.3" 2>/dev/null || true
+      ;;
+  esac
+else
+  echo "(dry-run) would create ld-linux compatibility symlinks in $LFS"
+fi
+
+# 2) apply patch if present (glibc-*-fhs patch often recommended)
+PATCH_DIR="$(cd "$(dirname "$0")/.." >/dev/null 2>&1 && pwd)/patches"
+if [ -d "$PATCH_DIR" ]; then
+  for p in "$PATCH_DIR"/*.patch; do
+    [ -f "$p" ] || continue
+    echo "ℹ️  Found patch: $p -- applying"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      patch -Np1 -i "$p"
+    else
+      echo "(dry-run) would run: patch -Np1 -i $p"
+    fi
+  done
+fi
+
+# 3) create build dir and configparms (rootsbindir)
+mkdir -p build
+cd build
+
+echo "rootsbindir=/usr/sbin" > configparms
+echo "ℹ️  configparms written (rootsbindir=/usr/sbin)"
+
+# 4) compose configure command (based on LFS recommendations)
+# default kernel support; allow override via env GLIBC_ENABLE_KERNEL
+GLIBC_ENABLE_KERNEL="${GLIBC_ENABLE_KERNEL:-5.4}"
+CONFIGURE_OPTS=(
+  "--prefix=/usr"
+  "--host=${LFS_TGT}"
+  "--build=$(../scripts/config.guess)"
+  "--disable-nscd"
+  "libc_cv_slibdir=/usr/lib"
+  "--enable-kernel=${GLIBC_ENABLE_KERNEL}"
+)
+
+# If in bootstrap (stage0/1) adapt options
+if [[ "${ADM_STAGE}" == stage0 || "${ADM_STAGE}" == stage1 ]]; then
+  # LFS suggests special treatment for initial cross toolchains
+  echo "ℹ️  Using bootstrap configuration adjustments"
+  # no change to options by default here, but hooks for advanced setups can set env
+fi
+
+CONFIGURE_CMD="../configure ${CONFIGURE_OPTS[*]}"
+
+echo "🏗️  Configure command prepared:"
+echo "    $CONFIGURE_CMD"
+
+# record
+echo "[`date -u`] configure: $CONFIGURE_CMD" >> "$ADM_LOG"
+
+# run configure unless dry-run
+if [ "$DRY_RUN" -eq 0 ]; then
+  # run configure and capture output for debugging
+  if ! eval "$CONFIGURE_CMD" > configure.out 2>&1; then
+    echo "❌ configure failed — see configure.out"
+    tail -n 200 configure.out || true
+    exit 1
+  fi
+else
+  echo "(dry-run) would run: $CONFIGURE_CMD"
+fi
+
+echo "✅ [glibc pre-build] Done"
