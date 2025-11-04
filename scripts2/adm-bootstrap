@@ -1,0 +1,483 @@
+#!/usr/bin/env bash
+#
+# adm-bootstrap
+# ----------------
+# Cria a infraestrutura inicial para o sistema ADM em /usr/src/adm:
+#  - cria diretórios base
+#  - gera /usr/src/adm/conf/adm.conf (shell-format) com valores padrão
+#  - cria logs e tmp
+#  - (opcional / futura etapa) prepara stage0-rootfs minimal (criação de diretórios)
+#
+# Suporta: --dry-run, --force, --yes, --verbose, --log <file>, --profile <none|normal|extreme>
+#
+# RISCOS: Este script cria e escreve em /usr/src/adm. Em execuções futuras
+#         (adm-chroot, adm-bootstrap --create-rootfs) montagens e chroot podem ocorrer.
+#         Operações destrutivas exigem --force --yes. Sempre use --dry-run primeiro.
+#
+# Uso (exemplo):
+#   ./adm-bootstrap --dry-run
+#   ./adm-bootstrap --force --yes
+#
+# Leia os comentários de risco dentro do script antes de executar.
+#
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### -----------------------------
+### Configuráveis / Defaults
+### -----------------------------
+ADM_ROOT="/usr/src/adm"
+ADM_SCRIPTS="$ADM_ROOT/scripts"
+ADM_METAFILES="$ADM_ROOT/metafiles"
+ADM_CACHE="$ADM_ROOT/cache"
+ADM_TARBALLS="$ADM_CACHE/tarballs"
+ADM_BUILDS="$ADM_ROOT/builds"
+ADM_LOGS="$ADM_ROOT/logs"
+ADM_TMP="$ADM_ROOT/tmp"
+ADM_CONF_DIR="$ADM_ROOT/conf"
+ADM_CONF_FILE="$ADM_CONF_DIR/adm.conf"
+ADM_PROFILES="$ADM_CONF_DIR/profiles.conf"
+DEFAULT_PROFILE="normal"
+DOWNLOAD_JOBS=8
+ADM_FORCE_COLOR="yes"
+
+# Timestamp for logs
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# Script identity
+SCRIPT_NAME="$(basename "$0")"
+
+### -----------------------------
+### Flags parsed
+### -----------------------------
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+VERBOSE=0
+LOGFILE=""
+PROFILE="$DEFAULT_PROFILE"
+
+### -----------------------------
+### Color & Icon helpers
+### -----------------------------
+# Detect color support
+if [ "${ADM_FORCE_COLOR:-yes}" = "yes" ] && command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET=""
+  CLR_GREEN=""
+  CLR_RED=""
+  CLR_YELLOW=""
+  CLR_BLUE=""
+  CLR_CYAN=""
+  CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+
+### -----------------------------
+### Logging helpers
+### -----------------------------
+log_to_file() {
+  if [ -n "$LOGFILE" ]; then
+    echo "$@" >>"$LOGFILE"
+  fi
+}
+info() {
+  printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"
+  log_to_file "[INFO] $(date +%Y-%m-%dT%H:%M:%S) $1"
+}
+ok() {
+  printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"
+  log_to_file "[OK] $(date +%Y-%m-%dT%H:%M:%S) $1"
+}
+warn() {
+  printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2
+  log_to_file "[WARN] $(date +%Y-%m-%dT%H:%M:%S) $1"
+}
+err() {
+  printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2
+  log_to_file "[ERROR] $(date +%Y-%m-%dT%H:%M:%S) $1"
+}
+verbose() {
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"
+    log_to_file "[VERB] $(date +%Y-%m-%dT%H:%M:%S) $1"
+  fi
+}
+
+### -----------------------------
+### Spinner (simple)
+### -----------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  # lightweight spinner in background
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.1
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b" # remove spinner char
+  ok "$okmsg"
+  trap - EXIT
+}
+
+### -----------------------------
+### Usage / Arg parsing
+### -----------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options]
+
+Options:
+  --dry-run           : simulate actions (no disk changes)
+  --force             : force actions (overwrite existing files)
+  --yes               : assume yes to prompts (use with care)
+  --verbose           : verbose output
+  --log <file>        : write a log file (default: /usr/src/adm/logs/adm-bootstrap-<ts>.log)
+  --profile <name>    : profile (none|normal|extreme) (default: $DEFAULT_PROFILE)
+  --help              : this help
+EOF
+  exit 1
+}
+
+# Parse args (simple)
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --log) shift; LOGFILE="$1"; shift ;;
+    --profile) shift; PROFILE="$1"; shift ;;
+    --help|-h) usage ;;
+    *) echo "Unknown arg: $1"; usage ;;
+  esac
+done
+
+# Default logfile if not provided
+if [ -z "$LOGFILE" ]; then
+  LOGFILE="$ADM_LOGS/adm-bootstrap-$TS.log"
+fi
+
+# In dry-run, don't write logs to disk by default (but we still capture to /dev/null unless explicit)
+if [ "$DRY_RUN" -eq 1 ] && [ -z "${LOGFILE:-}" ]; then
+  LOGFILE="/dev/null"
+fi
+
+### -----------------------------
+### Safety pre-checks
+### -----------------------------
+# Ensure script is not run as non-root if certain operations will occur later. For bootstrap creation of dirs we allow user, but warn strongly.
+if [ "$(id -u)" -ne 0 ]; then
+  warn "You are not root. Some operations created later (chroot, mounting) will require root privileges."
+  verbose "Current UID is $(id -u). Running as non-root is allowed for initial directory creation, but mounting/chroot steps will need root."
+fi
+
+# Confirm destructive if adm root exists and not --force
+if [ -d "$ADM_ROOT" ] && [ "$FORCE" -ne 1 ]; then
+  warn "Directory $ADM_ROOT already exists."
+  echo
+  echo "If you proceed, existing files under $ADM_ROOT may be overwritten."
+  echo "Run with --force to overwrite, or run with --dry-run to simulate."
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    read -r -p "Proceed and create/modify $ADM_ROOT? [y/N] " ans || true
+    case "$ans" in
+      [yY]|[yY][eE][sS]) ;;
+      *) info "Aborting. Use --dry-run to simulate or --force --yes to proceed."; exit 0 ;;
+    esac
+  else
+    info "--yes given; proceeding despite existing $ADM_ROOT"
+  fi
+fi
+
+### -----------------------------
+### Helper: safe mkdir
+### -----------------------------
+safe_mkdir() {
+  local path="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) mkdir -p $path"
+    return 0
+  fi
+  if [ -e "$path" ] && [ ! -d "$path" ]; then
+    err "Path $path exists and is not a directory."
+    return 1
+  fi
+  mkdir -p "$path"
+  verbose "mkdir -p $path"
+  return 0
+}
+
+### -----------------------------
+### Step 1: create base directories
+### -----------------------------
+step_create_directories() {
+  spinner_start "Etapa: Criando diretórios base..."
+  local dirs=(
+    "$ADM_ROOT"
+    "$ADM_SCRIPTS"
+    "$ADM_METAFILES"
+    "$ADM_CACHE"
+    "$ADM_TARBALLS"
+    "$ADM_BUILDS"
+    "$ADM_LOGS"
+    "$ADM_TMP"
+    "$ADM_CONF_DIR"
+  )
+  for d in "${dirs[@]}"; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+      verbose "(dry-run) Criando diretório: $d"
+    else
+      if [ -d "$d" ]; then
+        verbose "Diretório existe: $d"
+      else
+        safe_mkdir "$d" || { spinner_stop "falha"; err "Falha ao criar $d"; exit 1; }
+      fi
+    fi
+  done
+  spinner_stop "Diretórios base criados"
+}
+
+### -----------------------------
+### Step 2: generate adm.conf (shell format)
+### -----------------------------
+generate_adm_conf() {
+  local adm_conf_tmp
+  adm_conf_tmp="$(mktemp -t adm-conf-XXXX.sh)"
+  cat >"$adm_conf_tmp" <<'EOF'
+###############################################################################
+# adm.conf — Configuração global do sistema ADM
+# Gerado automaticamente por adm-bootstrap
+# Editar com cautela. Use `adm-clean` para regenerar se necessário.
+###############################################################################
+
+# Caminhos principais (ajustados em tempo de geração)
+ADM_ROOT="@ADM_ROOT@"
+ADM_SCRIPTS="$ADM_ROOT/scripts"
+ADM_METAFILES="$ADM_ROOT/metafiles"
+ADM_CACHE="$ADM_ROOT/cache"
+ADM_TARBALLS="$ADM_CACHE/tarballs"
+ADM_BUILDS="$ADM_ROOT/builds"
+ADM_LOGS="$ADM_ROOT/logs"
+ADM_CONF="$ADM_ROOT/conf"
+ADM_TMP="$ADM_ROOT/tmp"
+ADM_PROFILES="$ADM_CONF/profiles.conf"
+
+# Configuração do chroot
+CHROOT_BASE="$ADM_BUILDS"
+CHROOT_USE_NAMESPACE="yes"
+CHROOT_MOUNTS="/dev /dev/pts /proc /sys /run /tmp"
+CHROOT_SHELL="/bin/bash"
+
+# Configuração do downloader
+DOWNLOAD_JOBS=@DOWNLOAD_JOBS@
+DOWNLOAD_CACHE="$ADM_CACHE/sources"
+DOWNLOAD_TARBALLS="$ADM_CACHE/tarballs"
+
+# Compilação
+DEFAULT_PROFILE="@DEFAULT_PROFILE@"
+CFLAGS_normal="-O2 -pipe -fstack-protector-strong"
+CFLAGS_extreme="-O3 -flto -march=native -fuse-linker-plugin"
+CFLAGS_none="-O0"
+LDFLAGS_normal=""
+LDFLAGS_extreme="-flto"
+LDFLAGS_none=""
+
+# Comportamento global
+ADM_FORCE_COLOR="yes"
+ADM_LOG_LEVEL="info"
+ADM_PARALLEL_JOBS=4
+
+# Segurança
+SANDBOX_ENABLED="yes"
+CHECK_SHA256="yes"
+ALLOW_FORCE="no"
+###############################################################################
+EOF
+
+  # Replace placeholders
+  sed -i "s|@ADM_ROOT@|$ADM_ROOT|g" "$adm_conf_tmp"
+  sed -i "s|@DOWNLOAD_JOBS@|$DOWNLOAD_JOBS|g" "$adm_conf_tmp"
+  sed -i "s|@DEFAULT_PROFILE@|$PROFILE|g" "$adm_conf_tmp"
+
+  spinner_start "Etapa: Gerando adm.conf..."
+  if [ "$DRY_RUN" -eq 1 ]; then
+    spinner_stop "(dry-run) adm.conf seria criado com o conteúdo abaixo:"
+    sed -n '1,200p' "$adm_conf_tmp" | sed 's/^/    /'
+    rm -f "$adm_conf_tmp"
+    return 0
+  fi
+
+  # If file exists, handle overwrite
+  if [ -f "$ADM_CONF_FILE" ] && [ "$FORCE" -ne 1 ]; then
+    warn "$ADM_CONF_FILE já existe. Use --force para sobrescrever ou faça backup manualmente."
+    rm -f "$adm_conf_tmp"
+    spinner_stop "ignorado"
+    return 0
+  fi
+
+  # Write the final file atomically
+  mv "$adm_conf_tmp" "$ADM_CONF_FILE"
+  chmod 644 "$ADM_CONF_FILE"
+  spinner_stop "Gerado adm.conf em $ADM_CONF_FILE"
+  ok "adm.conf criado: $ADM_CONF_FILE"
+  verbose "Conteúdo (primeiras 40 linhas):"
+  head -n 40 "$ADM_CONF_FILE" | sed 's/^/    /'
+}
+
+### -----------------------------
+### Step 3: basic rootfs skeleton for stage0 (no mount yet)
+### -----------------------------
+create_stage0_skeleton() {
+  local stage0="$ADM_BUILDS/stage0-rootfs"
+  spinner_start "Etapa: Criando skeleton para stage0-rootfs em $stage0 ..."
+  local dirs=(
+    "$stage0/bin"
+    "$stage0/sbin"
+    "$stage0/lib"
+    "$stage0/lib64"
+    "$stage0/usr"
+    "$stage0/usr/bin"
+    "$stage0/usr/sbin"
+    "$stage0/etc"
+    "$stage0/var"
+    "$stage0/tmp"
+    "$stage0/proc"
+    "$stage0/sys"
+    "$stage0/dev"
+    "$stage0/run"
+    "$stage0/home"
+  )
+  for d in "${dirs[@]}"; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+      verbose "(dry-run) Criar: $d"
+    else
+      safe_mkdir "$d" || { spinner_stop "falha"; err "Falha ao criar $d"; exit 1; }
+    fi
+  done
+
+  # create minimal etc files (passwd/group/nsswitch resolv.conf)
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) Criando arquivos etc mínimos em $stage0/etc"
+  else
+    : >"$stage0/etc/passwd"
+    : >"$stage0/etc/group"
+    cp -L /etc/nsswitch.conf "$stage0/etc/nsswitch.conf" 2>/dev/null || true
+    if [ -f /etc/resolv.conf ]; then
+      cp -L /etc/resolv.conf "$stage0/etc/resolv.conf" || true
+    fi
+    # Permissions
+    chmod 755 "$stage0" || true
+  fi
+
+  spinner_stop "Skeleton stage0 criado (sem mounts) em $stage0"
+  verbose "stage0 path: $stage0"
+}
+
+### -----------------------------
+### Step 4: Final summary / next steps printed to screen
+### -----------------------------
+print_summary() {
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " ADM Bootstrap — resumo (simulado ou real)"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  [ "$DRY_RUN" -eq 1 ] && echo "Modo: DRY-RUN (nenhuma modificação foi feita)"
+  echo "ADM root: $ADM_ROOT"
+  echo "adm.conf: $ADM_CONF_FILE"
+  echo "builds dir: $ADM_BUILDS"
+  echo "cache dir: $ADM_CACHE"
+  echo "logs dir: $ADM_LOGS"
+  echo "tmp dir: $ADM_TMP"
+  echo
+  echo "Próximos scripts esperados a serem gerados (não implementados aqui ainda):"
+  echo " - adm-chroot       : cria chroot seguro, monta /proc /sys /dev e entra no namespace"
+  echo " - adm-downloader   : download paralelo com barra de progresso e sha256"
+  echo " - adm-build        : detecta toolchains e constrói fontes em destdir"
+  echo " - adm-install      : instala tarball no /usr (DESTDIR semantics)"
+  echo " - adm-resolver     : resolve dependências via metafiles"
+  echo
+  echo "Recomendações de segurança (leia atentamente):"
+  echo " - Sempre execute primeiro com --dry-run"
+  echo " - Para operações de montagem/chroot, execute em VM/contêiner"
+  echo " - Backups antes de operações que alterem /usr"
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+### -----------------------------
+### MAIN
+### -----------------------------
+main() {
+  info "Iniciando adm-bootstrap"
+  log_to_file "=== adm-bootstrap start: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+
+  # Step 1: directories
+  step_create_directories
+
+  # Ensure logs dir exists before opening logfile
+  if [ "$DRY_RUN" -eq 0 ]; then
+    safe_mkdir "$ADM_LOGS" || true
+  fi
+
+  # If user requested a custom logfile path (maybe into ADM_LOGS), ensure parent exists
+  if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+  fi
+
+  log_to_file "Logfile: $LOGFILE"
+
+  # Step 2: create adm.conf
+  generate_adm_conf
+
+  # Step 3: create stage0 skeleton (no mounts)
+  create_stage0_skeleton
+
+  # Final summary and guidance
+  print_summary
+
+  ok "adm-bootstrap finalizado"
+  log_to_file "=== adm-bootstrap end: $(date -u +"%Y-%m-%dT%H:%M:%SZ") ==="
+}
+
+# Run main and catch interrupts to cleanup spinner
+trap 'err "Interrompido pelo usuário"; _spinner_cleanup; exit 2' INT TERM
+main "$@"
