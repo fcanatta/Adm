@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# ADM HOOK: linux-kernel post-install
+# Verifica a instalação dentro do DESTDIR, cria initramfs (opcional) e registra versão
+set -euo pipefail
+
+echo "🔧 [linux-kernel post-install] Validando instalação e gerando artefatos..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-postinstall.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/linux-kernel-destdir}"
+PREFIX="${PREFIX:-/usr}"
+MKINITRAMFS_CMD="${MKINITRAMFS_CMD:-/usr/sbin/mkinitramfs}"   # user may override to dracut or mkinitcpio
+KIMAGE_DIR="${DESTDIR}/boot"
+MODULES_DIR="${DESTDIR}/lib/modules"
+
+mkdir -p "$(dirname "$ADM_LOG")" 2>/dev/null || true
+echo "[`date -u`] post-install start" >> "$ADM_LOG"
+
+# DESTDIR checks
+if [ -z "${DESTDIR:-}" ] || [ "${DESTDIR}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR inválido. Abortando."
+  exit 2
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria kernel em $KIMAGE_DIR e criaria initramfs usando ${MKINITRAMFS_CMD}"
+  exit 0
+fi
+
+# 1) verify kernel presence
+kfound="$(find "${KIMAGE_DIR}" -maxdepth 1 -type f \( -name 'bzImage*' -o -name 'vmlinuz*' -o -name 'Image*' \) -print -quit || true)"
+if [ -z "$kfound" ]; then
+  # fallback: maybe someone placed kernel name explicitly
+  echo "❌ Nenhum kernel encontrado em ${KIMAGE_DIR}"
+  exit 1
+fi
+echo "✔️  Kernel instalado: ${kfound}"
+
+# 2) create initramfs if mkinitramfs/dracut exists inside chroot OR on host but run inside chroot
+# NOTE: we NEVER run host mkinitramfs on host / — we run it inside chroot(DESTDIR) when requested.
+if command -v "${MKINITRAMFS_CMD}" >/dev/null 2>&1; then
+  echo "⚙️  Gerando initramfs com ${MKINITRAMFS_CMD} dentro do chroot temporário..."
+  # Use chroot to avoid altering host files; require permissions
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "⚠️  Para gerar initramfs dentro do chroot, é recomendável executar como root (no host)."
+    echo "    Você pode gerar manualmente: chroot ${DESTDIR} ${MKINITRAMFS_CMD} <args>"
+  else
+    # run inside chroot: create minimal /proc /sys /dev bind mounts, run command, then umount
+    echo "ℹ️  Montando /proc /sys /dev temporários e rodando ${MKINITRAMFS_CMD}..."
+    mount --bind /proc "${DESTDIR}/proc" 2>/dev/null || true
+    mount --bind /sys "${DESTDIR}/sys" 2>/dev/null || true
+    mount --bind /dev "${DESTDIR}/dev" 2>/dev/null || true
+    # attempt to build for each kernel image found
+    for img in "${KIMAGE_DIR}"/*; do
+      [ -f "$img" ] || continue
+      imgbase="$(basename "$img")"
+      # guess initramfs name: initramfs-<imgbase>.img
+      initname="initramfs-${imgbase}.img"
+      echo "ℹ️  Criando initramfs: ${initname}"
+      chroot "${DESTDIR}" ${MKINITRAMFS_CMD} -o "/boot/${initname}" || {
+        echo "⚠️  mkinitramfs falhou para ${imgbase} (continuando)"
+      }
+    done
+    umount "${DESTDIR}/proc" 2>/dev/null || true
+    umount "${DESTDIR}/sys" 2>/dev/null || true
+    umount "${DESTDIR}/dev" 2>/dev/null || true
+  fi
+else
+  echo "ℹ️  ${MKINITRAMFS_CMD} não encontrado no PATH do host. Você pode usar dracut/mkinitcpio dentro do chroot target."
+fi
+
+# 3) record kernel version into DESTDIR
+if [ -f "${DESTDIR}/lib/modules/"*"/modules.dep" ]; then
+  kver="$(basename "$(dirname "$(ls -d "${DESTDIR}/lib/modules/"* | head -n1)")")"
+  echo "${kver}" > "${DESTDIR}/var/lib/linux-kernel.version" || true
+  echo "ℹ️  Kernel version detected and recorded: ${kver}"
+fi
+
+echo "[`date -u`] post-install done" >> "$ADM_LOG"
+echo "✅ [linux-kernel post-install] Concluído."
