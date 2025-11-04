@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+# adm-clean - 
+# ADM System Cleaner: safely cleans cache, logs, locks, builds, tmp, and chroots.
+# Save final version as: /usr/src/adm/bin/adm-clean
+#
+# Default mode: safe dry-run. Any file deletion or umount is commented
+# with "# UNCOMMENT FOR REAL EXECUTION (in chroot only)".
+#
+set -euo pipefail
+shopt -s extglob
+
+# ---------------------------
+# CONFIG
+# ---------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_CACHE_DIR:=$ADM_ROOT/cache}"
+: "${ADM_CACHE_BIN:=$ADM_CACHE_DIR/bin}"
+: "${ADM_CACHE_SRC:=$ADM_CACHE_DIR/sources}"
+: "${ADM_TMPDIR:=$ADM_CACHE_DIR/tmp}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/clean}"
+: "${ADM_STATE_DIR:=$ADM_ROOT/state}"
+: "${ADM_LOCK_DIR:=$ADM_STATE_DIR/locks}"
+: "${ADM_CHROOT_DIR:=$ADM_STATE_DIR/chroots}"
+: "${ADM_MANIFEST_DIR:=$ADM_ROOT/manifests}"
+: "${ADM_DRY_RUN:=1}"
+: "${ADM_ALLOW_EXECUTION:=0}"
+: "${ADM_VERBOSE:=1}"
+: "${ADM_KEEP:=5}"
+
+mkdir -p "$ADM_LOG_DIR" "$ADM_TMPDIR" "$ADM_LOCK_DIR" "$ADM_CACHE_DIR" "$ADM_STATE_DIR" 2>/dev/null || true
+
+# ---------------------------
+# LOGGER
+# ---------------------------
+if [ -x "$ADM_BIN_DIR/adm-logger" ]; then
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info()    { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_error()   { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_debug()   { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+adm_log_info "Starting ADM Cleaner (safe mode, dry-run=$ADM_DRY_RUN)"
+
+# ---------------------------
+# UTILS
+# ---------------------------
+_adm_bytes_human() {
+  local bytes="$1"
+  local units=(B KB MB GB TB)
+  local i=0
+  while (( bytes > 1024 && i < ${#units[@]} - 1 )); do
+    bytes=$((bytes / 1024))
+    ((i++))
+  done
+  printf "%s%s" "$bytes" "${units[$i]}"
+}
+
+_adm_du_safe() {
+  du -sb "$1" 2>/dev/null | awk '{print $1}' || echo 0
+}
+
+_adm_safe_remove_file() {
+  local f="$1"
+  if [ ! -e "$f" ]; then
+    adm_log_debug "Skip missing: $f"
+    return 0
+  fi
+  [[ "$f" == "$ADM_ROOT"* ]] || { adm_log_error "Unsafe path: $f"; return 1; }
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rm -f -- "$f"
+    adm_log_debug "[SIM] rm -f $f"
+  else
+    adm_log_info "[DRY-RUN] Would remove file: $f"
+  fi
+}
+
+_adm_safe_remove_dir() {
+  local d="$1"
+  [[ "$d" == "$ADM_ROOT"* ]] || { adm_log_error "Unsafe directory: $d"; return 1; }
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rm -rf -- "$d"
+    adm_log_debug "[SIM] rm -rf $d"
+  else
+    adm_log_info "[DRY-RUN] Would remove directory: $d"
+  fi
+}
+
+# ---------------------------
+# LOCKS CLEANUP
+# ---------------------------
+_adm_clean_locks() {
+  adm_log_info "Cleaning old locks..."
+  mkdir -p "$ADM_LOCK_DIR"
+  local lock removed=0
+  for lock in "$ADM_LOCK_DIR"/*.lock; do
+    [ -f "$lock" ] || continue
+    local pidfile="${lock}.pid"
+    local pid=""
+    [ -f "$pidfile" ] && pid=$(cat "$pidfile" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      adm_log_debug "Lock active (PID $pid): $lock"
+      continue
+    fi
+    adm_log_info "Removing stale lock: $(basename "$lock")"
+    _adm_safe_remove_file "$lock"
+    _adm_safe_remove_file "$pidfile"
+    ((removed++))
+  done
+  adm_log_correct "Removed $removed stale locks."
+}
+
+# ---------------------------
+# CACHE CLEANUP
+# ---------------------------
+_adm_clean_cache() {
+  adm_log_info "Cleaning cache directories..."
+  local removed=0 bytes_freed=0
+
+  # TMP cleanup
+  if [ -d "$ADM_TMPDIR" ]; then
+    adm_log_info "Cleaning temporary cache..."
+    local size
+    size=$(_adm_du_safe "$ADM_TMPDIR")
+    bytes_freed=$((bytes_freed + size))
+    _adm_safe_remove_dir "$ADM_TMPDIR"
+    mkdir -p "$ADM_TMPDIR"
+  fi
+
+  # BIN cleanup - remove old bin packages not installed
+  if [ -d "$ADM_CACHE_BIN" ]; then
+    adm_log_info "Checking bin cache for stale entries..."
+    local pkg
+    for pkg in "$ADM_CACHE_BIN"/*.tar.*; do
+      [ -f "$pkg" ] || continue
+      local namever
+      namever=$(basename "$pkg" | sed -E 's/\.(tar\.gz|tar\.xz|tar\.zst)$//')
+      if ! grep -q "$namever" "$ADM_STATE_DIR/installed/"* 2>/dev/null; then
+        adm_log_info "Removing unused bin: $namever"
+        bytes_freed=$((bytes_freed + $(_adm_du_safe "$pkg")))
+        _adm_safe_remove_file "$pkg"
+        ((removed++))
+      fi
+    done
+  fi
+
+  # SOURCES cleanup - remove sources not referenced in metafiles
+  if [ -d "$ADM_CACHE_SRC" ]; then
+    adm_log_info "Checking sources cache..."
+    for src in "$ADM_CACHE_SRC"/*; do
+      [ -f "$src" ] || continue
+      local fname=$(basename "$src")
+      if ! grep -q "$fname" "$ADM_ROOT"/metafiles/**/metafile 2>/dev/null; then
+        adm_log_info "Removing unreferenced source: $fname"
+        bytes_freed=$((bytes_freed + $(_adm_du_safe "$src")))
+        _adm_safe_remove_file "$src"
+        ((removed++))
+      fi
+    done
+  fi
+
+  adm_log_correct "Cache cleaned. Removed $removed files, freed $(_adm_bytes_human "$bytes_freed")."
+}
+
+# ---------------------------
+# LOGS CLEANUP
+# ---------------------------
+_adm_clean_logs() {
+  adm_log_info "Cleaning old and empty logs..."
+  local count=0
+  find "$ADM_ROOT/logs" -type f -empty -print0 2>/dev/null | while IFS= read -r -d '' log; do
+    adm_log_debug "Removing empty log: $log"
+    _adm_safe_remove_file "$log"
+    ((count++))
+  done
+
+  # Remove logs older than 30 days (simulate)
+  find "$ADM_ROOT/logs" -type f -mtime +30 2>/dev/null | while read -r old; do
+    adm_log_info "Old log (>30d): $old"
+    _adm_safe_remove_file "$old"
+    ((count++))
+  done
+  adm_log_correct "Logs cleanup complete. Processed $count files."
+}
+
+# ---------------------------
+# BUILDS CLEANUP
+# ---------------------------
+_adm_clean_builds() {
+  adm_log_info "Cleaning old or failed builds..."
+  local builddir="$ADM_ROOT/builds"
+  [ -d "$builddir" ] || { adm_log_info "No builds directory found."; return 0; }
+
+  local removed=0
+  find "$builddir" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | while read -r b; do
+    if [ -f "$b/.build_failed" ] || [ -f "$b/.lock" ]; then
+      adm_log_info "Removing failed or locked build: $(basename "$b")"
+      _adm_safe_remove_dir "$b"
+      ((removed++))
+    fi
+  done
+
+  # Keep only last N builds (ADM_KEEP)
+  local total
+  total=$(find "$builddir" -mindepth 1 -maxdepth 1 -type d | wc -l)
+  if (( total > ADM_KEEP )); then
+    local extra=$(( total - ADM_KEEP ))
+    adm_log_info "Removing $extra old builds (keeping last $ADM_KEEP)"
+    ls -1t "$builddir" | tail -n "$extra" | while read -r old; do
+      _adm_safe_remove_dir "$builddir/$old"
+      ((removed++))
+    done
+  fi
+  adm_log_correct "Builds cleanup done. Removed $removed directories."
+}
+# ---------------------------
+# CHROOTS CLEANUP
+# - Detect mounted chroots, attempt safe unmount and removal of stale chroots
+# ---------------------------
+_adm_clean_chroots() {
+  adm_log_info "Cleaning chroots (detecting mounts and stale directories)..."
+  local removed=0 failed=0
+  mkdir -p "$ADM_CHROOT_DIR" 2>/dev/null || true
+
+  # Find chroot directories under ADM_CHROOT_DIR
+  for ch in "$ADM_CHROOT_DIR"/*; do
+    [ -d "$ch" ] || continue
+    local name
+    name=$(basename "$ch")
+    adm_log_debug "Inspecting chroot: $ch"
+
+    # Check if mounted (proc/sys/dev under chroot)
+    local mounted=0
+    if _adm_is_mountpoint() { mountpoint -q "$ch/proc" 2>/dev/null; return $?; }; then
+      if mountpoint -q "$ch/proc" 2>/dev/null; then mounted=1; fi
+    else
+      # fallback
+      if grep -qE "[[:space:]]${ch}/proc[[:space:]]" /proc/mounts 2>/dev/null; then mounted=1; fi
+    fi
+
+    # If mounted, attempt safe unmount sequence (reverse order)
+    if [ "$mounted" -eq 1 ]; then
+      adm_log_info "Chroot appears mounted: $name; attempting safe unmount (simulated)"
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] umount -l $ch/run || true"
+        adm_log_debug "[SIM] umount -l $ch/dev/pts || true"
+        adm_log_debug "[SIM] umount -l $ch/dev || true"
+        adm_log_debug "[SIM] umount -l $ch/sys || true"
+        adm_log_debug "[SIM] umount -l $ch/proc || true"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # umount -l "$ch/run" 2>/dev/null || true
+        # umount -l "$ch/dev/pts" 2>/dev/null || true
+        # umount -l "$ch/dev" 2>/dev/null || true
+        # umount -l "$ch/sys" 2>/dev/null || true
+        # umount -l "$ch/proc" 2>/dev/null || true
+        adm_log_info "[SIMULATION] Would unmount pseudo-filesystems from $ch"
+      else
+        adm_log_info "[DRY-RUN] Would unmount pseudo-filesystems from $ch"
+      fi
+    fi
+
+    # If not mounted (or after unmount), remove directory if stale (no active PID locks)
+    local lock="$ADM_LOCK_DIR/$name.lock"
+    local pidfile="${lock}.pid"
+    local pid=""
+    if [ -f "$pidfile" ]; then pid=$(cat "$pidfile" 2>/dev/null || true); fi
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      adm_log_info "Chroot $name is in use by PID $pid; skipping removal"
+      continue
+    fi
+
+    adm_log_info "Removing chroot directory (simulated): $ch"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] rm -rf $ch"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # rm -rf -- "$ch"
+      adm_log_correct "Chroot removed (simulated): $name"
+      ((removed++))
+    else
+      adm_log_info "[DRY-RUN] Would rm -rf $ch"
+      ((removed++))
+    fi
+  done
+
+  adm_log_correct "Chroots cleanup complete. Candidates processed: $removed"
+  return 0
+}
+
+# ---------------------------
+# STALE FILES detection & safe move to trash
+# - Find files in ADM_ROOT not referenced by any manifest
+# - Move to ADM_ROOT/trash/<timestamp>/ for manual review (or delete if --force)
+# ---------------------------
+_adm_clean_stale_files() {
+  adm_log_info "Detecting stale files not referenced by any manifest..."
+  local trash_dir="$ADM_ROOT/trash/$(date +%Y%m%d-%H%M%S)"
+  local found=0 moved=0
+  mkdir -p "$trash_dir" 2>/dev/null || true
+
+  # Build list of all files under ADM_ROOT
+  adm_log_debug "Scanning filesystem under $ADM_ROOT (this may take time)..."
+  mapfile -t allfiles < <(find "$ADM_ROOT" -xdev -type f 2>/dev/null || true)
+
+  # Build list of referenced filenames from manifests
+  adm_log_debug "Aggregating referenced files from manifests..."
+  local refpattern
+  refpattern=$(mktemp -p "$ADM_TMPDIR" adm-clean-refs.XXXX || true)
+  if [ -d "$ADM_MANIFEST_DIR" ]; then
+    find "$ADM_MANIFEST_DIR" -type f -name '*.manifest' -exec cat {} + 2>/dev/null | sort -u > "$refpattern" || true
+  fi
+
+  # For each file, check if present in manifests (exact path)
+  for f in "${allfiles[@]}"; do
+    ((found++))
+    if grep -Fxq "$f" "$refpattern" 2>/dev/null; then
+      adm_log_debug "Referenced file: $f"
+      continue
+    fi
+    # Exclude obvious runtime files we don't manage
+    case "$f" in
+      */chroots/*|*/cache/*|*/logs/*|*/state/*|*/manifests/*|*/metafiles/*|*/bin/*) ;;
+      *)
+        adm_log_info "Stale/unreferenced file detected: $f"
+        if [ "$ADM_DRY_RUN" = "1" ]; then
+          adm_log_info "[DRY-RUN] Would move $f -> $trash_dir/"
+        else
+          # Move to trash
+          mkdir -p "$trash_dir" 2>/dev/null || true
+          if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+            adm_log_debug "[SIM] mv \"$f\" \"$trash_dir/\""
+            # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+            # mv -- "$f" "$trash_dir/" || adm_log_error "Failed to move $f to trash"
+            adm_log_info "[SIMULATION] Moved $f -> $trash_dir/"
+            ((moved++))
+          else
+            adm_log_info "[DRY-RUN] Would move $f -> $trash_dir/"
+            ((moved++))
+          fi
+        fi
+        ;;
+    esac
+  done
+
+  rm -f "$refpattern" 2>/dev/null || true
+  adm_log_correct "Stale file scan finished. Scanned: $found, candidates moved: $moved (dry-run=$ADM_DRY_RUN). Trash dir: $trash_dir"
+  return 0
+}
+
+# ---------------------------
+# CLEAN ALL (combines all cleaning functions)
+# ---------------------------
+_adm_clean_all() {
+  local deep="$1"
+  adm_log_info "Performing full ADM cleanup (deep=$deep)"
+  _adm_clean_locks
+  _adm_clean_cache
+  _adm_clean_logs
+  _adm_clean_builds
+  _adm_clean_chroots
+  _adm_clean_stale_files
+  adm_log_correct "Full cleanup finished."
+}
+
+# ---------------------------
+# SUMMARY report (space freed, counts)
+# ---------------------------
+_adm_clean_summary() {
+  adm_log_info "Generating summary..."
+  local total_locks total_cache total_logs total_builds total_chroots
+  total_locks=$(ls -1 "$ADM_LOCK_DIR"/*.lock 2>/dev/null | wc -l || echo 0)
+  total_cache=$(find "$ADM_CACHE_DIR" -type f 2>/dev/null | wc -l || echo 0)
+  total_logs=$(find "$ADM_ROOT/logs" -type f 2>/dev/null | wc -l || echo 0)
+  total_builds=$(find "$ADM_ROOT/builds" -maxdepth 1 -type d 2>/dev/null | wc -l || echo 0)
+  total_chroots=$(find "$ADM_CHROOT_DIR" -maxdepth 1 -type d 2>/dev/null | wc -l || echo 0)
+
+  adm_log_info "Summary:"
+  adm_log_info "  Locks: $total_locks"
+  adm_log_info "  Cache files: $total_cache"
+  adm_log_info "  Log files: $total_logs"
+  adm_log_info "  Build dirs: $total_builds"
+  adm_log_info "  Chroots: $total_chroots"
+  adm_log_correct "ADM cleanup summary completed."
+}
+
+# ---------------------------
+# Helper: check executables used by this script
+# ---------------------------
+_adm_check_prereqs() {
+  local miss=0
+  for cmd in find grep awk sed sort uniq xargs; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      adm_log_error "Missing required command: $cmd"
+      miss=1
+    fi
+  done
+  if [ "$miss" -eq 1 ]; then
+    adm_log_error "Prerequisite commands missing. Aborting."
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------
+# CLI dispatcher
+# ---------------------------
+_adm_clean_show_help() {
+  cat <<EOF
+adm-clean - safe cleanup utility for ADM
+
+Usage:
+  adm-clean <action> [options]
+
+Actions:
+  all                 : full cleanup (locks, cache, logs, builds, chroots, stale)
+  cache               : clean caches (bin, sources, tmp)
+  logs                : clean logs (empty and >30d)
+  builds              : clean failed/old builds
+  locks               : remove stale locks
+  chroots             : detect & cleanup chroots
+  stale               : detect unreferenced files and move to trash
+  tmp                 : clear ADM tmp cache
+  help                : show this help
+
+Options:
+  --dry-run           : simulate (default)
+  --deep              : deeper cleaning where applicable
+  --force             : force removals (use with caution, requires ADM_ALLOW_EXECUTION=1)
+  --keep N            : keep last N builds/logs (default $ADM_KEEP)
+  --verbose           : verbose output (set ADM_VERBOSE=2)
+EOF
+}
+
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  # prerequisites
+  _adm_check_prereqs || true
+
+  if [ $# -lt 1 ]; then _adm_clean_show_help; exit 1; fi
+  action="$1"; shift
+  deep=0; force=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --deep) deep=1; shift ;;
+      --force) force=1; shift ;;
+      --keep) ADM_KEEP="$2"; shift 2 ;;
+      --verbose) ADM_VERBOSE=2; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  # map action
+  case "$action" in
+    all)
+      _adm_clean_all "$deep"
+      _adm_clean_summary
+      ;;
+    cache)
+      _adm_clean_cache
+      _adm_clean_summary
+      ;;
+    logs)
+      _adm_clean_logs
+      _adm_clean_summary
+      ;;
+    builds)
+      _adm_clean_builds
+      _adm_clean_summary
+      ;;
+    locks)
+      _adm_clean_locks
+      _adm_clean_summary
+      ;;
+    chroots)
+      _adm_clean_chroots
+      _adm_clean_summary
+      ;;
+    stale)
+      _adm_clean_stale_files
+      _adm_clean_summary
+      ;;
+    tmp)
+      adm_log_info "Cleaning tmp only..."
+      _adm_safe_remove_dir "$ADM_TMPDIR"
+      mkdir -p "$ADM_TMPDIR"
+      _adm_clean_summary
+      ;;
+    help|-h|--help)
+      _adm_clean_show_help
+      ;;
+    *)
+      adm_log_error "Unknown action: $action"
+      _adm_clean_show_help
+      exit 2
+      ;;
+  esac
+fi
