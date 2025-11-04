@@ -1,0 +1,12 @@
+description: Linux Kernel — the monolithic Unix-like operating system kernel originally developed by Linus Torvalds and maintained by the Linux community.
+name: linux-kernel
+version: 6.11.6
+license: GPL-2.0-only
+url: https://www.kernel.org/
+build: 1
+source: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.6.tar.xz
+source: git+https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git#v6.11.6
+sha256sum: 8de9c0795c3f7bcd8047c5462a849a3a1e868a13d366dd3023d4a0e6d667cfe8
+build_deps: gcc, make, bc, flex, bison, openssl, libelf-dev, zlib1g-dev, xz-utils, kmod, util-linux, perl
+run_deps: kmod, util-linux, e2fsprogs
+opt_deps: firmware-linux, grub, dracut, busybox
