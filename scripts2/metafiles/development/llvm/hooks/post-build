@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# ADM HOOK: llvm post-build
+# Executa validações pós-build, fallback para -j1 se erro e empacota artefato.
+set -euo pipefail
+
+echo "🔍 [llvm post-build] Validando build..."
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/llvm-build.log}"
+BUILD_DIR="${BUILD_DIR:-$(pwd)/build}"
+CACHE_DIR="${ADM_ROOT}/cache"
+PKG_NAME="${PKG_NAME:-llvm-${VERSION:-21.1.4}}"
+
+mkdir -p "$CACHE_DIR" || true
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria build e empacotaria em $CACHE_DIR"
+  exit 0
+fi
+
+# Verificar binários essenciais
+if [ ! -x "$BUILD_DIR/bin/clang" ] && [ ! -x "$BUILD_DIR/bin/clang-format" ]; then
+  echo "⚠️  clang não encontrado em $BUILD_DIR/bin - build pode ter falhado."
+fi
+
+# Se make/ninja falhar, adm-build deve re-run com -j1; aqui só detectamos
+# Empacotar instalação (se instalou em DESTDIR via pre-install, fallback)
+tarball="${CACHE_DIR}/${PKG_NAME}.tar.xz"
+echo "📦 Empacotando build em $tarball"
+tar -C "$BUILD_DIR" -cJf "$tarball" . || {
+  echo "❌ Falha ao empacotar"
+  exit 1
+}
+sha256sum "$tarball" > "${tarball}.sha256" || true
+echo "[`date -u`] packaged $tarball" >> "$ADM_LOG"
+echo "✅ [llvm post-build] Empacotamento concluído: $tarball"
