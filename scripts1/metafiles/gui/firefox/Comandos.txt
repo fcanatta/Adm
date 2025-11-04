@@ -1,0 +1,2 @@
+adm build gui/firefox --chroot stage3 --jobs 8
+adm install gui/firefox --chroot stage3
