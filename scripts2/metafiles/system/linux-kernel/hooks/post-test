@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel post-test
+# - Testa o kernel recém-compilado via QEMU/KVM (sanity check de boot).
+# - Requer qemu-system-x86_64 e imagem initramfs válida.
+# - Opcional, roda apenas se DRY_RUN=0 e QEMU disponível.
+#
+set -euo pipefail
+
+echo "🧪 [linux-kernel post-test] Testando kernel via QEMU..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-test.log}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+TMP_DIR="${ADM_ROOT}/tmp/qemu-test"
+mkdir -p "$TMP_DIR" "$(dirname "$ADM_LOG")" || true
+echo "[`date -u`] post-test start" >> "$ADM_LOG"
+
+# 1️⃣ Encontrar kernel e initramfs
+KERNEL_IMG="$(ls -1t "$CACHE_DIR"/linux-kernel-*/boot/*Image* 2>/dev/null | head -n1 || true)"
+INITRAMFS_IMG="$(ls -1t "$CACHE_DIR"/*initramfs*.img 2>/dev/null | head -n1 || true)"
+
+if [ -z "$KERNEL_IMG" ]; then
+  echo "❌ Nenhum kernel encontrado no cache."
+  exit 1
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria QEMU com $KERNEL_IMG e $INITRAMFS_IMG"
+  exit 0
+fi
+
+if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+  echo "⚠️  QEMU não encontrado — teste de boot ignorado."
+  exit 0
+fi
+
+# 2️⃣ Executar teste de boot
+echo "🚀 Testando boot rápido do kernel em QEMU..."
+qemu-system-x86_64 -kernel "$KERNEL_IMG" \
+  -initrd "$INITRAMFS_IMG" \
+  -append "console=ttyS0 quiet" \
+  -m 512M -nographic -no-reboot -smp 2 \
+  -serial mon:stdio -display none -snapshot -enable-kvm \
+  -timeout 30 > "$TMP_DIR/qemu.log" 2>&1 || true
+
+# 3️⃣ Validar saída
+if grep -q "Linux version" "$TMP_DIR/qemu.log"; then
+  echo "✔️  Boot OK — kernel inicializou no QEMU."
+  echo "[`date -u`] kernel test boot success" >> "$ADM_LOG"
+else
+  echo "⚠️  Kernel não inicializou completamente (ver $TMP_DIR/qemu.log)"
+  tail -n 40 "$TMP_DIR/qemu.log" || true
+fi
+
+echo "[`date -u`] post-test done" >> "$ADM_LOG"
+echo "✅ [linux-kernel post-test] Teste concluído."
