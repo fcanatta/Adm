@@ -1,0 +1,739 @@
+#!/usr/bin/env bash
+#
+# adm-chroot
+# ----------
+# Gerencia criação, montagem, entrada e desmontagem de chroots seguros para ADM.
+#
+# Subcomandos:
+#   create <path>           - cria skeleton básico do rootfs em <path>
+#   mount  <path>           - monta pseudo-filesystems (dev, dev/pts, proc, sys, run, tmp)
+#   enter  <path> [--cmd "<cmd>"] - entra no chroot (namespace se disponível) e executa comando ou shell
+#   umount <path>           - desmonta todos os mounts do chroot (ordem inversa)
+#   status <path>           - mostra estado de mounts e processos dentro do chroot
+#   clean  <path>           - desmonta e remove o rootfs (dangerous; requer --force --yes)
+#
+# Flags globais:
+#   --dry-run               : simula sem executar
+#   --force                 : força ações destrutivas (kill processes, rm -rf)
+#   --yes                   : assume yes para prompts
+#   --log <file>            : escreve logs detalhados
+#   --namespace / --no-namespace : força uso/ignora unshare
+#   --cmd "<command>"       : para 'enter', comando a executar dentro do chroot
+#   --verbose               : saída detalhada
+#
+# AVISO DE RISCO: Este script fará operações de montagem e desmontagem e pode matar processos.
+# Leia TODO o script e os comentários marcados com "## RISCO" antes de executar.
+#
+# Você assumiu responsabilidade por quaisquer danos — ainda assim recomendo VEEMENTEMENTE
+# testar em VM/container antes.
+#
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### -------------------------
+### Configurações padrão
+### -------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_BUILDS="${ADM_BUILDS:-$ADM_ROOT/builds}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+CHROOT_MOUNTS_FILE="${ADM_TMP}/chroot-mounts.log"   # registro de mounts por chroot (append)
+LOCKDIR="${ADM_TMP}/adm-chroot-locks"
+DEFAULT_SHELL="${CHROOT_SHELL:-/bin/bash}"
+
+# Variáveis mutáveis por flags
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+VERBOSE=0
+LOGFILE=""
+USE_NAMESPACE=""    # "", "yes", or "no" ("" -> autodetect)
+ENTER_CMD=""
+
+# Timestamp
+TS="$(date +%Y%m%d-%H%M%S)"
+
+### -------------------------
+### Color & icon helpers
+### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+### -------------------------
+### Spinner (background)
+### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+### -------------------------
+### Util helpers
+### -------------------------
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [global flags] <subcommand> <path> [subflags]
+
+Global flags:
+  --dry-run           Simula sem executar ações
+  --force             Força ações destrutivas (kill, rm -rf)
+  --yes               Assume 'yes' para prompts
+  --verbose           Saída detalhada
+  --log <file>        Arquivo de log
+  --namespace         Força uso de unshare namespace
+  --no-namespace      Desabilita uso de unshare namespace
+
+Subcomandos:
+  create <path>            Cria skeleton do rootfs em <path>
+  mount  <path>            Monta pseudo-filesystems em <path>
+  enter  <path> [--cmd "<c>"]   Entra no chroot (ou roda comando)
+  umount <path>            Desmonta pseudo-filesystems em <path>
+  status <path>            Mostra estado de mounts/processos
+  clean  <path>            Desmonta e remove o rootfs (requer --force --yes)
+
+Exemplo:
+  $(basename "$0") --dry-run create /usr/src/adm/builds/stage0-rootfs
+EOF
+  exit 1
+}
+
+# Minimal arg parsing (global flags first)
+if [ $# -lt 1 ]; then usage; fi
+
+# Extract global flags until we hit a subcommand (create/mount/etc)
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --log) shift; LOGFILE="$1"; shift ;;
+    --namespace) USE_NAMESPACE="yes"; shift ;;
+    --no-namespace) USE_NAMESPACE="no"; shift ;;
+    create|mount|enter|umount|status|clean) ARGS+=("$1"); shift; break ;;
+    -h|--help) usage ;;
+    *) err "Flag desconhecida: $1"; usage ;;
+  esac
+done
+
+# rest args
+if [ ${#ARGS[@]} -eq 0 ]; then err "Nenhum subcomando fornecido"; usage; fi
+SUBCMD="${ARGS[0]}"
+
+# Now pack remaining args
+REMAINING=("$@")
+
+# Prepare logfile default if not set
+if [ -z "${LOGFILE:-}" ]; then
+  LOGFILE="$ADM_LOGS/adm-chroot-$TS.log"
+fi
+
+# Ensure directories exist (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_TMP" "$ADM_LOGS" "$LOCKDIR" || true
+fi
+
+# Locking helper to avoid concurrent chroot operations on same path
+_lock_acquire() {
+  local lockname="$1"
+  local lockfile="$LOCKDIR/$(echo "$lockname" | sed 's/[^a-zA-Z0-9._-]/_/g').lock"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would acquire lock $lockfile"
+    echo "$lockfile"
+    return 0
+  fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then
+    err "Não foi possível adquirir lock $lockfile — outro processo pode estar operando neste chroot"
+    return 1
+  fi
+  # return lockfile path to caller via global
+  echo "$lockfile"
+  return 0
+}
+_lock_release() {
+  local lockfile="$1"
+  if [ -z "$lockfile" ]; then return 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would release lock $lockfile"; return 0; fi
+  # Close FD 9 if it's the same file (best-effort)
+  # No portable way to release specific flock held by fd; rely on shell exit to release.
+  :
+}
+
+### -------------------------
+### Path validation (safeguard)
+### -------------------------
+_validate_target_path() {
+  local path="$1"
+  # Normalize path
+  local full
+  full="$(readlink -f "$path" 2>/dev/null || echo "$path")"
+  # Accept only targets under ADM_BUILDS for safety
+  if [[ "$full" != "$(readlink -f "$ADM_BUILDS")"* ]]; then
+    warn "O alvo '$path' não parece estar sob o diretório seguro '$ADM_BUILDS'."
+    warn "Operações destrutivas (mount/umount/clean) exigirão --force --yes para continuar."
+    return 1
+  fi
+  return 0
+}
+
+### -------------------------
+### create_chroot_skeleton
+### -------------------------
+create_chroot_skeleton() {
+  local target="$1"
+  verbose "create_chroot_skeleton: target=$target"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) Criar skeleton em $target"
+    return 0
+  fi
+
+  # Validate path
+  if ! _validate_target_path "$target"; then
+    if [ "$FORCE" -ne 1 ] || [ "$ASSUME_YES" -ne 1 ]; then
+      read -r -p "Confirme criação em caminho não padrão '$target' (y/N): " a || true
+      case "$a" in [yY]|[yY][eE][sS]) ;; *) err "Abortando."; return 1 ;; esac
+    fi
+  fi
+
+  mkdir -p "$target" || { err "Falha ao criar $target"; return 1; }
+  # directories
+  local dirs=(bin sbin lib lib64 usr usr/bin usr/sbin etc var tmp proc sys dev run home mnt opt)
+  for d in "${dirs[@]}"; do
+    mkdir -p "$target/$d" || { err "Falha ao criar $target/$d"; return 1; }
+  done
+
+  # Minimal /etc files
+  : >"$target/etc/passwd" || true
+  : >"$target/etc/group" || true
+  # copy resolv.conf and nsswitch.conf to allow DNS resolution inside chroot
+  if [ -f /etc/resolv.conf ]; then cp -L /etc/resolv.conf "$target/etc/resolv.conf" || true; fi
+  if [ -f /etc/nsswitch.conf ]; then cp -L /etc/nsswitch.conf "$target/etc/nsswitch.conf" || true; fi
+  if [ -f /etc/hosts ]; then cp -L /etc/hosts "$target/etc/hosts" || true; fi
+
+  # Set permissions conservative
+  chmod 755 "$target" || true
+  ok "Skeleton criado em: $target"
+  log_to_file "[CREATE]" "skeleton created $target"
+  return 0
+}
+
+### -------------------------
+### mount_chroot
+### -------------------------
+# Monta: /dev (bind), /dev/pts (bind), /proc (proc), /sys (sysfs), /run (tmpfs), /tmp (tmpfs)
+mount_chroot() {
+  local target="$1"
+  verbose "mount_chroot: target=$target"
+
+  # Validate path
+  if [ ! -d "$target" ]; then err "Diretório $target não existe"; return 1; fi
+
+  # Acquire lock
+  local lock
+  lock="$(_lock_acquire "$target")" || return 1
+
+  # Helper to record mount
+  _record_mount() {
+    local src="$1" dst="$2" type="$3" opts="${4:-}"
+    local line="$(date -u +"%Y-%m-%dT%H:%M:%SZ") MOUNT $type $src -> $dst opts=$opts"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      verbose "(dry-run) $line"
+    else
+      echo "$line" >>"$CHROOT_MOUNTS_FILE"
+    fi
+  }
+
+  # Determine whether to use namespace
+  local use_ns="$USE_NAMESPACE"
+  if [ -z "$use_ns" ]; then
+    if command -v unshare >/dev/null 2>&1; then
+      use_ns="yes"
+    else
+      use_ns="no"
+    fi
+  fi
+
+  if [ "$use_ns" = "no" ]; then
+    warn "unshare não disponível ou --no-namespace usado. Operações de mount afetarão o namespace do host."
+    if [ "$DRY_RUN" -eq 0 ] && [ "$FORCE" -ne 1 ]; then
+      read -r -p "Continuar montando sem namespace (pode afetar host)? [y/N] " c || true
+      case "$c" in [yY]|[yY][eE][sS]) ;; *) _lock_release "$lock"; err "Abortando"; return 1 ;; esac
+    fi
+  fi
+
+  # Sequence of mounts (order matters). We will skip those already mounted.
+  # For each: check if already mounted (grep /proc/mounts)
+  local mounts_done=0
+
+  # /dev (bind)
+  local dev_src="/dev"
+  local dev_dst="$target/dev"
+  if grep -qE " ${dev_dst} " /proc/mounts 2>/dev/null; then
+    verbose "/dev já está montado em $dev_dst"
+  else
+    spinner_start "Montando /dev em $dev_dst ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) bind /dev -> $dev_dst"
+    else
+      mount --rbind --make-rslave "$dev_src" "$dev_dst" || { spinner_stop "falha"; err "Falha ao montar /dev"; _lock_release "$lock"; return 1; }
+      _record_mount "$dev_src" "$dev_dst" "bind"
+      spinner_stop "/dev montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # /dev/pts (bind) - ensure dir exists
+  mkdir -p "$target/dev/pts" || true
+  if grep -qE " ${target}/dev/pts " /proc/mounts 2>/dev/null; then
+    verbose "/dev/pts já montado"
+  else
+    spinner_start "Montando /dev/pts em $target/dev/pts ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) bind /dev/pts -> $target/dev/pts"
+    else
+      mount --bind /dev/pts "$target/dev/pts" || { spinner_stop "falha"; err "Falha ao montar /dev/pts"; _lock_release "$lock"; return 1; }
+      _record_mount "/dev/pts" "$target/dev/pts" "bind"
+      spinner_stop "/dev/pts montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # /proc
+  if grep -qE " ${target}/proc " /proc/mounts 2>/dev/null; then
+    verbose "/proc já montado em $target/proc"
+  else
+    spinner_start "Montando procfs em $target/proc ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) mount -t proc proc $target/proc"
+    else
+      mount -t proc proc "$target/proc" || { spinner_stop "falha"; err "Falha ao montar procfs"; _lock_release "$lock"; return 1; }
+      _record_mount "proc" "$target/proc" "proc"
+      spinner_stop "proc montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # /sys
+  if grep -qE " ${target}/sys " /proc/mounts 2>/dev/null; then
+    verbose "/sys já montado em $target/sys"
+  else
+    spinner_start "Montando sysfs em $target/sys ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) mount -t sysfs sys $target/sys"
+    else
+      mount -t sysfs sys "$target/sys" || { spinner_stop "falha"; err "Falha ao montar sysfs"; _lock_release "$lock"; return 1; }
+      _record_mount "sysfs" "$target/sys" "sysfs"
+      spinner_stop "sys montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # /run (tmpfs)
+  if grep -qE " ${target}/run " /proc/mounts 2>/dev/null; then
+    verbose "/run já montado em $target/run"
+  else
+    spinner_start "Montando tmpfs em $target/run ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) mount -t tmpfs tmpfs $target/run"
+    else
+      mount -t tmpfs tmpfs "$target/run" || { spinner_stop "falha"; err "Falha ao montar tmpfs em /run"; _lock_release "$lock"; return 1; }
+      _record_mount "tmpfs" "$target/run" "tmpfs"
+      spinner_stop "run montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # /tmp (tmpfs)
+  if grep -qE " ${target}/tmp " /proc/mounts 2>/dev/null; then
+    verbose "/tmp já montado em $target/tmp"
+  else
+    spinner_start "Montando tmpfs em $target/tmp ..."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      spinner_stop "(dry-run) mount -t tmpfs tmpfs $target/tmp"
+    else
+      mount -t tmpfs tmpfs "$target/tmp" || { spinner_stop "falha"; err "Falha ao montar tmpfs em /tmp"; _lock_release "$lock"; return 1; }
+      _record_mount "tmpfs" "$target/tmp" "tmpfs"
+      spinner_stop "tmp montado"
+    fi
+    mounts_done=$((mounts_done + 1))
+  fi
+
+  # success summary
+  if [ "$mounts_done" -gt 0 ]; then
+    ok "Montagens realizadas: $mounts_done"
+  else
+    info "Nenhuma montagem necessária; já estava montado"
+  fi
+
+  _lock_release "$lock"
+  return 0
+}
+
+### -------------------------
+### umount_chroot
+### -------------------------
+# desmonta em ordem inversa; tenta forçar com fuser -k se busy e --force
+umount_chroot() {
+  local target="$1"
+  verbose "umount_chroot: target=$target"
+
+  if [ ! -d "$target" ]; then err "Diretório $target não existe"; return 1; fi
+
+  # Acquire lock
+  local lock
+  lock="$(_lock_acquire "$target")" || return 1
+
+  # Helper: attempt umount and record
+  _try_umount() {
+    local m="$1"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      verbose "(dry-run) umount $m"
+      return 0
+    fi
+    if grep -qE " $m " /proc/mounts 2>/dev/null || mountpoint -q "$m" 2>/dev/null; then
+      # Attempt to unmount gracefully
+      if umount "$m" 2>/dev/null; then
+        log_to_file "[UMOUNT] $m"
+        verbose "umount $m OK"
+        return 0
+      fi
+      # If failed and --force, try lazy unmount then fuser -k
+      if [ "$FORCE" -eq 1 ]; then
+        warn "umount $m falhou; tentando lazy umount (-l)"
+        if umount -l "$m" 2>/dev/null; then
+          log_to_file "[UMOUNT-LAZY] $m"
+          verbose "umount -l $m OK"
+          return 0
+        fi
+        warn "Tentando terminar processos com fuser -km em $m (requer --force)"
+        if fuser -km "$m" 2>/dev/null; then
+          sleep 0.5
+          if umount "$m" 2>/dev/null; then
+            log_to_file "[UMOUNT-AFTER-FUSER] $m"
+            verbose "umount $m OK após fuser"
+            return 0
+          fi
+        fi
+      fi
+      err "Não foi possível desmontar $m (busy ou erro). Use --force para tentar forçar."
+      return 2
+    else
+      verbose "Não montado: $m"
+      return 0
+    fi
+  }
+
+  # Order: tmp, run, sys, proc, dev/pts, dev (targets under $target)
+  local mounts=("$target/tmp" "$target/run" "$target/sys" "$target/proc" "$target/dev/pts" "$target/dev")
+  local failed=0
+  for m in "${mounts[@]}"; do
+    if [ -d "$m" ]; then
+      spinner_start "Desmontando $m ..."
+      if ! _try_umount "$m"; then
+        spinner_stop "falha"
+        failed=1
+        # continue trying others
+      else
+        spinner_stop "desmontado $m"
+      fi
+    else
+      verbose "Pasta inexistente (ignorando): $m"
+    fi
+  done
+
+  if [ "$failed" -eq 1 ]; then
+    err "Algumas desmontagens falharam. Verifique processos em $target e tente novamente com --force."
+    _lock_release "$lock"
+    return 2
+  fi
+
+  # Remove mount records related to target from CHROOT_MOUNTS_FILE (best-effort)
+  if [ "$DRY_RUN" -eq 0 ] && [ -f "$CHROOT_MOUNTS_FILE" ]; then
+    # Filter out lines containing the absolute path
+    tmpf="$(mktemp -u "$CHROOT_MOUNTS_FILE.XXXX")" || tmpf="/tmp/adm-chroot-mounts.$$"
+    grep -v " $target" "$CHROOT_MOUNTS_FILE" >"$tmpf" 2>/dev/null || true
+    mv "$tmpf" "$CHROOT_MOUNTS_FILE" 2>/dev/null || true
+  fi
+
+  ok "Desmontagem completa para $target"
+  _lock_release "$lock"
+  return 0
+}
+
+### -------------------------
+### status_chroot
+### -------------------------
+status_chroot() {
+  local target="$1"
+  verbose "status_chroot: target=$target"
+  if [ ! -d "$target" ]; then err "Diretório $target não existe"; return 1; fi
+
+  info "Status de montagens relacionadas a $target:"
+  # show mounts lines from /proc/mounts
+  grep " $target" /proc/mounts || true
+
+  info "Processos com raiz dentro de $target (listar até 30 linhas):"
+  if command -v lsof >/dev/null 2>&1; then
+    # lsof +D can be slow; limit with head
+    lsof +D "$target" 2>/dev/null | sed -n '1,30p' || true
+  else
+    # fallback: ps aux and filter by cwd via /proc/*/cwd
+    ps aux --no-heading | sed -n '1,200p' || true
+    # To be accurate, we'd iterate /proc/*/cwd; expensive; show only a note
+    info "(lsof não disponível; listagem completa de processos por cwd exigiria varredura /proc)"
+  fi
+  return 0
+}
+
+### -------------------------
+### enter_chroot
+### -------------------------
+enter_chroot() {
+  local target="$1"
+  shift || true
+
+  # parse optional --cmd
+  local cmd=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cmd) shift; cmd="$1"; shift ;;
+      --cmd=*) cmd="${1#--cmd=}"; shift ;;
+      *) break ;;
+    esac
+  done
+
+  verbose "enter_chroot: target=$target cmd=$cmd"
+
+  if [ ! -d "$target" ]; then err "Diretório $target não existe"; return 1; fi
+
+  # check mounts essential exist if not in dry-run
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if ! grep -qE " ${target}/proc " /proc/mounts 2>/dev/null; then
+      warn "/proc não encontrado montado em $target/proc. Recomenda-se executar 'mount $target' primeiro."
+      if [ "$FORCE" -ne 1 ]; then
+        read -r -p "Continuar mesmo assim? [y/N] " a || true
+        case "$a" in [yY]|[yY][eE][sS]) ;; *) err "Abortando"; return 1 ;; esac
+      fi
+    fi
+  fi
+
+  # Determine unshare availability and decision
+  local use_ns="$USE_NAMESPACE"
+  if [ -z "$use_ns" ]; then
+    if command -v unshare >/dev/null 2>&1; then
+      use_ns="yes"
+    else
+      use_ns="no"
+    fi
+  fi
+
+  if [ "$use_ns" = "yes" ]; then
+    info "Entrando em namespace isolado via unshare (recomendado)."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if [ -n "$cmd" ]; then
+        info "(dry-run) Comando dentro do chroot: unshare --mount --uts --ipc --pid --fork --user --map-root-user --chroot $target $cmd"
+      else
+        info "(dry-run) Shell dentro do chroot: unshare --mount --uts --ipc --pid --fork --user --map-root-user --chroot $target $DEFAULT_SHELL"
+      fi
+      return 0
+    fi
+
+    # Execute unshare and chroot; keep environment minimal
+    if [ -n "$cmd" ]; then
+      # Make sure cmd is executed in a login-like shell
+      unshare --mount --uts --ipc --pid --fork --user --map-root-user --chroot "$target" /bin/sh -c "$cmd"
+      local rc=$?
+      log_to_file "[ENTER-CMD] rc=$rc cmd=$cmd target=$target"
+      return $rc
+    else
+      # interactive shell: use user's shell or default
+      unshare --mount --uts --ipc --pid --fork --user --map-root-user --chroot "$target" "$DEFAULT_SHELL"
+      local rc=$?
+      log_to_file "[ENTER-SHELL] rc=$rc target=$target"
+      return $rc
+    fi
+  else
+    warn "unshare não disponível. Usando chroot tradicional (menor isolamento)."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      if [ -n "$cmd" ]; then
+        info "(dry-run) chroot $target /bin/sh -c $cmd"
+      else
+        info "(dry-run) chroot $target $DEFAULT_SHELL"
+      fi
+      return 0
+    fi
+    if [ -n "$cmd" ]; then
+      chroot "$target" /bin/sh -c "$cmd"
+      local rc=$?
+      log_to_file "[ENTER-CHROOT-CMD] rc=$rc cmd=$cmd target=$target"
+      return $rc
+    else
+      chroot "$target" "$DEFAULT_SHELL"
+      local rc=$?
+      log_to_file "[ENTER-CHROOT-SHELL] rc=$rc target=$target"
+      return $rc
+    fi
+  fi
+}
+
+### -------------------------
+### clean_chroot
+### -------------------------
+# desmonta e remove o diretório (dangerous)
+clean_chroot() {
+  local target="$1"
+  verbose "clean_chroot: target=$target"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) clean $target (desmontar + rm -rf)"
+    return 0
+  fi
+
+  # Safety checks before rm -rf
+  local full="$(readlink -f "$target" 2>/dev/null || echo "$target")"
+  if [[ "$full" != "$(readlink -f "$ADM_BUILDS")"* ]]; then
+    warn "O alvo $full não está sob $ADM_BUILDS. Esta operação é perigosa."
+    if [ "$FORCE" -ne 1 ] || [ "$ASSUME_YES" -ne 1 ]; then
+      read -r -p "Confirma remoção completa de '$full'? (requer --force --yes) [y/N] " a || true
+      case "$a" in [yY]|[yY][eE][sS]) ;; *) err "Abortando clean"; return 1 ;; esac
+    fi
+  fi
+
+  # First attempt umount
+  umount_chroot "$target" || warn "umount_chroot retornou erro; prosseguindo para remoção com --force"
+
+  # Extra safety: if target root is / or empty, abort
+  if [ -z "$full" ] || [ "$full" = "/" ]; then
+    err "Alvo inválido para remoção: $full"
+    return 1
+  fi
+
+  # Count files (if huge, ask one more confirmation)
+  local cnt
+  cnt=$(find "$full" -mindepth 1 2>/dev/null | wc -l || echo "0")
+  if [ "$cnt" -gt 10000 ] && [ "$FORCE" -ne 1 ]; then
+    warn "O diretório contém >10000 arquivos ($cnt). Use --force para confirmar remoção em massa."
+    return 1
+  fi
+
+  # Final removal
+  if [ "$FORCE" -eq 1 ]; then
+    spinner_start "Removendo $full (rm -rf) ..."
+    rm -rf "$full" || { spinner_stop "falha"; err "Falha ao remover $full"; return 1; }
+    spinner_stop "Removido $full"
+    log_to_file "[CLEAN] removed $full"
+    ok "Clean completo para $full"
+    return 0
+  else
+    err "Operação clean requer --force"
+    return 1
+  fi
+}
+
+### -------------------------
+### Main routing
+### -------------------------
+_main() {
+  case "$SUBCMD" in
+    create)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "create requer <path>"; usage; fi
+      create_chroot_skeleton "${REMAINING[0]}"
+      ;;
+    mount)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "mount requer <path>"; usage; fi
+      mount_chroot "${REMAINING[0]}"
+      ;;
+    umount)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "umount requer <path>"; usage; fi
+      umount_chroot "${REMAINING[0]}"
+      ;;
+    status)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "status requer <path>"; usage; fi
+      status_chroot "${REMAINING[0]}"
+      ;;
+    enter)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "enter requer <path>"; usage; fi
+      enter_chroot "${REMAINING[0]}" "${REMAINING[@]:1}"
+      ;;
+    clean)
+      if [ ${#REMAINING[@]} -lt 1 ]; then err "clean requer <path>"; usage; fi
+      clean_chroot "${REMAINING[0]}"
+      ;;
+    *)
+      err "Subcomando desconhecido: $SUBCMD"
+      usage
+      ;;
+  esac
+}
+
+# Trap to ensure spinner is cleaned and to log interruptions
+trap 'err "Interrompido pelo usuário"; _spinner_cleanup; exit 130' INT TERM
+
+# Run main
+_main
