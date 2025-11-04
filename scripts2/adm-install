@@ -1,0 +1,1441 @@
+#!/usr/bin/env bash
+#
+# adm-install 
+# ----------------------
+# Installer de pacotes ADM — cabeçalho, helpers, parser, localizar tarball, leitura de metadados
+#
+# AVISO IMPORTANTÍSSIMO:
+# - Este script pode modificar o sistema (extrair arquivos em /usr, sobrescrever binários). Use com cautela.
+# - Leia todas as linhas marcadas com "## RISCO" antes de executar sem --dry-run.
+# - Sempre faça testes iniciais em VM/contêiner e rode com --dry-run e --verbose.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+########################
+# Cabeçalho / Defaults
+########################
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+
+# Paths (padrões, podem ser sobrescritos no adm.conf)
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_TARBALLS_DIR="${ADM_TARBALLS_DIR:-$ADM_CACHE/tarballs}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+ADM_INSTALLED_DB="${ADM_INSTALLED_DB:-$ADM_DB/installed}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_INDEX_JSON="${ADM_CACHE:-$ADM_CACHE}/index.json"   # index of tarballs
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+
+# defaults
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+VERBOSE=0
+RESOLVE_DEPS=1
+REINSTALL=0
+NO_HOOKS=0
+LOGFILE=""
+TARGET_DIR="/"   # where to install; default /usr (not /)
+KEEP_BACKUP=1
+
+# Internal runtime
+TARBALL_PATH=""
+TARBALL_SHA_EXPECTED=""
+TARBALL_SHA_ACTUAL=""
+TARBALL_NAME=""
+TARBALL_VERSION=""
+TARBALL_SIZE=""
+EXTRACT_TMP=""
+INSTALL_LOG=""
+MANIFEST_INSIDE=""   # path inside tar of manifest (if present)
+BUILDINFO_INSIDE=""
+
+# Load adm.conf if present (overrides defaults)
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+########################
+# Colors & icons
+########################
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+ICON_DOWN="⬇️"
+ICON_PACK="📦"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+########################
+# Spinner / progress
+########################
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+########################
+# Safe-run wrapper
+########################
+safe_run() {
+  # safe_run "<description>" cmd...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    if [ "$VERBOSE" -eq 1 ]; then
+      printf "  Comando (simulado): %s\n" "$*"
+    fi
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc (rc=$rc)"
+    return $rc
+  fi
+}
+
+########################
+# Locking for package operations
+########################
+LOCKDIR="$ADM_TMP/locks"
+mkdir -p "$LOCKDIR" 2>/dev/null || true
+
+_acquire_lock() {
+  local name="$1"
+  local lockfile="$LOCKDIR/$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g').lock"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would acquire lock $lockfile"
+    echo "$lockfile"
+    return 0
+  fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then
+    err "Não foi possível adquirir lock $lockfile — outro processo pode estar operando"
+    return 1
+  fi
+  echo "$lockfile"
+  return 0
+}
+_release_lock() {
+  local lockfile="$1"
+  if [ -z "$lockfile" ]; then return 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would release $lockfile"
+    return 0
+  fi
+  # fd 9 foi aberto acima; quando shell terminar, libera. Não fazer explicit close aqui.
+  :
+}
+
+########################
+# Usage / Argument parser
+########################
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] <package|/path/to/package.tar.zst>
+
+Options:
+  --dry-run            Simula instalação (não altera sistema)
+  --force              Força instalação, sobrescrevendo conflitos
+  --yes                Assume yes para prompts
+  --verbose, -v        Saída detalhada
+  --no-hooks           Não execute hooks do pacote
+  --resolve-deps/--no-resolve-deps  Tenta resolver dependências (default: on)
+  --reinstall          Reinstala mesmo se versão igual já estiver instalada
+  --target-dir <dir>   Instala em outro prefix (útil para chroot/testing). Default /usr
+  --log <file>         Usa arquivo de log customizado
+  --help               Mostra esta ajuda
+EOF
+  exit 1
+}
+
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --no-hooks) NO_HOOKS=1; shift ;;
+    --resolve-deps) RESOLVE_DEPS=1; shift ;;
+    --no-resolve-deps) RESOLVE_DEPS=0; shift ;;
+    --reinstall) REINSTALL=1; shift ;;
+    --target-dir) shift; TARGET_DIR="$1"; shift ;;
+    --log) shift; LOGFILE="$1"; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*)
+      err "Flag desconhecida: $1"
+      usage
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+if [ ${#POSITIONAL[@]} -lt 1 ]; then
+  err "Você deve informar um pacote (nome) ou caminho para um tarball."
+  usage
+fi
+
+TARGET_RAW="${POSITIONAL[0]}"
+LOGFILE="${LOGFILE:-$ADM_LOGS/adm-install-$TS.log}"
+mkdir -p "$ADM_LOGS" "$ADM_INSTALLED_DB" "$ADM_TMP" 2>/dev/null || true
+INSTALL_LOG="$LOGFILE"
+
+log_to_file "[START]" "adm-install start $TS target=$TARGET_RAW"
+
+info "adm-install iniciado: target='$TARGET_RAW' target-dir='$TARGET_DIR' resolve-deps=$RESOLVE_DEPS"
+
+########################
+# Utilities: human size, prompt
+########################
+human_size() {
+  # human_size <bytes>
+  awk 'function human(x){
+    s="B K M G T P";
+    for(i=1;i<=6;i++){
+      if(x<1024) return sprintf("%.1f%s",x,substr(s,2*i-1,1));
+      x/=1024;
+    }
+    return sprintf("%.1fE",x)
+  }{print human($1)}' <<<"$1"
+}
+
+confirm() {
+  if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) confirm: $msg"
+    return 0
+  fi
+  printf "%s [y/N]: " "$msg"
+  read -r ans
+  case "$ans" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+########################
+# Find tarball: by name/version or path
+########################
+# locate_tarball <target>
+# If target is a path to an existing file, use it.
+# If target is "name" or "name@version", search ADM_TARBALLS_DIR and ADM_INDEX_JSON
+locate_tarball() {
+  local target="$1"
+  TARBALL_PATH=""
+  TARBALL_SHA_EXPECTED=""
+
+  # if exists as file path, accept it
+  if [ -f "$target" ]; then
+    TARBALL_PATH="$(readlink -f "$target")"
+    verbose "Usando tarball local: $TARBALL_PATH"
+    return 0
+  fi
+
+  # if target is name@version
+  if printf '%s' "$target" | grep -q '@'; then
+    local name version
+    name="$(printf '%s' "$target" | cut -d'@' -f1)"
+    version="$(printf '%s' "$target" | cut -d'@' -f2-)"
+    # search tarball exact match
+    if compgen -G "$ADM_TARBALLS_DIR/${name}-${version}.*" >/dev/null 2>&1; then
+      # prefer .tar.zst then .tar.xz then .tar
+      if [ -f "$ADM_TARBALLS_DIR/${name}-${version}.tar.zst" ]; then
+        TARBALL_PATH="$ADM_TARBALLS_DIR/${name}-${version}.tar.zst"
+      elif [ -f "$ADM_TARBALLS_DIR/${name}-${version}.tar.xz" ]; then
+        TARBALL_PATH="$ADM_TARBALLS_DIR/${name}-${version}.tar.xz"
+      else
+        TARBALL_PATH="$(ls -1 "$ADM_TARBALLS_DIR/${name}-${version}."* 2>/dev/null | head -n1 || true)"
+      fi
+      if [ -n "$TARBALL_PATH" ]; then verbose "Tarball localizado: $TARBALL_PATH"; return 0; fi
+    fi
+    # consult index.json if available for precise path
+    if [ -f "$ADM_INDEX_JSON" ]; then
+      # try to parse index.json for name/version entries
+      if command -v python3 >/dev/null 2>&1; then
+        TARBALL_PATH="$(python3 - <<PY 2>/dev/null
+import json,sys
+idx=json.load(open(sys.argv[1]))
+name=sys.argv[2];ver=sys.argv[3]
+for e in idx:
+    if e.get("name")==name and e.get("version")==ver:
+        print(e.get("tarball",""))
+        sys.exit(0)
+print("")
+PY
+"$ADM_INDEX_JSON" "$name" "$version")"
+        if [ -n "$TARBALL_PATH" ] && [ -f "$TARBALL_PATH" ]; then verbose "Tarball via index: $TARBALL_PATH"; return 0; fi
+      fi
+    fi
+  fi
+
+  # if target is only name, try newest in index.json
+  if ! printf '%s' "$target" | grep -q '@'; then
+    local name="$target"
+    # search by pattern in tarballs dir: name-*.tar.*
+    if compgen -G "$ADM_TARBALLS_DIR/${name}-*.tar.*" >/dev/null 2>&1; then
+      # pick latest by mtime
+      TARBALL_PATH="$(ls -1t "$ADM_TARBALLS_DIR/${name}-*.tar."* 2>/dev/null | head -n1 || true)"
+      if [ -n "$TARBALL_PATH" ]; then verbose "Tarball mais recente encontrado: $TARBALL_PATH"; return 0; fi
+    fi
+    # fallback to index.json latest version
+    if [ -f "$ADM_INDEX_JSON" ] && command -v python3 >/dev/null 2>&1; then
+      TARBALL_PATH="$(python3 - <<PY 2>/dev/null
+import json,sys
+arr=json.load(open(sys.argv[1]))
+name=sys.argv[2]
+candidates=[e for e in arr if e.get("name")==name]
+if not candidates:
+    print("")
+    sys.exit(0)
+# sort by ts if present, else by version lexicographically
+candidates.sort(key=lambda e: e.get("ts",""), reverse=True)
+print(candidates[0].get("tarball",""))
+PY
+"$ADM_INDEX_JSON" "$name")"
+      if [ -n "$TARBALL_PATH" ] && [ -f "$TARBALL_PATH" ]; then verbose "Tarball via index: $TARBALL_PATH"; return 0; fi
+    fi
+  fi
+
+  # not found
+  return 1
+}
+
+########################
+# Read build-info.json and manifest from inside tarball safely
+########################
+# read_meta_from_tarball <tarball>
+# Sets globals: TARBALL_NAME, TARBALL_VERSION, BUILDINFO_INSIDE, MANIFEST_INSIDE, TARBALL_SIZE
+read_meta_from_tarball() {
+  local tar="$1"
+  if [ -z "$tar" ] || [ ! -f "$tar" ]; then
+    err "Tarball inexistente: $tar"
+    return 2
+  fi
+
+  TARBALL_SIZE="$(stat -c%s "$tar" 2>/dev/null || stat -f%z "$tar" 2>/dev/null || echo 0)"
+  # Try to extract build-info.json path using tar listing (prefer binary-safe)
+  BUILDINFO_INSIDE=""
+  MANIFEST_INSIDE=""
+
+  # Use tar -tf to list and search for build-info.json or manifest.txt
+  # Some tarballs store files under ./ or package-name/ subdir. We search for those names.
+  local listing
+  listing="$(tar -tf "$tar" 2>/dev/null || true)"
+  if [ -z "$listing" ]; then
+    # tar returned success but empty listing? possible corruption — mark and fail
+    err "Falha ao listar tarball (tar -tf retornou vazio). Arquivo pode estar corrompido."
+    return 3
+  fi
+
+  # Prefer build-info.json (common path: build-info.json or */build-info.json)
+  BUILDINFO_INSIDE="$(printf "%s\n" "$listing" | grep -E '(^|/)(build-info\.json)$' | head -n1 || true)"
+  MANIFEST_INSIDE="$(printf "%s\n" "$listing" | grep -E '(^|/)(manifest(\.txt)?$)' | head -n1 || true)"
+
+  # If neither exists, try common patterns like package/metadata.json etc.
+  if [ -z "$BUILDINFO_INSIDE" ]; then
+    BUILDINFO_INSIDE="$(printf "%s\n" "$listing" | grep -E '(^|/)(metadata\.json|pkgmeta\.json)$' | head -n1 || true)"
+  fi
+
+  # Read TARBALL_NAME and VERSION heuristically from filename if not found in build-info
+  # filename like name-version.tar.zst
+  local base
+  base="$(basename "$tar")"
+  if [[ "$base" =~ ^(.+)-([0-9]+\.[0-9A-Za-z_.+-]+)\.tar\.(zst|xz|gz|bz2)$ ]]; then
+    TARBALL_NAME="${BASH_REMATCH[1]}"
+    TARBALL_VERSION="${BASH_REMATCH[2]}"
+  else
+    # fallback: try to parse first directory entry in listing
+    local first_entry
+    first_entry="$(printf "%s\n" "$listing" | head -n1 || true)"
+    if [ -n "$first_entry" ] && [ "${first_entry: -1}" = "/" ]; then
+      # remove trailing slash
+      local dir="${first_entry%/}"
+      TARBALL_NAME="$(basename "$dir")"
+      # version unknown
+      TARBALL_VERSION="unknown"
+    else
+      TARBALL_NAME="$(echo "$base" | sed -E 's/\.tar\..+$//')"
+      TARBALL_VERSION="unknown"
+    fi
+  fi
+
+  # Try to read build-info.json content into variable BUILDINFO_JSON (safe)
+  BUILDINFO_JSON=""
+  if [ -n "$BUILDINFO_INSIDE" ]; then
+    # extract to stdout (no full extraction)
+    BUILDINFO_JSON="$(tar -xOf "$tar" "$BUILDINFO_INSIDE" 2>/dev/null || true)"
+    # sometimes tar returns 0 but no content; detect empties
+    if [ -z "$BUILDINFO_JSON" ]; then
+      warn "build-info.json vazio dentro do tarball (ou corrupção). Tentando fallback."
+      BUILDINFO_INSIDE=""
+    fi
+  fi
+
+  # If build-info not present, try to extract manifest to get basic info
+  if [ -z "$BUILDINFO_INSIDE" ] && [ -n "$MANIFEST_INSIDE" ]; then
+    # We will read first lines of manifest to guess name/version if possible
+    local manifest_preview
+    manifest_preview="$(tar -xOf "$tar" "$MANIFEST_INSIDE" 2>/dev/null | head -n20 || true)"
+    # No guarantee manifest includes name/version; skip
+    MANIFEST_PREVIEW="$manifest_preview"
+  fi
+
+  # set globals
+  BUILDINFO_INSIDE="${BUILDINFO_INSIDE:-}"
+  MANIFEST_INSIDE="${MANIFEST_INSIDE:-}"
+
+  verbose "Tarball meta: name=$TARBALL_NAME version=$TARBALL_VERSION size=$TARBALL_SIZE buildinfo_inside=$BUILDINFO_INSIDE manifest_inside=$MANIFEST_INSIDE"
+
+  return 0
+}
+
+########################
+# Verify SHA256 of tarball (if expected provided)
+# - tries multiple strategies: index.json, embedded .sha256 file in same dir, or a passed expected value
+# - returns 0 on match, 2 on mismatch, 3 on error
+########################
+verify_tarball_integrity() {
+  local tar="$1"
+  local expected="$2"  # optional expected sha
+  TARBALL_SHA_ACTUAL=""
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) verificar integridade de $tar"
+    return 0
+  fi
+  if [ ! -f "$tar" ]; then
+    err "Arquivo não encontrado: $tar"
+    return 3
+  fi
+
+  # compute actual sha
+  spinner_start "Calculando SHA256 de $tar"
+  # use sha256sum; robustly handle command missing
+  if command -v sha256sum >/dev/null 2>&1; then
+    TARBALL_SHA_ACTUAL="$(sha256sum "$tar" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    TARBALL_SHA_ACTUAL="$(shasum -a 256 "$tar" | awk '{print $1}')"
+  else
+    spinner_stop "sha tool ausente"
+    warn "Nenhuma ferramenta sha256 disponível (sha256sum/shasum). Não é possível verificar integridade."
+    return 3
+  fi
+  spinner_stop "SHA calculado"
+
+  # If expected provided, compare
+  if [ -n "${expected:-}" ]; then
+    if [ "${TARBALL_SHA_ACTUAL}" = "$expected" ]; then
+      ok "SHA256 confere (esperado fornecido)"
+      return 0
+    else
+      err "SHA256 mismatch: esperado=$expected obtido=${TARBALL_SHA_ACTUAL}"
+      return 2
+    fi
+  fi
+
+  # Try to find expected in adjacent .sha256 file (same base name)
+  local pfx="${tar%.*}"  # naive
+  if [ -f "${tar}.sha256" ]; then
+    local fromfile
+    fromfile="$(cat "${tar}.sha256" | awk '{print $1}' | tr -d ' \t\n')"
+    if [ -n "$fromfile" ]; then
+      if [ "$fromfile" = "$TARBALL_SHA_ACTUAL" ]; then ok "SHA256 confere (arquivo .sha256)"; return 0; else err "SHA mismatch com .sha256"; return 2; fi
+    fi
+  fi
+
+  # Try to find expected in ADM_INDEX_JSON if exists
+  if [ -f "$ADM_INDEX_JSON" ] && command -v python3 >/dev/null 2>&1; then
+    local idxsha
+    idxsha="$(python3 - <<PY 2>/dev/null
+import json,sys
+idx=json.load(open(sys.argv[1]))
+tar=sys.argv[2]
+for e in idx:
+    if e.get("tarball")==tar or e.get("tarball")==tar.replace("file://",""):
+        print(e.get("sha256",""))
+        sys.exit(0)
+print("")
+PY
+"$ADM_INDEX_JSON" "$tar")"
+    if [ -n "$idxsha" ]; then
+      if [ "$idxsha" = "$TARBALL_SHA_ACTUAL" ]; then ok "SHA256 confere (index.json)"; return 0; else err "SHA mismatch (index.json)"; return 2; fi
+    fi
+  fi
+
+  # If no expected found, warn and proceed (user can use --force)
+  warn "Nenhuma SHA esperada fornecida/found; tarball SHA256 calculado: ${TARBALL_SHA_ACTUAL}"
+  return 0
+}
+
+########################
+# Prepare installed DB directory for this package
+# prepare_installed_db <name> <version>
+########################
+prepare_installed_db() {
+  local name="$1" version="$2"
+  local target_dir="$ADM_INSTALLED_DB/$name/$version"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) preparar installed db dir $target_dir"
+    return 0
+  fi
+  mkdir -p "$target_dir" 2>/dev/null || true
+  return 0
+}
+
+##### End of PARTE 1/3
+#
+# A PARTE 2/3 terá:
+#  - backup/removal de versão anterior (com segurança),
+#  - extração segura do tarball (tar + pv se disponível) diretamente para TARGET_DIR,
+#  - hooks pre/post-install execution,
+#  - correções silenciosas e retries (ex: tar extraiu sem erro mas faltam arquivos; tentar extrair em tmp e checar),
+#  - detecção e prevenção de sobrescrita de arquivos críticos (ex.: /etc/passwd),
+#  - criação de manifest em ADM_INSTALLED_DB e processamento de permissões.
+#
+# Peça "PARTE 2/3" para eu gerar a próxima parte agora.
+##### -------------------------
+##### PARTE 2/3 - backup, extração segura, hooks, prevenção de sobrescrita
+##### -------------------------
+
+# Assumimos que PARTE 1/3 definiu: safe_run, spinner_start/stop, DRY_RUN, FORCE, TARGET_DIR,
+# ADM_INSTALLED_DB, LOGFILE, TARBALL_PATH, TARBALL_NAME, TARBALL_VERSION, BUILDINFO_JSON, etc.
+
+########################
+# Critical files protection
+########################
+# Files that should never be overwritten by default (unless --force)
+CRITICAL_PATHS=(
+  "/etc/passwd"
+  "/etc/shadow"
+  "/etc/group"
+  "/etc/gshadow"
+  "/etc/sudoers"
+  "/bin/bash"
+  "/sbin/init"
+  "/boot"
+)
+
+is_critical_path() {
+  local p="$1"
+  for c in "${CRITICAL_PATHS[@]}"; do
+    # exact or prefix (for directories)
+    if [ "$p" = "$c" ] || [[ "$p" = "$c/"* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+########################
+# backup_previous_install <name> <version>
+# Creates a safe backup of currently installed files for the package name (if present)
+########################
+backup_previous_install() {
+  local name="$1" version="$2"
+  local installed_dir="$ADM_INSTALLED_DB/$name/$version"
+  local backup_dir="$ADM_INSTALLED_DB/backups/$name-$version-$TS"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) backup_previous_install $name $version -> $backup_dir"
+    return 0
+  fi
+
+  # If no installed record, nothing to backup
+  if [ ! -d "$installed_dir" ]; then
+    verbose "Nenhuma versão anterior registrada para $name-$version"
+    return 0
+  fi
+
+  info "Realizando backup da instalação anterior em $backup_dir"
+  mkdir -p "$(dirname "$backup_dir")" 2>/dev/null || true
+
+  ## RISCO: copiar grandes quantidades de dados pode consumir disco; verificar espaço
+  local avail
+  avail="$(df -P "$(dirname "$backup_dir")" | awk 'END{print $4}')"
+  if [ -n "$avail" ] && [ "$avail" -lt 10240 ]; then
+    warn "Espaço livre pequeno para backup em $(dirname "$backup_dir"): ${avail}K"
+  fi
+
+  # Copy installed files record (manifest + build-info)
+  if [ -d "$installed_dir" ]; then
+    mkdir -p "$backup_dir" 2>/dev/null || true
+    cp -a "$installed_dir" "$backup_dir" 2>/dev/null || true
+    ok "Backup criado em $backup_dir"
+  fi
+  return 0
+}
+
+########################
+# remove_previous_install <name> <version>
+# Removes files listed in installed manifest (with safety checks).
+########################
+remove_previous_install() {
+  local name="$1" version="$2"
+  local installed_dir="$ADM_INSTALLED_DB/$name/$version"
+  local manifest="$installed_dir/manifest.txt"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) remove_previous_install $name $version (manifest: $manifest)"
+    return 0
+  fi
+
+  if [ ! -f "$manifest" ]; then
+    verbose "Sem manifest para $name-$version; nada a remover"
+    return 0
+  fi
+
+  info "Removendo arquivos da instalação anterior ($name-$version) — ver manifest"
+  while IFS= read -r file; do
+    # Convert to absolute path
+    local abs="$TARGET_DIR/${file#/}"
+    # Safety: do not remove critical paths unless --force
+    if is_critical_path "$abs" && [ "$FORCE" -ne 1 ]; then
+      warn "Arquivo crítico detectado no manifest: $abs — não será removido sem --force"
+      continue
+    fi
+    if [ -e "$abs" ]; then
+      ## RISCO: remoção permanente de arquivo do sistema
+      rm -f "$abs" 2>/dev/null || true
+      # if dir: attempt rmdir if empty
+      rmdir --ignore-fail-on-non-empty "$(dirname "$abs")" 2>/dev/null || true
+    fi
+  done <"$manifest"
+  ok "Remoção anterior (segura) concluída"
+  return 0
+}
+
+########################
+# detect_conflicting_files_in_tarball <tarball> <target_dir>
+# Scans tarball listing and tests for conflicts with existing files.
+# Returns list in CONFLICT_FILES global.
+########################
+detect_conflicting_files_in_tarball() {
+  local tar="$1" target_dir="$2"
+  CONFLICT_FILES=()
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) detectar conflitos em $tar -> $target_dir"
+    return 0
+  fi
+  verbose "Verificando conflitos de arquivos entre tarball e $target_dir"
+  # list entries (files only)
+  local entries
+  entries="$(tar -tf "$tar" 2>/dev/null || true)"
+  if [ -z "$entries" ]; then
+    warn "Tarball vazio ou listagem falhou"
+    return 0
+  fi
+  # Normalize entries: remove leading './' and topdir if present
+  # We'll just check each file existence at target_dir/path
+  while IFS= read -r e; do
+    # skip directories
+    case "$e" in
+      */) continue ;;
+    esac
+    # normalize: remove leading './'
+    local rel="${e#./}"
+    # If tarball stores as name/version/..., strip topdir component
+    rel="$(echo "$rel" | sed 's|^[^/]*/||')"
+    local abs="$target_dir/${rel#/}"
+    if [ -e "$abs" ]; then
+      CONFLICT_FILES+=("$abs")
+    fi
+  done <<<"$entries"
+
+  if [ ${#CONFLICT_FILES[@]} -gt 0 ]; then
+    warn "Foram detectados ${#CONFLICT_FILES[@]} arquivos que entrariam em conflito com o sistema existente"
+    # print a small sample
+    for i in "${!CONFLICT_FILES[@]}"; do
+      [ "$i" -ge 20 ] && break
+      verbose "  - ${CONFLICT_FILES[$i]}"
+    done
+  else
+    verbose "Nenhum conflito detectado"
+  fi
+  return 0
+}
+
+########################
+# remove_conflicting_files <files_array>
+# Remove files detected as conflicts if --force specified; otherwise prompts.
+########################
+remove_conflicting_files() {
+  local -n files_ref=$1
+  if [ ${#files_ref[@]} -eq 0 ]; then return 0; fi
+
+  info "Gerenciando arquivos conflitantes (${#files_ref[@]})"
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm "Confirma remoção/backup dos arquivos conflitantes listados? (necessário para prosseguir)"; then
+      err "Usuário recusou resolver conflitos. Abortando."
+      return 2
+    fi
+  fi
+
+  for f in "${files_ref[@]}"; do
+    if is_critical_path "$f" && [ "$FORCE" -ne 1 ]; then
+      warn "Arquivo crítico $f não será removido sem --force"
+      continue
+    fi
+    # backup the file to ADM_INSTALLED_DB/backups before removal
+    local bakdir="$ADM_INSTALLED_DB/backups/overwrites-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$bakdir"
+    if [ -e "$f" ]; then
+      # preserve permissions/owner by cp -a
+      cp -a "$f" "$bakdir/" 2>/dev/null || true
+      rm -f "$f" 2>/dev/null || true
+      verbose "Backup e remoção: $f -> $bakdir/"
+    fi
+  done
+  ok "Conflitos processados (forçados)."
+  return 0
+}
+
+########################
+# extract_tarball <tarball> <destdir>
+# Robust extraction pipeline:
+#  - Extract first into a tmp directory to validate
+#  - Verify manifest presence/consistency
+#  - Move files to target atomically (mv)
+#  - Uses pv when available to show progress
+########################
+extract_tarball() {
+  local tar="$1" destdir="$2"
+  local tmp_extract
+  tmp_extract="$(mktemp -d "$ADM_TMP/adm-install-extract-XXXX")"
+  EXTRACT_TMP="$tmp_extract"
+
+  info "Extraindo tarball para diretório temporário $tmp_extract"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) extração $tar -> $tmp_extract"
+    return 0
+  fi
+
+  # ensure destdirs exist
+  mkdir -p "$tmp_extract" "$destdir" 2>/dev/null || true
+
+  # Use streaming decompressor if needed (zstd/xz) and pv for progress
+  local decompress_cmd
+  case "$tar" in
+    *.tar.zst) 
+      if command -v zstd >/dev/null 2>&1; then
+        decompress_cmd="zstd -d -c '$tar'"
+      else
+        err "zstd não disponível para descompressão de $tar"; return 3
+      fi
+      ;;
+    *.tar.xz)
+      if command -v xz >/dev/null 2>&1; then
+        decompress_cmd="xz -dc '$tar'"
+      else
+        err "xz não disponível"; return 3
+      fi
+      ;;
+    *.tar.gz|*.tgz) decompress_cmd="gzip -dc '$tar'" ;;
+    *.tar.bz2) decompress_cmd="bzip2 -dc '$tar'" ;;
+    *.tar) decompress_cmd="cat '$tar'" ;;
+    *) err "Formato de tarball não suportado: $tar"; return 3 ;;
+  esac
+
+  # Attempt 1: streaming extraction via decompressor | tar -x -C tmp
+  spinner_start "Extraindo (1/2) $tar"
+  if command -v pv >/dev/null 2>&1; then
+    # use pv to show progress; fallback silent if pv lacks size
+    eval "$decompress_cmd" | pv -n -s "$TARBALL_SIZE" 2>>"$LOGFILE" | tar -xf - -C "$tmp_extract" >>"$LOGFILE" 2>&1 || rc=$? || true
+    rc=${rc:-${PIPESTATUS[2]:-0}}
+  else
+    eval "$decompress_cmd" | tar -xf - -C "$tmp_extract" >>"$LOGFILE" 2>&1 || rc=$? || true
+    rc=${rc:-${PIPESTATUS[1]:-0}}
+  fi
+  if [ "${rc:-0}" -ne 0 ]; then
+    spinner_stop "extração falhou"
+    warn "Primeira tentativa de extração falhou com código $rc; tentando extrair via tar diretamente..."
+    # fallback: tar can auto-detect compression if file passed directly
+    spinner_start "Extraindo (2/2) via tar auto-detect"
+    if tar -xf "$tar" -C "$tmp_extract" >>"$LOGFILE" 2>&1; then
+      spinner_stop "extração alternativa concluída"
+    else
+      spinner_stop "extração alternativa falhou"
+      err "Extração falhou definitivamente. Veja $LOGFILE"
+      # cleanup tmp
+      rm -rf "$tmp_extract" 2>/dev/null || true
+      return 4
+    fi
+  else
+    spinner_stop "extração concluída"
+  fi
+
+  # Validate extraction succeeded and manifest present (if expected)
+  if [ -n "$MANIFEST_INSIDE" ]; then
+    # ensure manifest exists in tmp_extract
+    if ! find "$tmp_extract" -type f -name "manifest*" | grep -q .; then
+      warn "Manifest esperado não encontrado dentro do tarball extraído"
+      # Not fatal: continue but warn
+    fi
+  fi
+
+  # Security check: ensure no files in tmp_extract would attempt to overwrite device nodes or symlinks pointing outside target
+  verbose "Verificando travessias (symlink escapes) e nodes perigosos"
+  local bad=0
+  while IFS= read -r f; do
+    # detect device nodes / FIFOs / sockets
+    if [ -b "$f" ] || [ -c "$f" ] || [ -p "$f" ] || [ -S "$f" ]; then
+      warn "Arquivo especial detectado e bloqueado (device/socket/pipe): $f"
+      bad=1
+      continue
+    fi
+    # detect symlink escapes: symlink that points outside extraction root after resolution
+    if [ -L "$f" ]; then
+      local target
+      target="$(readlink -f "$f")"
+      if [[ "$target" != "$tmp_extract"* ]]; then
+        warn "Symlink apontando para fora do pacote detectado: $f -> $target"
+        bad=1
+      fi
+    fi
+  done < <(find "$tmp_extract" -print)
+
+  if [ "$bad" -ne 0 ]; then
+    err "Arquivos perigosos detectados dentro do tarball. Abortando."
+    rm -rf "$tmp_extract" 2>/dev/null || true
+    return 5
+  fi
+
+  # If all ok, move/copy files to target dir
+  info "Movendo arquivos extraídos para $destdir"
+  # We'll move contents of tmp_extract into destdir preserving attributes
+  # To avoid partial update, move into a tmp subdir under target and then rename (atomic as possible)
+  local target_tmp="${destdir}.tmp-${TS}"
+  if [ -d "$target_tmp" ]; then rm -rf "$target_tmp" 2>/dev/null || true; fi
+  mkdir -p "$target_tmp" 2>/dev/null || true
+
+  # Move using rsync if available to preserve attributes; fallback to cp -a then mv
+  if command -v rsync >/dev/null 2>&1; then
+    spinner_start "Sincronizando arquivos para $target_tmp"
+    rsync -aHAX --delete "$tmp_extract"/ "$target_tmp"/ >>"$LOGFILE" 2>&1 || rc=$?
+    rc=${rc:-0}
+    spinner_stop "Sincronização concluída"
+    if [ "$rc" -ne 0 ]; then
+      warn "rsync retornou $rc; tentando cp -a fallback"
+      cp -a "$tmp_extract"/. "$target_tmp"/ 2>>"$LOGFILE" || true
+    fi
+  else
+    spinner_start "Copiando arquivos para $target_tmp"
+    cp -a "$tmp_extract"/. "$target_tmp"/ >>"$LOGFILE" 2>&1 || true
+    spinner_stop "Cópia concluída"
+  fi
+
+  # Basic verification: ensure target_tmp has files
+  if [ -z "$(ls -A "$target_tmp" 2>/dev/null || true)" ]; then
+    err "Extração falhou: diretório temporário de destino vazio após cópia"
+    rm -rf "$tmp_extract" "$target_tmp" 2>/dev/null || true
+    return 6
+  fi
+
+  # Now atomically merge: if destdir is root-target (/usr), we'll move files into place carefully
+  # We'll walk files under target_tmp and move to destdir
+  spinner_start "Instalando arquivos em $destdir"
+  # iterate to preserve file order
+  (cd "$target_tmp" && find . -mindepth 1 -print0) | while IFS= read -r -d '' f; do
+    local rel="${f#./}"
+    local src="$target_tmp/$rel"
+    local dest="$destdir/$rel"
+    mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+    # If dest exists and is a different file, handle based on FORCE
+    if [ -e "$dest" ]; then
+      if is_critical_path "$dest" && [ "$FORCE" -ne 1 ]; then
+        warn "Arquivo crítico detectado: $dest — não sobrescrito (use --force para forçar)"
+        continue
+      fi
+      # backup existing file before overwrite
+      local bakdir="$ADM_INSTALLED_DB/backups/preinstall-$(date +%Y%m%d-%H%M%S)"
+      mkdir -p "$bakdir"
+      if [ -e "$dest" ]; then
+        cp -a "$dest" "$bakdir/" 2>/dev/null || true
+      fi
+    fi
+    # Move (prefer mv)
+    mv -f "$src" "$dest" 2>>"$LOGFILE" || {
+      # fallback cp
+      cp -a "$src" "$dest" 2>>"$LOGFILE" || warn "Falha ao mover $src -> $dest"
+    }
+  done
+  spinner_stop "Instalação de arquivos concluída"
+
+  # cleanup tmp dirs
+  rm -rf "$tmp_extract" "$target_tmp" 2>/dev/null || true
+
+  ok "Extração e instalação concluída para $tar -> $destdir"
+  return 0
+}
+
+########################
+# run_hooks_pre_install <pkgdir>
+########################
+run_hooks_pre_install() {
+  local pkgdir="$1"
+  if [ "$NO_HOOKS" -eq 1 ]; then verbose "Hooks desativados (--no-hooks)"; return 0; fi
+  local hook="$pkgdir/hooks/pre-install"
+  if [ -x "$hook" ]; then
+    info "Executando hook pre-install: $hook"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) $hook"
+      return 0
+    fi
+    (cd "$TARGET_DIR" && "$hook") >>"$INSTALL_LOG" 2>&1 || {
+      warn "hook pre-install retornou erro (continuando): $hook"
+    }
+  fi
+  return 0
+}
+
+########################
+# run_hooks_post_install <pkgdir>
+########################
+run_hooks_post_install() {
+  local pkgdir="$1"
+  if [ "$NO_HOOKS" -eq 1 ]; then verbose "Hooks desativados (--no-hooks)"; return 0; fi
+  local hook="$pkgdir/hooks/post-install"
+  if [ -x "$hook" ]; then
+    info "Executando hook post-install: $hook"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) $hook"
+      return 0
+    fi
+    (cd "$TARGET_DIR" && "$hook") >>"$INSTALL_LOG" 2>&1 || warn "hook post-install retornou erro"
+  fi
+  return 0
+}
+
+########################
+# run_hook_on_failure <pkgdir>
+########################
+run_hook_on_failure() {
+  local pkgdir="$1"
+  local hook="$pkgdir/hooks/on-failure"
+  if [ -x "$hook" ]; then
+    info "Executando hook on-failure: $hook"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) $hook"
+      return 0
+    fi
+    (cd "$TARGET_DIR" && "$hook") >>"$INSTALL_LOG" 2>&1 || warn "hook on-failure retornou erro"
+  fi
+  return 0
+}
+
+########################
+# create_installed_record <name> <version> <tarball> <sha>
+# Writes manifest, build-info, install.log into ADM_INSTALLED_DB
+########################
+create_installed_record() {
+  local name="$1" version="$2" tarball="$3" sha="$4"
+  local installed_dir="$ADM_INSTALLED_DB/$name/$version"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) create_installed_record $installed_dir (tarball=$tarball sha=$sha)"
+    return 0
+  fi
+  mkdir -p "$installed_dir" 2>/dev/null || true
+
+  # Build manifest: list files under TARGET_DIR that belong to package
+  # Heuristic: compare tarball listing entries and convert to absolute paths under TARGET_DIR
+  local tmp_manifest
+  tmp_manifest="$(mktemp "$ADM_TMP/manifest.XXXX")" || tmp_manifest="$installed_dir/manifest.txt"
+  tar -tf "$tarball" 2>>"$INSTALL_LOG" | sed 's|^\./||' | sed 's|^[^/]*/||' | awk '{print "/"$0}' >"$tmp_manifest" 2>>"$INSTALL_LOG" || true
+
+  # sanitize manifest: remove entries that don't exist in TARGET_DIR (optional)
+  local final_manifest="$installed_dir/manifest.txt"
+  >"$final_manifest"
+  while IFS= read -r p; do
+    # if file exists under TARGET_DIR
+    local abs="$TARGET_DIR/${p#/}"
+    if [ -e "$abs" ]; then
+      printf "%s\n" "${p}" >>"$final_manifest"
+    else
+      # still record absent entries for audit
+      printf "%s\n" "${p}" >>"$final_manifest"
+    fi
+  done <"$tmp_manifest"
+
+  # copy build-info.json out of tarball if present
+  if [ -n "$BUILDINFO_INSIDE" ]; then
+    tar -xOf "$tarball" "$BUILDINFO_INSIDE" >"$installed_dir/build-info.json" 2>>"$INSTALL_LOG" || true
+  fi
+
+  # copy install log
+  cp -a "$INSTALL_LOG" "$installed_dir/install.log" 2>/dev/null || true
+
+  # write meta index entry
+  local idx="$ADM_INSTALLED_DB/index.json"
+  if [ -f "$idx" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>>"$INSTALL_LOG" || true
+import json,sys,os
+idx_path=sys.argv[1]
+name=sys.argv[2];ver=sys.argv[3];tar=sys.argv[4];sha=sys.argv[5]
+arr=[]
+if os.path.exists(idx_path):
+    arr=json.load(open(idx_path))
+arr=[e for e in arr if not (e.get("name")==name and e.get("version")==ver)]
+arr.append({"name":name,"version":ver,"tarball":tar,"sha":sha,"install_ts":"%s","host":"%s"})
+open(idx_path,'w').write(json.dumps(arr,indent=2))
+PY
+"$idx" "$name" "$version" "$tarball" "$sha" "$TS" "$HOSTNAME"
+  else
+    # fallback text record
+    printf "%s %s %s %s %s\n" "$name" "$version" "$tarball" "$sha" "$TS" >>"$ADM_INSTALLED_DB/index.txt" 2>>"$INSTALL_LOG" || true
+  fi
+
+  ok "Registro da instalação criado em $installed_dir"
+  rm -f "$tmp_manifest" 2>/dev/null || true
+  return 0
+}
+
+########################
+# check_and_install_package (orchestrator for install steps)
+########################
+check_and_install_package() {
+  # Ensure tarball located and meta read
+  if [ -z "$TARBALL_PATH" ]; then
+    err "Nenhum tarball especificado para instalação"
+    return 2
+  fi
+
+  # Read metadata from tarball (part1 function)
+  read_meta_from_tarball "$TARBALL_PATH" || { err "Não foi possível ler meta do tarball"; return 3; }
+
+  # Verify integrity
+  verify_tarball_integrity "$TARBALL_PATH" "$TARBALL_SHA_EXPECTED" || {
+    warn "Verificação de integridade falhou; use --force para ignorar"
+    if [ "$FORCE" -ne 1 ]; then return 4; fi
+  }
+
+  # Detect conflicts
+  detect_conflicting_files_in_tarball "$TARBALL_PATH" "$TARGET_DIR"
+  if [ ${#CONFLICT_FILES[@]} -gt 0 ]; then
+    # If conflicts present and not forced, ask user
+    if [ "$FORCE" -ne 1 ]; then
+      warn "Conflitos detectados — pedindo confirmação"
+      if ! confirm "Existem ${#CONFLICT_FILES[@]} arquivos em conflito. Deseja removê-los/backup e prosseguir?"; then
+        err "Instalação abortada por falta de confirmação para sobrescrita"
+        return 5
+      fi
+    fi
+    # Remove conflicting files (backing up)
+    remove_conflicting_files CONFLICT_FILES || warn "Falha ao remover conflitos (continuando)"
+  fi
+
+  # run pre-install hooks from metafile if possible (determine pkgdir)
+  local pkgdir=""
+  # try to find metafile in ADM_METAFILES by name
+  if [ -n "${TARBALL_NAME:-}" ]; then
+    if compgen -G "$ADM_ROOT/metafiles/*/${TARBALL_NAME}/metafile" >/dev/null 2>&1; then
+      pkgdir="$(dirname "$(compgen -G "$ADM_ROOT/metafiles/*/${TARBALL_NAME}/metafile" | head -n1)")"
+    fi
+  fi
+  run_hooks_pre_install "${pkgdir:-.}"
+
+  # Backup previous installation if same name/version present
+  if [ -n "${TARBALL_NAME:-}" ] && [ -n "${TARBALL_VERSION:-}" ]; then
+    backup_previous_install "$TARBALL_NAME" "$TARBALL_VERSION"
+  fi
+
+  # Extract into temp and then move into TARGET_DIR
+  extract_tarball "$TARBALL_PATH" "$TARGET_DIR" || {
+    warn "Extração falhou; executando on-failure hooks"
+    run_hook_on_failure "${pkgdir:-.}"
+    return 6
+  }
+
+  # Post-install hooks
+  run_hooks_post_install "${pkgdir:-.}"
+
+  # Create installed record
+  create_installed_record "${TARBALL_NAME:-unknown}" "${TARBALL_VERSION:-unknown}" "$TARBALL_PATH" "${TARBALL_SHA_ACTUAL:-}" || warn "Falha ao criar registro instalado"
+
+  ok "Pacote instalado: ${TARBALL_NAME:-unknown}-${TARBALL_VERSION:-unknown}"
+  return 0
+}
+
+##### -------------------------
+##### End of PARTE 2/3
+##### -------------------------
+# A PARTE 3/3 conterá:
+#  - resolução de dependências automática (integração com adm-resolver),
+#  - verificações finais (ldd/readelf para runtime deps e advertências),
+#  - limpeza final, permissões, selinux labeling optional,
+#  - resumo final (prints) e códigos de saída detalhados,
+#  - chamada principal que une locate_tarball -> check_and_install_package + traps.
+#
+# Peça "PARTE 3/3" que eu gero agora.
+##### -------------------------
+##### PARTE 3/3 - resolução de deps, verificações finais, resumo e main
+##### -------------------------
+
+# Assumimos que PARTES 1/3 e 2/3 já definiram todas as funções e variáveis usadas (safe_run, spinner, etc.)
+
+########################
+# resolve_dependencies_via_adm_resolver <name> <version>
+# Tries to call adm-resolver to ensure run-time/build deps are present.
+# Returns 0 if satisfied or no resolver present (and RESOLVE_DEPS=0),
+# returns non-zero if failed to resolve.
+########################
+resolve_dependencies_via_adm_resolver() {
+  local name="$1" version="$2"
+
+  if [ "$RESOLVE_DEPS" -ne 1 ]; then
+    verbose "Resolução de dependências desativada (--no-resolve-deps)"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) resolver dependências para $name-$version (via adm-resolver)"
+    return 0
+  fi
+
+  if command -v adm-resolver >/dev/null 2>&1; then
+    info "Resolvendo dependências via adm-resolver para $name-$version"
+    # adm-resolver should support something like: adm-resolver resolve name version --install
+    if adm-resolver resolve "$name" "$version" --install >>"$INSTALL_LOG" 2>&1; then
+      ok "Dependências resolvidas"
+      return 0
+    else
+      warn "adm-resolver reportou falha ao resolver dependências (veja $INSTALL_LOG)"
+      return 2
+    fi
+  else
+    warn "adm-resolver não encontrado; não é possível resolver dependências automaticamente"
+    return 1
+  fi
+}
+
+########################
+# verify_runtime_links <target_dir>
+# Walks executables/so under target_dir and runs ldd/readelf to find missing libs
+# Emits warnings if missing, returns 0 if OK or only nonfatal warnings, 2 if critical.
+########################
+verify_runtime_links() {
+  local target_dir="$1"
+  local missing_count=0
+  local forbidden=0
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) verificar links runtime em $target_dir"
+    return 0
+  fi
+
+  verbose "Verificando dependências runtime (ldd/readelf) em $target_dir"
+  # find ELF binaries and libs
+  while IFS= read -r -d '' f; do
+    # skip if not regular file
+    [ -f "$f" ] || continue
+    # use file to detect ELF
+    if file "$f" 2>/dev/null | grep -qi 'ELF'; then
+      # use ldd where possible
+      if command -v ldd >/dev/null 2>&1; then
+        local out
+        out="$(ldd "$f" 2>&1 || true)"
+        if echo "$out" | grep -q 'not found'; then
+          warn "Dependência faltando em $(realpath --relative-to="$TARGET_DIR" "$f"):"
+          echo "$out" | grep 'not found' | sed 's/^/  /'
+          missing_count=$((missing_count+1))
+        fi
+      else
+        # fallback to readelf
+        if command -v readelf >/dev/null 2>&1; then
+          local needed
+          needed="$(readelf -d "$f" 2>/dev/null | awk -F'[][]' '/NEEDED/ {print $2}' || true)"
+          for lib in $needed; do
+            # try to find lib on system via ldconfig -p
+            if command -v ldconfig >/dev/null 2>&1; then
+              if ! ldconfig -p | awk '{print $1}' | grep -q "^$lib$"; then
+                warn "Biblioteca $lib necessária por $f não encontrada pelo ldconfig"
+                missing_count=$((missing_count+1))
+              fi
+            fi
+          done
+        fi
+      fi
+    fi
+  done < <(find "$target_dir" -type f -print0 2>/dev/null)
+
+  if [ "$missing_count" -gt 0 ]; then
+    warn "Foram detectadas $missing_count dependências ausentes em runtime. Recomenda-se resolver antes de considerar pacote pronto."
+    return 2
+  fi
+
+  ok "Verificação de links runtime concluída sem dependências faltantes detectadas"
+  return 0
+}
+
+########################
+# compute_file_checksums <installed_dir>
+# Computes sha256 for each file listed in manifest and writes files.sha256
+########################
+compute_file_checksums() {
+  local name="$1" version="$2"
+  local installed_dir="$ADM_INSTALLED_DB/$name/$version"
+  local manifest="$installed_dir/manifest.txt"
+  local out="$installed_dir/files.sha256"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) calcular checksums para $installed_dir (manifest: $manifest)"
+    return 0
+  fi
+
+  if [ ! -f "$manifest" ]; then
+    warn "Manifest não encontrado para checksums: $manifest"
+    return 1
+  fi
+
+  info "Calculando SHA256 para arquivos instalados (pode demorar)"
+  : >"$out"
+  while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    local abs="$TARGET_DIR/${rel#/}"
+    if [ -f "$abs" ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$abs" >>"$out" 2>>"$INSTALL_LOG" || true
+      elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$abs" >>"$out" 2>>"$INSTALL_LOG" || true
+      fi
+    else
+      printf "%s  (missing)\n" "$rel" >>"$out"
+    fi
+  done <"$manifest"
+
+  ok "Checksums escritos em $out"
+  return 0
+}
+
+########################
+# apply_selinux_labeling (optional)
+# Attempts to relabel installed files if semanage/restorecon available
+########################
+apply_selinux_labeling() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) aplicar selinux labeling (se configurado)"
+    return 0
+  fi
+  if command -v restorecon >/dev/null 2>&1; then
+    info "Aplicando selinux labeling via restorecon"
+    safe_run "restorecon on ${TARGET_DIR}" restorecon -R -v "${TARGET_DIR}" >>"$INSTALL_LOG" 2>&1 || warn "restorecon apresentou aviso/erro"
+  else
+    verbose "restorecon não disponível; pulando selinux labeling"
+  fi
+  return 0
+}
+
+########################
+# finalize_installation: runs final checks and housekeeping
+########################
+finalize_installation() {
+  local name="$1" version="$2"
+  local installed_dir="$ADM_INSTALLED_DB/$name/$version"
+
+  # verify runtime links
+  verify_runtime_links "$TARGET_DIR" || warn "Problemas detectados em runtime links (veja logs)."
+
+  # compute file checksums (optional)
+  compute_file_checksums "$name" "$version" || warn "Falha ao calcular checksums por arquivo."
+
+  # apply selinux labels (best-effort)
+  apply_selinux_labeling || warn "Selinux labeling gerou avisos"
+
+  # update timestamp in installed record (touch)
+  if [ "$DRY_RUN" -eq 0 ]; then
+    touch "$installed_dir/installed_ts" 2>/dev/null || true
+  fi
+
+  ok "Finalização e verificações concluídas para $name-$version"
+  return 0
+}
+
+########################
+# print final summary and exit codes
+########################
+print_install_summary() {
+  local name="$1" version="$2" rc="$3"
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$rc" -eq 0 ]; then
+    printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "Instalação concluída: $name-$version"
+    printf "Destino: %s\n" "$TARGET_DIR"
+    printf "Tarball: %s\n" "$TARBALL_PATH"
+    [ -n "${TARBALL_SHA_ACTUAL:-}" ] && printf "Tarball SHA256: %s\n" "$TARBALL_SHA_ACTUAL"
+    printf "Registro instalado em: %s\n" "$ADM_INSTALLED_DB/$name/$version"
+  else
+    printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "Instalação falhou: $name-$version (rc=$rc)"
+    printf "Veja log: %s\n" "$INSTALL_LOG"
+  fi
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+########################
+# main runtime flow
+########################
+_main_install() {
+  local rc=0
+  local start_ts
+  start_ts="$(date +%s)"
+
+  # Acquire global lock for safety (use target name if available)
+  local lockfile
+  lockfile="$(_acquire_lock "adm-install")" || { err "Outro processo adm-install pode estar em execução. Abortando."; return 2; }
+
+  # 1) locate tarball
+  if ! locate_tarball "$TARGET_RAW"; then
+    err "Tarball não encontrado para '$TARGET_RAW' (procure em $ADM_TARBALLS_DIR ou use caminho completo)"
+    _release_lock "$lockfile"
+    return 3
+  fi
+
+  # set TARBALL_PATH from locate_tarball
+  verbose "Tarball selecionado: $TARBALL_PATH"
+
+  # 2) read meta & set globals (name/version)
+  read_meta_from_tarball "$TARBALL_PATH" || { err "Não foi possível ler metadados do tarball"; _release_lock "$lockfile"; return 4; }
+
+  # 3) optional: resolve deps (run-time) before actually installing (so we don't leave half-installed package)
+  if [ -n "${TARBALL_NAME:-}" ]; then
+    if ! resolve_dependencies_via_adm_resolver "$TARBALL_NAME" "$TARBALL_VERSION"; then
+      warn "Resolução automática de dependências falhou ou não disponível"
+      # if failure and not forced, ask user
+      if [ "$FORCE" -ne 1 ]; then
+        if ! confirm "Resolução de dependências falhou; deseja prosseguir mesmo assim?"; then
+          _release_lock "$lockfile"
+          return 5
+        fi
+      fi
+    fi
+  fi
+
+  # 4) prepare installed db dir
+  prepare_installed_db "${TARBALL_NAME:-unknown}" "${TARBALL_VERSION:-unknown}"
+
+  # 5) orchestrate install steps
+  if ! check_and_install_package; then
+    rc=$?
+    warn "check_and_install_package retornou código $rc"
+    # run on-failure hook if possible
+    run_hook_on_failure "." || true
+    print_install_summary "${TARBALL_NAME:-unknown}" "${TARBALL_VERSION:-unknown}" "$rc"
+    _release_lock "$lockfile"
+    return $rc
+  fi
+
+  # 6) finalize
+  finalize_installation "${TARBALL_NAME:-unknown}" "${TARBALL_VERSION:-unknown}" || warn "finalize_installation teve avisos"
+
+  # 7) print summary
+  print_install_summary "${TARBALL_NAME:-unknown}" "${TARBALL_VERSION:-unknown}" 0
+
+  # 8) cleanup (if any final temp dirs lingering)
+  if [ -n "${EXTRACT_TMP:-}" ] && [ -d "$EXTRACT_TMP" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) cleanup $EXTRACT_TMP"
+    else
+      rm -rf "$EXTRACT_TMP" 2>/dev/null || true
+    fi
+  fi
+
+  # release lock
+  _release_lock "$lockfile"
+
+  local end_ts elapsed
+  end_ts="$(date +%s)"
+  elapsed=$((end_ts - start_ts))
+  log_to_file "[END]" "adm-install end $TS target=$TARGET_RAW elapsed=${elapsed}s rc=$rc"
+  return 0
+}
+
+##### Trap handlers
+_on_interrupt_install() {
+  err "Instalação interrompida (SIGINT/SIGTERM). Tentando limpar e preservar backups."
+  # preserve EXTRACT_TMP if exists
+  if [ -n "${EXTRACT_TMP:-}" ] && [ -d "$EXTRACT_TMP" ]; then
+    warn "Preservando diretório temporário: $EXTRACT_TMP"
+  fi
+  exit 130
+}
+trap _on_interrupt_install INT TERM
+
+##### Execute main
+_main_install "$@"
+#
+# Observações finais:
+# - Revise os caminhos CRÍTICOS em CRITICAL_PATHS para adequar ao seu sistema.
+# - Teste em VM/contêiner com --dry-run e --target-dir apontando para uma raiz temporária.
