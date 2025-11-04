@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: Firefox post-build
+# - Verifica sucesso da compilação, executa checagens mínimas, prepara pacote (tarball / package)
+# - Respeita DRY_RUN
+#
+set -euo pipefail
+
+echo "🔍 [firefox post-build] Iniciando validação e empacotamento..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/firefox-build.log}"
+SRC_DIR="$(pwd)"
+OBJDIR="${OBJDIR:-${SRC_DIR}/obj-firefox}"
+DIST_DIR="${DIST_DIR:-${OBJDIR}/dist}"
+PACKAGE_NAME="${PACKAGE_NAME:-firefox-${VERSION:-unknown}}"
+
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+# 0) sanity: verificar se objdir existe e contém binários
+if [ ! -d "$OBJDIR" ]; then
+  echo "❌ OBJDIR não encontrado: $OBJDIR - build não executado?"
+  echo "[`date -u`] post-build abort: objdir missing" >> "$ADM_LOG"
+  exit 1
+fi
+
+# 1) Checar execução do build: procurar binário principal
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria presença de binários em $OBJDIR"
+else
+  # exemplo: linux64 build produz dist/bin/firefox
+  if [ ! -x "${OBJDIR}/dist/bin/firefox" ]; then
+    echo "⚠️  firefox binário não encontrado em ${OBJDIR}/dist/bin/firefox"
+    # tentar detecção alternativa
+    if ls "${OBJDIR}"/dist*/bin/firefox >/dev/null 2>&1; then
+      echo "ℹ️  firefox encontrado em dist*"
+    else
+      echo "❌ Build parece ter falhado (binário ausente). Aborting."
+      echo "[`date -u`] post-build abort: binary not found" >> "$ADM_LOG"
+      exit 2
+    fi
+  fi
+fi
+
+# 2) Executar testes funcionais mínimos (opcional)
+if [ "${RUN_SMOKE_TESTS:-1}" -eq 1 ] && [ "$DRY_RUN" -eq 0 ]; then
+  echo "⚙️  Executando smoke tests básicos (headless)"
+  # Se mozprocess/marionette etc estiverem disponíveis, rodar testes; caso contrário, skip
+  # Aqui faremos um teste simples: --headless -v -silent startup verifica que o binário inicia
+  "${OBJDIR}/dist/bin/firefox" --headless --version >/dev/null 2>&1 || {
+    echo "⚠️  smoke test: firefox não inicializou corretamente"
+    echo "[`date -u`] smoke test failed" >> "$ADM_LOG"
+    # não aborta automaticamente; marca warn
+  }
+fi
+
+# 3) Empacotar artefatos: criar tar.xz/zip a partir do dist dir
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) criaria pacote a partir de $DIST_DIR"
+  exit 0
+fi
+
+mkdir -p "${ADM_ROOT}/cache" 2>/dev/null || true
+PKG_FILE="${ADM_ROOT}/cache/${PACKAGE_NAME}.tar.xz"
+
+if [ -d "$DIST_DIR" ]; then
+  echo "📦 Empacotando $DIST_DIR -> $PKG_FILE (isso pode demorar)"
+  tar -C "$DIST_DIR" -cJf "$PKG_FILE" . || { echo "❌ Falha ao empacotar"; exit 1; }
+  echo "[`date -u`] Packaged: $PKG_FILE" >> "$ADM_LOG"
+  echo "✅ Pacote gerado: $PKG_FILE"
+else
+  echo "⚠️ Dist dir não encontrado: $DIST_DIR (pode ser que o build use outro caminho)"
+  # tentar localizar dist
+  alt="$(find "$OBJDIR" -maxdepth 3 -type d -name 'dist*' -print -quit || true)"
+  if [ -n "$alt" ]; then
+    echo "ℹ️  Usando dist alternativo: $alt"
+    tar -C "$alt" -cJf "$PKG_FILE" . || { echo "❌ Falha ao empacotar (alt)"; exit 1; }
+    echo "✅ Pacote gerado (alt): $PKG_FILE"
+  else
+    echo "❌ Não foi possível criar pacote: diretório de saída não encontrado"
+    exit 2
+  fi
+fi
+
+# 4) Gerar checksums do pacote
+sha256sum "$PKG_FILE" > "${PKG_FILE}.sha256" || true
+echo "[`date -u`] checksum criado: ${PKG_FILE}.sha256" >> "$ADM_LOG"
+
+echo "✅ [firefox post-build] Finalizado"
