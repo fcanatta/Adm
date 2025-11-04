@@ -1,0 +1,128 @@
+# ===============================================
+# Mozilla Firefox - mozconfig (profile = none)
+# Build mínimo para bootstrap (stage0/stage1)
+# Nenhuma otimização, sem debug pesado, sem LTO, sem PGO.
+# Compatível com ambientes chroot e toolchains incompletas.
+# ===============================================
+
+# Caminho do diretório de build (objdir separado)
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-firefox
+
+# ===============================================
+# 🧩 Configurações gerais
+# ===============================================
+
+# Aplicação alvo
+ac_add_options --enable-application=browser
+
+# Build mais simples e estável possível
+ac_add_options --disable-debug
+ac_add_options --disable-tests
+ac_add_options --disable-updater
+ac_add_options --disable-crashreporter
+ac_add_options --disable-install-strip
+ac_add_options --disable-elf-hack
+ac_add_options --disable-profiling
+ac_add_options --disable-strip
+ac_add_options --disable-optimize
+ac_add_options --disable-lto
+ac_add_options --disable-sandbox
+ac_add_options --disable-webrtc
+ac_add_options --disable-av1
+ac_add_options --disable-libproxy
+ac_add_options --disable-official-branding
+ac_add_options --disable-verify-mar
+ac_add_options --disable-eme
+ac_add_options --disable-parental-controls
+
+# Sem modo release — apenas build funcional básico
+# Ideal para bootstrap e toolchain de teste
+ac_add_options --enable-default-toolkit=cairo-gtk3
+
+# ===============================================
+# 🦀 Rust / LLVM mínimos
+# ===============================================
+
+# Usa gcc/ld padrão se clang não estiver disponível
+CC=${CC:-gcc}
+CXX=${CXX:-g++}
+LD=${LD:-ld}
+
+# Se clang disponível, usa ele (mais previsível)
+if which clang >/dev/null 2>&1; then
+  CC=clang
+  CXX=clang++
+  LD=lld
+fi
+
+export CC CXX LD
+
+# Desativa otimizações Rust
+export RUSTFLAGS="-C opt-level=0 -C debuginfo=1"
+export CARGO_INCREMENTAL=1
+
+# ===============================================
+# 🔨 Simplificações de build
+# ===============================================
+
+# Menor paralelismo para ambientes pequenos
+mk_add_options MOZ_MAKE_FLAGS=-j2
+
+# Desativa uso de ccache (para evitar ruídos no bootstrap)
+unset CCACHE_DIR || true
+ac_add_options --without-ccache
+
+# Evita LTO/PGO e reprodutibilidade forçada
+unset MOZ_LTO
+unset MOZ_THIN_LTO
+unset ADM_PGO
+
+# ===============================================
+# 📦 Paths de instalação e output
+# ===============================================
+
+# Prefixo /usr (mas adm-build moverá via DESTDIR)
+ac_add_options --prefix=/usr
+ac_add_options --libdir=/usr/lib
+ac_add_options --bindir=/usr/bin
+
+# ===============================================
+# 🌐 Dependências mínimas
+# ===============================================
+
+# Usa bibliotecas do sistema, reduzindo build interno
+ac_add_options --with-system-nspr
+ac_add_options --with-system-nss
+ac_add_options --without-system-libvpx
+ac_add_options --without-system-icu
+ac_add_options --without-system-pixman
+ac_add_options --without-system-harfbuzz
+ac_add_options --without-system-freetype
+
+# ===============================================
+# 🔒 Segurança e estabilidade
+# ===============================================
+
+# Sem sandbox (para permitir execução em bootstrap)
+ac_add_options --disable-content-sandbox
+
+# Nenhum hardening (melhor compatibilidade inicial)
+ac_add_options --disable-hardening
+
+# ===============================================
+# 📜 Registro e diagnóstico
+# ===============================================
+
+# Verbose logging para debugging básico
+export MOZ_VERBOSE_LOGGING=1
+export RUST_BACKTRACE=1
+
+# ===============================================
+# 🧹 Pós-build (manutenção)
+# ===============================================
+
+# Não stripar binários (útil para debugging)
+STRIP_FLAGS=""
+export STRIP_FLAGS
+
+# O adm-post-build empacotará dist/bin sem limpeza extra
