@@ -1,0 +1,1047 @@
+#!/usr/bin/env bash
+#
+# adm-conf - init, check, sync (robusto, sem erros silenciosos)
+#
+# Funções principais:
+#  - init    : cria estrutura /usr/src/adm, detecta ferramentas e escreve adm.conf (com backup)
+#  - check   : valida arquivos, diretórios, permissões e dependências
+#  - sync    : exporta variáveis de adm.conf no ambiente atual (cuidado)
+#  - set/unset/profile/verify serão implementadas nas partes seguintes
+#
+# Segurança:
+#  ## RISCO: sobrescrever adm.conf pode remover customizações -> backup e confirmação.
+#  ## RISCO: sync exporta variáveis no ambiente atual; use com cautela e preferir --dry-run.
+# # Diagnóstico completo com relatório JSON
+# adm-conf diagnose
+# Apenas verificar ambiente
+# adm-conf verify
+# Corrigir inconsistências simples
+# adm-conf auto-fix
+# Aplicar perfil "extreme" ao ambiente de build
+# adm-conf apply-profile extreme
+# Recarregar configurações e exportar ADM_* variáveis
+# adm-conf reload && adm-conf env
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+
+# --- Defaults (can be overridden by existing adm.conf) ---
+ADM_ROOT_DEFAULT="/usr/src/adm"
+ADM_CONF_PATH_DEFAULT="${ADM_ROOT_DEFAULT}/adm.conf"
+ADM_LOGS_DEFAULT="${ADM_ROOT_DEFAULT}/logs"
+ADM_TMP_DEFAULT="${ADM_ROOT_DEFAULT}/tmp"
+ADM_CACHE_DEFAULT="${ADM_ROOT_DEFAULT}/cache"
+ADM_SCRIPTS_DEFAULT="${ADM_ROOT_DEFAULT}/scripts"
+ADM_HOOKS_DEFAULT="${ADM_ROOT_DEFAULT}/hooks"
+ADM_METAFILES_DEFAULT="${ADM_ROOT_DEFAULT}/metafiles"
+ADM_BUILDS_DEFAULT="${ADM_ROOT_DEFAULT}/builds"
+ADM_TRUSTSTORE_DEFAULT="${ADM_ROOT_DEFAULT}/truststore"
+
+# runtime flags
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+ACTION=""
+# parsed args
+ADM_ROOT=""
+ADM_CONF_PATH=""
+LOGFILE=""
+REPORT_JSON=""
+
+# --- Helpers: colors/icons ---
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"; CLR_BLU="$(tput setaf 4)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""; CLR_BLU=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"; ICON_WORK="⚙️"
+
+# logging helpers
+logfile_default() { printf '%s/%s-%s.log' "${ADM_LOGS:-$ADM_LOGS_DEFAULT}" "${SCRIPT_NAME}" "${TS_NOW}"; }
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+# spinner (non-critical UX)
+_spinner_pid=""
+_spinner_cleanup() { if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then kill "$_spinner_pid" >/dev/null 2>&1 || true; wait "$_spinner_pid" 2>/dev/null || true; fi; _spinner_pid=""; }
+spinner_start() { local msg="$1"; [ "$DRY_RUN" -eq 1 ] && info "(dry-run) $msg" && return 0; printf "%b %s " "${CLR_BLU}${ICON_WORK}${CLR_RST}" "$msg"; ( local i=0; chars='|/-\' ; while :; do printf "\b%s" "${chars:i++%${#chars}:1}"; sleep 0.12; done ) & _spinner_pid=$!; trap _spinner_cleanup EXIT; }
+spinner_stop() { local okmsg="${1:-Done}"; if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi; _spinner_cleanup; printf "\b"; ok "$okmsg"; trap - EXIT; }
+
+# lock helpers
+LOCK_DIR="${ADM_TMP_DEFAULT}/adm-conf-locks"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+acquire_lock() {
+  local key="${1:-global}"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Outra operação adm-conf em andamento para $key (lock: $lockfile)"; return 1; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() { local lockfile="$1"; if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) release lock $lockfile"; return 0; fi; [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true; eval "exec 9>&-"; }
+
+# safe write (atomic)
+safe_write_file() {
+  local dst="$1" tmp="${dst}.$$.$(date +%s)" content="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would write $dst"; return 0; fi
+  printf '%s' "$content" >"$tmp" && mv -f "$tmp" "$dst"
+}
+
+# parse adm.conf into environment (non-exported)
+load_adm_conf_file() {
+  local conf="$1"
+  if [ -z "$conf" ] || [ ! -f "$conf" ]; then return 1; fi
+  # shellcheck disable=SC1090
+  # source in a subshell to avoid polluting current shell unless sync is used
+  ( set -o posix; . "$conf"; printf "__ADM_CONF_LOADED__\n"; env | grep -E '^ADM_' || true ) 2>/dev/null || true
+  return 0
+}
+
+# read adm.conf into associative array (basic parser)
+read_adm_conf_into_vars() {
+  local conf="$1"
+  unset _ADM_CONF_VARS || true
+  declare -gA _ADM_CONF_VARS
+  _ADM_CONF_VARS=()
+  [ -f "$conf" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="$(printf '%s' "$line" | sed -e 's/^\s*//' -e 's/\s*$//')"
+    [ -z "$line" ] && continue
+    case "$line" in '#'* ) continue ;; esac
+    if printf '%s' "$line" | grep -q '='; then
+      key="$(printf '%s' "$line" | cut -d'=' -f1 | sed -e 's/\s*$//' -e 's/[^A-Za-z0-9_]/_/g')"
+      val="$(printf '%s' "$line" | cut -d'=' -f2- | sed -e 's/^["'\'']//; s/["'\'']$//')"
+      _ADM_CONF_VARS["$key"]="$val"
+    fi
+  done <"$conf"
+  return 0
+}
+
+# generate default adm.conf content (shell-friendly)
+generate_default_adm_conf() {
+  local root="$1"
+  cat <<EOF
+# ADM System Configuration (auto-generated)
+ADM_ROOT="${root}"
+ADM_LOGS="\${ADM_ROOT}/logs"
+ADM_TMP="\${ADM_ROOT}/tmp"
+ADM_CACHE="\${ADM_ROOT}/cache"
+ADM_SCRIPTS="\${ADM_ROOT}/scripts"
+ADM_HOOKS="\${ADM_ROOT}/hooks"
+ADM_METAFILES="\${ADM_ROOT}/metafiles"
+ADM_BUILDS="\${ADM_ROOT}/builds"
+ADM_TRUSTSTORE="\${ADM_ROOT}/truststore"
+
+# Policy & runtime
+ADM_POLICY="audit"          # strict | audit | trust
+ADM_SANDBOX="auto"          # auto | nsjail | bwrap | chroot | none
+ADM_PARALLEL=4              # default parallel jobs
+ADM_TIMEOUT=180             # default hook timeout (seconds)
+ADM_OPT_PROFILE="normal"    # none | normal | extreme
+ADM_USE_COLORS=1
+ADM_FORCE_CONFIRM=0
+ADM_DRY_RUN=0
+EOF
+}
+
+# detect common tool presence and versions
+detect_tool_version() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then printf ''; return 1; fi
+  case "$cmd" in
+    gcc|clang|rustc|go|javac|javap)
+      if "$cmd" --version 2>/dev/null | head -n1; then return 0; fi ;;
+    python3)
+      if python3 -V 2>/dev/null | head -n1; then return 0; fi ;;
+    git|make|cmake|pkg-config|curl|wget|tar|xz|zstd)
+      if command -v "$cmd" >/dev/null 2>&1; then printf "%s" "$("$cmd" --version 2>/dev/null | head -n1)"; return 0; fi ;;
+    *)
+      command -v "$cmd" >/dev/null 2>&1 && printf "%s" "$cmd" && return 0 ;;
+  esac
+  return 1
+}
+
+# create directories safely
+ensure_dirs() {
+  local root="$1"
+  shift
+  for d in "$root" "$root/logs" "$root/tmp" "$root/cache" "$root/scripts" "$root/hooks" "$root/metafiles" "$root/builds" "$root/truststore"; do
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) mkdir -p $d"; else mkdir -p "$d" 2>/dev/null || { err "Falha ao criar $d"; return 2; } fi
+  done
+  return 0
+}
+
+# create log/report defaults
+init_logging() {
+  ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+  ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_CONF_PATH_DEFAULT}}"
+  mkdir -p "${ADM_LOGS:-$ADM_LOGS_DEFAULT}" 2>/dev/null || true
+  LOGFILE="${LOGFILE:-$(logfile_default)}"
+  REPORT_JSON="${REPORT_JSON:-${ADM_TMP_DEFAULT}/adm-conf-report-${TS_NOW}.json}"
+  # init empty json report (best-effort)
+  if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+    cat >"$REPORT_JSON" <<JSON
+{
+  "timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "action":"adm-conf",
+  "results":[]
+}
+JSON
+  fi
+}
+
+json_add_report() {
+  local k="$1" v="$2"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) report add $k=$v" && return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys,time
+f=sys.argv[1]; k=sys.argv[2]; v=sys.argv[3]
+d=json.load(open(f))
+d.setdefault('results',[]).append({'key':k,'value':v,'time':time.time()})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    printf '%s: %s\n' "$k" "$v" >>"$REPORT_JSON".txt
+  fi
+}
+
+# prompt confirmation
+confirm_prompt() {
+  local prompt="${1:-Proceed?}"
+  if [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ]; then verbose "(non-interactive) assume yes for: $prompt"; return 0; fi
+  while true; do
+    read -r -p "$prompt [y/N]: " a
+    case "$a" in [Yy]|[Yy][Ee][Ss]) return 0 ;; [Nn]|""|*) return 1 ;; esac
+  done
+}
+
+# write adm.conf safely (backup prior)
+write_adm_conf() {
+  local conf="$1" content="$2"
+  if [ -f "$conf" ]; then
+    local bak="${conf}.bak-${TS_NOW}"
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would backup $conf -> $bak"; else cp -a "$conf" "$bak" 2>/dev/null || warn "Não foi possível criar backup $bak"; fi
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) write adm.conf to $conf"; else safe_write_file "$conf" "$content"; fi
+  ok "adm.conf written: $conf"
+  json_add_report "adm_conf_written" "$conf"
+}
+
+# generate detected resources summary
+detect_system_resources() {
+  spinner_start "Detecting system resources"
+  local comps=("gcc" "clang" "rustc" "go" "python3" "javac" "make" "cmake" "pkg-config" "git" "curl" "wget" "tar" "xz" "zstd" "nsjail" "bwrap")
+  declare -A detected
+  for c in "${comps[@]}"; do
+    if command -v "$c" >/dev/null 2>&1; then
+      detected["$c"]="yes"
+    else
+      detected["$c"]="no"
+    fi
+  done
+  spinner_stop "Detection complete"
+  # return via global associative string (simpler)
+  DETECTED_TOOLS="$(for k in "${!detected[@]}"; do printf '%s=%s\n' "$k" "${detected[$k]}"; done)"
+  json_add_report "detection" "$(printf '%s' "$DETECTED_TOOLS")"
+  return 0
+}
+
+# --- ACTION: init ---
+cmd_init() {
+  acquire_lock "init" || { err "Não foi possível adquirir lock para init"; return 3; }
+  info "Initializing ADM configuration (init)"
+  ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+  ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_CONF_PATH_DEFAULT}}"
+
+  # ensure directories
+  ensure_dirs "$ADM_ROOT" || { release_lock ""; return 4; }
+
+  detect_system_resources
+
+  # generate default conf (and augment with detected tool availability)
+  local conf_content
+  conf_content="$(generate_default_adm_conf "$ADM_ROOT")"
+  # add detected tool flags to conf_content
+  conf_content="$conf_content
+# Detected tools (yes/no)
+"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    k="$(printf '%s' "$line" | cut -d'=' -f1)"
+    v="$(printf '%s' "$line" | cut -d'=' -f2-)"
+    conf_content="$conf_content
+ADM_DETECT_${k}=\"${v}\""
+  done <<<"$DETECTED_TOOLS"
+
+  # warn and confirm if overwriting existing adm.conf
+  if [ -f "$ADM_CONF_PATH" ]; then
+    warn "adm.conf já existe em ${ADM_CONF_PATH}"
+    ## RISCO: sobrescrever adm.conf existente pode perder personalizações
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would prompt to overwrite adm.conf"; else
+      if [ "$FORCE" -ne 1 ]; then
+        if ! confirm_prompt "adm.conf já existe. Sobrescrever?"; then info "Aborting init"; release_lock ""; return 1; fi
+      fi
+    fi
+  fi
+
+  write_adm_conf "$ADM_CONF_PATH" "$conf_content" || { release_lock ""; return 5; }
+
+  ok "ADM initialization complete. adm.conf at: $ADM_CONF_PATH"
+  release_lock ""
+  return 0
+}
+
+# --- ACTION: check ---
+cmd_check() {
+  acquire_lock "check" || { err "Não foi possível adquirir lock para check"; return 3; }
+  info "Running ADM configuration check"
+
+  # decide conf path
+  ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_CONF_PATH_DEFAULT}}"
+  if [ ! -f "$ADM_CONF_PATH" ]; then warn "adm.conf not found at $ADM_CONF_PATH"; json_add_report "check" "adm_conf_missing"; release_lock ""; return 2; fi
+
+  # read conf vars
+  read_adm_conf_into_vars "$ADM_CONF_PATH" || warn "Falha ao ler adm.conf (parsing best-effort)"
+
+  # key checks: directories
+  local -a dirs=( "ADM_ROOT" "ADM_LOGS" "ADM_TMP" "ADM_CACHE" "ADM_SCRIPTS" "ADM_HOOKS" "ADM_METAFILES" "ADM_BUILDS" "ADM_TRUSTSTORE" )
+  local status=0
+  for key in "${dirs[@]}"; do
+    val="${_ADM_CONF_VARS[$key]:-}"
+    if [ -z "$val" ]; then warn "Variable $key is empty in adm.conf"; json_add_report "missing_var_$key" ""; status=1; continue; fi
+    # expand variables if contain ${ADM_ROOT}
+    eval "expanded=\"$val\""
+    if [ -d "$expanded" ]; then
+      if [ -w "$expanded" ]; then ok "$key -> $expanded (exists & writable)"; json_add_report "ok_dir_$key" "$expanded"; else warn "$key -> $expanded exists but not writable"; json_add_report "not_writable_$key" "$expanded"; status=1; fi
+    else
+      warn "$key -> $expanded does not exist"; json_add_report "missing_dir_$key" "$expanded"; status=1
+    fi
+  done
+
+  # tool checks (presence)
+  local -a tools=( gcc clang rustc go python3 make cmake git pkg-config curl wget tar xz zstd )
+  local missing_tools=()
+  for t in "${tools[@]}"; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      missing_tools+=("$t")
+    else
+      verbose "Tool $t present"
+    fi
+  done
+  if [ "${#missing_tools[@]}" -gt 0 ]; then warn "Missing tools: ${missing_tools[*]}"; json_add_report "missing_tools" "$(printf '%s ' "${missing_tools[@]}")"; status=1; else ok "All core tools present"; json_add_report "tools_ok" "1"; fi
+
+  # adm policy validation
+  local policy="${_ADM_CONF_VARS[ADM_POLICY]:-audit}"
+  case "$policy" in strict|audit|trust) ok "Policy: $policy"; json_add_report "policy" "$policy" ;; *) warn "Unknown ADM_POLICY: $policy"; json_add_report "policy_invalid" "$policy"; status=1 ;; esac
+
+  # sandbox validation
+  local sandbox="${_ADM_CONF_VARS[ADM_SANDBOX]:-auto}"
+  case "$sandbox" in
+    auto)
+      if command -v nsjail >/dev/null 2>&1; then ok "Sandbox: nsjail available (auto)"; json_add_report "sandbox" "nsjail"
+      elif command -v bwrap >/dev/null 2>&1; then ok "Sandbox: bubblewrap available (auto)"; json_add_report "sandbox" "bwrap"
+      elif [ "$(id -u)" -eq 0 ]; then ok "Sandbox: chroot available (root)"; json_add_report "sandbox" "chroot"
+      else warn "Sandbox: none detected"; json_add_report "sandbox" "none"; status=1
+      fi
+      ;;
+    nsjail|bwrap|chroot|none) ok "Sandbox configured: $sandbox"; json_add_report "sandbox" "$sandbox" ;;
+    *) warn "Unknown ADM_SANDBOX: $sandbox"; json_add_report "sandbox_invalid" "$sandbox"; status=1 ;;
+  esac
+
+  # permissions sanity: ensure logs/tmp/cache writable
+  local warn_perm=0
+  for key in ADM_LOGS ADM_TMP ADM_CACHE; do
+    val="${_ADM_CONF_VARS[$key]:-${ADM_ROOT}/$key}"
+    eval "p=\"$val\""
+    if [ -d "$p" ]; then
+      if [ ! -w "$p" ]; then warn "Directory not writable: $p"; json_add_report "perm_fail" "$p"; warn_perm=1; fi
+    else
+      warn "Directory missing (will be created on init or sync): $p"; json_add_report "dir_missing" "$p"; warn_perm=1
+    fi
+  done
+  [ "$warn_perm" -eq 1 ] && status=1
+
+  # final status
+  if [ "$status" -eq 0 ]; then ok "ADM configuration check: OK"; else warn "ADM configuration check: issues detected (see report)"; fi
+  release_lock ""
+  return $status
+}
+
+# --- ACTION: sync ---
+cmd_sync() {
+  acquire_lock "sync" || { err "Não foi possível adquirir lock para sync"; return 3; }
+  info "Syncing environment with adm.conf (exporting ADM_* variables)"
+
+  ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_CONF_PATH_DEFAULT}}"
+  if [ ! -f "$ADM_CONF_PATH" ]; then err "adm.conf not found at $ADM_CONF_PATH"; release_lock ""; return 2; fi
+
+  read_adm_conf_into_vars "$ADM_CONF_PATH" || warn "Falha ao parsear adm.conf (best-effort)"
+
+  # Prepare export commands
+  local export_script="${ADM_TMP_DEFAULT}/adm-conf-env-${TS_NOW}.sh"
+  local export_content="# generated by adm-conf sync at ${TS_NOW}\n"
+  for k in "${!_ADM_CONF_VARS[@]}"; do
+    v="${_ADM_CONF_VARS[$k]}"
+    # Only export variables beginning with ADM_
+    case "$k" in ADM_*)
+      # escape quotes
+      v_escaped="$(printf '%s' "$v" | sed -e 's/"/\\"/g')"
+      export_content="${export_content}export ${k}=\"${v_escaped}\"\n"
+      ;;
+    esac
+  done
+
+  # write export script safely
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would write env script $export_script"; info "(dry-run) To apply: source $export_script"; release_lock ""; return 0; fi
+  printf '%b' "$export_content" >"$export_script" && chmod 0644 "$export_script" || { err "Failed to write $export_script"; release_lock ""; return 4; }
+  ok "Environment script generated: $export_script"
+  info "To apply variables to current shell: run 'source $export_script' (or set in your shell rc)"
+
+  json_add_report "sync_script" "$export_script"
+  release_lock ""
+  return 0
+}
+
+# --- CLI parsing ---
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME <command> [options]
+Commands:
+  init                Initialize ADM directories & generate adm.conf
+  check               Validate adm.conf and environment
+  sync                Export ADM_* variables (writes env script under tmp)
+Global options:
+  --conf <path>       Path to adm.conf (default: /usr/src/adm/adm.conf)
+  --root <path>       ADM_ROOT override (default: /usr/src/adm)
+  --dry-run           Simulate actions
+  --force             Assume yes to prompts
+  --verbose (-v)      Verbose output
+  --quiet             Minimal output
+  --help              Show this help
+EOF
+  exit 1
+}
+
+# parse args
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    init|check|sync) ACTION="$1"; shift ;;
+    --conf) ADM_CONF_PATH="$2"; shift 2 ;;
+    --root) ADM_ROOT="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# set defaults and logging
+ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_CONF_PATH_DEFAULT}}"
+ADM_LOGS="${ADM_LOGS:-$ADM_LOGS_DEFAULT}"
+ADM_TMP="${ADM_TMP:-$ADM_TMP_DEFAULT}"
+init_logging
+
+# dispatch
+case "$ACTION" in
+  init) cmd_init; rc=$?; exit $rc ;;
+  check) cmd_check; rc=$?; exit $rc ;;
+  sync) cmd_sync; rc=$?; exit $rc ;;
+  *) usage ;;
+esac
+#!/usr/bin/env bash
+#
+# adm-conf (PARTE 2/3) - set, unset, profile (safe, validated, no silent failures)
+#
+# Requisitos: esta PARTE 2/3 supõe que PARTE 1/3 já definiu helpers:
+#   - acquire_lock, release_lock, safe_write_file, json_add_report, read_adm_conf_into_vars, write_adm_conf, etc.
+# Se estiver usando como arquivo único, garanta que PARTE 1/3 esteja acima deste conteúdo.
+#
+# Funções implementadas:
+#  - cmd_set <VAR>=<VAL>        : add/modify variable in adm.conf (safe backup)
+#  - cmd_unset <VAR>           : remove variable from adm.conf (protected vars guarded)
+#  - cmd_profile [none|normal|extreme] : set optimization profile and adjust flags
+#  - validate_flags             : check that flags are well-formed and safe-ish
+#
+# Segurança:
+#  ## RISCO: alterar adm.conf pode afetar todo o sistema ADM; backups são criados automaticamente.
+#  ## RISCO: profiles 'extreme' aplica LTO/O3 que pode tornar binários incompatíveis com debug; documentado.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# ---- ensure basic helpers exist (if running standalone, provide minimal fallbacks) ----
+: "${ADM_ROOT:=${ADM_ROOT:-/usr/src/adm}}"
+: "${ADM_CONF_PATH:=${ADM_CONF_PATH:-${ADM_ROOT}/adm.conf}}"
+: "${ADM_TMP:=${ADM_TMP:-${ADM_ROOT}/tmp}}"
+: "${ADM_LOGS:=${ADM_LOGS:-${ADM_ROOT}/logs}}"
+
+# minimal fallback helpers if not defined (these mirror functions from PART1)
+if ! declare -F acquire_lock >/dev/null 2>&1; then
+  LOCK_DIR="${LOCK_DIR:-${ADM_TMP}/adm-conf-locks}"
+  mkdir -p "$LOCK_DIR" 2>/dev/null || true
+  acquire_lock() {
+    local key="${1:-global}"
+    local lockfile="${LOCK_DIR}/${key}.lock"
+    exec 9>"$lockfile"
+    if ! flock -n 9; then printf "%s\n" >&2 "lock-failed"; return 1; fi
+    printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+    echo "$lockfile"
+  }
+  release_lock() { local lockfile="$1"; [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true; eval "exec 9>&-"; }
+fi
+
+if ! declare -F safe_write_file >/dev/null 2>&1; then
+  safe_write_file() { local dst="$1" content="$2"; local tmp="${dst}.$$.$(date +%s)"; printf '%s' "$content" >"$tmp" && mv -f "$tmp" "$dst"; }
+fi
+
+if ! declare -F json_add_report >/dev/null 2>&1; then
+  json_add_report() { local k="$1" v="$2"; mkdir -p "$(dirname "${ADM_TMP}/adm-conf-report.txt")" 2>/dev/null || true; printf '%s: %s\n' "$k" "$v" >>"${ADM_TMP}/adm-conf-report.txt"; }
+fi
+
+if ! declare -F read_adm_conf_into_vars >/dev/null 2>&1; then
+  read_adm_conf_into_vars() {
+    local conf="$1"
+    declare -gA _ADM_CONF_VARS || true
+    _ADM_CONF_VARS=()
+    [ -f "$conf" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="$(printf '%s' "$line" | sed -e 's/^\s*//' -e 's/\s*$//')"
+      [ -z "$line" ] && continue
+      case "$line" in '#'* ) continue ;; esac
+      if printf '%s' "$line" | grep -q '='; then
+        key="$(printf '%s' "$line" | cut -d'=' -f1 | sed -e 's/\s*$//' -e 's/[^A-Za-z0-9_]/_/g')"
+        val="$(printf '%s' "$line" | cut -d'=' -f2- | sed -e 's/^["'\'']//; s/["'\'']$//')"
+        _ADM_CONF_VARS["$key"]="$val"
+      fi
+    done <"$conf"
+    return 0
+  }
+fi
+
+# defaults for this part
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+PROTECTED_VARS=( "ADM_ROOT" "ADM_SCRIPTS" "ADM_CONF" "ADM_CONF_PATH" )
+
+# CLI parsing for this part
+ACTION=""
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    set|unset|profile) ACTION="$1"; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --conf) ADM_CONF_PATH="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) printf "Unknown option: %s\n" "$1" >&2; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# map positional
+ARG1="${POSITIONAL[0]:-}"
+ARG2="${POSITIONAL[1]:-}"
+
+# helpers for output
+info() { [ "$QUIET" -eq 0 ] && printf "ℹ️  %s\n" "$1"; }
+ok()   { [ "$QUIET" -eq 0 ] && printf "✔️  %s\n" "$1"; }
+warn() { [ "$QUIET" -eq 0 ] && printf "⚠️  %s\n" "$1" >&2; }
+err()  { [ "$QUIET" -eq 0 ] && printf "❌  %s\n" "$1" >&2; }
+
+# utility: safe backup of adm.conf
+backup_adm_conf() {
+  local conf="${1:-$ADM_CONF_PATH}"
+  [ -f "$conf" ] || return 0
+  local bak="${conf}.bak-${TS_NOW}"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) cp $conf -> $bak"; return 0; fi
+  if cp -a "$conf" "$bak"; then
+    ok "Backup criado: $bak"
+    json_add_report "adm_conf_backup" "$bak"
+    return 0
+  else
+    err "Falha ao criar backup $bak"
+    return 2
+  fi
+}
+
+# utility: atomic update adm.conf preserving comments & other keys not modified
+# behaviour: if key exists, replace; if not, append; preserve shell comments
+update_adm_conf_key() {
+  local conf="${1:-$ADM_CONF_PATH}"
+  local key="$2"
+  local val="$3"
+  # Validate key name
+  if ! printf '%s' "$key" | grep -qE '^[A-Z_][A-Z0-9_]*$'; then err "Invalid variable name: $key"; return 2; fi
+  # read file, replace line starting with key= or append
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) update $conf: $key=\"$val\""; return 0; fi
+  mkdir -p "$(dirname "$conf")" 2>/dev/null || true
+  if [ ! -f "$conf" ]; then
+    printf '%s="%s"\n' "$key" "$val" >"$conf"
+    ok "Created $conf with $key"
+    return 0
+  fi
+  # create temp and perform replacement
+  local tmp="${conf}.$$.$(date +%s)"
+  awk -v K="$key" -v V="$val" -F= '
+    BEGIN{replaced=0}
+    /^#/ { print; next }
+    /^[[:space:]]*$/ { print; next }
+    {
+      line=$0
+      gsub(/^[[:space:]]+/,"",line)
+      split(line,a,"=")
+      key=a[1]
+      if (key==K) {
+         print K"=\""V"\""
+         replaced=1
+      } else {
+         print $0
+      }
+    }
+    END { if (replaced==0) print K"=\""V"\"" }
+  ' "$conf" >"$tmp"
+  mv -f "$tmp" "$conf"
+  ok "Updated $key in $conf"
+  json_add_report "update_key" "$key"
+  return 0
+}
+
+# remove key from adm.conf (comment out or remove)
+remove_adm_conf_key() {
+  local conf="${1:-$ADM_CONF_PATH}"
+  local key="$2"
+  if [ -z "$key" ]; then err "remove_adm_conf_key: key missing"; return 2; fi
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) remove $key from $conf"; return 0; fi
+  if [ ! -f "$conf" ]; then warn "adm.conf not found: $conf"; return 1; fi
+  if printf '%s' "$key" | grep -qE '^(ADM_ROOT|ADM_SCRIPTS|ADM_CONF|ADM_CONF_PATH)$'; then err "Protected key: $key cannot be removed"; return 3; fi
+  local tmp="${conf}.$$.$(date +%s)"
+  awk -v K="$key" -F= '
+    /^#/ { print; next }
+    /^[[:space:]]*$/ { print; next }
+    {
+      gsub(/^[[:space:]]+/,"",$0)
+      split($0,a,"=")
+      if (a[1]==K) {
+         # comment out instead of removing to preserve history
+         print "# REMOVED " $0
+      } else {
+         print $0
+      }
+    }
+  ' "$conf" >"$tmp"
+  mv -f "$tmp" "$conf"
+  ok "Key $key removed (commented) from $conf"
+  json_add_report "remove_key" "$key"
+  return 0
+}
+
+# validate flags for compilations: simple heuristics to avoid injecting dangerous constructs
+validate_flags() {
+  local varname="$1" flags="$2"
+  # disallow unescaped backticks, $(), ;, &&, ||, >, < to reduce injection risk
+  if printf '%s' "$flags" | grep -qE '[`$();&<>]'; then
+    warn "Flags for $varname contain suspicious characters (`, $, ;, &, <, >). Rejecting."
+    return 2
+  fi
+  # allowed characters set
+  if ! printf '%s' "$flags" | grep -qE '^[A-Za-z0-9_\- ,.=+%/]*$'; then
+    warn "Flags for $varname contain potentially unsafe characters. Please review."
+    return 3
+  fi
+  return 0
+}
+
+# profile presets: produce CFLAGS, CXXFLAGS, LDFLAGS, RUSTFLAGS
+profile_generate_flags() {
+  local profile="$1"
+  local -A flags
+  flags=()
+  case "$profile" in
+    none)
+      flags[CFLAGS]="-O0 -g"
+      flags[CXXFLAGS]="-O0 -g"
+      flags[LDFLAGS]=""
+      flags[RUSTFLAGS]=""
+      ;;
+    normal)
+      flags[CFLAGS]="-O2 -pipe -march=native"
+      flags[CXXFLAGS]="-O2 -pipe -march=native"
+      flags[LDFLAGS]=""
+      flags[RUSTFLAGS]="-C opt-level=2"
+      ;;
+    extreme)
+      # RISCO: extreme uses aggressive optimizations and LTO which may break debug & increase build complexity.
+      flags[CFLAGS]="-O3 -march=native -flto -fno-plt -fomit-frame-pointer -fno-exceptions"
+      flags[CXXFLAGS]="-O3 -march=native -flto -fno-plt -fomit-frame-pointer -fno-exceptions"
+      flags[LDFLAGS]="-flto"
+      flags[RUSTFLAGS]="-C opt-level=3 -C lto"
+      ;;
+    *) err "Unknown profile: $profile"; return 2 ;;
+  esac
+  # print as KEY=VAL lines
+  printf '%s\n' "CFLAGS=${flags[CFLAGS]}" "CXXFLAGS=${flags[CXXFLAGS]}" "LDFLAGS=${flags[LDFLAGS]}" "RUSTFLAGS=${flags[RUSTFLAGS]}"
+  return 0
+}
+
+# set command implementation
+cmd_set() {
+  local assignment="$1"
+  if [ -z "$assignment" ]; then err "set requires argument like VAR=VAL"; return 2; fi
+  if ! printf '%s' "$assignment" | grep -q '='; then err "set argument must be VAR=VAL"; return 2; fi
+  local key="$(printf '%s' "$assignment" | cut -d'=' -f1)"
+  local val="$(printf '%s' "$assignment" | cut -d'=' -f2-)"
+  key="$(printf '%s' "$key" | sed -e 's/[^A-Za-z0-9_]//g')"
+  if [ -z "$key" ]; then err "Invalid variable name"; return 3; fi
+  # protect certain keys from accidental changes
+  for p in "${PROTECTED_VARS[@]}"; do
+    if [ "$key" = "$p" ]; then err "Protected variable: $key cannot be set"; return 4; fi
+  done
+
+  acquire_lock "set" || { err "Failed to acquire lock for set"; return 5; }
+  backup_adm_conf "$ADM_CONF_PATH" || warn "Backup failed (continuing)"
+  # validate if setting flags
+  case "$key" in
+    CFLAGS|CXXFLAGS|LDFLAGS|RUSTFLAGS)
+      if ! validate_flags "$key" "$val"; then release_lock ""; return 6; fi
+      ;;
+  esac
+
+  # write/update key
+  update_adm_conf_key "$ADM_CONF_PATH" "$key" "$val" || { release_lock ""; return 7; }
+  ok "Set $key in $ADM_CONF_PATH"
+  json_add_report "set" "$key=$val"
+  release_lock ""
+  return 0
+}
+
+# unset command implementation
+cmd_unset() {
+  local key="$1"
+  if [ -z "$key" ]; then err "unset requires variable name"; return 2; fi
+  # protect important keys
+  for p in "${PROTECTED_VARS[@]}"; do
+    if [ "$key" = "$p" ]; then err "Protected variable: $key cannot be removed"; return 3; fi
+  done
+  acquire_lock "unset" || { err "Failed to acquire lock for unset"; return 4; }
+  backup_adm_conf "$ADM_CONF_PATH" || warn "Backup failed (continuing)"
+  remove_adm_conf_key "$ADM_CONF_PATH" "$key" || { release_lock ""; return 5; }
+  ok "Unset $key in $ADM_CONF_PATH (commented)"
+  json_add_report "unset" "$key"
+  release_lock ""
+  return 0
+}
+
+# profile command implementation
+cmd_profile() {
+  local prof="$1"
+  if [ -z "$prof" ]; then err "profile requires one of: none|normal|extreme"; return 2; fi
+  case "$prof" in none|normal|extreme) ;; *) err "Unknown profile: $prof"; return 3 ;; esac
+
+  acquire_lock "profile" || { err "Failed to acquire lock for profile"; return 4; }
+  backup_adm_conf "$ADM_CONF_PATH" || warn "Backup failed (continuing)"
+
+  # generate flags
+  local flags
+  flags="$(profile_generate_flags "$prof")" || { release_lock ""; return 5; }
+
+  # apply flags into adm.conf: ADM_OPT_PROFILE, CFLAGS, CXXFLAGS, LDFLAGS, RUSTFLAGS
+  update_adm_conf_key "$ADM_CONF_PATH" "ADM_OPT_PROFILE" "$prof" || { release_lock ""; return 6; }
+  # parse generated flags lines
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -z "$line" ] && continue
+    k="$(printf '%s' "$line" | cut -d'=' -f1)"
+    v="$(printf '%s' "$line" | cut -d'=' -f2-)"
+    # remove possible surrounding quotes
+    v="$(printf '%s' "$v" | sed -e 's/^"//' -e 's/"$//')"
+    # validate
+    if ! validate_flags "$k" "$v"; then warn "Validation failed for $k: $v (profile may be unsafe)"; fi
+    update_adm_conf_key "$ADM_CONF_PATH" "$k" "$v" || warn "Failed to update $k in adm.conf"
+  done <<<"$flags"
+
+  ok "Profile set to $prof and flags written to $ADM_CONF_PATH"
+  json_add_report "profile_set" "$prof"
+  release_lock ""
+  return 0
+}
+
+# main dispatch
+case "$ACTION" in
+  set)
+    if [ -z "$ARG1" ]; then printf "Usage: adm-conf set VAR=VAL\n" >&2; exit 2; fi
+    cmd_set "$ARG1"; exit $?
+    ;;
+  unset)
+    if [ -z "$ARG1" ]; then printf "Usage: adm-conf unset VAR\n" >&2; exit 2; fi
+    cmd_unset "$ARG1"; exit $?
+    ;;
+  profile)
+    if [ -z "$ARG1" ]; then printf "Usage: adm-conf profile [none|normal|extreme]\n" >&2; exit 2; fi
+    cmd_profile "$ARG1"; exit $?
+    ;;
+  *)
+    printf "Unknown or missing action. Supported: set, unset, profile\n" >&2
+    exit 1
+    ;;
+esac
+#!/usr/bin/env bash
+#
+# adm-conf (PARTE 3/3)
+# verify, diagnose, env, reload, auto-fix, apply-profile
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_CONF_PATH="${ADM_CONF_PATH:-${ADM_ROOT}/adm.conf}"
+ADM_TMP="${ADM_TMP:-${ADM_ROOT}/tmp}"
+ADM_LOGS="${ADM_LOGS:-${ADM_ROOT}/logs}"
+DIAG_JSON="${ADM_TMP}/adm-diagnose-${TS_NOW}.json"
+
+# color helpers
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"; CLR_BLU="$(tput setaf 4)"; else CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""; CLR_BLU=""; fi
+
+ok()   { printf "%b✔️  %s%b\n" "$CLR_GRN" "$1" "$CLR_RST"; }
+warn() { printf "%b⚠️  %s%b\n" "$CLR_YEL" "$1" "$CLR_RST"; }
+err()  { printf "%b❌  %s%b\n" "$CLR_RED" "$1" "$CLR_RST"; }
+info() { printf "%bℹ️  %s%b\n" "$CLR_BLU" "$1" "$CLR_RST"; }
+
+json_append_diag() {
+  local key="$1" value="$2" status="$3"
+  mkdir -p "$(dirname "$DIAG_JSON")" 2>/dev/null || true
+  if [ ! -f "$DIAG_JSON" ]; then
+    cat >"$DIAG_JSON" <<JSON
+{"timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")","checks":[]}
+JSON
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1];k=sys.argv[2];v=sys.argv[3];s=sys.argv[4]
+d=json.load(open(f))
+d['checks'].append({'key':k,'value':v,'status':s})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+# Disk and directory validation
+check_dirs_permissions() {
+  local dirs=( "${ADM_ROOT}" "${ADM_LOGS}" "${ADM_TMP}" "${ADM_ROOT}/cache" "${ADM_ROOT}/scripts" "${ADM_ROOT}/hooks" "${ADM_ROOT}/metafiles" )
+  local rc=0
+  for d in "${dirs[@]}"; do
+    if [ -d "$d" ]; then
+      if [ -w "$d" ]; then ok "Dir OK: $d"; json_append_diag "dir:$d" "exists,writable" "ok"
+      else warn "Dir exists but not writable: $d"; json_append_diag "dir:$d" "not-writable" "warn"; rc=1; fi
+    else
+      warn "Dir missing: $d"; json_append_diag "dir:$d" "missing" "warn"; rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# Check available disk space
+check_disk_space() {
+  local space
+  space="$(df -Pm "$ADM_ROOT" | awk 'NR==2 {print $4}')"
+  if [ "$space" -lt 1024 ]; then
+    warn "Low disk space: ${space}MB free"; json_append_diag "disk_space" "$space MB" "warn"; return 1
+  else
+    ok "Disk space: ${space}MB free"; json_append_diag "disk_space" "$space MB" "ok"; return 0
+  fi
+}
+
+# Toolchain validation
+check_toolchain() {
+  local tools=( gcc clang rustc go python3 cmake pkg-config make git )
+  local rc=0
+  for t in "${tools[@]}"; do
+    if command -v "$t" >/dev/null 2>&1; then
+      local ver
+      ver="$($t --version 2>/dev/null | head -n1)"
+      ok "$t detected: $ver"
+      json_append_diag "$t" "$ver" "ok"
+    else
+      warn "Tool missing: $t"
+      json_append_diag "$t" "not-found" "warn"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+# Validate adm.conf integrity
+check_adm_conf_integrity() {
+  if [ ! -f "$ADM_CONF_PATH" ]; then
+    err "adm.conf missing at $ADM_CONF_PATH"
+    json_append_diag "adm_conf" "missing" "error"
+    return 2
+  fi
+  if grep -qE '[^[:print:]]' "$ADM_CONF_PATH"; then
+    warn "adm.conf contains non-printable chars (possible corruption)"
+    json_append_diag "adm_conf" "non-printable" "warn"
+  fi
+  if grep -q -E '={2,}' "$ADM_CONF_PATH"; then
+    warn "adm.conf has malformed lines (multiple = signs)"
+    json_append_diag "adm_conf" "malformed-lines" "warn"
+  fi
+  ok "adm.conf integrity check OK"
+  json_append_diag "adm_conf" "ok" "ok"
+  return 0
+}
+
+# Verify profile and toolchain alignment
+verify_profile_alignment() {
+  local prof
+  prof="$(grep '^ADM_OPT_PROFILE=' "$ADM_CONF_PATH" | cut -d'=' -f2 | tr -d '"')"
+  [ -z "$prof" ] && prof="normal"
+  info "Profile configured: $prof"
+  case "$prof" in
+    none|normal|extreme) ok "Valid profile: $prof"; json_append_diag "profile" "$prof" "ok" ;;
+    *) warn "Invalid profile: $prof"; json_append_diag "profile" "$prof" "warn" ;;
+  esac
+}
+
+# apply-profile (safely sets env vars for toolchains)
+cmd_apply_profile() {
+  local prof="$1"
+  if [ -z "$prof" ]; then err "apply-profile requires [none|normal|extreme]"; return 2; fi
+  info "Applying profile $prof to toolchain..."
+  local flags
+  flags="$(profile_generate_flags "$prof")"
+  eval "$flags"
+  export CFLAGS CXXFLAGS LDFLAGS RUSTFLAGS
+  ok "Profile applied to current environment"
+  json_append_diag "apply_profile" "$prof" "ok"
+  return 0
+}
+
+# verify command (full system check)
+cmd_verify() {
+  info "Running ADM system verification..."
+  local status=0
+  check_dirs_permissions || status=$((status+1))
+  check_disk_space || status=$((status+1))
+  check_toolchain || status=$((status+1))
+  check_adm_conf_integrity || status=$((status+1))
+  verify_profile_alignment || status=$((status+1))
+  if [ "$status" -eq 0 ]; then ok "System verification complete: all OK"; else warn "System verification completed with warnings ($status)"; fi
+  echo "Report: $DIAG_JSON"
+  return "$status"
+}
+
+# env command
+cmd_env() {
+  info "Listing all ADM_* environment variables"
+  env | grep '^ADM_' | sort
+  return 0
+}
+
+# reload command
+cmd_reload() {
+  if [ ! -f "$ADM_CONF_PATH" ]; then err "adm.conf not found at $ADM_CONF_PATH"; return 2; fi
+  # shellcheck disable=SC1090
+  . "$ADM_CONF_PATH"
+  ok "adm.conf reloaded into current environment"
+  return 0
+}
+
+# diagnose command (JSON output)
+cmd_diagnose() {
+  info "Running deep diagnosis..."
+  cmd_verify || true
+  local json_report="$DIAG_JSON"
+  ok "Diagnosis complete. Full report saved to $json_report"
+  if command -v jq >/dev/null 2>&1; then
+    echo
+    jq . "$json_report"
+  else
+    cat "$json_report"
+  fi
+  return 0
+}
+
+# auto-fix command
+cmd_auto_fix() {
+  info "Attempting automatic fix of simple issues"
+  local rc=0
+  local dirs=( "${ADM_ROOT}" "${ADM_LOGS}" "${ADM_TMP}" "${ADM_ROOT}/cache" "${ADM_ROOT}/scripts" "${ADM_ROOT}/hooks" "${ADM_ROOT}/metafiles" )
+  for d in "${dirs[@]}"; do
+    if [ ! -d "$d" ]; then
+      ## RISCO: cria diretórios automaticamente — pode sobrescrever permissões personalizadas
+      warn "Missing directory $d — creating..."
+      mkdir -p "$d" 2>/dev/null || { err "Failed to create $d"; rc=1; }
+    fi
+    chmod 755 "$d" 2>/dev/null || warn "Could not set permissions on $d"
+  done
+  ok "Directory structure repaired (if missing)"
+  json_append_diag "auto_fix" "directories_repaired" "ok"
+
+  # Check adm.conf existence
+  if [ ! -f "$ADM_CONF_PATH" ]; then
+    warn "adm.conf missing — regenerating default"
+    local conf_content
+    conf_content="$(generate_default_adm_conf "$ADM_ROOT")"
+    printf '%s' "$conf_content" >"$ADM_CONF_PATH"
+    ok "Default adm.conf created at $ADM_CONF_PATH"
+    json_append_diag "auto_fix" "adm_conf_regenerated" "ok"
+  fi
+
+  ok "Auto-fix completed"
+  return "$rc"
+}
+
+# CLI parsing for this part
+ACTION="${1:-}"
+ARG="${2:-}"
+
+case "$ACTION" in
+  verify) cmd_verify; exit $? ;;
+  env) cmd_env; exit $? ;;
+  reload) cmd_reload; exit $? ;;
+  diagnose) cmd_diagnose; exit $? ;;
+  apply-profile) cmd_apply_profile "$ARG"; exit $? ;;
+  auto-fix) cmd_auto_fix; exit $? ;;
+  *)
+    cat <<EOF
+Usage: adm-conf <command>
+
+Commands:
+  verify           Run full system verification
+  diagnose         Deep check (produces JSON report)
+  env              Show all ADM_* variables
+  reload           Reload adm.conf into current environment
+  apply-profile    Apply optimization profile to toolchain env
+  auto-fix         Automatically repair simple issues
+EOF
+    exit 1
+    ;;
+esac
