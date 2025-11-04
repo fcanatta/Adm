@@ -1,0 +1,5 @@
+DRY_RUN=1 adm build glibc --dry-run --verbose
+DRY_RUN=1 ./usr/src/adm/metafiles/system/glibc/hooks/pre-install
+DESTDIR=/path/to/safe/rootfs adm build glibc --verbose
+# garantir que adm-build use DESTDIR (o pipeline deve exportar DESTDIR antes de chamar hooks)
+DESTDIR=/ adm run glibc pre-install   # deve abortar com mensagem de risco
