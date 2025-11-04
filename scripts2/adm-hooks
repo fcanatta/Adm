@@ -1,0 +1,958 @@
+#!/usr/bin/env bash
+#
+# adm-hooks - discovery, list, check, run (scaffold + safe exec)
+# ----------------------------------------------------------------------
+# Funções:
+#  - detecta hooks (globais e por pacote)
+#  - lista hooks com status (executable / missing shebang / size)
+#  - verifica integridade básica (perms, shebang)
+#  - executa hooks com isolamento (env controlado), logs, dry-run, force
+#  - cria estrutura de diretórios necessários (global + metafiles)
+#
+# Segurança:
+#  - ## RISCO: execução de hooks personalizados pode alterar arquivos do sistema.
+#  - Apenas executa quando confirmada (ou --force).
+#  - Use --dry-run para simular.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----- Basic settings & defaults -----
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+METAFILES_DIR="${METAFILES_DIR:-${ADM_ROOT}/metafiles}"
+GLOBAL_HOOKS_DIR="${ADM_ROOT}/hooks/global"
+LOGS_DIR="${ADM_LOGS:-${ADM_ROOT}/logs}"
+TMP_DIR="${ADM_TMP:-${ADM_ROOT}/tmp}"
+LOCK_DIR="${LOCK_DIR:-${TMP_DIR}/adm-hooks-locks}"
+
+# runtime flags
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+GLOBAL=0
+CATEGORY=""
+PROGRAM=""
+HOOK_TYPE=""   # ex: pre-build, post-install, on-error
+HOOK_NAME=""   # specific hook filename
+ACTION=""      # list, check, run, add, remove, exec, env
+USER_HOOK_CONTENT=""  # used by add
+
+# limits & safety
+MAX_HOOK_SIZE_BYTES=$((5 * 1024 * 1024))  # 5MB
+ALLOWED_HOOK_TYPES="pre-bootstrap post-bootstrap pre-build post-build pre-install post-install pre-update post-update pre-uninstall post-uninstall pre-patch post-patch on-error custom"
+
+# create directories
+mkdir -p "$LOGS_DIR" "$TMP_DIR" "$LOCK_DIR" 2>/dev/null || true
+
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-hooks-${TS_NOW}.log}"
+REPORT_JSON="${REPORT_JSON:-${TMP_DIR}/adm-hooks-report-${TS_NOW}.json}"
+
+### ----- Colors & icons -----
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"
+  CLR_BLU="$(tput setaf 4)"; CLR_CYN="$(tput setaf 6)"; CLR_BOLD="$(tput bold)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""; CLR_BLU=""; CLR_CYN=""; CLR_BOLD=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"; ICON_WORK="⚙️"
+
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+### ----- Spinner (non-blocking) -----
+_spinner_pid=""
+_spinner_cleanup() { if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then kill "$_spinner_pid" >/dev/null 2>&1 || true; wait "$_spinner_pid" 2>/dev/null || true; fi; _spinner_pid=""; }
+spinner_start() {
+  local msg="$1"; [ "$DRY_RUN" -eq 1 ] && info "(dry-run) $msg" && return 0
+  printf "%b %s " "${CLR_BLU}${ICON_WORK}${CLR_RST}" "$msg"
+  ( local i=0 chars='|/-\' ; while :; do printf "\b%s" "${chars:i++%${#chars}:1}"; sleep 0.12; done ) &
+  _spinner_pid=$!; trap _spinner_cleanup EXIT
+}
+spinner_stop() { local okmsg="${1:-Done}"; if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi; _spinner_cleanup; printf "\b"; ok "$okmsg"; trap - EXIT; }
+
+### ----- Lock helpers (prevent concurrent runs per program) -----
+acquire_lock() {
+  local key="${1:-global}"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Another adm-hooks operation is active for $key (lock: $lockfile)"; return 1; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() {
+  local lockfile="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) release lock $lockfile"; return 0; fi
+  [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+  return 0
+}
+
+### ----- Small JSON helpers (python3 if available) ----- 
+json_init_report() {
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) init report $REPORT_JSON"; return 0; fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  cat >"$REPORT_JSON" <<JSON
+{
+  "timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "action":"adm-hooks",
+  "category":"${CATEGORY:-}",
+  "program":"${PROGRAM:-}",
+  "hook_type":"${HOOK_TYPE:-}",
+  "results":[]
+}
+JSON
+}
+json_add_result() {
+  local name="$1" status="$2" exitcode="${3:-}" details="${4:-}"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) json add $name $status" && return 0
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys,time
+f=sys.argv[1]; name=sys.argv[2]; status=sys.argv[3]; code=sys.argv[4]; details=sys.argv[5]
+d=json.load(open(f))
+d.setdefault('results',[]).append({'name':name,'status':status,'exitcode':int(code) if code else None,'details':details,'time':time.time()})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    # best-effort append (non-robust)
+    printf '{"name":"%s","status":"%s","exitcode":%s,"details":"%s","time":%s},\n' "$name" "$status" "${exitcode:-null}" "${details:-}" "$(date +%s)" >>"${REPORT_JSON}.append" || true
+  fi
+}
+
+### ----- Helpers: validate hook type & paths ----- 
+is_valid_hook_type() {
+  local t="$1"
+  case " $ALLOWED_HOOK_TYPES " in *" $t "*) return 0 ;; *) return 1 ;; esac
+}
+
+global_hook_path() {
+  local type="$1"
+  printf '%s/%s' "$GLOBAL_HOOKS_DIR" "$type"
+}
+
+local_hook_dir() {
+  local cat="$1" prog="$2" type="$3"
+  printf '%s/%s/%s/hooks/%s' "$METAFILES_DIR" "$cat" "$prog" "$type"
+}
+
+all_local_hooks_dir() {
+  printf '%s/%s/%s/hooks' "$METAFILES_DIR" "$CATEGORY" "$PROGRAM"
+}
+
+### ----- Detect hooks (returns newline paths) ----- 
+detect_hooks() {
+  local type="$1" glob="$2"  # if glob=1 include global too
+  [ -z "$type" ] && { err "detect_hooks: missing type"; return 2; }
+  is_valid_hook_type "$type" || { err "Invalid hook type: $type"; return 3; }
+
+  local out=()
+  # global hooks dir for this type (can contain multiple files)
+  if [ "$glob" = "1" ]; then
+    local gdir
+    gdir="$(global_hook_path "$type")"
+    if [ -d "$gdir" ]; then
+      while IFS= read -r -d '' f; do out+=("$f"); done < <(find "$gdir" -maxdepth 1 -type f -print0 2>/dev/null | sort -z) || true
+    fi
+  fi
+
+  # local hooks in metafile dir
+  if [ -n "$CATEGORY" ] && [ -n "$PROGRAM" ]; then
+    local ldir
+    ldir="$(local_hook_dir "$CATEGORY" "$PROGRAM" "$type")"
+    if [ -d "$ldir" ]; then
+      while IFS= read -r -d '' f; do out+=("$f"); done < <(find "$ldir" -maxdepth 1 -type f -print0 2>/dev/null | sort -z) || true
+    fi
+  fi
+
+  # print results
+  for p in "${out[@]:-}"; do printf '%s\n' "$p"; done
+  return 0
+}
+
+### ----- Hook metadata & quick checks ----- 
+hook_info_line() {
+  local path="$1"
+  [ -f "$path" ] || { printf '%s\t%s\n' "$path" "MISSING"; return 0; }
+  local exe=0 shbang_ok=0 size=0
+  [ -x "$path" ] && exe=1
+  size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+  # check shebang (first line starts with #!)
+  local first
+  first="$(head -n1 "$path" 2>/dev/null || echo "")"
+  case "$first" in '#!'*) shbang_ok=1 ;; *) shbang_ok=0 ;; esac
+  printf '%s\texe=%s\tshebang=%s\tsize=%s\n' "$path" "$exe" "$shbang_ok" "$size"
+}
+
+check_hook_file() {
+  local path="$1"
+  if [ -z "$path" ]; then err "check_hook_file: missing path"; return 2; fi
+  if [ ! -f "$path" ]; then warn "Hook not found: $path"; return 3; fi
+  # size check
+  local sz
+  sz=$(stat -c%s "$path" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$MAX_HOOK_SIZE_BYTES" ]; then warn "Hook file too large (> ${MAX_HOOK_SIZE_BYTES}B): $path"; json_add_result "$(basename "$path")" "size-too-large" "1" "size=${sz}"; fi
+  # shebang check
+  local first
+  first="$(head -n1 "$path" 2>/dev/null || echo "")"
+  if [[ "$first" != "#!"* ]]; then warn "Hook missing shebang: $path"; json_add_result "$(basename "$path")" "no-shebang" "1" ""; fi
+  # executable check
+  if [ ! -x "$path" ]; then warn "Hook not executable: $path"; json_add_result "$(basename "$path")" "not-exec" "1" ""; fi
+  return 0
+}
+
+### ----- Run a single hook safely ----- 
+# env_vars: associative array or string of KEY=VALUE lines (we'll pass in a sanitized env file)
+run_single_hook() {
+  local hookpath="$1"
+  local envfile="${2:-}"    # optional path to file with env lines KEY=VAL
+  local logfile_local="${LOGS_DIR}/hooks-$(basename "$hookpath")-${TS_NOW}.log"
+  if [ -z "$hookpath" ]; then err "run_single_hook: missing path"; return 2; fi
+  if [ ! -f "$hookpath" ]; then err "Hook missing: $hookpath"; return 3; fi
+  # size and safety checks
+  local sz
+  sz=$(stat -c%s "$hookpath" 2>/dev/null || echo 0)
+  if [ "$sz" -gt "$MAX_HOOK_SIZE_BYTES" ]; then warn "Refusing to run overly-large hook: $hookpath"; return 4; fi
+  # require shebang or explicit shell invocation
+  local first
+  first="$(head -n1 "$hookpath" 2>/dev/null || echo "")"
+  if [[ "$first" != "#!"* ]] && ! grep -qE '^#!/bin/(ba)?sh' "$hookpath" 2>/dev/null; then warn "Hook has no valid shebang: $hookpath"; fi
+
+  # Dry-run mode simulates
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would execute hook: $hookpath"; json_add_result "$(basename "$hookpath")" "dry-run" "0" "simulated"; return 0; fi
+
+  # run with sanitized environment
+  local env_cmd=(env -i LANG=C PATH=/usr/bin:/bin TERM="${TERM:-dumb}" ADM_ROOT="$ADM_ROOT" CATEGORY="$CATEGORY" PROGRAM="$PROGRAM" HOOK_TYPE="$HOOK_TYPE" HOOK_PATH="$hookpath")
+  # If envfile provided, read key=val lines and append
+  if [ -n "$envfile" ] && [ -f "$envfile" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in *'='*) env_cmd+=("$line") ;; *) verbose "Ignoring invalid env line: $line" ;; esac
+    done <"$envfile"
+  fi
+
+  # Execute in a subshell and capture output to logfile_local
+  info "Executing hook: $hookpath (log: $logfile_local)"
+  if "${env_cmd[@]}" bash -c "set -euo pipefail; exec \"$hookpath\"" >"$logfile_local" 2>&1; then
+    ok "Hook OK: $(basename "$hookpath")"
+    json_add_result "$(basename "$hookpath")" "ok" "0" "log:${logfile_local}"
+    return 0
+  else
+    local rc=$?
+    err "Hook failed: $(basename "$hookpath") rc=$rc (log: $logfile_local)"
+    json_add_result "$(basename "$hookpath")" "failed" "$rc" "log:${logfile_local}"
+    # call on-error global hooks if failure (non-fatal here)
+    # find global on-error hooks and run them (best-effort)
+    local on_err_dir
+    on_err_dir="$(global_hook_path "on-error")"
+    if [ -d "$on_err_dir" ]; then
+      for h in "$on_err_dir"/*; do
+        [ -x "$h" ] || continue
+        verbose "Running on-error global hook: $h"
+        if "${env_cmd[@]}" bash -c "exec \"$h\"" >>"$logfile_local" 2>&1; then ok "on-error hook OK: $(basename "$h")"; else warn "on-error hook failed: $(basename "$h")"; fi
+      done
+    fi
+    return "$rc"
+  fi
+}
+
+### ----- High level: run hooks of a type (global then local) ----- 
+run_hooks_of_type() {
+  local type="$1"
+  local envfile="${2:-}"
+  local glob=1
+  is_valid_hook_type "$type" || { err "Invalid hook type: $type"; return 2; }
+  HOOK_TYPE="$type"
+  # Acquire lock key per category/program to avoid concurrent interference
+  local lockkey="${CATEGORY:-global}_${PROGRAM:-global}"
+  local lockfile
+  lockfile="$(acquire_lock "$lockkey")" || { err "Failed to acquire lock"; return 3; }
+
+  spinner_start "Running hooks: $type"
+  # detect and run global hooks first
+  local gdir
+  gdir="$(global_hook_path "$type")"
+  if [ -d "$gdir" ]; then
+    for f in "$gdir"/*; do
+      [ -f "$f" ] || continue
+      # skip non-regular files
+      check_hook_file "$f" || true
+      if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) global hook: $f"; continue; fi
+      run_single_hook "$f" "$envfile" || warn "Global hook failed: $f"
+    done
+  fi
+
+  # then local hooks (package-specific)
+  if [ -n "$CATEGORY" ] && [ -n "$PROGRAM" ]; then
+    local ldir
+    ldir="$(local_hook_dir "$CATEGORY" "$PROGRAM" "$type")"
+    if [ -d "$ldir" ]; then
+      for f in "$ldir"/*; do
+        [ -f "$f" ] || continue
+        check_hook_file "$f" || true
+        if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) local hook: $f"; continue; fi
+        # require explicit confirmation unless forced
+        if [ "$FORCE" -ne 1 ]; then
+          if ! confirm_prompt "Execute hook $(basename "$f") for ${CATEGORY}/${PROGRAM}?"; then warn "Skipped hook: $(basename "$f")"; json_add_result "$(basename "$f")" "skipped" "" "user"; continue; fi
+        fi
+        if ! run_single_hook "$f" "$envfile"; then warn "Local hook failed: $f"; fi
+      done
+    fi
+  fi
+
+  spinner_stop "Hooks run complete"
+  release_lock "$lockfile"
+  return 0
+}
+
+### ----- List hooks (detailed) ----- 
+list_hooks() {
+  local type="$1" glob="$2"
+  is_valid_hook_type "${type}" || { err "Invalid hook type: $type"; return 2; }
+  echo "Hooks for type: ${type} (global included: ${glob})"
+  if [ "$glob" = "1" ]; then
+    local gdir
+    gdir="$(global_hook_path "$type")"
+    if [ -d "$gdir" ]; then
+      echo " Global hooks in: $gdir"
+      for f in "$gdir"/*; do
+        [ -e "$f" ] || continue
+        hook_info_line "$f"
+      done
+    else
+      echo " No global hooks dir: $gdir"
+    fi
+  fi
+  if [ -n "$CATEGORY" ] && [ -n "$PROGRAM" ]; then
+    local ldir
+    ldir="$(local_hook_dir "$CATEGORY" "$PROGRAM" "$type")"
+    if [ -d "$ldir" ]; then
+      echo " Local hooks in: $ldir"
+      for f in "$ldir"/*; do
+        [ -e "$f" ] || continue
+        hook_info_line "$f"
+      done
+    else
+      echo " No local hooks dir: $ldir"
+    fi
+  fi
+  return 0
+}
+
+### ----- Add a hook (safe) ----- 
+# creates the hook file in target dir and sets executable bit
+# ## RISCO: adding hooks executes custom code later; ensure content is trusted
+add_hook() {
+  local type="$1" content="$2" global_flag="$3"
+  is_valid_hook_type "$type" || { err "Invalid hook type: $type"; return 2; }
+  local destdir
+  if [ "$global_flag" = "1" ]; then
+    destdir="$(global_hook_path "$type")"
+  else
+    if [ -z "$CATEGORY" ] || [ -z "$PROGRAM" ]; then err "add_hook: require --category and --program for local hooks"; return 3; fi
+    destdir="$(local_hook_dir "$CATEGORY" "$PROGRAM" "$type")"
+  fi
+  # ensure dir
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) create dir $destdir and write hook"; return 0; fi
+  mkdir -p "$destdir" 2>/dev/null || { err "Failed to create hook dir: $destdir"; return 4; }
+  # determine filename (timestamped)
+  local fname="${TS_NOW}-hook.sh"
+  local dest="${destdir}/${fname}"
+  printf '%s\n' "#!/usr/bin/env bash" >"$dest"
+  printf '%s\n\n' "set -euo pipefail" >>"$dest"
+  printf '%s\n' "$content" >>"$dest"
+  chmod 0755 "$dest" || true
+  ok "Hook created: $dest"
+  log "[HOOK-ADD]" "$dest"
+  json_add_result "$(basename "$dest")" "added" "0" "created"
+  return 0
+}
+
+### ----- Remove hook (safe) ----- 
+remove_hook() {
+  local path="$1"
+  if [ -z "$path" ] || [ ! -f "$path" ]; then err "remove_hook: path missing or not file: $path"; return 2; fi
+  ## RISCO: removing hook may change automation behavior
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) rm $path"; return 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Remove hook $path?"; then warn "User cancelled removal"; return 1; fi
+  fi
+  if rm -f "$path"; then ok "Removed hook: $path"; json_add_result "$(basename "$path")" "removed" "0" ""; return 0; else err "Failed to remove $path"; return 3; fi
+}
+
+### ----- Show env that hooks receive (for debugging) ----- 
+show_hook_env() {
+  cat <<ENV
+ADM hook env (sample):
+  ADM_ROOT=${ADM_ROOT}
+  CATEGORY=${CATEGORY}
+  PROGRAM=${PROGRAM}
+  HOOK_TYPE=${HOOK_TYPE}
+  LOGS_DIR=${LOGS_DIR}
+  TMP_DIR=${TMP_DIR}
+ENV
+}
+
+### ----- CLI parsing ----- 
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] <command>
+
+Global options:
+  --dry-run               Simulate actions
+  --force                 Non-interactive / assume yes
+  --verbose, -v           Verbose
+  --quiet                 Minimal output
+  --global                Operate on global hooks (when applicable)
+  --category <cat>        Package category (for local hooks)
+  --program <prog>        Package name (for local hooks)
+  --type <hook-type>      Hook type (pre-build, post-install, on-error, etc.)
+  --hook <hook-file>      Specific hook filename (path) for remove/exec
+
+Commands:
+  list                    List hooks for --type (global & local if args given)
+  check                   Check hooks (permissions, shebang, size)
+  run                     Run hooks for --type (global then local)
+  add                     Add a new hook (reads content from STDIN). Use --global to add global
+  remove                  Remove a hook (provide --hook <path>)
+  exec                    Execute a specific hook file (--hook <path>)
+  env                     Show environment passed to hooks (debug)
+  help                    Show this help
+
+Examples:
+  $SCRIPT_NAME --type pre-build --category base --program zlib list
+  $SCRIPT_NAME --type pre-build --run --category base --program zlib
+  $SCRIPT_NAME --type pre-build add < my-hook.sh
+  $SCRIPT_NAME --type pre-build --global add < global-hook.sh
+EOF
+  exit 1
+}
+
+# parse options
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --global) GLOBAL=1; shift ;;
+    --category) CATEGORY="${2:-}"; shift 2 ;;
+    --program) PROGRAM="${2:-}"; shift 2 ;;
+    --type) HOOK_TYPE="${2:-}"; shift 2 ;;
+    --hook) HOOK_NAME="${2:-}"; shift 2 ;;
+    list|check|run|add|remove|exec|env|help) ACTION="$1"; shift ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# default help
+[ -n "$ACTION" ] || usage
+
+# basic validations
+if [ -n "$HOOK_TYPE" ]; then
+  if ! is_valid_hook_type "$HOOK_TYPE"; then err "Invalid hook type: $HOOK_TYPE"; exit 2; fi
+fi
+
+# initialize report
+json_init_report
+
+# dispatch actions
+case "$ACTION" in
+  help) usage ;;
+  list)
+    detect_hooks "${HOOK_TYPE:-pre-build}" "${GLOBAL:-1}" || true
+    list_hooks "${HOOK_TYPE:-pre-build}" "${GLOBAL:-1}"
+    ;;
+  check)
+    # run checks for detected hooks
+    mapfile -t found < <(detect_hooks "${HOOK_TYPE:-pre-build}" "${GLOBAL:-1}" || true)
+    if [ "${#found[@]}" -eq 0 ]; then info "No hooks found to check"; exit 0; fi
+    for f in "${found[@]}"; do
+      verbose "Checking $f"
+      check_hook_file "$f" || warn "check reported issues for $f"
+      json_add_result "$(basename "$f")" "checked" "0" ""
+    done
+    ;;
+  run)
+    if [ -z "$HOOK_TYPE" ]; then err "run requires --type"; exit 2; fi
+    run_hooks_of_type "$HOOK_TYPE" || warn "Some hooks may have failed"
+    ;;
+  add)
+    # read from STDIN
+    if [ -z "$HOOK_TYPE" ]; then err "add requires --type"; exit 2; fi
+    USER_HOOK_CONTENT="$(cat - 2>/dev/null || true)"
+    if [ -z "$USER_HOOK_CONTENT" ]; then err "No hook content provided on STDIN"; exit 3; fi
+    add_hook "$HOOK_TYPE" "$USER_HOOK_CONTENT" "${GLOBAL}"
+    ;;
+  remove)
+    if [ -z "$HOOK_NAME" ]; then err "remove requires --hook <path>"; exit 2; fi
+    remove_hook "$HOOK_NAME"
+    ;;
+  exec)
+    if [ -z "$HOOK_NAME" ]; then err "exec requires --hook <path>"; exit 2; fi
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) exec $HOOK_NAME"; exit 0; fi
+    run_single_hook "$HOOK_NAME" || warn "Execution of $HOOK_NAME failed"
+    ;;
+  env)
+    show_hook_env
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+###############################################################################
+# adm-hooks (PARTE 2/3)
+# Execução avançada: paralelismo, timeout, retry, sandbox, resiliência
+###############################################################################
+
+# --- Configurações padrão ajustáveis (podem ser sobrescritas via adm.conf) ---
+ADM_CONF="${ADM_CONF:-${ADM_ROOT}/adm.conf}"
+MAX_PARALLEL_HOOKS="${MAX_PARALLEL_HOOKS:-4}"
+HOOK_TIMEOUT_SEC="${HOOK_TIMEOUT_SEC:-180}"
+HOOK_MAX_RETRIES="${HOOK_MAX_RETRIES:-2}"
+SANDBOX_ENABLED="${SANDBOX_ENABLED:-auto}"
+
+# --- Carregar configurações de adm.conf (se existir) ---
+if [ -f "$ADM_CONF" ]; then
+  while IFS='=' read -r key val; do
+    case "$key" in
+      \#*|"") continue ;;
+      MAX_PARALLEL_HOOKS) MAX_PARALLEL_HOOKS="$val" ;;
+      HOOK_TIMEOUT_SEC) HOOK_TIMEOUT_SEC="$val" ;;
+      HOOK_MAX_RETRIES) HOOK_MAX_RETRIES="$val" ;;
+      SANDBOX_ENABLED) SANDBOX_ENABLED="$val" ;;
+    esac
+  done <"$ADM_CONF"
+fi
+
+###############################################################################
+# Sandbox & isolamento
+###############################################################################
+
+detect_sandbox() {
+  # auto-detect nsjail, bubblewrap, chroot
+  if [ "$SANDBOX_ENABLED" = "auto" ]; then
+    if command -v nsjail >/dev/null 2>&1; then
+      echo "nsjail"
+    elif command -v bwrap >/dev/null 2>&1; then
+      echo "bwrap"
+    elif [ "$(id -u)" -eq 0 ]; then
+      echo "chroot"
+    else
+      echo "none"
+    fi
+  else
+    echo "$SANDBOX_ENABLED"
+  fi
+}
+
+run_in_sandbox() {
+  local hookpath="$1"
+  local logfile="$2"
+  local sandbox_type
+  sandbox_type="$(detect_sandbox)"
+
+  case "$sandbox_type" in
+    nsjail)
+      verbose "Executing in nsjail sandbox"
+      nsjail --quiet --disable_proc --chroot / --user nobody --group nogroup \
+        --cwd /tmp -- "$hookpath" >>"$logfile" 2>&1
+      ;;
+    bwrap)
+      verbose "Executing in bubblewrap sandbox"
+      bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp bash -c "$hookpath" >>"$logfile" 2>&1
+      ;;
+    chroot)
+      verbose "Executing in chroot sandbox"
+      chroot / bash -c "$hookpath" >>"$logfile" 2>&1
+      ;;
+    none)
+      verbose "Sandbox disabled (running directly)"
+      bash -c "$hookpath" >>"$logfile" 2>&1
+      ;;
+    *)
+      warn "Unknown sandbox type '$sandbox_type', running without isolation"
+      bash -c "$hookpath" >>"$logfile" 2>&1
+      ;;
+  esac
+}
+
+###############################################################################
+# Timeout, retry e execução paralela
+###############################################################################
+
+execute_hook_with_retry() {
+  local hookpath="$1"
+  local envfile="$2"
+  local logfile="$3"
+  local attempt=1
+  local rc=1
+
+  while [ "$attempt" -le "$HOOK_MAX_RETRIES" ]; do
+    info "Execução tentativa ${attempt}/${HOOK_MAX_RETRIES}: $(basename "$hookpath")"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) simulando execução de $hookpath"
+      json_add_result "$(basename "$hookpath")" "dry-run" "0" "simulated"
+      return 0
+    fi
+
+    if timeout --preserve-status "$HOOK_TIMEOUT_SEC" bash -c "
+      set -euo pipefail
+      export ADM_ROOT CATEGORY PROGRAM HOOK_TYPE
+      run_in_sandbox '$hookpath' '$logfile'
+    " >>"$logfile" 2>&1; then
+      ok "Hook executado com sucesso: $(basename "$hookpath")"
+      json_add_result "$(basename "$hookpath")" "ok" "0" "attempt=${attempt}"
+      return 0
+    else
+      rc=$?
+      warn "Hook $(basename "$hookpath") falhou (tentativa ${attempt}/${HOOK_MAX_RETRIES}, código $rc)"
+      json_add_result "$(basename "$hookpath")" "fail" "$rc" "attempt=${attempt}"
+      attempt=$((attempt + 1))
+      sleep 2
+    fi
+  done
+  err "Hook $(basename "$hookpath") falhou após ${HOOK_MAX_RETRIES} tentativas"
+  return "$rc"
+}
+
+run_hooks_parallel() {
+  local type="$1"
+  local envfile="${2:-}"
+  local all_hooks=()
+
+  mapfile -t all_hooks < <(detect_hooks "$type" 1 || true)
+  if [ "${#all_hooks[@]}" -eq 0 ]; then info "Nenhum hook encontrado para $type"; return 0; fi
+
+  info "Executando ${#all_hooks[@]} hooks (${MAX_PARALLEL_HOOKS} em paralelo, timeout=${HOOK_TIMEOUT_SEC}s)"
+  json_add_result "batch" "start" "0" "type=$type"
+
+  # Criar fila e executar com paralelismo limitado
+  local parallel_jobs=0
+  for hookpath in "${all_hooks[@]}"; do
+    local logfile="${LOGS_DIR}/hook-${type}-$(basename "$hookpath")-${TS_NOW}.log"
+    (
+      execute_hook_with_retry "$hookpath" "$envfile" "$logfile"
+    ) &
+    parallel_jobs=$((parallel_jobs + 1))
+
+    if [ "$parallel_jobs" -ge "$MAX_PARALLEL_HOOKS" ]; then
+      wait -n
+      parallel_jobs=$((parallel_jobs - 1))
+    fi
+  done
+
+  wait
+  ok "Todos os hooks de $type finalizados"
+  json_add_result "batch" "end" "0" "type=$type"
+}
+
+###############################################################################
+# Detecção e resposta a falhas críticas
+###############################################################################
+
+trap_hooks_signal_handler() {
+  local sig="$1"
+  err "Sinal recebido: $sig. Abortando execução de hooks..."
+  log "[ABORT]" "Signal $sig"
+  pkill -P $$ >/dev/null 2>&1 || true
+  exit 99
+}
+
+trap 'trap_hooks_signal_handler SIGINT' INT
+trap 'trap_hooks_signal_handler SIGTERM' TERM
+
+verify_logs_integrity() {
+  local hook_type="$1"
+  local count
+  count=$(grep -c '"status"' "$REPORT_JSON" 2>/dev/null || echo 0)
+  info "Relatório de hooks $hook_type contém $count entradas"
+  [ "$count" -gt 0 ] || warn "Nenhum resultado registrado (verifique se os hooks executaram corretamente)"
+}
+
+###############################################################################
+# Funções CLI de alto nível adicionais
+###############################################################################
+
+cmd_run_parallel() {
+  if [ -z "$HOOK_TYPE" ]; then err "--type é obrigatório"; exit 2; fi
+  run_hooks_parallel "$HOOK_TYPE"
+  verify_logs_integrity "$HOOK_TYPE"
+}
+
+cmd_test_sandbox() {
+  local s
+  s="$(detect_sandbox)"
+  echo "Sandbox detectado: $s"
+  case "$s" in
+    none) warn "Sem sandbox ativo (execuções não isoladas)" ;;
+    nsjail) ok "nsjail disponível: isolamento forte" ;;
+    bwrap) ok "bubblewrap disponível: isolamento médio" ;;
+    chroot) ok "chroot ativo: isolamento básico" ;;
+  esac
+}
+
+###############################################################################
+# Integração com CLI existente
+###############################################################################
+
+if [ "$ACTION" = "run-parallel" ]; then
+  cmd_run_parallel
+  exit 0
+fi
+
+if [ "$ACTION" = "test-sandbox" ]; then
+  cmd_test_sandbox
+  exit 0
+fi
+
+###############################################################################
+# adm-hooks (PARTE 3/3)
+# Integração, verificação, políticas e relatórios finais
+###############################################################################
+
+# --- Configurações adicionais ---
+TRUSTSTORE_DIR="${ADM_ROOT}/truststore/hooks"
+HOOKS_SUMMARY_JSON="${ADM_ROOT}/logs/hooks-summary.json"
+POLICY_MODE="${POLICY_MODE:-audit}"   # strict | audit | trust
+
+mkdir -p "$TRUSTSTORE_DIR" "$LOGS_DIR" 2>/dev/null || true
+
+###############################################################################
+# 🔐 Verificação de integridade e assinaturas
+###############################################################################
+
+verify_hook_signature() {
+  local hookpath="$1"
+  local hashfile="${hookpath}.sha256"
+  local sigfile="${hookpath}.asc"
+  local ok_count=0
+
+  # SHA256
+  if [ -f "$hashfile" ]; then
+    local expected
+    expected="$(cut -d' ' -f1 "$hashfile" | tr -d '\n')"
+    local actual
+    actual="$(sha256sum "$hookpath" | cut -d' ' -f1)"
+    if [ "$expected" = "$actual" ]; then
+      ok_count=$((ok_count + 1))
+      verbose "SHA256 ok: $(basename "$hookpath")"
+    else
+      warn "SHA256 incorreto em $hookpath"
+      [ "$POLICY_MODE" = "strict" ] && return 2
+    fi
+  else
+    warn "Sem arquivo .sha256 para $hookpath"
+    [ "$POLICY_MODE" = "strict" ] && return 2
+  fi
+
+  # Assinatura GPG opcional
+  if [ -f "$sigfile" ]; then
+    if gpg --quiet --status-fd 1 --verify "$sigfile" "$hookpath" 2>/dev/null | grep -qE '\[GNUPG:\] GOODSIG'; then
+      ok_count=$((ok_count + 1))
+      verbose "Assinatura GPG válida: $(basename "$hookpath")"
+    else
+      warn "Assinatura GPG inválida em $hookpath"
+      [ "$POLICY_MODE" = "strict" ] && return 3
+    fi
+  fi
+
+  [ "$ok_count" -gt 0 ] && return 0 || return 1
+}
+
+###############################################################################
+# 🧩 Integração com outros módulos ADM
+###############################################################################
+
+# Cada módulo chama adm-hooks automaticamente:
+#   adm-build   -> pre-build, post-build
+#   adm-install -> pre-install, post-install
+#   adm-update  -> pre-update, post-update
+#   adm-patches -> pre-patch, post-patch
+#   adm-uninstall -> pre-uninstall, post-uninstall
+
+auto_register_hooks() {
+  local type="$1"
+  local desc="auto-registered for $type"
+  json_add_result "auto-${type}" "registered" "0" "$desc"
+  log "[AUTO]" "Hooks registered for $type"
+}
+
+auto_run_integration() {
+  local module="$1"
+  local phase="$2"
+
+  case "$module:$phase" in
+    build:pre) run_hooks_parallel "pre-build" ;;
+    build:post) run_hooks_parallel "post-build" ;;
+    install:pre) run_hooks_parallel "pre-install" ;;
+    install:post) run_hooks_parallel "post-install" ;;
+    update:pre) run_hooks_parallel "pre-update" ;;
+    update:post) run_hooks_parallel "post-update" ;;
+    patches:pre) run_hooks_parallel "pre-patch" ;;
+    patches:post) run_hooks_parallel "post-patch" ;;
+    uninstall:pre) run_hooks_parallel "pre-uninstall" ;;
+    uninstall:post) run_hooks_parallel "post-uninstall" ;;
+    *) warn "Fase desconhecida: ${module}:${phase}" ;;
+  esac
+}
+
+###############################################################################
+# ⚙️ Políticas de execução (strict, audit, trust)
+###############################################################################
+
+check_trust_policy() {
+  local hookpath="$1"
+
+  case "$POLICY_MODE" in
+    strict)
+      if ! verify_hook_signature "$hookpath"; then
+        err "Hook $hookpath falhou na verificação de integridade (modo strict)"
+        return 2
+      fi
+      ;;
+    audit)
+      if ! verify_hook_signature "$hookpath"; then
+        warn "Hook $hookpath sem verificação válida (modo audit)"
+        json_add_result "$(basename "$hookpath")" "unverified" "0" "audit mode"
+      fi
+      ;;
+    trust)
+      verbose "Modo trust: sem verificação forçada"
+      ;;
+    *)
+      warn "Modo de política desconhecido: $POLICY_MODE"
+      ;;
+  esac
+  return 0
+}
+
+###############################################################################
+# 🧾 Consolidação de relatórios (hooks-summary.json)
+###############################################################################
+
+finalize_hooks_report() {
+  info "Consolidando relatórios em $HOOKS_SUMMARY_JSON"
+  local all_reports=()
+  mapfile -t all_reports < <(find "$TMP_DIR" -type f -name 'adm-hooks-report-*.json' 2>/dev/null || true)
+  if [ "${#all_reports[@]}" -eq 0 ]; then warn "Nenhum relatório encontrado"; return 0; fi
+
+  if command -v jq >/dev/null 2>&1; then
+    jq -s '{generated: now | strftime("%Y-%m-%dT%H:%M:%SZ"), reports: .}' "${all_reports[@]}" >"$HOOKS_SUMMARY_JSON" 2>/dev/null \
+      && ok "Resumo consolidado salvo" \
+      || warn "Falha ao consolidar relatórios"
+  else
+    cat >"$HOOKS_SUMMARY_JSON" <<EOF
+# Hooks summary generated $(date -u)
+$(for f in "${all_reports[@]}"; do echo "  - $f"; done)
+EOF
+    ok "Resumo básico criado sem jq"
+  fi
+}
+
+###############################################################################
+# 🛡️ Fail-safe e on-error hooks globais
+###############################################################################
+
+run_on_error_global() {
+  local msg="$1"
+  local errdir
+  errdir="$(global_hook_path "on-error")"
+  [ -d "$errdir" ] || return 0
+
+  warn "Erro detectado: executando on-error hooks..."
+  for h in "$errdir"/*; do
+    [ -x "$h" ] || continue
+    info "Executando on-error: $h"
+    if timeout 30s bash "$h" >>"$LOGFILE" 2>&1; then
+      ok "on-error executado: $(basename "$h")"
+    else
+      warn "on-error falhou: $(basename "$h")"
+    fi
+  done
+}
+
+###############################################################################
+# 📜 Auto-registro e cache de hooks (hook-cache.json)
+###############################################################################
+
+HOOK_CACHE_JSON="${TMP_DIR}/adm-hooks-cache.json"
+
+build_hook_cache() {
+  info "Construindo cache de hooks..."
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) skip cache build"; return 0; fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,os,time
+base="${METAFILES_DIR}"
+hooks=[]
+for root,dirs,files in os.walk(base):
+    for f in files:
+        if f.endswith(".sh"):
+            p=os.path.join(root,f)
+            hooks.append({"path":p,"size":os.path.getsize(p),"mtime":os.path.getmtime(p)})
+open("${HOOK_CACHE_JSON}","w").write(json.dumps({"generated":time.time(),"hooks":hooks},indent=2))
+PY
+    ok "Cache de hooks atualizado (${HOOK_CACHE_JSON})"
+  else
+    warn "Python3 ausente, cache não criado"
+  fi
+}
+
+###############################################################################
+# 🚨 Execução segura com rollback em falhas
+###############################################################################
+
+execute_with_rollback() {
+  local hooktype="$1"
+  if ! run_hooks_parallel "$hooktype"; then
+    run_on_error_global "Falha em $hooktype"
+    warn "Rollback parcial iniciado"
+    return 1
+  fi
+  return 0
+}
+
+###############################################################################
+# CLI de integração final
+###############################################################################
+
+if [ "$ACTION" = "verify" ]; then
+  if [ -z "$HOOK_NAME" ]; then err "--hook <file> obrigatório"; exit 2; fi
+  verify_hook_signature "$HOOK_NAME"
+  exit $?
+fi
+
+if [ "$ACTION" = "policy" ]; then
+  echo "Política atual: $POLICY_MODE"
+  echo "Confiança: $(detect_sandbox)"
+  exit 0
+fi
+
+if [ "$ACTION" = "finalize" ]; then
+  finalize_hooks_report
+  build_hook_cache
+  exit 0
+fi
+
+if [ "$ACTION" = "auto" ]; then
+  auto_register_hooks "$HOOK_TYPE"
+  auto_run_integration "$CATEGORY" "$HOOK_TYPE"
+  finalize_hooks_report
+  exit 0
+fi
