@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ADM HOOK: GCC pre-install
+# Cria diretórios e prepara ambiente antes de instalar o GCC
+
+set -euo pipefail
+
+echo "📦 [GCC pre-install] Preparando DESTDIR..."
+
+DESTDIR="${DESTDIR:-/usr/src/adm/tmp/gcc-destdir}"
+
+mkdir -p "$DESTDIR/usr/bin" "$DESTDIR/usr/lib/gcc" "$DESTDIR/usr/share/info" "$DESTDIR/usr/share/man"
+
+echo "✅ Diretórios criados em $DESTDIR"
+
+# Garantir que variáveis de build estejam definidas
+: "${PREFIX:=/usr}"
+: "${CFLAGS:=}"
+: "${LDFLAGS:=}"
+
+echo "ℹ️  Instalando para prefixo: $PREFIX"
+
+# Apenas simular se dry-run
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo "(dry-run) make install DESTDIR=$DESTDIR"
+else
+  make install DESTDIR="$DESTDIR"
+fi
