@@ -1,0 +1,140 @@
+# ===============================================
+# Mozilla Firefox - mozconfig (profile = extreme)
+# Otimizado para performance máxima, builds estáveis e binários compactos
+# Compatível com sistema ADM e pipeline adm-build
+# ===============================================
+
+# Caminho do diretório de build (objdir)
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-firefox
+
+# ===============================================
+# 🧩 Configurações gerais do build
+# ===============================================
+
+# Aplicação alvo: Firefox
+ac_add_options --enable-application=browser
+
+# Tipo de build: otimizado e com símbolos mínimos
+ac_add_options --enable-optimize="-O3 -pipe -march=native -flto=auto -fuse-ld=lld"
+ac_add_options --enable-strip
+ac_add_options --disable-debug
+ac_add_options --enable-release
+
+# Desativar recursos não essenciais para reduzir tamanho e tempo de build
+ac_add_options --disable-tests
+ac_add_options --disable-updater
+ac_add_options --disable-crashreporter
+ac_add_options --disable-install-strip
+ac_add_options --disable-elf-hack
+
+# Desativar sandbox de build (gera binários ligeiramente menores)
+# ac_add_options --disable-sandbox  # opcional, se necessário
+
+# ===============================================
+# 🦀 Integração com Rust / LLVM / LTO
+# ===============================================
+
+# Força uso do clang e lld (melhor performance de linkagem)
+CC=clang
+CXX=clang++
+LD=lld
+
+# Ativa LTO e ThinLTO (Link-Time Optimization)
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native -C link-arg=-fuse-ld=lld -C embed-bitcode=yes"
+export RUSTFLAGS
+export MOZ_LTO=1
+export MOZ_THIN_LTO=1
+
+# Rust incremental off → builds reprodutíveis e rápidos em LTO
+export CARGO_INCREMENTAL=0
+export RUSTC_OPT_LEVEL=3
+
+# ===============================================
+# 🧠 PGO (Profile-Guided Optimization)
+# ===============================================
+# O PGO é feito em duas etapas:
+#   1. Build de instrumentação (com `--enable-profile-generate`)
+#   2. Execução do Firefox instrumentado em modo headless
+#   3. Rebuild final (com `--enable-profile-use`)
+#
+# As opções abaixo estão preparadas, mas desabilitadas por padrão.
+# Para usar PGO: defina `ADM_PGO=1` antes do build.
+
+if [ "${ADM_PGO:-0}" -eq 1 ]; then
+  ac_add_options --enable-profile-use
+else
+  # Primeira compilação sem PGO
+  ac_add_options --enable-profile-generate
+fi
+
+# ===============================================
+# ⚙️ Suporte a multithread, ccache e pipelines
+# ===============================================
+
+# Ativa uso de múltiplos jobs
+mk_add_options MOZ_MAKE_FLAGS=-j$(nproc)
+
+# Ativa ccache se disponível
+if which ccache >/dev/null 2>&1; then
+  mk_add_options "CCACHE=ccache"
+  export CCACHE_DIR="${CCACHE_DIR:-/usr/src/adm/cache/ccache}"
+  export CCACHE_COMPRESS=1
+  export CCACHE_SLOPPINESS=time_macros
+fi
+
+# ===============================================
+# 🔊 Integração com áudio e vídeo
+# ===============================================
+
+# Ativar integração com PulseAudio e PipeWire (conforme build_deps)
+ac_add_options --enable-pulseaudio
+ac_add_options --enable-webrtc
+ac_add_options --enable-alsa
+ac_add_options --enable-ffmpeg
+ac_add_options --enable-av1
+
+# ===============================================
+# 🌐 Idioma, internacionalização e localização
+# ===============================================
+
+ac_add_options --with-l10n-base=@TOPSRCDIR@/l10n
+ac_add_options --enable-ui-locale=en-US
+
+# ===============================================
+# 📦 Paths de instalação e output
+# ===============================================
+
+# Prefixo padrão /usr (sistema ADM moverá via DESTDIR)
+ac_add_options --prefix=/usr
+ac_add_options --libdir=/usr/lib
+ac_add_options --bindir=/usr/bin
+
+# ===============================================
+# 🔒 Segurança e integridade
+# ===============================================
+
+# Ativar suporte a sandbox de conteúdo (mantém segurança)
+ac_add_options --enable-content-sandbox
+ac_add_options --enable-hardening
+ac_add_options --enable-default-toolkit=cairo-gtk3
+
+# Ativar uso de NSS/NSPR externos (mais seguros e consistentes)
+ac_add_options --with-system-nspr
+ac_add_options --with-system-nss
+
+# ===============================================
+# 📜 Registro e diagnóstico
+# ===============================================
+
+# Logs detalhados (apenas se necessário)
+# export MOZ_VERBOSE_LOGGING=1
+# export RUST_BACKTRACE=1
+
+# ===============================================
+# 🧹 Limpeza e empacotamento
+# ===============================================
+
+# Após build, `post-build` do ADM empacota o dist/bin/
+# Aqui apenas garantimos que não há símbolos desnecessários
+STRIP_FLAGS="--strip-unneeded"
+export STRIP_FLAGS
