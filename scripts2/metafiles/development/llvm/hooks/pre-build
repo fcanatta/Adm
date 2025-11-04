@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ADM HOOK: llvm pre-build
+# Prepara ambiente: build dir out-of-source, configura cmake args, verifica deps.
+set -euo pipefail
+
+echo "🔧 [llvm pre-build] Iniciando..."
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/llvm-build.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+INSTALL_PREFIX="${PREFIX:-/usr}"
+THREADS="${THREADS:--j$(nproc)}"
+
+mkdir -p "$(dirname "$ADM_LOG")" || true
+echo "[`date -u`] pre-build start" >> "$ADM_LOG"
+
+# Verificações básicas de dependências (não instala, apenas alerta)
+missing=()
+for t in cmake ninja python3 gcc g++; do
+  if ! command -v "$t" >/dev/null 2>&1; then
+    missing+=("$t")
+  fi
+done
+if [ ${#missing[@]} -ne 0 ]; then
+  echo "⚠️  Ferramentas faltantes: ${missing[*]} (instale antes do build ou use adm-resolver)."
+  echo "[`date -u`] missing_tools: ${missing[*]}" >> "$ADM_LOG"
+fi
+
+# Criar build dir out-of-source
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) criaria build dir: $BUILD_DIR"
+else
+  rm -rf "$BUILD_DIR" || true
+  mkdir -p "$BUILD_DIR"
+fi
+
+# Compor cmake options (ajustáveis via env)
+CMAKE_ARGS=(
+  -G Ninja
+  -DLLVM_ENABLE_PROJECTS="clang;lld;libcxx;compiler-rt"
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}"
+  -DLLVM_ENABLE_RUNTIMES="libcxx;compiler-rt"
+  -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64"
+  -DLLVM_ENABLE_LLD=ON
+  -DLLVM_ENABLE_RTTI=ON
+)
+
+# Adaptações para perfis
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+case "$ADM_PROFILE" in
+  extreme)
+    CMAKE_ARGS+=(-DCMAKE_C_FLAGS="-O3 -march=native -flto" -DCMAKE_CXX_FLAGS="-O3 -march=native -flto")
+    ;;
+  none)
+    CMAKE_ARGS+=(-DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_ENABLE_ASSERTIONS=ON)
+    ;;
+  normal|*)
+    # padrão: Release com algumas otimizações
+    ;;
+esac
+
+echo "🏗️  cmake args: ${CMAKE_ARGS[*]}"
+echo "[`date -u`] cmake: ${CMAKE_ARGS[*]}" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) would run cmake in $BUILD_DIR"
+else
+  pushd "$BUILD_DIR" >/dev/null
+  cmake "${CMAKE_ARGS[@]}" "${SRC_DIR}/llvm" > cmake.configure.out 2>&1 || {
+    echo "❌ cmake configure failed (ver cmake.configure.out)"
+    tail -n 200 cmake.configure.out || true
+    popd >/dev/null
+    exit 1
+  }
+  popd >/dev/null
+fi
+
+echo "✅ [llvm pre-build] Configuração pronta"
