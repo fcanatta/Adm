@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# ADM HOOK: binutils post-build
+# Testes e verificação após make
+
+set -euo pipefail
+
+echo "🔍 [binutils post-build] Validando build..."
+
+ADM_STAGE="${ADM_STAGE:-$(cat /etc/adm-stage 2>/dev/null || echo stage3)}"
+
+if [[ "$ADM_STAGE" =~ stage0|stage1 ]]; then
+  echo "ℹ️  Ignorando testes no bootstrap (${ADM_STAGE})"
+else
+  echo "⚙️  Executando 'make -k check'"
+  if [ "${DRY_RUN:-0}" -eq 1 ]; then
+    echo "(dry-run) simulando testes"
+  else
+    make -k check || echo "⚠️  Alguns testes falharam, continuar com cautela."
+  fi
+fi
+
+echo "✅ [binutils post-build] Etapa concluída"
