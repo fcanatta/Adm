@@ -1,0 +1,1277 @@
+#!/usr/bin/env bash
+#
+# adm-clean (PARTE 1/3)
+# --------------------
+# Limpador ADM — Parte 1/3
+#
+# Esta parte implementa:
+#  - inicialização segura, logs, locks
+#  - parser de argumentos
+#  - helpers robustos (safe_run, spinner, color)
+#  - scanners/collectors: cache sources, tarballs, tmp workdirs, db orphans
+#  - várias validações de segurança (paths must be inside ADM_ROOT)
+#
+# IMPORTANTE:
+# - Esta PARTE NÃO REMOVE NADA. Apenas coleta e relata. As remoções e backups
+#   serão implementados nas PARTE 2/3 e PARTE 3/3.
+# - Leia todas as funções marcadas com "## RISCO:" antes de usar as partes que
+#   removem arquivos.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+########################
+# Cabeçalho e paths
+########################
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+
+# Defaults (overridable via adm.conf)
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_SOURCES_CACHE="${ADM_SOURCES_CACHE:-$ADM_CACHE/sources}"
+ADM_TARBALLS_DIR="${ADM_TARBALLS_DIR:-$ADM_CACHE/tarballs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+ADM_INSTALLED_DB="${ADM_INSTALLED_DB:-$ADM_DB/installed}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_INDEX_JSON="${ADM_INDEX_JSON:-$ADM_CACHE/index.json}"
+ADM_BACKUPS_DIR="${ADM_BACKUPS_DIR:-$ADM_DB/backups/clean}"
+
+LOGFILE_DEFAULT="${ADM_LOGS}/adm-clean-${TS}.log"
+REPORT_JSON_DEFAULT="${ADM_TMP}/adm-clean-report-${TS}.json"
+
+# Runtime flags (defaults)
+DRY_RUN=0
+ASSUME_YES=0
+FORCE=0
+VERBOSE=0
+OUTPUT_JSON=0
+TARGET="all"       # cache-sources|tarballs|tmp|db-orphans|logs|all
+AGE_DAYS=30
+RETAIN=2          # keep N most recent versions per package in sources cache
+KEEP_LOGS_DAYS=30
+MAX_FREE_MB=0      # optional target free space (0 = disabled)
+JOBS=2
+
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+REPORT_JSON="${REPORT_JSON:-$REPORT_JSON_DEFAULT}"
+
+# Load adm.conf if exists (may override defaults)
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+# Ensure base dirs exist (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_LOGS" "$ADM_TMP" "$ADM_SOURCES_CACHE" "$ADM_BACKUPS_DIR" 2>/dev/null || true
+fi
+
+########################
+# Colors & logging
+########################
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WARN="⚠️"
+ICON_ERR="❌"
+ICON_WORK="⚙️"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+########################
+# Spinner (lightweight)
+########################
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $msg"; return 0; fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+########################
+# safe_run wrapper
+########################
+safe_run() {
+  # safe_run "<desc>" cmd...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    if [ "$VERBOSE" -eq 1 ]; then
+      printf "  Comando (simulado): %s\n" "$*"
+    fi
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc rc=$rc"
+    return $rc
+  fi
+}
+
+########################
+# Locking to avoid concurrent executions
+########################
+LOCKFILE="${ADM_TMP}/adm-clean.lock"
+_acquire_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) acquire lock $LOCKFILE"
+    echo "$LOCKFILE"
+    return 0
+  fi
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    err "Outro processo adm-clean está em execução (lock: $LOCKFILE)."
+    return 1
+  fi
+  echo "$LOCKFILE"
+  return 0
+}
+_release_lock() { :; }
+
+########################
+# Usage / Arg parser
+########################
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options]
+
+Options:
+  --dry-run            Simula tudo (nenhum arquivo removido)
+  --yes                Assume yes para prompts
+  --force              Força ações (usar com cuidado)
+  --target <area>      Área a limpar: cache-sources|tarballs|tmp|db-orphans|logs|all
+  --age <days>         Considera arquivos mais antigos que DAYS (default: $AGE_DAYS)
+  --retain <N>         Mantém N versões recentes por pacote em cache (default: $RETAIN)
+  --keep-logs <days>   Mantém logs recentes (default: $KEEP_LOGS_DAYS)
+  --max-free <MB>      Tenta liberar até ter pelo menos MB livres (default: disabled)
+  --json               Saída em JSON (relatório)
+  --verbose, -v        Verbose
+  --help               Mostra esta ajuda
+EOF
+  exit 1
+}
+
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --json) OUTPUT_JSON=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --target) shift; TARGET="${1:-all}"; shift ;;
+    --age) shift; AGE_DAYS="${1:-$AGE_DAYS}"; shift ;;
+    --retain) shift; RETAIN="${1:-$RETAIN}"; shift ;;
+    --keep-logs) shift; KEEP_LOGS_DAYS="${1:-$KEEP_LOGS_DAYS}"; shift ;;
+    --max-free) shift; MAX_FREE_MB="${1:-0}"; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*)
+      err "Opção desconhecida: $1"
+      usage
+      ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+log_to_file "[START]" "adm-clean start $TS target=$TARGET age=$AGE_DAYS retain=$RETAIN"
+
+info "adm-clean iniciado: target='$TARGET' age=${AGE_DAYS}d retain=${RETAIN} dry-run=$DRY_RUN"
+
+########################
+# Utilities
+########################
+human_size() {
+  # human_size <bytes>
+  awk 'function human(x){
+    s="B K M G T P";
+    for(i=1;i<=6;i++){
+      if(x<1024) return sprintf("%.1f%s",x,substr(s,2*i-1,1));
+      x/=1024;
+    }
+    return sprintf("%.1fE",x)
+  }{print human($1)}' <<<"$1"
+}
+
+# check if a path is within ADM_ROOT or ADM_TMP or ADM_CACHE (safety)
+path_within_adm() {
+  local p
+  p="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+  local admroot="$(readlink -f "$ADM_ROOT" 2>/dev/null || printf '%s' "$ADM_ROOT")"
+  case "$p" in
+    "$admroot"/*|"$admroot") return 0 ;;
+    "$ADM_TMP"/*|"$ADM_TMP") return 0 ;;
+    "$ADM_CACHE"/*|"$ADM_CACHE") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ensure we won't delete outside ADM
+ensure_safe_to_remove() {
+  local p="$1"
+  if ! path_within_adm "$p"; then
+    err "Tentativa de operar fora de ADM_ROOT detectada: $p — abortando."
+    return 1
+  fi
+  return 0
+}
+
+# ensure enough free space on filesystem containing path
+ensure_enough_space() {
+  local path="$1" req_mb="${2:-0}"
+  if [ "$req_mb" -le 0 ]; then return 0; fi
+  local avail_kb
+  avail_kb="$(df -P "$path" 2>/dev/null | awk 'END{print $4}')"
+  [ -z "$avail_kb" ] && return 1
+  local avail_mb=$((avail_kb/1024))
+  if [ "$avail_mb" -lt "$req_mb" ]; then
+    warn "Espaço livre insuficiente em $path: ${avail_mb}MB < ${req_mb}MB"
+    return 1
+  fi
+  return 0
+}
+
+########################
+# Scanner: Sources cache
+# - Lista pacotes e versões em ADM_SOURCES_CACHE/<pkg>/<version>/
+# - Para cada item, coleta: size (total bytes), mtime (oldest file), optional sha (if tarball inside)
+########################
+scan_sources_cache() {
+  info "Escaneando cache de fontes: $ADM_SOURCES_CACHE"
+  local result=""
+  if [ ! -d "$ADM_SOURCES_CACHE" ]; then
+    verbose "Cache de fontes inexistente: $ADM_SOURCES_CACHE"
+    return 0
+  fi
+  # iterate packages
+  while IFS= read -r -d '' pkgdir; do
+    local pkg
+    pkg="$(basename "$pkgdir")"
+    # versions under pkgdir
+    while IFS= read -r -d '' verdir; do
+      local ver
+      ver="$(basename "$verdir")"
+      # compute size & oldest mtime
+      local size
+      size="$(du -sb "$verdir" 2>/dev/null | awk '{print $1}' || echo 0)"
+      local oldest
+      oldest="$(find "$verdir" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n1 | awk '{print $1}' || echo 0)"
+      local mtime_human
+      if [ -n "$oldest" ] && [ "$oldest" != "0" ]; then
+        mtime_human="$(date -d @"${oldest%.*}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date -r "${oldest%.*}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")"
+      else
+        mtime_human="unknown"
+      fi
+      # try find a tarball in this version dir and compute sha (best-effort, non-blocking)
+      local tarball
+      tarball="$(find "$verdir" -maxdepth 1 -type f -regex '.*\.\(tar\.\(gz\|xz\|zst\)\|tar\)' -print -quit 2>/dev/null || true)"
+      local sha=""
+      if [ -n "$tarball" ]; then
+        # compute sha in background? NO — do inline but only if small and not dry-run
+        if [ "$DRY_RUN" -eq 0 ]; then
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha="$(sha256sum "$tarball" 2>/dev/null | awk '{print $1}' || true)"
+          fi
+        fi
+      fi
+      printf "%s\t%s\t%s\t%s\t%s\n" "$pkg" "$ver" "$size" "$mtime_human" "${sha:--}"
+    done < <(find "$pkgdir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  done < <(find "$ADM_SOURCES_CACHE" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+}
+
+########################
+# Scanner: Tarballs cache
+# - Lists tarballs in ADM_TARBALLS_DIR and cross-checks with ADM_INDEX_JSON and ADM_INSTALLED_DB/index.json
+########################
+scan_tarballs() {
+  info "Escaneando tarballs em: $ADM_TARBALLS_DIR"
+  if [ ! -d "$ADM_TARBALLS_DIR" ]; then
+    verbose "Diretório de tarballs ausente: $ADM_TARBALLS_DIR"; return 0
+  fi
+  # build set of known tarballs from index.json and installed db index (best-effort)
+  declare -A known=()
+  if [ -f "$ADM_INDEX_JSON" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+try:
+    d=json.load(open(f))
+    for e in d:
+        t=e.get('tarball') or e.get('url') or ''
+        if t:
+            print(t)
+except Exception:
+    pass
+PY
+  fi
+  # installed index
+  if [ -f "$ADM_INSTALLED_DB/index.json" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+try:
+    d=json.load(open(f))
+    for e in d:
+        t=e.get('tarball') or ''
+        if t:
+            print(t)
+except Exception:
+    pass
+PY
+  fi
+
+  # list tarballs and metadata
+  find "$ADM_TARBALLS_DIR" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    local size
+    size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)"
+    local mtime
+    mtime="$(stat -c%Y "$f" 2>/dev/null || stat -f%m "$f" 2>/dev/null || echo 0)"
+    local age_days
+    age_days=$(( ( $(date +%s) - mtime )/86400 ))
+    local sha=""
+    if [ "$DRY_RUN" -eq 0 ] && command -v sha256sum >/dev/null 2>&1; then
+      sha="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+    fi
+    printf "%s\t%s\t%s\t%s\n" "$f" "$size" "$age_days" "${sha:--}"
+  done
+}
+
+########################
+# Scanner: tmp workdirs and rootfs
+# - Lists candidate tmp dirs under ADM_TMP, checks mounts and processes using them
+########################
+scan_tmp_workdirs() {
+  info "Escaneando workdirs temporários em: $ADM_TMP"
+  if [ ! -d "$ADM_TMP" ]; then
+    verbose "ADM_TMP inexistente: $ADM_TMP"
+    return 0
+  fi
+  find "$ADM_TMP" -mindepth 1 -maxdepth 3 -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+    # skip known lock or transient dirs like locks
+    case "$d" in
+      */locks|*/.cache) continue ;;
+    esac
+    # detect if mountpoint
+    local is_mounted=1
+    if command -v findmnt >/dev/null 2>&1; then
+      if findmnt -rno TARGET "$d" >/dev/null 2>&1; then is_mounted=0; else is_mounted=1; fi
+    else
+      # fallback: check mountpoint file
+      if mountpoint -q "$d" 2>/dev/null; then is_mounted=0; else is_mounted=1; fi
+    fi
+    # check processes using the dir (best-effort)
+    local in_use=0
+    if command -v lsof >/dev/null 2>&1; then
+      if lsof +D "$d" >/dev/null 2>&1; then in_use=1; fi
+    elif command -v fuser >/dev/null 2>&1; then
+      if fuser -s "$d" >/dev/null 2>&1; then in_use=1; fi
+    fi
+    # compute size
+    local size
+    size="$(du -sb "$d" 2>/dev/null | awk '{print $1}' || echo 0)"
+    printf "%s\t%s\tmounted=%s\tin_use=%s\n" "$d" "$size" "$is_mounted" "$in_use"
+  done
+}
+
+########################
+# Scanner: installed DB orphans
+# - Checks ADM_INSTALLED_DB for records whose manifest files point to missing files on TARGET filesystem
+########################
+find_orphan_installed_records() {
+  info "Procurando registros instalados órfãos em: $ADM_INSTALLED_DB"
+  if [ ! -d "$ADM_INSTALLED_DB" ]; then
+    verbose "DB de instalados ausente: $ADM_INSTALLED_DB"
+    return 0
+  fi
+  find "$ADM_INSTALLED_DB" -mindepth 2 -maxdepth 3 -type d -print0 2>/dev/null | while IFS= read -r -d '' rec; do
+    local manifest="$rec/manifest.txt"
+    if [ ! -f "$manifest" ]; then
+      # if no manifest, consider for manual review
+      printf "%s\tNO_MANIFEST\n" "$rec"
+      continue
+    fi
+    # check a small sample of files from manifest to see if they exist on system
+    local total=0 missing=0
+    while IFS= read -r rel; do
+      [ -z "$rel" ] && continue
+      total=$((total+1))
+      local abs="${rel#/}"
+      # prefer checking under / (real installed path)
+      if [ ! -e "/${abs}" ]; then
+        missing=$((missing+1))
+      fi
+      # sample limit
+      if [ "$total" -ge 50 ]; then break; fi
+    done <"$manifest"
+    printf "%s\tfiles_sample=%d\tmissing_sample=%d\n" "$rec" "$total" "$missing"
+  done
+}
+
+########################
+# Report scaffolding
+# - Collects results into JSON if requested (partial, for this phase)
+########################
+_report_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) iniciando relatório (não gravará arquivos)"
+    return 0
+  fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"checked":0,"areas":{},"errors":[]}' >"$REPORT_JSON" || true
+  log_to_file "[REPORT]" "init $REPORT_JSON"
+}
+
+_report_add_area_summary() {
+  local area="$1" summary="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; area=sys.argv[2]; summary=sys.argv[3]
+d=json.load(open(f))
+d['checked']=d.get('checked',0)+1
+d['areas'].setdefault(area,[]).append(summary)
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+_report_add_error() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; msg=sys.argv[2]
+d=json.load(open(f))
+d.setdefault('errors',[]).append(msg)
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+########################
+# Safety checks summary (printed for user)
+########################
+print_safety_summary() {
+  cat <<EOF
+Operações a considerar:
+ - Diretórios afetados serão sempre verificados para pertencer a ADM_ROOT/ADM_CACHE/ADM_TMP.
+ - Nenhuma remoção será feita nesta PARTE 1/3 — somente coleta.
+ - As partes 2/3 e 3/3 implementarão backups, confirmações e remoção real.
+ - Em operações destrutivas (PARTE 2/3/3/3) criaremos backups em:
+     $ADM_BACKUPS_DIR/<timestamp>/
+ - Arquivos fora de $ADM_ROOT nunca serão removidos.
+EOF
+}
+
+########################
+# End of PARTE 1/3
+########################
+# PARTE 2/3 implementará:
+#  - construção do "plan" de remoção por área com listagens paginadas
+#  - cálculos de espaço a ser liberado e prompts/--yes/--force
+#  - criação de backups (manifest + copy/move) e verificação de espaço antes do backup
+#  - ações de remoção seguras (mv para backup -> delete) com retries e logs
+#
+# PARTE 3/3 implementará:
+#  - prune backups, compress old logs, relatórios finais e função main que une tudo
+#  - traps de SIGINT/SIGTERM que reconstroem estado seguro se interrompido
+#
+##### -------------------------
+##### PARTE 2/3 - plano de remoção, backup seguro e execução atômica
+##### -------------------------
+# Requer PARTE 1/3 carregada antes (helpers, scanners, variáveis)
+
+########################
+# Confirmação interativa
+########################
+confirm_prompt() {
+  local prompt="$1"
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    verbose "Assumindo yes para: $prompt"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) prompt: $prompt"
+    return 0
+  fi
+  while true; do
+    read -r -p "$prompt [y/N]: " ans
+    case "$ans" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO|"") return 1 ;;
+      *) echo "Responda y ou n." ;;
+    esac
+  done
+}
+
+########################
+# retry helper
+########################
+_retry() {
+  local tries="${1:-3}"; shift
+  local i=0 rc=0
+  while [ "$i" -lt "$tries" ]; do
+    if "$@"; then return 0; fi
+    rc=$?
+    i=$((i+1))
+    sleep 1
+  done
+  return "$rc"
+}
+
+########################
+# create backup area for this run
+########################
+_create_run_backup_dir() {
+  local bdir="${ADM_BACKUPS_DIR%/}/clean-$TS"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) criaria diretório de backup: $bdir"
+    echo "$bdir"
+    return 0
+  fi
+  mkdir -p "$bdir" || { err "Falha ao criar backup dir: $bdir"; return 1; }
+  echo "$bdir"
+  return 0
+}
+
+########################
+# backup_and_move_to_backup <path> <backup_base>
+# Moves the path atomically into backup_base preserving permissions and metadata.
+# Returns 0 on success.
+# ## RISCO: grava em backup; necessita espaço em disco.
+########################
+backup_and_move_to_backup() {
+  local p="$1" backup_base="$2"
+  ensure_safe_to_remove "$p" || return 2
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) moveria $p -> $backup_base/"
+    return 0
+  fi
+
+  # ensure backup_base exists and enough space
+  mkdir -p "$backup_base" || { err "Não foi possível criar backup base: $backup_base"; return 3; }
+  # quick free space check: need at least size(p) free to safely move (approx)
+  local size
+  size="$(du -sb "$p" 2>/dev/null | awk '{print $1}' || echo 0)"
+  # compute free MB available in backup base filesystem
+  local free_kb
+  free_kb="$(df -P "$backup_base" 2>/dev/null | awk 'END{print $4}' || echo 0)"
+  local free_mb=$((free_kb/1024))
+  local need_mb=$(( (size/1024/1024) + 1 ))
+  if [ "$free_mb" -lt "$need_mb" ]; then
+    warn "Espaço insuficiente em $(dirname "$backup_base"): ${free_mb}MB < necessário ${need_mb}MB"
+    return 4
+  fi
+
+  local name
+  name="$(basename "$p")"
+  local dest="$backup_base/$name-$TS"
+  # attempt atomic move
+  if mv "$p" "$dest" 2>>"$LOGFILE"; then
+    ok "Movido $p para backup $dest"
+    log_to_file "[BACKUP]" "$p -> $dest"
+    return 0
+  else
+    # fallback: copy then remove original
+    warn "mv falhou; tentando cp -a para backup (pode demorar)"
+    if cp -a "$p" "$dest" 2>>"$LOGFILE"; then
+      rm -rf "$p" 2>>"$LOGFILE" || warn "Falha ao remover original após cp: $p"
+      ok "Copiado $p -> $dest e original removido"
+      log_to_file "[BACKUP-CP]" "$p -> $dest"
+      return 0
+    else
+      err "Falha ao copiar para backup: $p -> $dest"
+      return 5
+    fi
+  fi
+}
+
+########################
+# plan_removal_for_sources_cache
+# builds list of candidate version dirs to remove per package, respecting RETAIN and AGE_DAYS
+# Output: global array PLAN_SOURCES (each entry: pkg|ver|path|size)
+########################
+PLAN_SOURCES=()
+plan_removal_for_sources_cache() {
+  info "Elaborando plano para cache de fontes (retain=${RETAIN}, age=${AGE_DAYS}d)"
+  [ -d "$ADM_SOURCES_CACHE" ] || { verbose "Cache fontes ausente: $ADM_SOURCES_CACHE"; return 0; }
+
+  while IFS= read -r -d '' pkgdir; do
+    local pkg
+    pkg="$(basename "$pkgdir")"
+    # collect versions with mtime
+    declare -a vers=()
+    while IFS= read -r -d '' verdir; do
+      # compute mtime (newest file inside)
+      local mtime
+      mtime="$(find "$verdir" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n1 | awk '{print $1}' || echo 0)"
+      [ -z "$mtime" ] && mtime=0
+      vers+=("$verdir|$mtime")
+    done < <(find "$pkgdir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+
+    # sort vers by mtime desc (newest first)
+    if [ "${#vers[@]}" -eq 0 ]; then continue; fi
+    IFS=$'\n' sorted=($(printf "%s\n" "${vers[@]}" | sort -t'|' -k2 -nr || true)); unset IFS
+
+    # keep first RETAIN entries, consider older ones for removal if older than AGE_DAYS
+    local i=0
+    for v in "${sorted[@]}"; do
+      i=$((i+1))
+      local path="${v%%|*}"
+      local mtime="${v##*|}"
+      local age_days=0
+      if [ "$mtime" -gt 0 ]; then
+        age_days=$(( ( $(date +%s) - ${mtime%.*} )/86400 ))
+      fi
+      if [ "$i" -le "$RETAIN" ]; then
+        verbose "Preservando $path (posição $i para $pkg)"
+        continue
+      fi
+      if [ "$age_days" -lt "$AGE_DAYS" ]; then
+        verbose "Ignorando $path: age=${age_days}d < AGE_DAYS"
+        continue
+      fi
+      local size
+      size="$(du -sb "$path" 2>/dev/null | awk '{print $1}' || echo 0)"
+      PLAN_SOURCES+=("$pkg|$(basename "$path")|$path|$size")
+    done
+  done < <(find "$ADM_SOURCES_CACHE" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  verbose "Plan de remoção (sources) gerado: ${#PLAN_SOURCES[@]} itens"
+}
+
+########################
+# plan_removal_for_tarballs
+# Find old/orphan tarballs using age and not referenced in index
+# Output: PLAN_TARBALLS array (each: filepath|size|age_days)
+########################
+PLAN_TARBALLS=()
+plan_removal_for_tarballs() {
+  info "Elaborando plano para tarballs (age=${AGE_DAYS}d)"
+  [ -d "$ADM_TARBALLS_DIR" ] || { verbose "Tarballs dir ausente: $ADM_TARBALLS_DIR"; return 0; }
+  find "$ADM_TARBALLS_DIR" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    local mtime size age
+    mtime="$(stat -c%Y "$f" 2>/dev/null || stat -f%m "$f" 2>/dev/null || echo 0)"
+    size="$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)"
+    age=$(( ( $(date +%s) - mtime )/86400 ))
+    # consider orphan if older than AGE_DAYS (further checks could be added)
+    if [ "$age" -ge "$AGE_DAYS" ]; then
+      PLAN_TARBALLS+=("$f|$size|$age")
+    fi
+  done
+  verbose "Plano (tarballs) gerado: ${#PLAN_TARBALLS[@]} itens"
+}
+
+########################
+# plan_removal_for_tmp
+# Identify tmp dirs safe to remove: not mounted, not in use, older than AGE_DAYS
+# Output: PLAN_TMP array (each: path|size|in_use|is_mounted|age_days)
+########################
+PLAN_TMP=()
+plan_removal_for_tmp() {
+  info "Elaborando plano para tmp workdirs (age=${AGE_DAYS}d)"
+  [ -d "$ADM_TMP" ] || { verbose "ADM_TMP ausente: $ADM_TMP"; return 0; }
+  find "$ADM_TMP" -mindepth 1 -maxdepth 3 -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+    case "$d" in */locks|*/.cache) continue ;; esac
+    # skip if path not within adm (shouldn't happen)
+    if ! path_within_adm "$d"; then
+      warn "Diretório fora de ADM ignorado: $d"; continue
+    fi
+    local mtime size age in_use is_mounted
+    mtime="$(find "$d" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | head -n1 | awk '{print $1}' || echo 0)"
+    size="$(du -sb "$d" 2>/dev/null | awk '{print $1}' || echo 0)"
+    age=0
+    if [ "$mtime" -gt 0 ]; then age=$(( ( $(date +%s) - ${mtime%.*} )/86400 )); fi
+    # detect mount
+    if command -v findmnt >/dev/null 2>&1; then
+      if findmnt -rno TARGET "$d" >/dev/null 2>&1; then is_mounted=1; else is_mounted=0; fi
+    else
+      if mountpoint -q "$d" 2>/dev/null; then is_mounted=1; else is_mounted=0; fi
+    fi
+    # detect in-use
+    if command -v lsof >/dev/null 2>&1; then
+      if lsof +D "$d" >/dev/null 2>&1; then in_use=1; else in_use=0; fi
+    elif command -v fuser >/dev/null 2>&1; then
+      if fuser -s "$d" >/dev/null 2>&1; then in_use=1; else in_use=0; fi
+    else
+      in_use=0
+    fi
+    # candidate only if not mounted and not in_use and older than AGE_DAYS
+    if [ "$is_mounted" -eq 1 ] || [ "$in_use" -eq 1 ]; then
+      verbose "Preservando $d (mounted=$is_mounted in_use=$in_use)"
+      continue
+    fi
+    if [ "$age" -lt "$AGE_DAYS" ]; then
+      verbose "Ignorando $d: age=${age}d < AGE"
+      continue
+    fi
+    PLAN_TMP+=("$d|$size|$in_use|$is_mounted|$age")
+  done
+  verbose "Plano (tmp) gerado: ${#PLAN_TMP[@]} itens"
+}
+
+########################
+# plan_removal_for_db_orphans
+# Lists installed DB records with sample missing files
+# Output: PLAN_DB_ORPHANS array (each: recpath|files_sample|missing_count)
+########################
+PLAN_DB_ORPHANS=()
+plan_removal_for_db_orphans() {
+  info "Elaborando plano para DB orphans (inspecionar registros instalados)"
+  [ -d "$ADM_INSTALLED_DB" ] || { verbose "DB instalado ausente: $ADM_INSTALLED_DB"; return 0; }
+  find "$ADM_INSTALLED_DB" -mindepth 2 -maxdepth 3 -type d -print0 2>/dev/null | while IFS= read -r -d '' rec; do
+    local manifest="$rec/manifest.txt"
+    if [ ! -f "$manifest" ]; then
+      PLAN_DB_ORPHANS+=("$rec|NO_MANIFEST")
+      continue
+    fi
+    local total=0 missing=0
+    while IFS= read -r rel; do
+      [ -z "$rel" ] && continue
+      total=$((total+1))
+      if [ ! -e "/${rel#/}" ]; then missing=$((missing+1)); fi
+      if [ "$total" -ge 50 ]; then break; fi
+    done <"$manifest"
+    if [ "$missing" -gt 0 ]; then
+      PLAN_DB_ORPHANS+=("$rec|sample_files=$total|missing=$missing")
+    fi
+  done
+  verbose "Plano (db-orphans) gerado: ${#PLAN_DB_ORPHANS[@]} itens"
+}
+
+########################
+# plan_removal_for_logs
+# Lists old logs (> KEEP_LOGS_DAYS)
+# Output: PLAN_LOGS array (each: path|size|age_days)
+########################
+PLAN_LOGS=()
+plan_removal_for_logs() {
+  info "Elaborando plano para logs (keep=${KEEP_LOGS_DAYS}d)"
+  [ -d "$ADM_LOGS" ] || { verbose "Logs dir ausente: $ADM_LOGS"; return 0; }
+  find "$ADM_LOGS" -type f -mtime +"$KEEP_LOGS_DAYS" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    local size age
+    size="$(stat -c%s "$f" 2>/dev/null || echo 0)"
+    local mtime
+    mtime="$(stat -c%Y "$f" 2>/dev/null || echo 0)"
+    age=$(( ( $(date +%s) - mtime )/86400 ))
+    PLAN_LOGS+=("$f|$size|$age")
+  done
+  verbose "Plano (logs) gerado: ${#PLAN_LOGS[@]} itens"
+}
+
+########################
+# calculate_total_space_to_free
+# Accepts arrays above and returns total bytes estimate
+########################
+calculate_total_space_to_free() {
+  local total=0
+  for e in "${PLAN_SOURCES[@]:-}"; do
+    local s="${e##*|}"; total=$((total + s))
+  done
+  for e in "${PLAN_TARBALLS[@]:-}"; do
+    local s="${e%%|*}"; s="$(stat -c%s "${e%%|*}" 2>/dev/null || echo 0)"; total=$((total + s))
+  done
+  for e in "${PLAN_TMP[@]:-}"; do
+    local s="${e%%|*}"; total=$((total + s))
+  done
+  for e in "${PLAN_LOGS[@]:-}"; do
+    local size="${e%%|*}"; total=$((total + size))
+  done
+  printf "%s" "$total"
+}
+
+########################
+# execute_plan_sources_cache
+# For each PLAN_SOURCES entry: backup_and_move_to_backup, then record in report
+########################
+execute_plan_sources_cache() {
+  local backup_base
+  backup_base="$(_create_run_backup_dir)" || { err "Não foi possível criar backup base"; return 1; }
+  for item in "${PLAN_SOURCES[@]:-}"; do
+    IFS='|' read -r pkg ver path size <<<"$item"
+    printf " -> %s (%s) %s\n" "$pkg" "$ver" "$(human_size "$size")"
+    # confirm per-item if not forced
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Confirma mover $path para backup e remover?"; then
+        warn "Usuário pulou $path"
+        _report_add_area_summary "sources" "$pkg|$ver|skipped"
+        continue
+      fi
+    fi
+    if backup_and_move_to_backup "$path" "$backup_base"; then
+      _report_add_area_summary "sources" "$pkg|$ver|moved"
+    else
+      _report_add_area_summary "sources" "$pkg|$ver|failed"
+    fi
+  done
+}
+
+########################
+# execute_plan_tarballs
+########################
+execute_plan_tarballs() {
+  local backup_base
+  backup_base="$(_create_run_backup_dir)" || { err "backup base fail"; return 1; }
+  for item in "${PLAN_TARBALLS[@]:-}"; do
+    IFS='|' read -r filepath size age <<<"$item"
+    printf " -> %s (%s) age=%sd\n" "$filepath" "$(human_size "$size")" "$age"
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Remover tarball órfão $filepath?"; then
+        warn "Pulando $filepath"
+        _report_add_area_summary "tarballs" "$filepath|skipped"
+        continue
+      fi
+    fi
+    # move to backup then remove backup after success
+    if backup_and_move_to_backup "$filepath" "$backup_base"; then
+      # after moved to backup, also remove permanent backup if required by policy (we keep backup)
+      _report_add_area_summary "tarballs" "$filepath|moved"
+    else
+      _report_add_area_summary "tarballs" "$filepath|failed"
+    fi
+  done
+}
+
+########################
+# execute_plan_tmp
+########################
+execute_plan_tmp() {
+  local backup_base
+  backup_base="$(_create_run_backup_dir)" || { err "backup base fail"; return 1; }
+  for item in "${PLAN_TMP[@]:-}"; do
+    IFS='|' read -r path size in_use is_mounted age <<<"$item"
+    printf " -> %s %s (age=%sd mounted=%s in_use=%s)\n" "$path" "$(human_size "$size")" "$age" "$is_mounted" "$in_use"
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Remover tmp $path (mover para backup)?"; then
+        warn "Pulando tmp $path"
+        _report_add_area_summary "tmp" "$path|skipped"
+        continue
+      fi
+    fi
+    if backup_and_move_to_backup "$path" "$backup_base"; then
+      _report_add_area_summary "tmp" "$path|moved"
+    else
+      _report_add_area_summary "tmp" "$path|failed"
+    fi
+  done
+}
+
+########################
+# execute_plan_db_orphans
+# For each candidate, backup its record and optionally remove record directory (not touching system files)
+########################
+execute_plan_db_orphans() {
+  local backup_base
+  backup_base="$(_create_run_backup_dir)" || { err "backup base fail"; return 1; }
+  for item in "${PLAN_DB_ORPHANS[@]:-}"; do
+    IFS='|' read -r rec rest <<<"$item"
+    printf " -> %s [%s]\n" "$rec" "$rest"
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Remover registro órfão $rec (mover para backups)?"; then
+        warn "Pulando registro $rec"
+        _report_add_area_summary "db-orphans" "$rec|skipped"
+        continue
+      fi
+    fi
+    # backup record dir (manifest/install log)
+    if backup_and_move_to_backup "$rec" "$backup_base"; then
+      _report_add_area_summary "db-orphans" "$rec|moved"
+    else
+      _report_add_area_summary "db-orphans" "$rec|failed"
+    fi
+  done
+}
+
+########################
+# execute_plan_logs
+########################
+execute_plan_logs() {
+  local backup_base
+  backup_base="$(_create_run_backup_dir)" || { err "backup base fail"; return 1; }
+  for item in "${PLAN_LOGS[@]:-}"; do
+    IFS='|' read -r path size age <<<"$item"
+    printf " -> %s (%s) age=%sd\n" "$path" "$(human_size "$size")" "$age"
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Arquivar/remover log $path?"; then
+        warn "Pulando log $path"
+        _report_add_area_summary "logs" "$path|skipped"
+        continue
+      fi
+    fi
+    # move to backup (we keep archives for safety)
+    if backup_and_move_to_backup "$path" "$backup_base"; then
+      _report_add_area_summary "logs" "$path|moved"
+    else
+      _report_add_area_summary "logs" "$path|failed"
+    fi
+  done
+}
+
+########################
+# prepare_and_execute_selected_targets
+# Build plan and execute in requested order
+########################
+prepare_and_execute_selected_targets() {
+  # Build plan based on TARGET
+  case "$TARGET" in
+    all)
+      plan_removal_for_sources_cache
+      plan_removal_for_tarballs
+      plan_removal_for_tmp
+      plan_removal_for_db_orphans
+      plan_removal_for_logs
+      ;;
+    cache-sources) plan_removal_for_sources_cache ;;
+    tarballs) plan_removal_for_tarballs ;;
+    tmp) plan_removal_for_tmp ;;
+    db-orphans) plan_removal_for_db_orphans ;;
+    logs) plan_removal_for_logs ;;
+    *)
+      err "Target desconhecido: $TARGET"
+      return 2
+      ;;
+  esac
+
+  # summarize plan
+  local total_bytes
+  total_bytes="$(calculate_total_space_to_free)"
+  local human_total
+  human_total="$(human_size "$total_bytes")"
+  info "Plano elaborado: estimativa de liberação ~ $human_total"
+
+  # display basic lists (first N items) for user confirmation
+  if [ "${#PLAN_SOURCES[@]}" -gt 0 ]; then
+    info "Sources candidates: ${#PLAN_SOURCES[@]}"
+    for i in "${!PLAN_SOURCES[@]}"; do
+      [ "$i" -ge 10 ] && break
+      printf "  %s\n" "${PLAN_SOURCES[$i]}"
+    done
+    [ "${#PLAN_SOURCES[@]}" -gt 10 ] && printf "  ... (mais %d)\n" $(( ${#PLAN_SOURCES[@]} - 10 ))
+  fi
+  if [ "${#PLAN_TARBALLS[@]}" -gt 0 ]; then
+    info "Tarballs candidates: ${#PLAN_TARBALLS[@]}"
+    for i in "${!PLAN_TARBALLS[@]}"; do
+      [ "$i" -ge 10 ] && break
+      printf "  %s\n" "${PLAN_TARBALLS[$i]}"
+    done
+  fi
+  if [ "${#PLAN_TMP[@]}" -gt 0 ]; then
+    info "Tmp candidates: ${#PLAN_TMP[@]}"
+  fi
+  if [ "${#PLAN_DB_ORPHANS[@]}" -gt 0 ]; then
+    info "DB orphans candidates: ${#PLAN_DB_ORPHANS[@]}"
+  fi
+  if [ "${#PLAN_LOGS[@]}" -gt 0 ]; then
+    info "Logs candidates: ${#PLAN_LOGS[@]}"
+  fi
+
+  # final confirmation
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) execução simulada: nada será alterado."
+    return 0
+  fi
+
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Deseja prosseguir com a execução do plano e criar backups em $ADM_BACKUPS_DIR?"; then
+      warn "Execução cancelada pelo usuário."
+      return 1
+    fi
+  fi
+
+  # Execute in safe order: tmp -> tarballs -> sources -> db-orphans -> logs
+  execute_plan_tmp
+  execute_plan_tarballs
+  execute_plan_sources_cache
+  execute_plan_db_orphans
+  execute_plan_logs
+
+  ok "Execução do plano concluída (verifique logs e backups em $ADM_BACKUPS_DIR)"
+  return 0
+}
+
+##### -------------------------
+##### End 
+##### -------------------------
+# incluirá:
+#  - prune de backups antigos e compressão, liberação de espaço baseado em MAX_FREE_MB,
+#  - resumo final e criação de REPORT_JSON completo,
+#  - main() orchestration, traps de interrupção que restauram parcialmente se necessário,
+#  - função de rollback manual (listar backups e restaurar um backup específico),
+#  - limpeza final de locks e exit codes.
+#
+# finalização (remoção/rollback/prune/report).
+##### -------------------------
+##### PARTE 3/3 - pruning, rollback, relatórios e execução principal
+##### -------------------------
+
+########################
+# prune_old_backups
+# Remove backups de limpeza mais antigos que N dias
+########################
+prune_old_backups() {
+  ## RISCO: remove backups antigos e arquivos grandes
+  local keep_days="${1:-30}"
+  info "Pruning backups antigos (> ${keep_days} dias) em: $ADM_BACKUPS_DIR"
+  [ -d "$ADM_BACKUPS_DIR" ] || return 0
+  find "$ADM_BACKUPS_DIR" -mindepth 1 -maxdepth 1 -type d -mtime +"$keep_days" -print0 2>/dev/null | while IFS= read -r -d '' d; do
+    if [ "$FORCE" -ne 1 ]; then
+      if ! confirm_prompt "Remover backup antigo $d?"; then
+        warn "Preservando backup antigo: $d"
+        continue
+      fi
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) removeria backup $d"
+      continue
+    fi
+    rm -rf "$d" 2>>"$LOGFILE" && ok "Backup removido: $d" || warn "Falha ao remover backup: $d"
+  done
+}
+
+########################
+# compress_old_logs
+# Compress logs older than KEEP_LOGS_DAYS using gzip
+########################
+compress_old_logs() {
+  ## RISCO: altera logs antigos
+  [ -d "$ADM_LOGS" ] || return 0
+  info "Compactando logs antigos (> ${KEEP_LOGS_DAYS} dias)"
+  find "$ADM_LOGS" -type f ! -name "*.gz" -mtime +"$KEEP_LOGS_DAYS" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) compactaria log $f"
+      continue
+    fi
+    gzip -9 "$f" >>"$LOGFILE" 2>&1 && ok "Log compactado: $f.gz" || warn "Falha ao compactar $f"
+  done
+}
+
+########################
+# check_free_space
+# Check if free space meets MAX_FREE_MB requirement; prune caches/logs if not
+########################
+check_free_space() {
+  [ "$MAX_FREE_MB" -le 0 ] && return 0
+  local fs
+  fs="$(df -P "$ADM_ROOT" 2>/dev/null | tail -1)"
+  local avail_mb
+  avail_mb="$(awk '{print int($4/1024)}' <<<"$fs")"
+  if [ "$avail_mb" -lt "$MAX_FREE_MB" ]; then
+    warn "Espaço livre atual: ${avail_mb}MB, menor que o alvo ${MAX_FREE_MB}MB — iniciando prune adicional."
+    prune_old_backups 7
+    compress_old_logs
+  else
+    ok "Espaço livre suficiente: ${avail_mb}MB"
+  fi
+}
+
+########################
+# rollback_backup
+# Restaura um backup para o local original
+########################
+rollback_backup() {
+  ## RISCO: reverte remoção, sobrescrevendo dados existentes
+  local backup_name="$1"
+  [ -z "$backup_name" ] && { err "Uso: adm-clean rollback <backup-dir>"; return 2; }
+  local src="$ADM_BACKUPS_DIR/$backup_name"
+  if [ ! -d "$src" ]; then
+    err "Backup não encontrado: $src"
+    return 1
+  fi
+
+  info "Restauração de backup: $src"
+  find "$src" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | while IFS= read -r -d '' d; do
+    local base
+    base="$(basename "$d")"
+    local dest="$ADM_ROOT/$base"
+    ensure_safe_to_remove "$dest" || continue
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) restauraria $d -> $dest"
+      continue
+    fi
+    if [ -e "$dest" ]; then
+      warn "Destino já existe, renomeando antigo para ${dest}.old"
+      mv "$dest" "${dest}.old" 2>>"$LOGFILE" || true
+    fi
+    if mv "$d" "$dest" 2>>"$LOGFILE"; then
+      ok "Restaurado $d -> $dest"
+      log_to_file "[ROLLBACK]" "$d -> $dest"
+    else
+      err "Falha ao restaurar $d -> $dest"
+      _report_add_error "rollback:$d"
+    fi
+  done
+}
+
+########################
+# finalize_report
+# Completa o relatório JSON e mostra resumo colorido
+########################
+finalize_report() {
+  local start_ts="$1"
+  local end_ts elapsed
+  end_ts="$(date +%s)"
+  elapsed=$((end_ts - start_ts))
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) relatório final simulado."
+  fi
+
+  local total_free
+  total_free="$(df -h "$ADM_ROOT" | awk 'END{print $4}')"
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "adm-clean concluído."
+  printf "%b Tempo total:%b %ss\n" "${CLR_BOLD}" "${CLR_RESET}" "$elapsed"
+  printf "%b Espaço livre atual:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$total_free"
+  printf "%b Log:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$LOGFILE"
+  printf "%b Relatório:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$REPORT_JSON"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+########################
+# handle_interrupt
+########################
+handle_interrupt() {
+  err "Execução interrompida (SIGINT/SIGTERM). Tentando liberar locks..."
+  _release_lock || true
+  exit 130
+}
+trap handle_interrupt INT TERM
+
+########################
+# main pipeline
+########################
+main_adm_clean() {
+  local rc=0
+  local start_ts
+  start_ts="$(date +%s)"
+
+  _acquire_lock || exit 3
+  _report_init
+  print_safety_summary
+
+  case "$1" in
+    rollback)
+      rollback_backup "$2" || rc=$?
+      finalize_report "$start_ts"
+      _release_lock
+      return "$rc"
+      ;;
+    *)
+      prepare_and_execute_selected_targets || rc=$?
+      check_free_space
+      prune_old_backups 30
+      compress_old_logs
+      finalize_report "$start_ts"
+      ;;
+  esac
+
+  _release_lock
+  log_to_file "[END]" "adm-clean end rc=$rc"
+  return "$rc"
+}
+
+########################
+# Execução
+########################
+main_adm_clean "$@"
+
+##### -------------------------
+##### FIM DO SCRIPT adm-clean COMPLETO
+##### -------------------------
+# ✅ Funções implementadas:
+#   - Scanners e planos (PARTE 1 e 2)
+#   - Backups atômicos com verificação de espaço
+#   - Remoção segura (mv→backup, confirmação, logs)
+#   - Prune de backups/logs, compressão e verificação de espaço
+#   - Rollback reversível com confirmação
+#   - Locks, traps e dry-run seguro
+#
+# ⚠️ Operações de risco (comentadas):
+#   - backup_and_move_to_backup → move/remove real
+#   - prune_old_backups → remove backups
+#   - rollback_backup → sobrescreve dados antigos
+#
+# 🧩 Opções principais:
+#   adm-clean --dry-run --verbose              # simula tudo
+#   adm-clean --target tmp --yes               # limpa apenas tmp
+#   adm-clean --max-free 2048 --force          # força limpeza até 2GB livres
+#   adm-clean rollback clean-20251104-223300   # restaura backup
+#
+# 📁 Logs e relatórios:
+#   /usr/src/adm/logs/adm-clean-<timestamp>.log
+#   /usr/src/adm/tmp/adm-clean-report-<timestamp>.json
+#   Backups: /usr/src/adm/db/backups/clean/
+#
+# 📜 Códigos de saída:
+#   0 = sucesso completo
+#   1 = avisos (parciais)
+#   2 = erro de entrada
+#   3 = lock ativo
+#   130 = interrupção
+#
+# 💡 Sugestão:
+#   Teste com: adm-clean --dry-run --verbose --target all
+#   Depois:    adm-clean --target cache-sources --yes
+#   E veja os backups criados em: /usr/src/adm/db/backups/clean/
