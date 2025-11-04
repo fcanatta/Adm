@@ -1,0 +1,8 @@
+name: binutils
+version: 2.43.1
+source: https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+sha256: 4f3988e926e2c0dd3a0979728e9270a4c33cb85ce865458a9082a93c28fce603
+desc: The GNU Binutils package - a collection of binary tools including linker, assembler, and more.
+build_deps: make, texinfo, zstd
+run_deps: glibc
+upstream: https://www.gnu.org/software/binutils/
