@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+#
+# ADM hook: glibc post-build
+# - Run tests (if allowed), warn about parallel-make issues and fallback to -j1
+#
+set -euo pipefail
+
+echo "🔍 [glibc post-build] Starting..."
+DRY_RUN="${DRY_RUN:-0}"
+ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-build.log}"
+ADM_STAGE="${ADM_STAGE:-stage3}"
+
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+# LFS note: parallel make sometimes fails; fallback to -j1 if failure detected.
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) would run: make (and possibly make -k check)"
+  exit 0
+fi
+
+# Try normal make (assumes the build was already executed by adm-build)
+# Run tests only if not in bootstrap stages
+if [[ "$ADM_STAGE" == stage0 || "$ADM_STAGE" == stage1 ]]; then
+  echo "ℹ️  Skipping make check in bootstrap stage ($ADM_STAGE)"
+else
+  echo "⚙️  Running 'make -k check' (may be long)"
+  if ! make -k check; then
+    echo "⚠️  Some tests failed. Retrying check in single-thread mode to get deterministic results..."
+    if ! make -k check -j1; then
+      echo "⚠️  make check still failed. Logging and continuing (you may inspect results)."
+      # do NOT abort automatically; let adm-build decide policy — here we log
+      echo "[`date -u`] make check failed" >> "$ADM_LOG"
+    fi
+  fi
+fi
+
+echo "✅ [glibc post-build] Tests attempted (see logs for details)"
