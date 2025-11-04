@@ -1,0 +1,13 @@
+description: GNU Binutils - a collection of binary tools including the GNU assembler, linker, and related utilities.
+name: binutils
+version: 2.43.1
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/binutils/
+build: 1
+source: https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+source: https://ftpmirror.gnu.org/binutils/binutils-2.43.1.tar.xz
+source: git+https://sourceware.org/git/binutils-gdb.git#binutils-2_43_1
+sha256sum: e8f9c08b48f9c116b0eaa9c60497d67b54b6c0d56452b12e4a993ef3b78d9dfb
+build_deps: make, texinfo, bash, bison, flex, zstd
+run_deps: glibc, zlib
+opt_deps: gdb, python3
