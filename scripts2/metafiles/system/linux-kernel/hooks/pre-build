@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# ADM HOOK: linux-kernel pre-build
+# Prepara ambiente para compilar o kernel (limpeza, configuração, export de variáveis)
+# Respeita DRY_RUN; logs em ${ADM_LOG}
+set -euo pipefail
+
+echo "🔧 [linux-kernel pre-build] Iniciando..."
+
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-prebuild.log}"
+SRC_DIR="${SRC_DIR:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$BUILD_DIR" 2>/dev/null || true
+echo "[`date -u`] pre-build start (profile=${ADM_PROFILE})" >> "$ADM_LOG"
+
+# 1) sanity checks: make present
+if ! command -v make >/dev/null 2>&1; then
+  echo "❌ make não encontrado. Instale 'make' e as build_deps antes."
+  echo "[`date -u`] abort: make missing" >> "$ADM_LOG"
+  exit 1
+fi
+
+# 2) show kernel version from Makefile if present
+KVER="unknown"
+if [ -f "${SRC_DIR}/Makefile" ]; then
+  # parsing VERSION.PATCHLEVEL.SUBLEVEL is dynamic; fallback safe
+  KVER="$(sed -n -E 's/^(VERSION|PATCHLEVEL|SUBLEVEL)\s*=\s*(.*)/\1=\2/p' "${SRC_DIR}/Makefile" 2>/dev/null || true)"
+fi
+echo "ℹ️  Fonte do kernel em: ${SRC_DIR} (ver: ${KVER:-unknown})"
+echo "[`date -u`] src=${SRC_DIR} kernel_ver=${KVER}" >> "$ADM_LOG"
+
+# 3) Clean or preserve based on profile
+case "${ADM_PROFILE}" in
+  none)
+    echo "⚙️  Perfil none: não limparemos a árvore (preservar para bootstrap minimal)"
+    ;;
+  *)
+    echo "🧼 Executando 'make mrproper' para limpar árvore de build (padrão)."
+    if [ "${DRY_RUN}" -eq 1 ]; then
+      echo "(dry-run) make mrproper"
+    else
+      # try but don't fail hard if mrproper fails in some sparse sources
+      if ! make -C "${SRC_DIR}" mrproper > "${BUILD_DIR}/mrproper.log" 2>&1; then
+        echo "⚠️  make mrproper retornou erro — ver ${BUILD_DIR}/mrproper.log"
+        tail -n 80 "${BUILD_DIR}/mrproper.log" || true
+        if [ "${FORCE}" -ne 1 ]; then
+          echo "Abortando (use FORCE=1 para forçar continuar apesar do erro)."
+          exit 1
+        fi
+      fi
+    fi
+    ;;
+esac
+
+# 4) Configure default .config if not present
+if [ ! -f "${SRC_DIR}/.config" ]; then
+  echo "ℹ️  .config não encontrado — criando defconfig (geralmente 'make defconfig')."
+  if [ "${DRY_RUN}" -eq 1 ]; then
+    echo "(dry-run) make defconfig"
+  else
+    if ! make -C "${SRC_DIR}" defconfig > "${BUILD_DIR}/defconfig.log" 2>&1; then
+      echo "❌ make defconfig falhou — ver ${BUILD_DIR}/defconfig.log"
+      tail -n 80 "${BUILD_DIR}/defconfig.log" || true
+      exit 1
+    fi
+  fi
+else
+  echo "ℹ️  .config já existe — assumindo configuração personalizada."
+fi
+
+# 5) Export variables for build
+export BUILD_DIR
+export MAKEFLAGS
+echo "[`date -u`] pre-build ok" >> "$ADM_LOG"
+echo "✅ [linux-kernel pre-build] Preparado."
