@@ -1,0 +1,1234 @@
+#!/usr/bin/env bash
+#
+# adm - CLI master (PARTE 1/3)
+# - Inicialização, detecção de scripts adm-*, helper dinâmico, flags globais, runner wrapper
+# - Não contém ações destrutivas por padrão; use --dry-run para simular
+#
+# RISCO: Este arquivo orquestra execução de múltiplos scripts que podem modificar o sistema.
+# Use --dry-run primeiro. O uso de --force pode pular confirmações de segurança.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+###########################
+# Basic environment & vars
+###########################
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+USER="$(id -un 2>/dev/null || echo unknown)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+SCRIPTS_DIR="${SCRIPTS_DIR:-${ADM_ROOT}/scripts}"
+ADM_CONF="${ADM_CONF:-${ADM_ROOT}/adm.conf}"
+LOGS_DIR="${LOGS_DIR:-${ADM_ROOT}/logs}"
+TMP_DIR="${TMP_DIR:-${ADM_ROOT}/tmp}"
+REPORT_JSON="${REPORT_JSON:-${TMP_DIR}/adm-cli-report-${TS_NOW}.json}"
+
+# Global runtime flags (defaults)
+DRY_RUN=0
+VERBOSE=0
+FORCE=0
+QUIET=0
+OUTPUT_JSON=0
+
+# Colors & icons
+supports_color(){ command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"; CLR_BLU="$(tput setaf 4)"; CLR_BOLD="$(tput bold)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""; CLR_BLU=""; CLR_BOLD=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"
+
+# logs & locking
+mkdir -p "$LOGS_DIR" "$TMP_DIR" 2>/dev/null || true
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-cli-${TS_NOW}.log}"
+LOCK_DIR="${TMP_DIR}/adm-cli-locks"
+mkdir -p "$LOCK_DIR" 2>/dev/null || true
+
+log(){ [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info(){ [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok(){ [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn(){ [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; }
+err(){ [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; }
+
+verbose(){ [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+acquire_lock(){
+  local key="${1:-global}"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Another adm CLI instance is active (lock: $lockfile)"; exit 3; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock(){ local lf="$1"; [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) release lock $lf" && return 0; [ -n "$lf" ] && rm -f "${lf}.pid" 2>/dev/null || true; eval "exec 9>&-"; }
+
+# spinner (non-blocking)
+_spinner_pid=""
+_spinner_cleanup(){ if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then kill "$_spinner_pid" >/dev/null 2>&1 || true; wait "$_spinner_pid" 2>/dev/null || true; fi; _spinner_pid=""; }
+spinner_start(){ local msg="$1"; [ "$DRY_RUN" -eq 1 ] && info "(dry-run) $msg" && return 0; printf "%b %s " "${CLR_BLU}${ICON_INFO}${CLR_RST}" "$msg"; ( local i=0; chars='|/-\' ; while :; do printf "\b%s" "${chars:i++%${#chars}:1}"; sleep 0.12; done ) & _spinner_pid=$!; trap _spinner_cleanup EXIT; }
+spinner_stop(){ local okmsg="${1:-Done}"; if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi; _spinner_cleanup; printf "\b"; ok "$okmsg"; trap - EXIT; }
+
+# JSON helpers
+_has_py(){ command -v python3 >/dev/null 2>&1; }
+json_init(){
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) init json $REPORT_JSON"; return 0; fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  if _has_py; then
+    python3 - <<PY 2>/dev/null
+import json,sys
+d={"tool":"adm-cli","timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")","host":"$(hostname -f 2>/dev/null || hostname)","commands":{}}
+open(sys.argv[1],"w").write(json.dumps(d,indent=2))
+PY
+  else
+    cat >"$REPORT_JSON" <<JSON
+{"tool":"adm-cli","timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")","host":"$(hostname -f 2>/dev/null || hostname)","commands":{}}
+JSON
+  fi
+}
+json_add(){ local key="$1"; local info="$2"; [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) json add $key" && return 0; if _has_py; then python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; k=sys.argv[2]; i=sys.argv[3]
+d=json.load(open(f))
+d.setdefault("commands",{}).setdefault(k,[]).append({"info":i,"time":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    printf '%s: %s\n' "$key" "$info" >>"${REPORT_JSON}.txt"
+  fi
+}
+
+############################
+# Initialization & checks
+############################
+check_environment(){
+  spinner_start "Validating ADM environment"
+  # ADM_ROOT exist?
+  if [ ! -d "$ADM_ROOT" ]; then
+    warn "ADM_ROOT missing: $ADM_ROOT"
+    ## RISCO: create ADM_ROOT automatically only with --force; otherwise user must initialize
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would mkdir -p $ADM_ROOT"; else
+      if [ "$FORCE" -eq 1 ]; then
+        mkdir -p "$ADM_ROOT" || { err "Failed to create ADM_ROOT: $ADM_ROOT"; exit 2; }
+        ok "Created ADM_ROOT: $ADM_ROOT"
+      else
+        err "ADM_ROOT not present. Run 'adm help' or set ADM_ROOT. Aborting."
+        spinner_stop "Validation failed"
+        exit 2
+      fi
+    fi
+  else
+    ok "ADM_ROOT present: $ADM_ROOT"
+  fi
+
+  # scripts dir presence
+  if [ ! -d "$SCRIPTS_DIR" ]; then
+    warn "scripts dir missing: $SCRIPTS_DIR"
+    if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would mkdir -p $SCRIPTS_DIR"; else
+      if [ "$FORCE" -eq 1 ]; then mkdir -p "$SCRIPTS_DIR" || { err "Failed to create $SCRIPTS_DIR"; exit 2; }; ok "Created $SCRIPTS_DIR"; else err "scripts dir missing. Aborting."; spinner_stop "Validation failed"; exit 2; fi
+    fi
+  else
+    ok "scripts dir: $SCRIPTS_DIR"
+  fi
+
+  # adm.conf readable?
+  if [ -f "$ADM_CONF" ]; then
+    if [ -r "$ADM_CONF" ]; then ok "adm.conf found: $ADM_CONF"; else err "adm.conf exists but not readable: $ADM_CONF"; exit 2; fi
+  else
+    warn "adm.conf not found at $ADM_CONF (some commands may fail)"
+  fi
+
+  # logs & tmp
+  mkdir -p "$LOGS_DIR" "$TMP_DIR" 2>/dev/null || { err "Failed to create logs/tmp"; exit 2; }
+  ok "logs & tmp ready"
+  spinner_stop "Validation complete"
+}
+
+############################
+# Script detection & introspection
+############################
+# Registry structure:
+#   declare -A COMMAND_REGISTRY
+#   COMMAND_REGISTRY["build"]="adm-build"
+#   and COMMAND_HELP["adm-build"]="string with usage..."
+declare -A COMMAND_REGISTRY
+declare -A COMMAND_HELP
+declare -A SCRIPT_PATHS
+
+discover_scripts(){
+  spinner_start "Discovering adm-* scripts in $SCRIPTS_DIR"
+  local found=0
+  if [ ! -d "$SCRIPTS_DIR" ]; then warn "Scripts dir not found: $SCRIPTS_DIR"; spinner_stop "Discovery"; return 1; fi
+  while IFS= read -r -d $'\0' f; do
+    found=$((found+1))
+    local base
+    base="$(basename "$f")"   # adm-build
+    local cmdname
+    cmdname="${base#adm-}"    # build
+    COMMAND_REGISTRY["$cmdname"]="$base"
+    SCRIPT_PATHS["$base"]="$f"
+  done < <(find "$SCRIPTS_DIR" -maxdepth 1 -type f -name 'adm-*' -print0 2>/dev/null)
+  if [ "$found" -eq 0 ]; then warn "No adm-* scripts found in $SCRIPTS_DIR"; spinner_stop "Discovery (0)"; return 1; fi
+  spinner_stop "Discovered $found scripts"
+  # introspect help for each script (best-effort, safe timeout)
+  for k in "${!COMMAND_REGISTRY[@]}"; do
+    local script="${COMMAND_REGISTRY[$k]}"
+    local path="${SCRIPT_PATHS[$script]:-}"
+    if [ -z "$path" ]; then COMMAND_HELP["$script"]="(script path unknown)"; continue; fi
+    # attempt to run --help with timeout; skip if dry-run
+    if [ "$DRY_RUN" -eq 1 ]; then
+      COMMAND_HELP["$script"]="(dry-run) help unavailable"
+      verbose "(dry-run) skip introspection for $script"
+      continue
+    fi
+    if [ ! -x "$path" ]; then
+      COMMAND_HELP["$script"]="(not executable)"
+      warn "Script not executable: $path"
+      continue
+    fi
+    # run the script's help safely with timeout 5s
+    local help_out
+    help_out="$(timeout 5 "$path" --help 2>&1 || true)"
+    if [ -z "$help_out" ]; then
+      COMMAND_HELP["$script"]="(no help output or timed out)"
+      verbose "No help for $script (timed out or silent)"
+    else
+      COMMAND_HELP["$script"]="$help_out"
+    fi
+  done
+  return 0
+}
+
+############################
+# Helper UI: dynamic help
+############################
+print_help(){
+  cat <<EOF
+ADM CLI - Unified Manager (PART 1/3)
+Usage: adm [global-options] <command> [command-args...]
+
+Global options:
+  --dry-run       simulate actions (no destructive changes)
+  --verbose, -v   verbose output
+  --force         assume yes to confirmations
+  --quiet         minimal output
+  --json          output machine-readable JSON report
+  --help          show this help
+
+Available top-level commands (auto-discovered from ${SCRIPTS_DIR}):
+EOF
+
+  for k in $(printf '%s\n' "${!COMMAND_REGISTRY[@]}" | sort); do
+    local script="${COMMAND_REGISTRY[$k]}"
+    printf "  %-12s - %s\n" "$k" "$script"
+  done
+
+  cat <<EOF
+
+Helper commands:
+  help            show this help
+  list            list discovered commands and scripts with paths
+  run <cmd> [...] run underlying script directly (adm run build -- <args>)
+  search <term>   search metafiles for packages matching <term>
+  info <pkg>      show package information (from metafile)
+  menu            open TUI menu (part 3)
+  status          call adm-status (if present)
+
+Examples:
+  adm --dry-run install firefox
+  adm build xz --profile extreme
+  adm run chroot create --name myroot --size 1G
+EOF
+}
+
+list_commands(){
+  printf "Discovered commands:\n"
+  for k in $(printf '%s\n' "${!COMMAND_REGISTRY[@]}" | sort); do
+    local script="${COMMAND_REGISTRY[$k]}"
+    local path="${SCRIPT_PATHS[$script]:-}"
+    printf "  %-12s -> %s\n" "$k" "$path"
+    verbose "Help for $script: ${COMMAND_HELP[$script]:0:200}..."
+  done
+}
+
+############################
+# Runner wrapper (safe)
+############################
+# Runs an underlying adm-* script with inheriting global flags (dry-run/verbose/force/quiet/json)
+# Usage: run_script "build" -- <args...>
+run_script(){
+  local subcmd="$1"; shift
+  local pass_through=()
+  # map global flags into underlying script invocation
+  [ "$DRY_RUN" -eq 1 ] && pass_through+=("--dry-run")
+  [ "$VERBOSE" -eq 1 ] && pass_through+=("--verbose")
+  [ "$FORCE" -eq 1 ] && pass_through+=("--force")
+  [ "$QUIET" -eq 1 ] && pass_through+=("--quiet")
+  [ "$OUTPUT_JSON" -eq 1 ] && pass_through+=("--json")
+
+  local scriptname="${COMMAND_REGISTRY[$subcmd]:-}"
+  if [ -z "$scriptname" ]; then err "Unknown command: $subcmd"; return 3; fi
+  local scriptpath="${SCRIPT_PATHS[$scriptname]:-}"
+  if [ -z "$scriptpath" ] || [ ! -f "$scriptpath" ]; then err "Script not found for $subcmd: $scriptpath"; return 4; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) would run: $scriptpath ${pass_through[*]} -- $*"
+    json_add "run_simulation" "$scriptpath ${pass_through[*]} -- $*"
+    return 0
+  fi
+  # ensure executable
+  if [ ! -x "$scriptpath" ]; then err "Script not executable: $scriptpath"; return 5; fi
+
+  info "Running: $scriptpath ${pass_through[*]} -- $*"
+  json_add "run" "$scriptpath $*"
+  # Execute and propagate exit code
+  if "$scriptpath" "${pass_through[@]}" -- "$@"; then
+    ok "Completed: $subcmd"
+    return 0
+  else
+    local rc=$?
+    err "Script $scriptname failed with exit code $rc"
+    return $rc
+  fi
+}
+
+############################
+# Simple package search/info helpers (lightweight)
+############################
+search_packages(){
+  local term="$1"
+  if [ -z "$term" ]; then err "search requires term"; return 2; fi
+  if [ ! -d "$ADM_ROOT/metafiles" ]; then warn "metafiles dir missing: ${ADM_ROOT}/metafiles"; return 1; fi
+  spinner_start "Searching metafiles for: $term"
+  # search filenames and inside files
+  find "${ADM_ROOT}/metafiles" -type f -name 'metafile' -print0 2>/dev/null | xargs -0 -I{} grep -iH --label="{}" -E "${term}" {} 2>/dev/null | sed -e 's/:/ /' || true
+  spinner_stop "Search finished"
+}
+
+info_package(){
+  local pkg="$1"
+  if [ -z "$pkg" ]; then err "info requires package name"; return 2; fi
+  local mf="$(find "${ADM_ROOT}/metafiles" -type f -name 'metafile' -path "*/${pkg}/*" -print -quit 2>/dev/null || true)"
+  if [ -z "$mf" ]; then warn "No metafile found for package: $pkg"; return 1; fi
+  info "Metafile: $mf"
+  sed -n '1,200p' "$mf" || true
+}
+
+############################
+# CLI parsing & dispatch (main)
+############################
+usage_and_exit(){ print_help; exit "${1:-0}"; }
+
+# parse global options until first non-option (positional)
+GLOBAL_OPTS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; GLOBAL_OPTS+=("$1"); shift ;;
+    --verbose|-v) VERBOSE=1; GLOBAL_OPTS+=("$1"); shift ;;
+    --force) FORCE=1; GLOBAL_OPTS+=("$1"); shift ;;
+    --quiet) QUIET=1; GLOBAL_OPTS+=("$1"); shift ;;
+    --json) OUTPUT_JSON=1; GLOBAL_OPTS+=("$1"); shift ;;
+    --help|-h) usage_and_exit 0 ;;
+    --) shift; break ;;
+    -*)
+      err "Unknown global option: $1"; usage_and_exit 1 ;;
+    *) break ;;
+  esac
+done
+
+# initialize environment and registry
+acquire_lock || true
+json_init
+check_environment
+discover_scripts
+
+# dispatch top-level command
+CMD="${1:-help}"; shift || true
+
+case "$CMD" in
+  help|--help|-h) print_help; release_lock >/dev/null 2>&1 || true; exit 0 ;;
+  list) list_commands; release_lock >/dev/null 2>&1 || true; exit 0 ;;
+  run)
+    if [ $# -lt 1 ]; then err "Usage: adm run <command> -- <args...>"; release_lock >/dev/null 2>&1 || exit 2; fi
+    sub="$1"; shift
+    # if '--' present, skip it
+    if [ "${1:-}" = "--" ]; then shift; fi
+    run_script "$sub" "$@"
+    release_lock >/dev/null 2>&1 || true
+    exit $?
+    ;;
+  search)
+    search_packages "$1"
+    release_lock >/dev/null 2>&1 || true
+    exit 0
+    ;;
+  info)
+    info_package "$1"
+    release_lock >/dev/null 2>&1 || true
+    exit $?
+    ;;
+  status)
+    # call adm-status if available
+    if [ -x "${SCRIPTS_DIR}/adm-status" ]; then
+      run_script "status" "$@"
+      release_lock >/dev/null 2>&1 || true
+      exit $?
+    else
+      warn "adm-status not found in $SCRIPTS_DIR"
+      release_lock >/dev/null 2>&1 || true
+      exit 1
+    fi
+    ;;
+  # Top-level commands mapped to scripts (auto)
+  *)
+    if [ -n "${COMMAND_REGISTRY[$CMD]:-}" ]; then
+      # pass remaining args to script
+      run_script "$CMD" "$@"
+      release_lock >/dev/null 2>&1 || true
+      exit $?
+    fi
+    err "Unknown command: $CMD"
+    print_help
+    release_lock >/dev/null 2>&1 || true
+    exit 2
+    ;;
+esac
+###############################################################################
+# adm - CLI master
+# Pipeline inteligente, preview/dry-run, validation, execution with rollback
+###############################################################################
+# ensure required globals exist
+if ! declare -p COMMAND_REGISTRY >/dev/null 2>&1 || ! declare -p SCRIPT_PATHS >/dev/null 2>&1; then
+  err "COMMAND_REGISTRY / SCRIPT_PATHS not found — ensure PARTE 1/3 is sourced before PARTE 2/3"
+  exit 2
+fi
+
+# Pipeline JSON dir
+PIPELINE_DIR="${TMP_DIR:-/usr/src/adm/tmp}"
+mkdir -p "$PIPELINE_DIR" 2>/dev/null || true
+
+# Default pipeline timeout per stage (seconds)
+STAGE_TIMEOUT="${STAGE_TIMEOUT:-3600}"
+
+# Allowed profiles
+ALLOWED_PROFILES=(none normal extreme)
+
+# ---------- Utilities specific to pipeline ----------
+
+# validate package name: simple heuristic (alphanumeric, -,+,_,.)
+validate_pkg_name() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then err "Package name empty"; return 2; fi
+  if ! printf '%s' "$pkg" | grep -qE '^[A-Za-z0-9._+-]+$'; then err "Invalid package name: $pkg"; return 3; fi
+  return 0
+}
+
+# validate profile
+validate_profile() {
+  local p="$1"
+  for x in "${ALLOWED_PROFILES[@]}"; do [ "$x" = "$p" ] && return 0; done
+  err "Invalid profile: $p (allowed: ${ALLOWED_PROFILES[*]})"
+  return 4
+}
+
+# helper: check command script exists for logical step (resolver, downloader, build, install, uninstall, update)
+has_module() {
+  local mod="$1"
+  [ -n "${COMMAND_REGISTRY[$mod]:-}" ] && [ -n "${SCRIPT_PATHS[${COMMAND_REGISTRY[$mod]}]:-}" ] && [ -f "${SCRIPT_PATHS[${COMMAND_REGISTRY[$mod]}]}" ]
+}
+
+# builds a pipeline (ordered list) for a requested action (install, build, update, uninstall, bootstrap)
+# returns newline-separated steps as: STEP_NAME|MODULE_NAME|ARGS...
+plan_pipeline() {
+  local action="$1"; shift
+  local pkg="$1"; shift || true
+  local profile="${PROFILE_OVERRIDE:-}"   # optional override set by global or caller
+  local -a plan=()
+
+  case "$action" in
+    build)
+      plan+=("resolve|resolver|$pkg")
+      plan+=("download|downloader|$pkg")
+      plan+=("patch|patches|$pkg")
+      plan+=("prebuild-hooks|hooks|pre-build|$pkg")
+      plan+=("build|build|$pkg")
+      plan+=("postbuild-hooks|hooks|post-build|$pkg")
+      plan+=("package|build|package|$pkg")
+      ;;
+    install)
+      plan+=("resolve|resolver|$pkg")
+      plan+=("download|downloader|$pkg")
+      plan+=("patch|patches|$pkg")
+      plan+=("prebuild-hooks|hooks|pre-build|$pkg")
+      plan+=("build|build|$pkg")
+      plan+=("postbuild-hooks|hooks|post-build|$pkg")
+      plan+=("install|install|$pkg")
+      plan+=("postinstall-hooks|hooks|post-install|$pkg")
+      ;;
+    update)
+      plan+=("preupdate-hooks|hooks|pre-update|$pkg")
+      plan+=("update|update|$pkg")
+      plan+=("resolve|resolver|$pkg")
+      plan+=("download|downloader|$pkg")
+      plan+=("build|build|$pkg")
+      plan+=("install|install|$pkg")
+      plan+=("postupdate-hooks|hooks|post-update|$pkg")
+      ;;
+    uninstall)
+      plan+=("preuninstall-hooks|hooks|pre-uninstall|$pkg")
+      plan+=("uninstall|uninstall|$pkg")
+      plan+=("postuninstall-hooks|hooks|post-uninstall|$pkg")
+      plan+=("clean-orphans|clean|orphans|$pkg")
+      ;;
+    bootstrap)
+      # bootstrap stages handled via adm-bootstrap module (if exists)
+      plan+=("bootstrap|bootstrap|$pkg")
+      ;;
+    *) err "Unknown pipeline action: $action"; return 2 ;;
+  esac
+
+  # Print plan lines
+  printf '%s\n' "${plan[@]}"
+  return 0
+}
+
+# preview pipeline in human-friendly format
+preview_pipeline() {
+  local action="$1"; local pkg="$2"
+  info "Previewing pipeline for: $action ${pkg:-}"
+  local plan
+  plan="$(plan_pipeline "$action" "$pkg")" || return $?
+  local idx=0
+  echo
+  printf "%-4s %-18s %-18s %s\n" "#" "STEP" "MODULE" "ARGS"
+  echo "---------------------------------------------------------------------"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    idx=$((idx+1))
+    IFS='|' read -r step module rest <<<"$line"
+    printf "%-4s %-18s %-18s %s\n" "$idx" "$step" "$module" "${rest:-}"
+  done <<<"$plan"
+  echo
+  info "Total steps: $idx"
+  [ "$DRY_RUN" -eq 1 ] && info "(dry-run) Nothing will be executed; this is a preview."
+  return 0
+}
+
+# safe wrapper to run adm-* step using run_script (defined in part1)
+# step format: STEP_KEY|MODULE|ARGS...
+safe_run_step() {
+  local step_line="$1"
+  local run_opts=()   # additional flags to pass (e.g. --profile)
+  local step module rest rc
+  IFS='|' read -r step module rest <<<"$step_line"
+  # module maps to a top-level command (resolver/downloader/build/install/patches/hooks/clean/update/uninstall/bootstrap)
+  local module_key="$module"
+
+  # ensure module exists
+  if ! has_module "$module_key"; then
+    warn "Module not found for step $step: $module_key (skipping or failing based on policy)"
+    # by default fail hard
+    return 4
+  fi
+
+  # If hooks step, call adm-hooks with type indicated by 'rest' (pre-build etc.)
+  if [ "$module_key" = "hooks" ]; then
+    # rest may contain e.g. "pre-build|pkg"
+    IFS='|' read -r hooktype hookpkg <<<"$rest"
+    # use adm-hooks CLI: adm-hooks --category <category?> --program <program?> --type <hooktype> run-parallel
+    # We only have hooktype and package; call run_script "hooks" with appropriate args
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) would run hooks: type=$hooktype pkg=${hookpkg:-}"
+      json_add "pipeline_step" "hooks preview: $hooktype $hookpkg"
+      return 0
+    fi
+    # run_script will pass global flags
+    run_script "hooks" "run-parallel" "--type" "$hooktype" "--program" "${hookpkg:-}"
+    return $?
+  fi
+
+  # For other modules, call run_script with appropriate mapping
+  # rest may contain package name or additional args; split into args array
+  local -a args=()
+  if [ -n "${rest:-}" ]; then
+    # rest could be "pkg" or "package|something"; replace '|' with ' ' for arguments
+    IFS='|' read -r -a tmp <<<"$rest"
+    for e in "${tmp[@]}"; do args+=("$e"); done
+  fi
+
+  # handle special-case module names mapping to registry keys
+  # e.g. 'patches' -> top-level 'patches', 'build' -> 'build', 'downloader' -> 'downloader'
+  # Validate package name if present (first arg)
+  if [ "${#args[@]}" -ge 1 ] && [ -n "${args[0]:-}" ]; then
+    validate_pkg_name "${args[0]}" || return $?
+  fi
+
+  # If chroot mode requested (PROFILE_CHROOT env), optionally run in chroot via adm-chroot run
+  # (implementation: if global CHROOT_MODE=1 or --chroot passed as env, try to run in chroot)
+  if [ "${CHROOT_MODE:-0}" -eq 1 ]; then
+    # Attempt to run module inside chroot via adm-chroot wrapper if available
+    if [ -n "${COMMAND_REGISTRY[chroot]:-}" ]; then
+      # example: adm chroot run -- <module> <args...>  — but easier: call the underlying module with same arguments, but inside chroot
+      # We'll try: adm run chroot -- run-in "<module> <args...>"  (Assumes adm-chroot supports run-in or similar)
+      info "Running step inside chroot: $module_key ${args[*]:-}"
+      if [ "$DRY_RUN" -eq 1 ]; then
+        info "(dry-run) chroot: would run module $module_key ${args[*]:-}"
+        json_add "pipeline_step" "chroot-preview $module_key ${args[*]:-}"
+        return 0
+      fi
+      # prefer a standardized interface: adm-chroot run -- <module> <args...>
+      run_script "chroot" "run" "--" "${module_key}" "${args[@]}"
+      return $?
+    else
+      warn "Chroot requested but adm-chroot module not available; running on host"
+    fi
+  fi
+
+  # Normal host execution
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) would run module $module_key ${args[*]:-}"
+    json_add "pipeline_step" "preview $module_key ${args[*]:-}"
+    return 0
+  fi
+
+  # Actually run module
+  run_script "$module_key" "${args[@]}"
+  rc=$?
+  return $rc
+}
+
+# run_with_hooks: runs pre-hooks, step, post-hooks for a given step if applicable
+# Usage: run_with_hooks "build|build|pkg"
+run_with_hooks() {
+  local step_line="$1"
+  local step module rest
+  IFS='|' read -r step module rest <<<"$step_line"
+
+  # Determine hook phases for this module if needed
+  case "$module" in
+    build)
+      # run pre-build hooks
+      safe_run_step "prebuild-hooks|hooks|pre-build|${rest%%|*}"
+      safe_run_step "$step_line"
+      safe_run_step "postbuild-hooks|hooks|post-build|${rest%%|*}"
+      ;;
+    install)
+      safe_run_step "preinstall-hooks|hooks|pre-install|${rest%%|*}"
+      safe_run_step "$step_line"
+      safe_run_step "postinstall-hooks|hooks|post-install|${rest%%|*}"
+      ;;
+    update)
+      safe_run_step "preupdate-hooks|hooks|pre-update|${rest%%|*}"
+      safe_run_step "$step_line"
+      safe_run_step "postupdate-hooks|hooks|post-update|${rest%%|*}"
+      ;;
+    uninstall)
+      safe_run_step "preuninstall-hooks|hooks|pre-uninstall|${rest%%|*}"
+      safe_run_step "$step_line"
+      safe_run_step "postuninstall-hooks|hooks|post-uninstall|${rest%%|*}"
+      ;;
+    patches|patches)
+      # single apply
+      safe_run_step "$step_line"
+      ;;
+    *)
+      # default: just run the step
+      safe_run_step "$step_line"
+      ;;
+  esac
+}
+
+# rollback pipeline: best-effort; called on partial failure
+# Accepts pipeline id and executed steps list
+rollback_pipeline() {
+  local pipeline_id="$1"
+  local executed_steps_file="${PIPELINE_DIR}/executed-${pipeline_id}.txt"
+  warn "Pipeline $pipeline_id failed — attempting rollback (best-effort)"
+  json_add "pipeline_${pipeline_id}" "rollback_started" "Attempting best-effort rollback"
+
+  # iterate executed steps in reverse order and try to undo common actions
+  if [ -f "$executed_steps_file" ]; then
+    tac "$executed_steps_file" | while IFS= read -r line; do
+      [ -z "$line" ] && continue
+      IFS='|' read -r step module rest <<<"$line"
+      case "$module" in
+        install)
+          # attempt uninstall of package
+          local pkg="${rest%%|*}"
+          warn "Rolling back install of $pkg (invoking adm uninstall --force)"
+          if has_module "uninstall"; then
+            if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would run uninstall $pkg"; else
+              run_script "uninstall" "$pkg" "--force" || warn "Rollback uninstall of $pkg failed"
+            fi
+          fi
+          ;;
+        build)
+          # remove destdir artifacts or intermediate build dir (best-effort)
+          warn "Rollback: build step detected; cleaning build artifacts (best-effort)"
+          if has_module "clean"; then
+            if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would run clean for build artifacts"; else
+              run_script "clean" "builds" "$pkg" || warn "Rollback clean failed"
+            fi
+          fi
+          ;;
+        download)
+          # optionally remove cached tarball
+          warn "Rollback: download step - not deleting cached files by default"
+          ;;
+        *)
+          verbose "No rollback action defined for module: $module"
+          ;;
+      esac
+    done
+  else
+    warn "No executed steps log found for pipeline $pipeline_id — cannot rollback"
+  fi
+
+  # run global on-error hooks
+  if has_module "hooks"; then
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would run global on-error hooks"; else
+      run_script "hooks" "run-parallel" "--type" "on-error"
+    fi
+  fi
+  json_add "pipeline_${pipeline_id}" "rollback_done" "completed"
+  warn "Rollback attempts finished (some actions may have failed)"
+}
+
+# execute_pipeline: runs the plan sequentially, records executed steps, handles failures and rollback
+# Usage: execute_pipeline <action> <pkg>
+execute_pipeline() {
+  local action="$1"; shift
+  local pkg="$1"; shift || true
+  local pipeline_id="${action}-${pkg}-${TS_NOW}"
+  local plan
+  plan="$(plan_pipeline "$action" "$pkg")" || { err "Failed to plan pipeline"; return 3; }
+  local executed_file="${PIPELINE_DIR}/executed-${pipeline_id}.txt"
+  : >"$executed_file"
+
+  info "Executing pipeline: $action ${pkg:-} (id: $pipeline_id)"
+  json_add "pipeline_${pipeline_id}" "start" "action=$action pkg=${pkg:-}"
+
+  # iterate steps
+  while IFS= read -r step_line; do
+    [ -z "$step_line" ] && continue
+    info "-> Step: $step_line"
+    spinner_start "Running step: ${step_line}"
+    if run_with_hooks "$step_line"; then
+      spinner_stop "Step succeeded"
+      echo "$step_line" >>"$executed_file"
+      json_add "pipeline_${pipeline_id}" "step_ok" "$step_line"
+      continue
+    else
+      spinner_stop "Step failed"
+      local rc=$?
+      err "Step failed: $step_line (rc=$rc)"
+      json_add "pipeline_${pipeline_id}" "step_fail" "$step_line rc=$rc"
+      # attempt rollback
+      rollback_pipeline "$pipeline_id"
+      json_add "pipeline_${pipeline_id}" "end" "failed rc=$rc"
+      return $rc
+    fi
+  done <<<"$plan"
+
+  json_add "pipeline_${pipeline_id}" "end" "success"
+  ok "Pipeline $pipeline_id completed successfully"
+  return 0
+}
+
+# ---------- Top-level pipeline CLI: orchestrates preview/execute/validate ----------
+
+# cli entry: adm pipeline <action> <pkg> [--preview]
+cmd_pipeline() {
+  local action="$1"; local pkg="$2"; shift 2 || true
+  local preview=0
+  # consume flags in $@
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --preview) preview=1; shift ;;
+      --profile) PROFILE_OVERRIDE="$2"; shift 2 ;;
+      --chroot) CHROOT_MODE=1; shift ;;
+      --no-chroot) CHROOT_MODE=0; shift ;;
+      *) shift ;; # ignore unknown flags here; they will be validated later per step
+    esac
+  done
+
+  # Validate
+  case "$action" in
+    build|install|update|uninstall|bootstrap) ;;
+    *) err "Unknown pipeline action: $action"; return 2 ;;
+  esac
+
+  if [ -n "${pkg:-}" ]; then
+    validate_pkg_name "$pkg" || return $?
+  fi
+  if [ -n "${PROFILE_OVERRIDE:-}" ]; then validate_profile "$PROFILE_OVERRIDE" || return $?; fi
+
+  # Plan & preview
+  preview_pipeline "$action" "$pkg"
+  if [ "$preview" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+    info "(preview/dry-run) pipeline not executed"
+    return 0
+  fi
+
+  # Confirm unless forced
+  if [ "$FORCE" -ne 1 ]; then
+    printf "Proceed with pipeline %s %s ? [y/N]: " "$action" "${pkg:-}"
+    read -r yn
+    case "$yn" in [Yy]|[Yy][Ee][Ss]) ;; *) info "Aborted by user"; return 1 ;; esac
+  fi
+
+  # Execute
+  execute_pipeline "$action" "$pkg"
+  return $?
+}
+
+# ---------- Integration entrypoints for top-level CLI (wired to dispatch) ----------
+# Extend dispatch in PARTE 1/3 to handle pipeline subcommand:
+# Example:
+# case "$CMD" in
+#   pipeline) cmd_pipeline "$@";;
+#   install) cmd_pipeline install "$@" ;;
+#   build) cmd_pipeline build "$@" ;;
+# esac
+#
+# We'll provide a helper dispatch function to be used by Parte 1/3 when integrating.
+
+adm_dispatch_pipeline_or_command() {
+  # Called with original top-level CMD and remaining args
+  local cmd="$1"; shift
+  case "$cmd" in
+    build|install|update|uninstall|bootstrap)
+      # If invoked as top-level command like: adm build <pkg> [--preview] ...
+      local pkg="${1:-}"; shift || true
+      cmd_pipeline "$cmd" "$pkg" "$@"
+      return $?
+      ;;
+    pipeline)
+      # adm pipeline <action> <pkg> [--preview]
+      local action="${1:-}"; local pkg="${2:-}"; shift 2 || true
+      cmd_pipeline "$action" "$pkg" "$@"
+      return $?
+      ;;
+    *)
+      err "adm_dispatch_pipeline_or_command: unsupported cmd $cmd"
+      return 2
+      ;;
+  esac
+}
+# Note: integrate adm_dispatch_pipeline_or_command call into Parte 1/3 dispatch where top-level commands are handled.
+###############################################################################
+# RISK NOTES:
+# - Pipeline execution will call many modules which may alter the system (build, install).
+# - Use --dry-run to preview and test; use --force only if you accept risks.
+# - Rollback is best-effort and may not revert all side-effects (files modified by build scripts).
+###############################################################################
+###############################################################################
+# adm - CLI master 
+# TUI (menu), final reports, adm-status & adm-conf integration, export HTML
+###############################################################################
+# Preconditions: functions/vars from PART 1/2 must exist:
+#  - run_script, adm_dispatch_pipeline_or_command, json_init, json_add, json_report path vars,
+#  - DRY_RUN, VERBOSE, FORCE, QUIET, OUTPUT_JSON, SCRIPTS_DIR, ADM_ROOT, TMP_DIR, LOGFILE etc.
+if ! declare -F run_script >/dev/null 2>&1; then
+  err "run_script not found — ensure Parte 1/3 is loaded before Parte 3/3"
+  exit 2
+fi
+if ! declare -F adm_dispatch_pipeline_or_command >/dev/null 2>&1; then
+  err "adm_dispatch_pipeline_or_command not found — ensure Parte 2/3 is loaded before Parte 3/3"
+  exit 2
+fi
+
+# UI tool detection
+HAS_DIALOG=0; HAS_WHIPTAIL=0; HAS_FZF=0
+command -v dialog >/dev/null 2>&1 && HAS_DIALOG=1
+command -v whiptail >/dev/null 2>&1 && HAS_WHIPTAIL=1
+command -v fzf >/dev/null 2>&1 && HAS_FZF=1
+
+# report files
+FINAL_REPORT_JSON="${REPORT_JSON:-${TMP_DIR}/adm-cli-report-final-${TS_NOW}.json}"
+FINAL_REPORT_HTML="${TMP_DIR}/adm-cli-report-final-${TS_NOW}.html}"
+
+# small helper: safe read input with default
+safe_read() {
+  local prompt="$1" default="$2" var
+  if [ "$DRY_RUN" -eq 1 ]; then printf "%s [default=%s]\n" "$prompt" "$default"; printf "%s\n" "$default"; return 0; fi
+  read -r -p "$prompt [$default]: " var
+  if [ -z "$var" ]; then printf '%s\n' "$default"; else printf '%s\n' "$var"; fi
+}
+
+# UI fallback menu (pure-shell)
+text_menu() {
+  local title="$1"
+  shift
+  local -a opts=("$@")
+  local PS3="Choose an option (number): "
+  echo
+  echo "=== $title ==="
+  local i=1
+  for o in "${opts[@]}"; do
+    printf "  %2d) %s\n" "$i" "$o"
+    i=$((i+1))
+  done
+  echo "  0) Cancel"
+  printf "\n"
+  local choice
+  while true; do
+    printf "%s" "$PS3"
+    read -r choice
+    if [ "$choice" = "0" ] || [ -z "$choice" ]; then echo ""; return 1; fi
+    if ! printf '%s\n' "${opts[@]}" | sed -n "${choice}p" >/dev/null 2>&1; then echo "Invalid"; else
+      selected="$(printf '%s\n' "${opts[@]}" | sed -n "${choice}p")"
+      printf '%s\n' "$selected"
+      return 0
+    fi
+  done
+}
+
+# UI selection helper returning newline-separated selection(s)
+ui_select_one() {
+  local prompt="$1" shift="$2"
+  shift 2
+  local -a items=("$@")
+  local res=""
+  if [ "$HAS_DIALOG" -eq 1 ]; then
+    # build dialog menu options
+    local tag=1; local args=()
+    for it in "${items[@]}"; do args+=("$tag" "$it"); tag=$((tag+1)); done
+    local tmpfile="${TMP_DIR}/adm-ui-$$.tmp"
+    dialog --clear --title "$prompt" --menu "$prompt" 0 0 0 "${args[@]}" 2> "$tmpfile"
+    if [ $? -eq 0 ]; then
+      local choice="$(cat "$tmpfile")"
+      rm -f "$tmpfile"
+      res="$(printf '%s\n' "${items[@]}" | sed -n "${choice}p")"
+    fi
+  elif [ "$HAS_WHIPTAIL" -eq 1 ]; then
+    local tmpfile="${TMP_DIR}/adm-ui-$$.tmp"
+    whiptail --title "$prompt" --menu "$prompt" 20 70 10 $(for i in "${!items[@]}"; do printf "%s \"%s\" " "$i" "${items[$i]}"; done) 2> "$tmpfile"
+    if [ $? -eq 0 ]; then
+      local choice="$(cat "$tmpfile")"
+      res="${items[$choice]}"
+    fi
+  elif [ "$HAS_FZF" -eq 1 ]; then
+    res="$(printf '%s\n' "${items[@]}" | fzf --prompt="$prompt> " --height=40%)"
+  else
+    # fallback
+    if selected="$(text_menu "$prompt" "${items[@]}")"; then res="$selected"; else res=""; fi
+  fi
+  printf '%s' "$res"
+  return 0
+}
+
+# UI multi-select helper (returns newline-separated selections)
+ui_multi_select() {
+  local prompt="$1"
+  shift
+  local -a items=("$@")
+  local res=""
+  if [ "$HAS_DIALOG" -eq 1 ]; then
+    local args=()
+    local tag=1
+    for it in "${items[@]}"; do args+=("$tag" "$it" "off"); tag=$((tag+1)); done
+    local tmpfile="${TMP_DIR}/adm-ui-$$.tmp"
+    dialog --clear --title "$prompt" --checklist "$prompt" 0 0 0 "${args[@]}" 2> "$tmpfile"
+    if [ $? -eq 0 ]; then
+      # dialog returns tags; map to items
+      local tags="$(cat "$tmpfile")"
+      rm -f "$tmpfile"
+      for t in $tags; do res="${res}\n${items[$((t-1))]}"; done
+    fi
+  elif [ "$HAS_FZF" -eq 1 ]; then
+    res="$(printf '%s\n' "${items[@]}" | fzf --multi --prompt="$prompt> " --height=40%)"
+  else
+    # fallback: repeated single selection until empty
+    while true; do
+      sel="$(ui_select_one "$prompt (select one; Cancel to finish)" "${items[@]}")" || break
+      [ -z "$sel" ] && break
+      res="${res}\n${sel}"
+    done
+  fi
+  # trim leading newline
+  res="$(printf '%s' "$res" | sed '1{/^$/d;}')"
+  printf '%s' "$res"
+  return 0
+}
+
+# menu actions
+menu_build() {
+  local pkg
+  pkg="$(safe_read "Package to build" "")"
+  [ -z "$pkg" ] && info "Cancelled" && return 1
+  # ask preview / run
+  local preview_choice
+  preview_choice="$(ui_select_one "Run mode" "Preview only" "Execute pipeline" "Cancel")" || { info "Cancelled"; return 1; }
+  if [ "$preview_choice" = "Preview only" ]; then
+    adm_dispatch_pipeline_or_command pipeline build "$pkg" --preview
+  else
+    adm_dispatch_pipeline_or_command build "$pkg"
+  fi
+}
+
+menu_install() {
+  local pkg
+  pkg="$(safe_read "Package to install" "")"
+  [ -z "$pkg" ] && info "Cancelled" && return 1
+  local preview_choice
+  preview_choice="$(ui_select_one "Run mode" "Preview only" "Execute pipeline" "Cancel")" || { info "Cancelled"; return 1; }
+  if [ "$preview_choice" = "Preview only" ]; then
+    adm_dispatch_pipeline_or_command pipeline install "$pkg" --preview
+  else
+    adm_dispatch_pipeline_or_command install "$pkg"
+  fi
+}
+
+menu_update() {
+  local pkg
+  pkg="$(safe_read "Package to update (or leave empty to check all)" "")"
+  if [ -z "$pkg" ]; then
+    # call adm update without package - assume adm-update supports list or scan
+    if has_module "update"; then
+      run_script "update" "--scan"
+    else
+      warn "update module not available"
+    fi
+    return 0
+  fi
+  adm_dispatch_pipeline_or_command pipeline update "$pkg"
+}
+
+menu_uninstall() {
+  local pkg
+  pkg="$(safe_read "Package to uninstall" "")"
+  [ -z "$pkg" ] && info "Cancelled" && return 1
+  adm_dispatch_pipeline_or_command uninstall "$pkg"
+}
+
+menu_status() {
+  info "Running adm-status summary (if available)"
+  if has_module "status"; then
+    run_script "status" "summary"
+  else
+    warn "adm-status module not found"
+  fi
+}
+
+menu_conf() {
+  # open helper to set/unset/profile/verify
+  local actions=("init" "set" "unset" "profile" "verify" "sync" "env" "reload")
+  local choice
+  choice="$(ui_select_one "adm-conf actions" "${actions[@]}")" || { info "Cancelled"; return 1; }
+  case "$choice" in
+    init) run_script "conf" "init" ;;
+    set)
+      var="$(safe_read 'Variable to set (e.g. ADM_PARALLEL)' '')"
+      val="$(safe_read "Value for $var" '')"
+      run_script "conf" "set" "${var}=${val}"
+      ;;
+    unset)
+      var="$(safe_read 'Variable to unset (e.g. ADM_PARALLEL)' '')"
+      run_script "conf" "unset" "$var"
+      ;;
+    profile)
+      prof="$(ui_select_one "Select profile" "none" "normal" "extreme")"
+      run_script "conf" "profile" "$prof"
+      ;;
+    verify) run_script "conf" "verify" ;;
+    sync) run_script "conf" "sync" ;;
+    env) run_script "conf" "env" ;;
+    reload) run_script "conf" "reload" ;;
+    *) info "Not implemented: $choice" ;;
+  esac
+}
+
+menu_chroot() {
+  # chroot actions: create, enter, umount, cleanup, run
+  local actions=("create" "enter" "umount" "cleanup" "run")
+  local ch_choice
+  ch_choice="$(ui_select_one "adm-chroot actions" "${actions[@]}")" || { info "Cancelled"; return 1; }
+  case "$ch_choice" in
+    create)
+      name="$(safe_read 'Chroot name' 'adm-root')"
+      size="$(safe_read 'Size (e.g. 1G) or empty' '')"
+      run_script "chroot" "create" "--name" "$name" ${size:+--size "$size"}
+      ;;
+    enter)
+      name="$(safe_read 'Chroot name to enter' 'adm-root')"
+      run_script "chroot" "enter" "--name" "$name"
+      ;;
+    umount)
+      name="$(safe_read 'Chroot name to umount' 'adm-root')"
+      run_script "chroot" "umount" "--name" "$name"
+      ;;
+    cleanup)
+      name="$(safe_read 'Chroot name to cleanup' 'adm-root')"
+      run_script "chroot" "cleanup" "--name" "$name"
+      ;;
+    run)
+      # run arbitrary module inside chroot: ask module and args
+      module="$(ui_select_one 'Module to run in chroot' $(printf '%s\n' "${!COMMAND_REGISTRY[@]}"))" || { info "Cancelled"; return 1; }
+      args="$(safe_read 'Args to pass (single string)' '')"
+      # call adm-chroot run -- <module> <args...>
+      run_script "chroot" "run" "--" "$module" $([ -n "$args" ] && printf '%s' "$args")
+      ;;
+  esac
+}
+
+menu_hooks() {
+  local actions=("list" "run" "verify" "policy")
+  local choice
+  choice="$(ui_select_one "adm-hooks actions" "${actions[@]}")" || { info "Cancelled"; return 1; }
+  case "$choice" in
+    list) run_script "hooks" "list" ;;
+    run)
+      type="$(safe_read 'Hook type (pre-build/post-build/etc)' 'pre-build')"
+      program="$(safe_read 'Program (optional)' '')"
+      run_script "hooks" "run-parallel" "--type" "$type" ${program:+--program "$program"}
+      ;;
+    verify) run_script "hooks" "verify" ;;
+    policy)
+      p="$(ui_select_one 'Select hook policy' "strict" "audit" "trust")"
+      run_script "hooks" "policy" "$p"
+      ;;
+  esac
+}
+
+menu_clean() {
+  local actions=("tmp" "cache" "logs" "backups" "all")
+  choice="$(ui_select_one "adm-clean actions" "${actions[@]}")" || { info "Cancelled"; return 1; }
+  case "$choice" in
+    tmp|cache|logs|backups) run_script "clean" "$choice" ;;
+    all)
+      if [ "$FORCE" -ne 1 ]; then read -r -p "Dangerous: clean ALL (including cache). Confirm? [y/N]: " yn; case "$yn" in [Yy]*) ;; *) info "Aborted"; return 1 ;; esac; fi
+      run_script "clean" "all" "--force"
+      ;;
+  esac
+}
+
+menu_status_full() {
+  if has_module "status"; then
+    run_script "status" "full"
+  else
+    warn "adm-status not available"
+  fi
+}
+
+menu_search_info() {
+  local sel
+  sel="$(ui_select_one "Search or Info" "Search packages" "Package info" "Cancel")" || { info "Cancelled"; return 1; }
+  case "$sel" in
+    "Search packages")
+      term="$(safe_read 'Search term' '')"
+      [ -z "$term" ] && info "Cancelled" && return 1
+      search_packages "$term"
+      ;;
+    "Package info")
+      pkg="$(safe_read 'Package name' '')"
+      [ -z "$pkg" ] && info "Cancelled" && return 1
+      info_package "$pkg"
+      ;;
+  esac
+}
+
+# Top-level menu dispatcher
+cmd_menu() {
+  info "Opening ADM menu (interactive)"
+  local items=( "Build package" "Install package" "Update package" "Uninstall package" "Status summary" "Full status" "Configuration" "Chroot" "Hooks" "Clean" "Search / Info" "Exit" )
+  while true; do
+    sel="$(ui_select_one "ADM Menu" "${items[@]}")" || { info "Menu closed"; return 0; }
+    case "$sel" in
+      "Build package") menu_build ;;
+      "Install package") menu_install ;;
+      "Update package") menu_update ;;
+      "Uninstall package") menu_uninstall ;;
+      "Status summary") menu_status ;;
+      "Full status") menu_status_full ;;
+      "Configuration") menu_conf ;;
+      "Chroot") menu_chroot ;;
+      "Hooks") menu_hooks ;;
+      "Clean") menu_clean ;;
+      "Search / Info") menu_search_info ;;
+      "Exit") info "Exiting menu"; return 0 ;;
+      *) info "Unknown selection: $sel" ;;
+    esac
+  done
+}
+
+# ---------------------------- Final report export (JSON->HTML) ----------------------------
+export_report_html() {
+  local jsonf="${1:-$FINAL_REPORT_JSON}"
+  local htmlf="${2:-$FINAL_REPORT_HTML}"
+  if [ ! -f "$jsonf" ]; then warn "JSON report not found: $jsonf"; return 1; fi
+  # Use python if available for nicer HTML; otherwise a minimal transform
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys,html
+f=sys.argv[1]; out=sys.argv[2]
+d=json.load(open(f))
+s=[]
+s.append("<html><head><meta charset='utf-8'><title>ADM Report</title></head><body>")
+s.append("<h1>ADM Report</h1>")
+s.append("<pre>"+html.escape(json.dumps(d,indent=2))+"</pre>")
+s.append("</body></html>")
+open(out,"w").write("\n".join(s))
+PY
+    ok "HTML report generated: $htmlf"
+  else
+    # minimal fallback: wrap in <pre>
+    printf '<html><body><pre>\n' >"$htmlf"
+    sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g' "$jsonf" >>"$htmlf"
+    printf '\n</pre></body></html>\n' >>"$htmlf"
+    ok "HTML report generated (fallback): $htmlf"
+  fi
+  json_add "export_html" "$htmlf"
+  return 0
+}
+
+# ---------------------------- Post-pipeline summary & integration ----------------------------
+# Called after pipeline completes to show consolidated summary and optionally export report
+post_pipeline_summary() {
+  local pipeline_id="$1"
+  info "Pipeline finished (id: $pipeline_id). Generating final summary..."
+  # Copy temp pipeline data into FINAL_REPORT_JSON (best-effort merge)
+  if [ -f "$REPORT_JSON" ]; then
+    cp -a "$REPORT_JSON" "$FINAL_REPORT_JSON" 2>/dev/null || warn "Failed to copy JSON report"
+    ok "Final JSON report: $FINAL_REPORT_JSON"
+  else
+    warn "No intermediate REPORT_JSON found to export"
+  fi
+  # Ask to export to HTML (unless in dry-run)
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ "$OUTPUT_JSON" -eq 1 ]; then info "JSON output requested; saved at $FINAL_REPORT_JSON"; fi
+    # autopreview with adm-status full if available
+    if has_module "status"; then
+      info "Running adm-status summary for post-check"
+      run_script "status" "summary"
+    fi
+    # Ask to export to HTML (only prompt if not forced)
+    if [ "$FORCE" -eq 0 ]; then
+      read -r -p "Export final report to HTML? [Y/n]: " yn
+      case "$yn" in [Nn]) info "Skipping HTML export" ;; *) export_report_html "$FINAL_REPORT_JSON" "$FINAL_REPORT_HTML" ;; esac
+    else
+      export_report_html "$FINAL_REPORT_JSON" "$FINAL_REPORT_HTML"
+    fi
+  else
+    info "(dry-run) skip final post-pipeline actions"
+  fi
+}
+
+# ---------------------------- CLI dispatch extension (Part1 integration) ----------------------------
+# Extend main dispatch in PART 1/3 to include menu and pipeline mapping.
+# If integrated, call cmd_menu when 'menu' invoked, call adm_dispatch_pipeline_or_command when top-level build/install/update/uninstall invoked.
+
+# For convenience: export functions to be used by part1/dispatcher
+export -f cmd_menu menu_build menu_install menu_update menu_uninstall menu_status menu_conf menu_chroot menu_hooks menu_clean menu_search_info
+export -f post_pipeline_summary export_report_html ui_select_one ui_multi_select
+
+###############################################################################
+# End of PARTE
+###############################################################################
+# RISK NOTES:
+# - The TUI can trigger pipelines which may alter the system. Use --dry-run for safety.
+# - The chroot run assumes adm-chroot implements a 'run' subcommand — check compatibility.
+# - HTML export is minimal; keep sensitive data out of public reports.
+###############################################################################
