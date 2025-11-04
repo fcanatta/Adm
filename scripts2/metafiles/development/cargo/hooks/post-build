@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo post-build
+# - Verifica se o binário foi gerado e empacota resultado.
+#
+set -euo pipefail
+
+echo "🔍 [cargo post-build] Verificando build..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/cargo-build.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+CACHE_DIR="${ADM_ROOT}/cache"
+PKG_NAME="cargo-${VERSION:-$(date +%Y%m%d)}"
+
+mkdir -p "$CACHE_DIR"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria e empacotaria $BUILD_DIR"
+  exit 0
+fi
+
+# 1️⃣ Validar binário
+if [ ! -f "$SRC_DIR/target/release/cargo" ]; then
+  echo "❌ Cargo binário não encontrado."
+  exit 1
+fi
+
+# 2️⃣ Empacotar binário
+tar -C "$SRC_DIR/target/release" -cJf "${CACHE_DIR}/${PKG_NAME}.tar.xz" cargo
+sha256sum "${CACHE_DIR}/${PKG_NAME}.tar.xz" > "${CACHE_DIR}/${PKG_NAME}.sha256"
+
+echo "[`date -u`] cargo build OK" >> "$ADM_LOG"
+echo "✅ [cargo post-build] Empacotamento concluído: ${PKG_NAME}.tar.xz"
