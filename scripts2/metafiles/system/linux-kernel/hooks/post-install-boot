@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# ADM HOOK: linux-kernel post-install-boot
+# Atualiza bootloader dentro do DESTDIR (opcional) — NÃO modifica o host automaticamente.
+# Use FORCE=1 para forçar execução (aceita risco do usuário).
+# Suporta grub-mkconfig, efibootmgr, systemd-boot install (quando presente no chroot)
+set -euo pipefail
+
+echo "🚀 [linux-kernel post-install-boot] Atualizando bootloader (opcional)..."
+
+DRY_RUN="${DRY_RUN:-0}"
+FORCE="${FORCE:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-boot.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/linux-kernel-destdir}"
+BOOTLOADER="${BOOTLOADER:-grub}"   # options: grub, systemd-boot, none
+
+mkdir -p "$(dirname "$ADM_LOG")" 2>/dev/null || true
+echo "[`date -u`] post-install-boot start (bootloader=${BOOTLOADER})" >> "$ADM_LOG"
+
+# Safety: never run update-grub on host root unless explicit FORCE and purposeful chroot
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) mostraria comandos para atualizar bootloader dentro do chroot ${DESTDIR}"
+  exit 0
+fi
+
+_norm_dest="${DESTDIR%/}"
+if [ "${_norm_dest}" = "" ] || [ "${_norm_dest}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR inválido. Abortando."
+  exit 2
+fi
+
+case "${BOOTLOADER}" in
+  grub)
+    if [ "${FORCE}" -ne 1 ]; then
+      echo "ℹ️  Para atualizar GRUB dentro do target, reexecute com FORCE=1 (confirmando risco)."
+      echo "(ex.: FORCE=1 chroot ${DESTDIR} /usr/sbin/update-grub)"
+      exit 0
+    fi
+    if [ "$(id -u)" -ne 0 ]; then
+      echo "❌ Atualizar grub dentro do chroot requer root no host para montar bind /proc /sys /dev. Abortando."
+      exit 2
+    fi
+    echo "⚙️  Atualizando GRUB dentro do chroot ${DESTDIR} ..."
+    # mount binds
+    mount --bind /proc "${DESTDIR}/proc" 2>/dev/null || true
+    mount --bind /sys "${DESTDIR}/sys" 2>/dev/null || true
+    mount --bind /dev "${DESTDIR}/dev" 2>/dev/null || true
+    chroot "${DESTDIR}" /usr/sbin/update-grub || {
+      echo "⚠️  update-grub dentro do chroot retornou não-zero"
+    }
+    umount "${DESTDIR}/proc" 2>/dev/null || true
+    umount "${DESTDIR}/sys" 2>/dev/null || true
+    umount "${DESTDIR}/dev" 2>/dev/null || true
+    ;;
+  systemd-boot)
+    if [ "${FORCE}" -ne 1 ]; then
+      echo "ℹ️  Para instalar systemd-boot dentro do target use FORCE=1."
+      exit 0
+    fi
+    echo "⚙️  Instalando/atualizando systemd-boot dentro do chroot ${DESTDIR}..."
+    if [ "$(id -u)" -ne 0 ]; then
+      echo "❌ Esta operação precisa ser executada como root no host."
+      exit 2
+    fi
+    mount --bind /proc "${DESTDIR}/proc" 2>/dev/null || true
+    mount --bind /sys "${DESTDIR}/sys" 2>/dev/null || true
+    mount --bind /dev "${DESTDIR}/dev" 2>/dev/null || true
+    chroot "${DESTDIR}" /usr/bin/bootctl update || {
+      echo "⚠️  bootctl update falhou (ver chroot)."
+    }
+    umount "${DESTDIR}/proc" 2>/dev/null || true
+    umount "${DESTDIR}/sys" 2>/dev/null || true
+    umount "${DESTDIR}/dev" 2>/dev/null || true
+    ;;
+  none)
+    echo "ℹ️  Bootloader update pulado (BOOTLOADER=none)."
+    ;;
+  *)
+    echo "⚠️  Bootloader desconhecido: ${BOOTLOADER} (use grub/systemd-boot/none)."
+    ;;
+esac
+
+echo "[`date -u`] post-install-boot done" >> "$ADM_LOG"
+echo "✅ [linux-kernel post-install-boot] Concluído (ver logs)."
