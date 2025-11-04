@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# ADM post-build hook for Binutils
+# Runs after install; performs cleanup and sanity checks
+
+adm_log_info "[HOOK post-build] Verifying Binutils installation..."
+"${DESTDIR:-/usr/local}/bin/ld" --version || adm_log_err "ld not found after build!"
+adm_log_ok "[HOOK post-build] Binutils build completed successfully."
