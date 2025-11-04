@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: rust post-bootstrap
+# - Valida o funcionamento do toolchain Rust stage0 após o pre-bootstrap.
+# - Compila e executa um programa de teste, registra versão e limpa caches antigos.
+# - Respeita DRY_RUN e aborta em erros críticos.
+#
+# ⚠️ Este script NUNCA toca o sistema host (/usr, /bin etc.),
+#     opera exclusivamente dentro de /usr/src/adm/toolchains.
+#
+set -euo pipefail
+
+echo "🧩 [rust post-bootstrap] Validando toolchain stage0..."
+
+# Variáveis padrão
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/rust-bootstrap.log}"
+BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${ADM_ROOT}/toolchains/rust-bootstrap}"
+TEST_DIR="${TEST_DIR:-${BOOTSTRAP_DIR}/.test}"
+VERSION_FILE="${BOOTSTRAP_DIR}/version"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$TEST_DIR" || true
+echo "[`date -u`] rust post-bootstrap start" >> "$ADM_LOG"
+
+# 1️⃣ Validar presença dos binários
+RUSTC="${BOOTSTRAP_DIR}/bin/rustc"
+CARGO="${BOOTSTRAP_DIR}/bin/cargo"
+RUSTDOC="${BOOTSTRAP_DIR}/bin/rustdoc"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria existência de binários em $BOOTSTRAP_DIR/bin"
+else
+  for bin in "$RUSTC" "$CARGO" "$RUSTDOC"; do
+    if [ ! -x "$bin" ]; then
+      echo "❌ Binário ausente ou não executável: $bin"
+      echo "[`date -u`] missing binary: $bin" >> "$ADM_LOG"
+      exit 2
+    fi
+  done
+fi
+
+# 2️⃣ Verificar versão e salvar
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) registraria versão do Rust em $VERSION_FILE"
+else
+  ver="$($RUSTC --version || echo "desconhecido")"
+  echo "$ver" > "$VERSION_FILE"
+  echo "[`date -u`] rustc version: $ver" >> "$ADM_LOG"
+  echo "✔️  Rust toolchain detectado: $ver"
+fi
+
+# 3️⃣ Compilar programa teste simples
+echo "⚙️  Compilando teste 'Hello, Rust!'..."
+cat > "$TEST_DIR/hello.rs" <<'RS'
+fn main() {
+    println!("Hello, Rust world!");
+}
+RS
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria: $RUSTC hello.rs -o hello"
+else
+  pushd "$TEST_DIR" >/dev/null
+  if ! "$RUSTC" hello.rs -o hello 2> build.log; then
+    echo "❌ Falha ao compilar hello.rs"
+    tail -n 50 build.log || true
+    echo "[`date -u`] rustc test compile failed" >> "$ADM_LOG"
+    popd >/dev/null
+    exit 1
+  fi
+
+  if ! ./hello >/dev/null 2>&1; then
+    echo "❌ Execução do binário de teste falhou."
+    echo "[`date -u`] rustc test run failed" >> "$ADM_LOG"
+    popd >/dev/null
+    exit 2
+  fi
+
+  echo "✔️  Teste de compilação e execução bem-sucedido."
+  echo "[`date -u`] rust test OK" >> "$ADM_LOG"
+  popd >/dev/null
+fi
+
+# 4️⃣ Limpeza opcional de toolchains antigos
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) limparia toolchains antigos"
+else
+  echo "🧹 Limpando toolchains antigos..."
+  find "${ADM_ROOT}/toolchains" -maxdepth 1 -type d -name 'rust-*' ! -path "$BOOTSTRAP_DIR" -exec rm -rf {} + 2>/dev/null || true
+fi
+
+# 5️⃣ Registrar conclusão
+echo "✅ [rust post-bootstrap] Toolchain verificado e registrado em $VERSION_FILE"
+echo "[`date -u`] rust post-bootstrap complete" >> "$ADM_LOG"
