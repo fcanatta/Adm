@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo post-install
+# - Valida a instalação e registra versão.
+#
+set -euo pipefail
+
+echo "🔧 [cargo post-install] Verificando instalação..."
+
+DRY_RUN="${DRY_RUN:-0}"
+DESTDIR="${DESTDIR:-/usr/src/adm/tmp/cargo-destdir}"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria $DESTDIR/usr/bin/cargo"
+  exit 0
+fi
+
+if [ ! -x "$DESTDIR/usr/bin/cargo" ]; then
+  echo "❌ Cargo não encontrado após instalação."
+  exit 1
+fi
+
+ver="$("$DESTDIR/usr/bin/cargo" --version || echo unknown)"
+mkdir -p "$DESTDIR/var/lib/cargo"
+echo "$ver" > "$DESTDIR/var/lib/cargo/version"
+
+echo "✅ [cargo post-install] Cargo $ver instalado com sucesso."
