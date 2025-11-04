@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo pre-install
+# - Instala o Cargo no DESTDIR com segurança.
+#
+set -euo pipefail
+
+echo "📦 [cargo pre-install] Instalando Cargo..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/cargo-destdir}"
+SRC_DIR="$(pwd)"
+
+if [ -z "$DESTDIR" ] || [ "$DESTDIR" = "/" ]; then
+  echo "❌ DESTDIR inválido."
+  exit 2
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) instalaria Cargo em $DESTDIR/usr/bin"
+  exit 0
+fi
+
+mkdir -p "$DESTDIR/usr/bin"
+install -Dm755 "$SRC_DIR/target/release/cargo" "$DESTDIR/usr/bin/cargo"
+
+echo "✅ [cargo pre-install] Instalação concluída em $DESTDIR/usr/bin/"
