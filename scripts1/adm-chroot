@@ -3,6 +3,9 @@
 #
 # Save as: /usr/src/adm/bin/adm-chroot
 # Usage:
+# ADM_ALLOW_EXECUTION=0 /usr/src/adm/bin/adm-chroot create stage0
+# /usr/src/adm/bin/adm-chroot list
+# /usr/src/adm/bin/adm-chroot exists stage0
 #   adm-chroot create <name> [--from <other>] [--stage <stageN>]
 #   adm-chroot exists <name>
 #   adm-chroot enter <name> [-- <command>]
