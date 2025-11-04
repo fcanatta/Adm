@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#
+# ADM hook: glibc post-install
+# - Perform sanity checks described by LFS (dummy compile, readelf checks),
+#   and cleanup test files. Does not run ldconfig on host by default.
+#
+set -euo pipefail
+
+echo "🔧 [glibc post-install] Running sanity checks..."
+DRY_RUN="${DRY_RUN:-0}"
+ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-install.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/glibc-destdir}"
+LFS="${LFS:-/mnt/lfs}"
+LFS_TGT="${LFS_TGT:-${TARGET_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || true)}}"
+
+echo "[`date -u`] post-install start" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) would run sanity compile + readelf checks"
+  exit 0
+fi
+
+# 1) Sanity compile: echo 'int main(){}' | $LFS_TGT-gcc -x c - -v -Wl,--verbose
+echo "⚙️  Performing sanity compile with ${LFS_TGT}-gcc"
+echo 'int main(){}' > dummy.c
+if ! ${LFS_TGT}-gcc -x c dummy.c -v -Wl,--verbose &> dummy.log; then
+  echo "❌ Sanity compile failed; see dummy.log"
+  tail -n 200 dummy.log || true
+  rm -f dummy.c a.out || true
+  exit 1
+fi
+
+# 2) readelf to check program interpreter references
+if command -v readelf >/dev/null 2>&1; then
+  readelf -l a.out | grep ': /lib' || {
+    echo "❌ readelf check failed: program interpreter not in /lib or /lib64"
+    tail -n 200 dummy.log || true
+    rm -f dummy.c a.out dummy.log || true
+    exit 1
+  }
+else
+  echo "⚠️  readelf not available to perform check"
+fi
+
+# 3) Check that libc.so.6 is reachable
+grep -E "/lib.*/libc.so.6 " dummy.log || {
+  echo "❌ libc.so.6 not found in dummy.log"
+  tail -n 200 dummy.log || true
+  rm -f dummy.c a.out dummy.log || true
+  exit 1
+}
+
+# 4) Confirm dynamic linker path found
+grep 'found' dummy.log || {
+  echo "❌ dynamic linker path not found in dummy.log"
+  tail -n 200 dummy.log || true
+  rm -f dummy.c a.out dummy.log || true
+  exit 1
+}
+
+# cleanup
+rm -v dummy.c a.out dummy.log 2>/dev/null || true
+echo "✅ [glibc post-install] Sanity checks passed"
+
+# NOTE: We do not run ldconfig on the host automatically. Running ldconfig may
+# replace the running libc and can break the system. If you must run ldconfig,
+# do it inside the target chroot with care.
+echo "[`date -u`] glibc install and sanity checks OK" >> "$ADM_LOG"
