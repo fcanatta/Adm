@@ -1,0 +1,405 @@
+#!/usr/bin/env bash
+#
+# adm-trust - Gerenciador de truststore para ADM
+#
+# Funções:
+#  - init                  : inicializa truststore e keyring local
+#  - gen-key               : gera chave GPG (uso: gen-key <email> [--name "Name"])
+#  - import-key            : importa chave pública para truststore
+#  - list-keys             : lista chaves no truststore
+#  - sign-file             : gera SHA256 e assinatura GPG para um arquivo (ex: hook)
+#  - verify-file           : verifica SHA256 + assinatura GPG de um arquivo
+#  - revoke-key            : marca chave como revogada (gera arquivo .rev)
+#  - export-key            : exporta chave pública do truststore
+#  - remove-key            : remove (arquiva) chave da store
+#  - help                  : mostra ajuda
+#
+# Segurança:
+#  - ## RISCO: geração/importação/remoção/revogação de chaves é sensível.
+#  - Operações destrutivas pedem confirmação (ou use --force).
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----- Defaults & environment -----
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+TRUSTSTORE_DIR="${TRUSTSTORE_DIR:-${ADM_ROOT}/truststore}"
+KEYRING_DIR="${KEYRING_DIR:-${TRUSTSTORE_DIR}/gpg}"
+PUBKEYS_DIR="${PUBKEYS_DIR:-${TRUSTSTORE_DIR}/pubkeys}"
+REVOKED_DIR="${REVOKED_DIR:-${TRUSTSTORE_DIR}/revoked}"
+LOGS_DIR="${ADM_LOGS:-${ADM_ROOT}/logs}"
+TMP_DIR="${ADM_TMP:-${ADM_ROOT}/tmp}"
+LOCK_DIR="${LOCK_DIR:-${TMP_DIR}/adm-trust-locks}"
+
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+GPG_BIN="${GPG_BIN:-gpg}"   # allow override
+GPG_OPTS="--batch --yes --no-tty"
+
+# create structure
+mkdir -p "$TRUSTSTORE_DIR" "$KEYRING_DIR" "$PUBKEYS_DIR" "$REVOKED_DIR" "$LOGS_DIR" "$TMP_DIR" "$LOCK_DIR" 2>/dev/null || true
+
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-trust-${TS_NOW}.log}"
+
+### ----- Helpers ----- 
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "ℹ️  %s\n" "$1"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "✔️  %s\n" "$1"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "⚠️  %s\n" "$1" >&2; log "[WARN]" "$1"; }
+err()   { [ "$QUIET" -eq 0 ] && printf "❌  %s\n" "$1" >&2; log "[ERROR]" "$1"; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+confirm_prompt() {
+  local prompt="${1:-Proceed?}"
+  if [ "$DRY_RUN" -eq 1 ] || [ "$FORCE" -eq 1 ]; then verbose "(non-interactive) assume yes for: $prompt"; return 0; fi
+  while true; do
+    read -r -p "$prompt [y/N]: " a
+    case "$a" in [Yy]|[Yy][Ee][Ss]) return 0 ;; [Nn]|""|*) return 1 ;; esac
+  done
+}
+
+acquire_lock() {
+  local key="${1:-global}"
+  local lockfile="${LOCK_DIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Outra operação adm-trust em andamento (lock: $lockfile)"; return 1; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() {
+  local lockfile="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) release lock $lockfile"; return 0; fi
+  [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+  return 0
+}
+
+gpg_home() { printf '%s' "$KEYRING_DIR"; }
+
+gpg_cmd() {
+  # wrapper for gpg using isolated home
+  env GNUPGHOME="$(gpg_home)" "$GPG_BIN" $GPG_OPTS "$@"
+}
+
+sha256_file() { command -v sha256sum >/dev/null 2>&1 && sha256sum "$1" | awk '{print $1}' || (sha256 -q "$1" 2>/dev/null || true); }
+
+ensure_tool() {
+  local t="$1"
+  if ! command -v "$t" >/dev/null 2>&1; then err "Ferramenta ausente: $t"; return 1; fi
+  return 0
+}
+
+safe_write() {
+  # write content to file atomically
+  local dst="$1" content="$2"
+  local tmp="${dst}.$$.$(date +%s)"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) write $dst"; return 0; fi
+  printf '%s' "$content" >"$tmp" && mv -f "$tmp" "$dst"
+}
+
+json_report_add_entry() {
+  # minimal append into JSON-like file (best-effort)
+  local k="$1" v="$2"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) report add $k=$v" && return 0
+  mkdir -p "$(dirname "${TRUSTSTORE_DIR}/trust-report.json")" 2>/dev/null || true
+  printf '%s: %s\n' "$k" "$v" >>"${TRUSTSTORE_DIR}/trust-report.json"
+}
+
+### ----- Usage ----- 
+usage() {
+  cat <<EOF
+adm-trust - Gerenciador de truststore (ADM)
+
+Usage: $SCRIPT_NAME <command> [args] [--dry-run] [--force] [--verbose]
+
+Commands:
+  init                             : Inicializa truststore e keyring local
+  gen-key <email> [--name "Name"]  : Gera chave GPG para email (interativo por defeito)
+  import-key <pubkey-file>         : Importa chave pública PEM/ASCII para truststore
+  list-keys                        : Lista chaves no truststore (local keyring)
+  export-key <keyid> [--out file]  : Exporta chave pública do keyring para arquivo
+  remove-key <keyid>               : Remove (arquiva) chave da store (requires --force to skip confirm)
+  revoke-key <keyid>               : Marca chave como revogada (gera .rev arquivo)
+  sign-file <file> [--gpg-id id]   : Gera SHA256 e assinatura (.sha256 + .asc)
+  verify-file <file>               : Verifica SHA256 e assinatura
+  help
+
+Global flags:
+  --dry-run    : Simula ações
+  --force      : Não pedir confirmações
+  --verbose    : Mais verbosidade
+
+Examples:
+  adm-trust init
+  adm-trust gen-key alice@example.com --name "Alice Maintainer"
+  adm-trust import-key alice.pub
+  adm-trust sign-file /usr/src/adm/metafiles/base/zlib/hooks/pre-build/hook.sh --gpg-id alice@example.com
+  adm-trust verify-file /usr/src/adm/metafiles/.../hook.sh
+EOF
+  exit 1
+}
+
+### ----- Parse global flags ----- 
+POSITIONAL=()
+COMMAND=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose) VERBOSE=1; shift ;;
+    init|gen-key|import-key|list-keys|export-key|remove-key|revoke-key|sign-file|verify-file|help) COMMAND="$1"; shift ;;
+    --name) NAME_FLAG="$2"; shift 2 ;;
+    --gpg-id) GPG_ID_FLAG="$2"; shift 2 ;;
+    --out) OUT_FLAG="$2"; shift 2 ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# map positional args to variables
+ARGS=("${POSITIONAL[@]:-}")
+
+### ----- Implementations ----- 
+
+cmd_init() {
+  info "Inicializando truststore em $TRUSTSTORE_DIR"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) mkdir -p $TRUSTSTORE_DIR $KEYRING_DIR $PUBKEYS_DIR"; return 0; fi
+  mkdir -p "$TRUSTSTORE_DIR" "$KEYRING_DIR" "$PUBKEYS_DIR" "$REVOKED_DIR"
+  # create empty GNUPGHOME with proper permissions
+  if [ ! -d "$KEYRING_DIR" ] || [ -z "$(ls -A "$KEYRING_DIR" 2>/dev/null || true)" ]; then
+    mkdir -p "$KEYRING_DIR"
+    chmod 0700 "$KEYRING_DIR"
+    # initialize gpg (create home)
+    if ! gpg_cmd --list-keys >/dev/null 2>&1; then
+      # no-op: listing will initialize GNUPGHOME
+      verbose "Inicializando gpg home em $KEYRING_DIR"
+    fi
+  fi
+  ok "Truststore inicializado"
+  json_report_add_entry "initialized" "$TS_NOW"
+  return 0
+}
+
+cmd_gen_key() {
+  local email="${ARGS[0]:-}"
+  local name="${NAME_FLAG:-ADM Maintainer}"
+  if [ -z "$email" ]; then err "gen-key requires <email>"; usage; fi
+  info "Gerando chave GPG para $email (name='$name')"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would generate key for $email"; return 0; fi
+  # generate batch file
+  local batchfile="${TMP_DIR}/gpg-gen-${TS_NOW}.batch"
+  cat >"$batchfile" <<EOF
+%echo Generating ADM key
+Key-Type: default
+Key-Length: 4096
+Name-Real: ${name}
+Name-Email: ${email}
+Expire-Date: 0
+%no-protection
+%commit
+%echo done
+EOF
+  # use GNUPGHOME
+  if gpg_cmd --batch --generate-key "$batchfile" >>"$LOGFILE" 2>&1; then
+    ok "Chave gerada para $email"
+    # export public key to pubkeys dir
+    local keyid
+    keyid="$(gpg_cmd --with-colons --list-keys "$email" 2>/dev/null | awk -F: '/^pub/ {print $5; exit}')"
+    if [ -n "$keyid" ]; then
+      gpg_cmd --armor --output "${PUBKEYS_DIR}/${keyid}.pub" --export "$keyid" >/dev/null 2>&1 || true
+      ok "Chave pública exportada: ${PUBKEYS_DIR}/${keyid}.pub"
+      json_report_add_entry "gen-key" "$keyid"
+    fi
+    rm -f "$batchfile"
+    return 0
+  else
+    err "Falha ao gerar chave (ver logs)"
+    return 2
+  fi
+}
+
+cmd_import_key() {
+  local pubfile="${ARGS[0]:-}"
+  if [ -z "$pubfile" ]; then err "import-key requires <pubkey-file>"; usage; fi
+  if [ ! -f "$pubfile" ]; then err "Arquivo não encontrado: $pubfile"; return 2; fi
+  info "Importando chave pública: $pubfile"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) import $pubfile -> $KEYRING_DIR"; return 0; fi
+  if gpg_cmd --import "$pubfile" >>"$LOGFILE" 2>&1; then
+    ok "Importado: $pubfile"
+    # copy to pubkeys dir
+    cp -a "$pubfile" "${PUBKEYS_DIR}/" 2>/dev/null || true
+    json_report_add_entry "import-key" "$(basename "$pubfile")"
+    return 0
+  else
+    err "Falha na importação de chave (veja logs)"
+    return 3
+  fi
+}
+
+cmd_list_keys() {
+  info "Chaves no truststore (GNUPGHOME=${KEYRING_DIR}):"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) gpg --list-keys"; return 0; fi
+  gpg_cmd --list-keys --with-colons | awk -F: '
+    /^pub/ { printf("Key: %s Algorithm:%s Length:%s\n", $5, $3, $4) }
+    /^uid/ { print "  UID: " $10 }
+  '
+  return 0
+}
+
+cmd_export_key() {
+  local keyid="${ARGS[0]:-}"
+  local out="${OUT_FLAG:-${PWD}/${keyid}.pub}"
+  if [ -z "$keyid" ]; then err "export-key requires <keyid>"; usage; fi
+  info "Exportando chave pública $keyid -> $out"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) gpg --armor --export $keyid > $out"; return 0; fi
+  if gpg_cmd --armor --output "$out" --export "$keyid" >>"$LOGFILE" 2>&1; then
+    ok "Exportado: $out"
+    return 0
+  else
+    err "Falha ao exportar chave $keyid"
+    return 2
+  fi
+}
+
+cmd_remove_key() {
+  local keyid="${ARGS[0]:-}"
+  if [ -z "$keyid" ]; then err "remove-key requires <keyid>"; usage; fi
+  ## RISCO: remover chave do keyring pode invalidar assinaturas futuras; operação destrutiva
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would remove key $keyid"; return 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Remover chave $keyid do truststore? Esta operação é destrutiva."; then info "Cancelled"; return 1; fi
+  fi
+  # Archive public key before removal
+  local archive="${REVOKED_DIR}/${keyid}.archive-${TS_NOW}.pub"
+  gpg_cmd --armor --output "$archive" --export "$keyid" >/dev/null 2>&1 || true
+  # delete from keyring
+  if gpg_cmd --batch --yes --delete-secret-and-public-keys "$keyid" >>"$LOGFILE" 2>&1; then
+    ok "Chave $keyid removida (arquivo arquivado: $archive)"
+    json_report_add_entry "remove-key" "$keyid"
+    return 0
+  else
+    err "Falha ao remover chave $keyid"
+    return 2
+  fi
+}
+
+cmd_revoke_key() {
+  local keyid="${ARGS[0]:-}"
+  if [ -z "$keyid" ]; then err "revoke-key requires <keyid>"; usage; fi
+  ## RISCO: revogar chave é irreversível para confiança pública; registre justificativa
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would revoke $keyid"; return 0; fi
+  if [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Revogar chave $keyid? Isto marca a chave como revogada."; then info "Cancelled"; return 1; fi
+  fi
+  # generate revocation certificate
+  local revfile="${REVOKED_DIR}/${keyid}.rev"
+  if gpg_cmd --output "$revfile" --gen-revoke "$keyid" >>"$LOGFILE" 2>&1; then
+    ok "Revogação criada: $revfile"
+    json_report_add_entry "revoke-key" "$keyid"
+    return 0
+  else
+    err "Falha ao gerar revogação (ver logs)"
+    return 2
+  fi
+}
+
+cmd_sign_file() {
+  local file="${ARGS[0]:-}"
+  local gpgid="${GPG_ID_FLAG:-}"
+  if [ -z "$file" ]; then err "sign-file requires <file>"; usage; fi
+  if [ ! -f "$file" ]; then err "Arquivo não encontrado: $file"; return 2; fi
+  # compute sha256, write .sha256 next to file
+  local sha
+  sha="$(sha256_file "$file")" || true
+  local sha_file="${file}.sha256"
+  local asc_file="${file}.asc"
+  info "Gerando SHA256 para $file -> $sha_file"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would write $sha_file and sign to $asc_file"; return 0; fi
+  printf '%s  %s\n' "$sha" "$(basename "$file")" >"$sha_file"
+  # sign with gpg id if provided, otherwise use default secret key in keyring
+  if [ -n "$gpgid" ]; then
+    info "Usando GPG id: $gpgid para assinar"
+    if gpg_cmd --local-user "$gpgid" --armor --output "$asc_file" --detach-sign "$file" >>"$LOGFILE" 2>&1; then
+      ok "Assinado: $asc_file"
+    else
+      err "Falha na assinatura GPG (ver logs)"
+      return 3
+    fi
+  else
+    if gpg_cmd --armor --output "$asc_file" --detach-sign "$file" >>"$LOGFILE" 2>&1; then
+      ok "Assinado com chave padrão: $asc_file"
+    else
+      err "Falha na assinatura GPG (ver logs)"
+      return 4
+    fi
+  fi
+  # copy sha and asc to pubkeys dir optionally for distribution
+  cp -a "$sha_file" "${PUBKEYS_DIR}/" 2>/dev/null || true
+  cp -a "$asc_file" "${PUBKEYS_DIR}/" 2>/dev/null || true
+  json_report_add_entry "sign-file" "$(basename "$file")"
+  # integration hint: notify adm-hooks (if present) to re-verify cache (best-effort)
+  if command -v adm-hooks >/dev/null 2>&1; then
+    verbose "Notifying adm-hooks about signed file (if integrated)"
+    # best-effort: adm-hooks finalize could be invoked externally
+  fi
+  return 0
+}
+
+cmd_verify_file() {
+  local file="${ARGS[0]:-}"
+  if [ -z "$file" ]; then err "verify-file requires <file>"; usage; fi
+  if [ ! -f "$file" ]; then err "Arquivo não encontrado: $file"; return 2; fi
+  local sha_file="${file}.sha256"
+  local asc_file="${file}.asc"
+  if [ ! -f "$sha_file" ]; then warn "Checksum não encontrado: $sha_file"; fi
+  if [ ! -f "$asc_file" ]; then warn "Assinatura não encontrada: $asc_file"; fi
+
+  # verify sha if exists
+  if [ -f "$sha_file" ]; then
+    local expected
+    expected="$(awk '{print $1}' "$sha_file" 2>/dev/null || true)"
+    local actual
+    actual="$(sha256_file "$file" 2>/dev/null || true)"
+    if [ "$expected" = "$actual" ]; then ok "SHA256 OK for $file"; else err "SHA mismatch for $file (expected $expected actual $actual)"; return 3; fi
+  else
+    warn "SHA file absent, skipping sha check"
+  fi
+
+  # verify signature using imported public keys
+  if [ -f "$asc_file" ]; then
+    if gpg_cmd --verify "$asc_file" "$file" >>"$LOGFILE" 2>&1; then
+      ok "GPG signature verified for $file"
+      return 0
+    else
+      err "Signature verification FAILED for $file (see $LOGFILE)"
+      return 4
+    fi
+  else
+    warn "No .asc signature present; cannot verify GPG signature"
+    return 5
+  fi
+}
+
+### ----- Dispatch commands ----- 
+case "$COMMAND" in
+  init) acquire_lock "init" || exit 3; cmd_init; release_lock "init"; exit $? ;;
+  gen-key) acquire_lock "genkey" || exit 3; cmd_gen_key; release_lock "genkey"; exit $? ;;
+  import-key) acquire_lock "import" || exit 3; cmd_import_key; release_lock "import"; exit $? ;;
+  list-keys) acquire_lock "list" || exit 3; cmd_list_keys; release_lock "list"; exit $? ;;
+  export-key) acquire_lock "export" || exit 3; cmd_export_key; release_lock "export"; exit $? ;;
+  remove-key) acquire_lock "remove" || exit 3; cmd_remove_key; release_lock "remove"; exit $? ;;
+  revoke-key) acquire_lock "revoke" || exit 3; cmd_revoke_key; release_lock "revoke"; exit $? ;;
+  sign-file) acquire_lock "sign" || exit 3; cmd_sign_file; release_lock "sign"; exit $? ;;
+  verify-file) acquire_lock "verify" || exit 3; cmd_verify_file; release_lock "verify"; exit $? ;;
+  help|"") usage ;;
+  *) err "Unknown command: $COMMAND"; usage ;;
+esac
