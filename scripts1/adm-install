@@ -3,6 +3,7 @@
 # Save as /usr/src/adm/bin/adm-install
 #
 # Usage:
+# ADM_DRY_RUN=1 /usr/src/adm/bin/adm-install install /usr/src/adm/metafiles/hello/metafile --chroot stage0
 #   adm-install install [--bin] [--chroot <name>] <metafile|pkgname|path>
 #   adm-install install --dir <path-to-bin-dir> [--chroot <name>]
 #   adm-install list [--chroot <name>]
