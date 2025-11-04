@@ -217,38 +217,181 @@ _adm_get_latest_from_upstream() {
   if [ -z "$latest_ver" ] && [ -n "$orig_source" ]; then
     adm_log_debug "Falling back to source pattern inspection"
     # try to replace version in orig_source by scanning nearby versions (not exhaustive)
-    # this is a best-effort placeholder: user can supply upstream that is parseable
-    local basefn
-    basefn=$(basename "$orig_source")
-    # capture numeric version in filename
-    local curver
-    curver=$(echo "$basefn" | sed -E 's/.*[-_]?([0-9]+(\.[0-9]+)+).*/\1/' || true)
-    adm_log_debug "Current version extracted from source: $curver"
-    if [ -n "$curver" ]; then
-      # naive attempt: increment patch
-      IFS='.' read -ra parts <<< "$curver"
-      lastidx=$(( ${#parts[@]} - 1 ))
-      parts[$lastidx]=$(( ${parts[$lastidx]} + 1 ))
-      latest_ver=$(IFS='.'; echo "${parts[*]}")
-      # best-effort construct URL by replacing current version in source with new
-      latest_url=$(echo "$orig_source" | sed -E "s/$curver/$latest_ver/")
-      adm_log_debug "Naive bump -> $latest_ver | $latest_url"
+# -------------------------
+# Universal Upstream Inspector
+# Supports: GitHub, GitLab, SourceForge, S3 buckets, FTP, and generic directory listings
+# Returns "version|url" if a newer version is detected, otherwise empty.
+# -------------------------
+_adm_get_latest_from_upstream() {
+  local upstream="$1" orig_source="$2"
+  local tmp="$ADM_TMPDIR/adm-update-$(date +%s)-$$"
+  mkdir -p "$tmp"
+  local latest_ver="" latest_url=""
+
+  adm_log_info "Inspecting upstream source: $upstream"
+
+  # Helper to fetch content (curl or wget fallback)
+  _adm_fetch_content() {
+    local url="$1"
+    if _adm_exists_cmd curl; then
+      curl -fsSL "$url" 2>/dev/null || true
+    elif _adm_exists_cmd wget; then
+      wget -qO- "$url" 2>/dev/null || true
+    else
+      return 1
+    fi
+  }
+
+  # Extract numeric version patterns
+  _adm_extract_versions() {
+    grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V | uniq
+  }
+
+  # -------------------------
+  # 1. GitHub
+  # -------------------------
+  if echo "$upstream" | grep -qi "github.com"; then
+    adm_log_debug "Upstream detected as GitHub"
+    local owner_repo gh_api
+    owner_repo=$(echo "$upstream" | sed -E 's#.*github.com/([^/]+/[^/]+).*#\1#')
+    gh_api="https://api.github.com/repos/${owner_repo}/releases"
+    if _adm_exists_cmd curl; then
+      adm_log_debug "Using GitHub API: $gh_api"
+      local json
+      json=$(curl -sSf "$gh_api" 2>/dev/null || true)
+      if [ -n "$json" ]; then
+        latest_ver=$(echo "$json" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+        [ -z "$latest_ver" ] && latest_ver=$(echo "$json" | awk -F'"' '/"name":/ {print $4; exit}')
+        if [ -n "$latest_ver" ]; then
+          latest_url="https://github.com/${owner_repo}/archive/refs/tags/${latest_ver}.tar.gz"
+          adm_log_debug "GitHub detected: version=$latest_ver url=$latest_url"
+        fi
+      fi
     fi
   fi
 
-  # cleanup temp
+  # -------------------------
+  # 2. GitLab
+  # -------------------------
+  if [ -z "$latest_ver" ] && echo "$upstream" | grep -qi "gitlab.com"; then
+    adm_log_debug "Upstream detected as GitLab"
+    local project_path
+    project_path=$(echo "$upstream" | sed -E 's#.*gitlab.com/([^/]+/[^/]+).*#\1#')
+    local api="https://gitlab.com/api/v4/projects/$(echo "$project_path" | sed 's#/#%2F#g')/releases"
+    if _adm_exists_cmd curl; then
+      local json
+      json=$(curl -sSf "$api" 2>/dev/null || true)
+      if [ -n "$json" ]; then
+        latest_ver=$(echo "$json" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+        if [ -n "$latest_ver" ]; then
+          latest_url="https://gitlab.com/${project_path}/-/archive/${latest_ver}/${project_path##*/}-${latest_ver}.tar.gz"
+          adm_log_debug "GitLab detected: version=$latest_ver url=$latest_url"
+        fi
+      fi
+    fi
+  fi
+
+  # -------------------------
+  # 3. SourceForge
+  # -------------------------
+  if [ -z "$latest_ver" ] && echo "$upstream" | grep -qi "sourceforge.net"; then
+    adm_log_debug "Upstream detected as SourceForge"
+    local project
+    project=$(echo "$upstream" | sed -E 's#.*/projects/([^/]+)/?.*#\1#')
+    local rss="https://sourceforge.net/projects/${project}/rss?limit=20"
+    if _adm_exists_cmd curl; then
+      local xml
+      xml=$(curl -sSf "$rss" 2>/dev/null || true)
+      if [ -n "$xml" ]; then
+        latest_url=$(echo "$xml" | grep -Eo 'https://sourceforge.net/projects[^<]+' | grep -E '\.tar\.(gz|xz|zst)' | head -n1)
+        latest_ver=$(basename "$latest_url" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V | tail -n1)
+        adm_log_debug "SourceForge detected: version=$latest_ver url=$latest_url"
+      fi
+    fi
+  fi
+
+  # -------------------------
+  # 4. S3 buckets / HTTP mirrors (simple indexes)
+  # -------------------------
+  if [ -z "$latest_ver" ] && echo "$upstream" | grep -qE 's3\.amazonaws\.com|\.s3\.|\.mirror|/releases/?$'; then
+    adm_log_debug "Upstream detected as S3 or mirror index"
+    local html
+    html=$(_adm_fetch_content "$upstream")
+    if [ -n "$html" ]; then
+      latest_url=$(echo "$html" | grep -Eo 'href="[^"]+"' | sed -E 's/href="([^"]+)".*/\1/' | grep -E '\.tar\.(gz|xz|zst)$' | sort -u | tail -n1)
+      if [ -n "$latest_url" ]; then
+        [ "${latest_url:0:4}" != "http" ] && latest_url="${upstream%/}/$latest_url"
+        latest_ver=$(basename "$latest_url" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V | tail -n1)
+        adm_log_debug "S3/Mirror detected: version=$latest_ver url=$latest_url"
+      fi
+    fi
+  fi
+
+  # -------------------------
+  # 5. FTP servers
+  # -------------------------
+  if [ -z "$latest_ver" ] && echo "$upstream" | grep -qi '^ftp://'; then
+    adm_log_debug "Upstream detected as FTP"
+    local listing
+    if _adm_exists_cmd curl; then
+      listing=$(curl -s "$upstream" 2>/dev/null || true)
+    elif _adm_exists_cmd wget; then
+      listing=$(wget -qO- "$upstream" 2>/dev/null || true)
+    fi
+    if [ -n "$listing" ]; then
+      latest_url=$(echo "$listing" | grep -Eo '[^[:space:]]+\.tar\.(gz|xz|zst)' | sort -u | tail -n1)
+      [ "${latest_url:0:4}" != "ftp" ] && latest_url="${upstream%/}/$latest_url"
+      latest_ver=$(basename "$latest_url" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V | tail -n1)
+      adm_log_debug "FTP detected: version=$latest_ver url=$latest_url"
+    fi
+  fi
+
+  # -------------------------
+  # 6. Generic HTML directory listing (Apache/Nginx index)
+  # -------------------------
+  if [ -z "$latest_ver" ]; then
+    adm_log_debug "Fallback: generic HTML index parsing"
+    local html
+    html=$(_adm_fetch_content "$upstream")
+    if [ -n "$html" ]; then
+      latest_url=$(echo "$html" | grep -Eo 'href="[^"]+"' | sed -E 's/href="([^"]+)".*/\1/' | grep -E '\.tar\.(gz|xz|zst)$' | sort -u | tail -n1)
+      [ -n "$latest_url" ] && [ "${latest_url:0:4}" != "http" ] && latest_url="${upstream%/}/$latest_url"
+      latest_ver=$(basename "$latest_url" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | sort -V | tail -n1)
+      adm_log_debug "Generic index detected: version=$latest_ver url=$latest_url"
+    fi
+  fi
+
+  # -------------------------
+  # Fallback heuristic: try bumping the version from orig_source
+  # -------------------------
+  if [ -z "$latest_ver" ] && [ -n "$orig_source" ]; then
+    adm_log_debug "Fallback: heuristic bump from orig_source"
+    local curver basefn
+    basefn=$(basename "$orig_source")
+    curver=$(echo "$basefn" | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)
+    if [ -n "$curver" ]; then
+      IFS='.' read -ra parts <<< "$curver"
+      parts[${#parts[@]}-1]=$(( ${parts[${#parts[@]}-1]} + 1 ))
+      latest_ver=$(IFS='.'; echo "${parts[*]}")
+      latest_url=$(echo "$orig_source" | sed -E "s/$curver/$latest_ver/")
+      adm_log_debug "Heuristic bump -> $latest_ver | $latest_url"
+    fi
+  fi
+
+  # Clean temporary files
   rm -rf "$tmp" 2>/dev/null || true
 
-  # return results as version|url
-  if [ -n "$latest_ver" ] || [ -n "$latest_url" ]; then
-    printf "%s|%s" "${latest_ver:-}" "${latest_url:-}"
+  # -------------------------
+  # Return final result
+  # -------------------------
+  if [ -n "$latest_ver" ] && [ -n "$latest_url" ]; then
+    printf "%s|%s" "$latest_ver" "$latest_url"
     return 0
   fi
 
-  # nothing found
-  return 2
+  adm_log_info "No valid upstream version detected for $upstream"
+  return 1
 }
-
 # -------------------------
 # Download + verify helpers
 # -------------------------
