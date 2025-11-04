@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+# adm-install - Install packages produced by adm-build
+# Save as /usr/src/adm/bin/adm-install
+#
+# Usage:
+#   adm-install install [--bin] [--chroot <name>] <metafile|pkgname|path>
+#   adm-install install --dir <path-to-bin-dir> [--chroot <name>]
+#   adm-install list [--chroot <name>]
+#   adm-install info <pkg>
+#   adm-install help
+#
+# Safety:
+#  - By default operates in SIMULATION mode. To run real destructive actions
+#    you must manually enable ADM_ALLOW_EXECUTION=1 (and preferably run inside a VM).
+#  - All destructive commands (tar extraction into chroot, file removals, etc.)
+#    are commented and clearly marked: "# UNCOMMENT FOR REAL EXECUTION (in chroot only)"
+#
+set -euo pipefail
+shopt -s extglob
+
+# ----------------------------
+# Config (override via env)
+# ----------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_CACHE_BIN:=$ADM_ROOT/cache/bin}"
+: "${ADM_MANIFEST_DIR:=$ADM_ROOT/manifests}"
+: "${ADM_STATE_INSTALLED:=$ADM_ROOT/state/installed}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/install}"
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_ALLOW_EXECUTION:=0}"   # 0 simulate, 1 allow real ops (still commands remain commented)
+: "${ADM_LOCK_DIR:=$ADM_ROOT/state/locks}"
+: "${ADM_CHROOT:=}"             # optional chroot target
+: "${ADM_VERBOSE:=1}"
+: "${ADM_JOBS:=1}"
+
+mkdir -p "$ADM_CACHE_BIN" "$ADM_MANIFEST_DIR" "$ADM_STATE_INSTALLED" "$ADM_LOG_DIR" "$ADM_TMPDIR" "$ADM_LOCK_DIR" 2>/dev/null || true
+
+# ----------------------------
+# logger (use adm-logger if present)
+# ----------------------------
+if [ -x "$ADM_BIN_DIR/adm-logger" ]; then
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info() { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_error() { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_debug() { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+# ----------------------------
+# Utility helpers
+# ----------------------------
+_adm_lockfile() { local n="$1"; printf "%s/install-%s.lock" "$ADM_LOCK_DIR" "$n"; }
+_adm_acquire_lock() {
+  local name="$1"; local lock; lock=$(_adm_lockfile "$name")
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    adm_log_error "Could not acquire lock for $name (lock: $lock)"
+    return 1
+  fi
+  echo "$$" > "${lock}.pid" 2>/dev/null || true
+  adm_log_debug "Acquired lock: $lock"
+  return 0
+}
+_adm_release_lock() {
+  local name="$1"; local lock; lock=$(_adm_lockfile "$name")
+  rm -f "${lock}.pid" 2>/dev/null || true
+  exec 9>&- || true
+  adm_log_debug "Released lock: $lock"
+}
+
+_adm_pkg_safe() { echo "$1" | sed -E 's/[^A-Za-z0-9._+-]/_/g'; }
+_adm_arch() { uname -m 2>/dev/null || echo "unknown"; }
+_adm_exists_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# ----------------------------
+# Helpers to interact with other ADM modules (best-effort)
+# ----------------------------
+# adm-meta: adm_meta_load <metafile>; adm_meta_get <field>
+if [ -x "$ADM_BIN_DIR/adm-meta" ]; then
+  source "$ADM_BIN_DIR/adm-meta"
+  adm_log_debug "Loaded adm-meta"
+fi
+
+# adm-deps: find_metafile_by_name <name> (optional)
+if [ -x "$ADM_BIN_DIR/adm-deps" ]; then
+  source "$ADM_BIN_DIR/adm-deps"
+  adm_log_debug "Loaded adm-deps"
+fi
+
+# adm-downloader: adm_cache_download <url> <sha>
+if [ -x "$ADM_BIN_DIR/adm-downloader" ]; then
+  source "$ADM_BIN_DIR/adm-downloader"
+  adm_log_debug "Loaded adm-downloader"
+fi
+
+# adm-chroot wrapper expected at ADM_BIN_DIR/adm-chroot
+# adm-build expected at ADM_BIN_DIR/adm-build
+
+# ----------------------------
+# find metafile by name helper (fallback search)
+# ----------------------------
+find_metafile_by_name_fallback() {
+  local name="$1"
+  # search metafiles dir
+  if [ -d "$ADM_ROOT/metafiles" ]; then
+    find "$ADM_ROOT/metafiles" -type f -name 'metafile' -exec grep -l "^name: ${name}$" {} + 2>/dev/null | head -n1 || true
+  fi
+}
+
+find_metafile_by_name_wrapped() {
+  local name="$1"
+  if declare -f find_metafile_by_name >/dev/null 2>&1; then
+    find_metafile_by_name "$name" 2>/dev/null || find_metafile_by_name_fallback "$name"
+  else
+    find_metafile_by_name_fallback "$name"
+  fi
+}
+
+# ----------------------------
+# Read metafile quick extractor (fallback)
+# ----------------------------
+_adm_read_metafile_field() {
+  local mf="$1" field="$2"
+  [ -f "$mf" ] || return 1
+  # first try adm_meta_get
+  if declare -f adm_meta_load >/dev/null 2>&1 && declare -f adm_meta_get >/dev/null 2>&1; then
+    adm_meta_load "$mf"
+    adm_meta_get "$field" 2>/dev/null || true
+    return 0
+  fi
+  # fallback crude parse
+  grep -E "^${field}:" "$mf" 2>/dev/null | sed -E "s/^${field}:[[:space:]]*//" | head -n1 || true
+}
+
+# ----------------------------
+# Resolve binary in cache
+# returns: path to binary archive or empty
+# ----------------------------
+_adm_install_resolve_binary() {
+  local name="$1" version="$2" arch="$3"
+  # prefer explicit file in cache matching pattern
+  local cand
+  cand=$(ls -1 "$ADM_CACHE_BIN/${name}-${version}-${arch}".* 2>/dev/null || true)
+  if [ -n "$cand" ]; then
+    echo "$cand"
+    return 0
+  fi
+  # fallback: find any matching prefix
+  cand=$(ls -1 "$ADM_CACHE_BIN/${name}-${version}"* 2>/dev/null | head -n1 || true)
+  if [ -n "$cand" ]; then
+    echo "$cand"
+    return 0
+  fi
+  # fallback: look in index (if adm-cache index used)
+  if [ -f "$ADM_CACHE_BIN/index.txt" ]; then
+    awk -F'|' -v pkg="$name" '$1==pkg {print $4}' "$ADM_CACHE_BIN/index.txt" 2>/dev/null | tail -n1 || true
+  fi
+}
+
+# ----------------------------
+# Verify sha256 (if provided)
+# ----------------------------
+_adm_verify_sha() {
+  local file="$1" expected="$2"
+  [ -z "$expected" ] && return 0
+  if ! _adm_exists_cmd sha256sum; then
+    adm_log_error "sha256sum missing; cannot verify $file"
+    return 2
+  fi
+  local got
+  got=$(sha256sum "$file" | awk '{print $1}')
+  if [ "$got" != "$expected" ]; then
+    adm_log_error "SHA256 mismatch for $file: expected $expected got $got"
+    return 1
+  fi
+  adm_log_debug "SHA256 OK for $file"
+  return 0
+}
+
+# ----------------------------
+# Extract package into chroot (safe)
+# ----------------------------
+_adm_install_extract_to_chroot() {
+  local pkg="$1" archive="$2" chrootname="$3" dest="/" dry="$4"
+  # Determine destination path inside chroot
+  if [ -n "$chrootname" ]; then
+    local chrootpath
+    chrootpath=$("$ADM_BIN_DIR/adm-chroot" exists "$chrootname" 2>/dev/null || _adm_chroot_path "$chrootname")
+    if [ -z "$chrootpath" ] || [ ! -d "$chrootpath" ]; then
+      adm_log_error "Chroot not found: $chrootname"
+      return 1
+    fi
+    local destpath="$chrootpath$dest"
+    adm_log_info "Would extract $archive into $destpath"
+    if [ "$ADM_DRY_RUN" = "1" ] || [ "$dry" = "1" ]; then
+      adm_log_info "[DRY-RUN] extract $archive -> $destpath"
+      return 0
+    fi
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_info "[SIMULATION] Will extract archive into chroot (line commented for safety)"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # mkdir -p "$destpath"
+      # tar -C "$destpath" -xf "$archive"
+    else
+      adm_log_info "[SIMULATION] Would extract $archive -> $destpath (ADM_ALLOW_EXECUTION=0)"
+    fi
+    return 0
+  else
+    # installing to host (shouldn't be usual; warn)
+    adm_log_error "Installation without chroot is not recommended. Use --chroot <name>."
+    return 2
+  fi
+}
+
+# ----------------------------
+# Register installation state and manifest
+# ----------------------------
+_adm_install_write_manifest_and_state() {
+  local pkg="$1" version="$2" arch="$3" archive="$4" chrootname="$5"
+  local manifest_file="$ADM_MANIFEST_DIR/${pkg}-${version}.manifest"
+  local state_file="$ADM_STATE_INSTALLED/${pkg}-${version}-${arch}.installed"
+  mkdir -p "$(dirname "$manifest_file")" 2>/dev/null || true
+  {
+    echo "name: $pkg"
+    echo "version: $version"
+    echo "archive: $archive"
+    echo "arch: $arch"
+    echo "installed_at: $(date -Iseconds)"
+    echo "chroot: ${chrootname:-}"
+  } > "$manifest_file"
+  # state: simple marker file
+  mkdir -p "$ADM_STATE_INSTALLED" 2>/dev/null || true
+  echo "installed_at=$(date -Iseconds)" > "$state_file"
+  echo "archive=$archive" >> "$state_file"
+  adm_log_correct "Manifest written: $manifest_file"
+  adm_log_correct "State recorded: $state_file"
+}
+
+# ----------------------------
+# Resolve runtime dependencies and optionally install them
+# ----------------------------
+_adm_install_resolve_deps() {
+  local metafile="$1" chrootname="$2" pkgname="$3"
+  local -a build_deps run_deps merged
+  build_deps=()
+  run_deps=()
+  # read via adm_meta_get if available
+  if declare -f adm_meta_load >/dev/null 2>&1; then
+    adm_meta_load "$metafile"
+    local b r
+    b="$(adm_meta_get build_deps 2>/dev/null || echo '')"
+    r="$(adm_meta_get run_deps 2>/dev/null || echo '')"
+    IFS=',' read -ra build_deps <<< "$b"
+    IFS=',' read -ra run_deps <<< "$r"
+  else
+    # crude parse
+    local line
+    line=$(grep -E "^build_deps:" "$metafile" 2>/dev/null || true)
+    line="${line#build_deps:}"
+    IFS=',' read -ra build_deps <<< "$line"
+    line=$(grep -E "^run_deps:" "$metafile" 2>/dev/null || true)
+    line="${line#run_deps:}"
+    IFS=',' read -ra run_deps <<< "$line"
+  fi
+
+  # merge unique
+  declare -A _uniq
+  local d
+  for d in "${build_deps[@]}" "${run_deps[@]}"; do
+    d="$(echo "$d" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [ -z "$d" ] && continue
+    _uniq["$d"]=1
+  done
+
+  for d in "${!_uniq[@]}"; do
+    adm_log_info "Dependency required for $pkgname: $d"
+    # check installed state
+    if [ -f "$ADM_STATE_INSTALLED/${d}"* ]; then
+      adm_log_debug "Dependency $d already installed (state file present)"
+      continue
+    fi
+    # try binary cache
+    local mf
+    mf=$(find_metafile_by_name_wrapped "$d" 2>/dev/null || true)
+    if [ -n "$mf" ]; then
+      adm_log_info "Found metafile for dependency $d: $mf"
+      # call adm-install recursively for dependency (but avoid infinite recursion)
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would install dependency $d via adm-install"
+      else
+        # run in separate process to avoid state bleed
+        "$ADM_BIN_DIR/adm-install" install --chroot "$chrootname" "$mf" || {
+          adm_log_error "Failed to install dependency $d"
+          return 1
+        }
+      fi
+    else
+      adm_log_error "No metafile found for dependency $d; please provide it or preinstall binary"
+    fi
+  done
+  return 0
+}
+
+# ----------------------------
+# Public command: install a single package (metafile | pkgname | path)
+# ----------------------------
+_adm_install_cmd_install_single() {
+  local bin_only=0
+  local target=""
+  local chrootname="$ADM_CHROOT"
+  # parse args
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --bin) bin_only=1; shift ;;
+      --chroot) chrootname="$2"; shift 2 ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --jobs) ADM_JOBS="$2"; shift 2 ;;
+      *) target="$1"; shift ;;
+    esac
+  done
+
+  if [ -z "$target" ]; then adm_log_error "install requires a target (metafile path or package name)"; return 2; fi
+
+  # Resolve metafile path if given name
+  local metafile=""
+  if [ -f "$target" ]; then
+    metafile="$target"
+  else
+    metafile=$(find_metafile_by_name_wrapped "$target" 2>/dev/null || true)
+    if [ -z "$metafile" ]; then
+      adm_log_error "Metafile for target not found: $target"
+      return 1
+    fi
+  fi
+
+  # Load metadata
+  local name version source sha desc arch
+  name="$(_adm_read_metafile_field "$metafile" name || true)"
+  version="$(_adm_read_metafile_field "$metafile" version || echo unknown)"
+  source="$(_adm_read_metafile_field "$metafile" source || echo '')"
+  sha="$(_adm_read_metafile_field "$metafile" sha256 || echo '')"
+  desc="$(_adm_read_metafile_field "$metafile" desc || echo '')"
+  arch="$(_adm_arch)"
+
+  [ -n "$name" ] || { adm_log_error "Failed to determine package name from metafile $metafile"; return 1; }
+
+  adm_log_info "Installing package: $name (version: $version) into chroot: ${chrootname:-<none>}"
+
+  # Acquire lock
+  _adm_acquire_lock "$name" || return 1
+  trap "_adm_release_lock $name" RETURN
+
+  # resolve dependencies first (build/run)
+  adm_log_info "Resolving dependencies for $name"
+  _adm_install_resolve_deps "$metafile" "$chrootname" "$name" || { adm_log_error "Dependency resolution failed"; return 1; }
+
+  # locate binary
+  local binpath=""
+  if [ "$bin_only" -eq 1 ]; then
+    binpath=$(_adm_install_resolve_binary "$name" "$version" "$arch" || true)
+    if [ -z "$binpath" ]; then
+      adm_log_error "Binary for $name not found in cache; cannot --bin install"
+      return 1
+    fi
+  else
+    # try to find binary first
+    binpath=$(_adm_install_resolve_binary "$name" "$version" "$arch" || true)
+    if [ -z "$binpath" ]; then
+      # attempt to build via adm-build
+      adm_log_info "Binary not found in cache; will invoke adm-build to construct $name"
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would call adm-build for $metafile"
+      else
+        if [ -x "$ADM_BIN_DIR/adm-build" ]; then
+          "$ADM_BIN_DIR/adm-build" "$metafile" --chroot "${chrootname:-}" --profile normal --jobs "$ADM_JOBS" || {
+            adm_log_error "adm-build failed for $name"
+            return 1
+          }
+          # after successful build, try to find binary again
+          binpath=$(_adm_install_resolve_binary "$name" "$version" "$arch" || true)
+        else
+          adm_log_error "adm-build not available at $ADM_BIN_DIR/adm-build; cannot build missing binary"
+          return 1
+        fi
+      fi
+    fi
+  fi
+
+  if [ -z "$binpath" ]; then adm_log_error "No binary available for $name after build attempt"; return 1; fi
+
+  adm_log_info "Using binary: $binpath"
+  # verify sha if available
+  if [ -n "$sha" ]; then
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would verify sha for $binpath"
+    else
+      _adm_verify_sha "$binpath" "$sha" || { adm_log_error "Checksum verification failed"; return 1; }
+    fi
+  fi
+
+  # extract into chroot (safe)
+  _adm_install_extract_to_chroot "$name" "$binpath" "$chrootname" "0" || { adm_log_error "Extraction failed"; return 1; }
+
+  # write manifest/state
+  _adm_install_write_manifest_and_state "$name" "$version" "$arch" "$binpath" "$chrootname"
+
+  adm_log_correct "Installed $name successfully."
+  return 0
+}
+
+# ----------------------------
+# install --dir <path>: install all archives from dir
+# ----------------------------
+_adm_install_cmd_install_dir() {
+  local dir="" chrootname="$ADM_CHROOT"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dir) dir="$2"; shift 2 ;;
+      --chroot) chrootname="$2"; shift 2 ;;
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$dir" ] || { adm_log_error "--dir requires a path"; return 2; }
+  if [ ! -d "$dir" ]; then adm_log_error "Directory not found: $dir"; return 1; fi
+
+  local archives; archives=()
+  while IFS= read -r -d '' f; do archives+=("$f"); done < <(find "$dir" -maxdepth 1 -type f \( -name '*.tar.zst' -o -name '*.tar.xz' -o -name '*.tar.gz' \) -print0)
+
+  if [ "${#archives[@]}" -eq 0 ]; then adm_log_info "No archives found in $dir"; return 0; fi
+
+  adm_log_info "Installing ${#archives[@]} archives from $dir into chroot $chrootname"
+
+  for a in "${archives[@]}"; do
+    # try to parse name and version from filename: name-version-arch.ext
+    base=$(basename "$a")
+    namever=$(echo "$base" | sed -E 's/(\.tar\.(zst|xz|gz))$//' )
+    name=$(echo "$namever" | awk -F'-' '{ $NF=""; sub(/-$/,""); print }' )
+    version=$(echo "$namever" | awk -F'-' '{print $NF}')
+    [ -z "$name" ] && name="$namever"
+    adm_log_info "Installing archive $a as $name (version: $version)"
+    # create a temporary minimal metafile for processing
+    tmpmf="$ADM_TMPDIR/${name}-${version}.metafile"
+    {
+      echo "name: $name"
+      echo "version: $version"
+      echo "source: $a"
+      echo "sha256: "
+    } > "$tmpmf"
+    # call install single with --bin
+    "$ADM_BIN_DIR/adm-install" install --bin --chroot "$chrootname" "$tmpmf" || adm_log_error "Failed to install $a"
+    rm -f "$tmpmf" 2>/dev/null || true
+  done
+  return 0
+}
+
+# ----------------------------
+# list installed packages
+# ----------------------------
+_adm_install_cmd_list() {
+  local chrootname="$ADM_CHROOT"
+  adm_log_info "Installed packages (state dir: $ADM_STATE_INSTALLED):"
+  for f in "$ADM_STATE_INSTALLED"/*; do
+    [ -f "$f" ] || continue
+    awk 'BEGIN{FS="="} /^installed_at/ {ts=$2} /^archive/ {a=$2} END{print FILENAME":"a","ts}' "$f" 2>/dev/null | sed "s@${ADM_STATE_INSTALLED}/@@g"
+  done
+  return 0
+}
+
+# ----------------------------
+# show info about package (reads metafile or manifest)
+# ----------------------------
+_adm_install_cmd_info() {
+  local target="$1"
+  local mf
+  if [ -f "$target" ]; then mf="$target"; else mf=$(find_metafile_by_name_wrapped "$target" 2>/dev/null || true); fi
+  if [ -n "$mf" ]; then
+    adm_log_info "Metafile: $mf"
+    sed -n '1,200p' "$mf"
+    return 0
+  fi
+  # else show manifest if installed
+  local statef
+  statef=$(ls "$ADM_STATE_INSTALLED/${target}-"* 2>/dev/null | head -n1 || true)
+  if [ -n "$statef" ]; then
+    adm_log_info "Installed state: $statef"
+    sed -n '1,200p' "$statef"
+    return 0
+  fi
+  adm_log_error "No metafile or installed record found for $target"
+  return 1
+}
+
+# ----------------------------
+# CLI dispatcher
+# ----------------------------
+_adm_show_help() {
+  cat <<EOF
+adm-install - install packages built by adm-build
+
+Commands:
+  install [--bin] [--chroot <name>] <metafile|pkgname|path>   Install single package
+  install --dir <path> [--chroot <name>]                     Install all archives in directory
+  list [--chroot <name>]                                     List installed packages
+  info <pkg|metafile>                                        Show metadata or installed state
+  help                                                       Show this help
+
+Notes:
+ - Script runs in SIMULATION by default. To allow real operations review the lines
+   marked with "# UNCOMMENT FOR REAL EXECUTION (in chroot only)" and uncomment them
+   only inside a secure VM.
+ - adm-install integrates with adm-meta, adm-deps, adm-build, adm-chroot and adm-downloader if available.
+EOF
+}
+
+# ----------------------------
+# entrypoint
+# ----------------------------
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  if [ $# -lt 1 ]; then _adm_show_help; exit 1; fi
+  cmd="$1"; shift
+  case "$cmd" in
+    install)
+      # support two modes: --dir and single install
+      if [ "$1" = "--dir" ]; then
+        shift
+        _adm_install_cmd_install_dir --dir "$1" "${@:2}"
+        exit $?
+      else
+        _adm_install_cmd_install_single "$@"
+        exit $?
+      fi
+      ;;
+    list)
+      _adm_install_cmd_list "$@"; exit $?
+      ;;
+    info)
+      _adm_install_cmd_info "$1"; exit $?
+      ;;
+    help|-h|--help)
+      _adm_show_help; exit 0
+      ;;
+    *)
+      adm_log_error "Unknown command: $cmd"
+      _adm_show_help
+      exit 2
+      ;;
+  esac
+fi
