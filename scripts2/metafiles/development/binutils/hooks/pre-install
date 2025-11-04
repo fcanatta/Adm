@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# ADM HOOK: binutils pre-install
+# Cria diretórios necessários e prepara DESTDIR
+
+set -euo pipefail
+
+echo "📦 [binutils pre-install] Preparando instalação..."
+
+DESTDIR="${DESTDIR:-/usr/src/adm/tmp/binutils-destdir}"
+PREFIX="${PREFIX:-/usr}"
+
+mkdir -p "$DESTDIR/$PREFIX/bin" "$DESTDIR/$PREFIX/lib" "$DESTDIR/$PREFIX/share/info"
+
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo "(dry-run) simulando make install"
+else
+  make install DESTDIR="$DESTDIR"
+fi
+
+echo "✅ [binutils pre-install] Arquivos instalados em $DESTDIR"
