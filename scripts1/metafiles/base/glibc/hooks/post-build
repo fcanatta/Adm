@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# ADM post-build hook for glibc
+# Verifies installation and cleans up temporary files.
+
+adm_log_info "[HOOK post-build] Validating glibc installation..."
+if [ -x "${DESTDIR:-/usr/local}/lib/ld-linux-x86-64.so.2" ]; then
+  adm_log_ok "[HOOK post-build] glibc dynamic loader present."
+else
+  adm_log_err "[HOOK post-build] glibc loader missing!"
+fi
+adm_log_info "[HOOK post-build] Cleaning temporary files..."
+find . -type f -name "*.o" -delete 2>/dev/null || true
+adm_log_ok "[HOOK post-build] glibc build completed successfully."
