@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel-headers pre-bootstrap
+# - Gera e instala headers mínimos do kernel durante stage0/stage1.
+# - Permite construir glibc/musl sem kernel host.
+# - Totalmente isolado e DRY_RUN compatível.
+#
+# ⚠️ Operação segura, porém essencial:
+#    - Não toca /usr/include do host.
+#    - Usa INSTALL_HDR_PATH no rootfs bootstrap.
+#    - Pode ser chamada automaticamente pelo adm-bootstrap.
+#
+set -euo pipefail
+
+echo "🧱 [linux-kernel-headers pre-bootstrap] Iniciando instalação mínima de headers..."
+
+# Variáveis do ambiente ADM
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/kernel-headers-bootstrap.log}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+BOOTSTRAP_ROOT="${BOOTSTRAP_ROOT:-${ADM_ROOT}/rootfs/stage0}"
+SRC_DIR="$(pwd)"
+KERNEL_VERSION_FILE="${SRC_DIR}/Makefile"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$CACHE_DIR" "$BOOTSTRAP_ROOT" || true
+echo "[`date -u`] pre-bootstrap start" >> "$ADM_LOG"
+
+# 1️⃣ Detectar versão do kernel do source
+if [ -f "$KERNEL_VERSION_FILE" ]; then
+  kernel_ver=$(grep -E "VERSION|PATCHLEVEL|SUBLEVEL" "$KERNEL_VERSION_FILE" | awk '{print $3}' | xargs | tr ' ' '.')
+else
+  kernel_ver="unknown"
+fi
+
+echo "📦 Kernel detectado: Linux $kernel_ver"
+echo "[`date -u`] detected kernel version: $kernel_ver" >> "$ADM_LOG"
+
+# 2️⃣ Validar ferramentas mínimas
+for cmd in make gcc; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "❌ Ferramenta obrigatória não encontrada: $cmd"
+    echo "[`date -u`] missing $cmd" >> "$ADM_LOG"
+    exit 1
+  fi
+done
+
+# 3️⃣ Preparar diretórios e limpar resíduos
+INSTALL_PATH="${BOOTSTRAP_ROOT}/usr"
+mkdir -p "$INSTALL_PATH/include"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria make mrproper"
+  echo "(dry-run) executaria make headers_install INSTALL_HDR_PATH=$INSTALL_PATH"
+else
+  echo "🧼 Limpando árvore anterior..."
+  make mrproper > "$ADM_ROOT/tmp/kernel-mrproper.log" 2>&1 || true
+fi
+
+# 4️⃣ Instalar headers mínimos
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria make headers_install INSTALL_HDR_PATH=$INSTALL_PATH"
+else
+  echo "📂 Instalando headers no rootfs bootstrap ($INSTALL_PATH)..."
+  make headers_install INSTALL_HDR_PATH="$INSTALL_PATH" > "$ADM_ROOT/tmp/kernel-headers-bootstrap.log" 2>&1 || {
+    echo "❌ Falha ao instalar headers. Veja kernel-headers-bootstrap.log"
+    tail -n 50 "$ADM_ROOT/tmp/kernel-headers-bootstrap.log" || true
+    exit 1
+  }
+fi
+
+# 5️⃣ Validar estrutura mínima
+if [ "$DRY_RUN" -eq 0 ]; then
+  if [ ! -f "$INSTALL_PATH/include/linux/version.h" ]; then
+    echo "❌ Header version.h ausente. Falha na instalação mínima."
+    echo "[`date -u`] missing version.h" >> "$ADM_LOG"
+    exit 2
+  fi
+  echo "✔️  Headers mínimos instalados corretamente."
+  echo "[`date -u`] bootstrap headers OK" >> "$ADM_LOG"
+else
+  echo "(dry-run) verificaria presence de include/linux/version.h"
+fi
+
+# 6️⃣ Empacotar headers no cache (opcional)
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) empacotaria headers bootstrap em $CACHE_DIR"
+else
+  tarball="${CACHE_DIR}/linux-headers-bootstrap-${kernel_ver}.tar.xz"
+  echo "📦 Empacotando headers mínimos → $tarball"
+  tar -C "$INSTALL_PATH/include" -cJf "$tarball" . || true
+  sha256sum "$tarball" > "${tarball}.sha256" || true
+  echo "[`date -u`] packaged bootstrap headers $tarball" >> "$ADM_LOG"
+fi
+
+echo "✅ [linux-kernel-headers pre-bootstrap] Headers mínimos prontos para stage0/stage1."
