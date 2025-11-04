@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ADM pre-build hook for Binutils
+# Runs before configure/make, ensures clean environment
+
+adm_log_info "[HOOK pre-build] Setting up environment for Binutils..."
+export LANG=C
+export LC_ALL=C
+export MAKEFLAGS="-j${ADM_JOBS:-4}"
+adm_log_info "[HOOK pre-build] Environment ready. Configuring build directory..."
+mkdir -p build && cd build
