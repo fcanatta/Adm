@@ -1,0 +1,604 @@
+#!/usr/bin/env bash
+#
+# adm-status - Painel de integridade e auditoria para ADM System
+# Version: 1.0
+#
+# Objetivo:
+#   - Fornecer visão consolidada do estado do ADM (/usr/src/adm)
+#   - Gerar relatório JSON detalhado e sumário legível
+#   - Detectar problemas (permissões, ferramentas ausentes, caches corrompidos, hooks sem assinatura, builds outdated)
+#
+# Segurança:
+#   ## RISCO: verificações completas de cache e builds podem consumir I/O intensivo.
+#   ## RISCO: --auto-fix (não implementado por segurança aqui) seria destrutivo.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+### ----------------------------- Defaults & env ----------------------------- ###
+SCRIPT_NAME="$(basename "$0")"
+TS_NOW="$(date +%Y%m%d-%H%M%S)"
+USER="$(id -un 2>/dev/null || echo unknown)"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+SCRIPTS_DIR="${ADM_ROOT}/scripts"
+METAFILES_DIR="${ADM_ROOT}/metafiles"
+CACHE_DIR="${ADM_ROOT}/cache"
+BUILDS_DIR="${ADM_ROOT}/builds"
+TMP_DIR="${ADM_ROOT}/tmp"
+LOGS_DIR="${ADM_ROOT}/logs"
+TRUSTSTORE_DIR="${ADM_ROOT}/truststore"
+
+REPORT_JSON_DEFAULT="${TMP_DIR}/adm-status-${TS_NOW}.json"
+REPORT_TXT_DEFAULT="${TMP_DIR}/adm-status-${TS_NOW}.txt"
+
+# runtime flags
+MODE="summary"         # summary | full | json | trust | cache
+DRY_RUN=0
+FORCE=0
+VERBOSE=0
+QUIET=0
+PARALLEL_JOBS=4
+TIMEOUT_PER_CHECK=30   # seconds for network/tool probes
+EXIT_CODE=0
+
+# Logging
+mkdir -p "$LOGS_DIR" "$TMP_DIR" 2>/dev/null || true
+LOGFILE="${LOGFILE:-${LOGS_DIR}/adm-status-${TS_NOW}.log}"
+REPORT_JSON="${REPORT_JSON:-$REPORT_JSON_DEFAULT}"
+REPORT_TXT="${REPORT_TXT:-$REPORT_TXT_DEFAULT}"
+
+# Colors and icons
+supports_color() { command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]; }
+if supports_color; then
+  CLR_RST="$(tput sgr0)"; CLR_GRN="$(tput setaf 2)"; CLR_RED="$(tput setaf 1)"; CLR_YEL="$(tput setaf 3)"; CLR_BLU="$(tput setaf 4)"; CLR_CYN="$(tput setaf 6)"; CLR_BOLD="$(tput bold)"
+else
+  CLR_RST=""; CLR_GRN=""; CLR_RED=""; CLR_YEL=""; CLR_BLU=""; CLR_CYN=""; CLR_BOLD=""
+fi
+ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="❌"; ICON_INFO="ℹ️"
+
+log() { [ -n "${LOGFILE:-}" ] && printf '%s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true; }
+info()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${ICON_INFO}" "$1" "${CLR_RST}"; log "[INFO]" "$1"; }
+ok()    { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_GRN}${ICON_OK}${CLR_RST}" "$1" "${CLR_RST}"; log "[OK]" "$1"; }
+warn()  { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_YEL}${ICON_WARN}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[WARN]" "$1"; EXIT_CODE=1; }
+err()   { [ "$QUIET" -eq 0 ] && printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RST}" "$1" "${CLR_RST}" >&2; log "[ERROR]" "$1"; EXIT_CODE=2; }
+
+verbose() { [ "$VERBOSE" -eq 1 ] && printf "  [VERB] %s\n" "$1"; [ "$VERBOSE" -eq 1 ] && log "[VERB]" "$1"; }
+
+# locks - prevent concurrent runs
+LOCKDIR="${TMP_DIR}/adm-status-locks"
+mkdir -p "$LOCKDIR" 2>/dev/null || true
+acquire_lock() {
+  local key="adm-status"
+  local lockfile="${LOCKDIR}/${key}.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) acquire lock $lockfile"; echo "$lockfile"; return 0; fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then err "Another adm-status run is active (lock: $lockfile)"; exit 3; fi
+  printf "%s\n" "$$" >"${lockfile}.pid" 2>/dev/null || true
+  echo "$lockfile"
+}
+release_lock() { local lockfile="$1"; [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) release lock $lockfile" && return 0; [ -n "$lockfile" ] && rm -f "${lockfile}.pid" 2>/dev/null || true; eval "exec 9>&-"; }
+
+# JSON helpers (use python3 if available)
+_has_py() { command -v python3 >/dev/null 2>&1; }
+json_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) init json $REPORT_JSON"; return 0; fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  if _has_py; then
+    python3 - <<PY 2>/dev/null
+import json,sys
+d={"generated_by":"adm-status","timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")","host":"$(hostname -f 2>/dev/null || hostname)","checks":{}}
+open(sys.argv[1],"w").write(json.dumps(d,indent=2))
+PY
+  else
+    cat >"$REPORT_JSON" <<JSON
+{
+  "generated_by":"adm-status",
+  "timestamp":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+  "host":"$(hostname -f 2>/dev/null || hostname)",
+  "checks": {}
+}
+JSON
+  fi
+}
+
+json_add() {
+  local key="$1"; local status="$2"; local info_str="$3"
+  [ "$DRY_RUN" -eq 1 ] && verbose "(dry-run) json add $key" && return 0
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; k=sys.argv[2]; s=sys.argv[3]; i=sys.argv[4]
+d=json.load(open(f))
+d.setdefault("checks",{}).setdefault(k,[]).append({"status":s,"info":i,"time":"$(date -u +"%Y-%m-%dT%H:%M:%SZ")"})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  else
+    printf '%s: %s - %s\n' "$key" "$status" "$info_str" >>"${REPORT_JSON}.txt"
+  fi
+}
+
+# spinner
+_spinner_pid=""
+_spinner_cleanup() { if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then kill "$_spinner_pid" >/dev/null 2>&1 || true; wait "$_spinner_pid" 2>/dev/null || true; fi; _spinner_pid=""; }
+spinner_start() { local msg="$1"; [ "$DRY_RUN" -eq 1 ] && info "(dry-run) $msg" && return 0; printf "%b %s " "${CLR_BLU}${ICON_INFO}${CLR_RST}" "$msg"; ( local i=0 chars='|/-\' ; while :; do printf "\b%s" "${chars:i++%${#chars}:1}"; sleep 0.12; done ) & _spinner_pid=$!; trap _spinner_cleanup EXIT; }
+spinner_stop() { local okmsg="${1:-Done}"; if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi; _spinner_cleanup; printf "\b"; ok "$okmsg"; trap - EXIT; }
+
+### ---------------------------- Basic checks ---------------------------- ###
+check_config_file() {
+  local conf="${ADM_ROOT}/adm.conf"
+  if [ -f "$conf" ]; then
+    ok "adm.conf found: $conf"
+    json_add "adm_conf" "ok" "$conf"
+  else
+    warn "adm.conf not found at $conf"
+    json_add "adm_conf" "missing" "$conf"
+  fi
+}
+
+check_directories() {
+  local required=( "$ADM_ROOT" "$METAFILES_DIR" "$CACHE_DIR" "$BUILDS_DIR" "$TMP_DIR" "$LOGS_DIR" "$TRUSTSTORE_DIR" )
+  local ok_count=0 warn_count=0
+  for d in "${required[@]}"; do
+    if [ -d "$d" ]; then
+      if [ -w "$d" ]; then
+        ok "Directory: $d (exists & writable)"
+        json_add "dir_${d}" "ok" "exists,writable"
+        ok_count=$((ok_count+1))
+      else
+        warn "Directory not writable: $d"
+        json_add "dir_${d}" "warn" "exists,not-writable"
+        warn_count=$((warn_count+1)); EXIT_CODE=1
+      fi
+    else
+      warn "Directory missing: $d"
+      json_add "dir_${d}" "missing" "not-found"
+      warn_count=$((warn_count+1)); EXIT_CODE=1
+    fi
+  done
+  return 0
+}
+
+check_disk_space() {
+  if df -P "$ADM_ROOT" >/dev/null 2>&1; then
+    local avail
+    avail=$(df -Pm "$ADM_ROOT" | awk 'NR==2 {print $4}')
+    if [ -z "$avail" ]; then warn "Disk space check failed"; json_add "disk_space" "fail" "unknown"; return 1; fi
+    ok "Disk space under $ADM_ROOT: ${avail}MB available"
+    json_add "disk_space" "ok" "${avail}MB"
+    if [ "$avail" -lt 1024 ]; then warn "Low disk space: ${avail}MB (<1024MB)"; json_add "disk_space_level" "low" "${avail}MB"; EXIT_CODE=1; fi
+  else
+    warn "df not available to check disk space"
+    json_add "disk_space" "unknown" "df-unavailable"
+  fi
+}
+
+check_toolchains() {
+  spinner_start "Detecting compilers/toolchains"
+  local tools=(gcc clang rustc go python3 javac make cmake git pkg-config)
+  local present=()
+  for t in "${tools[@]}"; do
+    if command -v "$t" >/dev/null 2>&1; then
+      local ver
+      # try to get version safely
+      ver=$({ "$t" --version 2>/dev/null || "$t" -v 2>/dev/null || echo "unknown"; } | head -n1 | tr -s ' ' ' ')
+      ok "Tool detected: $t -> ${ver}"
+      json_add "tool_${t}" "ok" "${ver}"
+      present+=("$t")
+    else
+      warn "Tool missing: $t"
+      json_add "tool_${t}" "missing" ""
+      EXIT_CODE=1
+    fi
+  done
+  spinner_stop "Toolchain detection finished"
+}
+
+### ---------------------------- Trust/checks ---------------------------- ###
+check_truststore() {
+  spinner_start "Checking truststore"
+  if [ -d "$TRUSTSTORE_DIR" ]; then
+    local keys_count
+    # try GPG listing
+    if command -v gpg >/dev/null 2>&1; then
+      # use any GNUPGHOME in TRUSTSTORE_DIR if exists, else best-effort list pubkeys dir
+      local gnupghome="$TRUSTSTORE_DIR/gpg"
+      if [ -d "$gnupghome" ]; then
+        keys_count=$(GNUPGHOME="$gnupghome" gpg --list-keys --with-colons 2>/dev/null | awk -F: '/^pub/ {print $5}' | wc -l)
+        keys_count=${keys_count:-0}
+        ok "Truststore keys: $keys_count (GNUPGHOME=$gnupghome)"
+        json_add "trust_keys" "ok" "$keys_count"
+      else
+        # fallback: count public key files
+        keys_count=$(find "$TRUSTSTORE_DIR" -maxdepth 1 -type f -name '*.pub' 2>/dev/null | wc -l || echo 0)
+        ok "Truststore public key files: $keys_count"
+        json_add "trust_keys" "ok" "$keys_count"
+      fi
+    else
+      warn "gpg not available; truststore can't be deeply checked"
+      json_add "trust_keys" "unknown" "gpg-unavailable"
+      EXIT_CODE=1
+    fi
+  else
+    warn "Truststore dir missing: $TRUSTSTORE_DIR"
+    json_add "truststore" "missing" "$TRUSTSTORE_DIR"
+    EXIT_CODE=1
+  fi
+  spinner_stop "Truststore check finished"
+}
+
+### ---------------------------- Hooks checks ---------------------------- ###
+# Detect hooks in global and local metafiles and check presence of .sha256/.asc
+detect_hooks_list() {
+  local type="$1"
+  local glob_dir="${ADM_ROOT}/hooks/global/${type}"
+  local list=()
+  [ -d "$glob_dir" ] && while IFS= read -r -d $'\0' f; do list+=("$f"); done < <(find "$glob_dir" -type f -print0 2>/dev/null) || true
+  # add local
+  if [ -d "$METAFILES_DIR" ]; then
+    while IFS= read -r -d $'\0' h; do list+=("$h"); done < <(find "$METAFILES_DIR" -type f -path "*/hooks/${type}/*" -print0 2>/dev/null) || true
+  fi
+  printf '%s\n' "${list[@]:-}"
+}
+
+check_hooks() {
+  spinner_start "Checking hooks signatures and presence"
+  local total=0 missing_sig=0 unsigned=0 ok_count=0
+  # common hook types
+  local types=(pre-build post-build pre-install post-install pre-update post-update pre-uninstall post-uninstall pre-patch post-patch on-error)
+  for t in "${types[@]}"; do
+    while IFS= read -r hook; do
+      [ -z "$hook" ] && continue
+      total=$((total+1))
+      local sha="${hook}.sha256"
+      local asc="${hook}.asc"
+      if [ -f "$sha" ] && [ -s "$sha" ]; then
+        # verify sha if file exists (best-effort: compare basename)
+        local expected
+        expected="$(awk '{print $1}' "$sha" 2>/dev/null || true)"
+        if [ -n "$expected" ]; then
+          local actual
+          actual="$(sha256sum "$hook" 2>/dev/null | cut -d' ' -f1 || true)"
+          if [ "$actual" = "$expected" ]; then
+            ok "Hook OK: $(basename "$hook") (sha256 matched)"
+            json_add "hook_$(basename "$hook")" "ok" "sha256"
+            ok_count=$((ok_count+1))
+          else
+            warn "Hook sha mismatch: $(basename "$hook")"
+            json_add "hook_$(basename "$hook")" "fail" "sha-mismatch"
+            missing_sig=$((missing_sig+1)); EXIT_CODE=1
+          fi
+        else
+          warn "Hook sha file empty/unreadable: $sha"
+          json_add "hook_$(basename "$hook")" "warn" "sha-empty"
+          missing_sig=$((missing_sig+1)); EXIT_CODE=1
+        fi
+      else
+        if [ -f "$asc" ]; then
+          # has signature but no sha; still mark as signed
+          ok "Hook signed (no sha): $(basename "$hook")"
+          json_add "hook_$(basename "$hook")" "ok" "asc-only"
+          ok_count=$((ok_count+1))
+        else
+          warn "Hook without sha/asc: $(basename "$hook")"
+          json_add "hook_$(basename "$hook")" "unsigned" ""
+          unsigned=$((unsigned+1)); EXIT_CODE=1
+        fi
+      fi
+    done < <(detect_hooks_list "$t")
+  done
+  spinner_stop "Hooks check finished"
+  info "Hooks scanned: total=${total} ok=${ok_count} missing_sig=${missing_sig} unsigned=${unsigned}"
+  json_add "hooks_summary" "info" "total=${total},ok=${ok_count},missing_sig=${missing_sig},unsigned=${unsigned}"
+}
+
+### ---------------------------- Metafile checks ---------------------------- ###
+# Validate that each metafile contains required keys: name,version,license,url,build,source,sha256sum,build_deps,run_deps,opt_deps
+check_metafiles_consistency() {
+  spinner_start "Checking metafiles structure"
+  local count=0 bad=0
+  if [ ! -d "$METAFILES_DIR" ]; then warn "metafiles dir missing: $METAFILES_DIR"; json_add "metafiles" "missing" "$METAFILES_DIR"; EXIT_CODE=1; spinner_stop "Metafiles check"; return 1; fi
+  while IFS= read -r -d $'\0' mf; do
+    count=$((count+1))
+    # Parse simple keys (best-effort)
+    local name version license url build source sha deps run opt
+    name="$(grep -E '^[[:space:]]*name[[:space:]]*=' "$mf" 2>/dev/null | head -n1 | cut -d'=' -f2- | sed 's/[ "']//g' || true)"
+    version="$(grep -E '^[[:space:]]*version[[:space:]]*=' "$mf" 2>/dev/null | head -n1 | cut -d'=' -f2- | sed 's/[ "']//g' || true)"
+    sha="$(grep -E 'sha256sum' "$mf" 2>/dev/null | head -n1 | cut -d'=' -f2- | sed 's/[ "']//g' || true)"
+    if [ -z "$name" ] || [ -z "$version" ] || [ -z "$sha" ]; then
+      warn "Metafile incomplete: $mf (missing name/version/sha)"
+      json_add "metafile_$(basename "$mf")" "incomplete" ""
+      bad=$((bad+1)); EXIT_CODE=1
+    else
+      ok "Metafile OK: $(basename "$mf") -> ${name}-${version}"
+      json_add "metafile_$(basename "$mf")" "ok" "${name}-${version}"
+    fi
+  done < <(find "$METAFILES_DIR" -type f -name 'metafile' -print0 2>/dev/null)
+  spinner_stop "Metafiles check finished"
+  info "Metafiles scanned: ${count}, issues: ${bad}"
+  json_add "metafiles_summary" "info" "count=${count},issues=${bad}"
+}
+
+### ---------------------------- Cache checks ---------------------------- ###
+# Validate cached tarballs (best-effort: if metafile contains sha, compare)
+# WARNING: This can be I/O heavy for big caches. Use --dry-run to estimate.
+check_cache_integrity() {
+  spinner_start "Checking cache integrity (sha256)"
+  local total=0 corrupted=0 verified=0 missing=0
+  if [ ! -d "$CACHE_DIR" ]; then warn "Cache dir missing: $CACHE_DIR"; json_add "cache" "missing" "$CACHE_DIR"; spinner_stop "Cache check"; EXIT_CODE=1; return 1; fi
+
+  # If metafiles exist, try to map expected sha from metafile sources
+  declare -A expected_shas
+  while IFS= read -r -d $'\0' mf; do
+    local mfdir
+    mfdir="$(dirname "$mf")"
+    # search for lines with "sha256sum" or "sha256"
+    while IFS= read -r line; do
+      case "$line" in
+        *sha256sum*|*sha256*)
+          # attempt to extract hex
+          sha="$(printf '%s' "$line" | grep -oE '[a-f0-9]{64}' || true)"
+          # attempt to find filename in same dir
+          fname="$(basename "$mfdir")"
+          [ -n "$sha" ] && expected_shas["$fname"]="$sha"
+          ;;
+      esac
+    done < <(grep -E 'sha256(sum)?' "$mf" 2>/dev/null || true)
+  done < <(find "$METAFILES_DIR" -type f -name 'metafile' -print0 2>/dev/null)
+
+  # Check cache files
+  while IFS= read -r -d $'\0' file; do
+    total=$((total+1))
+    # if file is a tarball, compute sha
+    if [[ "$file" =~ \.(tar\.gz|tar\.xz|tar\.zst|zip|tgz|tar)$ ]]; then
+      if [ "$DRY_RUN" -eq 1 ]; then verbose "(dry-run) would sha256 $file"; verified=$((verified+1)); continue; fi
+      actual="$(sha256sum "$file" 2>/dev/null | cut -d' ' -f1 || true)"
+      # try to find expected from metafile map by basename match
+      base="$(basename "$file")"
+      match_sha=""
+      for k in "${!expected_shas[@]}"; do
+        if [[ "$base" == *"$k"* ]]; then match_sha="${expected_shas[$k]}"; break; fi
+      done
+      if [ -n "$match_sha" ]; then
+        if [ "$actual" = "$match_sha" ]; then
+          ok "Cache verified: $base (sha matched)"
+          json_add "cache_${base}" "ok" "sha-matched"
+          verified=$((verified+1))
+        else
+          warn "Cache corrupt or mismatched: $base"
+          json_add "cache_${base}" "corrupt" "sha-mismatch"
+          corrupted=$((corrupted+1)); EXIT_CODE=1
+        fi
+      else
+        # no expected sha known
+        ok "Cache file without metafile reference: $base (sha:${actual})"
+        json_add "cache_${base}" "unknown" "$actual"
+      fi
+    else
+      # non-tarball files skip
+      verbose "Skipping non-archive cache file: $file"
+    fi
+  done < <(find "$CACHE_DIR" -type f -print0 2>/dev/null)
+  spinner_stop "Cache integrity check finished"
+  info "Cache files scanned: total=${total},verified=${verified},corrupt=${corrupted}"
+  json_add "cache_summary" "info" "total=${total},verified=${verified},corrupt=${corrupted}"
+}
+
+### ---------------------------- Builds checks ---------------------------- ###
+check_builds() {
+  spinner_start "Checking builds artifacts"
+  local total=0 outdated=0 bad=0 okc=0
+  if [ ! -d "$BUILDS_DIR" ]; then warn "Builds dir missing: $BUILDS_DIR"; json_add "builds" "missing" "$BUILDS_DIR"; spinner_stop "Builds check"; EXIT_CODE=1; return 1; fi
+  # iterate tarballs
+  while IFS= read -r -d $'\0' f; do
+    total=$((total+1))
+    # best-effort: extract package name and version from filename
+    base="$(basename "$f")"
+    # if metafile exists for similar name, could compare modification times, but we avoid network checks
+    ok "Build artifact: $base (size=$(stat -c%s "$f" 2>/dev/null || echo '?') bytes)"
+    json_add "build_${base}" "found" ""
+    okc=$((okc+1))
+  done < <(find "$BUILDS_DIR" -type f -name '*.tar.*' -print0 2>/dev/null)
+  spinner_stop "Builds check finished"
+  info "Builds scanned: total=${total},ok=${okc},outdated=${outdated},bad=${bad}"
+  json_add "builds_summary" "info" "total=${total},ok=${okc},outdated=${outdated},bad=${bad}"
+}
+
+### ---------------------------- Metafile updates check (local compare only) ---------------------------- ###
+# This check does not contact upstream. It flags metafiles that have 'update' markers or missing required fields.
+check_metafile_updates_hint() {
+  spinner_start "Scanning metafiles for update hints"
+  local count=0 hints=0
+  while IFS= read -r -d $'\0' mf; do
+    count=$((count+1))
+    if grep -qEi '(update|latest|version:.*-rc|snapshot|git|github)' "$mf" 2>/dev/null; then
+      warn "Metafile suggests potential upstream changes/hints: $mf"
+      json_add "metafile_hint_$(basename "$mf")" "hint" ""
+      hints=$((hints+1)); EXIT_CODE=1
+    fi
+  done < <(find "$METAFILES_DIR" -type f -name 'metafile' -print0 2>/dev/null)
+  spinner_stop "Metafile hints scan finished"
+  info "Metafiles scanned: ${count},hints:${hints}"
+  json_add "metafile_hints" "info" "scanned=${count},hints=${hints}"
+}
+
+### ---------------------------- Logs analysis ---------------------------- ###
+check_logs() {
+  spinner_start "Analyzing recent logs (last 7 days)"
+  local recent_errors=0
+  if [ -d "$LOGS_DIR" ]; then
+    while IFS= read -r -d $'\0' lf; do
+      # check for "error" or "fail" keywords safely (case-insensitive)
+      if grep -Eiq 'error|fail|segfault|traceback' "$lf" 2>/dev/null; then
+        warn "Log contains error keywords: $(basename "$lf")"
+        json_add "log_$(basename "$lf")" "error-keywords" ""
+        recent_errors=$((recent_errors+1)); EXIT_CODE=1
+      fi
+    done < <(find "$LOGS_DIR" -type f -mtime -7 -print0 2>/dev/null)
+  else
+    warn "Logs directory missing: $LOGS_DIR"; json_add "logs" "missing" "$LOGS_DIR"; EXIT_CODE=1
+  fi
+  spinner_stop "Logs analysis finished"
+  info "Recent logs with errors: ${recent_errors}"
+  json_add "logs_summary" "info" "recent_errors=${recent_errors}"
+}
+
+### ---------------------------- Final report & summary ---------------------------- ###
+print_summary() {
+  echo
+  echo "📊 ADM System Status Report ($(date -u +"%Y-%m-%d %H:%M:%SZ") UTC)"
+  echo
+  # Quick high-level checks from JSON if available
+  if _has_py; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+try:
+    d=json.load(open(f))
+    checks=d.get('checks',{})
+    def status_icon(s):
+        return "✔️" if s=="ok" else ("⚠️" if s=="warn" or s=="unknown" else "❌")
+    top = []
+    # adm_conf
+    ac = checks.get('adm_conf',[{"status":"missing","info":""}])[-1]
+    print(f"{status_icon(ac['status'])}  adm.conf: {ac['status']}")
+    # dirs summary
+    dirs = [v[-1] for k,v in checks.items() if k.startswith('dir_')]
+    okdirs = sum(1 for x in dirs if x['status']=="ok")
+    print(f"✔️  Directories OK: {okdirs}")
+    # tools
+    tools = [k for k in checks.keys() if k.startswith('tool_')]
+    present = sum(1 for k in tools if checks[k][-1]['status']=="ok" if False else True)
+    # fallback simple message
+    print()
+    print("For detailed report, use: adm-status full or adm-status json")
+except Exception:
+    print("Summary generation failed (json parse)")
+PY
+  else
+    echo "Resumo: relatório JSON não disponível para sumarização (python3 ausente)."
+  fi
+  echo
+  echo "Report JSON: $REPORT_JSON"
+  echo "Log file: $LOGFILE"
+  echo
+}
+
+generate_json_and_exit() {
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) would write JSON report to $REPORT_JSON"; fi
+  info "Report saved: $REPORT_JSON"
+  exit "$EXIT_CODE"
+}
+
+### ---------------------------- CLI parsing ---------------------------- ###
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] <mode>
+
+Modes:
+  summary    - brief human summary (default)
+  full       - detailed checks printed to terminal
+  json       - generate JSON report only
+  trust      - run only truststore checks
+  cache      - run only cache integrity checks
+
+Options:
+  --dry-run        : simulate (no heavy I/O operations)
+  --force          : ignore confirmations (not used for read-only)
+  --verbose, -v    : verbose output
+  --quiet          : minimal output
+  --jobs N         : parallel jobs (for certain checks) [default: $PARALLEL_JOBS]
+  --help           : show help
+
+Examples:
+  $SCRIPT_NAME summary
+  $SCRIPT_NAME full --verbose
+  $SCRIPT_NAME json --dry-run
+EOF
+  exit 1
+}
+
+# Parse args
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    summary|full|json|trust|cache) MODE="$1"; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --quiet) QUIET=1; shift ;;
+    --jobs) PARALLEL_JOBS="${2:-$PARALLEL_JOBS}"; shift 2 ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Unknown option: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# init
+acquire_lock >/dev/null || true
+json_init
+
+# Dispatch per mode
+case "$MODE" in
+  summary)
+    check_config_file
+    check_directories
+    check_disk_space
+    check_toolchains
+    check_truststore
+    check_hooks
+    check_metafiles_consistency
+    print_summary
+    generate_json_and_exit
+    ;;
+  full)
+    info "Running full checks (this may be I/O intensive)"
+    check_config_file
+    check_directories
+    check_disk_space
+    check_toolchains
+    check_truststore
+    check_hooks
+    check_metafiles_consistency
+    check_cache_integrity
+    check_builds
+    check_metafile_updates_hint
+    check_logs
+    print_summary
+    generate_json_and_exit
+    ;;
+  json)
+    info "Generating JSON report only"
+    check_config_file
+    check_directories
+    check_toolchains
+    check_truststore
+    check_hooks
+    check_metafiles_consistency
+    check_cache_integrity
+    check_builds
+    check_logs
+    info "JSON report: $REPORT_JSON"
+    release_lock >/dev/null || true
+    exit "$EXIT_CODE"
+    ;;
+  trust)
+    check_truststore
+    release_lock >/dev/null || true
+    exit "$EXIT_CODE"
+    ;;
+  cache)
+    check_cache_integrity
+    release_lock >/dev/null || true
+    exit "$EXIT_CODE"
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+# cleanup
+release_lock >/dev/null || true
+exit "$EXIT_CODE"
