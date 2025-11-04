@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: rust pre-install
+# - Instala o Rust compilado em um DESTDIR seguro.
+# - Aborta se DESTDIR vazio ou "/", respeita DRY_RUN.
+#
+set -euo pipefail
+
+echo "📦 [rust pre-install] Instalando para DESTDIR..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/rust-install.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/rust-destdir}"
+SRC_DIR="$(pwd)"
+
+# Segurança DESTDIR
+if [ -z "$DESTDIR" ] || [ "$DESTDIR" = "/" ]; then
+  echo "❌ RISCO: DESTDIR inválido ($DESTDIR)"
+  exit 2
+fi
+mkdir -p "$DESTDIR"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria: ./x.py install --prefix=/usr --destdir=$DESTDIR"
+  exit 0
+fi
+
+if ! ./x.py install --prefix=/usr --destdir="$DESTDIR" > install.log 2>&1; then
+  echo "❌ Falha na instalação — veja install.log"
+  tail -n 50 install.log
+  exit 1
+fi
+
+echo "[`date -u`] installed into $DESTDIR" >> "$ADM_LOG"
+echo "✅ [rust pre-install] Instalação concluída em $DESTDIR."
