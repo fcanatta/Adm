@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# ADM HOOK: linux-kernel post-build
+# Verifica saída do build, coleta artefatos, empacota kernel+modules em cache
+# Respeita DRY_RUN e grava logs
+set -euo pipefail
+
+echo "🔍 [linux-kernel post-build] Iniciando verificação e empacotamento..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/linux-kernel-postbuild.log}"
+SRC_DIR="${SRC_DIR:-$(pwd)}"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+PKG_NAME="${PKG_NAME:-linux-kernel-$(date +%Y%m%d_%H%M%S)}"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$CACHE_DIR" 2>/dev/null || true
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+# 1) Detect compiled vmlinuz / bzImage
+KIMG=""
+for candidate in "arch/$(uname -m)/boot/bzImage" "arch/x86/boot/bzImage" "vmlinux" "arch/$(uname -m)/boot/Image"; do
+  if [ -f "${SRC_DIR}/${candidate}" ]; then
+    KIMG="${SRC_DIR}/${candidate}"
+    break
+  fi
+done
+
+if [ -z "$KIMG" ]; then
+  echo "⚠️  Não encontrei kernel compilado na árvore de fontes."
+  # try to find in build dir
+  alt="$(find "${SRC_DIR}" -type f -name 'bzImage' -o -name 'vmlinuz' -print -quit 2>/dev/null || true)"
+  if [ -n "$alt" ]; then
+    KIMG="$alt"
+    echo "ℹ️  Encontrado: $KIMG"
+  else
+    echo "❌ Build aparentemente falhou — ver logs de compilação."
+    echo "[`date -u`] post-build abort: kernel image missing" >> "$ADM_LOG"
+    exit 2
+  fi
+fi
+
+echo "✔️  Kernel image encontrado: $KIMG"
+
+# 2) Collect modules tree (make modules_install to staged DESTDIR is done in pre-install usually)
+# Here we just package compiled image + modules in build dir if present
+PKG_DIR="${CACHE_DIR}/${PKG_NAME}"
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) criaria pacote ${PKG_DIR}.tar.xz com kernel e modules"
+  exit 0
+fi
+
+rm -rf "${PKG_DIR}" || true
+mkdir -p "${PKG_DIR}/boot" "${PKG_DIR}/lib/modules" 2>/dev/null || true
+
+# copy kernel image
+cp -av "$KIMG" "${PKG_DIR}/boot/" 2>/dev/null || true
+
+# try copy modules from modules/* or from /lib/modules/<version> in build output
+modp="$(find "${SRC_DIR}" -type d -path '*/lib/modules/*' -print -quit 2>/dev/null || true)"
+if [ -n "$modp" ]; then
+  cp -a "$modp" "${PKG_DIR}/lib/" 2>/dev/null || true
+else
+  # maybe modules are in INSTALL_MOD_PATH area; try build dir
+  altm="$(find "${SRC_DIR}" -maxdepth 4 -type d -name "$(uname -r)" -print -quit 2>/dev/null || true)"
+  if [ -n "$altm" ]; then
+    cp -a "$altm" "${PKG_DIR}/lib/modules/" 2>/dev/null || true
+  fi
+fi
+
+# 3) tar.xz the package
+TARBALL="${CACHE_DIR}/${PKG_NAME}.tar.xz"
+tar -C "${PKG_DIR}" -cJf "${TARBALL}" . || {
+  echo "❌ Falha ao empacotar kernel em ${TARBALL}"
+  exit 1
+}
+sha256sum "${TARBALL}" > "${TARBALL}.sha256" || true
+echo "[`date -u`] packaged kernel: ${TARBALL}" >> "$ADM_LOG"
+echo "✅ [linux-kernel post-build] Pacote gerado: ${TARBALL}"
