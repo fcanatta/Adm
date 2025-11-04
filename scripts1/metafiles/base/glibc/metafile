@@ -1,0 +1,8 @@
+name: glibc
+version: 2.40
+source: https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
+sha256: f6db4a4a30f9fa7b10b1c4cfd9e97808d7a3f5f3bfb44cb4bb47047955e3aef5
+desc: The GNU C Library providing the core system APIs and runtime for Linux systems.
+build_deps: make, gawk, bison, texinfo, gcc, binutils
+run_deps: gcc, binutils
+upstream: https://www.gnu.org/software/libc/
