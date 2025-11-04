@@ -1,0 +1,8 @@
+name: gcc
+version: 14.2.0
+source: https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+sha256: 4d742f4a3e4a15dfba7f68e5792c877edb5ec33f1ef425a4b8b7bb4ef8f7e9e7
+desc: The GNU Compiler Collection - compilers for C, C++, Fortran, Ada, Go, and more.
+build_deps: gmp, mpfr, mpc, isl, zstd, make, flex, bison, texinfo
+run_deps: glibc, libgcc, libstdc++
+upstream: https://gcc.gnu.org/
