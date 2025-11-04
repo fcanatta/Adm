@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo pre-build
+# - Prepara ambiente para construir o Cargo a partir do código-fonte.
+# - Garante que o Rust (stage2) esteja funcional e configura as flags corretas.
+#
+set -euo pipefail
+
+echo "🔧 [cargo pre-build] Preparando ambiente de compilação..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/cargo-build.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/cargo-destdir}"
+RUSTC="$(command -v rustc || echo /usr/src/adm/toolchains/rust-bootstrap/bin/rustc)"
+CARGO_BOOT="$(command -v cargo || echo /usr/src/adm/toolchains/rust-bootstrap/bin/cargo)"
+
+mkdir -p "$BUILD_DIR" "$(dirname "$ADM_LOG")"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) verificaria toolchain Rust e criaria ambiente de build"
+  exit 0
+fi
+
+# 1️⃣ Verificar se Rust está disponível
+if [ ! -x "$RUSTC" ]; then
+  echo "❌ rustc não encontrado. Execute 'adm-build rust' primeiro."
+  exit 1
+fi
+
+echo "✔️  Rust toolchain detectado: $($RUSTC --version)"
+echo "[`date -u`] cargo pre-build start" >> "$ADM_LOG"
+
+# 2️⃣ Preparar variáveis
+export RUSTC_BOOTSTRAP=1
+export RUST_BACKTRACE=1
+export CARGO_HOME="${ADM_ROOT}/cache/cargo-home"
+export RUSTFLAGS="-C opt-level=2 -C target-cpu=native"
+export PATH="$(dirname "$RUSTC"):$PATH"
+
+mkdir -p "$CARGO_HOME" "$DESTDIR"
+
+echo "🏗️  Iniciando build Cargo com Rust toolchain ativo..."
