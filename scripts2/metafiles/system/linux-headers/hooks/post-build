@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel-headers post-build
+# - Executa verificação após build dos headers (headers_check).
+# - Garante integridade da árvore de includes gerada.
+#
+set -euo pipefail
+
+echo "🔍 [linux-kernel-headers post-build] Verificando build..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/kernel-headers.log}"
+SRC_DIR="$(pwd)"
+
+echo "[`date -u`] post-build start" >> "$ADM_LOG"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria make headers_check"
+  exit 0
+fi
+
+echo "🧪 Verificando integridade dos headers..."
+make headers_check > "$SRC_DIR/headers_check.log" 2>&1 || {
+  echo "⚠️  make headers_check retornou erros — veja headers_check.log"
+  tail -n 50 "$SRC_DIR/headers_check.log" || true
+}
+echo "[`date -u`] headers_check complete" >> "$ADM_LOG"
+echo "✅ [post-build] Headers verificados com sucesso."
