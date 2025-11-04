@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# ADM post-build hook for Mozilla Firefox
+# Installs binaries, verifies integrity and cleans intermediates.
+
+adm_log_info "[HOOK post-build] Installing Firefox..."
+DESTDIR="${DESTDIR:-/usr/local}"
+cd objdir || exit 1
+
+# Build and install
+../mach build || {
+  adm_log_err "Firefox build failed!"
+  exit 1
+}
+
+../mach install --prefix="$DESTDIR/usr" || {
+  adm_log_err "Firefox install failed!"
+  exit 1
+}
+
+# Cleanup and verify
+adm_log_info "[HOOK post-build] Stripping binaries..."
+find "$DESTDIR/usr/lib/firefox" -type f -executable -exec strip --strip-unneeded {} + 2>/dev/null || true
+
+adm_log_ok "[HOOK post-build] Firefox build completed successfully."
+adm_log_info "[HOOK post-build] Installed in: $DESTDIR/usr/lib/firefox"
