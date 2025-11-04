@@ -1,0 +1,1884 @@
+#!/usr/bin/env bash
+#
+# adm-downloader (PARTE 1/3)
+# -------------------------
+# Motor de download do ADM — Parte 1/3
+#
+# Função desta parte:
+#  - Inicialização, segurança, logs, locks
+#  - Parser de argumentos (fetch/verify/clean)
+#  - Verificação de ferramentas (curl,wget,git,rsync,hg,svn,aria2)
+#  - Estrutura de cache e locks por pacote/versão
+#  - Parser robusto de metafile (todos campos relevantes)
+#  - Normalização/validação de URLs e tipos (http,ftp,rsync,git,hg,svn,file,magnet)
+#  - Helpers: retry/backoff, safe_run, spinner, human_size, ensure_space
+#  - Report scaffolding JSON
+#
+# Observações:
+#  - Esta PARTE 1/3 não realiza downloads em massa; implementa a infra
+#    e funções auxiliares necessárias para as PARTES 2/3 e 3/3.
+#  - Tudo respeita --dry-run; nenhum estado crítico é modificado sem confirmação.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Headers / Defaults
+##### -------------------------
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_SOURCES_CACHE="${ADM_SOURCES_CACHE:-$ADM_CACHE/sources}"
+ADM_TARBALLS_CACHE="${ADM_TARBALLS_CACHE:-$ADM_CACHE/tarballs}"
+ADM_VCS_CACHE="${ADM_VCS_CACHE:-$ADM_CACHE/vcs}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_PROVIDE_MAP="${ADM_PROVIDE_MAP:-$ADM_CONF_DIR/provide-map}"
+
+LOGFILE_DEFAULT="${ADM_LOGS}/adm-downloader-${TS}.log"
+REPORT_JSON_DEFAULT="${ADM_TMP}/adm-downloader-report-${TS}.json"
+
+# Runtime flags (defaults)
+DRY_RUN=0
+FORCE=0
+VERIFY_ONLY=0
+PARALLEL=4
+TIMEOUT=60
+RETRIES=3
+BACKOFF_BASE=2      # backoff multiplier
+ASSUME_YES=0
+VERBOSE=0
+OUTPUT_JSON=0
+PROFILE="normal"    # normal|extreme|none
+JOBS="$PARALLEL"
+
+# Commands' availability (populated at init)
+HAS_CURL=0; HAS_WGET=0; HAS_GIT=0; HAS_RSYNC=0; HAS_HG=0; HAS_SVN=0; HAS_ARIA2=0; HAS_SHA256SUM=0
+
+# Ensure adm.conf overrides
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+# Create dirs (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_SOURCES_CACHE" "$ADM_TARBALLS_CACHE" "$ADM_VCS_CACHE" "$ADM_LOGS" "$ADM_TMP" 2>/dev/null || true
+fi
+
+##### -------------------------
+##### Colors & icons
+##### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+ICON_DOWN="⬇️"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+##### -------------------------
+##### Spinner (lightweight, safe)
+##### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $msg"; return 0; fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+##### -------------------------
+##### Safe-run wrapper (with dry-run support)
+##### -------------------------
+safe_run() {
+  # safe_run "<desc>" cmd...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    [ "$VERBOSE" -eq 1 ] && printf "  Simulated: %s\n" "$*"
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc rc=$rc"
+    return $rc
+  fi
+}
+
+##### -------------------------
+##### Retry with backoff
+##### -------------------------
+_retry_with_backoff() {
+  # _retry_with_backoff <tries> <cmd...>
+  local tries="${1:-3}"; shift
+  local attempt=0 rc=0
+  while [ "$attempt" -lt "$tries" ]; do
+    if "$@"; then
+      return 0
+    fi
+    rc=$?
+    attempt=$((attempt+1))
+    local sleep_for=$(( BACKOFF_BASE ** attempt ))
+    warn "Tentativa $attempt/$tries falhou (rc=$rc). Aguardando ${sleep_for}s antes de nova tentativa..."
+    sleep "$sleep_for"
+  done
+  return $rc
+}
+
+##### -------------------------
+##### Utilities: human_size, ensure_enough_space, safe_mkdir
+##### -------------------------
+human_size() {
+  # human_size <bytes>
+  if [ -z "${1:-}" ]; then echo "0B"; return; fi
+  awk 'function hs(x){
+    s="B KiB MiB GiB TiB PiB";
+    for(i=0;i<6;i++){ if(x<1024) return sprintf("%.1f%s",x,substr(s,i*5+1,4)); x/=1024; }
+    return sprintf("%.1fEiB",x)
+  }{print hs($1)}' <<<"$1"
+}
+
+ensure_enough_space() {
+  # ensure_enough_space <directory> <needed_mb>
+  local dir="$1"; local need_mb="${2:-0}"
+  if [ "$need_mb" -le 0 ]; then return 0; fi
+  local avail_kb
+  avail_kb="$(df -P "$dir" 2>/dev/null | awk 'END{print $4}')"
+  [ -z "$avail_kb" ] && return 1
+  local avail_mb=$((avail_kb/1024))
+  if [ "$avail_mb" -lt "$need_mb" ]; then
+    warn "Espaço insuficiente em $dir: ${avail_mb}MB disponível < ${need_mb}MB necessários"
+    return 1
+  fi
+  return 0
+}
+
+safe_mkdir() {
+  local d="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) mkdir -p $d"
+    return 0
+  fi
+  mkdir -p "$d" || { err "Falha ao criar diretório: $d"; return 1; }
+  return 0
+}
+
+##### -------------------------
+##### Validate availability of required tools (with fallbacks)
+##### -------------------------
+_check_tools() {
+  HAS_CURL=0; HAS_WGET=0; HAS_GIT=0; HAS_RSYNC=0; HAS_HG=0; HAS_SVN=0; HAS_ARIA2=0; HAS_SHA256SUM=0
+  if command -v curl >/dev/null 2>&1; then HAS_CURL=1; fi
+  if command -v wget >/dev/null 2>&1; then HAS_WGET=1; fi
+  if command -v git >/dev/null 2>&1; then HAS_GIT=1; fi
+  if command -v rsync >/dev/null 2>&1; then HAS_RSYNC=1; fi
+  if command -v hg >/dev/null 2>&1; then HAS_HG=1; fi
+  if command -v svn >/dev/null 2>&1; then HAS_SVN=1; fi
+  if command -v aria2c >/dev/null 2>&1; then HAS_ARIA2=1; fi
+  if command -v sha256sum >/dev/null 2>&1; then HAS_SHA256SUM=1; fi
+
+  verbose "Tools: curl=$HAS_CURL wget=$HAS_WGET git=$HAS_GIT rsync=$HAS_RSYNC hg=$HAS_HG svn=$HAS_SVN aria2=$HAS_ARIA2 sha256=$HAS_SHA256SUM"
+}
+
+##### -------------------------
+##### Locking for cache entries (per-package/version)
+##### - create_lock_for <pkg> <ver> -> prints lockfile path or returns failure
+##### - release_lock_for <lockfile>
+##### - locks are robust: use flock on fd to ensure process-based locks
+##### -------------------------
+create_lock_for() {
+  local pkg="$1" ver="$2"
+  local lockdir="${ADM_SOURCES_CACHE%/}/.locks"
+  safe_mkdir "$lockdir"
+  local key
+  key="$(printf '%s/%s' "$pkg" "$ver" | sed -e 's/[^a-zA-Z0-9._-]/_/g')"
+  local lockfile="$lockdir/$key.lock"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would create lock $lockfile"
+    printf "%s" "$lockfile"; return 0
+  fi
+  # create and open fd for flock to manage lifetime
+  exec {fd}>"$lockfile" || { err "Não foi possível criar lockfile $lockfile"; return 1; }
+  if ! flock -n "$fd"; then
+    err "Lock já em uso: $lockfile"
+    # leave fd open? No, close and return error
+    eval "exec ${fd}>&-"
+    return 2
+  fi
+  # store pid into lockfile meta for human inspection
+  printf "%s\n" "$$" >"$lockfile.pid" 2>/dev/null || true
+  # return the lockfile path and fd number (for release)
+  printf "%s|%s" "$lockfile" "$fd"
+  return 0
+}
+
+release_lock_for() {
+  # release_lock_for <lockfile> <fd>
+  local lockfile="$1" fd="$2"
+  if [ -z "$lockfile" ] || [ -z "$fd" ]; then
+    warn "release_lock_for requires lockfile and fd"
+    return 1
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would release lock $lockfile fd=$fd"
+    return 0
+  fi
+  # close fd to release flock
+  eval "exec ${fd}>&-"
+  rm -f "$lockfile.pid" 2>/dev/null || true
+  return 0
+}
+
+##### -------------------------
+##### Metafile parsing: very robust
+##### - parse_metafile <metafile_path> -> populates associative arrays:
+#####   MF_NAME, MF_VERSION, MF_LICENSE, MF_BUILD, MF_SHA256S (array), MF_SOURCES (array), MF_FIELDS_RAW (map)
+##### - Accepts:
+#####   key: value
+#####   key:
+#####     - item
+##### - Strict validation and error reporting
+##### -------------------------
+declare -A MF_FIELDS_RAW
+declare -a MF_SOURCES
+declare -a MF_SHA256S
+MF_NAME=""; MF_VERSION=""; MF_LICENSE=""; MF_BUILD=""; MF_DESC=""
+
+parse_metafile() {
+  local mf="$1"
+  if [ -z "$mf" ] || [ ! -f "$mf" ]; then
+    err "Metafile ausente: $mf"
+    return 2
+  fi
+
+  # reset
+  MF_SOURCES=(); MF_SHA256S=(); MF_FIELDS_RAW=(); MF_NAME=""; MF_VERSION=""; MF_LICENSE=""; MF_BUILD=""; MF_DESC=""
+
+  # read line by line, support YAML-like simple format
+  local current_list=""
+  while IFS= read -r rawline || [ -n "$rawline" ]; do
+    # remove BOM and trim
+    local line
+    line="$(printf '%s' "$rawline" | sed -e 's/^\xEF\xBB\xBF//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$line" ] && continue
+    case "$line" in
+      \#*) continue ;;
+    esac
+
+    # list item (dash)
+    if printf '%s' "$line" | grep -qE '^- '; then
+      local item
+      item="$(printf '%s' "$line" | sed -E 's/^- +//')"
+      if [ -z "$current_list" ]; then
+        verbose "Item de lista sem cabeçalho no metafile ($mf): $item"
+        continue
+      fi
+      case "$current_list" in
+        source|sources) MF_SOURCES+=("$item") ;;
+        sha256sum|sha256) MF_SHA256S+=("$item") ;;
+        *) MF_FIELDS_RAW["$current_list"]="${MF_FIELDS_RAW[$current_list]:-}${item}," ;;
+      esac
+      continue
+    fi
+
+    # key: value or key:
+    if printf '%s' "$line" | grep -qE '^[a-zA-Z0-9_]+:'; then
+      local key val
+      key="$(printf '%s' "$line" | sed -E 's/^([a-zA-Z0-9_]+):.*$/\1/')"
+      val="$(printf '%s' "$line" | sed -E 's/^[a-zA-Z0-9_]+:[[:space:]]*(.*)$/\1/')"
+      # if val empty => enter list mode
+      if [ -z "$val" ]; then
+        current_list="$key"
+        continue
+      else
+        current_list=""
+      fi
+      case "$key" in
+        name|nome) MF_NAME="$val" ;;
+        version|versao) MF_VERSION="$val" ;;
+        license) MF_LICENSE="$val" ;;
+        build) MF_BUILD="$val" ;;
+        sha256sum|sha256)
+          # comma-separated
+          IFS=',' read -r -a arr <<<"$val"
+          for a in "${arr[@]}"; do MF_SHA256S+=("$(printf '%s' "$a" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"); done
+          ;;
+        source|sources)
+          IFS=',' read -r -a arr <<<"$val"
+          for a in "${arr[@]}"; do MF_SOURCES+=("$(printf '%s' "$a" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"); done
+          ;;
+        description|desc) MF_DESC="$val" ;;
+        *)
+          MF_FIELDS_RAW["$key"]="$val"
+          verbose "Campo desconhecido lido em $mf: $key (preservado)"
+          ;;
+      esac
+    else
+      verbose "Linha ignorada (formato inesperado) em $mf: $line"
+    fi
+  done <"$mf"
+
+  # post-validate
+  if [ -z "$MF_NAME" ] || [ -z "$MF_VERSION" ]; then
+    err "Metafile incompleto ($mf): name/version obrigatórios"
+    return 3
+  fi
+
+  # normalize sources to absolute-like strings
+  local tmp=()
+  for s in "${MF_SOURCES[@]:-}"; do
+    s="$(printf '%s' "$s" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$s" ] && continue
+    tmp+=("$s")
+  done
+  MF_SOURCES=("${tmp[@]}")
+
+  verbose "Metafile parseado: name=$MF_NAME version=$MF_VERSION sources=${#MF_SOURCES[@]} shas=${#MF_SHA256S[@]}"
+  return 0
+}
+
+##### -------------------------
+##### URL/type normalization & detection
+##### - classify_source <source_string> -> prints "type|normalized_url|extra"
+##### types: http, https, ftp, rsync, git, hg, svn, file, magnet, torrent, unknown
+##### -------------------------
+classify_source() {
+  local src="$1"
+  [ -z "$src" ] && { printf "unknown||"; return 1; }
+  # strip surrounding quotes
+  src="$(printf '%s' "$src" | sed -e "s/^['\"]//" -e "s/['\"]$//")"
+
+  # git+ prefix
+  if printf '%s' "$src" | grep -qE '^git\+'; then
+    local url="${src#git+}"
+    printf "git|%s|\n" "$url"; return 0
+  fi
+  # hg+ prefix
+  if printf '%s' "$src" | grep -qE '^hg\+'; then
+    local url="${src#hg+}"
+    printf "hg|%s|\n" "$url"; return 0
+  fi
+  # svn+ prefix
+  if printf '%s' "$src" | grep -qE '^svn\+'; then
+    local url="${src#svn+}"
+    printf "svn|%s|\n" "$url"; return 0
+  fi
+
+  if printf '%s' "$src" | grep -qE '^https?://'; then
+    printf "http|%s|\n" "$src"; return 0
+  fi
+  if printf '%s' "$src" | grep -qE '^ftp://'; then
+    printf "ftp|%s|\n" "$src"; return 0
+  fi
+  if printf '%s' "$src" | grep -qE '^rsync://'; then
+    printf "rsync|%s|\n" "$src"; return 0
+  fi
+  if printf '%s' "$src" | grep -qE '^file://'; then
+    printf "file|%s|\n" "$src"; return 0
+  fi
+  if printf '%s' "$src" | grep -qE '^magnet:'; then
+    printf "magnet|%s|\n" "$src"; return 0
+  fi
+  if printf '%s' "$src" | grep -qE '\.torrent$'; then
+    printf "torrent|%s|\n" "$src"; return 0
+  fi
+  # ssh git, git@github:...
+  if printf '%s' "$src" | grep -qE '^git@|^ssh://|^[^/:]+:[^/]+/'; then
+    printf "git|%s|\n" "$src"; return 0
+  fi
+
+  # fallback: unknown
+  printf "unknown|%s|\n" "$src"
+  return 1
+}
+
+##### -------------------------
+##### Cache path helpers
+##### - cache_base_for <pkg> <ver> -> prints path
+##### - cache_tarball_path_for <pkg> <ver> <filename>
+##### - vcs_cache_dir <pkg> <ver>
+##### -------------------------
+cache_base_for() {
+  local pkg="$1" ver="$2"
+  local base="$ADM_SOURCES_CACHE/$(printf '%s' "$pkg" | sed -e 's/[^a-zA-Z0-9._-]/_/g')/$ver"
+  printf "%s" "$base"
+}
+
+cache_tarball_path_for() {
+  local pkg="$1" ver="$2" fname="$3"
+  local base
+  base="$(cache_base_for "$pkg" "$ver")"
+  printf "%s/%s" "$base" "$fname"
+}
+
+vcs_cache_dir() {
+  local pkg="$1" ver="$2"
+  printf "%s/%s/%s" "$ADM_VCS_CACHE" "$(printf '%s' "$pkg" | sed -e 's/[^a-zA-Z0-9._-]/_/g')" "$ver"
+}
+
+##### -------------------------
+##### Write metadata and sha records for cached files
+##### - write_cache_meta <path> <origin_url> <sha256 or empty>
+##### -------------------------
+write_cache_meta() {
+  local file="$1" origin="$2" sha="$3"
+  local dir
+  dir="$(dirname "$file")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) escrever meta em $dir"
+    return 0
+  fi
+  printf "origin: %s\nfetched_at: %s\nsha256: %s\n" "$origin" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "${sha:-unknown}" >"$dir/.source.meta" 2>/dev/null || true
+  if [ -n "$sha" ] && [ "$sha" != "unknown" ]; then
+    printf "%s  %s\n" "$sha" "$(basename "$file")" >"$file.sha256" 2>/dev/null || true
+  fi
+  return 0
+}
+
+##### -------------------------
+##### Report scaffolding (JSON)
+##### -------------------------
+_report_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) iniciando scaffold de relatório (não gravará arquivos)"
+    return 0
+  fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","fetched":[], "skipped":[], "errors": []}' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$REPORT_JSON" || true
+  log_to_file "[REPORT]" "init $REPORT_JSON"
+}
+
+_report_add_fetched() {
+  local pkg="$1" ver="$2" file="$3" sha="$4" origin="$5"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; pkg=sys.argv[2]; ver=sys.argv[3]; file=sys.argv[4]; sha=sys.argv[5]; origin=sys.argv[6]
+d=json.load(open(f))
+d['fetched'].append({"pkg":pkg,"ver":ver,"file":file,"sha":sha,"origin":origin})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+_report_add_skipped() {
+  local pkg="$1" ver="$2" reason="$3"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; pkg=sys.argv[2]; ver=sys.argv[3]; reason=sys.argv[4]
+d=json.load(open(f))
+d['skipped'].append({"pkg":pkg,"ver":ver,"reason":reason})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+_report_add_error() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; msg=sys.argv[2]
+d=json.load(open(f))
+d['errors'].append(msg)
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+##### -------------------------
+##### High-level resolve_sources (prepare list normalized)
+##### - resolve_sources_for_metafile <metafile> -> prints lines: <type>|<url>|<expected_sha or ->|
+##### - respects multiple sources and MF_SHA256S if provided
+##### -------------------------
+resolve_sources_for_metafile() {
+  local mf="$1"
+  parse_metafile "$mf" || return 2
+  # if no sources but MF_FIELDS_RAW contains 'source' as a complex field, try to use it
+  local idx=0
+  if [ "${#MF_SOURCES[@]}" -eq 0 ]; then
+    # try to extract 'source' from raw fields
+    local sraw="${MF_FIELDS_RAW[source]:-}"
+    if [ -n "$sraw" ]; then
+      IFS=',' read -r -a arr <<<"$sraw"
+      for a in "${arr[@]}"; do MF_SOURCES+=("$a"); done
+    fi
+  fi
+
+  # pair MF_SOURCES with MF_SHA256S if lengths match or if single sha provided
+  for src in "${MF_SOURCES[@]:-}"; do
+    idx=$((idx+1))
+    local type url
+    read -r type url extra <<<"$(classify_source "$src" | tr -d '\r')"
+    local expected_sha=""
+
+    if [ "${#MF_SHA256S[@]}" -ge "$idx" ]; then
+      expected_sha="${MF_SHA256S[$((idx-1))]}"
+    elif [ "${#MF_SHA256S[@]}" -eq 1 ]; then
+      expected_sha="${MF_SHA256S[0]}"
+    fi
+    printf "%s|%s|%s\n" "$type" "$url" "${expected_sha:-}"
+  done
+  return 0
+}
+
+##### -------------------------
+##### Entrypoints: fetch, verify, clean-cache (argument parsing will dispatch)
+##### - fetch <pkg> [--all-sources] [--force] [--parallel N] [--timeout S] [--retries N]
+##### - verify <pkg|--all> [--parallel N]
+##### - clean-cache --older-than N [--dry-run]
+##### -------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME <command> [options] <package>
+
+Commands:
+  fetch <package>        Baixa fontes para pacote (usa metafile)
+  verify <package|--all> Verifica integridade do cache
+  clean-cache [--older-than DAYS] Remove cache corrompido/antigo
+Options:
+  --dry-run              Simula (não grava)
+  --force                Força novo download mesmo que exista em cache
+  --verify-only          Apenas verifica (não baixa)
+  --parallel N           Número de downloads simultâneos (default: $PARALLEL)
+  --timeout S            Timeout por conexão (default: $TIMEOUT)
+  --retries N            Tentativas por download (default: $RETRIES)
+  --yes                  Assume yes para prompts
+  --json                 Gera relatório JSON
+  --verbose, -v          Verbose
+  --help                 Mostra esta ajuda
+EOF
+  exit 1
+}
+
+# parse top-level
+if [ $# -lt 1 ]; then usage; fi
+CMD="$1"; shift || true
+
+# parse options (simple loop)
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --verify-only) VERIFY_ONLY=1; shift ;;
+    --parallel) shift; PARALLEL="${1:-$PARALLEL}"; shift ;;
+    --timeout) shift; TIMEOUT="${1:-$TIMEOUT}"; shift ;;
+    --retries) shift; RETRIES="${1:-$RETRIES}"; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --json) OUTPUT_JSON=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*)
+      err "Opção desconhecida: $1"; usage ;;
+    *)
+      POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+TARGET_PKG="${POSITIONAL[0]:-}"
+
+# finalize runtime derived vars
+JOBS="$PARALLEL"
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+REPORT_JSON="${REPORT_JSON:-$REPORT_JSON_DEFAULT}"
+
+_check_tools
+_report_init
+
+##### -------------------------
+##### Safety: prevent running as unexpected user without warning
+##### -------------------------
+if [ "$(id -u)" -ne 0 ]; then
+  warn "É recomendável rodar adm-downloader como root ou usuário com permissões apropriadas para gravar em $ADM_CACHE. Continuando, mas verifique permissões se ocorrerem erros."
+fi
+
+##### -------------------------
+##### Basic dispatch / helpers for main logic (the heavy download logic in PART 2/3)
+##### - Here we validate inputs, build lists, validate metafile path, check tool availability
+##### - Provide wrappers callers in PART 2/3 will use to actually download
+##### -------------------------
+find_metafile_for_pkg() {
+  local pkg="$1"
+  # if user passed category/pkg
+  if printf '%s' "$pkg" | grep -q '/'; then
+    if [ -f "$ADM_SOURCES_CACHE/$pkg/metafile" ]; then
+      printf "%s" "$ADM_SOURCES_CACHE/$pkg/metafile"
+      return 0
+    fi
+  fi
+  # search in metafiles tree
+  if [ -d "$ADM_ROOT/metafiles" ]; then
+    local found=""
+    while IFS= read -r -d '' d; do
+      local name
+      name="$(basename "$(dirname "$d")")/$(basename "$(dirname "$(dirname "$d")")")" # not ideal; fallback
+      # simplified: match directory name ending with pkg
+      if printf '%s' "$d" | grep -qE "/$pkg/metafile$"; then
+        found="$d"; break
+      fi
+    done < <(find "$ADM_ROOT/metafiles" -type f -name metafile -print0 2>/dev/null)
+    if [ -n "$found" ]; then
+      printf "%s" "$found"; return 0
+    fi
+  fi
+  # as last resort, check direct path
+  if [ -f "$pkg" ]; then
+    printf "%s" "$pkg"; return 0
+  fi
+  return 1
+}
+
+_validate_pkg_and_metafile() {
+  local pkg="$1"
+  local mf
+  mf="$(find_metafile_for_pkg "$pkg" 2>/dev/null || true)"
+  if [ -z "$mf" ]; then
+    err "Não foi possível localizar metafile para pacote: $pkg"
+    return 2
+  fi
+  if ! parse_metafile "$mf"; then
+    err "Falha ao parsear metafile: $mf"
+    return 3
+  fi
+  printf "%s" "$mf"
+  return 0
+}
+
+# quick sanity: if command is fetch and no package, error
+case "$CMD" in
+  fetch)
+    if [ -z "$TARGET_PKG" ]; then err "fetch requer nome do pacote"; usage; fi
+    MF_PATH="$(_validate_pkg_and_metafile "$TARGET_PKG" 2>/dev/null || true)"
+    if [ -z "$MF_PATH" ]; then exit 2; fi
+    info "Pronto para fetch: pacote='$TARGET_PKG' metafile='$MF_PATH'"
+    ;;
+  verify)
+    if [ -z "$TARGET_PKG" ]; then warn "verify sem pacote: use --all para verificar todo cache"; fi
+    ;;
+  clean-cache)
+    info "Preparando limpeza de cache (com segurança)"
+    ;;
+  *)
+    err "Comando inválido: $CMD"; usage ;;
+esac
+
+##### -------------------------
+##### Provide exported helper stubs that PART 2/3 will call
+##### - download_dispatcher <type> <url> <dest> <expected_sha> <pkg> <ver>
+##### - verify_cached_file <file> <expected_sha>
+##### - these are implemented as robust wrappers here but will call detailed implementations in PART 2/3
+##### -------------------------
+download_dispatcher() {
+  local type="$1"; local url="$2"; local dest="$3"; local expected_sha="$4"; local pkg="$5"; local ver="$6"
+  # This function is intentionally defensive and will be extended in PART 2/3.
+  # For now, validate inputs and create dest dir.
+  if [ -z "$type" ] || [ -z "$url" ] || [ -z "$dest" ]; then
+    err "download_dispatcher: parâmetros insuficientes"
+    return 2
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) dispatch download: $type $url -> $dest (expect_sha=${expected_sha:-none})"
+    return 0
+  fi
+  # ensure dest dir
+  safe_mkdir "$(dirname "$dest")" || return 3
+
+  # choose preferred downloader (order: aria2c (if many parallel), curl, wget)
+  if [ "$HAS_ARIA2" -eq 1 ] && [ "$PARALLEL" -gt 1 ]; then
+    verbose "aria2 disponível e paralelo>1; usar aria2 para $url"
+    # call specialized function implemented in part 2
+    _download_with_aria2 "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver"
+    return $?
+  fi
+
+  if [ "$HAS_CURL" -eq 1 ]; then
+    verbose "Usando curl para baixar $url"
+    _download_with_curl "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver"
+    return $?
+  fi
+  if [ "$HAS_WGET" -eq 1 ]; then
+    verbose "Usando wget para baixar $url"
+    _download_with_wget "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver"
+    return $?
+  fi
+  err "Nenhuma ferramenta de download disponível (curl/wget/aria2)"
+  return 4
+}
+
+# stub implementations to be expanded in PART 2/3; they implement retries and basic checks
+_download_with_curl() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  # RISCO/REDE: network op; retries handled
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) curl -L $url -o $dest"
+    return 0
+  fi
+  # basic retry wrapper
+  _retry_with_backoff "$retries" curl -fL --connect-timeout 10 --max-time "$timeout" -o "$dest" "$url"
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    err "curl falhou para $url (rc=$rc)"
+    _report_add_error "curl:$url"
+    return $rc
+  fi
+  # post-verify sha optionally (in PART 2/3 a robust verify is done)
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ]; then
+    if [ "$HAS_SHA256SUM" -eq 1 ]; then
+      local got
+      got="$(sha256sum "$dest" | awk '{print $1}' || true)"
+      if [ -z "$got" ] || [ "$got" != "$expected_sha" ]; then
+        err "SHA mismatch for $dest : expected=$expected_sha got=${got:-none}"
+        _report_add_error "sha_mismatch:$dest"
+        return 3
+      fi
+    fi
+  fi
+  # write cache meta
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$dest" "$url" "$sha_val"
+  _report_add_fetched "${pkg:-unknown}" "${ver:-unknown}" "$dest" "$sha_val" "$url"
+  return 0
+}
+
+_download_with_wget() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) wget $url -O $dest"
+    return 0
+  fi
+  _retry_with_backoff "$retries" wget --timeout="$timeout" -O "$dest" "$url"
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    err "wget falhou para $url (rc=$rc)"
+    _report_add_error "wget:$url"
+    return $rc
+  fi
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ]; then
+    if [ "$HAS_SHA256SUM" -eq 1 ]; then
+      local got
+      got="$(sha256sum "$dest" | awk '{print $1}' || true)"
+      if [ -z "$got" ] || [ "$got" != "$expected_sha" ]; then
+        err "SHA mismatch for $dest : expected=$expected_sha got=${got:-none}"
+        _report_add_error "sha_mismatch:$dest"
+        return 3
+      fi
+    fi
+  fi
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$dest" "$url" "$sha_val"
+  _report_add_fetched "${pkg:-unknown}" "${ver:-unknown}" "$dest" "$sha_val" "$url"
+  return 0
+}
+
+_download_with_aria2() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) aria2c $url -o $dest"
+    return 0
+  fi
+  if [ "$HAS_ARIA2" -ne 1 ]; then err "aria2 não disponível"; return 2; fi
+  # aria2 options: enable resume, max-connection-per-server, split, timeout
+  aria2c -x4 -s4 --retry-wait=5 --max-tries="$retries" -d "$(dirname "$dest")" -o "$(basename "$dest")" "$url" >>"$LOGFILE" 2>&1
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    err "aria2c falhou para $url (rc=$rc)"
+    _report_add_error "aria2:$url"
+    return $rc
+  fi
+  # verify sha if requested
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+    local got
+    got="$(sha256sum "$dest" | awk '{print $1}' || true)"
+    if [ -z "$got" ] || [ "$got" != "$expected_sha" ]; then
+      err "SHA mismatch aria2 for $dest : expected=$expected_sha got=${got:-none}"
+      _report_add_error "sha_mismatch:$dest"
+      return 3
+    fi
+  fi
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$dest" "$url" "$sha_val"
+  _report_add_fetched "${pkg:-unknown}" "${ver:-unknown}" "$dest" "$sha_val" "$url"
+  return 0
+}
+
+##### -------------------------
+##### Final message for PART 1/3
+##### -------------------------
+inform_part1_ready() {
+  echo
+  echo "adm-downloader PARTE 1/3 gerada com sucesso."
+  echo "Pronto para executar fluxos de fetch/verify/clean dispatch."
+  echo "Use --dry-run para testar sem efeitos colaterais."
+  echo "Próximo: execute PART 2/3 para implementar a lógica de download completa (vários protocolos, vcs, rsync, ftp, validações avançadas)."
+  echo
+}
+
+inform_part1_ready
+
+# End
+# implementar:
+#  - _download_with_git, _download_with_rsync, _download_with_hg, _download_with_svn
+#  - robust handling of torrent/magnet if aria2 available
+#  - verify_cached_file (move to corrupted if mismatch)
+#  - concurrency orchestration (parallel worker pool)
+#  - rate limiting, timeouts, progress bars (per-file)
+#  - full integration with adm-build / adm-resolver calls
+#
+# (faço downloads reais e integração).
+##### -------------------------
+##### adm-downloader PARTE 2/3
+##### -------------------------
+# Implementa downloads reais para: http(s), ftp, rsync, git, hg, svn, aria2 (torrent/magnet),
+# verificação robusta de SHA256, cache corrompido, retries, resume, parallel worker pool.
+#
+# Requisito: PARTE 1/3 carregada no mesmo script (helpers, parse_metafile, download_dispatcher, create_lock_for, etc.)
+#
+
+##### -------------------------
+##### Internal globals for concurrency
+##### -------------------------
+WORKDIR="${ADM_TMP}/adm-downloader-work-$TS"
+safe_mkdir "$WORKDIR" || true
+JOB_PIDS=()
+JOB_MAX="${PARALLEL:-4}"
+declare -A JOB_STATUS   # job_id -> rc
+trap 'for p in "${JOB_PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done' EXIT
+
+##### -------------------------
+##### Helper: mark corrupted cache
+##### -------------------------
+mark_cache_corrupted() {
+  # mark_cache_corrupted <file> <reason>
+  local f="$1" reason="$2"
+  if [ -z "$f" ] || [ ! -f "$f" ]; then
+    warn "mark_cache_corrupted: arquivo inexistente: $f"
+    return 1
+  fi
+  local dir; dir="$(dirname "$f")"
+  local corrupt_dir="${dir}/.corrupted"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    warn "(dry-run) marcaria como corrompido $f ($reason)"
+    return 0
+  fi
+  mkdir -p "$corrupt_dir" || true
+  local base; base="$(basename "$f")"
+  mv -f "$f" "$corrupt_dir/${base}.$TS" 2>>"$LOGFILE" || { warn "Falha ao mover arquivo corrompido $f"; return 2; }
+  log_to_file "[CORRUPT]" "$f reason=$reason"
+  warn "Arquivo movido para $corrupt_dir/${base}.$TS"
+  return 0
+}
+
+##### -------------------------
+##### verify_cached_file <file> <expected_sha>
+##### - If expected_sha empty -> attempt compute sha and return it
+##### - If expected_sha provided and mismatch -> mark corrupted and return non-zero
+##### -------------------------
+verify_cached_file() {
+  local file="$1" expected="$2"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    err "verify_cached_file: arquivo ausente: $file"
+    return 2
+  fi
+  if [ "$HAS_SHA256SUM" -ne 1 ]; then
+    warn "sha256sum não disponível; não é possível verificar integridade de $file"
+    return 0
+  fi
+  local got
+  got="$(sha256sum "$file" | awk '{print $1}' 2>/dev/null || true)"
+  if [ -z "$got" ]; then
+    err "Falha ao calcular sha de $file"
+    return 3
+  fi
+  if [ -z "${expected:-}" ] || [ "$expected" = "-" ]; then
+    # return computed sha on stdout
+    printf "%s" "$got"
+    return 0
+  fi
+  if [ "$got" != "$expected" ]; then
+    err "SHA mismatch: $file expected=$expected got=$got"
+    mark_cache_corrupted "$file" "sha_mismatch"
+    return 4
+  fi
+  ok "SHA verificado: $file"
+  return 0
+}
+
+##### -------------------------
+##### _download_with_git
+##### - Clona repositório para cache as bare mirror + checkout tag/revision if needed
+##### - Uses git clone --mirror for efficient updates; then create tarball of requested ref (tag or branch)
+##### -------------------------
+_download_with_git() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  ## REDE: git network operation
+  local vcsdir
+  vcsdir="$(vcs_cache_dir "$pkg" "$ver")"
+  local lock_info
+  lock_info="$(create_lock_for "$pkg" "$ver" 2>/dev/null || true)"
+  if [ -z "$lock_info" ]; then
+    err "Não foi possível obter lock para git $pkg:$ver"
+    return 2
+  fi
+  local lockfile fd
+  lockfile="${lock_info%%|*}"; fd="${lock_info##*|}"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) _download_with_git $url -> $vcsdir"
+    release_lock_for "$lockfile" "$fd" || true
+    return 0
+  fi
+
+  safe_mkdir "$vcsdir" || { release_lock_for "$lockfile" "$fd" || true; return 3; }
+
+  if [ "$HAS_GIT" -ne 1 ]; then
+    err "git não disponível no sistema"
+    release_lock_for "$lockfile" "$fd" || true
+    return 4
+  fi
+
+  # If mirror exists, fetch; else clone --mirror
+  if [ -d "$vcsdir/refs" ] || [ -d "$vcsdir/objects" ]; then
+    verbose "Atualizando mirror git em $vcsdir"
+    pushd "$vcsdir" >/dev/null 2>&1 || true
+    # try fetch with retries
+    if ! _retry_with_backoff "$retries" git remote update --prune >>"$LOGFILE" 2>&1; then
+      err "git remote update falhou para $url"
+      release_lock_for "$lockfile" "$fd" || true
+      popd >/dev/null 2>&1 || true
+      return 5
+    fi
+    popd >/dev/null 2>&1 || true
+  else
+    verbose "Clonando mirror git $url para $vcsdir"
+    if ! _retry_with_backoff "$retries" git clone --mirror "$url" "$vcsdir" >>"$LOGFILE" 2>&1; then
+      err "git clone --mirror falhou para $url"
+      release_lock_for "$lockfile" "$fd" || true
+      return 6
+    fi
+  fi
+
+  # create a tarball of specified ref (ver can be tag/branch); try to resolve ver -> commit
+  local commitish="${ver:-HEAD}"
+  # resolve tag to commit
+  local commit
+  commit="$(git --git-dir="$vcsdir" rev-parse --verify "$commitish" 2>/dev/null || true)"
+  if [ -z "$commit" ]; then
+    # try refs/tags/$ver or refs/heads/$ver
+    commit="$(git --git-dir="$vcsdir" rev-parse --verify "refs/tags/$commitish" 2>/dev/null || true)"
+  fi
+  if [ -z "$commit" ]; then
+    commit="$(git --git-dir="$vcsdir" rev-parse --verify "refs/heads/$commitish" 2>/dev/null || true)"
+  fi
+  if [ -z "$commit" ]; then
+    warn "Não foi possível resolver $ver para commit; usando HEAD"
+    commit="$(git --git-dir="$vcsdir" rev-parse --verify HEAD 2>/dev/null || true)"
+  fi
+
+  # create tarball in dest directory
+  local tar_dest="$dest"
+  safe_mkdir "$(dirname "$tar_dest")" || { release_lock_for "$lockfile" "$fd" || true; return 7; }
+  # Use git archive to create tar (requires non-bare worktree -> use git archive --remote if supported)
+  # We'll use a temporary bare-to-temp clone to archive if needed
+  local tmp_clone="${WORKDIR}/git-archive-${pkg}-${TS}"
+  rm -rf "$tmp_clone" 2>/dev/null || true
+  if git clone --no-checkout --local "$vcsdir" "$tmp_clone" >>"$LOGFILE" 2>&1; then
+    pushd "$tmp_clone" >/dev/null 2>&1 || true
+    if git archive --format=tar --output="$tar_dest" "$commit" >>"$LOGFILE" 2>&1; then
+      ok "Tarball git criado: $tar_dest"
+    else
+      err "git archive falhou para $commit"
+      release_lock_for "$lockfile" "$fd" || true
+      popd >/dev/null 2>&1 || true
+      rm -rf "$tmp_clone" 2>/dev/null || true
+      return 8
+    fi
+    popd >/dev/null 2>&1 || true
+    rm -rf "$tmp_clone" 2>/dev/null || true
+  else
+    # fallback: use git --git-dir archive via git archive --remote (may not be supported)
+    if git --git-dir="$vcsdir" archive --format=tar -o "$tar_dest" "$commit" >>"$LOGFILE" 2>&1; then
+      ok "Tarball git criado (direct): $tar_dest"
+    else
+      err "Falha em criar tarball git para $pkg"
+      release_lock_for "$lockfile" "$fd" || true
+      return 9
+    fi
+  fi
+
+  # verify sha if provided
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ]; then
+    if [ "$HAS_SHA256SUM" -eq 1 ]; then
+      if ! verify_cached_file "$tar_dest" "$expected_sha"; then
+        warn "Tarball git verificado com erro: $tar_dest"
+        release_lock_for "$lockfile" "$fd" || true
+        return 10
+      fi
+    fi
+  fi
+
+  # write meta and release lock
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$tar_dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$tar_dest" "$url" "$sha_val"
+  _report_add_fetched "$pkg" "$ver" "$tar_dest" "$sha_val" "$url"
+  release_lock_for "$lockfile" "$fd" || true
+  return 0
+}
+
+##### -------------------------
+##### _download_with_hg
+##### -------------------------
+_download_with_hg() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  ## REDE: hg operations
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) _download_with_hg $url -> $dest"
+    return 0
+  fi
+  if [ "$HAS_HG" -ne 1 ]; then
+    err "hg não disponível"
+    return 2
+  fi
+  local vcsdir
+  vcsdir="$(vcs_cache_dir "$pkg" "$ver")"
+  safe_mkdir "$vcsdir" || return 3
+
+  # if exists, pull; else clone
+  if [ -d "$vcsdir/.hg" ]; then
+    verbose "hg pull -u em $vcsdir"
+    if ! _retry_with_backoff "$retries" hg --config ui.timeout="$timeout" -R "$vcsdir" pull -u "$url" >>"$LOGFILE" 2>&1; then
+      err "hg pull falhou para $url"
+      return 5
+    fi
+  else
+    if ! _retry_with_backoff "$retries" hg clone --noupdate --config ui.timeout="$timeout" "$url" "$vcsdir" >>"$LOGFILE" 2>&1; then
+      err "hg clone falhou para $url"
+      return 6
+    fi
+  fi
+
+  # create tarball of revision ver (if provided) or tip
+  local rev="${ver:-tip}"
+  local tar_dest="$dest"
+  if ! hg -R "$vcsdir" archive -r "$rev" -t tar -I . -p "" -o "$tar_dest" >>"$LOGFILE" 2>&1; then
+    err "hg archive falhou para $rev"
+    return 7
+  fi
+
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+    if ! verify_cached_file "$tar_dest" "$expected_sha"; then return 8; fi
+  fi
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$tar_dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$tar_dest" "$url" "$sha_val"
+  _report_add_fetched "$pkg" "$ver" "$tar_dest" "$sha_val" "$url"
+  return 0
+}
+
+##### -------------------------
+##### _download_with_svn
+##### -------------------------
+_download_with_svn() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  ## REDE: svn operations
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) _download_with_svn $url -> $dest"
+    return 0
+  fi
+  if [ "$HAS_SVN" -ne 1 ]; then
+    err "svn não disponível"
+    return 2
+  fi
+  local tmpdir="${WORKDIR}/svn-$pkg-$TS"
+  rm -rf "$tmpdir" 2>/dev/null || true
+  safe_mkdir "$tmpdir" || return 3
+  local checkout_url="$url"
+  local revopt=""
+  if [ -n "$ver" ] && [ "$ver" != "-" ]; then
+    # if ver is a revision or tag path, user must give appropriate url; else we checkout and then export
+    :
+  fi
+  if ! _retry_with_backoff "$retries" svn checkout --non-interactive "$checkout_url" "$tmpdir" >>"$LOGFILE" 2>&1; then
+    err "svn checkout falhou para $url"
+    return 4
+  fi
+  # create tarball from tmpdir
+  local tar_dest="$dest"
+  if ! tar -C "$tmpdir" -cf - . | xz -9 >"$tar_dest" 2>>"$LOGFILE"; then
+    err "Falha ao compactar checkout svn"
+    rm -rf "$tmpdir" 2>/dev/null || true
+    return 5
+  fi
+  rm -rf "$tmpdir" 2>/dev/null || true
+
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+    if ! verify_cached_file "$tar_dest" "$expected_sha"; then return 6; fi
+  fi
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$tar_dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$tar_dest" "$url" "$sha_val"
+  _report_add_fetched "$pkg" "$ver" "$tar_dest" "$sha_val" "$url"
+  return 0
+}
+
+##### -------------------------
+##### _download_with_rsync
+##### -------------------------
+_download_with_rsync() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  ## REDE: rsync network operation
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) rsync $url -> $dest"
+    return 0
+  fi
+  if [ "$HAS_RSYNC" -ne 1 ]; then
+    err "rsync não disponível"
+    return 2
+  fi
+  safe_mkdir "$(dirname "$dest")" || return 3
+  # use --partial for resume and --remove-source-files not used (we keep remote)
+  if ! _retry_with_backoff "$retries" rsync -avz --partial --timeout="$timeout" "$url" "$(dirname "$dest")/" >>"$LOGFILE" 2>&1; then
+    err "rsync falhou para $url"
+    _report_add_error "rsync:$url"
+    return 4
+  fi
+  # locate downloaded file inside destination dir (guess by basename)
+  local base="$(basename "$url")"
+  local downloaded="$(find "$(dirname "$dest")" -maxdepth 1 -type f -name "$base" -print -quit 2>/dev/null || true)"
+  if [ -z "$downloaded" ]; then
+    # maybe remote was a directory; create tarball of dir
+    local dir_downloaded="$(dirname "$dest")/$(basename "$url")"
+    if [ -d "$dir_downloaded" ]; then
+      tar -C "$(dirname "$dir_downloaded")" -cf - "$(basename "$dir_downloaded")" | xz -9 >"$dest" 2>>"$LOGFILE" || true
+      downloaded="$dest"
+    fi
+  fi
+  if [ -z "$downloaded" ]; then
+    err "Não foi possível localizar arquivo baixado via rsync para $url"
+    return 5
+  fi
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+    if ! verify_cached_file "$downloaded" "$expected_sha"; then return 6; fi
+  fi
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$downloaded" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$downloaded" "$url" "$sha_val"
+  _report_add_fetched "$pkg" "$ver" "$downloaded" "$sha_val" "$url"
+  return 0
+}
+
+##### -------------------------
+##### _download_with_http_or_ftp (curl/wget resume)
+##### - supports Range/resume, redirects, timeouts
+##### - writes to tmp .part then moves atomically to dest
+##### -------------------------
+_download_with_http_or_ftp() {
+  local url="$1" dest="$2" expected_sha="$3" retries="${4:-$RETRIES}" timeout="${5:-$TIMEOUT}" pkg="$6" ver="$7"
+  ## REDE: HTTP/FTP download
+  safe_mkdir "$(dirname "$dest")" || return 3
+  local part="${dest}.part"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) download http/ftp $url -> $dest"
+    return 0
+  fi
+
+  # try continue if part exists
+  local resume_opt_curl resume_opt_wget
+  if [ -f "$part" ]; then
+    resume_opt_curl="--continue-at -"
+    resume_opt_wget="--continue"
+  fi
+
+  # choose curl if available
+  if [ "$HAS_CURL" -eq 1 ]; then
+    local attempt=0 rc=0
+    while [ $attempt -lt "$retries" ]; do
+      attempt=$((attempt+1))
+      verbose "curl attempt $attempt/$retries for $url"
+      if curl -fL --connect-timeout 10 --max-time "$timeout" $resume_opt_curl -o "$part" "$url" >>"$LOGFILE" 2>&1; then
+        rc=0; break
+      else
+        rc=$?
+        warn "curl failed attempt $attempt/$retries (rc=$rc) for $url"
+        sleep $(( BACKOFF_BASE ** attempt ))
+      fi
+    done
+    if [ $rc -ne 0 ]; then
+      err "curl falhou para $url após $retries tentativas"
+      _report_add_error "curl:$url"
+      return $rc
+    fi
+  elif [ "$HAS_WGET" -eq 1 ]; then
+    local attempt=0 rc=0
+    while [ $attempt -lt "$retries" ]; do
+      attempt=$((attempt+1))
+      verbose "wget attempt $attempt/$retries for $url"
+      if wget --timeout="$timeout" $resume_opt_wget -O "$part" "$url" >>"$LOGFILE" 2>&1; then
+        rc=0; break
+      else
+        rc=$?
+        warn "wget failed attempt $attempt/$retries (rc=$rc) for $url"
+        sleep $(( BACKOFF_BASE ** attempt ))
+      fi
+    done
+    if [ $rc -ne 0 ]; then
+      err "wget falhou para $url após $retries tentativas"
+      _report_add_error "wget:$url"
+      return $rc
+    fi
+  else
+    err "Nenhum downloader HTTP/FTP disponível (curl/wget)"
+    return 4
+  fi
+
+  # move part -> dest atomically
+  if mv -f "$part" "$dest" 2>>"$LOGFILE"; then
+    ok "Download concluído: $dest"
+  else
+    err "mv do part para dest falhou: $part -> $dest"
+    _report_add_error "mv_failed:$part"
+    return 5
+  fi
+
+  # verify sha if requested
+  if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ]; then
+    if [ "$HAS_SHA256SUM" -eq 1 ]; then
+      if ! verify_cached_file "$dest" "$expected_sha"; then return 6; fi
+    fi
+  fi
+
+  # write meta
+  local sha_val="unknown"
+  if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$dest" | awk '{print $1}' || echo "unknown")"; fi
+  write_cache_meta "$dest" "$url" "$sha_val"
+  _report_add_fetched "$pkg" "$ver" "$dest" "$sha_val" "$url"
+  return 0
+}
+
+##### -------------------------
+##### download_worker: orchestrates a single download job based on classified type
+##### Input (env): TYPE|URL|EXPECTED_SHA|PKG|VER
+##### -------------------------
+download_worker() {
+  local spec="$1"
+  # spec format: type|url|expected_sha|pkg|ver|dest
+  IFS='|' read -r typ url expected_sha pkg ver dest <<<"$spec"
+  if [ -z "$typ" ] || [ -z "$url" ] || [ -z "$dest" ]; then
+    err "download_worker: spec inválido: $spec"
+    return 2
+  fi
+  verbose "Worker iniciando: $typ $url -> $dest"
+  case "$typ" in
+    git) _download_with_git "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver" ;;
+    hg) _download_with_hg "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver" ;;
+    svn) _download_with_svn "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver" ;;
+    rsync) _download_with_rsync "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver" ;;
+    http|ftp) _download_with_http_or_ftp "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver" ;;
+    magnet|torrent)
+      if [ "$HAS_ARIA2" -eq 1 ]; then
+        _download_with_aria2 "$url" "$dest" "$expected_sha" "$RETRIES" "$TIMEOUT" "$pkg" "$ver"
+      else
+        err "torrent/magnet solicitado mas aria2 não disponível"
+        return 3
+      fi
+      ;;
+    file)
+      # copy local file
+      if [ "$DRY_RUN" -eq 1 ]; then
+        info "(dry-run) copiar file:// $url -> $dest"
+        return 0
+      fi
+      # strip file://
+      local path="${url#file://}"
+      if [ ! -e "$path" ]; then
+        err "Arquivo local não encontrado: $path"
+        return 4
+      fi
+      safe_mkdir "$(dirname "$dest")" || return 5
+      if cp -a "$path" "$dest" >>"$LOGFILE" 2>&1; then
+        ok "Copiado local $path -> $dest"
+        if [ -n "$expected_sha" ] && [ "$expected_sha" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+          if ! verify_cached_file "$dest" "$expected_sha"; then return 6; fi
+        fi
+        local sha_val="unknown"
+        if [ "$HAS_SHA256SUM" -eq 1 ]; then sha_val="$(sha256sum "$dest" | awk '{print $1}' || echo "unknown")"; fi
+        write_cache_meta "$dest" "$url" "$sha_val"
+        _report_add_fetched "$pkg" "$ver" "$dest" "$sha_val" "$url"
+        return 0
+      else
+        err "Falha ao copiar $path"
+        return 7
+      fi
+      ;;
+    *)
+      err "Tipo desconhecido no worker: $typ"
+      return 8
+      ;;
+  esac
+  return $?
+}
+
+##### -------------------------
+##### build_download_specs_for_metafile
+##### - For a given metafile, produce list of specs: type|url|expected_sha|pkg|ver|dest
+##### - Dest computed via cache_tarball_path_for or vcs_cache
+##### -------------------------
+build_download_specs_for_metafile() {
+  local mf="$1"
+  parse_metafile "$mf" || return 2
+  local pkg="$MF_NAME" ver="$MF_VERSION"
+  local idx=0
+  local specs=()
+  for src in "${MF_SOURCES[@]:-}"; do
+    idx=$((idx+1))
+    # classify
+    read -r typ url extra <<<"$(classify_source "$src" | tr -d '\r')"
+    local expected=""
+    if [ "${#MF_SHA256S[@]}" -ge "$idx" ]; then expected="${MF_SHA256S[$((idx-1))]}"; fi
+    if [ -z "$expected" ] && [ "${#MF_SHA256S[@]}" -eq 1 ]; then expected="${MF_SHA256S[0]}"; fi
+
+    # destination selection
+    local dest
+    case "$typ" in
+      git|hg|svn)
+        # create tarball filename pkg-ver-vcs.tar
+        local fname="$(printf '%s-%s-vcs.tar' "$pkg" "$ver")"
+        dest="$(cache_tarball_path_for "$pkg" "$ver" "$fname")"
+        ;;
+      http|ftp|rsync|file)
+        # use basename of url
+        local base="$(basename "$url")"
+        # if query params present, sanitize
+        base="$(printf '%s' "$base" | sed -e 's/[?].*$//')"
+        if [ -z "$base" ]; then base="$(printf '%s-%s' "$pkg" "$ver")"; fi
+        dest="$(cache_tarball_path_for "$pkg" "$ver" "$base")"
+        ;;
+      torrent|magnet)
+        # use pkg-ver.torrent or magnet -> pkg-ver.torrent
+        local base="$(printf '%s-%s.torrent' "$pkg" "$ver")"
+        dest="$(cache_tarball_path_for "$pkg" "$ver" "$base")"
+        ;;
+      unknown)
+        warn "Fonte com tipo desconhecido: $src (será ignorada)"
+        _report_add_error "unknown_source:$pkg|$src"
+        continue
+        ;;
+      *)
+        # fallback: treat as http
+        local base="$(basename "$url")"
+        dest="$(cache_tarball_path_for "$pkg" "$ver" "$base")"
+        ;;
+    esac
+    specs+=("${typ}|${url}|${expected:-}|${pkg}|${ver}|${dest}")
+  done
+
+  # print specs (caller will read lines)
+  for s in "${specs[@]:-}"; do
+    printf "%s\n" "$s"
+  done
+  return 0
+}
+
+##### -------------------------
+##### worker pool orchestration
+##### - spawn parallel workers reading specs from an array
+##### - ensures not more than JOB_MAX concurrent jobs
+##### -------------------------
+_run_specs_parallel() {
+  local specs=("$@")
+  local total="${#specs[@]}"
+  local i=0
+  JOB_PIDS=()
+  while [ "$i" -lt "$total" ]; do
+    # wait for slot
+    while [ "${#JOB_PIDS[@]}" -ge "$JOB_MAX" ]; do
+      # reap finished jobs
+      local newpids=()
+      for pid in "${JOB_PIDS[@]}"; do
+        if kill -0 "$pid" >/dev/null 2>&1; then
+          newpids+=("$pid")
+        else
+          wait "$pid" || true
+        fi
+      done
+      JOB_PIDS=("${newpids[@]}")
+      sleep 0.1
+    done
+    spec="${specs[$i]}"
+    # spawn worker in background
+    (
+      download_worker "$spec"
+    ) &
+    pid=$!
+    JOB_PIDS+=("$pid")
+    i=$((i+1))
+  done
+
+  # wait all
+  for pid in "${JOB_PIDS[@]:-}"; do
+    wait "$pid" || true
+  done
+  JOB_PIDS=()
+  return 0
+}
+
+##### -------------------------
+##### Public function: fetch_metafile_sources
+##### - Given a metafile path, builds specs and runs them (supports --verify-only and --force)
+##### -------------------------
+fetch_metafile_sources() {
+  local mf="$1"
+  if [ -z "$mf" ] || [ ! -f "$mf" ]; then
+    err "fetch_metafile_sources: metafile inválido: $mf"
+    return 2
+  fi
+  parse_metafile "$mf" || return 3
+  local pkg="$MF_NAME" ver="$MF_VERSION"
+
+  info "Preparando downloads para $pkg:$ver (sources=${#MF_SOURCES[@]})"
+  # build specs
+  mapfile -t specs < <(build_download_specs_for_metafile "$mf" 2>/dev/null || true)
+  if [ "${#specs[@]}" -eq 0 ]; then
+    warn "Nenhuma fonte válida encontrada para $pkg"
+    return 0
+  fi
+
+  # filter specs: if not FORCE and dest exists and sha matches -> skip
+  local to_run=()
+  for s in "${specs[@]}"; do
+    IFS='|' read -r typ url expected pkg2 ver2 dest <<<"$s"
+    if [ -f "$dest" ] && [ "$FORCE" -ne 1 ]; then
+      if [ -n "$expected" ] && [ "$expected" != "-" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+        if verify_cached_file "$dest" "$expected" >/dev/null 2>&1; then
+          verbose "Arquivo em cache ok, pulando: $dest"
+          _report_add_skipped "$pkg2" "$ver2" "cached_ok"
+          continue
+        else
+          warn "Arquivo em cache corrompido ou mismatch, será rebaixado: $dest"
+        fi
+      else
+        verbose "Arquivo em cache presente, sem sha para verificar: $dest (pulando)"
+        _report_add_skipped "$pkg2" "$ver2" "cached_present_no_sha"
+        continue
+      fi
+    fi
+    to_run+=("$s")
+  done
+
+  if [ "${#to_run[@]}" -eq 0 ]; then
+    ok "Nada para baixar para $pkg:$ver"
+    return 0
+  fi
+
+  # parallel execution
+  info "Iniciando downloads (parallel=${JOB_MAX}) para $pkg:$ver -> ${#to_run[@]} job(s)"
+  _run_specs_parallel "${to_run[@]}"
+  ok "Downloads agendados/concluídos para $pkg:$ver"
+  return 0
+}
+
+##### -------------------------
+##### verify_cache_for_metafile
+##### - Verify all cache entries for given metafile (or --all)
+##### -------------------------
+verify_cache_for_metafile() {
+  local mf="$1"
+  parse_metafile "$mf" || return 2
+  local pkg="$MF_NAME" ver="$MF_VERSION"
+  info "Verificando cache para $pkg:$ver"
+  # find files under cache_base_for
+  local base
+  base="$(cache_base_for "$pkg" "$ver")"
+  if [ ! -d "$base" ]; then
+    warn "Cache inexistente para $pkg:$ver"
+    return 0
+  fi
+  find "$base" -type f ! -name ".source.meta" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    # get expected sha from file.sha256 or .source.meta
+    local expected="-"
+    if [ -f "${f}.sha256" ]; then
+      expected="$(awk '{print $1}' "${f}.sha256" 2>/dev/null || true)"
+    elif [ -f "${base}/.source.meta" ]; then
+      expected="$(awk -F': ' '/^sha256:/{print $2;exit}' "${base}/.source.meta" 2>/dev/null || true)"
+    fi
+    if [ -n "$expected" ] && [ "$expected" != "-" ]; then
+      if ! verify_cached_file "$f" "$expected"; then
+        warn "Arquivo corrompido detectado: $f"
+      fi
+    else
+      verbose "Sem sha conhecido para $f; saltando verificação"
+    fi
+  done
+  ok "Verificação concluída para $pkg:$ver"
+  return 0
+}
+
+##### -------------------------
+##### clean_cache_older_than <days>
+##### - Removes caches older than specified days by moving to corrupted/old (calls mark_cache_corrupted)
+##### -------------------------
+clean_cache_older_than() {
+  local days="${1:-90}"
+  info "Limpando caches com mais de ${days} dias em $ADM_SOURCES_CACHE"
+  find "$ADM_SOURCES_CACHE" -mindepth 2 -maxdepth 3 -type d -mtime +"$days" -print0 2>/dev/null | while IFS= read -r -d '' d; do
+    # find tarballs inside and move them to corrupted area
+    find "$d" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+      mark_cache_corrupted "$f" "old"
+    done
+    # optionally remove empty dirs
+    rmdir --ignore-fail-on-non-empty "$d" 2>/dev/null || true
+  done
+  ok "Limpeza de cache antigo concluída."
+  return 0
+}
+
+##### -------------------------
+##### finalize PART 2/3
+##### - message and instructions for PART 3/3
+##### -------------------------
+_part2_ready() {
+  echo
+  echo "adm-downloader PARTE 2/3 gerada com sucesso."
+  echo "Implementa downloads reais para git/hg/svn/rsync/http/ftp/file/torrent(magnet via aria2)."
+  echo "Use --dry-run para testar. Em caso de problemas, veja o log em $LOGFILE."
+  echo "Agora falta a PARTE 3/3 (main CLI hooks, resume policies avançadas, rate limiting e resumo final)."
+  echo
+}
+
+_part2_ready
+
+# End of PARTE 2/3
+# PARTE 3/3 will:
+#  - Provide main dispatch wiring for commands (fetch/verify/clean-cache)
+#  - Implement resume policies, rate limiting, global progress bars, advanced retries
+#  - Provide consistent exit codes and final JSON summary
+#  - Provide integration functions for adm-build (pull cached sources into build tree)
+#
+##### -------------------------
+##### adm-downloader PARTE 3/3 (final)
+##### -------------------------
+# Final wiring: main dispatcher, resume policies, rate limiting (simple), integration stubs, final report.
+# Assumes PARTE 1/3 e PARTE 2/3 já carregadas no mesmo arquivo.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Exit codes
+EX_OK=0
+EX_WARN=1
+EX_FAIL=2
+EX_LOCK=3
+EX_INTERRUPT=130
+
+# simple rate-limit: sleep between downloads if RATE_LIMIT_MS > 0
+RATE_LIMIT_MS="${RATE_LIMIT_MS:-0}"
+
+# Graceful interrupt handler
+_on_interrupt() {
+  err "Interrompido pelo usuário. Liberando recursos..."
+  # try to kill background jobs
+  for p in "${JOB_PIDS[@]:-}"; do
+    kill "$p" >/dev/null 2>&1 || true
+  done
+  # cleanup workdir if desired (keeps partials for resume)
+  # do not remove caches by default
+  exit "$EX_INTERRUPT"
+}
+trap _on_interrupt INT TERM
+
+# helper: human-friendly elapsed
+_elapsed() {
+  local s=$1
+  printf '%02dh:%02dm:%02ds' $((s/3600)) $((s%3600/60)) $((s%60))
+}
+
+# integration helper for adm-build: returns path to cached tarball for package/version if exists
+# adm-build expects a tarball or directory to unpack. This function will return the first verified tarball path or empty.
+get_cached_tarball_for_pkg() {
+  local pkg="$1" ver="$2"
+  local base
+  base="$(cache_base_for "$pkg" "$ver")"
+  if [ -z "$base" ] || [ ! -d "$base" ]; then
+    printf ""
+    return 1
+  fi
+  # prefer files that are not marked corrupted
+  local f
+  while IFS= read -r -d '' f; do
+    # skip meta files
+    case "$f" in *.sha256|*.meta) continue ;; esac
+    # skip files in .corrupted
+    if printf '%s' "$f" | grep -q '/.corrupted/'; then continue; fi
+    # verify if .sha256 exists and matches
+    if [ -f "${f}.sha256" ] && [ "$HAS_SHA256SUM" -eq 1 ]; then
+      expected="$(awk '{print $1}' "${f}.sha256" 2>/dev/null || true)"
+      if [ -n "$expected" ]; then
+        if verify_cached_file "$f" "$expected" >/dev/null 2>&1; then
+          printf "%s" "$f"; return 0
+        else
+          # mark handled by verify_cached_file
+          continue
+        fi
+      fi
+    else
+      # no sha, but return as candidate
+      printf "%s" "$f"; return 0
+    fi
+  done < <(find "$base" -maxdepth 1 -type f -print0 2>/dev/null)
+  printf ""
+  return 1
+}
+
+# resume_policy: few heuristics to prefer resume vs restart
+# returns 0 for resume, 1 for restart
+resume_policy_should_resume() {
+  local partfile="$1"
+  if [ ! -f "$partfile" ]; then
+    return 1
+  fi
+  # if partfile size > 1MB, try resume
+  local size
+  size="$(stat -c%s "$partfile" 2>/dev/null || echo 0)"
+  if [ "$size" -gt 1048576 ]; then
+    return 0
+  fi
+  return 1
+}
+
+# top-level command handlers
+_cmd_fetch() {
+  local pkg="$1"
+  local all_sources=0
+  # optional second arg: --all-sources
+  if [ "${2:-}" = "--all-sources" ]; then all_sources=1; fi
+
+  if [ -z "$pkg" ]; then
+    err "fetch requer pacote"
+    return $EX_FAIL
+  fi
+
+  local mf
+  mf="$(find_metafile_for_pkg "$pkg" 2>/dev/null || true)"
+  if [ -z "$mf" ]; then
+    err "Metafile não encontrado para $pkg"
+    return $EX_FAIL
+  fi
+
+  # initialize report
+  _report_init
+  local start_ts=$(date +%s)
+  info "Iniciando fetch para $pkg (dry-run=$DRY_RUN) ..."
+
+  # fetch sources (handles skip if cached and ok)
+  if [ "$VERIFY_ONLY" -eq 1 ]; then
+    info "Modo verify-only: apenas verificando cache para $pkg"
+    verify_cache_for_metafile "$mf" || warn "Verificação terminou com avisos"
+  else
+    fetch_metafile_sources "$mf" || warn "Fetch concluído com avisos"
+  fi
+
+  # summary
+  local end_ts=$(date +%s)
+  local elapsed=$((end_ts - start_ts))
+  info "Fetch finalizado: $pkg (tempo: $(_elapsed $elapsed))"
+  [ "$OUTPUT_JSON" -eq 1 ] && printf "Relatório escrito em %s\n" "$REPORT_JSON"
+  return 0
+}
+
+_cmd_verify() {
+  local target="${1:-}"
+  local start_ts=$(date +%s)
+  _report_init
+  if [ -z "$target" ] || [ "$target" = "--all" ]; then
+    info "Verificando todo cache em $ADM_SOURCES_CACHE ..."
+    # iterate all metafiles and verify
+    if [ -d "$ADM_ROOT/metafiles" ]; then
+      while IFS= read -r -d '' mf; do
+        verify_cache_for_metafile "$mf" || warn "Verificação com avisos para $mf"
+      done < <(find "$ADM_ROOT/metafiles" -type f -name metafile -print0 2>/dev/null)
+    else
+      warn "Nenhum metafiles encontrado em $ADM_ROOT/metafiles"
+    fi
+  else
+    local mf
+    mf="$(find_metafile_for_pkg "$target" 2>/dev/null || true)"
+    if [ -z "$mf" ]; then
+      err "Metafile não encontrado para $target"
+      return $EX_FAIL
+    fi
+    verify_cache_for_metafile "$mf" || warn "Verificação com avisos"
+  fi
+  local end_ts=$(date +%s)
+  info "verify concluído em $((end_ts - start_ts))s"
+  return 0
+}
+
+_cmd_clean_cache() {
+  local older_days="${1:-}"
+  if [ -z "$older_days" ]; then older_days=90; fi
+  info "clean-cache: movendo caches antigos (>${older_days} dias) para .corrupted"
+  clean_cache_older_than "$older_days" || warn "clean-cache terminou com avisos"
+  return 0
+}
+
+# main dispatch (already partially parsed in PART 1/3)
+# supports:
+#   adm-downloader fetch <pkg> [--all-sources]
+#   adm-downloader verify <pkg|--all>
+#   adm-downloader clean-cache [--older-than N]
+_main_dispatch() {
+  case "$CMD" in
+    fetch)
+      _cmd_fetch "$TARGET_PKG" "${POSITIONAL[1]:-}"
+      ;;
+    verify)
+      _cmd_verify "${TARGET_PKG:-}" 
+      ;;
+    clean-cache)
+      # allow --older-than as next positional
+      local days="${POSITIONAL[0]:-}"
+      _cmd_clean_cache "${days:-90}"
+      ;;
+    *)
+      err "Comando desconhecido: $CMD"
+      usage
+      ;;
+  esac
+}
+
+# start timer and run
+START_TS=$(date +%s)
+_check_tools
+_report_init
+
+# Acquire global lock to avoid multiple downloader runs colliding on cache metadata
+GLOBAL_LOCK="${ADM_TMP}/adm-downloader-global.lock"
+_acquire_global_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) acquiring global lock $GLOBAL_LOCK"
+    return 0
+  fi
+  exec 8>"$GLOBAL_LOCK"
+  if ! flock -n 8; then
+    err "Outra instância de adm-downloader está ativa (lock: $GLOBAL_LOCK)."
+    return 1
+  fi
+  printf "%s\n" "$$" >"${GLOBAL_LOCK}.pid" 2>/dev/null || true
+  return 0
+}
+_release_global_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) release global lock $GLOBAL_LOCK"
+    return 0
+  fi
+  rm -f "${GLOBAL_LOCK}.pid" 2>/dev/null || true
+  eval "exec 8>&-"
+  return 0
+}
+
+_acquire_global_lock || exit $EX_LOCK
+
+# run main dispatch
+_run_rc=0
+_main_dispatch || _run_rc=$?
+
+# final actions
+_release_global_lock || true
+END_TS=$(date +%s)
+TOTAL_ELAPSED=$((END_TS - START_TS))
+
+# final summary
+echo
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$_run_rc" -eq 0 ]; then
+  printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "adm-downloader concluído com sucesso."
+else
+  printf "%b %s (rc=%s)%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "adm-downloader finalizado com erros" "$_run_rc" "${CLR_RESET}"
+fi
+printf "%b Tempo total:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$(_elapsed $TOTAL_ELAPSED)"
+printf "%b Log:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$LOGFILE"
+printf "%b Relatório:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$REPORT_JSON"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+exit "$_run_rc"
+
+##### -------------------------
+##### FIM adm-downloader
+##### -------------------------
+# Observações finais:
+# - Teste com: adm-downloader --dry-run fetch bash
+# - Use adm-downloader verify --all para checar todo cache
+# - adm-build pode chamar get_cached_tarball_for_pkg para reutilizar fontes baixadas
+# - Logs em: $LOGFILE
+# - Todos os pontos de rede são tratados com retries, verificações de sha e fallback entre curl/wget
+# - Em caso de problemas pesados de I/O, reduza --parallel e use --timeout menor
+#
