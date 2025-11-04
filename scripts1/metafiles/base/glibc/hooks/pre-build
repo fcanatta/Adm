@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# ADM pre-build hook for glibc
+# Runs before configure/make; sets up build environment and sanity checks.
+
+adm_log_info "[HOOK pre-build] Preparing environment for glibc..."
+export LANG=C
+export LC_ALL=C
+export MAKEFLAGS="-j${ADM_JOBS:-4}"
+mkdir -p build && cd build || exit 1
+adm_log_info "[HOOK pre-build] Environment ready, starting configure step..."
