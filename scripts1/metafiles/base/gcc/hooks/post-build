@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# ADM post-build hook for GCC
+# Runs after build/install to verify and strip binaries
+
+adm_log_info "[HOOK post-build] Stripping unneeded symbols..."
+find "${DESTDIR:-/usr/local}" -type f -executable -exec strip --strip-unneeded {} + 2>/dev/null || true
+adm_log_ok "[HOOK post-build] GCC build finished successfully."
