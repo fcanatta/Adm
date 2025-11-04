@@ -1,0 +1,879 @@
+#!/usr/bin/env bash
+# adm-bootstrap - Part 1/3
+# Automated multi-stage bootstrap for ADM system (stage0..stage3)
+# Safe by default: dry-run mode. All destructive commands are commented and marked with
+# "# UNCOMMENT FOR REAL EXECUTION (in chroot only)".
+#
+# Generates isolated chroot environments for toolchain and system build stages.
+# Integrates with adm-logger, adm-build, adm-install, adm-hooks, adm-meta.
+#
+set -euo pipefail
+shopt -s extglob
+
+# -------------------------------------------------------
+# CONFIGURATION
+# -------------------------------------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_PROFILES_DIR:=$ADM_ROOT/profiles}"
+: "${ADM_CHROOTS_DIR:=$ADM_ROOT/chroots}"
+: "${ADM_STATE_DIR:=$ADM_ROOT/state/bootstrap}"
+: "${ADM_LOCK_DIR:=$ADM_STATE_DIR/locks}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/bootstrap}"
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+: "${ADM_JOBS:=$(nproc 2>/dev/null || echo 1)}"
+: "${ADM_DRY_RUN:=1}"
+: "${ADM_ALLOW_EXECUTION:=0}"
+: "${ADM_VERBOSE:=1}"
+: "${ADM_DEFAULT_PROFILE:=normal}"
+
+mkdir -p "$ADM_LOG_DIR" "$ADM_TMPDIR" "$ADM_STATE_DIR" "$ADM_LOCK_DIR" "$ADM_PROFILES_DIR" "$ADM_CHROOTS_DIR" 2>/dev/null || true
+
+# -------------------------------------------------------
+# LOGGER
+# -------------------------------------------------------
+if [ -x "$ADM_BIN_DIR/adm-logger" ]; then
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info()    { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_error()   { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_debug()   { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+adm_log_info "Starting ADM Bootstrap (dry-run=$ADM_DRY_RUN, allow-exec=$ADM_ALLOW_EXECUTION)"
+
+# -------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------
+_adm_bootstrap_bytes_human() {
+  local bytes="$1"
+  local units=(B KB MB GB TB)
+  local i=0
+  while (( bytes > 1024 && i < ${#units[@]} - 1 )); do
+    bytes=$((bytes / 1024))
+    ((i++))
+  done
+  printf "%s%s" "$bytes" "${units[$i]}"
+}
+
+_adm_bootstrap_safe_rm() {
+  local path="$1"
+  [[ "$path" == "$ADM_ROOT"* ]] || { adm_log_error "Unsafe path: $path"; return 1; }
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] rm -rf $path"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rm -rf -- "$path"
+  else
+    adm_log_info "[DRY-RUN] Would remove $path"
+  fi
+}
+
+_adm_bootstrap_safe_mkdir() {
+  local dir="$1"
+  if [ ! -d "$dir" ]; then
+    adm_log_info "Creating directory: $dir"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] mkdir -p $dir"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # mkdir -p "$dir"
+    else
+      adm_log_info "[DRY-RUN] Would create directory: $dir"
+    fi
+  fi
+}
+
+_adm_bootstrap_lockfile() { echo "$ADM_LOCK_DIR/$1.lock"; }
+_adm_bootstrap_acquire_lock() {
+  local name="$1"; local lock
+  lock=$(_adm_bootstrap_lockfile "$name")
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    adm_log_error "Lock held for $name. Another bootstrap process may be running."
+    return 1
+  fi
+  echo "$$" > "${lock}.pid"
+  adm_log_debug "Acquired bootstrap lock for $name"
+}
+_adm_bootstrap_release_lock() {
+  local name="$1"; local lock=$(_adm_bootstrap_lockfile "$name")
+  rm -f "${lock}.pid" 2>/dev/null || true
+  exec 9>&- || true
+  adm_log_debug "Released bootstrap lock for $name"
+}
+
+# -------------------------------------------------------
+# VALIDATIONS
+# -------------------------------------------------------
+_adm_bootstrap_check_tools() {
+  local miss=0
+  for t in bash find awk sed grep sort uniq rsync mount umount chroot; do
+    if ! command -v "$t" >/dev/null 2>&1; then
+      adm_log_error "Missing required tool: $t"
+      miss=1
+    fi
+  done
+  if [ "$miss" -eq 1 ]; then
+    adm_log_error "Bootstrap prerequisites missing. Aborting."
+    return 1
+  fi
+}
+
+_adm_bootstrap_check_space() {
+  local min_gb=10
+  local available
+  available=$(df -BG "$ADM_ROOT" 2>/dev/null | awk 'NR==2{gsub("G","",$4); print $4}' || echo 0)
+  if (( available < min_gb )); then
+    adm_log_error "Insufficient disk space under $ADM_ROOT (${available}GB < ${min_gb}GB)"
+    return 1
+  fi
+  adm_log_debug "Disk space check OK (${available}GB >= ${min_gb}GB)"
+}
+
+_adm_bootstrap_validate_host_env() {
+  adm_log_info "Validating host environment..."
+  _adm_bootstrap_check_tools || return 1
+  _adm_bootstrap_check_space || return 1
+  adm_log_correct "Host environment validated."
+}
+
+# -------------------------------------------------------
+# PROFILES MANAGEMENT
+# -------------------------------------------------------
+_adm_bootstrap_profiles_init() {
+  adm_log_info "Ensuring default profiles exist..."
+  mkdir -p "$ADM_PROFILES_DIR"
+  declare -A default_profiles
+  default_profiles["normal"]='CFLAGS="-O2 -g"
+LDFLAGS=""
+ADM_TOOLCHAIN_MODE=normal
+ADM_JOBS=$(nproc)
+'
+  default_profiles["toolchain-extreme"]='CFLAGS="-O3 -march=native -flto -fomit-frame-pointer -pipe"
+LDFLAGS="-Wl,-O1 -flto"
+ADM_TOOLCHAIN_MODE=extreme
+'
+  default_profiles["lto"]='CFLAGS="-O2 -flto"
+LDFLAGS="-flto"
+ADM_TOOLCHAIN_MODE=lto
+'
+  default_profiles["debug"]='CFLAGS="-O0 -g"
+ADM_TOOLCHAIN_MODE=debug
+'
+
+  for p in "${!default_profiles[@]}"; do
+    local f="$ADM_PROFILES_DIR/$p.env"
+    if [ ! -f "$f" ]; then
+      adm_log_info "Creating default profile: $p"
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        echo "${default_profiles[$p]}" > "$f"
+      else
+        adm_log_info "[DRY-RUN] Would create profile $p.env"
+      fi
+    fi
+  done
+  adm_log_correct "Profiles initialized."
+}
+
+_adm_bootstrap_load_profile() {
+  local profile="$1"
+  local f="$ADM_PROFILES_DIR/$profile.env"
+  if [ ! -f "$f" ]; then
+    adm_log_error "Profile not found: $profile"
+    return 1
+  fi
+  adm_log_info "Loading profile: $profile"
+  # shellcheck source=/dev/null
+  source "$f"
+  export ADM_PROFILE="$profile"
+  export CFLAGS LDFLAGS ADM_TOOLCHAIN_MODE
+  adm_log_correct "Profile $profile loaded (CFLAGS=$CFLAGS)"
+}
+
+# -------------------------------------------------------
+# ENVIRONMENT EXPORT
+# -------------------------------------------------------
+_adm_bootstrap_export_env_for_stage() {
+  local stage="$1"
+  local chroot="$ADM_CHROOTS_DIR/$stage"
+  local profile="${ADM_PROFILE:-$ADM_DEFAULT_PROFILE}"
+  local envfile="$chroot/etc/profile.d/adm-bootstrap.sh"
+  adm_log_info "Exporting environment for $stage (profile=$profile)"
+  mkdir -p "$(dirname "$envfile")"
+  {
+    echo "# Auto-generated ADM bootstrap env"
+    echo "export ADM_STAGE=$stage"
+    echo "export ADM_PROFILE=$profile"
+    echo "export CFLAGS=\"$CFLAGS\""
+    echo "export LDFLAGS=\"$LDFLAGS\""
+    echo "export ADM_TOOLCHAIN_MODE=\"$ADM_TOOLCHAIN_MODE\""
+    echo "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    echo "export MAKEFLAGS=\"-j${ADM_JOBS}\""
+  } > "$envfile"
+  adm_log_correct "Environment written: $envfile"
+}
+
+# -------------------------------------------------------
+# ENVIRONMENT VALIDATION
+# -------------------------------------------------------
+_adm_bootstrap_validate_stage_name() {
+  local s="$1"
+  case "$s" in
+    stage0|stage1|stage2|stage3) return 0 ;;
+    *) adm_log_error "Invalid stage name: $s"; return 1 ;;
+  esac
+}
+
+_adm_bootstrap_chroot_path() {
+  local stage="$1"
+  echo "$ADM_CHROOTS_DIR/$stage"
+}
+
+# End of Part 1/3
+# -------------------------------------------------------
+# adm-bootstrap - Part 2/3
+# Rootfs creation, mounts, hooks, checkpoints, and stage management
+# -------------------------------------------------------
+
+# -----------------------------
+# ROOTFS CREATION & SETUP
+# -----------------------------
+_adm_bootstrap_create_rootfs_dirs() {
+  local chroot="$1"
+  adm_log_info "Creating rootfs layout in $chroot"
+
+  local dirs=(
+    bin sbin lib lib64 usr usr/bin usr/sbin usr/lib usr/lib64
+    etc var tmp run proc sys dev home root boot opt mnt media srv
+  )
+
+  for d in "${dirs[@]}"; do
+    _adm_bootstrap_safe_mkdir "$chroot/$d"
+  done
+
+  # special perms
+  adm_log_info "Setting special permissions..."
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] chmod 1777 $chroot/tmp"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # chmod 1777 "$chroot/tmp"
+  else
+    adm_log_info "[DRY-RUN] Would set sticky bit on $chroot/tmp"
+  fi
+
+  adm_log_correct "Rootfs directory layout prepared."
+}
+
+_adm_bootstrap_populate_etc() {
+  local chroot="$1"
+  adm_log_info "Populating minimal /etc in $chroot"
+
+  local etcdir="$chroot/etc"
+  _adm_bootstrap_safe_mkdir "$etcdir"
+
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    echo "root:x:0:0:root:/root:/bin/bash" > "$etcdir/passwd"
+    echo "root:x:0:" > "$etcdir/group"
+    echo "hosts: files dns" > "$etcdir/nsswitch.conf"
+  else
+    adm_log_info "[DRY-RUN] Would create basic /etc/passwd and /etc/group"
+  fi
+}
+
+_adm_bootstrap_set_permissions() {
+  local chroot="$1"
+  adm_log_info "Setting permissions for $chroot"
+
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] chown -R root:root $chroot"
+    adm_log_debug "[SIM] chmod 755 $chroot"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # chown -R root:root "$chroot"
+    # chmod 755 "$chroot"
+  else
+    adm_log_info "[DRY-RUN] Would adjust ownership and perms recursively"
+  fi
+}
+
+# -----------------------------
+# MOUNT / UMOUNT PSEUDO FILESYSTEMS
+# -----------------------------
+_adm_bootstrap_mount_pseudo() {
+  local chroot="$1"
+  adm_log_info "Mounting pseudo-filesystems for $chroot"
+
+  local mounts=(proc sys dev dev/pts run)
+  for m in "${mounts[@]}"; do
+    local src="/$m" dest="$chroot/$m"
+    _adm_bootstrap_safe_mkdir "$dest"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] mount --rbind $src $dest && mount --make-rslave $dest"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # mount --rbind "$src" "$dest"
+      # mount --make-rslave "$dest"
+    else
+      adm_log_info "[DRY-RUN] Would bind mount $src -> $dest"
+    fi
+  done
+  adm_log_correct "Pseudo-filesystems mounted (simulated)."
+}
+
+_adm_bootstrap_umount_pseudo() {
+  local chroot="$1"
+  adm_log_info "Unmounting pseudo-filesystems from $chroot"
+  local mounts=(run dev/pts dev sys proc)
+  for m in "${mounts[@]}"; do
+    local dest="$chroot/$m"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] umount -l $dest"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # umount -l "$dest" 2>/dev/null || true
+    else
+      adm_log_info "[DRY-RUN] Would unmount $dest"
+    fi
+  done
+  adm_log_correct "Unmount sequence completed."
+}
+
+# -----------------------------
+# STAGE CREATION AND SNAPSHOT
+# -----------------------------
+_adm_bootstrap_stage_exists() {
+  local s="$1"
+  [ -d "$ADM_CHROOTS_DIR/$s" ]
+}
+
+_adm_bootstrap_create_stage() {
+  local stage="$1" from_stage="${2:-}"
+  _adm_bootstrap_validate_stage_name "$stage" || return 1
+  local chroot="$ADM_CHROOTS_DIR/$stage"
+
+  adm_log_info "Creating stage: $stage (source=$from_stage)"
+  _adm_bootstrap_acquire_lock "$stage" || return 1
+
+  if _adm_bootstrap_stage_exists "$stage"; then
+    adm_log_info "$stage already exists."
+    _adm_bootstrap_release_lock "$stage"
+    return 0
+  fi
+
+  _adm_bootstrap_safe_mkdir "$chroot"
+
+  if [ -n "$from_stage" ] && _adm_bootstrap_stage_exists "$from_stage"; then
+    adm_log_info "Cloning from $from_stage → $stage"
+    local src="$ADM_CHROOTS_DIR/$from_stage"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] rsync -a --link-dest=$src $src/ $chroot/"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # rsync -a --link-dest="$src" "$src"/ "$chroot"/
+    else
+      adm_log_info "[DRY-RUN] Would clone $from_stage to $stage"
+    fi
+  else
+    _adm_bootstrap_create_rootfs_dirs "$chroot"
+    _adm_bootstrap_populate_etc "$chroot"
+    _adm_bootstrap_set_permissions "$chroot"
+  fi
+
+  echo "$stage" > "$chroot/.adm_bootstrap_stage"
+  _adm_bootstrap_release_lock "$stage"
+  adm_log_correct "Stage $stage created successfully."
+}
+
+_adm_bootstrap_snapshot_stage() {
+  local from="$1" to="$2"
+  adm_log_info "Creating snapshot $to from $from"
+  if ! _adm_bootstrap_stage_exists "$from"; then
+    adm_log_error "Source stage $from does not exist"
+    return 1
+  fi
+  _adm_bootstrap_create_stage "$to" "$from"
+  adm_log_correct "Snapshot complete."
+}
+
+# -----------------------------
+# HOOKS
+# -----------------------------
+_adm_bootstrap_run_hooks() {
+  local phase="$1" stage="$2"
+  adm_log_info "Running hooks ($phase) for $stage"
+
+  local hooks=()
+  hooks+=("$ADM_ROOT/metafiles/bootstrap/hooks/${phase}.sh")
+  hooks+=("$ADM_ROOT/hooks/bootstrap/${phase}.sh")
+  hooks+=("$ADM_ROOT/metafiles/$stage/hooks/${phase}.sh")
+
+  for hook in "${hooks[@]}"; do
+    [ -x "$hook" ] || continue
+    adm_log_info "Executing hook: $hook"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] bash $hook $stage $phase"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # bash "$hook" "$stage" "$phase" || adm_log_error "Hook failed: $hook"
+    else
+      adm_log_info "[DRY-RUN] Would run hook: $hook"
+    fi
+  done
+
+  adm_log_correct "Hooks ($phase) executed for $stage."
+}
+
+# -----------------------------
+# CHECKPOINTS
+# -----------------------------
+_adm_bootstrap_checkpoint_file() {
+  echo "$ADM_STATE_DIR/$1.checkpoint"
+}
+
+_adm_bootstrap_save_checkpoint() {
+  local stage="$1" step="$2" status="${3:-ok}"
+  local file
+  file=$(_adm_bootstrap_checkpoint_file "$stage")
+  adm_log_debug "Saving checkpoint: stage=$stage step=$step status=$status"
+  mkdir -p "$(dirname "$file")"
+  echo "$(date '+%F %T')|$step|$status" >> "$file"
+}
+
+_adm_bootstrap_load_checkpoint() {
+  local stage="$1"
+  local file
+  file=$(_adm_bootstrap_checkpoint_file "$stage")
+  [ -f "$file" ] && tail -n1 "$file" || echo "none"
+}
+
+_adm_bootstrap_resume() {
+  local stage="$1"
+  adm_log_info "Attempting to resume stage $stage"
+  local last
+  last=$(_adm_bootstrap_load_checkpoint "$stage")
+  if [ "$last" = "none" ]; then
+    adm_log_info "No checkpoint found; starting from beginning."
+    return 0
+  fi
+  local step status
+  step=$(echo "$last" | awk -F'|' '{print $2}')
+  status=$(echo "$last" | awk -F'|' '{print $3}')
+  adm_log_info "Last step recorded: $step (status=$status)"
+}
+
+# End of Part 2/3
+# -------------------------------------------------------
+# adm-bootstrap - Part 3/3
+# Toolchain orchestration, CLI dispatcher, resume and utilities
+# -------------------------------------------------------
+
+# -----------------------------
+# TOOLCHAIN / STAGE BUILDERS
+# These orchestrate calls to adm-build (simulated) for sequences like:
+# stage0: binutils -> gcc-bootstrap -> minimal libc
+# stage1: full toolchain rebuild (gcc final + glibc)
+# stage2: core userland
+# stage3: final packages
+# -----------------------------
+_adm_bootstrap_build_toolchain_stage0() {
+  local stage="$1"
+  adm_log_info "Starting toolchain bootstrap for $stage"
+  local chroot="$(_adm_bootstrap_chroot_path "$stage")"
+  _adm_bootstrap_acquire_lock "$stage" || return 1
+  trap "_adm_bootstrap_release_lock $stage" RETURN
+
+  _adm_bootstrap_run_hooks "pre-stage" "$stage"
+
+  # Ensure env exported
+  _adm_bootstrap_export_env_for_stage "$stage"
+
+  # Sequence of packages (can be customized / read from metafiles)
+  local seq=(binutils gcc-bootstrap libc-mini)
+  local pkg
+  for pkg in "${seq[@]}"; do
+    adm_log_info "Building $pkg in $stage (via adm-build)"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would call adm-build $pkg --chroot $stage --profile $ADM_PROFILE --jobs $ADM_JOBS"
+      _adm_bootstrap_save_checkpoint "$stage" "$pkg" "dry-run"
+      continue
+    fi
+    if [ -x "$ADM_BIN_DIR/adm-build" ]; then
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] $ADM_BIN_DIR/adm-build $pkg --chroot $stage --profile $ADM_PROFILE --jobs $ADM_JOBS"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # "$ADM_BIN_DIR/adm-build" "$pkg" --chroot "$stage" --profile "$ADM_PROFILE" --jobs "$ADM_JOBS" || {
+        #   adm_log_error "adm-build failed for $pkg in $stage"
+        #   _adm_bootstrap_save_checkpoint "$stage" "$pkg" "failed"
+        #   return 1
+        # }
+        adm_log_info "[SIMULATION] adm-build invoked (commented) for $pkg"
+        _adm_bootstrap_save_checkpoint "$stage" "$pkg" "simulated"
+      else
+        adm_log_info "[SIMULATION] Would run adm-build $pkg --chroot $stage"
+        _adm_bootstrap_save_checkpoint "$stage" "$pkg" "simulated"
+      fi
+    else
+      adm_log_error "adm-build not found at $ADM_BIN_DIR/adm-build; cannot build $pkg"
+      _adm_bootstrap_save_checkpoint "$stage" "$pkg" "missing-adm-build"
+      return 1
+    fi
+  done
+
+  _adm_bootstrap_run_hooks "post-stage" "$stage"
+  _adm_bootstrap_save_checkpoint "$stage" "stage0-complete" "ok"
+  adm_log_correct "Toolchain bootstrap for $stage completed (simulated)."
+  return 0
+}
+
+_adm_bootstrap_build_toolchain_stage1() {
+  local stage="$1"
+  adm_log_info "Starting stage1 toolchain expansion for $stage"
+  _adm_bootstrap_acquire_lock "$stage" || return 1
+  trap "_adm_bootstrap_release_lock $stage" RETURN
+
+  _adm_bootstrap_run_hooks "pre-stage" "$stage"
+  _adm_bootstrap_export_env_for_stage "$stage"
+
+  # Example seq for stage1
+  local seq=(gcc glibc binutils-rt coreutils)
+  local pkg
+  for pkg in "${seq[@]}"; do
+    adm_log_info "Building $pkg in $stage"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would call adm-build $pkg --chroot $stage"
+      _adm_bootstrap_save_checkpoint "$stage" "$pkg" "dry-run"
+      continue
+    fi
+    if [ -x "$ADM_BIN_DIR/adm-build" ]; then
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] adm-build $pkg --chroot $stage --profile $ADM_PROFILE --jobs $ADM_JOBS"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # "$ADM_BIN_DIR/adm-build" "$pkg" --chroot "$stage" --profile "$ADM_PROFILE" --jobs "$ADM_JOBS"
+        adm_log_info "[SIMULATION] adm-build invoked (commented)"
+        _adm_bootstrap_save_checkpoint "$stage" "$pkg" "simulated"
+      else
+        adm_log_info "[SIMULATION] Would run adm-build $pkg --chroot $stage"
+      fi
+    else
+      adm_log_error "adm-build not available"
+      return 1
+    fi
+  done
+
+  _adm_bootstrap_run_hooks "post-stage" "$stage"
+  _adm_bootstrap_save_checkpoint "$stage" "stage1-complete" "ok"
+  adm_log_correct "Stage1 toolchain expansion completed (simulated)."
+  return 0
+}
+
+_adm_bootstrap_build_stage2() {
+  local stage="$1"
+  adm_log_info "Populating stage2 (userland) for $stage"
+  _adm_bootstrap_acquire_lock "$stage" || return 1
+  trap "_adm_bootstrap_release_lock $stage" RETURN
+
+  _adm_bootstrap_run_hooks "pre-stage" "$stage"
+  _adm_bootstrap_export_env_for_stage "$stage"
+
+  local seq=(coreutils bash make pkg-config)
+  local pkg
+  for pkg in "${seq[@]}"; do
+    adm_log_info "Building/Installing $pkg in $stage"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would call adm-build $pkg --chroot $stage"
+      _adm_bootstrap_save_checkpoint "$stage" "$pkg" "dry-run"
+      continue
+    fi
+    if [ -x "$ADM_BIN_DIR/adm-build" ]; then
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] adm-build $pkg --chroot $stage --profile $ADM_PROFILE --jobs $ADM_JOBS"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # "$ADM_BIN_DIR/adm-build" "$pkg" --chroot "$stage" --profile "$ADM_PROFILE" --jobs "$ADM_JOBS"
+        adm_log_info "[SIMULATION] adm-build invoked (commented)"
+      else
+        adm_log_info "[SIMULATION] Would run adm-build $pkg --chroot $stage"
+      fi
+    else
+      adm_log_error "adm-build not available"
+      return 1
+    fi
+  done
+
+  _adm_bootstrap_run_hooks "post-stage" "$stage"
+  _adm_bootstrap_save_checkpoint "$stage" "stage2-complete" "ok"
+  adm_log_correct "Stage2 populated (simulated)."
+  return 0
+}
+
+_adm_bootstrap_build_stage3() {
+  local stage="$1"
+  adm_log_info "Finalizing stage3 for $stage"
+  _adm_bootstrap_acquire_lock "$stage" || return 1
+  trap "_adm_bootstrap_release_lock $stage" RETURN
+
+  _adm_bootstrap_run_hooks "pre-stage" "$stage"
+  _adm_bootstrap_export_env_for_stage "$stage"
+
+  local seq=(networking man-pages documentation extra-tools)
+  local pkg
+  for pkg in "${seq[@]}"; do
+    adm_log_info "Processing $pkg in $stage"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would call adm-build $pkg --chroot $stage"
+      _adm_bootstrap_save_checkpoint "$stage" "$pkg" "dry-run"
+      continue
+    fi
+    if [ -x "$ADM_BIN_DIR/adm-build" ]; then
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] adm-build $pkg --chroot $stage --profile $ADM_PROFILE --jobs $ADM_JOBS"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # "$ADM_BIN_DIR/adm-build" "$pkg" --chroot "$stage" --profile "$ADM_PROFILE" --jobs "$ADM_JOBS"
+        adm_log_info "[SIMULATION] adm-build invoked (commented)"
+      else
+        adm_log_info "[SIMULATION] Would run adm-build $pkg --chroot $stage"
+      fi
+    else
+      adm_log_error "adm-build not available"
+      return 1
+    fi
+  done
+
+  _adm_bootstrap_run_hooks "post-stage" "$stage"
+  _adm_bootstrap_save_checkpoint "$stage" "stage3-complete" "ok"
+  adm_log_correct "Stage3 finalized (simulated)."
+  return 0
+}
+
+# -----------------------------
+# ENTER CHROOT (simulated)
+# -----------------------------
+_adm_bootstrap_enter_stage() {
+  local stage="$1"
+  shift || true
+  local cmd=("$@")
+  local chroot="$(_adm_bootstrap_chroot_path "$stage")"
+
+  if [ ! -d "$chroot" ]; then
+    adm_log_error "Chroot for $stage does not exist: $chroot"
+    return 1
+  fi
+
+  adm_log_info "Entering chroot: $stage; command: ${cmd[*]:-interactive shell}"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would enter chroot $chroot and run: ${cmd[*]:-bash}"
+    return 0
+  fi
+
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] chroot $chroot ${cmd[*]}"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # if [ ${#cmd[@]} -eq 0 ]; then
+    #   chroot "$chroot" /bin/bash --login
+    # else
+    #   chroot "$chroot" "${cmd[@]}"
+    # fi
+    adm_log_info "[SIMULATION] chroot entry simulated (command commented)"
+    return 0
+  else
+    adm_log_info "[SIMULATION] Would run chroot $chroot ${cmd[*]} (ADM_ALLOW_EXECUTION=0)"
+    return 0
+  fi
+}
+
+# -----------------------------
+# DESTROY STAGE (safe)
+# -----------------------------
+_adm_bootstrap_destroy_stage() {
+  local stage="$1"
+  _adm_bootstrap_validate_stage_name "$stage" || return 1
+  local chroot="$(_adm_bootstrap_chroot_path "$stage")"
+
+  adm_log_info "Destroying stage: $stage (path: $chroot)"
+  if [ ! -d "$chroot" ]; then
+    adm_log_info "Stage does not exist; nothing to destroy."
+    return 0
+  fi
+
+  # Acquire lock to avoid races
+  _adm_bootstrap_acquire_lock "destroy-$stage" || return 1
+  trap "_adm_bootstrap_release_lock destroy-$stage" RETURN
+
+  # attempt unmount pseudo (simulated)
+  _adm_bootstrap_umount_pseudo "$chroot"
+
+  # remove directory
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would rm -rf $chroot"
+  else
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] rm -rf $chroot"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # rm -rf -- "$chroot"
+      adm_log_correct "Stage $stage destroyed (simulated)."
+    else
+      adm_log_info "[SIMULATION] Would rm -rf $chroot (ADM_ALLOW_EXECUTION=0)"
+    fi
+  fi
+
+  # cleanup checkpoint and lock entries
+  local ck=$(_adm_bootstrap_checkpoint_file "$stage")
+  rm -f "$ck" 2>/dev/null || true
+  adm_log_correct "Cleaned checkpoints for $stage"
+  return 0
+}
+
+# -----------------------------
+# STATUS & LIST
+# -----------------------------
+_adm_bootstrap_list_stages() {
+  adm_log_info "Available stages under $ADM_CHROOTS_DIR:"
+  for s in "$ADM_CHROOTS_DIR"/*; do
+    [ -d "$s" ] || continue
+    local name
+    name=$(basename "$s")
+    adm_log_info " - $name"
+  done
+}
+
+_adm_bootstrap_status() {
+  local stage="$1"
+  local chroot="$(_adm_bootstrap_chroot_path "$stage")"
+  adm_log_info "Status for stage: $stage"
+  if [ -d "$chroot" ]; then
+    adm_log_info " Path: $chroot"
+    adm_log_info " Checkpoint: $(_adm_bootstrap_load_checkpoint "$stage")"
+  else
+    adm_log_info " Stage not present"
+  fi
+}
+
+# -----------------------------
+# CLI / DISPATCHER
+# -----------------------------
+_adm_bootstrap_show_help() {
+  cat <<EOF
+adm-bootstrap - create and manage bootstrap stages (stage0..stage3)
+
+Usage:
+  adm-bootstrap create <stage> [--from <stageN>] [--profile <profile>] [--no-snapshot]
+  adm-bootstrap build <stage> [--phase stage0|stage1|stage2|stage3]
+  adm-bootstrap resume <stage>
+  adm-bootstrap snapshot <from> <to>
+  adm-bootstrap enter <stage> [-- <command>]
+  adm-bootstrap destroy <stage> [--force]
+  adm-bootstrap list
+  adm-bootstrap status <stage>
+  adm-bootstrap help
+
+Options:
+  --dry-run   : simulate actions (default)
+  --force     : force destructive actions (requires ADM_ALLOW_EXECUTION=1)
+  --profile   : profile name (normal, toolchain-extreme, lto, debug)
+  --no-snapshot: skip automatic snapshot after create
+EOF
+}
+
+# Entry point
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  if [ $# -lt 1 ]; then _adm_bootstrap_show_help; exit 1; fi
+  cmd="$1"; shift
+
+  # global flags parsing (simple)
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) ADM_DRY_RUN=1; shift ;;
+      --force) ADM_ALLOW_EXECUTION=1; shift ;;
+      --profile) ADM_PROFILE="$2"; shift 2 ;;
+      --no-snapshot) NO_SNAPSHOT=1; shift ;;
+      --jobs) ADM_JOBS="$2"; shift 2 ;;
+      --verbose) ADM_VERBOSE=2; shift ;;
+      *) break ;;
+    esac
+  done
+
+  # ensure profiles exist and optionally load profile
+  _adm_bootstrap_profiles_init
+  if [ -z "${ADM_PROFILE:-}" ]; then ADM_PROFILE="$ADM_DEFAULT_PROFILE"; fi
+  _adm_bootstrap_load_profile "$ADM_PROFILE" || adm_log_info "Continuing with default profile"
+
+  case "$cmd" in
+    create)
+      if [ $# -lt 1 ]; then adm_log_error "create requires a stage name"; exit 2; fi
+      stage="$1"; shift
+      from=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from) from="$2"; shift 2 ;;
+          --no-snapshot) NO_SNAPSHOT=1; shift ;;
+          *) shift ;;
+        esac
+      done
+      _adm_bootstrap_create_stage "$stage" "$from" || exit 1
+      if [ -z "${NO_SNAPSHOT:-}" ] && [ -n "$from" ]; then
+        adm_log_info "Snapshot created as part of create"
+      fi
+      ;;
+
+    build)
+      if [ $# -lt 1 ]; then adm_log_error "build requires a stage name"; exit 2; fi
+      stage="$1"; shift
+      phase=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --phase) phase="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      case "$phase" in
+        ""|stage0) _adm_bootstrap_build_toolchain_stage0 "$stage" || exit 1 ;;
+        stage1) _adm_bootstrap_build_toolchain_stage1 "$stage" || exit 1 ;;
+        stage2) _adm_bootstrap_build_stage2 "$stage" || exit 1 ;;
+        stage3) _adm_bootstrap_build_stage3 "$stage" || exit 1 ;;
+        *) adm_log_error "Unknown phase: $phase"; exit 2 ;;
+      esac
+      ;;
+
+    resume)
+      if [ $# -lt 1 ]; then adm_log_error "resume requires stage"; exit 2; fi
+      stage="$1"
+      _adm_bootstrap_resume "$stage" || exit 1
+      ;;
+
+    snapshot)
+      if [ $# -lt 2 ]; then adm_log_error "snapshot requires from and to"; exit 2; fi
+      from="$1"; to="$2"
+      _adm_bootstrap_snapshot_stage "$from" "$to" || exit 1
+      ;;
+
+    enter)
+      if [ $# -lt 1 ]; then adm_log_error "enter requires stage"; exit 2; fi
+      stage="$1"; shift
+      # pass remaining args as command
+      _adm_bootstrap_enter_stage "$stage" "$@" || exit 1
+      ;;
+
+    destroy)
+      if [ $# -lt 1 ]; then adm_log_error "destroy requires stage"; exit 2; fi
+      stage="$1"
+      _adm_bootstrap_destroy_stage "$stage" || exit 1
+      ;;
+
+    list)
+      _adm_bootstrap_list_stages
+      ;;
+
+    status)
+      if [ $# -lt 1 ]; then adm_log_error "status requires stage"; exit 2; fi
+      _adm_bootstrap_status "$1"
+      ;;
+
+    help|-h|--help)
+      _adm_bootstrap_show_help
+      ;;
+
+    *)
+      adm_log_error "Unknown command: $cmd"
+      _adm_bootstrap_show_help
+      exit 2
+      ;;
+  esac
+fi
+
+# End of adm-bootstrap Part 3/3
