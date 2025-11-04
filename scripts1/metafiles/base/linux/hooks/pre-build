@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# ADM pre-build hook for Linux kernel
+# Sets up the environment before compiling
+
+adm_log_info "[HOOK pre-build] Preparing Linux kernel build environment..."
+export LANG=C
+export LC_ALL=C
+export MAKEFLAGS="-j${ADM_JOBS:-4}"
+
+# Use default configuration if none provided
+if [ ! -f ".config" ]; then
+  adm_log_info "[HOOK pre-build] No .config found, generating default defconfig..."
+  make defconfig || adm_log_err "Failed to generate default config"
+fi
+
+adm_log_ok "[HOOK pre-build] Configuration ready. Starting compilation..."
