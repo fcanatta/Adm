@@ -1,0 +1,8 @@
+name: firefox
+version: 133.0
+source: https://archive.mozilla.org/pub/firefox/releases/133.0/source/firefox-133.0.source.tar.xz
+sha256: 8d8e527e3e9a8f7b0f58b8f3f92db56c6ce084e154b34bbfc783f69cc5ab43b4
+desc: Mozilla Firefox web browser — a fast, privacy-focused open source browser.
+build_deps: python3, cargo, rust, nodejs, gcc, clang, llvm, yasm, nasm, make, unzip, zip, gtk3, libpng, libjpeg, dbus, pulseaudio, alsa-lib, pango, cairo, glib, icu, zlib
+run_deps: gtk3, dbus, pulseaudio, alsa-lib, libjpeg, libpng, zlib, nss, nspr
+upstream: https://www.mozilla.org/firefox/
