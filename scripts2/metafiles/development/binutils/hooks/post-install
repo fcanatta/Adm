@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ADM HOOK: binutils post-install
+# Ajusta links simbólicos, registra versão e limpa resíduos
+
+set -euo pipefail
+
+echo "🔧 [binutils post-install] Ajustando instalação..."
+
+DESTDIR="${DESTDIR:-/usr/src/adm/tmp/binutils-destdir}"
+PREFIX="${PREFIX:-/usr}"
+
+# Criar links simbólicos padrões
+ln -sf ld "$DESTDIR/$PREFIX/bin/ld.gold" 2>/dev/null || true
+ln -sf as "$DESTDIR/$PREFIX/bin/assembler" 2>/dev/null || true
+
+# Detectar versão instalada
+if [ -x "$DESTDIR/$PREFIX/bin/ld" ]; then
+  ver="$("$DESTDIR/$PREFIX/bin/ld" -v 2>&1 | head -n1 | awk '{print $NF}')"
+  echo "$ver" > "$DESTDIR/$PREFIX/lib/binutils.version"
+  echo "✔️  Binutils versão registrada: $ver"
+fi
+
+# Remover arquivos temporários e arquivos .la
+find "$DESTDIR" -name '*.la' -delete 2>/dev/null || true
+echo "🧹 Limpando arquivos temporários..."
+
+echo "[`date -u`] Binutils ${ver:-unknown} instalado com sucesso" >> "${ADM_LOG:-/usr/src/adm/logs/binutils-install.log}"
+
+echo "✅ [binutils post-install] Concluído"
