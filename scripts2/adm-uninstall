@@ -1,0 +1,1444 @@
+#!/usr/bin/env bash
+#
+# adm-uninstall (PARTE 1/3)
+# ------------------------
+# Parte 1/3: Inicialização, helpers, parser de argumentos, leitura/validação de manifests,
+# verificação de dependências reversas (integração com adm-resolver), locks e relatório scaffold.
+#
+# Esta PARTE NÃO remove arquivos do sistema — apenas prepara tudo para as PARTES 2/3 e 3/3.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Header / defaults
+##### -------------------------
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_INSTALLED_DB="${ADM_INSTALLED_DB:-$ADM_ROOT/installed}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_BACKUPS_DIR="${ADM_BACKUPS_DIR:-$ADM_ROOT/db/backups/uninstall}"
+LOGFILE_DEFAULT="${ADM_LOGS}/adm-uninstall-${TS}.log"
+REPORT_JSON_DEFAULT="${ADM_TMP}/adm-uninstall-report-${TS}.json"
+
+# runtime flags
+DRY_RUN=0
+ASSUME_YES=0
+FORCE=0
+PURGE=0
+VERBOSE=0
+OUTPUT_JSON=0
+TARGET_PKG=""
+SKIP_DEPS_CHECK=0
+KEEP_BACKUP_DAYS=7
+
+LOGFILE="${LOGFILE:-$LOGFILE_DEFAULT}"
+REPORT_JSON="${REPORT_JSON:-$REPORT_JSON_DEFAULT}"
+
+# load adm.conf if exists
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+# ensure runtime dirs (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_LOGS" "$ADM_TMP" "$ADM_BACKUPS_DIR" 2>/dev/null || true
+fi
+
+##### -------------------------
+##### Colors and icons
+##### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WARN="⚠️"
+ICON_ERR="❌"
+ICON_WORK="⚙️"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+##### -------------------------
+##### Spinner (lightweight)
+##### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $msg"; return 0; fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then ok "(dry-run) $okmsg"; return 0; fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+##### -------------------------
+##### safe_run wrapper (respects dry-run)
+##### -------------------------
+safe_run() {
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    [ "$VERBOSE" -eq 1 ] && printf "  Simulated: %s\n" "$*"
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc rc=$rc"
+    return $rc
+  fi
+}
+
+##### -------------------------
+##### Locking for uninstall runs
+##### -------------------------
+LOCKFILE="${ADM_TMP}/adm-uninstall.lock"
+_acquire_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) acquire lock $LOCKFILE"
+    echo "$LOCKFILE"
+    return 0
+  fi
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    err "Outra execução de adm-uninstall está ativa (lock: $LOCKFILE)."
+    return 1
+  fi
+  printf "%s\n" "$$" >"${LOCKFILE}.pid" 2>/dev/null || true
+  return 0
+}
+_release_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) release lock $LOCKFILE"
+    return 0
+  fi
+  rm -f "${LOCKFILE}.pid" 2>/dev/null || true
+  eval "exec 9>&-"
+  return 0
+}
+
+##### -------------------------
+##### Safety helpers
+##### -------------------------
+# ensure path resolution and prevent accidental op outside ADM_ROOT
+path_real() {
+  readlink -f "$1" 2>/dev/null || printf '%s' "$1"
+}
+path_within_adm() {
+  local p; p="$(path_real "$1")"
+  local admroot; admroot="$(path_real "$ADM_ROOT")"
+  case "$p" in
+    "$admroot"/*|"$admroot") return 0 ;;
+    "$ADM_TMP"/*|"$ADM_TMP") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+ensure_safe_to_operate() {
+  local p="$1"
+  if ! path_within_adm "$p"; then
+    err "Operação abortada: caminho fora de ADM_ROOT detectado: $p"
+    return 1
+  fi
+  return 0
+}
+
+# human size
+human_size() {
+  [ -z "${1:-}" ] && { printf "0B"; return; }
+  awk 'function hs(x){
+    s="B KiB MiB GiB TiB PiB";
+    for(i=0;i<6;i++){ if(x<1024) return sprintf("%.1f%s",x,substr(s,i*5+1,4)); x/=1024; }
+    return sprintf("%.1fEiB",x)
+  }{print hs($1)}' <<<"$1"
+}
+
+##### -------------------------
+##### Report scaffolding (JSON)
+##### -------------------------
+_report_init() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) iniciando scaffold de relatório (não gravará arquivos)"
+    return 0
+  fi
+  mkdir -p "$(dirname "$REPORT_JSON")" 2>/dev/null || true
+  printf '{"timestamp":"%s","package":"","actions":[],"errors":[]} ' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >"$REPORT_JSON" || true
+  log_to_file "[REPORT]" "init $REPORT_JSON"
+}
+_report_add_action() {
+  local pkg="$1" action="$2" details="$3"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; pkg=sys.argv[2]; action=sys.argv[3]; details=sys.argv[4]
+d=json.load(open(f))
+d.setdefault('actions',[]).append({"pkg":pkg,"action":action,"details":details})
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+_report_add_error() {
+  local m="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then return 0; fi
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; msg=sys.argv[2]
+d=json.load(open(f))
+d.setdefault('errors',[]).append(msg)
+open(f,'w').write(json.dumps(d,indent=2))
+PY
+  fi
+}
+
+##### -------------------------
+##### Manifest parsing / validation
+##### - Manifest format:
+#####   one absolute path per line (files/directories)
+#####   comments (#) and blank lines ignored
+##### - read_manifest <pkg> -> populates array MANIFEST_FILES and returns manifest path
+##### -------------------------
+declare -a MANIFEST_FILES
+MANIFEST_PKG=""
+MANIFEST_PATH=""
+
+read_manifest_for_pkg() {
+  local pkg="$1"
+  MANIFEST_FILES=(); MANIFEST_PKG=""; MANIFEST_PATH=""
+  if [ -z "$pkg" ]; then err "read_manifest_for_pkg: pacote não fornecido"; return 2; fi
+  # try find in ADM_INSTALLED_DB/<pkg>/manifest.txt or ADM_INSTALLED_DB/<pkg>.manifest
+  local candidate1="$ADM_INSTALLED_DB/$pkg/manifest.txt"
+  local candidate2="$ADM_INSTALLED_DB/$pkg.manifest"
+  local candidate3="$(printf '%s/%s/manifest.txt' "$ADM_INSTALLED_DB" "$pkg")"
+  local mf=""
+  if [ -f "$candidate1" ]; then mf="$candidate1"; fi
+  if [ -z "$mf" ] && [ -f "$candidate2" ]; then mf="$candidate2"; fi
+  if [ -z "$mf" ] && [ -f "$candidate3" ]; then mf="$candidate3"; fi
+  if [ -z "$mf" ]; then
+    err "Manifest não encontrado para pacote: $pkg (procurei: $candidate1, $candidate2, $candidate3)"
+    return 3
+  fi
+  MANIFEST_PATH="$mf"
+  MANIFEST_PKG="$pkg"
+  # Read file defensively
+  while IFS= read -r l || [ -n "$l" ]; do
+    # strip BOM and whitespace
+    l="$(printf '%s' "$l" | sed -e 's/^\xEF\xBB\xBF//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$l" ] && continue
+    case "$l" in \#*) continue ;; esac
+    # must be absolute path
+    if [[ "$l" != /* ]]; then
+      warn "Linha ignorada no manifest (não é caminho absoluto): $l"
+      continue
+    fi
+    # ensure inside ADM_ROOT or known safe install prefixes (/usr, /etc, /var) — but be conservative: only allow removal if path is within ADM_ROOT OR is a typical system install path and matches record
+    # Here we accept absolute paths but will check ownership and manifest mapping before removal in later parts
+    MANIFEST_FILES+=("$l")
+  done <"$mf"
+  verbose "Manifest lido: pkg=$pkg files=${#MANIFEST_FILES[@]}"
+  return 0
+}
+
+##### -------------------------
+##### Helper: detect_reverse_dependencies
+##### - Uses adm-resolver if available to check if any installed package depends on target pkg
+##### - Fallback: scan installed manifests for occurrences of pkg name (best-effort)
+##### - Returns list of dependents (printed one per line) or empty
+##### -------------------------
+detect_reverse_dependencies() {
+  local pkg="$1"
+  local dependents_file="${ADM_TMP}/adm-uninstall-depends-${pkg}-$TS.txt"
+  : >"$dependents_file" 2>/dev/null || true
+
+  # prefer adm-resolver if available
+  if command -v adm-resolver >/dev/null 2>&1; then
+    # adm-resolver expected to support a CLI: adm-resolver dependents <pkg> --installed --json or stdout list
+    if adm-resolver dependents "$pkg" --installed --json >/dev/null 2>&1; then
+      # capture json and extract names (best-effort)
+      if adm-resolver dependents "$pkg" --installed --json >"${dependents_file}.json" 2>>"$LOGFILE"; then
+        if command -v python3 >/dev/null 2>&1; then
+          python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]; out=sys.argv[2]
+try:
+  d=json.load(open(f))
+  names=[]
+  # depending on adm-resolver schema, try common keys
+  if isinstance(d,dict) and 'dependents' in d:
+    names=[x.get('name') for x in d['dependents'] if isinstance(x,dict)]
+  elif isinstance(d,list):
+    names=[x.get('name') if isinstance(x,dict) else x for x in d]
+  open(out,'w').write('\n'.join([n for n in names if n]))
+except Exception:
+  pass
+PY
+          if [ -s "${dependents_file}" ]; then
+            cat "${dependents_file}"
+            return 0
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # fallback: naive scan installed manifests for references to pkg (string match)
+  if [ -d "$ADM_INSTALLED_DB" ]; then
+    find "$ADM_INSTALLED_DB" -type f -name "manifest*" -print0 2>/dev/null | while IFS= read -r -d '' mf; do
+      # skip the target manifest itself
+      case "$mf" in *"/$pkg/"*|*"/$pkg.manifest"*) continue ;; esac
+      if grep -qE "/$pkg([/ ]|$)" "$mf" 2>/dev/null || grep -q "$pkg" "$mf" 2>/dev/null; then
+        # derive package name from path
+        local p
+        p="$(basename "$(dirname "$mf")" 2>/dev/null || true)"
+        if [ -n "$p" ]; then
+          printf "%s\n" "$p" >>"$dependents_file"
+        fi
+      fi
+    done
+  fi
+
+  # remove duplicates and print
+  if [ -f "$dependents_file" ]; then
+    sort -u "$dependents_file" -o "$dependents_file" 2>/dev/null || true
+    if [ -s "$dependents_file" ]; then
+      cat "$dependents_file"
+      return 0
+    fi
+  fi
+  return 0
+}
+
+##### -------------------------
+##### Safety summary printed to user
+##### -------------------------
+print_safety_summary() {
+  cat <<EOF
+Atenção — operações destrutivas só serão feitas nas partes 2/3 e 3/3:
+ - Nenhum arquivo será apagado enquanto estiver em --dry-run.
+ - Antes de apagar, será criado backup em: $ADM_BACKUPS_DIR/<pkg>-<timestamp>/
+ - Em caso de erro, tentaremos um rollback automático a partir do backup.
+ - Você pode testar com: $SCRIPT_NAME --dry-run --verbose <pkg>
+ - Operações que tocam paths fora de $ADM_ROOT serão rejeitadas.
+ - Use --force para ignorar checagens de dependência reversa (risco elevado).
+EOF
+}
+
+##### -------------------------
+##### Usage / Arg parsing
+##### -------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [options] <package|--orphans|--help>
+
+Options:
+  --dry-run          Simula tudo (nenhum arquivo removido)
+  --yes              Assume yes em prompts
+  --force            Força remoção mesmo com dependências reversas
+  --purge            Remove também cache e configs
+  --verbose, -v      Verbose
+  --json             Gera relatório JSON
+  --keep-backups N   Mantém backups por N dias (default: $KEEP_BACKUP_DAYS)
+  --skip-deps-check  Pula verificação de dependências reversas (USE COM CAUTELA)
+  --help             Mostra esta ajuda
+EOF
+  exit 1
+}
+
+# parse args
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --purge) PURGE=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --json) OUTPUT_JSON=1; shift ;;
+    --keep-backups) shift; KEEP_BACKUP_DAYS="${1:-$KEEP_BACKUP_DAYS}"; shift ;;
+    --skip-deps-check) SKIP_DEPS_CHECK=1; shift ;;
+    --help|-h) usage ;;
+    --) shift; break ;;
+    -*) err "Opção desconhecida: $1"; usage ;;
+    *) POSITIONAL+=("$1"); shift ;;
+  esac
+done
+set -- "${POSITIONAL[@]:-}"
+
+# handle special commands
+if [ "${POSITIONAL[0]:-}" = "--orphans" ]; then
+  TARGET_PKG="--orphans"
+else
+  TARGET_PKG="${POSITIONAL[0]:-}"
+fi
+
+log_to_file "[START]" "adm-uninstall start $TS target=$TARGET_PKG dry-run=$DRY_RUN"
+
+info "adm-uninstall iniciado: target='$TARGET_PKG' dry-run=$DRY_RUN verbose=$VERBOSE"
+
+# Acquire lock
+_acquire_lock || exit 3
+
+# print safety
+print_safety_summary
+
+##### -------------------------
+##### Quick sanity checks
+##### -------------------------
+if [ -z "$TARGET_PKG" ]; then
+  warn "Nenhum pacote especificado. Use --orphans para operar em órfãos ou forneça um pacote."
+fi
+if [ "$(id -u)" -ne 0 ]; then
+  warn "Recomendado executar adm-uninstall como root para garantir remoção completa. Continuando (pode falhar por permissão)."
+fi
+
+##### -------------------------
+##### Exports for later parts
+##### - read_manifest_for_pkg
+##### - detect_reverse_dependencies
+##### - ensure_safe_to_operate
+##### - _report_init, _report_add_action, _report_add_error
+##### - Variables: MANIFEST_FILES, MANIFEST_PATH, MANIFEST_PKG
+##### -------------------------
+# Make sure report initialised
+_report_init
+
+info "PARTE 1/3 carregada — pronto para executar as partes 2/3 e 3/3 (remoção segura, backup e rollback)."
+
+# end of part 1/3
+# PART 2/3 will implement:
+#  - backup_and_move_to_backup (atomic move; space checks)
+#  - execute_uninstall_plan: run pre-hooks, move files to backup, remove entries from installed DB
+#  - rollback handlers and robust error handling
+# PART 3/3 will implement:
+#  - orphan detection & bulk removal, purge mode, prune old backups, finalize report and exit codes
+#
+# Release lock now; subsequent parts will re-acquire when running main pipeline
+_release_lock || true
+##### -------------------------
+##### adm-uninstall PARTE 2/3
+##### -------------------------
+# Implementa:
+#  - backup_and_move_to_backup (atomic move; space checks)
+#  - execute_uninstall_plan: run pre-hooks, move files to backup, remove entries from installed DB
+#  - rollback handlers and robust error handling
+#  - traps to ensure backups are left consistent and locks released
+#
+# Requer PARTE 1/3 carregada antes: helpers, read_manifest_for_pkg, detect_reverse_dependencies, ensure_safe_to_operate, etc.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Globals for this part
+##### -------------------------
+UNINSTALL_WORKDIR="${ADM_TMP}/adm-uninstall-work-${TS}"
+UNINSTALL_BACKUP_BASE="${ADM_BACKUPS_DIR%/}/backup-${TS}"
+safe_mkdir "$UNINSTALL_WORKDIR" || true
+safe_mkdir "$UNINSTALL_BACKUP_BASE" || true
+
+# state for rollback
+declare -a _BACKED_UP_PATHS   # list of dest paths (backup) -> original path
+declare -A _BACKUP_MAP        # backup_path -> original_path
+
+# flags for progress
+_UNINSTALL_RC=0
+_INTERRUPTED=0
+
+##### -------------------------
+##### Trap and interruption handling
+##### -------------------------
+_handle_interrupt() {
+  _INT_RC=130
+  _INT_MSG="Interrompido pelo usuário. Tentando rollback parcial e liberando locks..."
+  err "$_INT_MSG"
+  _INTERRUPTED=1
+  # attempt rollback
+  rollback_restore || true
+  _release_lock || true
+  exit "$_INT_RC"
+}
+trap _handle_interrupt INT TERM
+
+##### -------------------------
+##### Helper: human timestamp
+##### -------------------------
+now_ts() { date -u +"%Y%m%d-%H%M%S"; }
+
+##### -------------------------
+##### create_run_backup_dir
+##### - creates per-package backup dir and returns it
+##### -------------------------
+create_run_backup_dir() {
+  local pkg="$1"
+  local base="${UNINSTALL_BACKUP_BASE}/${pkg}-${TS}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) criaria backup dir: $base"
+    printf "%s" "$base"
+    return 0
+  fi
+  mkdir -p "$base" || { err "Falha ao criar backup dir: $base"; return 1; }
+  printf "%s" "$base"
+  return 0
+}
+
+##### -------------------------
+##### backup_and_move_to_backup <file_or_dir> <backup_base>
+##### - Moves file/dir atomically to backup_base preserving metadata.
+##### - On same-filesystem, mv is atomic; on cross-fs uses cp -a then rm -rf with checks.
+##### - Returns 0 on success.
+##### ## RISCO: efetua movs/copies de arquivos; requer espaço suficiente.
+##### -------------------------
+backup_and_move_to_backup() {
+  local target="$1"
+  local backup_base="$2"
+  if [ -z "$target" ] || [ -z "$backup_base" ]; then
+    err "backup_and_move_to_backup: parâmetros insuficientes"
+    return 2
+  fi
+  if ! ensure_safe_to_operate "$target"; then
+    err "backup_and_move_to_backup: target inseguro: $target"
+    return 2
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) moveria $target -> $backup_base/"
+    return 0
+  fi
+
+  safe_mkdir "$backup_base" || { err "Não foi possível criar $backup_base"; return 3; }
+
+  # compute approximate size needed (bytes)
+  local size_req
+  size_req="$(du -sb "$target" 2>/dev/null | awk '{print $1}' || echo 0)"
+  # check free space on backup_base filesystem
+  local avail_kb
+  avail_kb="$(df -P "$backup_base" 2>/dev/null | awk 'END{print $4}' || echo 0)"
+  local avail_mb=$((avail_kb/1024))
+  local need_mb=$(( (size_req/1024/1024) + 1 ))
+  if [ "$avail_mb" -lt "$need_mb" ]; then
+    warn "Espaço insuficiente para backup: disponível=${avail_mb}MB requerido~=${need_mb}MB"
+    return 4
+  fi
+
+  local name
+  name="$(basename "$target")"
+  local dest="${backup_base}/${name}-${TS}"
+  # try atomic move
+  if mv -f "$target" "$dest" 2>>"$LOGFILE"; then
+    ok "Movido $target -> $dest"
+    _BACKED_UP_PATHS+=("$dest")
+    _BACKUP_MAP["$dest"]="$target"
+    log_to_file "[UNINSTALL-BACKUP]" "$target -> $dest"
+    return 0
+  fi
+
+  # fallback copy & remove
+  warn "mv falhou para $target -> $dest, tentando cp -a..."
+  if cp -a "$target" "$dest" 2>>"$LOGFILE"; then
+    # verify copy size ~ original
+    local orig_sz copy_sz
+    orig_sz="$(du -sb "$target" 2>/dev/null | awk '{print $1}' || echo 0)"
+    copy_sz="$(du -sb "$dest" 2>/dev/null | awk '{print $1}' || echo 0)"
+    if [ "$orig_sz" -ne 0 ] && [ "$copy_sz" -lt $((orig_sz/2)) ]; then
+      err "Cópia incompleta detectada (orig:${orig_sz} dest:${copy_sz}). Abortando e removendo backup parcial."
+      rm -rf "$dest" 2>>"$LOGFILE" || true
+      return 5
+    fi
+    # attempt remove original
+    if rm -rf "$target" 2>>"$LOGFILE"; then
+      ok "Copiado e removido original: $target -> $dest"
+      _BACKED_UP_PATHS+=("$dest")
+      _BACKUP_MAP["$dest"]="$target"
+      log_to_file "[UNINSTALL-BACKUP-CP]" "$target -> $dest"
+      return 0
+    else
+      warn "Falha ao remover original após cp: $target (backup em $dest)"
+      _BACKED_UP_PATHS+=("$dest")
+      _BACKUP_MAP["$dest"]="$target"
+      return 0
+    fi
+  else
+    err "Falha ao copiar $target para backup $dest"
+    return 6
+  fi
+}
+
+##### -------------------------
+##### run_hook_if_exists <pkg> <hookname>
+##### - hookname: pre-uninstall or post-uninstall
+##### - Executa hook com cwd=/ e ambiente limpo; redireciona saída para log
+##### - Returns hook exit code (0 ok)
+##### -------------------------
+run_hook_if_exists() {
+  local pkg="$1" hook="$2"
+  # hook path inside metafile directory if exists
+  local hook_file=""
+  # search metafile dir
+  local mf_dir
+  mf_dir="$(dirname "$(find_metafile_for_pkg "$pkg" 2>/dev/null || true)" 2>/dev/null || true)"
+  if [ -z "$mf_dir" ]; then
+    verbose "run_hook_if_exists: metafile dir não encontrado para $pkg"
+    return 0
+  fi
+  hook_file="${mf_dir}/hooks/${hook}"
+  if [ ! -x "$hook_file" ]; then
+    verbose "Hook não encontrado/executável: $hook_file (ignorado)"
+    return 0
+  fi
+
+  info "Executando hook $hook para $pkg: $hook_file"
+  _report_add_action "$pkg" "hook-run" "$hook_file"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) exec $hook_file"
+    return 0
+  fi
+
+  # run in a subshell with limited environment for safety
+  (
+    cd / || true
+    umask 022
+    # supply safe env vars (avoid leaking host env)
+    PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+    export PATH LANG=C
+    if "$hook_file" >>"$LOGFILE" 2>&1; then
+      ok "Hook $hook executado com sucesso: $pkg"
+      return 0
+    else
+      local hrc=$?
+      warn "Hook $hook retornou rc=$hrc for $pkg"
+      _report_add_error "hook:$pkg:$hook:rc=$hrc"
+      return "$hrc"
+    fi
+  )
+  return $?
+}
+
+##### -------------------------
+##### remove_manifest_entries
+##### - Updates installed DB by removing package's manifest dir/file
+##### - Moves manifest to backups and writes installed index update
+##### -------------------------
+remove_manifest_entries() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then
+    err "remove_manifest_entries: pacote não especificado"
+    return 2
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) removeria manifest de $pkg em $ADM_INSTALLED_DB"
+    return 0
+  fi
+
+  # determine manifest path
+  local manifest_dir="$ADM_INSTALLED_DB/$pkg"
+  local manifest_file="$ADM_INSTALLED_DB/$pkg.manifest"
+  local backed=0
+  local bdir
+  bdir="$(create_run_backup_dir "$pkg" 2>/dev/null || true)"
+  if [ -d "$manifest_dir" ]; then
+    if mv "$manifest_dir" "${bdir}/manifest_dir" 2>>"$LOGFILE"; then
+      ok "Manifest dir movido para backup: ${bdir}/manifest_dir"
+      log_to_file "[UNINSTALL-MANIFEST-BACKUP]" "$manifest_dir -> ${bdir}/manifest_dir"
+      backed=1
+    else
+      warn "Falha ao mover manifest dir $manifest_dir"
+    fi
+  fi
+  if [ -f "$manifest_file" ]; then
+    if mv "$manifest_file" "${bdir}/manifest_file" 2>>"$LOGFILE"; then
+      ok "Manifest file movido para backup: ${bdir}/manifest_file"
+      log_to_file "[UNINSTALL-MANIFEST-BACKUP]" "$manifest_file -> ${bdir}/manifest_file"
+      backed=1
+    else
+      warn "Falha ao mover manifest file $manifest_file"
+    fi
+  fi
+  if [ "$backed" -eq 0 ]; then
+    warn "Nenhum manifesto existente movido para backup para $pkg"
+  fi
+
+  # Optionally update an installed index (if exists)
+  local index_json="$ADM_INSTALLED_DB/index.json"
+  if [ -f "$index_json" ] && command -v python3 >/dev/null 2>&1 ]; then
+    python3 - <<PY 2>>"$LOGFILE" || true
+import json,sys
+f=sys.argv[1]; pkg=sys.argv[2]
+try:
+  d=json.load(open(f))
+  if isinstance(d,list):
+    d=[x for x in d if not (isinstance(x,dict) and x.get('name')==pkg)]
+  open(f,'w').write(json.dumps(d,indent=2))
+except Exception:
+  pass
+PY
+    ok "Index de instalados atualizado (se presente)"
+  fi
+
+  _report_add_action "$pkg" "manifest-removed" "$bdir"
+  return 0
+}
+
+##### -------------------------
+##### rollback_restore
+##### - Attempts to restore files from backups moved earlier.
+##### - Restores in reverse order to increase chance of consistency.
+##### - Returns 0 on success or non-zero if some restores fail (logs errors).
+##### -------------------------
+rollback_restore() {
+  if [ "${#_BACKED_UP_PATHS[@]}" -eq 0 ]; then
+    verbose "Nada a restaurar (backup list empty)"
+    return 0
+  fi
+  warn "Iniciando rollback: restaurando ${#_BACKED_UP_PATHS[@]} itens..."
+  local rc=0
+  # iterate reverse
+  local i
+  for ((i=${#_BACKED_UP_PATHS[@]}-1;i>=0;i--)); do
+    local backup="${_BACKED_UP_PATHS[$i]}"
+    local orig="${_BACKUP_MAP[$backup]:-}"
+    if [ -z "$orig" ]; then
+      warn "Origem não encontrada para backup $backup (ignorando)"
+      continue
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) restauraria $backup -> $orig"
+      continue
+    fi
+    # ensure parent dir exists
+    safe_mkdir "$(dirname "$orig")" || { err "Falha ao criar dir para restauração: $(dirname "$orig")"; rc=1; continue; }
+    if mv -f "$backup" "$orig" 2>>"$LOGFILE"; then
+      ok "Restaurado $backup -> $orig"
+      log_to_file "[UNINSTALL-ROLLBACK]" "$backup -> $orig"
+      unset "_BACKUP_MAP[$backup]"
+      _BACKED_UP_PATHS[$i]="" || true
+    else
+      err "Falha ao restaurar $backup -> $orig"
+      _report_add_error "rollback_failed:$backup"
+      rc=2
+    fi
+  done
+  if [ "$rc" -eq 0 ]; then
+    ok "Rollback completo com sucesso."
+  else
+    warn "Rollback finalizado com erros (veja logs)."
+  fi
+  return "$rc"
+}
+
+##### -------------------------
+##### remove_files_atomic
+##### - Moves all manifest files/dirs to backup and optionally deletes backup if purge requested
+##### - Returns 0 on success, non-zero on failure
+##### -------------------------
+remove_files_atomic() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then err "remove_files_atomic: pacote não especificado"; return 2; fi
+  if [ "${#MANIFEST_FILES[@]}" -eq 0 ]; then warn "Nenhum arquivo no manifest para $pkg"; return 0; fi
+
+  local bdir
+  bdir="$(create_run_backup_dir "$pkg" 2>/dev/null || true)"
+  if [ -z "$bdir" ]; then
+    err "Falha ao criar backup para $pkg"
+    return 3
+  fi
+
+  local any_failed=0
+  for f in "${MANIFEST_FILES[@]}"; do
+    # safety: only operate if path is within adm or known safe system prefix (we verified earlier)
+    if ! ensure_safe_to_operate "$f"; then
+      warn "Ignorando $f (fora de ADM_ROOT)"
+      _report_add_action "$pkg" "skipped" "$f"
+      continue
+    fi
+    if [ ! -e "$f" ]; then
+      warn "Arquivo não existe, registrando e continuando: $f"
+      _report_add_action "$pkg" "missing" "$f"
+      continue
+    fi
+
+    # if it's a symlink, remove symlink only (but backup target if regular file)
+    if [ -L "$f" ]; then
+      # backup symlink by copying link info
+      if [ "$DRY_RUN" -eq 1 ]; then
+        info "(dry-run) movendo symlink $f -> $bdir"
+        _report_add_action "$pkg" "symlink-moved" "$f"
+        continue
+      fi
+      if backup_and_move_to_backup "$f" "$bdir"; then
+        _report_add_action "$pkg" "symlink-moved" "$f"
+      else
+        warn "Falha ao mover symlink $f"
+        any_failed=1
+        _report_add_action "$pkg" "failed-move" "$f"
+      fi
+      continue
+    fi
+
+    # regular file or dir: move to backup
+    if backup_and_move_to_backup "$f" "$bdir"; then
+      _report_add_action "$pkg" "moved" "$f"
+    else
+      warn "Falha ao mover $f para backup"
+      any_failed=1
+      _report_add_action "$pkg" "failed-move" "$f"
+      # do not abort immediately; attempt best-effort for remaining files
+    fi
+  done
+
+  # if any failures and not forced, attempt rollback and return non-zero
+  if [ "$any_failed" -ne 0 ] && [ "$FORCE" -ne 1 ]; then
+    err "Alguns arquivos não puderam ser movidos para backup; iniciando rollback"
+    rollback_restore || true
+    return 4
+  fi
+
+  # if purge true: remove backups now (irreversible) - require FORCE and explicit confirmation
+  if [ "$PURGE" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) purge habilitado - backups seriam removidos em produção"
+    else
+      if [ "$FORCE" -ne 1 ]; then
+        if ! confirm_prompt "Purge ativado. Remover backups permanentes para $pkg (irreversível)?"; then
+          warn "Purge cancelado pelo usuário; backups preservados em $bdir"
+        fi
+      fi
+      # remove backups if FORCE or confirmed
+      if [ "$FORCE" -eq 1 ]; then
+        rm -rf "$bdir" 2>>"$LOGFILE" && ok "Backups removidos (purge): $bdir" || warn "Falha ao remover backups: $bdir"
+      fi
+    fi
+  fi
+
+  return 0
+}
+
+##### -------------------------
+##### execute_uninstall_plan <pkg>
+##### - Main flow per-package:
+#####   1) Run pre-uninstall hooks
+#####   2) Move files/dirs to backup atomically
+#####   3) Update installed DB (remove manifest)
+#####   4) Run post-uninstall hooks
+#####   5) Return success or failure
+##### -------------------------
+execute_uninstall_plan() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then err "execute_uninstall_plan: pacote não fornecido"; return 2; fi
+
+  # read manifest
+  if ! read_manifest_for_pkg "$pkg"; then
+    err "Não foi possível ler manifest para $pkg"
+    return 3
+  fi
+
+  info "Preparando desinstalação de $pkg (files=${#MANIFEST_FILES[@]})"
+  _report_add_action "$pkg" "plan-start" "files=${#MANIFEST_FILES[@]}"
+
+  # detect reverse deps (unless skip)
+  if [ "$SKIP_DEPS_CHECK" -ne 1 ]; then
+    local deps
+    deps="$(detect_reverse_dependencies "$pkg" 2>/dev/null || true)"
+    if [ -n "$deps" ]; then
+      warn "Pacotes dependentes detectados:\n$deps"
+      if [ "$FORCE" -ne 1 ] && [ "$ASSUME_YES" -ne 1 ]; then
+        if ! confirm_prompt "Existem dependentes instalados. Deseja forçar remoção de $pkg?"; then
+          warn "Usuário cancelou remoção devido a dependentes."
+          _report_add_action "$pkg" "cancelled" "dependents_present"
+          return 4
+        fi
+      fi
+    fi
+  fi
+
+  # run pre-uninstall hook
+  if ! run_hook_if_exists "$pkg" "pre-uninstall"; then
+    warn "Hook pre-uninstall retornou erro (continuando a menos que FORCE=0 e não confirmado)."
+    _report_add_action "$pkg" "pre-hook-failed" ""
+    # if hook failed and not forced, abort
+    if [ "$FORCE" -ne 1 ]; then
+      err "Pre-hook falhou e --force não especificado; abortando."
+      return 5
+    fi
+  fi
+
+  # move files atomically to backup
+  if ! remove_files_atomic "$pkg"; then
+    err "Falha na etapa de mover arquivos para backup para $pkg"
+    _report_add_error "move_failed:$pkg"
+    return 6
+  fi
+
+  # update manifests/db
+  if ! remove_manifest_entries "$pkg"; then
+    warn "Falha ao atualizar manifest/db para $pkg (mas arquivos movidos para backup)"
+    _report_add_error "manifest_update_failed:$pkg"
+    # not fatal; let operator inspect backups
+  fi
+
+  # run post-uninstall hook
+  if ! run_hook_if_exists "$pkg" "post-uninstall"; then
+    warn "Hook post-uninstall retornou erro"
+    _report_add_action "$pkg" "post-hook-failed" ""
+    # post-hook failure is not necessarily fatal; continue
+  fi
+
+  _report_add_action "$pkg" "uninstalled" "$UNINSTALL_BACKUP_BASE"
+  ok "Desinstalação concluída (backup em $UNINSTALL_BACKUP_BASE)"
+  return 0
+}
+
+##### -------------------------
+##### confirm_prompt (reused from adm-clean style)
+##### -------------------------
+confirm_prompt() {
+  local prompt="$1"
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    verbose "Assumindo yes para: $prompt"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) prompt: $prompt"; return 0
+  fi
+  while true; do
+    read -r -p "$prompt [y/N]: " ans
+    case "$ans" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO|"") return 1 ;;
+      *) echo "Responda y ou n." ;;
+    esac
+  done
+}
+
+##### -------------------------
+##### Main per-target handler
+##### -------------------------
+handle_uninstall_target() {
+  local target="$1"
+  if [ "$target" = "--orphans" ]; then
+    warn "Orphans handling should be invoked via PART 3/3 (bulk orphan removal)."
+    return 0
+  fi
+  if [ -z "$target" ]; then
+    err "Nenhum pacote especificado para remoção"
+    return 2
+  fi
+
+  # ensure manifest exists
+  if ! read_manifest_for_pkg "$target"; then
+    err "Manifest não encontrado para $target; abortando"
+    return 3
+  fi
+
+  # require explicit confirmation unless dry-run or assume_yes or force
+  if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    echo
+    echo "Pacote: $target"
+    echo "Arquivos a serem removidos: ${#MANIFEST_FILES[@]}"
+    printf "Backup será criado em: %s/%s-%s\n" "$UNINSTALL_BACKUP_BASE" "$target" "$TS"
+    if ! confirm_prompt "Deseja prosseguir com a desinstalação de $target?"; then
+      warn "Operação cancelada pelo usuário."
+      _report_add_action "$target" "cancelled-user" ""
+      return 1
+    fi
+  fi
+
+  # run uninstall
+  if ! execute_uninstall_plan "$target"; then
+    err "Desinstalação de $target falhou (veja logs)"
+    _UNINSTALL_RC=1
+    return 1
+  fi
+
+  # success
+  _UNINSTALL_RC=0
+  return 0
+}
+
+##### -------------------------
+##### Final message for PART 2/3
+##### -------------------------
+# echo
+# echo "adm-uninstall pronta."
+# echo "Implementa backup seguro, execução de hooks, mover arquivos para backup e rollback automático."
+# echo "para implementar orfãos em lote, prune de backups, purge e summary final."
+# Note: do NOT release lock here; main pipeline will coordinate lock lifecycle.
+##### -------------------------
+##### adm-uninstall PARTE 3/3 (final)
+##### -------------------------
+# Final wiring: orphan detection & bulk removal, prune backups, restore, purge, final report and exit codes.
+# Assumes PART 1/3 and PART 2/3 already loaded in same file.
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# Exit codes
+EX_OK=0
+EX_WARN=1
+EX_FAIL=2
+EX_LOCK=3
+EX_INTERRUPT=130
+
+# Ensure we have common variables
+UNINSTALL_BACKUPS_ROOT="${ADM_BACKUPS_DIR:-$ADM_ROOT/db/backups/uninstall}"
+
+# Graceful trap (extend earlier)
+_final_interrupt() {
+  err "Interrompido. Liberando locks..."
+  _release_lock || true
+  exit $EX_INTERRUPT
+}
+trap _final_interrupt INT TERM
+
+##### -------------------------
+##### Utility: list installed packages
+##### -------------------------
+list_installed_pkgs() {
+  # prefer index.json if present
+  local idx="$ADM_INSTALLED_DB/index.json"
+  if [ -f "$idx" ] && command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null || true
+import json,sys
+f=sys.argv[1]
+try:
+  d=json.load(open(f))
+  if isinstance(d,list):
+    for e in d:
+      if isinstance(e,dict) and 'name' in e:
+        print(e['name'])
+      elif isinstance(e,str):
+        print(e)
+except Exception:
+  pass
+PY
+    return 0
+  fi
+  # fallback: list directories under ADM_INSTALLED_DB
+  if [ -d "$ADM_INSTALLED_DB" ]; then
+    find "$ADM_INSTALLED_DB" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null || true
+    # also look for pkg.manifest files
+    find "$ADM_INSTALLED_DB" -type f -name "*.manifest" -printf '%f\n' 2>/dev/null | sed -E 's/\.manifest$//g' || true
+  else
+    return 0
+  fi
+}
+
+##### -------------------------
+##### list_orphans
+##### - A package é órfão se nenhuma outra package instalada depende dele.
+##### - We use detect_reverse_dependencies (which prefers adm-resolver) for accuracy.
+##### -------------------------
+list_orphans() {
+  local pkgs
+  mapfile -t pkgs < <(list_installed_pkgs)
+  local orphans=()
+  for p in "${pkgs[@]:-}"; do
+    # skip if empty
+    [ -z "$p" ] && continue
+    # find dependents
+    local deps
+    deps="$(detect_reverse_dependencies "$p" 2>/dev/null || true)"
+    if [ -z "$deps" ]; then
+      orphans+=("$p")
+    fi
+  done
+  # print unique sorted
+  if [ "${#orphans[@]}" -gt 0 ]; then
+    printf "%s\n" "${orphans[@]}" | sort -u
+  fi
+  return 0
+}
+
+##### -------------------------
+##### autoremove_orphans
+##### - Remove orphans in safe order (reverse dependency order: remove leaves first)
+##### - This function will call handle_uninstall_target for each orphan.
+##### - Requires explicit confirmation unless --yes or --force.
+##### -------------------------
+autoremove_orphans() {
+  local auto_force="${1:-0}"
+  info "Detectando órfãos instalados..."
+  mapfile -t orphans < <(list_orphans)
+  if [ "${#orphans[@]}" -eq 0 ]; then
+    ok "Nenhum órfão detectado."
+    return 0
+  fi
+  info "Órfãos detectados (${#orphans[@]}):"
+  for p in "${orphans[@]}"; do printf "  - %s\n" "$p"; done
+
+  if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -ne 1 ] && [ "$auto_force" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Deseja desinstalar todos os órfãos listados?"; then
+      warn "Auto-remove cancelado pelo usuário."
+      return 1
+    fi
+  fi
+
+  # Remove in safe order; since they are orphans, simple iteration is acceptable.
+  local failed=0
+  for p in "${orphans[@]}"; do
+    info "Auto-removendo órfão: $p"
+    # call per-target handler (which will perform confirmations as needed)
+    if ! handle_uninstall_target "$p"; then
+      warn "Falha ao remover órfão: $p"
+      failed=1
+      # continue to next orphan unless FORCE not set? We'll continue but mark failure.
+    fi
+  done
+
+  if [ "$failed" -ne 0 ]; then
+    warn "Alguns órfãos não puderam ser removidos. Ver logs."
+    return 2
+  fi
+  ok "Auto-remove de órfãos concluído."
+  return 0
+}
+
+##### -------------------------
+##### list_backups
+##### - Lists available backups under UNINSTALL_BACKUPS_ROOT with brief metadata
+##### -------------------------
+list_backups() {
+  [ -d "$UNINSTALL_BACKUPS_ROOT" ] || { warn "Nenhum backup encontrado."; return 0; }
+  echo "Backups disponíveis em $UNINSTALL_BACKUPS_ROOT:"
+  find "$UNINSTALL_BACKUPS_ROOT" -mindepth 1 -maxdepth 2 -type d -printf '%TY-%Tm-%Td %TT %p\n' 2>/dev/null | sort -r || true
+  return 0
+}
+
+##### -------------------------
+##### restore_backup <backup_path_or_id>
+##### - Restores a given backup directory (must be inside UNINSTALL_BACKUPS_ROOT)
+##### - ## RISCO: pode sobrescrever arquivos existentes. Confirm required.
+##### -------------------------
+restore_backup() {
+  local id="$1"
+  if [ -z "$id" ]; then err "restore requires a backup path or id"; return 2; fi
+  # find matching backup dir
+  local match
+  # if id is absolute or relative path and exists, use it
+  if [ -d "$id" ]; then match="$id"
+  else
+    # try to match by name under UNINSTALL_BACKUPS_ROOT
+    match="$(find "$UNINSTALL_BACKUPS_ROOT" -type d -name "*$id*" -print -quit 2>/dev/null || true)"
+  fi
+  if [ -z "$match" ] || [ ! -d "$match" ]; then
+    err "Backup não encontrado correspondente a: $id"
+    return 3
+  fi
+
+  info "Restauração de backup: $match"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) restauraria backup $match para locais originais (simulado)"
+    return 0
+  fi
+
+  # confirm explicit
+  if [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Restauração irá sobrescrever arquivos existentes. Prosseguir?"; then
+      warn "Restauração cancelada."
+      return 1
+    fi
+  fi
+
+  # iterate items inside backup. Assume naming convention: backup contains <pkg>-<ts>/<files...>
+  local item
+  local rc=0
+  while IFS= read -r -d '' item; do
+    # If item is a file or dir, compute original target (try to derive from recorded metadata)
+    # We stored original paths in _BACKUP_MAP for run-time only; for persisted backups attempt heuristics:
+    # - if backup entry is something like manifest_dir or manifest_file it maps to installed DB; else try to move back to /
+    # We'll implement a conservative restore: ask user to manually inspect if mapping ambiguous.
+    local rel
+    rel="${item#$match/}"
+    # simple heuristic: if rel starts with "manifest_dir" or "manifest_file"
+    case "$rel" in
+      manifest_dir*|manifest_file*)
+        # move back to ADM_INSTALLED_DB/<pkg>
+        # try to obtain pkg from parent dir of match (if match contains pkg-TS)
+        local base="$(basename "$match")"
+        local pkg="$(printf '%s' "$base" | sed -E 's/^(.*)-[0-9]{8}-[0-9]{6}$//;s/-backup$//')"
+        [ -z "$pkg" ] && pkg="$base"
+        local dest="$ADM_INSTALLED_DB/$pkg"
+        safe_mkdir "$(dirname "$dest")" || true
+        if mv -f "$item" "$dest" 2>>"$LOGFILE"; then
+          ok "Restaurado $item -> $dest"
+        else
+          warn "Falha ao restaurar $item -> $dest"
+          rc=2
+        fi
+        ;;
+      *)
+        # default: restore to absolute path if original path included in filename? Try to read metadata file next to item
+        # if item/.source.meta exists, skip (these are source cache backups)
+        # We will attempt to restore by moving item to '/' + rel (dangerous) — but only after confirmation
+        local proposed="/$rel"
+        # safety: ensure proposed is within ADM_ROOT or /usr /etc /var — otherwise ask user
+        if path_within_adm "$proposed" || printf '%s' "$proposed" | grep -qE '^/usr/|^/etc/|^/var/'; then
+          if [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+            if ! confirm_prompt "Restaurar $item -> $proposed?"; then
+              warn "Pulando restauração de $item"
+              continue
+            fi
+          fi
+          safe_mkdir "$(dirname "$proposed")" || true
+          if mv -f "$item" "$proposed" 2>>"$LOGFILE"; then
+            ok "Restaurado $item -> $proposed"
+          else
+            warn "Falha ao restaurar $item -> $proposed"
+            rc=3
+          fi
+        else
+          warn "Não sei restaurar automaticamente $item (mapeamento ambíguo). Verifique manualmente."
+        fi
+        ;;
+    esac
+  done < <(find "$match" -mindepth 1 -print0 2>/dev/null)
+
+  if [ "$rc" -eq 0 ]; then
+    ok "Restauração concluída (verifique integridade dos arquivos restaurados)."
+  else
+    warn "Restauração concluída com erros (veja logs)."
+  fi
+  return "$rc"
+}
+
+##### -------------------------
+##### prune_backups <days>
+##### - Removes backup dirs older than N days under UNINSTALL_BACKUPS_ROOT
+##### - ## RISCO: remove backups permanentemente.
+##### -------------------------
+prune_backups() {
+  local days="${1:-30}"
+  info "Pruning backups em $UNINSTALL_BACKUPS_ROOT com mais de ${days} dias."
+  if [ ! -d "$UNINSTALL_BACKUPS_ROOT" ]; then
+    warn "Nenhum backup encontrado em $UNINSTALL_BACKUPS_ROOT"
+    return 0
+  fi
+  # find and list candidates
+  mapfile -t candidates < <(find "$UNINSTALL_BACKUPS_ROOT" -mindepth 1 -maxdepth 2 -type d -mtime +"$days" -print 2>/dev/null || true)
+  if [ "${#candidates[@]}" -eq 0 ]; then
+    ok "Nenhum backup antigo encontrado para prune."
+    return 0
+  fi
+  info "Backups candidatos para remoção (${#candidates[@]}):"
+  for c in "${candidates[@]}"; do printf "  %s\n" "$c"; done
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) prune not executed"
+    return 0
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Remover backups listados? (irreversível)"; then
+      warn "Prune cancelado."
+      return 1
+    fi
+  fi
+
+  local removed=0 failed=0
+  for c in "${candidates[@]}"; do
+    if rm -rf "$c" 2>>"$LOGFILE"; then
+      ok "Removido backup: $c"
+      removed=$((removed+1))
+    else
+      warn "Falha ao remover backup: $c"
+      failed=$((failed+1))
+    fi
+  done
+  printf "Prune finalizado: removidos=%d falhas=%d\n" "$removed" "$failed"
+  return 0
+}
+
+##### -------------------------
+##### purge_package <pkg>
+##### - Purge: removes backup, manifests, and any residual config/cache for a package
+##### - ## RISCO: operação irreversível; requires --force or confirmation
+##### -------------------------
+purge_package() {
+  local pkg="$1"
+  if [ -z "$pkg" ]; then err "purge_package requires a package name"; return 2; fi
+  info "Purge: pacote $pkg (remover manifest/caches/backups)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) purge would remove: installed manifest, cache, backups for $pkg"
+    return 0
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ] && [ "$FORCE" -ne 1 ]; then
+    if ! confirm_prompt "Purge é irreversível. Remover todos os vestígios de $pkg?"; then
+      warn "Purge cancelado."
+      return 1
+    fi
+  fi
+
+  # remove installed DB entries
+  if [ -d "$ADM_INSTALLED_DB/$pkg" ]; then
+    rm -rf "$ADM_INSTALLED_DB/$pkg" 2>>"$LOGFILE" && ok "Removido installed dir: $ADM_INSTALLED_DB/$pkg" || warn "Falha ao remover installed dir"
+  fi
+  if [ -f "$ADM_INSTALLED_DB/$pkg.manifest" ]; then
+    rm -f "$ADM_INSTALLED_DB/$pkg.manifest" 2>>"$LOGFILE" && ok "Removido manifest file" || warn "Falha ao remover manifest file"
+  fi
+
+  # remove caches (sources)
+  if [ -d "$ADM_SOURCES_CACHE/$pkg" ]; then
+    rm -rf "$ADM_SOURCES_CACHE/$pkg" 2>>"$LOGFILE" && ok "Cache de fontes removido: $pkg" || warn "Falha ao remover cache"
+  fi
+
+  # remove backups related to pkg
+  find "$UNINSTALL_BACKUPS_ROOT" -type d -name "${pkg}-*" -print0 2>/dev/null | while IFS= read -r -d '' b; do
+    rm -rf "$b" 2>>"$LOGFILE" && ok "Backup removido: $b" || warn "Falha ao remover backup: $b"
+  done
+
+  _report_add_action "$pkg" "purged" "ok"
+  return 0
+}
+
+##### -------------------------
+##### finalize_report_and_exit
+##### -------------------------
+finalize_report_and_exit() {
+  local rc="$1"
+  local start_ts="${START_TS:-$(date +%s)}"
+  local end_ts
+  end_ts="$(date +%s)"
+  local elapsed=$((end_ts - start_ts))
+  local free_space
+  free_space="$(df -h "$ADM_ROOT" 2>/dev/null | awk 'END{print $4}')"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) finalizing report"
+  fi
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$rc" -eq 0 ]; then
+    printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "adm-uninstall concluído com sucesso."
+  else
+    printf "%b %s (rc=%d)%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "adm-uninstall finalizado com erros" "$rc" "${CLR_RESET}"
+  fi
+  printf "%b Tempo:%b %ss\n" "${CLR_BOLD}" "${CLR_RESET}" "$elapsed"
+  printf "%b Espaço livre:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$free_space"
+  printf "%b Log:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$LOGFILE"
+  printf "%b Relatório:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$REPORT_JSON"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  # release lock
+  _release_lock || true
+  exit "$rc"
+}
+
+##### -------------------------
+##### Main CLI Additions / Dispatch
+##### - supports commands:
+#####   adm-uninstall <pkg>         # uninstall single package (default)
+#####   adm-uninstall --orphans     # list orphans
+#####   adm-uninstall --autoremove  # remove orphans
+#####   adm-uninstall restore <id>  # restore a backup dir or id
+#####   adm-uninstall prune-backups [days]
+#####   adm-uninstall purge <pkg>
+##### -------------------------
+_main_final_dispatch() {
+  local cmd="${POSITIONAL[0]:-}"
+  case "$cmd" in
+    --orphans)
+      list_orphans
+      finalize_report_and_exit 0
+      ;;
+    --autoremove)
+      # remove orphans in bulk
+      autoremove_orphans 0
+      finalize_report_and_exit $?
+      ;;
+    restore)
+      if [ -z "${POSITIONAL[1]:-}" ]; then err "restore requires backup id/path"; finalize_report_and_exit 2; fi
+      restore_backup "${POSITIONAL[1]:-}"
+      finalize_report_and_exit $?
+      ;;
+    prune-backups)
+      local days="${POSITIONAL[1]:-30}"
+      prune_backups "$days"
+      finalize_report_and_exit $?
+      ;;
+    purge)
+      if [ -z "${POSITIONAL[1]:-}" ]; then err "purge requires package"; finalize_report_and_exit 2; fi
+      purge_package "${POSITIONAL[1]:-}"
+      finalize_report_and_exit $?
+      ;;
+    "")
+      # default: uninstall TARGET_PKG (from earlier parsing)
+      if [ -z "$TARGET_PKG" ]; then
+        err "Nenhum pacote especificado. Use --orphans, --autoremove, restore, prune-backups ou purge."
+        finalize_report_and_exit 2
+      fi
+      handle_uninstall_target "$TARGET_PKG"
+      finalize_report_and_exit $?
+      ;;
+    *)
+      # user may pass package directly as first positional; handled earlier but allow here
+      handle_uninstall_target "$cmd"
+      finalize_report_and_exit $?
+      ;;
+  esac
+}
+
+##### -------------------------
+##### Start timer and run final dispatch
+##### -------------------------
+START_TS=$(date +%s)
+# Re-acquire lock to ensure exclusive run (if not already)
+_acquire_lock || { err "Não foi possível adquirir lock global."; exit $EX_LOCK; }
+
+# Run dispatch
+_main_final_dispatch
+
+# Should never reach here
+finalize_report_and_exit 0
