@@ -2,6 +2,12 @@
 # adm-update - 
 # Update packages by checking upstream, creating updated metafile and optionally installing
 # Save final file as: /usr/src/adm/bin/adm-update  
+# ADM_DRY_RUN=1 /usr/src/adm/bin/adm-update check <pkg>
+# Verifique onde o novo metafile foi escrito
+# ls -l /usr/src/adm/metafiles/update/<pkg>/
+# Teste run em dry-run 
+# ADM_DRY_RUN=1 /usr/src/adm/bin/adm-update run <pkg> --deps-first
+# Verifique logs em /usr/src/adm/logs/update
 #
 # Safety: by default runs in SIMULATION mode. Any destructive or environment-changing commands
 # are commented and marked with: "# UNCOMMENT FOR REAL EXECUTION (in chroot only)".
