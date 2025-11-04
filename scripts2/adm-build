@@ -1,0 +1,2019 @@
+#!/usr/bin/env bash
+#
+# adm-build 
+# --------------------
+# Script de construção de pacotes para ADM
+# Parte: cabeçalho, configuração, helpers, parser e detectores
+#
+# Conteúdo desta parte:
+#  - aviso de risco e instruções
+#  - variáveis globais e carregamento de adm.conf
+#  - helpers: log, colors, spinner, lock
+#  - parsing de argumentos globais
+#  - paths e preparação de diretórios
+#  - detectores: build systems, toolchains, suporte a flags
+#  - leitor de metafile minimal (conforme seu formato solicitado)
+#
+# Observações:
+#  - Suporta --dry-run, que simula sem executar ações destrutivas.
+#  - Este script usa ferramentas externas padrão (gcc/clang, make, cmake, cargo, go, node, python, tar, zstd/xz, etc.)
+#  - Em pontos marcados com "## RISCO" estão as operações potencialmente destrutivas/donos de risco.
+#  - Você assumiu responsabilidade por executar comandos perigosos; use --dry-run primeiro e prefira VM/contêiner.
+#
+# Como usar (exemplo mínimo):
+#   ./adm-build --dry-run --profile normal --jobs 4 category/program
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Configuração e defaults
+##### -------------------------
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+
+# Defaults (podem ser sobrescritos por /usr/src/adm/conf/adm.conf)
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_SOURCES_DIR="${ADM_SOURCES_DIR:-$ADM_CACHE/sources}"
+ADM_TARBALLS_DIR="${ADM_TARBALLS_DIR:-$ADM_CACHE/tarballs}"
+ADM_BUILDS="${ADM_BUILDS:-$ADM_ROOT/builds}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_PROVIDE_MAP="${ADM_PROVIDE_MAP:-$ADM_CONF_DIR/provide-map}"  # optional mapping
+ADM_DEFAULT_PROFILE="${ADM_DEFAULT_PROFILE:-normal}"
+
+# Defaults for build
+DEFAULT_JOBS=4
+DEFAULT_PROFILE="$ADM_DEFAULT_PROFILE"
+DEFAULT_COMPRESS="zstd"   # prefer zstd, fallback to xz
+MAX_RETRIES=3
+
+# runtime state (mutáveis via flags)
+DRY_RUN=0
+FORCE=0
+ASSUME_YES=0
+VERBOSE=0
+JOBS="$DEFAULT_JOBS"
+PROFILE="$DEFAULT_PROFILE"
+AUTO_FIX="off"   # can be 'off'|'interactive'|'on'
+SANDBOX="yes"    # use sandbox by default
+NO_SANDBOX=0
+LOGFILE=""
+KEEP_WORKDIR=0
+KEEP_BUILDLOGS=0
+PACK_ONLY=0
+REBUILD=0
+CHROOT_PATH=""
+WITH_COMPILER=""  # e.g., "gcc" or "clang"
+NO_HOOKS=0
+
+# Internal variables set later
+WORKDIR=""
+SRCDIR=""
+DESTDIR=""
+BUILD_LOG=""
+BUILD_INFO=""
+
+##### -------------------------
+##### Load adm.conf if present (override defaults)
+##### -------------------------
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+##### -------------------------
+##### Color & Icons
+##### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+ICON_DOWN="⬇️"
+ICON_PACK="📦"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+##### -------------------------
+##### Spinner (background)
+##### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+##### -------------------------
+##### Locking to avoid concurrent builds for same pkg
+##### -------------------------
+LOCKDIR="$ADM_TMP/locks"
+mkdir -p "$LOCKDIR" 2>/dev/null || true
+
+_acquire_lock() {
+  local name="$1"
+  local lockfile="$LOCKDIR/$(echo "$name" | sed 's/[^a-zA-Z0-9._-]/_/g').lock"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would acquire lock $lockfile"
+    echo "$lockfile"
+    return 0
+  fi
+  exec 9>"$lockfile"
+  if ! flock -n 9; then
+    err "Não foi possível adquirir lock $lockfile — outro processo pode estar operando neste pacote"
+    return 1
+  fi
+  echo "$lockfile"
+  return 0
+}
+_release_lock() {
+  local lockfile="$1"
+  if [ -z "$lockfile" ]; then return 0; fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) would release $lockfile"
+    return 0
+  fi
+  # closing fd 9 releases flock when shell exits. best-effort no-op here.
+  :
+}
+
+##### -------------------------
+##### Usage / Arguments globais
+##### -------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME [global options] <category/program>  # or path to source dir
+
+Global options:
+  --dry-run                Simula todas as ações (imprime comandos)
+  --force                  Força re-builds e operações destrutivas
+  --yes                    Assume yes para prompts
+  --verbose                Saída detalhada
+  --jobs N                 Número de jobs paralelos (default: $DEFAULT_JOBS)
+  --profile <none|normal|extreme>
+  --auto-fix <off|interactive|on>
+  --no-sandbox             Desabilita sandbox (não recomendado)
+  --chroot <path>          Use chroot específico para build
+  --log <file>             Grava log detalhado em arquivo
+  --keep-workdir           Não remove workdir após build (para debug)
+  --pack-only              Apenas empacota um destdir já existente
+  --rebuild                Força rebuild ignorando cache
+  --with-compiler <gcc|clang|...>
+  --no-hooks               Não execute hooks definidos no metafile/hook dir
+  -h, --help               Mostra esta ajuda
+
+Exemplos:
+  $SCRIPT_NAME --dry-run category/program
+  $SCRIPT_NAME --profile extreme --jobs 8 category/program
+EOF
+  exit 1
+}
+
+# parse global flags
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --jobs) shift; JOBS="${1:-$DEFAULT_JOBS}"; shift ;;
+    --profile) shift; PROFILE="${1:-$DEFAULT_PROFILE}"; shift ;;
+    --auto-fix) shift; AUTO_FIX="${1:-off}"; shift ;;
+    --no-sandbox) NO_SANDBOX=1; SANDBOX="no"; shift ;;
+    --sandbox) SANDBOX="yes"; shift ;;
+    --chroot) shift; CHROOT_PATH="$1"; shift ;;
+    --log) shift; LOGFILE="$1"; shift ;;
+    --keep-workdir) KEEP_WORKDIR=1; shift ;;
+    --pack-only) PACK_ONLY=1; shift ;;
+    --rebuild) REBUILD=1; shift ;;
+    --with-compiler) shift; WITH_COMPILER="$1"; shift ;;
+    --no-hooks) NO_HOOKS=1; shift ;;
+    -h|--help) usage ;;
+    --) shift; break ;;
+    -*)
+      err "Flag desconhecida: $1"
+      usage
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
+  esac
+done
+
+# restore positional args
+set -- "${POSITIONAL[@]:-}"
+
+if [ ${#POSITIONAL[@]} -lt 1 ]; then
+  err "Você deve informar category/program ou um caminho para o source."
+  usage
+fi
+
+# determine target (could be category/program or a path)
+TARGET_RAW="${POSITIONAL[0]}"
+# if it's a directory, use as source override
+if [ -d "$TARGET_RAW" ]; then
+  TARGET_IS_DIR=1
+  SRC_SOURCE_PATH="$(readlink -f "$TARGET_RAW")"
+else
+  TARGET_IS_DIR=0
+fi
+
+# default logfile if not specified
+if [ -z "${LOGFILE:-}" ]; then
+  LOGFILE="$ADM_LOGS/adm-build-$TS.log"
+fi
+
+# ensure top dirs exist (unless dry-run)
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_SOURCES_DIR" "$ADM_TARBALLS_DIR" "$ADM_BUILDS" "$ADM_LOGS" "$ADM_TMP" "$LOCKDIR" 2>/dev/null || true
+fi
+
+# start initial log header
+log_to_file "[START]" "adm-build start $TS"
+info "adm-build iniciado: target='$TARGET_RAW' profile='$PROFILE' jobs=$JOBS auto-fix=$AUTO_FIX sandbox=$SANDBOX"
+
+##### -------------------------
+##### Utility: safe_run - executes command with dry-run handling and logging
+##### -------------------------
+safe_run() {
+  # usage: safe_run "description" cmd args...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    if [ "$VERBOSE" -eq 1 ]; then
+      printf "  Comando (simulado): %s\n" "$*"
+    fi
+    return 0
+  fi
+  # execute and log
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    log_to_file "[CMD-FAIL]" "$desc"
+    return 2
+  fi
+}
+
+##### -------------------------
+##### Detect build systems (heurística)
+##### -------------------------
+# detect_build_systems <srcdir>
+detect_build_systems() {
+  local srcdir="$1"
+  local -a detected=()
+  [ -f "$srcdir/Cargo.toml" ] && detected+=("cargo")
+  [ -f "$srcdir/go.mod" ] && detected+=("go")
+  [ -f "$srcdir/package.json" ] && detected+=("node")
+  [ -f "$srcdir/pyproject.toml" ] && detected+=("python-pyproject")
+  [ -f "$srcdir/setup.py" ] && detected+=("python-setup")
+  [ -f "$srcdir/requirements.txt" ] && detected+=("python-reqs")
+  [ -f "$srcdir/pom.xml" ] && detected+=("maven")
+  [ -f "$srcdir/build.gradle" ] && detected+=("gradle")
+  [ -f "$srcdir/CMakeLists.txt" ] && detected+=("cmake")
+  [ -f "$srcdir/meson.build" ] && detected+=("meson")
+  [ -f "$srcdir/configure" -o -f "$srcdir/configure.ac" -o -f "$srcdir/autogen.sh" ] && detected+=("autotools")
+  [ -f "$srcdir/Makefile" ] && detected+=("makefile")
+  # zig check
+  if compgen -G "$srcdir/*.zig" >/dev/null 2>&1 || [ -f "$srcdir/build.zig" ]; then detected+=("zig"); fi
+  # haskell
+  if compgen -G "$srcdir/*.cabal" >/dev/null 2>&1; then detected+=("haskell"); fi
+  [ -f "$srcdir/Gemfile" ] && detected+=("ruby")
+  # dotnet
+  if compgen -G "$srcdir/*.csproj" >/dev/null 2>&1 || [ -f "$srcdir/global.json" ]; then detected+=("dotnet"); fi
+
+  # fallback: detect scripts by shebang
+  if [ ${#detected[@]} -eq 0 ]; then
+    if grep -RI --exclude-dir=.git -m1 '^#!' "$srcdir" 2>/dev/null | grep -qE 'python|node|perl|ruby|php'; then
+      detected+=("scripts")
+    fi
+  fi
+
+  # Emit preferred by priority (we'll prefer earlier entries if multiple)
+  if [ ${#detected[@]} -eq 0 ]; then
+    echo "unknown"
+  else
+    # print all detected as newline list
+    printf "%s\n" "${detected[@]}"
+  fi
+}
+
+##### -------------------------
+##### Detect toolchains and compilers
+##### -------------------------
+# populates associative arrays TOOL_PATH TOOL_VER and returns 0
+declare -A TOOL_PATH TOOL_VER TOOL_SUPPORTS_FLAG
+
+_probe_tool() {
+  local cmd="$1"
+  if command -v "$cmd" >/dev/null 2>&1; then
+    local path; path="$(command -v "$cmd" 2>/dev/null || true)"
+    local ver; ver="$("$cmd" --version 2>&1 | head -n1 | tr -s ' ' ' ' || true)"
+    echo "$path|||$ver"
+  else
+    echo ""
+  fi
+}
+
+# tests if compiler accepts a flag (compile tiny C)
+_compiler_supports_flag() {
+  local cc="$1"
+  local flag="$2"
+  local tmpc fileout
+  tmpc="$(mktemp -u "$ADM_TMP/test-XXXX.c")"
+  fileout="$(mktemp -u "$ADM_TMP/test-XXXX")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) test compiler flag: $cc $flag"
+    return 1
+  fi
+  printf 'int main(){return 0;}\n' >"$tmpc"
+  if "$cc" $flag "$tmpc" -o "$fileout" >/dev/null 2>&1; then
+    rm -f "$tmpc" "$fileout" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$tmpc" "$fileout" 2>/dev/null || true
+  return 1
+}
+
+detect_toolchains() {
+  verbose "Detectando toolchains disponíveis..."
+  local r
+  r="$(_probe_tool gcc)" && [ -n "$r" ] && TOOL_PATH[gcc]="${r%%|||*}" && TOOL_VER[gcc]="${r##*|||}"
+  r="$(_probe_tool g++)" && [ -n "$r" ] && TOOL_PATH[g++]="${r%%|||*}" && TOOL_VER[g++]="${r##*|||}"
+  r="$(_probe_tool clang)" && [ -n "$r" ] && TOOL_PATH[clang]="${r%%|||*}" && TOOL_VER[clang]="${r##*|||}"
+  r="$(_probe_tool cc)" && [ -n "$r" ] && TOOL_PATH[cc]="${r%%|||*}" && TOOL_VER[cc]="${r##*|||}"
+  r="$(_probe_tool c++)" && [ -n "$r" ] && TOOL_PATH[c++]="${r%%|||*}" && TOOL_VER[c++]="${r##*|||}"
+  r="$(_probe_tool rustc)" && [ -n "$r" ] && TOOL_PATH[rustc]="${r%%|||*}" && TOOL_VER[rustc]="${r##*|||}"
+  r="$(_probe_tool cargo)" && [ -n "$r" ] && TOOL_PATH[cargo]="${r%%|||*}" && TOOL_VER[cargo]="${r##*|||}"
+  r="$(_probe_tool go)" && [ -n "$r" ] && TOOL_PATH[go]="${r%%|||*}" && TOOL_VER[go]="${r##*|||}"
+  r="$(_probe_tool node)" && [ -n "$r" ] && TOOL_PATH[node]="${r%%|||*}" && TOOL_VER[node]="${r##*|||}"
+  r="$(_probe_tool npm)" && [ -n "$r" ] && TOOL_PATH[npm]="${r%%|||*}" && TOOL_VER[npm]="${r##*|||}"
+  r="$(_probe_tool yarn)" && [ -n "$r" ] && TOOL_PATH[yarn]="${r%%|||*}" && TOOL_VER[yarn]="${r##*|||}"
+  r="$(_probe_tool javac)" && [ -n "$r" ] && TOOL_PATH[javac]="${r%%|||*}" && TOOL_VER[javac]="${r##*|||}"
+  r="$(_probe_tool mvn)" && [ -n "$r" ] && TOOL_PATH[mvn]="${r%%|||*}" && TOOL_VER[mvn]="${r##*|||}"
+  r="$(_probe_tool gradle)" && [ -n "$r" ] && TOOL_PATH[gradle]="${r%%|||*}" && TOOL_VER[gradle]="${r##*|||}"
+  r="$(_probe_tool cmake)" && [ -n "$r" ] && TOOL_PATH[cmake]="${r%%|||*}" && TOOL_VER[cmake]="${r##*|||}"
+  r="$(_probe_tool meson)" && [ -n "$r" ] && TOOL_PATH[meson]="${r%%|||*}" && TOOL_VER[meson]="${r##*|||}"
+  r="$(_probe_tool ninja)" && [ -n "$r" ] && TOOL_PATH[ninja]="${r%%|||*}" && TOOL_VER[ninja]="${r##*|||}"
+  r="$(_probe_tool zig)" && [ -n "$r" ] && TOOL_PATH[zig]="${r%%|||*}" && TOOL_VER[zig]="${r##*|||}"
+  r="$(_probe_tool ghc)" && [ -n "$r" ] && TOOL_PATH[ghc]="${r%%|||*}" && TOOL_VER[ghc]="${r##*|||}"
+  r="$(_probe_tool dotnet)" && [ -n "$r" ] && TOOL_PATH[dotnet]="${r%%|||*}" && TOOL_VER[dotnet]="${r##*|||}"
+  r="$(_probe_tool pkg-config)" && [ -n "$r" ] && TOOL_PATH[pkg-config]="${r%%|||*}" && TOOL_VER[pkg-config]="${r##*|||}"
+
+  # test for support of LTO flag on detected compilers (gcc/clang)
+  if [ -n "${TOOL_PATH[gcc]:-}" ]; then
+    if _compiler_supports_flag "${TOOL_PATH[gcc]}" "-flto"; then
+      TOOL_SUPPORTS_FLAG["${TOOL_PATH[gcc]}"]="-flto"
+    fi
+  fi
+  if [ -n "${TOOL_PATH[clang]:-}" ]; then
+    if _compiler_supports_flag "${TOOL_PATH[clang]}" "-flto"; then
+      TOOL_SUPPORTS_FLAG["${TOOL_PATH[clang]}"]="-flto"
+    fi
+  fi
+
+  # Detect bubblewrap (bwrap) for sandboxing
+  if command -v bwrap >/dev/null 2>&1; then
+    TOOL_PATH[bwrap]="$(command -v bwrap)"
+    TOOL_VER[bwrap]="$(bwrap --version 2>&1 | head -n1 || true)"
+  fi
+
+  # report
+  if [ "$VERBOSE" -eq 1 ]; then
+    info "Toolchains detectadas:"
+    for k in "${!TOOL_PATH[@]}"; do
+      printf "  - %s: %s (%s)\n" "$k" "${TOOL_PATH[$k]}" "${TOOL_VER[$k]}"
+    done
+  fi
+}
+
+##### -------------------------
+##### Read minimal metafile (YAML-like) - strict fields only
+##### -------------------------
+# reads metafile and exports variables: META_DESCRICAO, META_NOME, META_VERSAO, META_LICENSE, META_URL,
+# META_BUILD, META_SOURCES (array), META_SHA256 (array), META_BUILD_DEPS (array), META_RUN_DEPS (array), META_OPT_DEPS (array)
+read_metafile() {
+  local metafile="$1"
+  if [ ! -f "$metafile" ]; then
+    err "Metafile não encontrado: $metafile"
+    return 2
+  fi
+
+  # Clear previous
+  unset META_DESCRICAO META_NOME META_VERSAO META_LICENSE META_URL META_BUILD
+  unset META_SOURCES META_SHA256 META_BUILD_DEPS META_RUN_DEPS META_OPT_DEPS
+  META_SOURCES=()
+  META_SHA256=()
+  META_BUILD_DEPS=()
+  META_RUN_DEPS=()
+  META_OPT_DEPS=()
+
+  # very simple parser: supports key: "value" and list under key (indented with two spaces or leading '- ')
+  # fields are exactly those you specified earlier (descricao, nome, versao, license, url, build, source, sha256sum, build_deps, run_deps, opt_deps)
+  local in_list=""
+  local list_key=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    # trim leading/trailing spaces
+    local l; l="$(printf '%s' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # skip empty or comments
+    case "$l" in
+      ""|\#*) continue ;;
+    esac
+    # list item?
+    if [[ "$l" =~ ^- ]]; then
+      # it's a list item; add to current list_key
+      local item; item="$(printf '%s' "$l" | sed -e 's/^- *//')"
+      case "$list_key" in
+        source) META_SOURCES+=("$item") ;;
+        sha256sum) META_SHA256+=("$item") ;;
+        build_deps) META_BUILD_DEPS+=("$item") ;;
+        run_deps) META_RUN_DEPS+=("$item") ;;
+        opt_deps) META_OPT_DEPS+=("$item") ;;
+        *) ;; # ignore if no active list
+      esac
+      continue
+    fi
+    # key: value
+    if [[ "$l" =~ ^([a-zA-Z_]+)[[:space:]]*:[[:space:]]*(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}"
+      local val="${BASH_REMATCH[2]}"
+      # remove surrounding quotes if present
+      val="$(printf "%s" "$val" | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")"
+      # assign
+      case "$key" in
+        descricao) META_DESCRICAO="$val" ;;
+        nome) META_NOME="$val" ;;
+        versao) META_VERSAO="$val" ;;
+        license) META_LICENSE="$val" ;;
+        url) META_URL="$val" ;;
+        build) META_BUILD="$val" ;;
+        source) # start list mode
+          list_key="source"
+          META_SOURCES+=("$val")
+          ;;
+        sha256sum)
+          list_key="sha256sum"
+          META_SHA256+=("$val")
+          ;;
+        build_deps)
+          list_key="build_deps"
+          META_BUILD_DEPS+=("$val")
+          ;;
+        run_deps)
+          list_key="run_deps"
+          META_RUN_DEPS+=("$val")
+          ;;
+        opt_deps)
+          list_key="opt_deps"
+          META_OPT_DEPS+=("$val")
+          ;;
+        *)
+          # unknown key - strict policy: warn and ignore
+          warn "Campo desconhecido no metafile (ignorado): $key"
+          ;;
+      esac
+    else
+      # non-matching line - ignore, but warn
+      warn "Linha do metafile ignorada (formato inesperado): $line"
+    fi
+  done <"$metafile"
+
+  # Validation: minimal required fields
+  if [ -z "${META_NOME:-}" ] || [ -z "${META_VERSAO:-}" ]; then
+    err "Metafile inválido: precisa conter 'nome' e 'versao'"
+    return 2
+  fi
+
+  # Print brief summary if verbose
+  if [ "$VERBOSE" -eq 1 ]; then
+    info "Metafile lido: $META_NOME $META_VERSAO"
+    verbose "Sources: ${META_SOURCES[*]:-none}"
+    verbose "Build deps: ${META_BUILD_DEPS[*]:-none}"
+    verbose "Run deps: ${META_RUN_DEPS[*]:-none}"
+  fi
+
+  return 0
+}
+
+##### -------------------------
+##### Helpers para paths e nomes
+##### -------------------------
+_safe_mktemp_dir() {
+  local prefix="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "$ADM_BUILDS/tmp/${prefix}-dryrun-$TS"
+    return 0
+  fi
+  local d
+  d="$(mktemp -d "$ADM_BUILDS/tmp/${prefix}-XXXXXX" 2>/dev/null || true)"
+  if [ -z "$d" ]; then
+    d="$ADM_BUILDS/tmp/${prefix}-$TS"
+    mkdir -p "$d"
+  fi
+  echo "$d"
+}
+
+_timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+##### -------------------------
+##### Prepare workdir and logging paths
+##### -------------------------
+prepare_workdirs() {
+  # Sets WORKDIR, SRCDIR, DESTDIR, BUILD_LOG, BUILD_INFO based on META_NOME/META_VERSAO or target dir
+  local name ver
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    name="$(basename "$SRC_SOURCE_PATH")"
+    ver="local-$(date +%Y%m%d%H%M%S)"
+  else
+    name="${META_NOME:-$(echo "$TARGET_RAW" | sed 's|/|_|g')}"
+    ver="${META_VERSAO:-unknown}"
+  fi
+
+  WORKDIR="$(_safe_mktemp_dir "${name}-${ver}")"
+  SRCDIR="$WORKDIR/src"
+  DESTDIR="$WORKDIR/destdir"
+  BUILD_LOG="$ADM_LOGS/build-${name}-${ver}-$TS.log"
+  BUILD_INFO="$WORKDIR/build-info.json"
+
+  if [ "$DRY_RUN" -eq 0 ]; then
+    mkdir -p "$WORKDIR" "$SRCDIR" "$DESTDIR" || true
+    touch "$BUILD_LOG" 2>/dev/null || true
+  fi
+
+  log_to_file "[WORKDIR]" "$WORKDIR"
+  verbose "Workdir preparado: $WORKDIR (src: $SRCDIR dest: $DESTDIR log: $BUILD_LOG)"
+}
+
+##### -------------------------
+##### Source extraction utilities
+##### -------------------------
+# extract_archive <archive> <destdir>
+extract_archive() {
+  local archive="$1" dest="$2"
+  verbose "extract_archive: $archive -> $dest"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) extrair $archive para $dest"
+    return 0
+  fi
+  mkdir -p "$dest"
+  case "$archive" in
+    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$dest" ;;
+    *.tar.bz2) tar -xjf "$archive" -C "$dest" ;;
+    *.tar.xz) tar -xJf "$archive" -C "$dest" ;;
+    *.tar.zst|*.tar.zstd) if command -v zstd >/dev/null 2>&1; then zstd -d -c "$archive" | tar -xf - -C "$dest"; else err "zstd não disponível"; return 2; fi ;;
+    *.zip) unzip -q "$archive" -d "$dest" ;;
+    *) err "Formato de arquivo desconhecido: $archive"; return 2 ;;
+  esac
+  return 0
+}
+
+# clone_git <url> <dest> [ref]
+clone_git() {
+  local url="$1" dest="$2" ref="${3:-}"
+  verbose "clone_git: $url -> $dest ref=$ref"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) git clone $url $dest (ref $ref)"
+    return 0
+  fi
+  if [ -d "$dest/.git" ]; then
+    # existing cached repo -> fetch
+    pushd "$dest" >/dev/null 2>&1 || return 2
+    git fetch --all --tags || true
+    if [ -n "$ref" ]; then git checkout "$ref" || true; fi
+    popd >/dev/null 2>&1 || true
+    return 0
+  fi
+  git clone --depth 1 "$url" "$dest" || {
+    # try full clone if shallow fails
+    git clone "$url" "$dest" || { err "git clone falhou: $url"; return 2; }
+  }
+  if [ -n "$ref" ]; then
+    pushd "$dest" >/dev/null 2>&1 || return 2
+    git fetch --all --tags || true
+    git checkout "$ref" || true
+    popd >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# find_source_in_cache - decide how to obtain sources based on META_SOURCES array
+find_source_in_cache() {
+  # Populates SOURCE_ARCHIVE or GIT_URL and SOURCE_DIR_HINT
+  SOURCE_ARCHIVE=""
+  GIT_URL=""
+  SOURCE_DIR_HINT=""
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    info "Usando diretório de sources fornecido: $SRC_SOURCE_PATH"
+    SOURCE_DIR_HINT="$SRC_SOURCE_PATH"
+    return 0
+  fi
+
+  # Try to match entries in META_SOURCES
+  for s in "${META_SOURCES[@]:-}"; do
+    # if s starts with git+ or git:// or https:// and ends with .git or contains git, treat as git
+    if printf '%s\n' "$s" | grep -qE '^git\+|^git://|^https?://.*\.git$|^ssh://'; then
+      # strip git+ prefix if present
+      GIT_URL="$(printf '%s' "$s" | sed -e 's/^git+//')"
+      return 0
+    fi
+    # if s looks like a tarball filename (no scheme), check cache
+    local base
+    base="$(basename "$s")"
+    # prioritize cached file matching basename or exact sha dir
+    if [ -f "$ADM_SOURCES_DIR/$base" ]; then
+      SOURCE_ARCHIVE="$ADM_SOURCES_DIR/$base"
+      return 0
+    fi
+    # try sha directories
+    if [ -d "$ADM_SOURCES_DIR/$base" ]; then
+      SOURCE_ARCHIVE="$ADM_SOURCES_DIR/$base"
+      return 0
+    fi
+    # if s is a URL http/https, attempt to see if cached version exists by sha or name
+    if printf '%s\n' "$s" | grep -qE '^https?://'; then
+      base="$(basename "$s")"
+      if [ -f "$ADM_SOURCES_DIR/$base" ]; then
+        SOURCE_ARCHIVE="$ADM_SOURCES_DIR/$base"
+        return 0
+      fi
+      # not cached, but return URL for downloader if auto-fetch allowed
+      SOURCE_ARCHIVE="$s"
+      return 0
+    fi
+  done
+
+  # fallback: nothing found
+  return 1
+}
+
+##### -------------------------
+##### verify_sha256sums
+##### -------------------------
+# Verify provided sha256 sums against local archive(s)
+verify_sha256sums() {
+  local -n archives_ref=$1  # array (passed by name)
+  local -n sums_ref=$2
+  local i=0
+  for a in "${archives_ref[@]:-}"; do
+    local expected="${sums_ref[$i]:-}"
+    if [ -z "$expected" ]; then
+      warn "Nenhum sha256 fornecido para $a; pular verificação"
+      i=$((i+1)); continue
+    fi
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) Verificar sha256 de $a == $expected"
+      i=$((i+1)); continue
+    fi
+    if [ ! -f "$a" ]; then
+      err "Arquivo ausente para verificação: $a"
+      return 2
+    fi
+    local got
+    got="$(sha256sum "$a" | awk '{print $1}')"
+    if [ "$got" != "$expected" ]; then
+      err "SHA256 mismatch para $a (esperado $expected, obtido $got)"
+      return 3
+    fi
+    i=$((i+1))
+  done
+  return 0
+}
+
+##### -------------------------
+##### apply_patches_and_hooks (pre-build)
+##### -------------------------
+# apply_patches_and_hooks <pkgdir> <workdir>
+apply_patches_and_hooks() {
+  local pkgdir="$1"
+  local workdir="$2"
+  local hooks_dir="$pkgdir/hooks"
+  local patches_dir="$pkgdir/patches"
+
+  # pre-patch hooks
+  if [ -d "$hooks_dir" ] && [ "$NO_HOOKS" -ne 1 ]; then
+    if [ -x "$hooks_dir/pre-patch" ]; then
+      info "Executando hook pre-patch"
+      if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $hooks_dir/pre-patch"; else "$hooks_dir/pre-patch"; fi
+    fi
+  fi
+
+  # apply patches
+  if [ -d "$patches_dir" ]; then
+    info "Aplicando patches de $patches_dir (se houver)"
+    for p in "$patches_dir"/*; do
+      [ -f "$p" ] || continue
+      verbose "Aplicando patch: $(basename "$p")"
+      if [ "$DRY_RUN" -eq 1 ]; then
+        info "(dry-run) patch -p1 < $p"
+        continue
+      fi
+      # attempt git apply first (preferred), fallback to patch -p1
+      if command -v git >/dev/null 2>&1 && [ -d "$SRCDIR/.git" ]; then
+        pushd "$SRCDIR" >/dev/null 2>&1 || true
+        if ! git apply --index "$p" 2>>"$BUILD_LOG"; then
+          warn "git apply falhou para $p; tentando patch -p1"
+          if ! patch -p1 <"$p" 2>>"$BUILD_LOG"; then
+            err "Falha ao aplicar patch $p; abortando"
+            return 2
+          fi
+        fi
+        popd >/dev/null 2>&1 || true
+      else
+        # use patch -p1 by default (works for many)
+        pushd "$SRCDIR" >/dev/null 2>&1 || true
+        if ! patch -p1 <"$p" 2>>"$BUILD_LOG"; then
+          # try -p0 as fallback
+          popd >/dev/null 2>&1 || true
+          pushd "$SRCDIR" >/dev/null 2>&1 || true
+          if ! patch -p0 <"$p" 2>>"$BUILD_LOG"; then
+            err "Falha ao aplicar patch $p (tentativas p1/p0). Veja $BUILD_LOG"
+            popd >/dev/null 2>&1 || true
+            return 2
+          fi
+        fi
+        popd >/dev/null 2>&1 || true
+      fi
+    done
+    ok "Patches aplicados (se existiam)"
+  fi
+
+  # post-patch hook
+  if [ -d "$hooks_dir" ] && [ "$NO_HOOKS" -ne 1 ]; then
+    if [ -x "$hooks_dir/post-patch" ]; then
+      info "Executando hook post-patch"
+      if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $hooks_dir/post-patch"; else "$hooks_dir/post-patch"; fi
+    fi
+  fi
+}
+
+##### -------------------------
+##### prepare env for profile
+##### -------------------------
+prepare_env_for_profile() {
+  # Sets CFLAGS LDFLAGS RUSTFLAGS GOFLAGS etc based on PROFILE
+  verbose "Preparando ambiente para profile: $PROFILE"
+  case "$PROFILE" in
+    none)
+      CFLAGS="-O0 -g"
+      LDFLAGS=""
+      RUSTFLAGS="-C opt-level=0"
+      GOFLAGS=""
+      STRIP_BINARIES="no"
+      ;;
+    normal)
+      CFLAGS="-O2 -pipe -fstack-protector-strong"
+      LDFLAGS=""
+      RUSTFLAGS=""
+      GOFLAGS="-trimpath"
+      STRIP_BINARIES="yes"
+      ;;
+    extreme)
+      # Extreme tries to enable LTO/PGO where possible
+      CFLAGS="-O3 -march=native -flto -fuse-linker-plugin -ffat-lto-objects"
+      LDFLAGS="-flto"
+      RUSTFLAGS="-C target-cpu=native -C lto=fat"
+      GOFLAGS="-trimpath"
+      STRIP_BINARIES="yes"
+      ;;
+    *)
+      warn "Profile desconhecido: $PROFILE. Usando 'normal'"
+      CFLAGS="-O2 -pipe -fstack-protector-strong"
+      LDFLAGS=""
+      STRIP_BINARIES="yes"
+      ;;
+  esac
+
+  # honor explicit compiler choice
+  if [ -n "$WITH_COMPILER" ]; then
+    if [ "$WITH_COMPILER" = "clang" ] && [ -n "${TOOL_PATH[clang]:-}" ]; then
+      CC="${TOOL_PATH[clang]}"
+      CXX="${TOOL_PATH[clang]/clang/clang++}"
+    elif [ "$WITH_COMPILER" = "gcc" ] && [ -n "${TOOL_PATH[gcc]:-}" ]; then
+      CC="${TOOL_PATH[gcc]}"
+      CXX="${TOOL_PATH[g++]}"
+    else
+      warn "Compilador pedido não encontrado: $WITH_COMPILER"
+    fi
+  fi
+
+  # fallback defaults
+  : "${CC:=${TOOL_PATH[gcc]:-gcc}}"
+  : "${CXX:=${TOOL_PATH[g++]:-g++}}"
+  : "${PKG_CONFIG_PATH:=/usr/lib/pkgconfig:/usr/share/pkgconfig}"
+
+  # Export env for child processes
+  export CC CXX CFLAGS LDFLAGS RUSTFLAGS GOFLAGS PKG_CONFIG_PATH
+
+  verbose "Env preparado: CC=$CC CXX=$CXX CFLAGS=$CFLAGS LDFLAGS=$LDFLAGS RUSTFLAGS=$RUSTFLAGS"
+}
+
+##### -------------------------
+##### Sandbox / chroot runner
+##### -------------------------
+# run_in_sandbox <workdir> <cmd...>
+run_in_sandbox() {
+  local workdir="$1"
+  shift
+  local cmd=( "$@" )
+  verbose "run_in_sandbox: sandbox=$SANDBOX chroot=$CHROOT_PATH cmd=${cmd[*]}"
+
+  # If user requested chroot path, delegate to adm-chroot enter
+  if [ -n "$CHROOT_PATH" ]; then
+    info "Executando dentro de chroot via adm-chroot: $CHROOT_PATH"
+    # ensure target is mounted; bind workdir into chroot work path
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) adm-chroot mount $CHROOT_PATH ; adm-chroot enter $CHROOT_PATH --cmd 'cd /work && ${cmd[*]}'"
+      return 0
+    fi
+    # Bind workdir into chroot at /work (dangerous; adm-chroot handles mounts)
+    # ## RISCO: bind-mounts e chroot podem afetar o host se adm-chroot não isolar corretamente
+    if ! adm-chroot mount "$CHROOT_PATH" 2>>"$BUILD_LOG"; then
+      err "Falha ao montar chroot $CHROOT_PATH. Abortando execução no chroot."
+      return 2
+    fi
+    # Use adm-chroot enter to execute
+    adm-chroot enter "$CHROOT_PATH" --cmd "mkdir -p /work && mount --bind '$workdir' /work 2>/dev/null || true ; cd /work && ${cmd[*]}"
+    local rc=$?
+    # Not unmounting here; user can rely on adm-chroot umount later or adm-build cleanup
+    return $rc
+  fi
+
+  # If bwrap available and SANDBOX=yes, use bubblewrap
+  if [ "$SANDBOX" = "yes" ] && command -v bwrap >/dev/null 2>&1; then
+    info "Executando em sandbox (bubblewrap)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind $workdir /work --chdir /work -- ${cmd[*]}"
+      return 0
+    fi
+    # Example bubblewrap config: minimal, bind workdir as /work, copy resolv etc
+    bwrap --dev-bind /dev /dev \
+          --proc /proc \
+          --tmpfs /tmp \
+          --bind "$workdir" /work \
+          --chdir /work \
+          --ro-bind /usr /usr \
+          --ro-bind /lib /lib 2>>"$BUILD_LOG" \
+          -- "${cmd[@]}"
+    return $?
+  fi
+
+  # If unshare available, attempt unshare sandbox
+  if [ "$SANDBOX" = "yes" ] && command -v unshare >/dev/null 2>&1; then
+    info "Executando em namespace isolado via unshare"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) unshare --mount --uts --ipc --pid --fork --map-root-user -- bash -c 'cd $workdir && ${cmd[*]}'"
+      return 0
+    fi
+    unshare --mount --uts --ipc --pid --fork --map-root-user -- bash -c "cd '$workdir' && ${cmd[*]}"
+    return $?
+  fi
+
+  # fallback: run directly (not sandboxed)
+  warn "Sandbox não disponível; executando diretamente no host (perigoso)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) (sem sandbox) cd $workdir && ${cmd[*]}"
+    return 0
+  fi
+  (cd "$workdir" && "${cmd[@]}")
+  return $?
+}
+
+##### -------------------------
+##### Build-system specific runners
+##### Each runner must:
+# - configure (if applies) using CC/CFLAGS/LDFLAGS and prefix=/usr
+# - build using $JOBS
+# - install into DESTDIR using make install DESTDIR or equivalent
+# - return 0 on success, non-zero on failure and append details to BUILD_LOG
+##### -------------------------
+
+# run_autotools_build <srcdir>
+run_autotools_build() {
+  local srcdir="$1"
+  verbose "run_autotools_build: srcdir=$srcdir"
+  local cmd
+  # Ensure configure exists (run autogen if needed)
+  if [ ! -x "$srcdir/configure" ]; then
+    if [ -x "$srcdir/autogen.sh" ]; then
+      cmd="./autogen.sh"
+    else
+      # try autoreconf -i
+      cmd="autoreconf -i"
+    fi
+  else
+    cmd="./configure"
+  fi
+
+  # full step list: autogen/ autoreconf; ./configure --prefix=/usr CFLAGS=.. LDFLAGS=.. ; make -j ; make install DESTDIR=..
+  local configure_cmd="$cmd --prefix=/usr CC='$CC' CXX='$CXX' CFLAGS='$CFLAGS' LDFLAGS='$LDFLAGS' --enable-shared --disable-static"
+  # Allow user-specified build options in META_BUILD
+  if [ -n "${META_BUILD:-}" ]; then
+    configure_cmd="$configure_cmd $META_BUILD"
+  fi
+
+  # Execute in sandbox
+  spinner_start "Configurando (autotools)"
+  run_in_sandbox "$SRCDIR" bash -lc "$configure_cmd" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "configure concluído"
+  if [ $rc -ne 0 ]; then err "configure falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Compilando (make -j$JOBS)"
+  run_in_sandbox "$SRCDIR" bash -lc "make -j$JOBS" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "compilação concluída"
+  if [ $rc -ne 0 ]; then err "make falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Instalando em DESTDIR"
+  run_in_sandbox "$SRCDIR" bash -lc "make install DESTDIR='$DESTDIR'" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "instalação concluída"
+  if [ $rc -ne 0 ]; then err "make install falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  return 0
+}
+
+# run_cmake_build <srcdir>
+run_cmake_build() {
+  local srcdir="$1"
+  verbose "run_cmake_build: srcdir=$srcdir"
+  local builddir="$SRCDIR/build"
+  if [ "$DRY_RUN" -eq 0 ]; then mkdir -p "$builddir"; fi
+
+  local cmake_cmd="cmake -S '$srcdir' -B '$builddir' -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER='$CC' -DCMAKE_CXX_COMPILER='$CXX' -DCMAKE_INSTALL_LIBDIR=lib"
+  if [ -n "${META_BUILD:-}" ]; then cmake_cmd="$cmake_cmd $META_BUILD"; fi
+
+  spinner_start "Configurando (cmake)"
+  run_in_sandbox "$SRCDIR" bash -lc "$cmake_cmd" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "cmake configure"
+  if [ $rc -ne 0 ]; then err "cmake configure falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Compilando (cmake --build)"
+  run_in_sandbox "$SRCDIR" bash -lc "cmake --build '$builddir' -- -j$JOBS" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "cmake build"
+  if [ $rc -ne 0 ]; then err "cmake build falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Instalando (cmake --install)"
+  run_in_sandbox "$SRCDIR" bash -lc "cmake --install '$builddir' --prefix /usr --destdir '$DESTDIR'" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "cmake install"
+  if [ $rc -ne 0 ]; then err "cmake install falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  return 0
+}
+
+# run_meson_build <srcdir>
+run_meson_build() {
+  local srcdir="$1"
+  verbose "run_meson_build: srcdir=$srcdir"
+  local builddir="$SRCDIR/build"
+  if [ "$DRY_RUN" -eq 0 ]; then mkdir -p "$builddir"; fi
+
+  local meson_cmd="meson setup '$SRCDIR' '$builddir' --prefix=/usr"
+  if [ -n "${META_BUILD:-}" ]; then meson_cmd="$meson_cmd $META_BUILD"; fi
+
+  spinner_start "Configurando (meson)"
+  run_in_sandbox "$SRCDIR" bash -lc "$meson_cmd" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "meson configure"
+  if [ $rc -ne 0 ]; then err "meson setup falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Compilando (ninja)"
+  run_in_sandbox "$SRCDIR" bash -lc "ninja -C '$builddir' -j$JOBS" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "meson build"
+  if [ $rc -ne 0 ]; then err "meson/ninja build falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Instalando (meson install)"
+  run_in_sandbox "$SRCDIR" bash -lc "DESTDIR='$DESTDIR' ninja -C '$builddir' install" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "meson install"
+  if [ $rc -ne 0 ]; then err "meson install falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  return 0
+}
+
+# run_cargo_build <srcdir>
+run_cargo_build() {
+  local srcdir="$1"
+  verbose "run_cargo_build: srcdir=$srcdir"
+  local cargo_cmd
+  local install_cmd
+
+  # Use cargo install --root DESTDIR or cargo build + copy binaries
+  spinner_start "Compilando (cargo build --release)"
+  # Setup env for cargo
+  if [ -n "$RUSTFLAGS" ]; then export RUSTFLAGS; fi
+
+  # Prefer cargo install for apps
+  if [ -f "$srcdir/Cargo.toml" ] && grep -q '\[package\]' "$srcdir/Cargo.toml" 2>/dev/null; then
+    # get package name to run cargo install
+    local pkgname
+    pkgname="$(awk -F= '/^name/ {gsub(/[" ]/,"",$2); print $2; exit}' "$srcdir/Cargo.toml" 2>/dev/null || true)"
+    if [ -n "$pkgname" ]; then
+      cargo_cmd="cargo build --release -p $pkgname --jobs $JOBS"
+      install_cmd="cargo install --path . --root '$DESTDIR' --force"
+    else
+      cargo_cmd="cargo build --release --jobs $JOBS"
+      install_cmd="cargo install --path . --root '$DESTDIR' --force"
+    fi
+  else
+    cargo_cmd="cargo build --release --jobs $JOBS"
+    install_cmd="cargo install --path . --root '$DESTDIR' --force"
+  fi
+
+  run_in_sandbox "$SRCDIR" bash -lc "$cargo_cmd" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "cargo build"
+  if [ $rc -ne 0 ]; then err "cargo build falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "cargo install to DESTDIR"
+  run_in_sandbox "$SRCDIR" bash -lc "$install_cmd" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "cargo install"
+  if [ $rc -ne 0 ]; then err "cargo install falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  return 0
+}
+
+# run_go_build <srcdir>
+run_go_build() {
+  local srcdir="$1"
+  verbose "run_go_build: srcdir=$srcdir"
+  # If module mode
+  spinner_start "Compilando (go build)"
+  run_in_sandbox "$SRCDIR" bash -lc "GOBIN='$DESTDIR/usr/bin' GOFLAGS='$GOFLAGS' go build ./... -v" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "go build"
+  if [ $rc -ne 0 ]; then err "go build falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  # For modules with 'go install', call install into DESTDIR
+  # Note: copying built binaries manually might be required; user may adjust
+  # Attempt 'go install' if main packages detected
+  if run_in_sandbox "$SRCDIR" bash -lc "go list -m >/dev/null 2>&1"; then
+    run_in_sandbox "$SRCDIR" bash -lc "GOBIN='$DESTDIR/usr/bin' go install ./... " >>"$BUILD_LOG" 2>&1 || true
+  fi
+  return 0
+}
+
+# run_node_build <srcdir>
+run_node_build() {
+  local srcdir="$1"
+  verbose "run_node_build: srcdir=$srcdir"
+  spinner_start "Instalando dependências (npm/yarn)"
+  # prefer yarn if available
+  if command -v yarn >/dev/null 2>&1 && [ -f "$srcdir/yarn.lock" ]; then
+    run_in_sandbox "$SRCDIR" bash -lc "yarn install --frozen-lockfile" >>"$BUILD_LOG" 2>&1
+  else
+    run_in_sandbox "$SRCDIR" bash -lc "npm ci" >>"$BUILD_LOG" 2>&1
+  fi
+  local rc=$?
+  spinner_stop "dependências instaladas"
+  if [ $rc -ne 0 ]; then err "npm/yarn install falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  # build script if provided
+  if node -e "process.exit(0)" >/dev/null 2>&1; then
+    if jq -e '.scripts.build' >/dev/null 2>&1 < "$srcdir/package.json"; then
+      spinner_start "Executando npm run build"
+      run_in_sandbox "$SRCDIR" bash -lc "npm run build --silent" >>"$BUILD_LOG" 2>&1
+      rc=$?
+      spinner_stop "npm build"
+      if [ $rc -ne 0 ]; then err "npm build falhou (veja $BUILD_LOG)"; return $rc; fi
+    fi
+  fi
+
+  # packaging: copy dist or files to DESTDIR/usr
+  spinner_start "Empacotando Node artifacts"
+  if [ -d "$srcdir/dist" ]; then
+    run_in_sandbox "$SRCDIR" bash -lc "mkdir -p '$DESTDIR/usr/lib/$META_NOME' && cp -a dist/* '$DESTDIR/usr/lib/$META_NOME/'" >>"$BUILD_LOG" 2>&1 || true
+  fi
+  spinner_stop "Node artifacts copiados"
+  return 0
+}
+
+# run_python_build <srcdir>
+run_python_build() {
+  local srcdir="$1"
+  verbose "run_python_build: srcdir=$srcdir"
+  spinner_start "Construindo wheel (python -m build) se disponível"
+  if command -v python3 >/dev/null 2>&1 && python3 -m build --version >/dev/null 2>&1; then
+    run_in_sandbox "$SRCDIR" bash -lc "python3 -m build --wheel -o '$WORKDIR/wheels'" >>"$BUILD_LOG" 2>&1
+    local rc=$?
+    spinner_stop "python build"
+    if [ $rc -ne 0 ]; then err "python build falhou (veja $BUILD_LOG)"; return $rc; fi
+    # install wheel into DESTDIR using pip
+    spinner_start "Instalando wheel com pip into DESTDIR"
+    run_in_sandbox "$SRCDIR" bash -lc "pip3 install --no-deps --target='$DESTDIR/usr/lib/python' '$WORKDIR/wheels'/*" >>"$BUILD_LOG" 2>&1 || true
+    spinner_stop "pip install"
+  else
+    warn "python-build: python3 -m build não disponível; fallback para setup.py install"
+    run_in_sandbox "$SRCDIR" bash -lc "python3 setup.py install --root='$DESTDIR' --install-layout=deb" >>"$BUILD_LOG" 2>&1 || true
+  fi
+  return 0
+}
+
+# run_makefile_build <srcdir>
+run_makefile_build() {
+  local srcdir="$1"
+  verbose "run_makefile_build: srcdir=$srcdir"
+  # Simple make
+  spinner_start "Compilando (make -j$JOBS)"
+  run_in_sandbox "$SRCDIR" bash -lc "make -j$JOBS" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "make done"
+  if [ $rc -ne 0 ]; then err "make falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  spinner_start "Instalando (make install DESTDIR)"
+  run_in_sandbox "$SRCDIR" bash -lc "make install DESTDIR='$DESTDIR'" >>"$BUILD_LOG" 2>&1
+  rc=$?
+  spinner_stop "make install"
+  if [ $rc -ne 0 ]; then err "make install falhou (veja $BUILD_LOG)"; return $rc; fi
+  return 0
+}
+
+# run_zig_build <srcdir>
+run_zig_build() {
+  local srcdir="$1"
+  verbose "run_zig_build: srcdir=$srcdir"
+  # example: zig build -Drelease-fast
+  spinner_start "Compilando (zig build)"
+  run_in_sandbox "$SRCDIR" bash -lc "zig build -Drelease-fast" >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "zig build"
+  if [ $rc -ne 0 ]; then err "zig build falhou (veja $BUILD_LOG)"; return $rc; fi
+
+  # install via script or copy; user-defined in META_BUILD likely
+  if [ -n "${META_BUILD:-}" ]; then
+    run_in_sandbox "$SRCDIR" bash -lc "${META_BUILD} DESTDIR='$DESTDIR'" >>"$BUILD_LOG" 2>&1 || true
+  fi
+  return 0
+}
+
+# run_java_build <srcdir>
+run_java_build() {
+  local srcdir="$1"
+  verbose "run_java_build: srcdir=$srcdir"
+  # Prefer maven
+  if [ -f "$srcdir/pom.xml" ] && command -v mvn >/dev/null 2>&1; then
+    spinner_start "Maven package"
+    run_in_sandbox "$SRCDIR" bash -lc "mvn -f '$srcdir/pom.xml' -T$JOBS package -DskipTests" >>"$BUILD_LOG" 2>&1
+    local rc=$?
+    spinner_stop "mvn package"
+    if [ $rc -ne 0 ]; then err "maven build falhou (veja $BUILD_LOG)"; return $rc; fi
+    # find jars and copy to DESTDIR/usr/share/java
+    run_in_sandbox "$SRCDIR" bash -lc "mkdir -p '$DESTDIR/usr/share/java' && find '$srcdir' -name '*.jar' -exec cp {} '$DESTDIR/usr/share/java/' \\;" >>"$BUILD_LOG" 2>&1 || true
+  elif [ -f "$srcdir/build.gradle" ] && command -v gradle >/dev/null 2>&1; then
+    spinner_start "Gradle build"
+    run_in_sandbox "$SRCDIR" bash -lc "gradle -p '$srcdir' build -x test" >>"$BUILD_LOG" 2>&1
+    local rc=$?
+    spinner_stop "gradle build"
+    if [ $rc -ne 0 ]; then err "gradle build falhou (veja $BUILD_LOG)"; return $rc; fi
+  else
+    warn "Java build-system não detectado ou ferramentas ausentes"
+    return 2
+  fi
+  return 0
+}
+
+##### -------------------------
+##### Generic build dispatcher
+##### -------------------------
+# run_build_steps <detected_buildsystem>
+# returns 0 on success
+run_build_steps() {
+  local buildsystem="$1"
+  verbose "run_build_steps: buildsystem=$buildsystem srdir=$SRCDIR"
+  case "$buildsystem" in
+    autotools) run_autotools_build "$SRCDIR" ;;
+    cmake) run_cmake_build "$SRCDIR" ;;
+    meson) run_meson_build "$SRCDIR" ;;
+    cargo) run_cargo_build "$SRCDIR" ;;
+    go) run_go_build "$SRCDIR" ;;
+    node) run_node_build "$SRCDIR" ;;
+    python-*) run_python_build "$SRCDIR" ;;
+    makefile) run_makefile_build "$SRCDIR" ;;
+    zig) run_zig_build "$SRCDIR" ;;
+    maven|gradle|java) run_java_build "$SRCDIR" ;;
+    unknown)
+      warn "Build system desconhecido; tentativa com make se Makefile presente"
+      if [ -f "$SRCDIR/Makefile" ]; then run_makefile_build "$SRCDIR"; else err "Sem build system detectado"; return 2; fi
+      ;;
+    *)
+      err "Runner para build system '$buildsystem' não implementado"
+      return 2
+      ;;
+  esac
+  return $?
+}
+
+##### -------------------------
+##### Source acquisition and prepare SRCDIR
+##### -------------------------
+acquire_and_prepare_sources() {
+  # Called after read_metafile; uses META_SOURCES/META_SHA256
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    info "Copiando fontes do diretório local para workdir"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) cp -a $SRC_SOURCE_PATH/* $SRCDIR/"
+      return 0
+    fi
+    cp -a "$SRC_SOURCE_PATH"/. "$SRCDIR"/ || { err "Falha ao copiar sources"; return 2; }
+    # If it's a git repo, preserve .git
+    return 0
+  fi
+
+  find_source_in_cache || {
+    warn "Nenhuma fonte encontrada no cache para este pacote"
+    # If source URL provided in META_SOURCES, we may call adm-downloader (if available)
+    # For safety, require interactive or --force to auto-download
+    if [ "$ASSUME_YES" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
+      info "Tentando baixar fontes via adm-downloader (auto)"
+      if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) adm-downloader ${META_SOURCES[*]}"; else adm-downloader "${META_SOURCES[@]}" >>"$BUILD_LOG" 2>&1 || true; fi
+      # retry find
+      find_source_in_cache || { err "Não foi possível obter fontes após adm-downloader"; return 2; }
+    else
+      err "Fontes não encontradas; use --yes para permitir download automático via adm-downloader"
+      return 2
+    fi
+  }
+
+  # Now SOURCE_ARCHIVE or GIT_URL or SOURCE_DIR_HINT should be set
+  if [ -n "$SOURCE_DIR_HINT" ]; then
+    info "Usando source dir hint: $SOURCE_DIR_HINT"
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) cp -a $SOURCE_DIR_HINT/* $SRCDIR/"; else cp -a "$SOURCE_DIR_HINT"/. "$SRCDIR"/; fi
+    return 0
+  fi
+
+  if [ -n "$GIT_URL" ]; then
+    info "Obtendo via git: $GIT_URL"
+    clone_git "$GIT_URL" "$SRCDIR" || { err "git clone falhou"; return 2; }
+    return 0
+  fi
+
+  if [ -n "$SOURCE_ARCHIVE" ]; then
+    info "Extraindo archive: $SOURCE_ARCHIVE"
+    # Allow META_SHA256 validation: map archive to corresponding sum entry. We will try simple mapping: if file basename matches
+    if [ ${#META_SHA256[@]:-0} -gt 0 ]; then
+      # if only one source/file, verify against first sha
+      verify_sha256sums SOURCE_ARCHIVE_ARRAY META_SHA256_ARRAY 2>/dev/null || true
+      # We don't have arrays here; perform a simple check if single archive and single sha
+      if [ "${#META_SOURCES[@]:-0}" -eq 1 ] && [ "${#META_SHA256[@]:-0}" -ge 1 ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) Verificar sha de $SOURCE_ARCHIVE == ${META_SHA256[0]}"; else
+          local got; got="$(sha256sum "$SOURCE_ARCHIVE" | awk '{print $1}')" || got=""
+          if [ -n "${META_SHA256[0]:-}" ] && [ "$got" != "${META_SHA256[0]}" ]; then
+            err "SHA mismatch para $SOURCE_ARCHIVE (esperado ${META_SHA256[0]}, obtido $got)"; return 3
+          fi
+        fi
+      fi
+    fi
+    extract_archive "$SOURCE_ARCHIVE" "$SRCDIR" || { err "Extração falhou"; return 2; }
+    # Many tarballs extract into a single subdir; make SRCDIR point to it (if so)
+    if [ "$DRY_RUN" -eq 0 ]; then
+      local top_dirs
+      top_dirs="$(find "$SRCDIR" -mindepth 1 -maxdepth 1 -type d | wc -l || echo 0)"
+      if [ "$top_dirs" -eq 1 ]; then
+        # change SRCDIR to that directory to ease build scripts
+        local only
+        only="$(find "$SRCDIR" -mindepth 1 -maxdepth 1 -type d -print -quit)"
+        if [ -n "$only" ]; then
+          # Move content up
+          mv "$only"/* "$SRCDIR"/ 2>/dev/null || true
+          rmdir "$only" 2>/dev/null || true
+        fi
+      fi
+    fi
+    return 0
+  fi
+
+  err "Nenhuma fonte identificada para extração"
+  return 2
+}
+
+##### -------------------------
+##### run pre-build hooks and apply patches & validate
+##### -------------------------
+prebuild_prepare() {
+  # 1) apply patches and run hooks pre-patch/post-patch done earlier
+  local pkgdir
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    pkgdir="$SRC_SOURCE_PATH"
+  else
+    # metafile lives in /usr/src/adm/metafiles/<cat>/<pkg>/metafile
+    pkgdir="$(dirname "$(dirname "$METAFILE")")"
+  fi
+
+  apply_patches_and_hooks "$pkgdir" "$WORKDIR" || return 2
+
+  # run pre-configure hook if exists
+  if [ -d "$pkgdir/hooks" ] && [ "$NO_HOOKS" -ne 1 ]; then
+    if [ -x "$pkgdir/hooks/pre-configure" ]; then
+      info "Executando hook pre-configure"
+      if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $pkgdir/hooks/pre-configure"; else (cd "$SRCDIR" && "$pkgdir/hooks/pre-configure") >>"$BUILD_LOG" 2>&1 || true; fi
+    fi
+  fi
+
+  # ensure essential tools available
+  if [ -z "${TOOL_PATH[pkg-config]:-}" ]; then
+    warn "pkg-config não detectado; builds que dependem de pkg-config podem falhar"
+  fi
+
+  # basic disk check
+  if [ "$DRY_RUN" -eq 0 ]; then
+    local avail
+    avail="$(df -P "$WORKDIR" | awk 'END{print $4}')"
+    if [ -n "$avail" ] && [ "$avail" -lt 10240 ]; then
+      warn "Espaço livre insuficiente em $(df -P "$WORKDIR" | awk 'END{print $1}'): ${avail}K disponível"
+    fi
+  fi
+
+  return 0
+}
+
+##### -------------------------
+##### Função: analyze_build_log
+##### -------------------------
+# Analisa o BUILD_LOG e tenta detectar padrões de erro comuns:
+#  - missing header, missing library, undefined reference
+#  - permission denied, out of space, LTO/PGO falhas
+#  - warnings que são graves (error:, FAILED:)
+# Retorna 0 se aparentemente OK, 1 se erro crítico detectado.
+# Preenche variáveis globais: ANALYSIS_ERRORS[], ANALYSIS_SUGGESTIONS[]
+analyze_build_log() {
+  local logfile="$BUILD_LOG"
+  ANALYSIS_ERRORS=()
+  ANALYSIS_SUGGESTIONS=()
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) análise de log simulada"
+    return 0
+  fi
+  if [ ! -s "$logfile" ]; then
+    warn "Log vazio — não foi possível analisar"
+    return 0
+  fi
+
+  verbose "Analisando log de build em $logfile"
+  # Cada padrão -> erro + sugestão
+  while IFS= read -r line; do
+    case "$line" in
+      *"fatal error:"*"No such file or directory"*)
+        ANALYSIS_ERRORS+=("Missing header")
+        ANALYSIS_SUGGESTIONS+=("Verifique build_deps (provavelmente falta -dev package ou include path).")
+        ;;
+      *"undefined reference to"*)
+        ANALYSIS_ERRORS+=("Missing library symbol")
+        ANALYSIS_SUGGESTIONS+=("Provável dependência de link não satisfeita. Verifique -l flags e run_deps.")
+        ;;
+      *"collect2:"*"error"*)
+        ANALYSIS_ERRORS+=("Linker error (collect2)")
+        ANALYSIS_SUGGESTIONS+=("Verifique bibliotecas de linkagem (ldflags, toolchain).")
+        ;;
+      *"ld:"*"cannot find"*)
+        ANALYSIS_ERRORS+=("Biblioteca não encontrada")
+        ANALYSIS_SUGGESTIONS+=("Provável dependência de build faltando. Use adm-resolver.")
+        ;;
+      *"error:"*)
+        ANALYSIS_ERRORS+=("Erro genérico detectado")
+        ;;
+      *"FAILED"*)
+        ANALYSIS_ERRORS+=("Falha relatada (FAILED)")
+        ;;
+      *"Permission denied"*)
+        ANALYSIS_ERRORS+=("Permissão negada")
+        ANALYSIS_SUGGESTIONS+=("Problema de permissões no destdir. Pode precisar de sudo/chown.")
+        ;;
+      *"LTO"*"fatal"*)
+        ANALYSIS_ERRORS+=("Falha no LTO")
+        ANALYSIS_SUGGESTIONS+=("Recompile sem -flto (profile=normal).")
+        ;;
+      *"No space left on device"*)
+        ANALYSIS_ERRORS+=("Sem espaço em disco")
+        ANALYSIS_SUGGESTIONS+=("Aumente espaço disponível em $WORKDIR.")
+        ;;
+      *"Segmentation fault"*)
+        ANALYSIS_ERRORS+=("Segmentation fault durante build")
+        ;;
+    esac
+  done <"$logfile"
+
+  if [ "${#ANALYSIS_ERRORS[@]}" -gt 0 ]; then
+    err "Erros detectados no log:"
+    printf '  - %s\n' "${ANALYSIS_ERRORS[@]}"
+    if [ "${#ANALYSIS_SUGGESTIONS[@]}" -gt 0 ]; then
+      warn "Sugestões:"
+      printf '  * %s\n' "${ANALYSIS_SUGGESTIONS[@]}"
+    fi
+    return 1
+  fi
+
+  ok "Nenhum erro crítico detectado nos logs"
+  return 0
+}
+
+##### -------------------------
+##### Função: attempt_auto_fix_and_retry
+##### -------------------------
+# Usa resultados da análise de log e tenta corrigir automaticamente:
+# - remove LTO flags se LTO falhou
+# - tenta rebuild com profile=normal
+# - tenta reinstalar dependências de build via adm-resolver
+# - tenta rebuild com outro compilador (clang <-> gcc)
+attempt_auto_fix_and_retry() {
+  if [ "$AUTO_FIX" = "off" ]; then
+    warn "AUTO_FIX desativado — sem tentativas de correção"
+    return 1
+  fi
+
+  local attempt=0 max_attempts=3
+  while [ $attempt -lt $max_attempts ]; do
+    attempt=$((attempt+1))
+    info "Tentativa de correção automática #$attempt"
+    analyze_build_log || true
+
+    local fixed=0
+
+    # Detecta erros e tenta correção
+    for errtype in "${ANALYSIS_ERRORS[@]:-}"; do
+      case "$errtype" in
+        *"LTO"*)
+          warn "Removendo flags LTO para tentar rebuild"
+          CFLAGS="$(echo "$CFLAGS" | sed 's/-flto//g')"
+          LDFLAGS="$(echo "$LDFLAGS" | sed 's/-flto//g')"
+          fixed=1
+          ;;
+        *"Biblioteca não encontrada"*)
+          if command -v adm-resolver >/dev/null 2>&1; then
+            warn "Chamando adm-resolver para dependências de build"
+            safe_run "resolver build_deps" adm-resolver --build-deps "$META_NOME"
+            fixed=1
+          fi
+          ;;
+        *"Missing header"*)
+          warn "Tentando detectar pacote de include ausente"
+          # heurística: header missing; tenta recompilar com paths padrão /usr/local/include
+          CFLAGS="$CFLAGS -I/usr/local/include"
+          fixed=1
+          ;;
+        *"Permission denied"*)
+          warn "Corrigindo permissões em DESTDIR"
+          if [ "$DRY_RUN" -eq 1 ]; then
+            info "(dry-run) chmod -R u+rw $DESTDIR"
+          else
+            chmod -R u+rw "$DESTDIR" 2>/dev/null || true
+          fi
+          fixed=1
+          ;;
+        *"Linker error"*)
+          warn "Tentando outro compilador (clang ↔ gcc)"
+          if [ "${CC##*/}" = "gcc" ] && [ -n "${TOOL_PATH[clang]:-}" ]; then
+            CC="${TOOL_PATH[clang]}"
+            CXX="${TOOL_PATH[clang]/clang/clang++}"
+          elif [ "${CC##*/}" = "clang" ] && [ -n "${TOOL_PATH[gcc]:-}" ]; then
+            CC="${TOOL_PATH[gcc]}"
+            CXX="${TOOL_PATH[g++]}"
+          fi
+          fixed=1
+          ;;
+      esac
+    done
+
+    if [ $fixed -eq 0 ]; then
+      warn "Nenhuma correção aplicável detectada — abortando tentativa"
+      return 1
+    fi
+
+    info "Reiniciando compilação após correções..."
+    run_build_steps "$DETECTED_SYSTEM"
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+      ok "Build concluído após tentativa #$attempt"
+      return 0
+    fi
+  done
+  err "Todas as tentativas de correção automática falharam."
+  return 2
+}
+
+##### -------------------------
+##### Função: detect_runtime_deps_from_destdir
+##### -------------------------
+# Analisa binários e scripts no DESTDIR e gera lista de dependências de runtime detectadas
+detect_runtime_deps_from_destdir() {
+  local dest="$DESTDIR"
+  DETECTED_RUNDEPS=()
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) detecção de dependências simulada"
+    return 0
+  fi
+
+  verbose "Detectando dependências de runtime em $dest"
+  # detect ELF dependencies
+  while IFS= read -r bin; do
+    if file "$bin" | grep -q ELF; then
+      while IFS= read -r lib; do
+        local libname
+        libname="$(basename "$lib")"
+        DETECTED_RUNDEPS+=("$libname")
+      done < <(ldd "$bin" 2>/dev/null | awk '{print $1}' | grep -E '\.so')
+    fi
+  done < <(find "$dest" -type f -executable 2>/dev/null)
+
+  # detect python
+  if find "$dest" -type f -name '*.py' | grep -q .; then
+    DETECTED_RUNDEPS+=("python3")
+  fi
+
+  # detect node
+  if find "$dest" -type f -name '*.js' | grep -q .; then
+    DETECTED_RUNDEPS+=("nodejs")
+  fi
+
+  # detect java
+  if find "$dest" -type f -name '*.jar' | grep -q .; then
+    DETECTED_RUNDEPS+=("java-runtime")
+  fi
+
+  # remove duplicates
+  DETECTED_RUNDEPS=($(printf "%s\n" "${DETECTED_RUNDEPS[@]}" | sort -u))
+
+  ok "Dependências de runtime detectadas: ${DETECTED_RUNDEPS[*]:-nenhuma}"
+  return 0
+}
+
+##### -------------------------
+##### Função: generate_manifest_and_build_info
+##### -------------------------
+generate_manifest_and_build_info() {
+  info "Gerando manifest e build-info.json"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) gerar manifest e build-info.json"
+    return 0
+  fi
+
+  local manifest="$WORKDIR/manifest.txt"
+  (cd "$DESTDIR" && find . -type f -printf "%P\n" | sort) >"$manifest"
+
+  local file_count
+  file_count="$(wc -l <"$manifest" | tr -d ' ')"
+
+  local sha
+  sha="$(sha256sum "$manifest" | awk '{print $1}')"
+
+  # criar build-info.json
+  cat >"$BUILD_INFO" <<EOF
+{
+  "name": "$META_NOME",
+  "version": "$META_VERSAO",
+  "description": "$META_DESCRICAO",
+  "license": "$META_LICENSE",
+  "url": "$META_URL",
+  "build_time": "$(_timestamp)",
+  "profile": "$PROFILE",
+  "compiler": "$CC",
+  "cflags": "$CFLAGS",
+  "ldflags": "$LDFLAGS",
+  "rustflags": "$RUSTFLAGS",
+  "toolchains": {
+EOF
+  for k in "${!TOOL_PATH[@]}"; do
+    printf '    "%s": "%s",\n' "$k" "${TOOL_VER[$k]}" >>"$BUILD_INFO"
+  done
+  cat >>"$BUILD_INFO" <<EOF
+  },
+  "files_count": "$file_count",
+  "manifest_sha256": "$sha",
+  "detected_run_deps": ["$(printf '%s' "${DETECTED_RUNDEPS[*]}" | sed 's/ /","/g')"]
+}
+EOF
+
+  ok "build-info.json criado em $BUILD_INFO"
+}
+
+##### -------------------------
+##### Função: run_post_build_hooks
+##### -------------------------
+run_post_build_hooks() {
+  local pkgdir
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    pkgdir="$SRC_SOURCE_PATH"
+  else
+    pkgdir="$(dirname "$(dirname "$METAFILE")")"
+  fi
+
+  if [ "$NO_HOOKS" -eq 1 ]; then
+    verbose "Hooks desativados (--no-hooks)"
+    return 0
+  fi
+
+  if [ -x "$pkgdir/hooks/post-build" ]; then
+    info "Executando hook post-build"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) $pkgdir/hooks/post-build"
+    else
+      (cd "$SRCDIR" && "$pkgdir/hooks/post-build") >>"$BUILD_LOG" 2>&1 || warn "Hook post-build retornou erro"
+    fi
+  fi
+
+  if [ -x "$pkgdir/hooks/post-finish" ]; then
+    info "Executando hook post-finish"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      info "(dry-run) $pkgdir/hooks/post-finish"
+    else
+      (cd "$SRCDIR" && "$pkgdir/hooks/post-finish") >>"$BUILD_LOG" 2>&1 || true
+    fi
+  fi
+}
+
+##### -------------------------
+##### Função: handle_failed_build
+##### -------------------------
+handle_failed_build() {
+  warn "Build falhou — preservando workdir para análise"
+  local faildir="$ADM_BUILDS/failed/${META_NOME}-${META_VERSAO}-${TS}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) cp -a $WORKDIR -> $faildir"
+    return 0
+  fi
+  mkdir -p "$(dirname "$faildir")"
+  cp -a "$WORKDIR" "$faildir" 2>/dev/null || true
+  warn "Workdir salvo em $faildir"
+}
+
+##### -------------------------
+##### Função: strip_and_finalize_binaries
+##### -------------------------
+strip_and_finalize_binaries() {
+  if [ "$STRIP_BINARIES" != "yes" ]; then
+    verbose "Strip desativado neste profile ($PROFILE)"
+    return 0
+  fi
+  info "Removendo símbolos de debug de binários (strip)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) strip executáveis em $DESTDIR"
+    return 0
+  fi
+  ## RISCO: alteração destrutiva de binários, use com cautela
+  find "$DESTDIR" -type f -exec sh -c '
+    file -i "$1" | grep -q "application/x-executable" && strip --strip-unneeded "$1" 2>/dev/null || true
+  ' _ {} \;
+  ok "Strip concluído"
+}
+
+##### -------------------------
+##### Função: clean_temporary_dirs
+##### -------------------------
+clean_temporary_dirs() {
+  if [ "$KEEP_WORKDIR" -eq 1 ]; then
+    verbose "Mantendo workdir (debug mode)"
+    return 0
+  fi
+  info "Limpando diretórios temporários"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) rm -rf $WORKDIR"
+    return 0
+  fi
+  ## RISCO: remoção permanente de diretórios
+  rm -rf "$WORKDIR" >/dev/null 2>&1 || true
+}
+
+##### -------------------------
+##### pack_tarball (tar.zst preferred, fallback to xz)
+##### -------------------------
+# pack_tarball <destdir> <name> <version>
+pack_tarball() {
+  local dest="$1"
+  local name="$2"
+  local version="$3"
+  local outdir="${ADM_TARBALLS_DIR}"
+  local basename="${name}-${version}"
+  local tmp_tar="$WORKDIR/${basename}.tar"
+  local out_tar_zst="$outdir/${basename}.tar.zst"
+  local out_tar_xz="$outdir/${basename}.tar.xz"
+  local final_out=""
+
+  info "Empacotando $name-$version em tarball (prefer zstd)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) tar -C '$dest' -cf '$tmp_tar' . ; zstd -T0 -19 -o '$out_tar_zst' '$tmp_tar'"
+    return 0
+  fi
+
+  mkdir -p "$outdir" 2>/dev/null || true
+
+  # create tar (uncompressed) then compress (to ensure reproducible ordering)
+  spinner_start "Criando tar (isto pode demorar dependendo do tamanho)"
+  (cd "$dest" && tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 -cf "$tmp_tar" .) >>"$BUILD_LOG" 2>&1
+  local rc=$?
+  spinner_stop "tar criado"
+  if [ $rc -ne 0 ]; then err "Falha ao criar tar em $tmp_tar"; return $rc; fi
+
+  # try zstd
+  if command -v zstd >/dev/null 2>&1; then
+    spinner_start "Compressão zstd"
+    zstd -T0 -19 -o "$out_tar_zst" "$tmp_tar" >>"$BUILD_LOG" 2>&1 || { spinner_stop "zstd falhou"; err "zstd falhou"; rm -f "$tmp_tar"; return 2; }
+    spinner_stop "zstd concluído"
+    final_out="$out_tar_zst"
+  else
+    # fallback to xz
+    spinner_start "Compressão xz (fallback)"
+    xz -9 -T0 -c "$tmp_tar" >"$out_tar_xz" 2>>"$BUILD_LOG" || { spinner_stop "xz falhou"; err "xz falhou"; rm -f "$tmp_tar"; return 2; }
+    spinner_stop "xz concluído"
+    final_out="$out_tar_xz"
+  fi
+
+  # compute sha256
+  spinner_start "Calculando SHA256 do tarball"
+  local sha
+  sha="$(sha256sum "$final_out" | awk '{print $1}')" || true
+  spinner_stop "SHA256: $sha"
+
+  # cleanup tmp tar
+  rm -f "$tmp_tar" 2>/dev/null || true
+
+  ok "Tarball gerado: $final_out"
+  log_to_file "[TARBALL]" "$final_out sha256=$sha"
+  printf "%s\n" "$sha" >"$WORKDIR/tarball.sha256" 2>/dev/null || true
+
+  # return path and sha via global variables
+  PACKED_TARBALL="$final_out"
+  PACKED_TARBALL_SHA="$sha"
+  return 0
+}
+
+##### -------------------------
+##### update_cache_index
+##### -------------------------
+# update_cache_index <tarball> <sha> <name> <version>
+update_cache_index() {
+  local tarball="$1"
+  local sha="$2"
+  local name="$3"
+  local version="$4"
+  local idx="$ADM_CACHE/index.json"
+
+  info "Atualizando índice de cache em $idx"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) adicionar entry: $name $version $tarball $sha"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$idx")" 2>/dev/null || true
+  # ensure file exists
+  if [ ! -f "$idx" ]; then echo "[]" >"$idx"; fi
+
+  # create a JSON object line (append)
+  # NOTE: we append to array safely by rewriting file (simple method) to keep portable (jq optional)
+  local tmp
+  tmp="$(mktemp "$ADM_TMP/index.XXXX.json")"
+  python3 - <<PY >"$tmp" 2>>"$BUILD_LOG" || {
+    warn "python3 not available or failed to update index; falling back to text index"
+    # fallback text index
+    printf "%s %s %s %s\n" "$name" "$version" "$tarball" "$sha" >>"$ADM_CACHE/index.txt" || true
+    return 0
+  }
+import json,sys
+idx_path=sys.argv[1]
+tar=sys.argv[2]
+sha=sys.argv[3]
+name=sys.argv[4]
+ver=sys.argv[5]
+with open(idx_path,'r') as f:
+    arr=json.load(f)
+arr.append({"name":name,"version":ver,"tarball":tar,"sha256":sha,"ts":"%s"}) 
+with open(idx_path,'w') as f:
+    json.dump(arr,f,indent=2)
+PY
+  # Note: Python invocation writes file; in case of failure fallback to text
+  if [ -f "$tmp" ]; then
+    # tmp already used via python above; but fallback: just append to text index
+    rm -f "$tmp" 2>/dev/null || true
+  fi
+
+  ok "Índice atualizado"
+  return 0
+}
+
+##### -------------------------
+##### Final summary & print
+##### -------------------------
+print_summary() {
+  local name="$1"
+  local ver="$2"
+  local rc="$3"
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$rc" -eq 0 ]; then
+    printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "Build concluído: $name-$ver"
+    printf "Tarball: %s\n" "${PACKED_TARBALL:-(nenhum)}"
+    [ -n "${PACKED_TARBALL_SHA:-}" ] && printf "SHA256: %s\n" "${PACKED_TARBALL_SHA}"
+  else
+    printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "Build falhou: $name-$ver (veja log em $BUILD_LOG)"
+  fi
+  printf "Build log: %s\n" "$BUILD_LOG"
+  printf "Build info: %s\n" "${BUILD_INFO:-(nenhum)}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+##### -------------------------
+##### _main pipeline
+##### -------------------------
+_main() {
+  local start_ts
+  start_ts="$(date +%s)"
+
+  # 1) read metafile unless target is a dir
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then
+    # For local dir, set META_* placeholders
+    META_NOME="$(basename "$SRC_SOURCE_PATH")"
+    META_VERSAO="local-$(date +%Y%m%d%H%M%S)"
+    META_DESCRICAO="Local source"
+    META_SOURCES=()
+  else
+    # expect TARGET_RAW like category/program
+    local category program metafile_path
+    category="$(printf '%s' "$TARGET_RAW" | cut -d'/' -f1)"
+    program="$(printf '%s' "$TARGET_RAW" | cut -d'/' -f2-)"
+    metafile_path="$ADM_METAFILES/$category/$program/metafile"
+    METAFILE="$metafile_path"
+    if [ ! -f "$metafile_path" ]; then
+      err "Metafile não encontrado em $metafile_path"
+      return 2
+    fi
+    read_metafile "$metafile_path" || return 2
+  fi
+
+  # Acquire lock for this package name-version
+  local lockf
+  lockf="$(_acquire_lock "${META_NOME}-${META_VERSAO}")" || { err "Falha ao adquirir lock"; return 2; }
+
+  # 2) prepare workdirs
+  prepare_workdirs
+
+  # set timestamps and build log path
+  log_to_file "[BUILD-START]" "$META_NOME $META_VERSAO"
+
+  # 3) detect toolchains (populate TOOL_PATH etc.)
+  detect_toolchains
+
+  # 4) acquire sources
+  acquire_and_prepare_sources || { handle_failed_build; _release_lock "$lockf"; return 3; }
+
+  # 5) detect build system
+  DETECTED_SYSTEM="$(detect_build_systems "$SRCDIR" | head -n1 || true)"
+  if [ "$DETECTED_SYSTEM" = "unknown" ] || [ -z "$DETECTED_SYSTEM" ]; then
+    warn "Build system não detectado; usando 'unknown' (tentar make)"
+    DETECTED_SYSTEM="unknown"
+  fi
+  verbose "Build system detectado: $DETECTED_SYSTEM"
+
+  # 6) prepare env
+  prepare_env_for_profile
+
+  # 7) prebuild: patches and hooks
+  prebuild_prepare || { handle_failed_build; _release_lock "$lockf"; return 4; }
+
+  # 8) run build
+  info "Iniciando build para $META_NOME-$META_VERSAO (sistema: $DETECTED_SYSTEM)"
+  run_build_steps "$DETECTED_SYSTEM" || {
+    warn "Build inicial falhou, analisando logs..."
+    analyze_build_log
+    if [ "$AUTO_FIX" != "off" ]; then
+      attempt_auto_fix_and_retry || { warn "Correções automáticas falharam"; handle_failed_build; run_post_build_hooks_on_failure=1; _release_lock "$lockf"; return 5; }
+    else
+      handle_failed_build
+      _release_lock "$lockf"
+      return 5
+    fi
+  }
+
+  # 9) post-build hooks
+  run_post_build_hooks || warn "post-build hooks geraram avisos"
+
+  # 10) install step is normally part of runners; ensure DESTDIR populated
+  if [ ! -d "$DESTDIR" ] || [ -z "$(ls -A "$DESTDIR" 2>/dev/null || true)" ]; then
+    warn "DESTDIR vazio após build; tentando 'make install' genérico"
+    run_in_sandbox "$SRCDIR" bash -lc "make install DESTDIR='$DESTDIR'" >>"$BUILD_LOG" 2>&1 || true
+  fi
+
+  # 11) strip binaries as per profile
+  strip_and_finalize_binaries || warn "strip step gerou avisos"
+
+  # 12) detect runtime deps
+  detect_runtime_deps_from_destdir || warn "Erro na detecção de runtime deps"
+
+  # 13) generate manifest and build-info
+  generate_manifest_and_build_info || warn "Erro ao gerar build-info"
+
+  # 14) pack tarball
+  pack_tarball "$DESTDIR" "$META_NOME" "$META_VERSAO" || { err "Empacotamento falhou"; handle_failed_build; _release_lock "$lockf"; return 6; }
+
+  # 15) update index
+  update_cache_index "$PACKED_TARBALL" "$PACKED_TARBALL_SHA" "$META_NOME" "$META_VERSAO" || warn "Falha ao atualizar index"
+
+  # 16) post-pack hooks / on-success hooks
+  local pkgdir
+  if [ "$TARGET_IS_DIR" -eq 1 ]; then pkgdir="$SRC_SOURCE_PATH"; else pkgdir="$(dirname "$(dirname "$METAFILE")")"; fi
+  if [ -x "$pkgdir/hooks/on-success" ] && [ "$NO_HOOKS" -ne 1 ]; then
+    info "Executando hook on-success"
+    if [ "$DRY_RUN" -eq 1 ]; then info "(dry-run) $pkgdir/hooks/on-success"; else (cd "$SRCDIR" && "$pkgdir/hooks/on-success") >>"$BUILD_LOG" 2>&1 || true; fi
+  fi
+
+  # 17) cleanup
+  clean_temporary_dirs
+
+  # release lock
+  _release_lock "$lockf"
+
+  # finish
+  local end_ts elapsed
+  end_ts="$(date +%s)"
+  elapsed=$((end_ts - start_ts))
+  log_to_file "[BUILD-END]" "$META_NOME $META_VERSAO elapsed=${elapsed}s tarball=${PACKED_TARBALL:-none}"
+  print_summary "$META_NOME" "$META_VERSAO" 0
+  return 0
+}
+
+##### -------------------------
+##### Trap handlers and signal safety
+##### -------------------------
+_on_interrupt() {
+  err "Interrompido pelo usuário (SIGINT/SIGTERM). Tentando limpar."
+  _spinner_cleanup || true
+  # Attempt to preserve workdir for debugging
+  if [ -n "${WORKDIR:-}" ] && [ -d "${WORKDIR:-}" ]; then
+    warn "Preservando workdir em $WORKDIR"
+  fi
+  exit 130
+}
+trap _on_interrupt INT TERM
+
+##### -------------------------
+##### Execute main
+##### -------------------------
+_main "$@"
