@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+# adm-uninstall - safely remove installed packages from ADM system
+# Save as: /usr/src/adm/bin/adm-uninstall
+#
+# Usage:
+#   adm-uninstall remove <pkgname> [--chroot stageX] [--dry-run] [--purge]
+#   adm-uninstall orphan [--auto] [--chroot stageX]
+#   adm-uninstall info <pkgname>
+#   adm-uninstall help
+#
+# Notes:
+#   - Runs in SAFE SIMULATION mode by default.
+#   - To allow real file deletions, review the lines marked with:
+#       # UNCOMMENT FOR REAL EXECUTION (in chroot only)
+#     and set ADM_ALLOW_EXECUTION=1 inside a VM or chroot.
+#   - Integrates with adm-hooks, adm-logger, adm-deps, adm-chroot.
+#
+set -euo pipefail
+shopt -s extglob
+
+# ----------------------------
+# Config defaults
+# ----------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_MANIFEST_DIR:=$ADM_ROOT/manifests}"
+: "${ADM_STATE_INSTALLED:=$ADM_ROOT/state/installed}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/uninstall}"
+: "${ADM_LOCK_DIR:=$ADM_ROOT/state/locks}"
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+: "${ADM_HOOKS_DIR:=$ADM_ROOT/hooks}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_ALLOW_EXECUTION:=0}"  # real file deletions commented
+: "${ADM_VERBOSE:=1}"
+
+mkdir -p "$ADM_LOG_DIR" "$ADM_LOCK_DIR" "$ADM_TMPDIR" "$ADM_MANIFEST_DIR" "$ADM_STATE_INSTALLED" 2>/dev/null || true
+
+# ----------------------------
+# Logger (adm-logger if available)
+# ----------------------------
+if [ -x "$ADM_BIN_DIR/adm-logger" ]; then
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info()    { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_error()   { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_debug()   { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+# ----------------------------
+# Lock helpers
+# ----------------------------
+_adm_lockfile() { local n="$1"; printf "%s/uninstall-%s.lock" "$ADM_LOCK_DIR" "$n"; }
+_adm_acquire_lock() {
+  local name="$1"; local lock=$(_adm_lockfile "$name")
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    adm_log_error "Lock busy: another uninstall of $name is running. ($lock)"
+    return 1
+  fi
+  echo "$$" > "${lock}.pid" 2>/dev/null || true
+  adm_log_debug "Acquired lock for $name ($lock)"
+}
+_adm_release_lock() {
+  local name="$1"; local lock=$(_adm_lockfile "$name")
+  rm -f "${lock}.pid" 2>/dev/null || true
+  exec 9>&- || true
+  adm_log_debug "Released lock for $name"
+}
+
+# ----------------------------
+# Safe file operations
+# ----------------------------
+_adm_safe_remove_file() {
+  local f="$1"
+  [[ "$f" == /* ]] || { adm_log_error "Skipping unsafe path (not absolute): $f"; return 1; }
+  case "$f" in
+    /usr/*|/etc/*|/var/*|/opt/*)
+      ;;
+    *)
+      adm_log_error "Skipping forbidden path: $f"
+      return 1
+      ;;
+  esac
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] rm -f $f"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rm -f -- "$f"
+  else
+    adm_log_info "[SIMULATION] Would remove file: $f"
+  fi
+}
+
+_adm_safe_remove_empty_dirs() {
+  local base="$1"
+  find "$base" -type d -empty 2>/dev/null | while read -r d; do
+    [[ "$d" == "$base" ]] && continue
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] rmdir $d"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # rmdir "$d" 2>/dev/null || true
+    else
+      adm_log_info "[SIMULATION] Would remove empty dir: $d"
+    fi
+  done
+}
+
+# ----------------------------
+# Hooks integration
+# ----------------------------
+_adm_hooks_run_if_present() {
+  local phase="$1" pkg="$2" chrootname="${3:-}"
+  local hook_script=""
+  # Priority 1: local hook in metafiles/<cat>/<pkg>/hooks/
+  local hook_paths
+  hook_paths=$(find "$ADM_ROOT/metafiles" -type f -path "*/$pkg/hooks/${phase}-uninstall.sh" 2>/dev/null | head -n1 || true)
+  if [ -n "$hook_paths" ]; then
+    hook_script="$hook_paths"
+  elif [ -f "$ADM_HOOKS_DIR/$pkg/${phase}-uninstall.sh" ]; then
+    hook_script="$ADM_HOOKS_DIR/$pkg/${phase}-uninstall.sh"
+  fi
+
+  if [ -n "$hook_script" ]; then
+    adm_log_info "Executing hook ($phase-uninstall): $hook_script"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would execute $hook_script"
+    else
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # bash "$hook_script" "$pkg" "$chrootname" || adm_log_error "Hook failed: $hook_script"
+        adm_log_info "[SIMULATION] Executing hook (commented)"
+      else
+        adm_log_info "[SIMULATION] Would execute hook: $hook_script"
+      fi
+    fi
+  elif [ -x "$ADM_BIN_DIR/adm-hooks" ]; then
+    adm_log_info "Delegating to adm-hooks for phase: $phase-uninstall"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] adm-hooks run ${phase}uninstall $pkg $chrootname"
+    else
+      "$ADM_BIN_DIR/adm-hooks" run "${phase}uninstall" "$pkg" "$chrootname" || true
+    fi
+  else
+    adm_log_debug "No hook found for $pkg ($phase)"
+  fi
+}
+
+# ----------------------------
+# Manifest handling
+# ----------------------------
+_adm_uninstall_find_manifest() {
+  local pkg="$1"
+  local mf
+  mf=$(ls "$ADM_MANIFEST_DIR/${pkg}-"*.manifest 2>/dev/null | head -n1 || true)
+  echo "$mf"
+}
+
+_adm_uninstall_load_manifest() {
+  local manifest="$1"
+  [ -f "$manifest" ] || { adm_log_error "Manifest not found: $manifest"; return 1; }
+  mapfile -t FILES < <(grep -vE '^(#|$)' "$manifest")
+  echo "${FILES[@]}"
+}
+
+# ----------------------------
+# Remove files listed in manifest (safe)
+# ----------------------------
+_adm_uninstall_remove_files() {
+  local manifest="$1" pkg="$2"
+  adm_log_info "Removing files for package $pkg using manifest $manifest"
+  local f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    [[ "$f" =~ ^# ]] && continue
+    if [ -e "$f" ]; then
+      _adm_safe_remove_file "$f" || true
+    else
+      adm_log_debug "File missing, skipping: $f"
+    fi
+  done < "$manifest"
+  # clean empty dirs
+  _adm_safe_remove_empty_dirs "/usr"
+  _adm_safe_remove_empty_dirs "/etc"
+  _adm_safe_remove_empty_dirs "/var"
+  return 0
+}
+
+# ----------------------------
+# Remove manifest + state record
+# ----------------------------
+_adm_uninstall_remove_state() {
+  local pkg="$1"
+  local mf="$(_adm_uninstall_find_manifest "$pkg")"
+  [ -n "$mf" ] && rm -f "$mf" 2>/dev/null || true
+  local st
+  st=$(ls "$ADM_STATE_INSTALLED/${pkg}-"*.installed 2>/dev/null | head -n1 || true)
+  [ -n "$st" ] && rm -f "$st" 2>/dev/null || true
+  adm_log_correct "Removed manifest and state for $pkg"
+}
+# ----------------------------
+# adm-uninstall - Part 2/2
+# Main orchestration, orphan detection/removal, CLI dispatcher
+# ----------------------------
+
+# ----------------------------
+# Helper: list installed packages (from state dir)
+# ----------------------------
+_adm_installed_list() {
+  local files pkg
+  files=$(ls "$ADM_STATE_INSTALLED"/* 2>/dev/null || true)
+  for f in $files; do
+    [ -f "$f" ] || continue
+    pkg=$(basename "$f" | sed -E 's/\.installed$//' | sed -E 's/-[0-9]+\.[0-9]+.*$//' )
+    # better: derive full pkg-version-arch as key
+    echo "$(basename "$f")"
+  done
+}
+
+# ----------------------------
+# Helper: list installed package names (without version)
+# ----------------------------
+_adm_installed_names() {
+  for f in "$ADM_STATE_INSTALLED"/* 2>/dev/null; do
+    [ -f "$f" ] || continue
+    # filename: pkg-version-arch.installed
+    bn=$(basename "$f")
+    name=$(echo "$bn" | sed -E 's/-[0-9]+(\.[0-9]+)*(-[A-Za-z0-9_.+-]+)?\.installed$//' )
+    # fallback: strip first -*
+    if [ -z "$name" ]; then name=$(echo "$bn" | cut -d'-' -f1); fi
+    echo "$name"
+  done | sort -u
+}
+
+# ----------------------------
+# Helper: read run_deps from metafile (via adm-meta or crude parse)
+# ----------------------------
+_adm_read_run_deps_from_metafile() {
+  local mf="$1"
+  if [ -z "$mf" ] || [ ! -f "$mf" ]; then
+    echo ""
+    return 0
+  fi
+  if declare -f adm_meta_load >/dev/null 2>&1 && declare -f adm_meta_get >/dev/null 2>&1; then
+    adm_meta_load "$mf"
+    adm_meta_get run_deps 2>/dev/null || echo ""
+    return 0
+  fi
+  # crude parse
+  grep -E "^run_deps:" "$mf" 2>/dev/null | sed -E 's/^run_deps:[[:space:]]*//' || true
+}
+
+# ----------------------------
+# Build dependency graph among installed packages
+# Returns lines: pkg:dep1,dep2
+# ----------------------------
+_adm_build_installed_depgraph() {
+  local name mf depsline deps deparr pkgname
+  # we rely on metafiles in ADM_ROOT/metafiles if present; otherwise manifests have only files, so we try to map manifest file name to metafile
+  if [ -d "$ADM_ROOT/metafiles" ]; then
+    # iterate metafiles and include only those that are installed
+    while IFS= read -r mf; do
+      [ -f "$mf" ] || continue
+      pkgname=$(_adm_read_metafile_field "$mf" name || true)
+      [ -z "$pkgname" ] && continue
+      # is pkg installed?
+      if ls "$ADM_STATE_INSTALLED/${pkgname}-"*.installed >/dev/null 2>&1; then
+        depsline=$(_adm_read_run_deps_from_metafile "$mf" || true)
+        # normalize depsline into comma-separated simple names
+        deps=$(echo "$depsline" | sed -E 's/[[:space:]]//g' | sed 's/,/ /g' | tr ' ' '\n' | sed '/^$/d' | paste -sd, -)
+        echo "${pkgname}:${deps}"
+      fi
+    done < <(find "$ADM_ROOT/metafiles" -type f -name metafile 2>/dev/null)
+  else
+    # no metafiles: attempt to infer nothing (empty graph)
+    adm_log_debug "No metafiles directory; cannot build dependency graph from metafiles"
+  fi
+}
+
+# ----------------------------
+# Find orphans: installed packages that are not depended upon by any other installed package
+# Returns a newline list of orphan package names
+# ----------------------------
+_adm_find_orphans() {
+  adm_log_info "Detecting orphan packages..."
+  declare -A dependents
+  declare -A exists
+  local line pkg deps dep
+  # Build graph
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    pkg=$(echo "$line" | cut -d':' -f1)
+    deps=$(echo "$line" | cut -d':' -f2-)
+    exists["$pkg"]=1
+    IFS=',' read -ra darr <<< "$deps"
+    for dep in "${darr[@]}"; do
+      dep=$(echo "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -z "$dep" ] && continue
+      dependents["$dep"]=1
+    done
+  done < <(_adm_build_installed_depgraph)
+
+  # Now installed names
+  local name
+  for name in $(_adm_installed_names); do
+    exists["$name"]=1
+  done
+
+  # Orphans: exists keys that are not in dependents
+  local orphans=()
+  for name in "${!exists[@]}"; do
+    if [ -z "${dependents[$name]:-}" ]; then
+      # Exclude core system packages if any pattern (you may customize)
+      case "$name" in
+        glibc|libc|coreutils|bash|ld*|gcc|linux|systemd) continue ;;
+      esac
+      orphans+=("$name")
+    fi
+  done
+
+  # Output sorted unique
+  if [ "${#orphans[@]}" -eq 0 ]; then
+    adm_log_info "No orphans detected."
+    return 0
+  fi
+  printf "%s\n" "${orphans[@]}" | sort -u
+}
+
+# ----------------------------
+# Remove orphan packages (list or auto)
+# ----------------------------
+_adm_remove_orphans() {
+  local auto="$1" chrootname="$2"
+  local orphans
+  mapfile -t orphans < <(_adm_find_orphans)
+  if [ "${#orphans[@]}" -eq 0 ]; then
+    adm_log_info "No orphan packages to remove."
+    return 0
+  fi
+
+  adm_log_info "Orphan packages detected:"
+  for p in "${orphans[@]}"; do adm_log_info "  - $p"; done
+
+  if [ "$auto" != "1" ]; then
+    adm_log_info "Run 'adm-uninstall orphan --auto' to remove these packages automatically."
+    return 0
+  fi
+
+  adm_log_info "Removing orphans automatically (--auto)"
+  for p in "${orphans[@]}"; do
+    adm_log_info "Auto-removing orphan: $p"
+    # call remove workflow
+    _adm_uninstall_remove_workflow "$p" "$chrootname" "--auto" || adm_log_error "Failed to remove orphan $p"
+  done
+  return 0
+}
+
+# ----------------------------
+# Show what would be removed (info)
+# ----------------------------
+_adm_uninstall_info() {
+  local pkg="$1"
+  local mf
+  mf=$(_adm_uninstall_find_manifest "$pkg")
+  if [ -z "$mf" ]; then adm_log_error "Manifest for $pkg not found"; return 1; fi
+  adm_log_info "Files listed in manifest ($mf):"
+  sed -n '1,500p' "$mf"
+  return 0
+}
+
+# ----------------------------
+# Core remove workflow invoked for a package
+# Steps:
+#  - find manifest
+#  - acquire lock
+#  - run pre-uninstall hook
+#  - remove files (manifest)
+#  - run post-uninstall hook
+#  - remove state & manifest
+# ----------------------------
+_adm_uninstall_remove_workflow() {
+  local pkg="$1"
+  local chrootname="${2:-}"
+  local extra_flag="${3:-}"  # e.g., --auto
+  adm_log_info "Initiating uninstall workflow for: $pkg (chroot: ${chrootname:-<none>})"
+
+  local manifest
+  manifest=$(_adm_uninstall_find_manifest "$pkg")
+  if [ -z "$manifest" ]; then
+    adm_log_error "Manifest for package $pkg not found; aborting."
+    return 1
+  fi
+
+  # Acquire lock
+  _adm_acquire_lock "$pkg" || return 1
+  trap "_adm_release_lock $pkg" RETURN
+
+  # Pre-uninstall hooks
+  _adm_hooks_run_if_present "pre" "$pkg" "$chrootname"
+
+  # Remove files (manifest lists absolute paths)
+  _adm_uninstall_remove_files "$manifest" "$pkg" || adm_log_error "Errors while removing files for $pkg"
+
+  # Post-uninstall hooks
+  _adm_hooks_run_if_present "post" "$pkg" "$chrootname"
+
+  # Remove manifest and state
+  _adm_uninstall_remove_state "$pkg"
+
+  adm_log_correct "Package $pkg removed successfully."
+
+  # After removal, detect orphans and show suggestion (but do not auto-remove unless requested)
+  # If called with --auto, caller will take care of subsequent orphan removal
+  return 0
+}
+
+# ----------------------------
+# CLI dispatcher
+# ----------------------------
+_adm_show_help() {
+  cat <<EOF
+adm-uninstall - safe package removal for ADM
+
+Commands:
+  adm-uninstall remove <pkgname> [--chroot <name>] [--dry-run] [--purge]
+  adm-uninstall info <pkgname>
+  adm-uninstall orphan [--auto] [--chroot <name>]
+  adm-uninstall help
+
+Notes:
+ - Script runs in SIMULATION by default (ADM_ALLOW_EXECUTION=0). Lines that perform deletions are
+   commented and labeled: "# UNCOMMENT FOR REAL EXECUTION (in chroot only)".
+ - Hooks: package-local hooks are looked up at:
+     /usr/src/adm/metafiles/<category>/<package>/hooks/{pre-uninstall.sh,post-uninstall.sh}
+   or global hooks at:
+     /usr/src/adm/hooks/<package>/{pre-uninstall.sh,post-uninstall.sh}
+   If adm-hooks exists, adm-uninstall will also call it.
+EOF
+}
+
+# ----------------------------
+# Argument parsing & entry
+# ----------------------------
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  if [ $# -lt 1 ]; then _adm_show_help; exit 1; fi
+  cmd="$1"; shift
+
+  case "$cmd" in
+    remove)
+      if [ $# -lt 1 ]; then adm_log_error "remove requires package name"; exit 2; fi
+      target="$1"; shift
+      chrootname=""
+      dry=0
+      purge=0
+      auto_flag=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --chroot) chrootname="$2"; shift 2 ;;
+          --dry-run) dry=1; ADM_DRY_RUN=1; shift ;;
+          --purge) purge=1; shift ;;
+          --auto) auto_flag="--auto"; shift ;;
+          *) shift ;;
+        esac
+      done
+      # If target is manifest path, derive pkg name
+      if [ -f "$target" ]; then
+        # try to extract name from manifest
+        maybe_name=$(sed -n '1p' "$target" | sed -E 's/^name:[[:space:]]*//')
+        if [ -n "$maybe_name" ]; then target="$maybe_name"; fi
+      fi
+      _adm_uninstall_remove_workflow "$target" "$chrootname" || exit 1
+      # after removal, suggest orphans
+      adm_log_info "Scanning for orphan packages after removal..."
+      _adm_find_orphans
+      exit 0
+      ;;
+
+    info)
+      if [ $# -lt 1 ]; then adm_log_error "info requires package name"; exit 2; fi
+      _adm_uninstall_info "$1"; exit $?
+      ;;
+
+    orphan)
+      chrootname=""
+      auto=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --auto) auto=1; shift ;;
+          --chroot) chrootname="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      _adm_remove_orphans "$auto" "$chrootname"
+      exit 0
+      ;;
+
+    help|-h|--help)
+      _adm_show_help; exit 0
+      ;;
+
+    *)
+      adm_log_error "Unknown command: $cmd"
+      _adm_show_help
+      exit 2
+      ;;
+  esac
+fi
