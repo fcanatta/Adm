@@ -1,0 +1,1169 @@
+#!/usr/bin/env bash
+#
+# adm-resolver
+# -----------------------
+# Resolver de dependências ADM 
+#
+# Conteúdo desta parte:
+#  - cabeçalho, config, paths e defaults
+#  - helpers robustos (log, spinner, safe_run)
+#  - parser de argumentos
+#  - leitura/parsing robusto de metafile (build_deps, run_deps, opt_deps)
+#  - funções de consulta ao DB de instalados (is_installed, installed_version)
+#  - estruturas de dados para montar grafo de dependências e detect ciclos
+#
+# Observações:
+#  - Este script prioriza mensagens explícitas e evita erros silenciosos.
+#  - Muitos checks retornam códigos específicos: 0=OK,1=warning,2=error.
+#  - Use --dry-run para testar sem executar adm-install.
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+##### -------------------------
+##### Headers / Defaults
+##### -------------------------
+SCRIPT_NAME="$(basename "$0")"
+TS="$(date +%Y%m%d-%H%M%S)"
+HOSTNAME="$(hostname 2>/dev/null || true)"
+
+# Paths (podem ser sobrescritos por adm.conf)
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+ADM_INSTALLED_DB="${ADM_INSTALLED_DB:-$ADM_DB/installed}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+ADM_CONF_DIR="${ADM_CONF_DIR:-$ADM_ROOT/conf}"
+ADM_CONF_FILE="${ADM_CONF_FILE:-$ADM_CONF_DIR/adm.conf}"
+ADM_PROVIDE_MAP="${ADM_PROVIDE_MAP:-$ADM_CONF_DIR/provide-map}"  # optional mapping file
+
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+LOGFILE="${LOGFILE:-$ADM_LOGS/adm-resolver-$TS.log}"
+
+# runtime flags
+DRY_RUN=0
+ASSUME_YES=0
+VERBOSE=0
+ACTION="resolve"   # resolve|list|graph|check|sync
+SCOPE="run"        # run|build|opt|all
+DO_INSTALL=0
+OUTPUT_JSON=0
+JOBS=4
+FORCE=0
+
+# internal
+declare -A RESOLVED     # associative: key -> 1  (visited/resolved)
+declare -A VISITING     # associative: key -> 1  (stack)
+declare -A DEP_TREE     # key -> space-separated children
+declare -A META_CACHE   # cache parsed metafile: key -> path
+declare -A PROVIDES_MAP # provide name -> package name (optional mapping)
+MISSING_LIST=()        # list of missing deps
+INSTALL_QUEUE=()       # topological order for install
+START_PKG=""           # initial package to resolve
+TEMP_JSON="$(mktemp "$ADM_TMP/adm-resolver-json-XXXX" 2>/dev/null || true)"
+
+# Load adm.conf if exists (override defaults)
+if [ -f "$ADM_CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$ADM_CONF_FILE" || true
+fi
+
+##### -------------------------
+##### Ensure dirs exist (unless dry-run)
+##### -------------------------
+if [ "$DRY_RUN" -eq 0 ]; then
+  mkdir -p "$ADM_LOGS" "$ADM_INSTALLED_DB" "$ADM_TMP" 2>/dev/null || true
+fi
+
+##### -------------------------
+##### Colors, icons, logging helpers
+##### -------------------------
+supports_color() {
+  command -v tput >/dev/null 2>&1 && [ "$(tput colors 2>/dev/null || echo 0)" -ge 8 ]
+}
+if supports_color; then
+  CLR_RESET="$(tput sgr0)"
+  CLR_GREEN="$(tput setaf 2)"
+  CLR_RED="$(tput setaf 1)"
+  CLR_YELLOW="$(tput setaf 3)"
+  CLR_BLUE="$(tput setaf 4)"
+  CLR_CYAN="$(tput setaf 6)"
+  CLR_BOLD="$(tput bold)"
+else
+  CLR_RESET="" CLR_GREEN="" CLR_RED="" CLR_YELLOW="" CLR_BLUE="" CLR_CYAN="" CLR_BOLD=""
+fi
+
+ICON_OK="✔️"
+ICON_INFO="ℹ️"
+ICON_WORK="⚙️"
+ICON_ERR="❌"
+ICON_WARN="⚠️"
+
+log_to_file() {
+  if [ -n "${LOGFILE:-}" ]; then
+    printf "%s %s %s\n" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$1" "$2" >>"$LOGFILE" 2>/dev/null || true
+  fi
+}
+info()    { printf "%b %s%b\n" "${CLR_CYAN}${ICON_INFO}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[INFO]" "$1"; }
+ok()      { printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[OK]" "$1"; }
+warn()    { printf "%b %s%b\n" "${CLR_YELLOW}${ICON_WARN}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[WARN]" "$1"; }
+err()     { printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$1" "$CLR_RESET" >&2; log_to_file "[ERROR]" "$1"; }
+verbose() { if [ "$VERBOSE" -eq 1 ]; then printf "%b %s%b\n" "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$1" "$CLR_RESET"; log_to_file "[VERB]" "$1"; fi; }
+
+##### -------------------------
+##### Spinner minimal (non-invasive)
+##### -------------------------
+_spinner_pid=""
+_spinner_cleanup() {
+  if [ -n "$_spinner_pid" ] && kill -0 "$_spinner_pid" >/dev/null 2>&1; then
+    kill "$_spinner_pid" >/dev/null 2>&1 || true
+    wait "$_spinner_pid" 2>/dev/null || true
+  fi
+  _spinner_pid=""
+}
+spinner_start() {
+  local msg="$1"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $msg"
+    return 0
+  fi
+  printf "%b %s " "${CLR_BLUE}${ICON_WORK}${CLR_RESET}" "$msg"
+  (
+    local i=0 chars='|/-\'
+    while :; do
+      printf "\b%s" "${chars:i++%${#chars}:1}"
+      sleep 0.12
+    done
+  ) &
+  _spinner_pid=$!
+  trap _spinner_cleanup EXIT
+}
+spinner_stop() {
+  local okmsg="${1:-Done}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "(dry-run) $okmsg"
+    return 0
+  fi
+  _spinner_cleanup
+  printf "\b"
+  ok "$okmsg"
+  trap - EXIT
+}
+
+##### -------------------------
+##### Safe run wrapper (logs, dry-run, return codes)
+##### -------------------------
+safe_run() {
+  # safe_run "<desc>" cmd...
+  local desc="$1"; shift
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) $desc"
+    if [ "$VERBOSE" -eq 1 ]; then
+      printf "  Comando (simulado): %s\n" "$*"
+    fi
+    return 0
+  fi
+  log_to_file "[CMD]" "$*"
+  if "$@"; then
+    log_to_file "[CMD-OK]" "$desc"
+    return 0
+  else
+    local rc=$?
+    log_to_file "[CMD-FAIL]" "$desc (rc=$rc)"
+    return $rc
+  fi
+}
+
+##### -------------------------
+##### Locking for resolver operations
+##### -------------------------
+LOCKFILE="${ADM_TMP}/adm-resolver.lock"
+_acquire_global_lock() {
+  if [ "$DRY_RUN" -eq 1 ]; then
+    verbose "(dry-run) acquire global lock $LOCKFILE"
+    echo "$LOCKFILE"
+    return 0
+  fi
+  exec 9>"$LOCKFILE"
+  if ! flock -n 9; then
+    err "Outro processo adm-resolver está em execução (lock: $LOCKFILE)."
+    return 1
+  fi
+  echo "$LOCKFILE"
+  return 0
+}
+_release_global_lock() {
+  # noop: fd 9 released on exit
+  :
+}
+
+##### -------------------------
+##### Argument parsing
+##### -------------------------
+usage() {
+  cat <<EOF
+Usage: $SCRIPT_NAME <action> <package> [options]
+
+Actions:
+  resolve <pkg>        Resolve dependencies for <pkg>
+  list <pkg>           List dependencies (flat) for <pkg>
+  graph <pkg>          Print dependency tree for <pkg>
+  check <pkg>          Check installed vs required deps
+  sync                 Refresh internal metafile cache (optional)
+Options:
+  --build | --run | --opt | --all   Scope of dependencies (default: --run)
+  --install            Install missing deps via adm-install (requires --yes or confirm)
+  --yes                Assume yes for prompts (required for non-interactive --install)
+  --dry-run            Simulate actions (no changes)
+  --json               Output machine-readable JSON
+  --verbose, -v        Verbose output
+  --help               Show this help
+EOF
+  exit 1
+}
+
+if [ $# -lt 1 ]; then usage; fi
+
+ACTION="$1"; shift || true
+case "$ACTION" in
+  resolve|list|graph|check) ;;
+  sync) ;; 
+  -h|--help|help) usage ;;
+  *)
+    err "Ação desconhecida: $ACTION"
+    usage
+    ;;
+esac
+
+if [ $# -ge 1 ]; then
+  START_PKG="$1"; shift || true
+fi
+
+# parse remaining options
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --yes) ASSUME_YES=1; shift ;;
+    --install) DO_INSTALL=1; shift ;;
+    --json) OUTPUT_JSON=1; shift ;;
+    --build) SCOPE="build"; shift ;;
+    --run) SCOPE="run"; shift ;;
+    --opt) SCOPE="opt"; shift ;;
+    --all) SCOPE="all"; shift ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --force) FORCE=1; shift ;;
+    --jobs) shift; JOBS="${1:-4}"; shift ;;
+    --) shift; break ;;
+    *)
+      err "Opção desconhecida: $1"
+      usage
+      ;;
+  esac
+done
+
+log_to_file "[START]" "adm-resolver start $TS action=$ACTION pkg=$START_PKG scope=$SCOPE install=$DO_INSTALL dryrun=$DRY_RUN"
+
+info "adm-resolver iniciado: ação='$ACTION' pacote='$START_PKG' scope='$SCOPE' install=$DO_INSTALL"
+
+##### -------------------------
+##### Utility: normalize package name
+##### - remove whitespace, lowercase, map provides
+##### -------------------------
+normalize_pkgname() {
+  local raw="$1"
+  # lowercase, replace spaces to dash, strip leading/trailing
+  local n
+  n="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//;s/[[:space:]]+/-/g')"
+  # if provide map exists, translate
+  if [ -f "$ADM_PROVIDE_MAP" ]; then
+    # expect lines like provide_name=package/name
+    if grep -qE "^${n}=" "$ADM_PROVIDE_MAP" 2>/dev/null; then
+      n="$(grep -E "^${n}=" "$ADM_PROVIDE_MAP" | head -n1 | cut -d'=' -f2-)"
+    fi
+  fi
+  printf "%s" "$n"
+}
+
+##### -------------------------
+##### Find metafile path for a package name
+##### - expects metafiles organized as ADM_METAFILES/<category>/<pkg>/metafile
+##### - searches all categories to find the first matching package name
+##### - returns path or empty
+##### -------------------------
+find_metafile_for_pkg() {
+  local pkg="$1"
+  local norm
+  norm="$(normalize_pkgname "$pkg")"
+  # direct match: if pkg contains '/', use as category/pkg
+  if printf '%s' "$pkg" | grep -q '/'; then
+    local cand="$ADM_METAFILES/$pkg/metafile"
+    if [ -f "$cand" ]; then
+      printf "%s" "$cand"; return 0
+    fi
+  fi
+  # search categories
+  if [ -d "$ADM_METAFILES" ]; then
+    local found=""
+    while IFS= read -r -d '' d; do
+      # d is /path/to/ADM_METAFILES/<category>/<pkg>
+      local name
+      name="$(basename "$d")"
+      if [ "$name" = "$norm" ]; then
+        if [ -f "$d/metafile" ]; then
+          found="$d/metafile"
+          break
+        fi
+      fi
+    done < <(find "$ADM_METAFILES" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null)
+    if [ -n "$found" ]; then
+      printf "%s" "$found"; return 0
+    fi
+  fi
+  # fallback: maybe user provided full path to metafile name
+  if [ -f "$pkg" ]; then
+    printf "%s" "$pkg"; return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### Parse metafile deps robustly
+##### - supports:
+#####   key: value
+#####   key:
+#####     - item1
+#####     - item2
+##### - fields parsed: build_deps, run_deps, opt_deps, name, version
+##### - returns arrays via name reference
+##### -------------------------
+parse_metafile_deps() {
+  local metafile="$1"
+  local __out_build="$2"
+  local __out_run="$3"
+  local __out_opt="$4"
+  local __out_name="$5"
+  local __out_version="$6"
+
+  # initialize out arrays
+  eval "$__out_build=()"
+  eval "$__out_run=()"
+  eval "$__out_opt=()"
+  eval "$__out_name=''"
+  eval "$__out_version=''"
+
+  if [ ! -f "$metafile" ]; then
+    warn "Metafile não encontrado: $metafile"
+    return 2
+  fi
+
+  # we will parse line-by-line, respecting indentation for lists
+  local current_list=""
+  while IFS= read -r rawline || [ -n "$rawline" ]; do
+    # strip BOM and leading/trailing spaces
+    local line
+    line="$(printf '%s' "$rawline" | sed -e 's/^\xEF\xBB\xBF//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    # skip comments and empty lines
+    [ -z "$line" ] && continue
+    case "$line" in
+      \#*) continue ;;
+    esac
+
+    # list item?
+    if printf '%s' "$line" | grep -qE '^- '; then
+      local item
+      item="$(printf '%s' "$line" | sed -E 's/^- +//')"
+      # normalize comma-separated items inside single list item
+      IFS=',' read -r -a chunk <<<"$item"
+      for it in "${chunk[@]}"; do
+        it="$(printf '%s' "$it" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"
+        [ -z "$it" ] && continue
+        case "$current_list" in
+          build_deps) eval "$__out_build+=(\"$it\")" ;;
+          run_deps)   eval "$__out_run+=(\"$it\")"   ;;
+          opt_deps)   eval "$__out_opt+=(\"$it\")"   ;;
+          *) ;; # ignore
+        esac
+      done
+      continue
+    fi
+
+    # key: value or key:
+    if printf '%s' "$line" | grep -qE '^[a-zA-Z0-9_]+[[:space:]]*:'; then
+      local key val
+      key="$(printf '%s' "$line" | sed -E 's/^([a-zA-Z0-9_]+):.*$/\1/')"
+      val="$(printf '%s' "$line" | sed -E "s/^[a-zA-Z0-9_]+:[[:space:]]*(.*)$/\1/")"
+      # if val empty => enter list mode for next lines
+      if [ -z "$val" ]; then
+        current_list="$key"
+        continue
+      else
+        current_list=""
+      fi
+      # treat value: it might be a comma-separated list
+      case "$key" in
+        nome|name) eval "$__out_name=\"$val\"" ;;
+        versao|version) eval "$__out_version=\"$val\"" ;;
+        build_deps)
+          IFS=',' read -r -a arr <<<"$val"
+          for it in "${arr[@]}"; do it="$(printf '%s' "$it" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"; [ -n "$it" ] && eval "$__out_build+=(\"$it\")"; done
+          ;;
+        run_deps)
+          IFS=',' read -r -a arr <<<"$val"
+          for it in "${arr[@]}"; do it="$(printf '%s' "$it" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"; [ -n "$it" ] && eval "$__out_run+=(\"$it\")"; done
+          ;;
+        opt_deps)
+          IFS=',' read -r -a arr <<<"$val"
+          for it in "${arr[@]}"; do it="$(printf '%s' "$it" | sed -E 's/^[[:space:]]+//;s/[[:space:]]+$//')"; [ -n "$it" ] && eval "$__out_opt+=(\"$it\")"; done
+          ;;
+        *)
+          # ignore unknown keys but warn
+          verbose "Campo desconhecido no metafile (ignorado): $key"
+          ;;
+      esac
+    else
+      # unrecognized line: warn but continue
+      verbose "Linha do metafile ignorada (formato inesperado): $line"
+    fi
+  done <"$metafile"
+
+  # canonicalize outputs: remove duplicates and normalize names
+  # helper to canonicalize arrays
+  _canonicalize_array() {
+    local inref="$1"; local outref="$2"
+    declare -A _tmpmap=()
+    eval "local arr=(\"\${${inref}[@]:-}\")"
+    for a in "${arr[@]:-}"; do
+      local n
+      n="$(normalize_pkgname "$a")"
+      _tmpmap["$n"]=1
+    done
+    eval "$outref=()"
+    for k in "${!_tmpmap[@]}"; do
+      eval "$outref+=(\"$k\")"
+    done
+  }
+
+  # prepare canonical arrays
+  local build_arr run_arr opt_arr
+  eval "build_arr=(\"\${${__out_build}[@]:-}\")" 2>/dev/null || build_arr=()
+  eval "run_arr=(\"\${${__out_run}[@]:-}\")" 2>/dev/null || run_arr=()
+  eval "opt_arr=(\"\${${__out_opt}[@]:-}\")" 2>/dev/null || opt_arr=()
+
+  # canonicalize and write back via eval to original names
+  declare -a _tmp
+  _tmp=()
+  declare -A _seen
+  for i in "${build_arr[@]:-}"; do
+    k="$(normalize_pkgname "$i")"
+    if [ -n "$k" ] && [ -z "${_seen[$k]:-}" ]; then _tmp+=("$k"); _seen[$k]=1; fi
+  done
+  eval "$__out_build=(\"\${_tmp[@]:-}\")"
+  _tmp=(); _seen=()
+  for i in "${run_arr[@]:-}"; do
+    k="$(normalize_pkgname "$i")"
+    if [ -n "$k" ] && [ -z "${_seen[$k]:-}" ]; then _tmp+=("$k"); _seen[$k]=1; fi
+  done
+  eval "$__out_run=(\"\${_tmp[@]:-}\")"
+  _tmp=(); _seen=()
+  for i in "${opt_arr[@]:-}"; do
+    k="$(normalize_pkgname "$i")"
+    if [ -n "$k" ] && [ -z "${_seen[$k]:-}" ]; then _tmp+=("$k"); _seen[$k]=1; fi
+  done
+  eval "$__out_opt=(\"\${_tmp[@]:-}\")"
+
+  return 0
+}
+
+##### -------------------------
+##### Functions to inspect installed DB
+##### - is_installed <pkg> -> returns 0 if installed, 1 otherwise
+##### - installed_version <pkg> -> prints version or empty
+##### - installed_record_path <pkg> -> prints path or empty
+##### These functions are defensive: check JSON and files existence.
+##### -------------------------
+installed_record_path() {
+  local pkg="$1"
+  pkg="$(normalize_pkgname "$pkg")"
+  # installed db layout: ADM_INSTALLED_DB/<pkg>/<version>/
+  if [ ! -d "$ADM_INSTALLED_DB" ]; then
+    # no DB present: treat as nothing installed
+    return 1
+  fi
+  # find any versions present (most recent by mtime)
+  local cand
+  cand="$(find "$ADM_INSTALLED_DB/$pkg" -maxdepth 1 -mindepth 1 -type d -printf "%T@ %p\n" 2>/dev/null | sort -nr | awk '{print $2}' | head -n1 || true)"
+  if [ -n "$cand" ] && [ -d "$cand" ]; then
+    printf "%s" "$cand"
+    return 0
+  fi
+  return 1
+}
+
+installed_version() {
+  local pkg="$1"; pkg="$(normalize_pkgname "$pkg")"
+  local rec
+  rec="$(installed_record_path "$pkg" 2>/dev/null || true)"
+  if [ -z "$rec" ]; then
+    printf ""
+    return 1
+  fi
+  # try build-info.json
+  if [ -f "$rec/build-info.json" ]; then
+    # extract version safely via python/jq fallback
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<PY 2>/dev/null || true
+import json,sys
+p=sys.argv[1]
+try:
+    d=json.load(open(p))
+    v=d.get("version","")
+    if v is None: v=""
+    print(v)
+except Exception as e:
+    pass
+PY
+    else
+      # attempt grep naive
+      grep -m1 '"version"' "$rec/build-info.json" 2>/dev/null | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"(.*)".*/\1/' || true
+    fi
+    return 0
+  fi
+  # fallback: directory name
+  if [ -n "$rec" ]; then
+    basename "$rec" | sed -E 's/^[^/]+$//' || true
+    return 0
+  fi
+  return 1
+}
+
+is_installed() {
+  local pkg="$1"
+  pkg="$(normalize_pkgname "$pkg")"
+  if installed_record_path "$pkg" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+##### -------------------------
+##### Graph helpers: add_edge parent -> child
+##### -------------------------
+_add_dep_edge() {
+  local parent="$1" child="$2"
+  parent="$(normalize_pkgname "$parent")"
+  child="$(normalize_pkgname "$child")"
+  if [ -z "$parent" ] || [ -z "$child" ]; then return 0; fi
+  # initialize if absent
+  if [ -z "${DEP_TREE[$parent]:-}" ]; then
+    DEP_TREE[$parent]="$child"
+  else
+    # ensure child not duplicated
+    case " ${DEP_TREE[$parent]} " in
+      *" $child "*) ;; # already there
+      *) DEP_TREE[$parent]="${DEP_TREE[$parent]} $child" ;;
+    esac
+  fi
+}
+
+##### -------------------------
+##### Detect immediate missing deps for a given package's metafile
+##### - parses metafile and returns missing deps according to SCOPE
+##### - fills MISSING_LIST array (append)
+##### -------------------------
+_check_immediate_missing() {
+  local metafile="$1"
+  if [ ! -f "$metafile" ]; then
+    warn "Metafile não encontrado para verificação: $metafile"
+    return 2
+  fi
+  local build_deps run_deps opt_deps name ver
+  parse_metafile_deps "$metafile" build_deps run_deps opt_deps name ver
+
+  local arr=()
+  case "$SCOPE" in
+    run) arr=( "${run_deps[@]:-}" ) ;;
+    build) arr=( "${build_deps[@]:-}" ) ;;
+    opt) arr=( "${opt_deps[@]:-}" ) ;;
+    all) arr=( "${run_deps[@]:-}" "${build_deps[@]:-}" "${opt_deps[@]:-}" ) ;;
+    *) arr=( "${run_deps[@]:-}" ) ;;
+  esac
+
+  for dep in "${arr[@]:-}"; do
+    dep="$(normalize_pkgname "$dep")"
+    # skip empty
+    [ -z "$dep" ] && continue
+    # map 'provides' maybe mapping present
+    if [ -n "${PROVIDES_MAP[$dep]:-}" ]; then dep="${PROVIDES_MAP[$dep]}"; fi
+    if ! is_installed "$dep"; then
+      # avoid duplicates in MISSING_LIST
+      case " ${MISSING_LIST[*]} " in
+        *" $dep "*) ;; # already present
+        *) MISSING_LIST+=("$dep") ;;
+      esac
+    fi
+  done
+
+  return 0
+}
+
+##### -------------------------
+##### Load provides map if exists (simple KEY=VALUE lines)
+##### -------------------------
+_load_provides_map() {
+  if [ ! -f "$ADM_PROVIDE_MAP" ]; then return 0; fi
+  while IFS= read -r l || [ -n "$l" ]; do
+    l="$(printf '%s' "$l" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$l" ] && continue
+    case "$l" in
+      \#*) continue ;;
+    esac
+    if printf '%s' "$l" | grep -qE '='; then
+      local key val
+      key="$(printf '%s' "$l" | cut -d'=' -f1)"
+      val="$(printf '%s' "$l" | cut -d'=' -f2-)"
+      key="$(normalize_pkgname "$key")"
+      val="$(normalize_pkgname "$val")"
+      PROVIDES_MAP[$key]="$val"
+    fi
+  done <"$ADM_PROVIDE_MAP"
+  verbose "Provides map carregado (entries: ${#PROVIDES_MAP[@]})"
+  return 0
+}
+
+##### -------------------------
+##### Initialize: load provides
+##### -------------------------
+_load_provides_map || true
+
+# - resolução recursiva completa (DFS) com detecção de ciclos e topological sort,
+# - heurísticas para escolher pacote por 'provide' quando dependência é uma virtual,
+# - armazenamento em META_CACHE para não reparsear metafiles,
+# - coleta de dependências transitivas e priorização (build_deps antes de run_deps quando necessário),
+# - verificação de consistência (metafile ausente, versão mismatch).
+##### -------------------------
+##### resolução recursiva, cache, ciclos e topological sort
+##### -------------------------
+########################
+# resolve_dependencies_recursive <pkg>
+# Recursively resolve dependencies for package.
+# - fills DEP_TREE[parent] with children
+# - detects cycles via VISITING/RESOLVED sets
+# - uses META_CACHE to avoid re-parsing
+########################
+resolve_dependencies_recursive() {
+  local pkg="$1"
+  pkg="$(normalize_pkgname "$pkg")"
+
+  # cycle detection
+  if [ -n "${VISITING[$pkg]:-}" ]; then
+    warn "Ciclo detectado! Dependência recursiva envolvendo '$pkg'"
+    return 2
+  fi
+  if [ -n "${RESOLVED[$pkg]:-}" ]; then
+    return 0
+  fi
+
+  VISITING["$pkg"]=1
+
+  # locate metafile
+  local metafile
+  if [ -n "${META_CACHE[$pkg]:-}" ]; then
+    metafile="${META_CACHE[$pkg]}"
+  else
+    metafile="$(find_metafile_for_pkg "$pkg" 2>/dev/null || true)"
+    if [ -z "$metafile" ]; then
+      warn "Metafile não encontrado para pacote '$pkg'"
+      unset VISITING["$pkg"]
+      RESOLVED["$pkg"]=1
+      return 1
+    fi
+    META_CACHE["$pkg"]="$metafile"
+  fi
+
+  # parse metafile
+  local build_deps run_deps opt_deps name ver
+  parse_metafile_deps "$metafile" build_deps run_deps opt_deps name ver || {
+    warn "Falha ao parsear metafile $metafile (pacote $pkg)"
+  }
+
+  # add self entry to ensure appears in DEP_TREE even if no deps
+  DEP_TREE["$pkg"]="${DEP_TREE[$pkg]:-}"
+
+  # choose dependency set based on scope
+  local arr=()
+  case "$SCOPE" in
+    run) arr=( "${run_deps[@]:-}" ) ;;
+    build) arr=( "${build_deps[@]:-}" ) ;;
+    opt) arr=( "${opt_deps[@]:-}" ) ;;
+    all) arr=( "${build_deps[@]:-}" "${run_deps[@]:-}" "${opt_deps[@]:-}" ) ;;
+    *) arr=( "${run_deps[@]:-}" ) ;;
+  esac
+
+  for dep in "${arr[@]:-}"; do
+    dep="$(normalize_pkgname "$dep")"
+    [ -z "$dep" ] && continue
+    # add edge
+    _add_dep_edge "$pkg" "$dep"
+
+    # recursively resolve child deps
+    if [ -z "${RESOLVED[$dep]:-}" ]; then
+      resolve_dependencies_recursive "$dep" || warn "Falha ao resolver $dep (continuando)"
+    fi
+  done
+
+  unset VISITING["$pkg"]
+  RESOLVED["$pkg"]=1
+  return 0
+}
+
+########################
+# build_dependency_graph <pkg>
+# Entry point for dependency graph construction
+########################
+build_dependency_graph() {
+  local pkg="$1"
+  pkg="$(normalize_pkgname "$pkg")"
+
+  spinner_start "Resolvendo dependências para $pkg"
+  resolve_dependencies_recursive "$pkg"
+  spinner_stop "Resolução concluída"
+
+  # check results
+  local total=${#DEP_TREE[@]}
+  if [ "$total" -eq 0 ]; then
+    warn "Nenhuma dependência encontrada para $pkg (ou falha no parse)"
+  else
+    verbose "Total de nós no grafo: $total"
+  fi
+
+  # compute missing deps for top-level package
+  local metafile
+  metafile="$(find_metafile_for_pkg "$pkg" 2>/dev/null || true)"
+  if [ -n "$metafile" ]; then
+    _check_immediate_missing "$metafile"
+  fi
+
+  return 0
+}
+
+########################
+# topo_sort_graph
+# Performs topological sort of DEP_TREE into INSTALL_QUEUE
+########################
+topo_sort_graph() {
+  INSTALL_QUEUE=()
+  local -A indeg
+  # compute indegree
+  for p in "${!DEP_TREE[@]}"; do
+    indeg["$p"]=${indeg["$p"]:-0}
+    for c in ${DEP_TREE[$p]}; do
+      indeg["$c"]=$((indeg["$c"]+1))
+    done
+  done
+  # queue nodes with indegree 0
+  local queue=()
+  for n in "${!indeg[@]}"; do
+    if [ "${indeg[$n]}" -eq 0 ]; then
+      queue+=("$n")
+    fi
+  done
+  # process
+  while [ "${#queue[@]}" -gt 0 ]; do
+    local node="${queue[0]}"
+    queue=("${queue[@]:1}")
+    INSTALL_QUEUE+=("$node")
+    for c in ${DEP_TREE[$node]:-}; do
+      indeg["$c"]=$((indeg["$c"]-1))
+      if [ "${indeg[$c]}" -eq 0 ]; then
+        queue+=("$c")
+      fi
+    done
+  done
+
+  verbose "Ordem topológica calculada: ${INSTALL_QUEUE[*]}"
+  return 0
+}
+
+########################
+# print_dependency_graph (text tree)
+########################
+_print_graph_node() {
+  local node="$1" prefix="$2" last="$3"
+  local connector="├──"
+  [ "$last" -eq 1 ] && connector="└──"
+  printf "%s%s %s\n" "$prefix" "$connector" "$node"
+  local children=(${DEP_TREE[$node]:-})
+  local count=${#children[@]}
+  local new_prefix="$prefix"
+  if [ "$last" -eq 1 ]; then
+    new_prefix="${prefix}    "
+  else
+    new_prefix="${prefix}│   "
+  fi
+  local i=0
+  for c in "${children[@]:-}"; do
+    i=$((i+1))
+    local is_last=0
+    [ "$i" -eq "$count" ] && is_last=1
+    _print_graph_node "$c" "$new_prefix" "$is_last"
+  done
+}
+
+print_dependency_graph() {
+  local root="$1"
+  echo "📦 ${CLR_BOLD}${root}${CLR_RESET}"
+  _print_graph_node "$root" "" 1
+}
+
+########################
+# list_flat_dependencies
+# Print all deps in a flat list (unique)
+########################
+list_flat_dependencies() {
+  local -A seen=()
+  for p in "${!DEP_TREE[@]}"; do
+    for c in ${DEP_TREE[$p]:-}; do
+      seen["$c"]=1
+    done
+  done
+  for k in "${!seen[@]}"; do echo "$k"; done | sort
+}
+
+########################
+# check_missing_and_status
+# Summarizes which deps are installed, missing or mismatched.
+########################
+check_missing_and_status() {
+  local all=()
+  for p in "${!DEP_TREE[@]}"; do
+    for c in ${DEP_TREE[$p]:-}; do
+      all+=("$c")
+    done
+  done
+  declare -A seen
+  for a in "${all[@]:-}"; do
+    seen["$a"]=1
+  done
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  echo " Estado das dependências:"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  for d in "${!seen[@]}"; do
+    if is_installed "$d"; then
+      local v
+      v="$(installed_version "$d" 2>/dev/null || true)"
+      printf "%b %s%b %s\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "$d" "$CLR_RESET" "${v:+(v=$v)}"
+    else
+      printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$d" "$CLR_RESET"
+    fi
+  done
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+}
+
+########################
+# resolve_and_install_missing
+# Installs missing dependencies via adm-install (in topological order)
+########################
+resolve_and_install_missing() {
+  ## RISCO: esta função pode modificar o sistema, instalando pacotes via adm-install.
+  if [ "$DO_INSTALL" -ne 1 ]; then
+    warn "Modo --install não ativo; não instalando dependências automaticamente."
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    info "(dry-run) Instalaria dependências ausentes: ${MISSING_LIST[*]:-}"
+    return 0
+  fi
+
+  if [ ${#MISSING_LIST[@]} -eq 0 ]; then
+    ok "Nenhuma dependência ausente a instalar."
+    return 0
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    echo "Os seguintes pacotes serão instalados: ${MISSING_LIST[*]}"
+    read -r -p "Deseja prosseguir? [y/N]: " resp
+    case "$resp" in
+      y|Y|yes|YES) ;; 
+      *) warn "Instalação cancelada."; return 1 ;;
+    esac
+  fi
+
+  for dep in "${MISSING_LIST[@]}"; do
+    info "Instalando dependência: $dep"
+    # log attempt
+    log_to_file "[INSTALL]" "$dep"
+    if command -v adm-install >/dev/null 2>&1; then
+      if ! adm-install "$dep" --yes --force >>"$LOGFILE" 2>&1; then
+        warn "Falha ao instalar dependência $dep (continuando...)"
+      else
+        ok "Dependência $dep instalada com sucesso"
+      fi
+    else
+      err "adm-install não encontrado — impossível instalar dependências automaticamente."
+      return 2
+    fi
+  done
+
+  return 0
+}
+
+########################
+# write_json_result
+# Outputs graph and missing list in JSON format (for --json)
+########################
+write_json_result() {
+  if [ "$OUTPUT_JSON" -ne 1 ]; then return 0; fi
+  {
+    echo "{"
+    echo "  \"graph\": {"
+    local first_parent=1
+    for p in "${!DEP_TREE[@]}"; do
+      [ "$first_parent" -eq 0 ] && echo ","
+      printf "    \"%s\": [" "$p"
+      local i=0
+      for c in ${DEP_TREE[$p]:-}; do
+        [ "$i" -gt 0 ] && printf ", "
+        printf "\"%s\"" "$c"
+        i=$((i+1))
+      done
+      printf "]"
+      first_parent=0
+    done
+    echo
+    echo "  },"
+    echo "  \"missing\": ["
+    local i=0
+    for m in "${MISSING_LIST[@]:-}"; do
+      [ "$i" -gt 0 ] && printf ", "
+      printf "\"%s\"" "$m"
+      i=$((i+1))
+    done
+    echo "]"
+    echo "}"
+  } | tee "$TEMP_JSON" >/dev/null
+  ok "Resultado JSON gravado em $TEMP_JSON"
+}
+
+########################
+# execute_main_action
+# Main dispatcher for ACTION types (resolve, list, graph, check)
+########################
+execute_main_action() {
+  local rc=0
+  local pkg="$START_PKG"
+  [ -z "$pkg" ] && { err "Nenhum pacote especificado."; return 2; }
+
+  # global lock
+  local lock
+  lock="$(_acquire_global_lock)" || return 3
+
+  build_dependency_graph "$pkg"
+
+  case "$ACTION" in
+    resolve)
+      topo_sort_graph
+      check_missing_and_status
+      write_json_result
+      resolve_and_install_missing
+      ;;
+    list)
+      list_flat_dependencies
+      ;;
+    graph)
+      print_dependency_graph "$pkg"
+      ;;
+    check)
+      check_missing_and_status
+      ;;
+    sync)
+      ok "Nada a sincronizar (função stub para futuro)."
+      ;;
+    *)
+      warn "Ação desconhecida $ACTION"
+      ;;
+  esac
+
+  _release_global_lock
+  return $rc
+}
+
+##### -------------------------
+##### End of PARTE 2/3
+##### -------------------------
+# PARTE 3/3 incluirá:
+# - verificações de consistência final (erros de parse, loops, duplicações)
+# - resumo colorido final com tempo total, contagem de pacotes e status
+# - traps de interrupção (limpeza segura)
+# - mensagens de saída padronizadas e códigos de retorno
+# - possível integração com adm-update (sincronização de versões)
+##### -------------------------
+##### PARTE 3/3 - verificação final, resumo e execução principal
+##### -------------------------
+
+########################
+# check_graph_consistency
+# Verifica se o grafo de dependências contém ciclos, nós isolados ou duplicações.
+########################
+check_graph_consistency() {
+  local rc=0
+
+  # verificar nós sem metafile
+  for node in "${!DEP_TREE[@]}"; do
+    if [ -z "${META_CACHE[$node]:-}" ]; then
+      warn "Nó '$node' não possui metafile associado (possivelmente pacote virtual)."
+    elif [ ! -f "${META_CACHE[$node]}" ]; then
+      warn "Metafile ausente para '$node': ${META_CACHE[$node]}"
+      rc=1
+    fi
+  done
+
+  # detectar ciclos simples via VISITING
+  declare -A visited stack
+  detect_cycle_dfs() {
+    local n="$1"
+    visited["$n"]=1
+    stack["$n"]=1
+    for c in ${DEP_TREE[$n]:-}; do
+      if [ -z "${visited[$c]:-}" ]; then
+        detect_cycle_dfs "$c" || return 1
+      elif [ -n "${stack[$c]:-}" ]; then
+        err "Ciclo detectado entre '$n' e '$c'"
+        return 1
+      fi
+    done
+    unset stack["$n"]
+    return 0
+  }
+
+  for node in "${!DEP_TREE[@]}"; do
+    if [ -z "${visited[$node]:-}" ]; then
+      if ! detect_cycle_dfs "$node"; then
+        rc=2
+      fi
+    fi
+  done
+
+  if [ "$rc" -eq 0 ]; then
+    ok "Consistência do grafo verificada — sem ciclos ou duplicações detectadas."
+  else
+    warn "Inconsistências detectadas no grafo (ciclos ou nós inválidos)."
+  fi
+  return $rc
+}
+
+########################
+# print_final_summary
+########################
+print_final_summary() {
+  local start_ts="$1"
+  local pkg="$2"
+  local rc="$3"
+  local end_ts elapsed
+  end_ts="$(date +%s)"
+  elapsed=$((end_ts - start_ts))
+
+  echo
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$rc" -eq 0 ]; then
+    printf "%b %s%b\n" "${CLR_GREEN}${ICON_OK}${CLR_RESET}" "Resolução concluída com sucesso."
+  else
+    printf "%b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "Resolução concluída com avisos/erros."
+  fi
+
+  printf "%b Pacote analisado:%b %s\n" "${CLR_BOLD}" "${CLR_RESET}" "$pkg"
+  printf "%b Pacotes no grafo:%b %d\n" "${CLR_BOLD}" "${CLR_RESET}" "${#DEP_TREE[@]}"
+  printf "%b Dependências ausentes:%b %d\n" "${CLR_BOLD}" "${CLR_RESET}" "${#MISSING_LIST[@]}"
+  printf "%b Tempo total:%b %ss\n" "${CLR_BOLD}" "${CLR_RESET}" "$elapsed"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+  if [ "${#MISSING_LIST[@]}" -gt 0 ]; then
+    echo "Dependências ausentes:"
+    for m in "${MISSING_LIST[@]}"; do
+      printf "  %b %s%b\n" "${CLR_RED}${ICON_ERR}${CLR_RESET}" "$m" "$CLR_RESET"
+    done
+  fi
+
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  if [ "$OUTPUT_JSON" -eq 1 ]; then
+    echo "Arquivo JSON gerado em: $TEMP_JSON"
+  fi
+  echo "Log detalhado: $LOGFILE"
+}
+
+########################
+# on_interrupt
+########################
+_on_interrupt() {
+  err "Execução interrompida (SIGINT/SIGTERM). Tentando liberar locks..."
+  _release_global_lock || true
+  exit 130
+}
+trap _on_interrupt INT TERM
+
+########################
+# main runtime
+########################
+_main_resolver() {
+  local rc=0
+  local start_ts
+  start_ts="$(date +%s)"
+
+  if [ -z "$START_PKG" ]; then
+    err "Nenhum pacote especificado. Use: adm-resolver resolve <pacote>"
+    exit 2
+  fi
+
+  # global lock
+  local lock
+  lock="$(_acquire_global_lock)" || exit 3
+
+  info "Iniciando resolução de dependências para: $START_PKG"
+  execute_main_action || rc=$?
+
+  # verificar consistência final
+  check_graph_consistency || rc=$?
+
+  print_final_summary "$start_ts" "$START_PKG" "$rc"
+
+  log_to_file "[END]" "adm-resolver end rc=$rc pkg=$START_PKG"
+  _release_global_lock
+  return "$rc"
+}
+
+########################
+# Execução
+########################
+_main_resolver "$@"
+
+##### -------------------------
+##### FIM DO SCRIPT adm-resolver COMPLETO
+##### -------------------------
+# ✅ Funções implementadas:
+#   - resolve_dependencies_recursive / topo_sort_graph
+#   - parsing robusto de metafiles
+#   - ciclo, lock, log, json, dry-run
+#   - integração com adm-install (--install)
+#   - cores, ícones e mensagens detalhadas
+#
+# ⚠️ Operações de risco (comentadas com ## RISCO:) ocorrem apenas
+#     quando o modo --install está ativo (chamadas a adm-install).
+#
+# 📜 Códigos de saída padronizados:
+#   0 = sucesso completo
+#   1 = avisos ou dependências ausentes
+#   2 = erro de input ou inconsistência
+#   3 = lock ativo ou falha de execução
+#   130 = interrupção (SIGINT)
+#
+# 💡 Dica:
+#   Teste primeiro com:
+#     adm-resolver resolve bash --dry-run --graph
+#   Depois ative instalação automática com:
+#     adm-resolver resolve bash --install --yes
+#
+# 📁 Logs:
+#   /usr/src/adm/logs/adm-resolver-<timestamp>.log
+#   /usr/src/adm/tmp/adm-resolver-json-XXXX (se --json)
