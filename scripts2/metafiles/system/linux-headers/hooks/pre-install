@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel-headers pre-install
+# - Executa instalação dos headers no DESTDIR seguro.
+# - Usa make headers_install com verificação.
+# - Respeita DRY_RUN e aborta em DESTDIR inválido.
+#
+set -euo pipefail
+
+echo "📦 [linux-kernel-headers pre-install] Instalando headers..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/kernel-headers.log}"
+SRC_DIR="$(pwd)"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/linux-headers-destdir}"
+
+# 1️⃣ Validação de DESTDIR (proteção crítica)
+if [ -z "$DESTDIR" ] || [ "$DESTDIR" = "/" ]; then
+  echo "❌ RISCO: DESTDIR inválido. Abortando."
+  exit 2
+fi
+
+mkdir -p "$DESTDIR" || true
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria: make headers_install INSTALL_HDR_PATH=$DESTDIR/usr"
+  exit 0
+fi
+
+# 2️⃣ Instalação real
+make headers_install INSTALL_HDR_PATH="$DESTDIR/usr" > "$DESTDIR/install.log" 2>&1 || {
+  echo "❌ Falha na instalação dos headers. Veja $DESTDIR/install.log"
+  tail -n 50 "$DESTDIR/install.log" || true
+  exit 1
+}
+
+echo "[`date -u`] headers_install complete -> $DESTDIR/usr/include" >> "$ADM_LOG"
+echo "✅ [pre-install] Headers instalados em $DESTDIR/usr/include"
