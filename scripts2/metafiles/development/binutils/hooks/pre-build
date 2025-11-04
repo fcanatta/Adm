@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# ADM HOOK: binutils pre-build
+# Prepara o ambiente e diretório de build
+
+set -euo pipefail
+
+echo "🔧 [binutils pre-build] Preparando ambiente..."
+
+ADM_STAGE="${ADM_STAGE:-$(cat /etc/adm-stage 2>/dev/null || echo stage3)}"
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+
+mkdir -p build
+cd build
+
+# Perfis
+case "$ADM_PROFILE" in
+  extreme)
+    export CFLAGS="-O3 -march=native -pipe -flto"
+    export LDFLAGS="-Wl,-O1,--as-needed"
+    ;;
+  normal)
+    export CFLAGS="-O2 -pipe"
+    export LDFLAGS="-Wl,-O1"
+    ;;
+  none)
+    export CFLAGS=""
+    export LDFLAGS=""
+    ;;
+esac
+
+PREFIX="${PREFIX:-/usr}"
+
+# Detectar se é build de bootstrap (sem headers)
+if [[ "$ADM_STAGE" =~ stage0|stage1 ]]; then
+  CONFIGURE_OPTS="--prefix=${PREFIX} --with-sysroot --disable-nls --disable-werror"
+else
+  CONFIGURE_OPTS="--prefix=${PREFIX} --enable-gold --enable-ld=default --enable-plugins --enable-shared --enable-64-bit-bfd"
+fi
+
+echo "ℹ️  Configurando binutils (${ADM_STAGE}, ${ADM_PROFILE})"
+echo "🏗️  ./configure ${CONFIGURE_OPTS}"
+
+if [ "${DRY_RUN:-0}" -eq 1 ]; then
+  echo "(dry-run) simulando ./configure"
+else
+  ../configure ${CONFIGURE_OPTS}
+fi
+
+echo "✅ [binutils pre-build] Ambiente pronto"
