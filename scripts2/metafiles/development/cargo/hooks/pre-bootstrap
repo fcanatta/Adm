@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: cargo pre-bootstrap
+# - Prepara toolchain Cargo bootstrap em ambientes sem Cargo instalado.
+# - Baixa binários oficiais do site da Rust Foundation, valida SHA256,
+#   instala isoladamente em /usr/src/adm/toolchains/cargo-bootstrap
+# - Compatível com DRY_RUN, seguro e sem erros silenciosos.
+#
+set -euo pipefail
+
+echo "📦 [cargo pre-bootstrap] Inicializando ambiente bootstrap para Cargo..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/cargo-bootstrap.log}"
+CACHE_DIR="${CACHE_DIR:-${ADM_ROOT}/cache}"
+BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${ADM_ROOT}/toolchains/cargo-bootstrap}"
+ARCH="$(uname -m)"
+OS="unknown-linux-gnu"
+CARGO_STAGE0_VERSION="${CARGO_STAGE0_VERSION:-1.85.1}"
+
+CARGO_URL="https://static.rust-lang.org/dist/cargo-${CARGO_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz"
+CARGO_SHA256_URL="https://static.rust-lang.org/dist/cargo-${CARGO_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz.sha256"
+CARGO_ARCHIVE="${CACHE_DIR}/cargo-${CARGO_STAGE0_VERSION}-${ARCH}-${OS}.tar.xz"
+CARGO_SUM="${CACHE_DIR}/cargo-${CARGO_STAGE0_VERSION}-${ARCH}-${OS}.sha256"
+
+mkdir -p "$CACHE_DIR" "$BOOTSTRAP_DIR" "$(dirname "$ADM_LOG")"
+echo "[`date -u`] cargo pre-bootstrap start" >> "$ADM_LOG"
+
+# 1️⃣ Verificar se Cargo já existe
+if command -v cargo >/dev/null 2>&1; then
+  echo "✔️ Cargo já detectado: $(cargo --version)"
+  echo "[`date -u`] cargo pre-bootstrap skipped (found existing cargo)" >> "$ADM_LOG"
+  exit 0
+fi
+
+# 2️⃣ Download do binário de bootstrap
+if [ ! -f "$CARGO_ARCHIVE" ]; then
+  echo "📥 Baixando Cargo bootstrap ${CARGO_STAGE0_VERSION}..."
+  echo "    → $CARGO_URL"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "(dry-run) pularia download"
+  else
+    curl -L --fail -o "$CARGO_ARCHIVE" "$CARGO_URL"
+    curl -L --fail -o "$CARGO_SUM" "$CARGO_SHA256_URL" || true
+  fi
+else
+  echo "ℹ️  Cargo bootstrap já em cache: $CARGO_ARCHIVE"
+fi
+
+# 3️⃣ Validar SHA256
+if [ "$DRY_RUN" -eq 0 ] && [ -f "$CARGO_SUM" ]; then
+  echo "🔒 Validando integridade SHA256..."
+  EXPECTED_SHA="$(awk '{print $1}' "$CARGO_SUM" | head -n1)"
+  GOT_SHA="$(sha256sum "$CARGO_ARCHIVE" | awk '{print $1}')"
+  if [ "$EXPECTED_SHA" != "$GOT_SHA" ]; then
+    echo "❌ SHA256 incorreto para $CARGO_ARCHIVE"
+    echo "Esperado: $EXPECTED_SHA"
+    echo "Obtido:   $GOT_SHA"
+    echo "[`date -u`] cargo bootstrap sha256 mismatch" >> "$ADM_LOG"
+    exit 2
+  fi
+  echo "✔️  SHA256 válido."
+else
+  echo "⚠️  SHA256 não validado (modo dry-run ou sum ausente)"
+fi
+
+# 4️⃣ Extração
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) extrairia $CARGO_ARCHIVE → $BOOTSTRAP_DIR"
+else
+  echo "📦 Extraindo Cargo bootstrap para $BOOTSTRAP_DIR..."
+  tar -xJf "$CARGO_ARCHIVE" -C "$BOOTSTRAP_DIR" --strip-components=1
+fi
+
+# 5️⃣ Instalação isolada
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria ./install.sh --prefix=$BOOTSTRAP_DIR"
+else
+  pushd "$BOOTSTRAP_DIR" >/dev/null
+  if [ -x "./install.sh" ]; then
+    ./install.sh --prefix="$BOOTSTRAP_DIR" > install.log 2>&1 || {
+      echo "❌ Falha na instalação do Cargo bootstrap."
+      tail -n 50 install.log
+      exit 1
+    }
+  else
+    echo "⚠️  Script install.sh não encontrado, copiando binários manualmente..."
+    mkdir -p "$BOOTSTRAP_DIR/bin"
+    find "$BOOTSTRAP_DIR" -type f -name cargo -exec cp {} "$BOOTSTRAP_DIR/bin/" \; || true
+  fi
+  popd >/dev/null
+fi
+
+# 6️⃣ Configurar ambiente
+export PATH="$BOOTSTRAP_DIR/bin:$PATH"
+export CARGO_HOME="${ADM_ROOT}/cache/cargo-home"
+export CARGO="$BOOTSTRAP_DIR/bin/cargo"
+
+mkdir -p "$CARGO_HOME" || true
+
+# 7️⃣ Verificar funcionalidade
+if [ "$DRY_RUN" -eq 0 ]; then
+  ver="$($CARGO --version || echo 'falha ao detectar versão')"
+  echo "✔️ Cargo bootstrap ativo: $ver"
+  echo "$ver" > "$BOOTSTRAP_DIR/version"
+else
+  echo "(dry-run) verificaria $BOOTSTRAP_DIR/bin/cargo --version"
+fi
+
+echo "[`date -u`] cargo pre-bootstrap complete" >> "$ADM_LOG"
+echo "✅ [cargo pre-bootstrap] Ambiente Cargo bootstrap pronto."
