@@ -1,0 +1,13 @@
+description: Rust Programming Language — a systems programming language empowering everyone to build reliable and efficient software.
+name: rust
+version: 1.85.1
+license: MIT OR Apache-2.0
+url: https://www.rust-lang.org/
+build: 1
+source: https://static.rust-lang.org/dist/rust-1.85.1-src.tar.gz
+source: https://static.rust-lang.org/dist/rust-1.85.1-src.tar.xz
+source: git+https://github.com/rust-lang/rust.git#1.85.1
+sha256sum: <INSERT_SHA256_FOR_rust-1.85.1-src.tar.xz>
+build_deps: cmake, python3, gcc, clang, llvm, lld, curl, git, pkgconfig, libssl-dev, zlib1g-dev
+run_deps: glibc, libgcc, zlib, libc6
+opt_deps: llvm-tools, lld-tools, rust-fmt, clippy, miri
