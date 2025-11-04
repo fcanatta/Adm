@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# ADM hook: glibc pre-install
+# - Prepare DESTDIR and warn about dangerous installs
+#
+set -euo pipefail
+
+echo "📦 [glibc pre-install] Preparing install..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-install.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/glibc-destdir}"
+LFS="${LFS:-/mnt/lfs}"
+
+echo "[`date -u`] pre-install start: DESTDIR=${DESTDIR}" >> "$ADM_LOG"
+
+# Danger warning
+echo "## RISCO: make install MUST use DESTDIR. Installing directly to / will likely break the system."
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) would run: make DESTDIR=$DESTDIR install"
+  exit 0
+fi
+
+# Perform install
+if ! make DESTDIR="$DESTDIR" install > install.out 2>&1; then
+  echo "❌ make install failed — see install.out"
+  tail -n 200 install.out || true
+  exit 1
+fi
+
+# Fix hard-coded ldd path in installed script per LFS:
+if [ -f "$DESTDIR/usr/bin/ldd" ]; then
+  sed -i '/RTLDLIST=/s@/usr@@g' "$DESTDIR/usr/bin/ldd" || true
+  echo "[`date -u`] ldd script patched" >> "$ADM_LOG"
+else
+  echo "⚠️  ldd script not found in $DESTDIR/usr/bin/ldd"
+fi
+
+echo "✅ [glibc pre-install] Install into DESTDIR complete"
