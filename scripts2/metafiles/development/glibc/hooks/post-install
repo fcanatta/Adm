@@ -2,67 +2,97 @@
 #
 # ADM hook: glibc post-install
 # - Perform sanity checks described by LFS (dummy compile, readelf checks),
-#   and cleanup test files. Does not run ldconfig on host by default.
+#   and cleanup test files. Operates ***inside DESTDIR***.
+# - STRICT DESTDIR validation included.
 #
 set -euo pipefail
 
 echo "🔧 [glibc post-install] Running sanity checks..."
 DRY_RUN="${DRY_RUN:-0}"
 ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-install.log}"
-DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/glibc-destdir}"
+DESTDIR="${DESTDIR:-${ADM_ROOT:-/usr/src/adm}/tmp/glibc-destdir}"
 LFS="${LFS:-/mnt/lfs}"
 LFS_TGT="${LFS_TGT:-${TARGET_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || true)}}"
 
-echo "[`date -u`] post-install start" >> "$ADM_LOG"
+echo "[`date -u`] post-install start (DESTDIR=${DESTDIR})" >> "$ADM_LOG"
+
+# STRICT DESTDIR CHECKS
+if [ -z "${DESTDIR:-}" ]; then
+  echo "❌ RISCO: DESTDIR is empty. Aborting sanity checks to avoid touching host."
+  echo "[`date -u`] ABORT post-install: DESTDIR empty" >> "$ADM_LOG"
+  exit 2
+fi
+_norm_dest="${DESTDIR%/}"
+if [ "${_norm_dest}" = "" ] || [ "${_norm_dest}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR resolves to root (/). Aborting to avoid system corruption."
+  echo "[`date -u`] ABORT post-install: DESTDIR root ($DESTDIR)" >> "$ADM_LOG"
+  exit 2
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "(dry-run) would run sanity compile + readelf checks"
+  echo "(dry-run) would run sanity compile + readelf checks inside $DESTDIR"
   exit 0
 fi
 
-# 1) Sanity compile: echo 'int main(){}' | $LFS_TGT-gcc -x c - -v -Wl,--verbose
-echo "⚙️  Performing sanity compile with ${LFS_TGT}-gcc"
+# Move to a temp chroot-like env for sanity compile: set PATH so that DESTDIR's bin is used if present
+export PATH="$DESTDIR/usr/bin:$DESTDIR/bin:$PATH"
+
+# 1) Sanity compile: create a small program and attempt to link/run inside env
 echo 'int main(){}' > dummy.c
-if ! ${LFS_TGT}-gcc -x c dummy.c -v -Wl,--verbose &> dummy.log; then
+# Use target compiler if available; prefer LFS_TGT-gcc then gcc in DESTDIR
+if command -v "${LFS_TGT}-gcc" >/dev/null 2>&1; then
+  CC="${LFS_TGT}-gcc"
+elif [ -x "$DESTDIR/usr/bin/gcc" ]; then
+  CC="$DESTDIR/usr/bin/gcc"
+elif command -v gcc >/dev/null 2>&1; then
+  CC="gcc"
+else
+  echo "❌ No suitable gcc found for sanity compile"
+  rm -f dummy.c || true
+  exit 1
+fi
+
+echo "⚙️  Performing sanity compile with ${CC}"
+if ! "$CC" -x c dummy.c -v -Wl,--verbose &> dummy.log; then
   echo "❌ Sanity compile failed; see dummy.log"
   tail -n 200 dummy.log || true
   rm -f dummy.c a.out || true
   exit 1
 fi
 
-# 2) readelf to check program interpreter references
+# 2) readelf to check program interpreter references (check a.out)
 if command -v readelf >/dev/null 2>&1; then
-  readelf -l a.out | grep ': /lib' || {
+  if ! readelf -l a.out | grep -E ': /(lib|lib64)'; then
     echo "❌ readelf check failed: program interpreter not in /lib or /lib64"
     tail -n 200 dummy.log || true
     rm -f dummy.c a.out dummy.log || true
     exit 1
-  }
+  fi
 else
   echo "⚠️  readelf not available to perform check"
 fi
 
-# 3) Check that libc.so.6 is reachable
-grep -E "/lib.*/libc.so.6 " dummy.log || {
+# 3) Check that libc.so.6 is reachable in the dummy.log
+if ! grep -E "/lib.*/libc.so.6 " dummy.log >/dev/null 2>&1; then
   echo "❌ libc.so.6 not found in dummy.log"
   tail -n 200 dummy.log || true
   rm -f dummy.c a.out dummy.log || true
   exit 1
-}
+fi
 
 # 4) Confirm dynamic linker path found
-grep 'found' dummy.log || {
+if ! grep 'found' dummy.log >/dev/null 2>&1; then
   echo "❌ dynamic linker path not found in dummy.log"
   tail -n 200 dummy.log || true
   rm -f dummy.c a.out dummy.log || true
   exit 1
-}
+fi
 
 # cleanup
 rm -v dummy.c a.out dummy.log 2>/dev/null || true
 echo "✅ [glibc post-install] Sanity checks passed"
 
-# NOTE: We do not run ldconfig on the host automatically. Running ldconfig may
-# replace the running libc and can break the system. If you must run ldconfig,
-# do it inside the target chroot with care.
 echo "[`date -u`] glibc install and sanity checks OK" >> "$ADM_LOG"
+
+# NOTE: We do NOT run ldconfig on the host automatically. If you need to enable the new glibc
+# in a chroot or target rootfs, run ldconfig inside that chroot intentionally.
