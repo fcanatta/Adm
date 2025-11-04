@@ -1,0 +1,8 @@
+name: linux
+version: 6.11.6
+source: https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.6.tar.xz
+sha256: 50b1e16a63152e86a98710a5d447ef48edb35e249db70bba87a03c6f3c71886b
+desc: The Linux kernel source tree providing the core of the operating system.
+build_deps: gcc, binutils, make, bc, flex, bison, perl, openssl
+run_deps: none
+upstream: https://www.kernel.org/
