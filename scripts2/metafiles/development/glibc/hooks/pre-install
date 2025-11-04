@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-#
 # ADM hook: glibc pre-install
 # - Prepare DESTDIR and warn about dangerous installs
+# - STRICT CHECK: abort if DESTDIR empty or "/"
 #
 set -euo pipefail
 
@@ -9,22 +9,40 @@ echo "📦 [glibc pre-install] Preparing install..."
 
 DRY_RUN="${DRY_RUN:-0}"
 ADM_LOG="${ADM_LOG:-/usr/src/adm/logs/glibc-install.log}"
-DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/glibc-destdir}"
+# default safe DESTDIR inside ADM tree if not provided
+DESTDIR="${DESTDIR:-${ADM_ROOT:-/usr/src/adm}/tmp/glibc-destdir}"
 LFS="${LFS:-/mnt/lfs}"
 
+# STRICT SAFETY CHECKS:
+if [ -z "${DESTDIR:-}" ]; then
+  echo "❌ RISCO: DESTDIR is empty. Aborting to avoid installing to host root."
+  echo "[`date -u`] ABORT: DESTDIR empty" >> "$ADM_LOG"
+  exit 2
+fi
+# normalize trailing slash
+_norm_dest="${DESTDIR%/}"
+if [ "${_norm_dest}" = "" ] || [ "${_norm_dest}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR resolves to root (/). Aborting to avoid system corruption."
+  echo "[`date -u`] ABORT: DESTDIR would be root ($DESTDIR)" >> "$ADM_LOG"
+  exit 2
+fi
+
+echo "ℹ️  DESTDIR verified safe: $DESTDIR"
 echo "[`date -u`] pre-install start: DESTDIR=${DESTDIR}" >> "$ADM_LOG"
 
-# Danger warning
+# Danger warning (user-facing)
 echo "## RISCO: make install MUST use DESTDIR. Installing directly to / will likely break the system."
+
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "(dry-run) would run: make DESTDIR=$DESTDIR install"
   exit 0
 fi
 
-# Perform install
+# Perform install and capture output
 if ! make DESTDIR="$DESTDIR" install > install.out 2>&1; then
   echo "❌ make install failed — see install.out"
   tail -n 200 install.out || true
+  echo "[`date -u`] make install failed (see install.out)" >> "$ADM_LOG"
   exit 1
 fi
 
@@ -36,4 +54,4 @@ else
   echo "⚠️  ldd script not found in $DESTDIR/usr/bin/ldd"
 fi
 
-echo "✅ [glibc pre-install] Install into DESTDIR complete"
+echo "✅ [glibc pre-install] Install into DESTDIR complete: $DESTDIR"
