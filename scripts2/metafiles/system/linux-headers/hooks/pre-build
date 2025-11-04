@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: linux-kernel-headers pre-build
+# - Prepara o ambiente para construção dos headers do kernel.
+# - Garante toolchain mínima e validação do source.
+# - Compatível com DRY_RUN e logs detalhados.
+#
+set -euo pipefail
+
+echo "🧩 [linux-kernel-headers pre-build] Preparando ambiente..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/kernel-headers.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/linux-headers-destdir}"
+
+mkdir -p "$(dirname "$ADM_LOG")" "$BUILD_DIR"
+
+echo "[`date -u`] pre-build start" >> "$ADM_LOG"
+
+# 1️⃣ Validar ferramentas essenciais
+for cmd in make gcc; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "❌ Ferramenta obrigatória não encontrada: $cmd"
+    echo "[`date -u`] missing: $cmd" >> "$ADM_LOG"
+    exit 1
+  fi
+done
+
+# 2️⃣ Verificar Makefile principal
+if [ ! -f "$SRC_DIR/Makefile" ]; then
+  echo "❌ Makefile do kernel não encontrado no diretório atual."
+  exit 1
+fi
+
+# 3️⃣ Preparar build
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria make mrproper"
+else
+  echo "🧼 Limpando árvore de build anterior..."
+  make mrproper > "$BUILD_DIR/mrproper.log" 2>&1 || true
+fi
+
+echo "✅ [pre-build] Ambiente de build preparado."
+echo "[`date -u`] pre-build done" >> "$ADM_LOG"
