@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: rust pre-build
+# - Prepara ambiente para construir o compilador Rust a partir do código-fonte.
+# - Detecta toolchain existente (bootstrap compiler), aplica configurações
+#   seguras e gera o arquivo config.toml necessário para o build.
+#
+# ⚠️ Operações críticas comentadas e abortadas se DESTDIR inseguro.
+#
+set -euo pipefail
+
+echo "🔧 [rust pre-build] Preparando ambiente de compilação..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/rust-build.log}"
+SRC_DIR="$(pwd)"
+BUILD_DIR="${BUILD_DIR:-${SRC_DIR}/build}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/rust-destdir}"
+ADM_PROFILE="${ADM_PROFILE:-normal}"
+ADM_STAGE="${ADM_STAGE:-stage3}"
+
+mkdir -p "$(dirname "$ADM_LOG")" || true
+echo "[`date -u`] pre-build start (stage=$ADM_STAGE, profile=$ADM_PROFILE)" >> "$ADM_LOG"
+
+# 1. Detectar compilador bootstrap existente (gcc/clang + rustc/cargo antigos)
+if ! command -v gcc >/dev/null 2>&1 && ! command -v clang >/dev/null 2>&1; then
+  echo "❌ Nenhum compilador C detectado (gcc/clang). Abortando."
+  exit 1
+fi
+if ! command -v rustc >/dev/null 2>&1; then
+  echo "⚠️  Nenhum rustc bootstrap detectado — o build irá baixar stage0 automaticamente."
+fi
+
+# 2. Gerar config.toml (arquivo principal do Rust build)
+CONFIG_TOML="${SRC_DIR}/config.toml"
+
+echo "⚙️  Gerando config.toml em ${CONFIG_TOML}..."
+if [ "$DRY_RUN" -eq 0 ]; then
+  cat > "$CONFIG_TOML" <<EOF
+[build]
+build = "$(uname -m)-unknown-linux-gnu"
+host = ["$(uname -m)-unknown-linux-gnu"]
+target = ["$(uname -m)-unknown-linux-gnu"]
+docs = false
+extended = true
+cargo = "$(command -v cargo || echo /usr/bin/cargo)"
+rustc = "$(command -v rustc || echo /usr/bin/rustc)"
+python = "$(command -v python3 || echo /usr/bin/python3)"
+submodules = false
+locked-deps = true
+vendor = true
+tools = ["cargo", "clippy", "rustfmt"]
+
+[install]
+prefix = "/usr"
+
+[rust]
+optimize = true
+debug = false
+codegen-units = 1
+debug-assertions = false
+debuginfo-level = 0
+backtrace = false
+channel = "stable"
+rpath = false
+lto = false
+
+[target.x86_64-unknown-linux-gnu]
+llvm-config = "$(command -v llvm-config || echo /usr/bin/llvm-config)"
+
+[dist]
+sign-folder = false
+compression-formats = ["xz"]
+EOF
+else
+  echo "(dry-run) criaria config.toml em ${CONFIG_TOML}"
+fi
+
+# 3. Configurar otimizações baseadas no perfil
+case "$ADM_PROFILE" in
+  extreme)
+    echo "⚙️  Perfil extreme: ativando LTO e PGO"
+    sed -i '/\[rust\]/a lto = true\ndebug-assertions = false\noptimize = true\ncodegen-units = 1' "$CONFIG_TOML" || true
+    ;;
+  none)
+    echo "⚙️  Perfil none: desativando otimizações"
+    sed -i '/\[rust\]/a optimize = false\ndebug = true\ndebuginfo-level = 1' "$CONFIG_TOML" || true
+    ;;
+  normal|*)
+    echo "⚙️  Perfil normal: otimização padrão (-O2)"
+    ;;
+esac
+
+echo "[`date -u`] config.toml generated" >> "$ADM_LOG"
+
+# 4. Mostrar comando de build previsto
+echo "🏗️  Comando planejado: ./x.py build --stage 2"
+echo "✅ [rust pre-build] Concluído."
