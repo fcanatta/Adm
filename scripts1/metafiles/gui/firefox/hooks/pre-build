@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# ADM pre-build hook for Mozilla Firefox
+# Sets up the environment, checks dependencies and configures build options.
+
+adm_log_info "[HOOK pre-build] Preparing environment for Firefox build..."
+export LANG=C
+export LC_ALL=C
+export MAKEFLAGS="-j${ADM_JOBS:-8}"
+
+# Ensure Rust and Cargo are available
+if ! command -v rustc >/dev/null 2>&1; then
+  adm_log_err "Rust compiler not found (rustc)"
+  exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  adm_log_err "Cargo not found"
+  exit 1
+fi
+
+# Ensure Python and NodeJS available
+if ! command -v python3 >/dev/null 2>&1; then
+  adm_log_err "Python 3 not found"
+  exit 1
+fi
+if ! command -v node >/dev/null 2>&1; then
+  adm_log_err "NodeJS not found"
+  exit 1
+fi
+
+# Create build directory
+mkdir -p objdir && cd objdir || exit 1
+
+# Configure with mozbuild
+adm_log_info "[HOOK pre-build] Running configure via mach..."
+../mach configure \
+  --prefix=/usr \
+  --enable-release \
+  --enable-official-branding \
+  --enable-optimize="-O2 -pipe" \
+  --disable-debug-symbols \
+  --disable-tests \
+  --disable-crashreporter \
+  --enable-linker=lld \
+  --enable-default-toolkit=cairo-gtk3 || {
+    adm_log_err "Firefox configure step failed!"
+    exit 1
+  }
+
+adm_log_ok "[HOOK pre-build] Configuration complete."
