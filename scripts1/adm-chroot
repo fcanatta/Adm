@@ -1,0 +1,578 @@
+#!/usr/bin/env bash
+# adm-chroot - create/exists/enter/destroy/manage chroots (safe-mode by default)
+#
+# Save as: /usr/src/adm/bin/adm-chroot
+# Usage:
+#   adm-chroot create <name> [--from <other>] [--stage <stageN>]
+#   adm-chroot exists <name>
+#   adm-chroot enter <name> [-- <command>]
+#   adm-chroot destroy <name> [--force]
+#   adm-chroot list
+#   adm-chroot snapshot <name> <snapshot-name>
+#   adm-chroot help
+#
+# IMPORTANT SAFETY NOTES:
+# - By default this script SIMULATES destructive/mounting actions.
+# - Commands that perform mounts/umounts, chroot or rm -rf are present but COMMENTED
+#   and clearly labeled with: "# UNCOMMENT FOR REAL EXECUTION (in chroot only)"
+# - To perform real actions you must manually uncomment the relevant lines
+#   after auditing the script and only run inside a secure VM.
+#
+set -euo pipefail
+shopt -s extglob
+
+# -------------------------
+# Configuration
+# -------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CHROOT_DIR:=$ADM_ROOT/chroots}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/chroots}"
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+: "${ADM_ALLOW_EXECUTION:=0}"   # 0 -> simulate; 1 -> still SIMULATE but logs show actions (real commands commented)
+: "${ADM_VERBOSE:=1}"
+: "${ADM_LOCK_DIR:=$ADM_STATE_DIR/locks}"
+: "${ADM_STATE_DIR:=$ADM_ROOT/state}"
+: "${ADM_DEFAULT_STAGE_PREFIX:=stage}"
+
+# Derived dirs
+mkdir -p "$ADM_CHROOT_DIR" "$ADM_LOG_DIR" "$ADM_TMPDIR" "$ADM_STATE_DIR" 2>/dev/null || true
+
+# simple logger (adm-logger optional)
+if [ -x "${ADM_ROOT}/bin/adm-logger" ]; then
+  source "${ADM_ROOT}/bin/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info() { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_error() { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_debug() { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+# -------------------------
+# Safety helpers
+# -------------------------
+_adm_lockfile_for() { local name="$1"; printf "%s/%s.lock" "$ADM_STATE_DIR" "$name"; }
+_adm_acquire_lock() {
+  local name="$1"; local lock
+  lock=$(_adm_lockfile_for "$name")
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  exec 9>"$lock"  # fd 9 for lock
+  if ! flock -n 9; then
+    adm_log_error "Failed to acquire lock for $name (another process may be running). Lock: $lock"
+    return 1
+  fi
+  echo "$$" > "$lock.pid" 2>/dev/null || true
+  adm_log_debug "Acquired lock: $lock (pid $$)"
+  return 0
+}
+_adm_release_lock() {
+  local name="$1"; local lock
+  lock=$(_adm_lockfile_for "$name")
+  # close fd 9 if open
+  if [ -e "$lock" ]; then
+    rm -f "$lock.pid" 2>/dev/null || true
+    # fd 9 will be closed on process exit; explicit close:
+    exec 9>&-
+    adm_log_debug "Released lock: $lock"
+  fi
+}
+
+# Ensure safe path: only allow chroots under ADM_CHROOT_DIR
+_adm_chroot_path() {
+  local name="$1"
+  # sanitize name
+  name=$(echo "$name" | sed -E 's/[^A-Za-z0-9._+-]/_/g')
+  printf "%s/%s" "$ADM_CHROOT_DIR" "$name"
+}
+
+# Check path safety before destructive ops
+_adm_safe_remove_dir() {
+  local path="$1"
+  # Ensure path is inside ADM_CHROOT_DIR
+  case "$path" in
+    "$ADM_CHROOT_DIR"/*) ;;
+    *)
+      adm_log_error "Refusing to remove unsafe path: $path"
+      return 1
+      ;;
+  esac
+  # Confirm not empty string
+  [ -n "$path" ] || return 1
+  # Simulation by default
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_info "[SIMULATION] Would remove directory: $path"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rm -rf -- "$path"
+  else
+    adm_log_info "[SIMULATION] Would remove directory: $path (ADM_ALLOW_EXECUTION=0)"
+  fi
+  return 0
+}
+
+# Validate mountpoint helper
+_adm_is_mountpoint() {
+  local mp="$1"
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q "$mp"
+    return $?
+  fi
+  # fallback: compare /proc/mounts
+  grep -qE "[[:space:]]$mp[[:space:]]" /proc/mounts 2>/dev/null && return 0 || return 1
+}
+
+# -------------------------
+# Chroot metadata helpers
+# -------------------------
+_adm_chroot_marker_file() {
+  local chroot="$1"
+  printf "%s/.adm_chroot_meta" "$chroot"
+}
+
+_adm_write_chroot_marker() {
+  local chroot="$1" stage="$2" from="$3"
+  mkdir -p "$chroot" 2>/dev/null || true
+  cat > "$(_adm_chroot_marker_file="$(_adm_chroot_marker_file "$chroot")"; printf "%s" "$_adm_chroot_marker_file")" <<EOF
+name: $(basename "$chroot")
+created_at: $(date -Iseconds)
+stage: ${stage:-unknown}
+from: ${from:-}
+adm_chroot_dir: $ADM_CHROOT_DIR
+EOF
+}
+
+# Actually write function properly (avoid complex subshell confusion)
+_adm_chroot_marker_file() { local c="$1"; printf "%s/.adm_chroot_meta" "$c"; }
+_adm_write_chroot_marker() {
+  local chroot="$1"; local stage="$2"; local from="$3"
+  local file
+  file="$(_adm_chroot_marker_file "$chroot")"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  {
+    echo "name: $(basename "$chroot")"
+    echo "created_at: $(date -Iseconds)"
+    echo "stage: ${stage:-unknown}"
+    echo "from: ${from:-}"
+    echo "adm_chroot_dir: $ADM_CHROOT_DIR"
+  } > "$file"
+}
+
+_adm_read_chroot_marker() {
+  local chroot="$1"
+  local file="$(_adm_chroot_marker_file "$chroot")"
+  [ -f "$file" ] || return 1
+  cat "$file"
+}
+
+# -------------------------
+# Mount / unmount helpers (SIMULATED by default)
+# Each real mount/umount call is commented; to enable real behavior UNCOMMENT
+# -------------------------
+_adm_mount_bind() {
+  local src="$1" dst="$2" opts="${3:-}"
+  adm_log_info "Bind mount: $src -> $dst $opts"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount --bind $src $dst"
+    adm_log_debug "[SIM] mount --make-rslave $dst"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dst"
+    # mount --bind "$src" "$dst"
+    # mount --make-rslave "$dst"
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dst; mount --bind $src $dst; mount --make-rslave $dst"
+  fi
+}
+
+_adm_mount_proc() {
+  local chroot="$1"
+  local dest="$chroot/proc"
+  adm_log_info "Mounting /proc into $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount -t proc proc $dest"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dest"
+    # mount -t proc proc "$dest"
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dest; mount -t proc proc $dest"
+  fi
+}
+
+_adm_mount_sys() {
+  local chroot="$1"
+  local dest="$chroot/sys"
+  adm_log_info "Mounting /sys into $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount -t sysfs sysfs $dest"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dest"
+    # mount -t sysfs sysfs "$dest"
+    # mount --make-rslave "$dest"
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dest; mount -t sysfs sysfs $dest"
+  fi
+}
+
+_adm_mount_dev() {
+  local chroot="$1"
+  local dest="$chroot/dev"
+  adm_log_info "Mounting /dev into $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount --rbind /dev $dest"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dest"
+    # mount --rbind /dev "$dest"
+    # mount --make-rslave "$dest"
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dest; mount --rbind /dev $dest"
+  fi
+}
+
+_adm_mount_dev_pts() {
+  local chroot="$1"
+  local dest="$chroot/dev/pts"
+  adm_log_info "Mounting dev/pts into $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount -t devpts devpts $dest -o gid=5,mode=620"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dest"
+    # mount -t devpts devpts "$dest" -o gid=5,mode=620
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dest; mount -t devpts devpts $dest -o gid=5,mode=620"
+  fi
+}
+
+_adm_mount_run() {
+  local chroot="$1"
+  local dest="$chroot/run"
+  adm_log_info "Mounting /run into $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] mount --bind /run $dest"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # mkdir -p "$dest"
+    # mount --bind /run "$dest"
+    # mount --make-rslave "$dest"
+  else
+    adm_log_info "[SIMULATION] Would run: mkdir -p $dest; mount --bind /run $dest"
+  fi
+}
+
+# Unmount helpers (reverse order)
+_adm_umount_if_mounted() {
+  local target="$1"
+  if _adm_is_mountpoint "$target"; then
+    adm_log_info "Unmounting $target"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] umount -l $target"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # umount -l "$target" || true
+    else
+      adm_log_info "[SIMULATION] Would run: umount -l $target"
+    fi
+  else
+    adm_log_debug "Not a mountpoint: $target"
+  fi
+}
+
+# -------------------------
+# Core actions
+# -------------------------
+_adm_chroot_exists() {
+  local name="$1"
+  local path
+  path="$(_adm_chroot_path "$name")"
+  if [ -d "$path" ] && [ -f "$(_adm_chroot_marker_file "$path")" ]; then
+    printf "%s\n" "$path"
+    return 0
+  fi
+  return 1
+}
+
+_adm_chroot_create() {
+  local name="$1"; local from="${2:-}"; local stage="${3:-$ADM_DEFAULT_STAGE_PREFIX}"
+  local path
+  path="$(_adm_chroot_path "$name")"
+
+  adm_log_info "Preparing chroot: name=$name path=$path stage=$stage from=${from:-none}"
+
+  if [ -d "$path" ]; then
+    adm_log_error "Chroot path already exists: $path"
+    return 1
+  fi
+
+  # Create base directories
+  adm_log_info "Creating chroot directories under $ADM_CHROOT_DIR"
+  adm_log_debug "[SIM] mkdir -p $path"
+  # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+  # mkdir -p "$path"
+  # mkdir -p "$path"/{dev,proc,sys,run,usr,tmp,var,home}
+
+  # If creating from an existing chroot, copy/sync files (snapshot)
+  if [ -n "$from" ]; then
+    local from_path
+    from_path="$(_adm_chroot_path "$from")"
+    if [ ! -d "$from_path" ]; then
+      adm_log_error "Source chroot to clone from does not exist: $from_path"
+      return 1
+    fi
+    adm_log_info "Cloning chroot from $from_path -> $path (safely)"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] cp -a $from_path/* $path/"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # rsync -a --delete "$from_path/" "$path/"
+    else
+      adm_log_info "[SIMULATION] Would rsync -a --delete $from_path/ $path/"
+    fi
+  else
+    # If not cloning, create minimal base (users can populate or use bootstrap)
+    adm_log_info "Creating minimal filesystem layout for $path"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] create minimal directories"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # mkdir -p "$path"/{bin,usr,lib,lib64,usr/bin,usr/lib,usr/lib64,dev,proc,sys,run,tmp,var}
+      # cp -a /etc/ld.so.cache "$path"/etc/ 2>/dev/null || true
+    else
+      adm_log_info "[SIMULATION] Would create minimal directories under $path"
+    fi
+  fi
+
+  # Write marker/meta
+  _adm_write_chroot_marker "$path" "$stage" "$from"
+  adm_log_correct "Chroot prepared at (simulated): $path"
+  adm_log_info "To populate toolchain run bootstrap scripts inside the chroot (manually or via adm-build)."
+  return 0
+}
+
+_adm_chroot_enter() {
+  local name="$1"; shift
+  local cmd=( "$@" )
+  local path
+  path="$(_adm_chroot_path "$name")"
+  if [ ! -d "$path" ]; then
+    adm_log_error "Chroot not found: $path"
+    return 1
+  fi
+
+  adm_log_info "Preparing to enter chroot: $path"
+
+  # Acquire lock for entering
+  _adm_acquire_lock "$name" || return 1
+  # Ensure mounts: /proc, /sys, /dev, /dev/pts, /run, and bind mounts for ADM cache/state
+  adm_log_info "Mounting required pseudo-filesystems (simulated)"
+  _adm_mount_proc "$path"
+  _adm_mount_sys "$path"
+  _adm_mount_dev "$path"
+  _adm_mount_dev_pts "$path"
+  _adm_mount_run "$path"
+
+  # Bind /usr/src/adm/cache into chroot (read-only ideally)
+  local src_cache="$ADM_ROOT/cache"
+  local dst_cache="$path/usr/src/adm-cache"
+  adm_log_info "Bind-mounting ADM cache into chroot: $src_cache -> $dst_cache"
+  _adm_mount_bind "$src_cache" "$dst_cache" "--ro"
+
+  # Additional safety: make /tmp private inside chroot (if desired)
+  # _adm_mount_bind /tmp "$path/tmp" ""
+
+  # Now enter the chroot: if no command provided, open an interactive shell
+  if [ "${#cmd[@]}" -eq 0 ]; then
+    adm_log_info "No command provided: would drop to interactive shell inside chroot"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] chroot $path /bin/bash --login"
+      adm_log_info "[SIMULATION] To actually enter, uncomment the chroot command below and run in VM."
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # chroot "$path" /bin/bash --login
+    else
+      adm_log_info "[SIMULATION] Would run: chroot $path /bin/bash --login"
+    fi
+  else
+    adm_log_info "Would run inside chroot: ${cmd[*]}"
+    if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+      adm_log_debug "[SIM] chroot $path ${cmd[*]}"
+      # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+      # chroot "$path" "${cmd[@]}"
+    else
+      adm_log_info "[SIMULATION] Would run: chroot $path ${cmd[*]}"
+    fi
+  fi
+
+  # After exit: unmount bind mounts (but keep chroot available)
+  adm_log_info "Unmounting pseudo-filesystems (simulated) after exit"
+  _adm_umount_if_mounted "$path/run" || true
+  _adm_umount_if_mounted "$path/dev/pts" || true
+  _adm_umount_if_mounted "$path/dev" || true
+  _adm_umount_if_mounted "$path/sys" || true
+  _adm_umount_if_mounted "$path/proc" || true
+  _adm_umount_if_mounted "$dst_cache" || true
+
+  _adm_release_lock "$name"
+  adm_log_correct "Exited chroot (simulated): $path"
+  return 0
+}
+
+_adm_chroot_destroy() {
+  local name="$1"; local force="${2:-0}"
+  local path
+  path="$(_adm_chroot_path "$name")"
+
+  adm_log_info "Destroying chroot: $name -> $path (force=$force)"
+  if [ ! -d "$path" ]; then
+    adm_log_error "Chroot not found: $path"
+    return 1
+  fi
+
+  # Acquire lock
+  _adm_acquire_lock "$name" || { adm_log_error "Unable to acquire lock for destroy"; return 1; }
+
+  # Unmount pseudo-filesystems safely (reverse order)
+  adm_log_info "Unmounting pseudo-filesystems (simulated)"
+  _adm_umount_if_mounted "$path/run" || true
+  _adm_umount_if_mounted "$path/dev/pts" || true
+  _adm_umount_if_mounted "$path/dev" || true
+  _adm_umount_if_mounted "$path/sys" || true
+  _adm_umount_if_mounted "$path/proc" || true
+
+  # Unmount any ADM bind mounts
+  local dst_cache="$path/usr/src/adm-cache"
+  _adm_umount_if_mounted "$dst_cache" || true
+
+  # Remove directory (safe guard)
+  _adm_safe_remove_dir "$path" || {
+    adm_log_error "Refusing to remove chroot path due to safety checks."
+    _adm_release_lock "$name"
+    return 1
+  }
+
+  # Release lock
+  _adm_release_lock "$name"
+  adm_log_correct "Chroot destroyed (simulated): $path"
+  return 0
+}
+
+# -------------------------
+# Additional helpers: list, snapshot
+# -------------------------
+_adm_chroot_list() {
+  adm_log_info "Listing chroots under $ADM_CHROOT_DIR"
+  for d in "$ADM_CHROOT_DIR"/*; do
+    [ -d "$d" ] || continue
+    local meta_file="$(_adm_chroot_marker_file "$d")"
+    local name
+    name=$(basename "$d")
+    if [ -f "$meta_file" ]; then
+      printf "%-20s %s\n" "$name" "$(awk '/created_at:/ {print $2} /stage:/ {print $2}' "$meta_file" 2>/dev/null | tr '\n' ' ' )"
+    else
+      printf "%-20s (no metadata)\n" "$name"
+    fi
+  done
+}
+
+_adm_chroot_snapshot() {
+  local name="$1"; local snapshot="$2"
+  local path dst
+  path="$(_adm_chroot_path "$name")"
+  if [ ! -d "$path" ]; then adm_log_error "Chroot not found: $path"; return 1; fi
+  dst="$ADM_CHROOT_DIR/${name}__snapshot__${snapshot}"
+  adm_log_info "Creating snapshot: $path -> $dst (simulated)"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] rsync -a --link-dest=$path $path/ $dst/"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # rsync -a --delete "$path/" "$dst/"
+  else
+    adm_log_info "[SIMULATION] Would run: rsync -a --delete $path/ $dst/"
+  fi
+  adm_log_correct "Snapshot created (simulated): $dst"
+  return 0
+}
+
+# -------------------------
+# CLI parsing
+# -------------------------
+_adm_show_help() {
+  cat <<EOF
+adm-chroot - create/manage chroot environments for ADM
+
+Usage:
+  adm-chroot create <name> [--from <other>] [--stage <stageN>]
+  adm-chroot exists <name>
+  adm-chroot enter <name> [-- <command>]
+  adm-chroot destroy <name> [--force]
+  adm-chroot list
+  adm-chroot snapshot <name> <snapshot-name>
+  adm-chroot help
+
+Notes:
+ - Script runs in SIMULATION mode by default (ADM_ALLOW_EXECUTION=0).
+ - Lines that perform mount/chroot/rm are present but commented with:
+   # UNCOMMENT FOR REAL EXECUTION (in chroot only)
+ - To enable real actions, review and manually uncomment those lines
+   and run inside a secure VM.
+EOF
+}
+
+# parse args
+if [ $# -lt 1 ]; then _adm_show_help; exit 1; fi
+cmd="$1"; shift || true
+
+case "$cmd" in
+  create)
+    if [ $# -lt 1 ]; then adm_log_error "create requires <name>"; exit 2; fi
+    name="$1"; shift
+    from=""
+    stage="$ADM_DEFAULT_STAGE_PREFIX"
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --from) from="$2"; shift 2;;
+        --stage) stage="$2"; shift 2;;
+        *) shift ;;
+      esac
+    done
+    _adm_chroot_create "$name" "$from" "$stage"
+    ;;
+
+  exists)
+    if [ $# -lt 1 ]; then adm_log_error "exists requires <name>"; exit 2; fi
+    name="$1"
+    if _adm_chroot_exists "$name"; then
+      adm_log_info "Chroot exists: $(_adm_chroot_path "$name")"; exit 0
+    else
+      adm_log_info "Chroot not found: $name"; exit 1
+    fi
+    ;;
+
+  enter)
+    if [ $# -lt 1 ]; then adm_log_error "enter requires <name>"; exit 2; fi
+    name="$1"; shift
+    # if next token is --, consume and the rest is the command
+    if [ "$#" -gt 0 ] && [ "$1" = "--" ]; then shift; fi
+    _adm_chroot_enter "$name" "$@"
+    ;;
+
+  destroy)
+    if [ $# -lt 1 ]; then adm_log_error "destroy requires <name>"; exit 2; fi
+    name="$1"; shift
+    force=0
+    if [ "$#" -gt 0 ] && [ "$1" = "--force" ]; then force=1; shift; fi
+    _adm_chroot_destroy "$name" "$force"
+    ;;
+
+  list)
+    _adm_chroot_list
+    ;;
+
+  snapshot)
+    if [ $# -lt 2 ]; then adm_log_error "snapshot requires <name> <snapshot-name>"; exit 2; fi
+    name="$1"; snap="$2"
+    _adm_chroot_snapshot "$name" "$snap"
+    ;;
+
+  help|-h|--help)
+    _adm_show_help
+    ;;
+
+  *)
+    adm_log_error "Unknown command: $cmd"
+    _adm_show_help
+    exit 2
+    ;;
+esac
+
+exit 0
