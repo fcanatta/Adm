@@ -805,6 +805,9 @@ trap _adm_chroot_trap_cleanup SIGINT SIGTERM EXIT
 # -----------------------------
 if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
   case "$1" in
+    exists)
+      [ -d "$ADM_CHROOTS_DIR/$1" ] && exit 0 || exit 1
+      ;;
     init)
       shift
       adm_chroot_init_env "$@"
