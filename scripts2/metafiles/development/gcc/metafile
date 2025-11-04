@@ -1,0 +1,13 @@
+description: GNU Compiler Collection (GCC) - a compiler system supporting C, C++, Objective-C, Fortran, Ada, Go, and more.
+name: gcc
+version: 14.2.0
+license: GPL-3.0-or-later
+url: https://gcc.gnu.org/
+build: 1
+source: https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+source: https://ftpmirror.gnu.org/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+source: git+https://gcc.gnu.org/git/gcc.git#v14.2.0
+sha256sum: 5d8f3ffce93b4e417db4f07b6cb2858b469b9b6d3df46d412c9e4457c9381c74
+build_deps: gmp, mpfr, mpc, isl, texinfo, binutils, make, bash, sed, bison, flex, zstd
+run_deps: glibc, zlib, libmpc, libisl, binutils
+opt_deps: gdb, valgrind, python3, libstdc++-docs
