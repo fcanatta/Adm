@@ -1,0 +1,134 @@
+# ===============================================
+# Mozilla Firefox - mozconfig (profile = normal)
+# Build equilibrado (estável + otimizado)
+# Ideal para uso diário no sistema ADM
+# ===============================================
+
+# Diretório de build separado
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-firefox
+
+# ===============================================
+# 🧩 Configurações gerais do build
+# ===============================================
+
+ac_add_options --enable-application=browser
+
+# Otimização padrão (equilíbrio entre performance e reprodutibilidade)
+ac_add_options --enable-optimize="-O2 -pipe -march=native -fno-plt"
+ac_add_options --disable-debug
+ac_add_options --enable-release
+ac_add_options --enable-strip
+ac_add_options --disable-tests
+ac_add_options --disable-updater
+ac_add_options --disable-crashreporter
+ac_add_options --disable-install-strip
+ac_add_options --disable-elf-hack
+
+# Toolkit padrão (GTK3)
+ac_add_options --enable-default-toolkit=cairo-gtk3
+
+# ===============================================
+# 🦀 Rust / LLVM / LTO parcial
+# ===============================================
+
+# Preferir clang/lld (linkagem rápida e estável)
+CC=clang
+CXX=clang++
+LD=lld
+
+# LTO leve (thin-lto) — melhora performance sem usar muita RAM
+export MOZ_LTO=1
+export MOZ_THIN_LTO=1
+
+RUSTFLAGS="-C opt-level=2 -C target-cpu=native -C link-arg=-fuse-ld=lld"
+export RUSTFLAGS
+export CARGO_INCREMENTAL=0
+
+# ===============================================
+# ⚙️ Multithreading, ccache e pipelines
+# ===============================================
+
+mk_add_options MOZ_MAKE_FLAGS=-j$(nproc)
+
+# Habilita ccache se disponível (ótimo ganho em rebuilds)
+if which ccache >/dev/null 2>&1; then
+  mk_add_options "CCACHE=ccache"
+  export CCACHE_DIR="${CCACHE_DIR:-/usr/src/adm/cache/ccache}"
+  export CCACHE_COMPRESS=1
+  export CCACHE_SLOPPINESS=time_macros
+fi
+
+# ===============================================
+# 🔊 Suporte a áudio e multimídia
+# ===============================================
+
+ac_add_options --enable-pulseaudio
+ac_add_options --enable-alsa
+ac_add_options --enable-webrtc
+ac_add_options --enable-ffmpeg
+ac_add_options --enable-av1
+ac_add_options --enable-system-ffi
+
+# ===============================================
+# 📚 Bibliotecas e dependências do sistema
+# ===============================================
+
+ac_add_options --with-system-nspr
+ac_add_options --with-system-nss
+ac_add_options --with-system-libvpx
+ac_add_options --with-system-icu
+ac_add_options --with-system-harfbuzz
+ac_add_options --with-system-freetype
+ac_add_options --with-system-pixman
+ac_add_options --with-system-jpeg
+ac_add_options --with-system-png
+ac_add_options --with-system-zlib
+
+# ===============================================
+# 🌐 Localização e idioma
+# ===============================================
+
+ac_add_options --enable-ui-locale=en-US
+ac_add_options --with-l10n-base=@TOPSRCDIR@/l10n
+
+# ===============================================
+# 🔒 Segurança e robustez
+# ===============================================
+
+ac_add_options --enable-content-sandbox
+ac_add_options --enable-hardening
+ac_add_options --enable-startup-notification
+ac_add_options --enable-necko-wifi
+
+# System NSS/NSPR já ativa crypto e TLS seguros
+ac_add_options --with-system-nss
+ac_add_options --with-system-nspr
+
+# ===============================================
+# 📦 Caminhos de instalação e output
+# ===============================================
+
+ac_add_options --prefix=/usr
+ac_add_options --libdir=/usr/lib
+ac_add_options --bindir=/usr/bin
+ac_add_options --includedir=/usr/include
+
+# ===============================================
+# 🧠 Logging e depuração
+# ===============================================
+
+# Desativar verbose por padrão (ativar manualmente se necessário)
+unset MOZ_VERBOSE_LOGGING
+unset RUST_BACKTRACE
+
+# Opcional: log reduzido (útil para build servers)
+export MOZ_OPTIMIZE_FLAGS="-O2 -pipe"
+
+# ===============================================
+# 🧹 Pós-build e empacotamento
+# ===============================================
+
+# Os hooks do ADM empacotam automaticamente o dist/bin/
+# Aqui apenas garantimos stripping mínimo
+STRIP_FLAGS="--strip-unneeded"
+export STRIP_FLAGS
