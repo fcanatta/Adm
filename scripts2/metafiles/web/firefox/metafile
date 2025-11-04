@@ -1,0 +1,13 @@
+description: Mozilla Firefox — web browser built on Gecko, with multiprocess architecture and modern web standards support.
+name: firefox
+version: 144.0.2
+license: MPL-2.0
+url: https://www.mozilla.org/firefox/
+build: 1
+source: https://ftp.mozilla.org/pub/firefox/releases/144.0.2/source/firefox-144.0.2.source.tar.xz
+source: https://download.cdn.mozilla.net/pub/firefox/releases/144.0.2/source/firefox-144.0.2.source.tar.xz
+source: git+https://github.com/mozilla/gecko-dev.git#FIREFOX_144_0_2_RELEASE
+sha256sum: <SHA256_OF_firefox-144.0.2.source.tar.xz — compute & insert>
+build_deps: rust, cargo, clang, gcc, llvm, lld, nasm, yasm, nodejs, python3, pkgconfig, mesa, gtk3-devel, glib2-devel, libXt-devel, libX11-devel, libXcomposite-devel, libXdamage-devel, libXrandr-devel, libXfixes-devel, libXext-devel, libxcb-devel, dbus-devel, libpulse-devel, fontconfig-devel, freetype2-devel, libvpx-devel, libwebp-devel, libjpeg-turbo-devel, opus-devel, alsa-lib-devel, pulseaudio-devel, libXtst-devel, cairo-devel, pango-devel, gtk-update-icon-cache, unzip, zip, cbindgen, clang-tools-extra, lld, wasm-tools, rust-src
+run_deps: glibc, gtk3, glib2, nss, nspr, libx11, libxcb, libxcomposite, libxdamage, libxext, libxfixes, libxrandr, libxss, pango, cairo, fontconfig, freetype2, libpulse (or pipewire-compat), ffmpeg (libavcodec/libavformat), libvpx, libwebp, libjpeg, zlib
+opt_deps: onnxruntime (local AI features), gdb, valgrind, speech-dispatcher, libnotify, networkmanager, hunspell (spellcheck), ttf-fonts (noto, dejavu), flatpak support, pipewire (optional audio backend)
