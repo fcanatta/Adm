@@ -1,0 +1,805 @@
+#!/usr/bin/env bash
+# adm-update - 
+# Update packages by checking upstream, creating updated metafile and optionally installing
+# Save final file as: /usr/src/adm/bin/adm-update  
+#
+# Safety: by default runs in SIMULATION mode. Any destructive or environment-changing commands
+# are commented and marked with: "# UNCOMMENT FOR REAL EXECUTION (in chroot only)".
+#
+set -euo pipefail
+shopt -s extglob
+
+# -------------------------
+# CONFIG
+# -------------------------
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_BIN_DIR:=$ADM_ROOT/bin}"
+: "${ADM_METAFILES_DIR:=$ADM_ROOT/metafiles}"
+: "${ADM_METAFILES_UPDATE_DIR:=$ADM_ROOT/metafiles/update}"
+: "${ADM_CACHE_BIN:=$ADM_ROOT/cache/bin}"
+: "${ADM_LOG_DIR:=$ADM_ROOT/logs/update}"
+: "${ADM_TMPDIR:=$ADM_ROOT/cache/tmp}"
+: "${ADM_DRY_RUN:=0}"
+: "${ADM_ALLOW_EXECUTION:=0}"   # 0 simulate, 1 allow (real commands still commented)
+: "${ADM_VERBOSE:=1}"
+: "${ADM_JOBS:=$(nproc 2>/dev/null || echo 1)}"
+: "${ADM_DEFAULT_CHROOT:=stage0}"
+
+mkdir -p "$ADM_METAFILES_DIR" "$ADM_METAFILES_UPDATE_DIR" "$ADM_CACHE_BIN" "$ADM_LOG_DIR" "$ADM_TMPDIR" 2>/dev/null || true
+
+# -------------------------
+# Logger (adm-logger if present)
+# -------------------------
+if [ -x "$ADM_BIN_DIR/adm-logger" ]; then
+  source "$ADM_BIN_DIR/adm-logger"
+else
+  _log() { printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+  adm_log_info()    { _log "[\033[1;35mINFO\033[0m] $*"; }
+  adm_log_correct() { _log "[\033[1;33mOK\033[0m] $*"; }
+  adm_log_error()   { _log "[\033[1;31mERROR\033[0m] $*" >&2; }
+  adm_log_debug()   { [ "$ADM_VERBOSE" -ge 2 ] && _log "[DEBUG] $*"; }
+fi
+
+# -------------------------
+# Load optional modules (best-effort)
+# -------------------------
+if [ -x "$ADM_BIN_DIR/adm-meta" ]; then
+  source "$ADM_BIN_DIR/adm-meta" || adm_log_debug "adm-meta present but failed to source"
+fi
+if [ -x "$ADM_BIN_DIR/adm-downloader" ]; then
+  source "$ADM_BIN_DIR/adm-downloader" || adm_log_debug "adm-downloader present but failed to source"
+fi
+# adm-deps, adm-build, adm-install, adm-hooks may be called dynamically later
+
+# -------------------------
+# Utilities
+# -------------------------
+_adm_pkg_safe() { echo "$1" | sed -E 's/[^A-Za-z0-9._+-]/_/g'; }
+_adm_arch() { uname -m 2>/dev/null || echo "unknown"; }
+_adm_exists_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# simple version compare: returns 0 if v1 < v2, 1 if v1 >= v2
+# supports semantic-ish numeric comparison of dot-separated integers
+_adm_version_lt() {
+  local v1="$1" v2="$2"
+  # normalize
+  local IFS=.
+  read -ra a <<< "$v1"
+  read -ra b <<< "$v2"
+  local i max
+  max=${#a[@]}; if [ "${#b[@]}" -gt "$max" ]; then max=${#b[@]}; fi
+  for ((i=0;i<max;i++)); do
+    local ai=${a[i]:-0}
+    local bi=${b[i]:-0}
+    # strip non-digits
+    ai=$(echo "$ai" | sed -E 's/[^0-9].*//g' || true)
+    bi=$(echo "$bi" | sed -E 's/[^0-9].*//g' || true)
+    ai=${ai:-0}; bi=${bi:-0}
+    if ((10#$ai < 10#$bi)); then return 0; fi
+    if ((10#$ai > 10#$bi)); then return 1; fi
+  done
+  return 1
+}
+
+# -------------------------
+# Metafile helpers
+# -------------------------
+# read a field from a metafile using adm-meta if available, else crude parse
+_adm_read_metafile_field() {
+  local mf="$1" field="$2"
+  [ -f "$mf" ] || return 1
+  if declare -f adm_meta_load >/dev/null 2>&1 && declare -f adm_meta_get >/dev/null 2>&1; then
+    adm_meta_load "$mf"
+    adm_meta_get "$field" 2>/dev/null || true
+    return 0
+  fi
+  grep -E "^${field}:" "$mf" 2>/dev/null | sed -E "s/^${field}:[[:space:]]*//" | head -n1 || true
+}
+
+# find metafile path by package name (best-effort)
+_adm_find_metafile_by_name() {
+  local name="$1"
+  # search under metafiles (deep)
+  find "$ADM_METAFILES_DIR" -type f -name metafile -exec awk '/^name:/{if($2=="'"$name"'"){print FILENAME; exit}}' {} + 2>/dev/null | head -n1 || true
+}
+
+# create update metafile dir and path
+_adm_update_metafile_path() {
+  local name="$1"
+  printf "%s/%s/metafile" "$ADM_METAFILES_UPDATE_DIR" "$(_adm_pkg_safe "$name")"
+}
+
+# generate a new metafile content (copy plus replace fields)
+_adm_generate_new_metafile() {
+  local orig_mf="$1" new_version="$2" new_source="$3" new_sha="$4"
+  local name
+  name=$(_adm_read_metafile_field "$orig_mf" name || true)
+  [ -n "$name" ] || name=$(basename "$(dirname "$orig_mf")")
+  local outdir="$ADM_METAFILES_UPDATE_DIR/$(_adm_pkg_safe "$name")"
+  mkdir -p "$outdir" 2>/dev/null || true
+  local outmf="$outdir/metafile"
+  adm_log_info "Generating new metafile for $name -> $outmf (version $new_version)"
+  # create copy but replace version/source/sha256
+  {
+    awk -v ver="$new_version" -v src="$new_source" -v sha="$new_sha" '
+    /^version:/ { print "version: " ver; next }
+    /^source:/ { print "source: " src; next }
+    /^sha256:/ { print "sha256: " sha; next }
+    { print $0 }
+    ' "$orig_mf"
+  } > "$outmf"
+  adm_log_correct "Wrote updated metafile: $outmf"
+  echo "$outmf"
+}
+
+# -------------------------
+# Upstream inspection helpers
+# -------------------------
+# Try to get latest version from upstream. Strategy:
+#  - If upstream contains "github.com" and ends with /releases or /releases/latest, use GitHub API if curl available
+#  - If upstream is a directory listing (ends with /), try to list and parse filenames
+#  - If upstream points directly to a tarball URL template, try to find next semantic version (best-effort)
+# Return new_version|new_source_url
+_adm_get_latest_from_upstream() {
+  local upstream="$1" orig_source="$2"
+  local tmp="$ADM_TMPDIR/adm-update-$(date +%s)-$$"
+  mkdir -p "$tmp"
+  local gh_api=""
+  local latest_ver=""
+  local latest_url=""
+
+  adm_log_info "Inspecting upstream: $upstream"
+
+  # GitHub heuristic
+  if echo "$upstream" | grep -qi "github.com"; then
+    adm_log_debug "Upstream looks like GitHub"
+    # try to derive owner/repo
+    # e.g. https://github.com/user/repo or https://github.com/user/repo/releases
+    local owner_repo
+    owner_repo=$(echo "$upstream" | sed -E 's#.*github.com/([^/]+/[^/]+).*#\1#' || true)
+    if [ -n "$owner_repo" ] && _adm_exists_cmd curl; then
+      # use GitHub API to list releases (public)
+      gh_api="https://api.github.com/repos/${owner_repo}/releases"
+      adm_log_debug "Attempting GitHub API: $gh_api"
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would call GitHub API: $gh_api"
+      else
+        if _adm_exists_cmd curl; then
+          # request and parse latest tag_name
+          local json
+          json=$(curl -sSf "$gh_api" 2>/dev/null || true)
+          if [ -n "$json" ]; then
+            latest_ver=$(echo "$json" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+            # construct tarball url from tag if possible
+            if [ -n "$latest_ver" ]; then
+              # try standard GitHub tarball url
+              latest_url="https://github.com/${owner_repo}/archive/refs/tags/${latest_ver}.tar.gz"
+              adm_log_debug "Detected GitHub tag: $latest_ver -> $latest_url"
+            fi
+          fi
+        fi
+      fi
+    fi
+  fi
+
+  # Directory listing heuristic (trailing slash)
+  if [ -z "$latest_ver" ] && echo "$upstream" | grep -qE '/$'; then
+    adm_log_debug "Upstream appears to be a directory; attempting to list"
+    if _adm_exists_cmd curl; then
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would list directory: $upstream"
+      else
+        local html
+        html=$(curl -sSf "$upstream" 2>/dev/null || true)
+        if [ -n "$html" ]; then
+          # find tarballs or versions in links
+          # try pattern name-version.ext
+          latest_url=$(echo "$html" | grep -Eo 'href="[^"]+"' | sed -E 's/href="([^"]+)".*/\1/' | grep -E '\.tar\.gz$|\.tar\.xz$|\.tar\.zst$' | head -n1 || true)
+          if [ -n "$latest_url" ] && ! echo "$latest_url" | grep -q '^http'; then
+            # relative link
+            latest_url="${upstream%/}/$latest_url"
+          fi
+          # attempt to extract version from filename
+          latest_ver=$(basename "$latest_url" | sed -E 's/.*[-_]?([0-9]+\.[0-9]+(\.[0-9]+)?)\..*/\1/' || true)
+          adm_log_debug "Directory listing heuristic -> $latest_ver | $latest_url"
+        fi
+      fi
+    fi
+  fi
+
+  # If still empty, fallback: check orig_source pattern (e.g., hello-1.0.tar.gz)
+  if [ -z "$latest_ver" ] && [ -n "$orig_source" ]; then
+    adm_log_debug "Falling back to source pattern inspection"
+    # try to replace version in orig_source by scanning nearby versions (not exhaustive)
+    # this is a best-effort placeholder: user can supply upstream that is parseable
+    local basefn
+    basefn=$(basename "$orig_source")
+    # capture numeric version in filename
+    local curver
+    curver=$(echo "$basefn" | sed -E 's/.*[-_]?([0-9]+(\.[0-9]+)+).*/\1/' || true)
+    adm_log_debug "Current version extracted from source: $curver"
+    if [ -n "$curver" ]; then
+      # naive attempt: increment patch
+      IFS='.' read -ra parts <<< "$curver"
+      lastidx=$(( ${#parts[@]} - 1 ))
+      parts[$lastidx]=$(( ${parts[$lastidx]} + 1 ))
+      latest_ver=$(IFS='.'; echo "${parts[*]}")
+      # best-effort construct URL by replacing current version in source with new
+      latest_url=$(echo "$orig_source" | sed -E "s/$curver/$latest_ver/")
+      adm_log_debug "Naive bump -> $latest_ver | $latest_url"
+    fi
+  fi
+
+  # cleanup temp
+  rm -rf "$tmp" 2>/dev/null || true
+
+  # return results as version|url
+  if [ -n "$latest_ver" ] || [ -n "$latest_url" ]; then
+    printf "%s|%s" "${latest_ver:-}" "${latest_url:-}"
+    return 0
+  fi
+
+  # nothing found
+  return 2
+}
+
+# -------------------------
+# Download + verify helpers
+# -------------------------
+_adm_download_and_verify() {
+  local url="$1" expected_sha="$2" outdir="$3"
+  mkdir -p "$outdir" 2>/dev/null || true
+  local fname
+  fname=$(basename "$url")
+  local out="$outdir/$fname"
+  adm_log_info "Downloading: $url -> $out"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would download $url"
+    echo "$out"
+    return 0
+  fi
+  if _adm_exists_cmd curl; then
+    curl -L --fail -o "$out" "$url" 2>/dev/null || { adm_log_error "curl failed to download $url"; return 1; }
+  elif _adm_exists_cmd wget; then
+    wget -O "$out" "$url" >/dev/null 2>&1 || { adm_log_error "wget failed to download $url"; return 1; }
+  else
+    adm_log_error "No downloader (curl/wget) available"
+    return 2
+  fi
+  # verify sha if given
+  if [ -n "$expected_sha" ] && _adm_exists_cmd sha256sum; then
+    local got
+    got=$(sha256sum "$out" | awk '{print $1}')
+    if [ "$got" != "$expected_sha" ]; then
+      adm_log_error "Checksum mismatch for $out (expected $expected_sha got $got)"
+      return 1
+    fi
+    adm_log_debug "Checksum OK for $out"
+  fi
+  echo "$out"
+  return 0
+}
+
+# -------------------------
+# Cache lookup for generated metafile/version
+# Given name and version, search cache for matching archive or metafile
+# returns path or empty
+# -------------------------
+_adm_cache_find_for_version() {
+  local name="$1" version="$2" arch="$3"
+  local cand
+  cand=$(ls -1 "$ADM_CACHE_BIN/${name}-${version}-${arch}".* 2>/dev/null | head -n1 || true)
+  if [ -n "$cand" ]; then
+    echo "$cand"
+    return 0
+  fi
+  cand=$(ls -1 "$ADM_CACHE_BIN/${name}-${version}"* 2>/dev/null | head -n1 || true)
+  if [ -n "$cand" ]; then
+    echo "$cand"
+    return 0
+  fi
+  # fallback: search index file if present
+  if [ -f "$ADM_CACHE_BIN/index.txt" ]; then
+    awk -F'|' -v pkg="$name" -v ver="$version" '$1==pkg && $2==ver {print $4; exit}' "$ADM_CACHE_BIN/index.txt" 2>/dev/null || true
+  fi
+}
+
+# -------------------------
+# Promote update metafile to main metafiles (careful)
+# This function will move the new metafile into the normal metafiles tree,
+# backing up the previous metafile. Actions commented by default.
+# -------------------------
+_adm_promote_metafile() {
+  local newmf="$1" orig_mf="$2"
+  [ -f "$newmf" ] || { adm_log_error "New metafile not found: $newmf"; return 1; }
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would promote $newmf -> $orig_mf (backup existing)"
+    return 0
+  fi
+  adm_log_info "Promoting metafile $newmf to main metafiles location"
+  # derive dest based on orig_mf location if available else create under metafiles/
+  local dest
+  if [ -n "$orig_mf" ] && [ -f "$orig_mf" ]; then
+    dest="$orig_mf"
+  else
+    # attempt to place under /usr/src/adm/metafiles/<name>/metafile
+    local name
+    name=$(_adm_read_metafile_field "$newmf" name || true)
+    dest="$ADM_METAFILES_DIR/$(_adm_pkg_safe "$name")/metafile"
+    mkdir -p "$(dirname "$dest")" 2>/dev/null || true
+  fi
+
+  adm_log_debug "Destination metafile: $dest"
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # cp -a "$dest" "${dest}.bak-$(date +%s)" 2>/dev/null || true
+    # cp -a "$newmf" "$dest"
+    adm_log_info "[SIMULATION] Promoted metafile (commands commented)"
+  else
+    adm_log_info "[SIMULATION] Would copy $newmf -> $dest (ADM_ALLOW_EXECUTION=0)"
+  fi
+  return 0
+}
+
+# -------------------------
+# Locks
+# -------------------------
+_adm_update_lockfile() { local n="$1"; printf "%s/update-%s.lock" "$ADM_TMPDIR" "$n"; }
+_adm_update_acquire_lock() {
+  local name="$1"; local lock; lock=$(_adm_update_lockfile "$name")
+  mkdir -p "$(dirname "$lock")" 2>/dev/null || true
+  exec 9>"$lock"
+  if ! flock -n 9; then
+    adm_log_error "Another update operation is running for $name (lock: $lock)"
+    return 1
+  fi
+  echo "$$" > "${lock}.pid" 2>/dev/null || true
+  adm_log_debug "Acquired lock for update: $name"
+}
+_adm_update_release_lock() {
+  local name="$1"; local lock; lock=$(_adm_update_lockfile "$name")
+  rm -f "${lock}.pid" 2>/dev/null || true
+  exec 9>&- || true
+  adm_log_debug "Released update lock for: $name"
+}
+
+# -------------------------
+# Hooks for update (pre/post)
+# -------------------------
+_adm_update_hooks_run() {
+  local phase="$1" pkg="$2" chrootname="${3:-}"
+  local hook_paths
+  # look for local hook under metafiles/update and metafiles/<cat>/<pkg>/hooks/
+  hook_paths=$(find "$ADM_METAFILES_UPDATE_DIR" "$ADM_METAFILES_DIR" -type f -path "*/$(_adm_pkg_safe "$pkg")/hooks/${phase}-update.sh" 2>/dev/null | head -n1 || true)
+  if [ -n "$hook_paths" ]; then
+    adm_log_info "Running local hook: $hook_paths"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would run hook: $hook_paths"
+    else
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_debug "[SIM] bash $hook_paths $pkg $chrootname"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # bash "$hook_paths" "$pkg" "$chrootname" || adm_log_error "Hook failed: $hook_paths"
+      else
+        adm_log_info "[SIMULATION] Would run: bash $hook_paths $pkg $chrootname (ADM_ALLOW_EXECUTION=0)"
+      fi
+    fi
+    return 0
+  fi
+
+  # fallback to global hooks dir
+  if [ -f "$ADM_HOOKS_DIR/$pkg/pre-update.sh" ] || [ -f "$ADM_HOOKS_DIR/$pkg/post-update.sh" ]; then
+    local hk
+    hk="$ADM_HOOKS_DIR/$pkg/${phase}-update.sh"
+    if [ -f "$hk" ]; then
+      adm_log_info "Running global hook: $hk"
+      if [ "$ADM_DRY_RUN" = "1" ]; then
+        adm_log_info "[DRY-RUN] Would run hook: $hk"
+      else
+        if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+          adm_log_debug "[SIM] bash $hk $pkg $chrootname"
+          # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+          # bash "$hk" "$pkg" "$chrootname" || adm_log_error "Hook failed: $hk"
+        else
+          adm_log_info "[SIMULATION] Would run: bash $hk $pkg $chrootname (ADM_ALLOW_EXECUTION=0)"
+        fi
+      fi
+      return 0
+    fi
+  fi
+
+  # delegate to adm-hooks if present
+  if [ -x "$ADM_BIN_DIR/adm-hooks" ]; then
+    adm_log_info "Delegating to adm-hooks: ${phase}update"
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] adm-hooks run ${phase}update $pkg $chrootname"
+    else
+      "$ADM_BIN_DIR/adm-hooks" run "${phase}update" "$pkg" "$chrootname" || adm_log_error "adm-hooks run ${phase}update failed for $pkg"
+    fi
+    return 0
+  fi
+
+  adm_log_debug "No update hook for $pkg (phase: $phase)"
+  return 0
+}
+
+# -------------------------
+# Check: find latest upstream version and generate update metafile (if any)
+# returns:
+#   0 -> new version available and metafile created (prints path)
+#   1 -> no new version
+#   2 -> error
+# -------------------------
+_adm_update_check_one() {
+  local target="$1"
+  local origmf=""
+  # find metafile by name or path
+  if [ -f "$target" ]; then origmf="$target"; else origmf=$(_adm_find_metafile_by_name "$target" || true); fi
+  if [ -z "$origmf" ]; then adm_log_error "Metafile for $target not found"; return 2; fi
+
+  local name curver upstream source sha
+  name=$(_adm_read_metafile_field "$origmf" name || true)
+  curver=$(_adm_read_metafile_field "$origmf" version || true)
+  upstream=$(_adm_read_metafile_field "$origmf" upstream || true)
+  source=$(_adm_read_metafile_field "$origmf" source || true)
+  sha=$(_adm_read_metafile_field "$origmf" sha256 || true)
+
+  adm_log_info "Checking updates for $name (current: ${curver:-<unknown>})"
+
+  if [ -z "$upstream" ] && [ -z "$source" ]; then
+    adm_log_error "No upstream/source information in metafile for $name"
+    return 2
+  fi
+
+  # inspect upstream
+  local found
+  found=$(_adm_get_latest_from_upstream "${upstream:-$source}" "$source" 2>/dev/null || true)
+  if [ -z "$found" ]; then
+    adm_log_info "No newer upstream information detected for $name"
+    return 1
+  fi
+  local newver newurl
+  newver=$(printf "%s" "$found" | awk -F'|' '{print $1}')
+  newurl=$(printf "%s" "$found" | awk -F'|' '{print $2}')
+  if [ -z "$newver" ] && [ -n "$newurl" ]; then
+    # try to extract version from url if possible
+    newver=$(basename "$newurl" | sed -E 's/.*[-_]?([0-9]+(\.[0-9]+)+).*/\1/' || true)
+  fi
+
+  adm_log_debug "Upstream check result for $name -> newver:$newver newurl:$newurl"
+
+  if [ -z "$newver" ]; then
+    adm_log_info "Could not determine latest version for $name"
+    return 1
+  fi
+
+  # If current version empty, treat as update available
+  if [ -z "$curver" ] || _adm_version_lt "$curver" "$newver"; then
+    adm_log_info "Newer version available: $newver (current: ${curver:-none})"
+    # download archive to temp and calculate sha256 (best-effort)
+    local dl=""
+    if [ -n "$newurl" ]; then
+      dl=$(_adm_download_and_verify "$newurl" "" "$ADM_TMPDIR" 2>/dev/null || true)
+      if [ -z "$dl" ]; then
+        adm_log_error "Failed to download new source for $name from $newurl"
+        # still proceed to create metafile with URL but empty sha
+      fi
+    fi
+    local newsha=""
+    if [ -n "$dl" ] && _adm_exists_cmd sha256sum; then
+      newsha=$(sha256sum "$dl" | awk '{print $1}')
+      adm_log_debug "Computed sha256: $newsha"
+    fi
+    # create new metafile
+    local newmf
+    newmf=$(_adm_generate_new_metafile "$origmf" "$newver" "${newurl:-$newurl}" "$newsha" 2>/dev/null || true)
+    if [ -n "$newmf" ]; then
+      printf "%s" "$newmf"
+      return 0
+    else
+      adm_log_error "Failed to generate update metafile for $name"
+      return 2
+    fi
+  else
+    adm_log_info "$name is up-to-date (version: $curver)"
+    return 1
+  fi
+}
+
+# -------------------------
+# Given a new metafile, attempt to find matching binary in cache for that version
+# If found and valid (sha if present), returns path to archive
+# -------------------------
+_adm_update_try_cache_and_install() {
+  local newmf="$1" chrootname="${2:-}" force="$3"
+  local pkg name version arch archive
+  name=$(_adm_read_metafile_field "$newmf" name || true)
+  version=$(_adm_read_metafile_field "$newmf" version || true)
+  arch="$(_adm_arch)"
+  [ -n "$pkg" ] || pkg="$name"
+  adm_log_info "Looking for binary in cache for ${name}-${version}-${arch}"
+  archive=$(_adm_cache_find_for_version "$name" "$version" "$arch" || true)
+  if [ -n "$archive" ] && [ "$force" != "1" ]; then
+    # verify sha if present in metafile
+    local expected
+    expected=$(_adm_read_metafile_field "$newmf" sha256 || true)
+    if [ -n "$expected" ] && _adm_exists_cmd sha256sum; then
+      local got
+      got=$(sha256sum "$archive" | awk '{print $1}')
+      if [ "$got" != "$expected" ]; then
+        adm_log_error "Cached binary sha mismatch: expected $expected got $got -> ignoring cache"
+        archive=""
+      fi
+    fi
+  fi
+
+  if [ -n "$archive" ]; then
+    adm_log_info "Found binary in cache: $archive"
+    # install via adm-install --bin (inside chroot if chrootname set)
+    if [ "$ADM_DRY_RUN" = "1" ]; then
+      adm_log_info "[DRY-RUN] Would call adm-install install --bin --chroot $chrootname $newmf"
+      return 0
+    fi
+    if [ -x "$ADM_BIN_DIR/adm-install" ]; then
+      if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+        adm_log_info "[SIMULATION] Invoking adm-install (line commented)"
+        # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+        # "$ADM_BIN_DIR/adm-install" install --bin --chroot "$chrootname" "$newmf"
+      else
+        adm_log_info "[SIMULATION] Would run: adm-install install --bin --chroot $chrootname $newmf"
+      fi
+      return 0
+    else
+      adm_log_error "adm-install not available; cannot install from cache automatically"
+      return 2
+    fi
+  fi
+  # no archive found
+  adm_log_info "No cached binary found for ${name}-${version}"
+  return 1
+}
+
+# -------------------------
+# Build or install new version: if cache found and not forced, install; else call adm-build for newmf
+# -------------------------
+_adm_update_build_or_install() {
+  local newmf="$1" chrootname="${2:-}" force="$3"
+  local name version
+  name=$(_adm_read_metafile_field "$newmf" name || true)
+  version=$(_adm_read_metafile_field "$newmf" version || true)
+
+  # try cache first
+  _adm_update_try_cache_and_install "$newmf" "$chrootname" "$force"
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    adm_log_correct "Installed $name-$version from cache."
+    return 0
+  fi
+
+  # else build via adm-build
+  if [ ! -x "$ADM_BIN_DIR/adm-build" ]; then
+    adm_log_error "adm-build not available; cannot build $name-$version"
+    return 2
+  fi
+
+  adm_log_info "No cache binary available; will invoke adm-build for $name-$version"
+  if [ "$ADM_DRY_RUN" = "1" ]; then
+    adm_log_info "[DRY-RUN] Would call adm-build $newmf --chroot $chrootname --jobs $ADM_JOBS"
+    return 0
+  fi
+
+  if [ "$ADM_ALLOW_EXECUTION" -eq 1 ]; then
+    adm_log_debug "[SIM] $ADM_BIN_DIR/adm-build $newmf --chroot $chrootname --jobs $ADM_JOBS"
+    # UNCOMMENT FOR REAL EXECUTION (in chroot only):
+    # "$ADM_BIN_DIR/adm-build" "$newmf" --chroot "$chrootname" --jobs "$ADM_JOBS"
+    adm_log_info "[SIMULATION] adm-build invoked (commands commented)"
+    return 0
+  else
+    adm_log_info "[SIMULATION] Would run: adm-build $newmf --chroot $chrootname --jobs $ADM_JOBS"
+    return 0
+  fi
+}
+
+# -------------------------
+# Promote new metafile into main tree (backup existing)
+# -------------------------
+_adm_update_promote_and_activate() {
+  local newmf="$1" origmf="$2"
+  # call promote helper from part1
+  _adm_promote_metafile "$newmf" "$origmf"
+  # optionally, trigger adm-install to install the new version
+  return 0
+}
+
+# -------------------------
+# Update dependencies first: for given target, resolve build_deps and run update for each
+# -------------------------
+_adm_update_deps_first() {
+  local target="$1" chrootname="${2:-}" force="$3"
+  local origmf
+  if [ -f "$target" ]; then origmf="$target"; else origmf=$(_adm_find_metafile_by_name "$target" || true); fi
+  if [ -z "$origmf" ]; then adm_log_error "Metafile for $target not found"; return 2; fi
+
+  # read build_deps via adm_meta_get or crude parse
+  local bdeps line dep
+  bdeps=""
+  if declare -f adm_meta_load >/dev/null 2>&1; then
+    adm_meta_load "$origmf"
+    bdeps=$(adm_meta_get build_deps 2>/dev/null || echo "")
+  else
+    line=$(grep -E "^build_deps:" "$origmf" 2>/dev/null || true)
+    bdeps="${line#build_deps:}"
+  fi
+  # normalize into array
+  IFS=',' read -ra deps <<< "$bdeps"
+  for dep in "${deps[@]}"; do
+    dep=$(echo "$dep" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [ -z "$dep" ] && continue
+    adm_log_info "Checking/updating dependency: $dep"
+    # run check & run on dep recursively
+    _adm_update_run_one "$dep" "$chrootname" "$force" || adm_log_error "Failed to update dependency $dep"
+  done
+  return 0
+}
+
+# -------------------------
+# Run update for a single package (full flow)
+# Steps:
+#  - check upstream -> create newmf
+#  - run pre-update hook
+#  - try install from cache or build
+#  - run post-update hook
+#  - promote metafile
+# -------------------------
+_adm_update_run_one() {
+  local target="$1" chrootname="${2:-}" force="${3:-0}"
+  local origmf newmf name version logfile
+  # locate metafile
+  if [ -f "$target" ]; then origmf="$target"; else origmf=$(_adm_find_metafile_by_name "$target" || true); fi
+  if [ -z "$origmf" ]; then adm_log_error "Metafile for $target not found"; return 2; fi
+
+  name=$(_adm_read_metafile_field "$origmf" name || true)
+  version=$(_adm_read_metafile_field "$origmf" version || true)
+  logfile="$ADM_LOG_DIR/${name}-update-$(date +%s).log"
+  adm_log_info "Starting update for $name (current version: ${version:-unknown}). Logs: $logfile"
+
+  _adm_update_acquire_lock "$name" || { adm_log_error "Could not acquire update lock for $name"; return 1; }
+  trap "_adm_update_release_lock $name" RETURN
+
+  # 1) check upstream and generate new metafile
+  newmf=$(_adm_update_check_one "$origmf" 2>/dev/null || true)
+  if [ -z "$newmf" ]; then
+    adm_log_info "No update available for $name"
+    return 1
+  fi
+
+  # 2) pre-update hooks
+  _adm_update_hooks_run "pre" "$name" "$chrootname"
+
+  # 3) if deps-first was requested, caller should have invoked _adm_update_deps_first; here we assume deps are ok
+
+  # 4) try install from cache or build
+  _adm_update_build_or_install "$newmf" "$chrootname" "$force" || { adm_log_error "Build/install failed for $name"; return 1; }
+
+  # 5) post-update hooks
+  _adm_update_hooks_run "post" "$name" "$chrootname"
+
+  # 6) promote metafile into main tree
+  _adm_update_promote_and_activate "$newmf" "$origmf"
+
+  adm_log_correct "Update finished for $name"
+  return 0
+}
+
+# -------------------------
+# Update all installed packages
+# -------------------------
+_adm_update_all() {
+  local chrootname="$1" deps_first="$2" force="$3"
+  adm_log_info "Updating all installed packages (deps_first=$deps_first)"
+  # iterate installed names
+  local nm
+  for nm in $(_adm_installed_names); do
+    if [ "$deps_first" = "1" ]; then
+      _adm_update_deps_first "$nm" "$chrootname" "$force" || adm_log_error "Deps-first failed for $nm"
+    fi
+    _adm_update_run_one "$nm" "$chrootname" "$force" || adm_log_error "Update failed for $nm"
+  done
+  return 0
+}
+
+# -------------------------
+# CLI parsing and dispatcher
+# -------------------------
+_adm_update_show_help() {
+  cat <<EOF
+adm-update - check and update packages from upstream
+
+Usage:
+  adm-update check <pkg|metafile>            : check for newer upstream version and create update metafile
+  adm-update run <pkg|metafile> [--chroot <name>] [--deps-first] [--force] [--dry-run]
+  adm-update deps <pkg|metafile> [--chroot <name>]    : update dependencies first, then the package
+  adm-update all [--deps-first] [--chroot <name>] [--force] : update all installed packages
+  adm-update help
+
+Options:
+  --dry-run   : simulate actions
+  --deps-first: update dependencies before the package
+  --force     : force rebuild/install even if cache matches
+  --bin       : force install from cache if available
+EOF
+}
+
+if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
+  if [ $# -lt 1 ]; then _adm_update_show_help; exit 1; fi
+  cmd="$1"; shift
+
+  case "$cmd" in
+    check)
+      if [ $# -lt 1 ]; then adm_log_error "check requires package name or metafile"; exit 2; fi
+      target="$1"
+      _adm_update_check_one "$target" && { adm_log_correct "Update metafile created (see /usr/src/adm/metafiles/update)"; exit 0; } || { adm_log_info "No update or error"; exit 1; }
+      ;;
+
+    run)
+      if [ $# -lt 1 ]; then adm_log_error "run requires package name or metafile"; exit 2; fi
+      target="$1"; shift
+      chrootname="$ADM_DEFAULT_CHROOT"
+      deps_first=0
+      force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --chroot) chrootname="$2"; shift 2 ;;
+          --deps-first) deps_first=1; shift ;;
+          --force) force=1; shift ;;
+          --dry-run) ADM_DRY_RUN=1; shift ;;
+          *) shift ;;
+        esac
+      done
+      if [ "$deps_first" -eq 1 ]; then
+        _adm_update_deps_first "$target" "$chrootname" "$force" || adm_log_error "Deps-first failed for $target"
+      fi
+      _adm_update_run_one "$target" "$chrootname" "$force" || { adm_log_error "Update run failed for $target"; exit 1; }
+      ;;
+
+    deps)
+      if [ $# -lt 1 ]; then adm_log_error "deps requires package name or metafile"; exit 2; fi
+      target="$1"; shift
+      chrootname="$ADM_DEFAULT_CHROOT"
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --chroot) chrootname="$2"; shift 2 ;;
+          --dry-run) ADM_DRY_RUN=1; shift ;;
+          *) shift ;;
+        esac
+      done
+      _adm_update_deps_first "$target" "$chrootname" "0" || { adm_log_error "Deps-first failed for $target"; exit 1; }
+      ;;
+
+    all)
+      chrootname="$ADM_DEFAULT_CHROOT"
+      deps_first=0
+      force=0
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --deps-first) deps_first=1; shift ;;
+          --chroot) chrootname="$2"; shift 2 ;;
+          --force) force=1; shift ;;
+          --dry-run) ADM_DRY_RUN=1; shift ;;
+          *) shift ;;
+        esac
+      done
+      _adm_update_all "$chrootname" "$deps_first" "$force" || { adm_log_error "Update all failed"; exit 1; }
+      ;;
+
+    help|-h|--help)
+      _adm_update_show_help; exit 0
+      ;;
+
+    *)
+      adm_log_error "Unknown command: $cmd"
+      _adm_update_show_help
+      exit 2
+      ;;
+  esac
+fi
