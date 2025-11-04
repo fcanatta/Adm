@@ -1,0 +1,4 @@
+adm bootstrap create stage0
+adm build base/binutils --chroot stage0
+adm build base/gcc --chroot stage0
+adm build base/glibc --chroot stage0
