@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# ADM HOOK: llvm post-install
+# Valida instalação, executa checagens (clang --version) e limpeza de arquivos temporários
+set -euo pipefail
+
+echo "🔧 [llvm post-install] Checando instalação..."
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/llvm-install.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/llvm-destdir}"
+PREFIX="${PREFIX:-/usr}"
+
+# DESTDIR validation
+if [ -z "${DESTDIR:-}" ] || [ "${DESTDIR}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR inválido. Abortando."
+  exit 2
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) checaria clang --version inside DESTDIR"
+  exit 0
+fi
+
+# Use clang inside DESTDIR if present
+if [ -x "${DESTDIR}${PREFIX}/bin/clang" ]; then
+  ver="$("${DESTDIR}${PREFIX}/bin/clang" --version 2>/dev/null | head -n1 || echo unknown)"
+  echo "✔️  clang instalado: $ver"
+  echo "$ver" > "${DESTDIR}${PREFIX}/lib/llvm.version" || true
+else
+  echo "⚠️  clang não encontrado em ${DESTDIR}${PREFIX}/bin/"
+  # procurar em dest tree
+  alt="$(find "${DESTDIR}" -type f -path "*/bin/clang" -print -quit || true)"
+  if [ -n "$alt" ]; then
+    ver="$("$alt" --version 2>/dev/null | head -n1 || echo unknown)"
+    echo "✔️  clang encontrado em $alt: $ver"
+    echo "$ver" > "${DESTDIR}${PREFIX}/lib/llvm.version" || true
+  else
+    echo "❌ clang não detectado — instalação possivelmente falhou"
+    exit 1
+  fi
+fi
+
+# Limpeza: remover arquivos .la se houver e logs temporários
+find "${DESTDIR}" -name '*.la' -delete 2>/dev/null || true
+rm -f "${ADM_ROOT}/logs/llvm-build.log" 2>/dev/null || true
+
+echo "[`date -u`] llvm installed OK" >> "$ADM_LOG"
+echo "✅ [llvm post-install] Verificação final concluída"
