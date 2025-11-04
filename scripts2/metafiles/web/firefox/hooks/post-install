@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# ADM HOOK: Firefox post-install
+# - Executa ações pós-instalação dentro do DESTDIR:
+#   - corrige desktop entries, atualiza cache de ícones (somente no target/rootfs),
+#   - gera registro de versão e limpa arquivos temporários.
+# - NÃO executa comandos que alterem o host como update-desktop-database global ou gtk-update-icon-cache fora do DESTDIR.
+#
+set -euo pipefail
+
+echo "🔧 [firefox post-install] Ajustes finais no DESTDIR..."
+
+DRY_RUN="${DRY_RUN:-0}"
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs/firefox-install.log}"
+DESTDIR="${DESTDIR:-${ADM_ROOT}/tmp/firefox-destdir}"
+PREFIX="${PREFIX:-/usr}"
+BIN_PATH="${DESTDIR}${PREFIX}/bin"
+
+echo "[`date -u`] post-install start for DESTDIR=${DESTDIR}" >> "$ADM_LOG"
+
+# DESTDIR safety check
+if [ -z "${DESTDIR:-}" ]; then
+  echo "❌ RISCO: DESTDIR vazio. Abortando."
+  exit 2
+fi
+_norm_dest="${DESTDIR%/}"
+if [ "${_norm_dest}" = "" ] || [ "${_norm_dest}" = "/" ]; then
+  echo "❌ RISCO: DESTDIR resolves to root. Abortando."
+  exit 2
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "(dry-run) executaria ajustes pós-instalação dentro de $DESTDIR"
+  exit 0
+fi
+
+# 1) Registrar versão
+if [ -x "$BIN_PATH/firefox" ]; then
+  ver="$("$BIN_PATH/firefox" --version 2>/dev/null | head -n1 || echo unknown)"
+  mkdir -p "$DESTDIR/var/lib/firefox" 2>/dev/null || true
+  echo "$ver" > "$DESTDIR/var/lib/firefox/version" || true
+  echo "ℹ️  Versão registrada: $ver"
+fi
+
+# 2) Desktop entry: ajustar caminhos relativos se necessário
+DESKTOP_FILE_REL="${PREFIX}/share/applications/firefox.desktop"
+if [ -f "$DESTDIR/$DESKTOP_FILE_REL" ]; then
+  # garantir Exec usando caminho dentro do prefix
+  sed -i "s|Exec=firefox|Exec=${PREFIX}/bin/firefox|g" "$DESTDIR/$DESKTOP_FILE_REL" || true
+  echo "ℹ️  Arquivo .desktop ajustado: $DESKTOP_FILE_REL"
+fi
+
+# 3) Atualizar cache de ícones dentro do dest (apenas se gtk-update-icon-cache disponível no chroot)
+if [ -x "$DESTDIR/usr/bin/gtk-update-icon-cache" ]; then
+  echo "⚙️  Atualizando cache de ícones dentro do DESTDIR"
+  chroot "$DESTDIR" /usr/bin/gtk-update-icon-cache -f -t /usr/share/icons/hicolor || true
+else
+  echo "ℹ️  gtk-update-icon-cache não disponível dentro do DESTDIR (ignorando)"
+fi
+
+# 4) Limpeza opcional de arquivos temporários, símbolos .la
+find "$DESTDIR" -name '*.la' -delete 2>/dev/null || true
+echo "🧹 Limpeza de arquivos .la concluída"
+
+echo "[`date -u`] post-install completed" >> "$ADM_LOG"
+echo "✅ [firefox post-install] Finalizado"
