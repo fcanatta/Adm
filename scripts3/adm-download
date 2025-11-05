@@ -1,0 +1,525 @@
+#!/usr/bin/env bash
+# adm-download (parte 1/2)
+# Download manager para ADM — suporta:
+#   - múltiplos URLs (URLS variable no metafile)
+#   - protocolos: http(s), ftp, rsync, git, diretório local, sourceforge (tratado como http)
+#   - cache em ${ADM_SOURCES_CACHE}
+#   - verificação SHA256
+#   - suporte a chroot: copiar fontes para chroot ou baixar diretamente dentro do chroot
+#   - comportamento idempotente e seguro (dry-run / --no-dry-run, --force)
+#   - paralelismo simples usando background jobs e limite de concorrência
+#
+# Uso:
+#   adm-download <metafile> [--no-dry-run] [--force] [--chroot <rootdir>] [--concurrency N]
+#
+# O metafile deve ser KEY=VAL (shell-compatible) e pode conter:
+#   NAME=...
+#   VERSION=...
+#   URLS="url1 url2 url3"   # listas separadas por espaço / nova linha
+#   FILENAME=optional       # nome do arquivo esperado no cache
+#   SHA256=optional
+#   CATEGORY=optional
+#   DESTDIR=optional
+#
+# Observações:
+#  - Se FILENAME não for fornecido, será inferido de cada URL.
+#  - Se múltiplos urls apontam para o mesmo arquivo (mesmo nome), será usado o primeiro bem-sucedido.
+#  - Git URLs: o comportamento é clonar e criar um tar.xz snapshot em cache.
+#  - Diretório local: "file:///path/to/dir" ou "/absolute/path" será copiado/arquivado.
+#
+# Dependências: curl or wget, git, rsync, sha256sum, tar, xz (opcionais mas recomendados)
+#
+# ----- PARTE 1 -----
+
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# parse basic flags but keep positional metafile as first non-flag
+# We'll handle --chroot and --concurrency here
+CHROOT_ROOT=""
+CONCURRENCY=3
+
+# collect args manually to allow adm_parse_common_flags to also run
+raw_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --chroot)
+      CHROOT_ROOT="$2"; shift 2 ;;
+    --concurrency)
+      CONCURRENCY="$2"; shift 2 ;;
+    --help|-h)
+      echo "Usage: $(basename "$0") <metafile> [--no-dry-run] [--force] [--chroot <rootdir>] [--concurrency N]"
+      exit 0
+      ;;
+    *)
+      raw_args+=("$1"); shift ;;
+  esac
+done
+
+# Now run adm_parse_common_flags on env flags passed earlier (we can infer)
+# Reconstruct for adm_parse_common_flags: check for --no-dry-run and --force in raw_args beyond first token
+adm_parse_common_flags "${raw_args[@]}" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+
+# Rebuild positional arguments removing flags we consumed
+# The metafile should be the first positional arg in raw_args
+METAFILE="${raw_args[0]:-}"
+if [ -z "${METAFILE}" ]; then
+  adm_log ERR "Uso: adm-download <metafile> [--no-dry-run] [--force] [--chroot <rootdir>] [--concurrency N]"
+  exit 1
+fi
+
+# Ensure ADM directories exist
+adm_ensure_dirs
+
+# tempdir for this run
+TMPDIR="$(mktempdir)"
+trap 'rm -rf "${TMPDIR}" 2>/dev/null || true' EXIT
+
+# load metafile variables safely into local scope
+if [ ! -f "${METAFILE}" ]; then
+  adm_log ERR "Metafile não encontrado: ${METAFILE}"
+  exit 1
+fi
+
+# Read NAME, URLS, FILENAME, SHA256, CATEGORY
+NAME=$(read_metafile_val "${METAFILE}" "NAME" || true)
+VERSION=$(read_metafile_val "${METAFILE}" "VERSION" || true)
+FILENAME=$(read_metafile_val "${METAFILE}" "FILENAME" || true)
+SHA256=$(read_metafile_val "${METAFILE}" "SHA256" || true)
+CATEGORY=$(read_metafile_val "${METAFILE}" "CATEGORY" || echo "misc")
+URLS_RAW=$(read_metafile_val "${METAFILE}" "URLS" || true)
+
+# normalize URLS into an array: split by whitespace and newlines
+URLS=()
+if [ -n "${URLS_RAW}" ]; then
+  # replace commas with spaces, then iterate
+  read -r -a URLS <<< "$(printf "%s" "${URLS_RAW}" | tr ',' ' ' )"
+fi
+
+# if FILENAME empty, we will infer per-URL
+# determine a default filename base
+if [ -z "${NAME}" ]; then NAME="unnamed"; fi
+if [ -z "${FILENAME}" ]; then
+  # FILENAME optional; may be set per URL during processing
+  :
+fi
+
+# ensure cache dir exists
+mkdir -p "${ADM_SOURCES_CACHE}" "${ADM_CACHE}" "${ADM_PACKAGES}"
+
+# utilities for detecting tools
+HAS_CURL=0; HAS_WGET=0; HAS_GIT=0; HAS_RSYNC=0
+if command -v curl >/dev/null 2>&1; then HAS_CURL=1; fi
+if command -v wget >/dev/null 2>&1; then HAS_WGET=1; fi
+if command -v git >/dev/null 2>&1; then HAS_GIT=1; fi
+if command -v rsync >/dev/null 2>&1; then HAS_RSYNC=1; fi
+
+# helper: infer filename from URL
+infer_filename_from_url() {
+  local url="$1"
+  # strip query params
+  local base="${url%%\?*}"
+  # if git url (endswith .git) then set archive name
+  if echo "${base}" | grep -Eq '\.git$'; then
+    printf "%s-%s.git.tar.xz" "${NAME}" "${VERSION:-snapshot}"
+    return 0
+  fi
+  # if url ends with slash -> use last non-empty component
+  local fn
+  fn=$(basename "${base}")
+  if [ -z "${fn}" ] || [ "${fn}" = "/" ]; then
+    printf "%s-%s.tar.xz" "${NAME}" "${VERSION:-snapshot}"
+  else
+    printf "%s" "${fn}"
+  fi
+}
+
+# helper: safe path in cache for given filename
+cache_path_for() {
+  local fname="$1"
+  printf "%s/%s" "${ADM_SOURCES_CACHE}" "${fname}"
+}
+
+# verify sha256 if provided
+verify_sha256() {
+  local file="$1"
+  local expected="$2"
+  if [ -z "${expected}" ]; then
+    adm_log INFO "No SHA256 provided; skipping verification for ${file}"
+    return 0
+  fi
+  if [ ! -f "${file}" ]; then
+    adm_log ERR "Arquivo não existe para verificação: ${file}"
+    return 1
+  fi
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] sha256sum -c on ${file}"
+    return 0
+  fi
+  adm_log INFO "Verificando SHA256 de ${file}..."
+  if echo "${expected}  ${file}" | sha256sum -c - >/dev/null 2>&1; then
+    adm_log OK "SHA256 OK: ${file}"
+    return 0
+  else
+    adm_log ERR "SHA256 mismatch para ${file}"
+    return 1
+  fi
+}
+
+# prepare download jobs array
+declare -a DOWNLOAD_JOBS
+# each job: "type|url|targetfile"
+#
+# Determine jobs from URLS list; if URLS empty and METAFILE contains URL (single) attempt that
+if [ "${#URLS[@]}" -eq 0 ]; then
+  # try single URL key
+  singleURL=$(read_metafile_val "${METAFILE}" "URL" || true)
+  if [ -n "${singleURL}" ]; then
+    URLS=("${singleURL}")
+  fi
+fi
+
+if [ "${#URLS[@]}" -eq 0 ]; then
+  adm_log ERR "Nenhuma URL encontrada no metafile (URLS or URL)."
+  exit 1
+fi
+
+# Compose job list
+for u in "${URLS[@]}"; do
+  [ -n "${u}" ] || continue
+  # strip quotes if any
+  u=$(printf "%s" "${u}" | sed -E 's/^"'"/; s/"$//; s/^'\''//; s/'\''$//')
+  # handle file:// or local absolute path
+  if echo "${u}" | grep -Eq '^file://'; then
+    # file:///absolute/path or file://relative
+    path="${u#file://}"
+    fname=$(infer_filename_from_url "${path}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("file|${path}|${target}")
+    continue
+  fi
+  if [[ "${u}" =~ ^/ ]]; then
+    fname=$(infer_filename_from_url "${u}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("file|${u}|${target}")
+    continue
+  fi
+  # git URLs detection
+  if echo "${u}" | grep -Eq '\.git$|git@|^git://|/gitlab/|/github/'; then
+    fname=$(infer_filename_from_url "${u}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("git|${u}|${target}")
+    continue
+  fi
+  # rsync
+  if echo "${u}" | grep -Eq '^rsync://|^rsync@|:.*:|^rsync:'; then
+    fname=$(infer_filename_from_url "${u}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("rsync|${u}|${target}")
+    continue
+  fi
+  # ftp
+  if echo "${u}" | grep -Eq '^ftp://'; then
+    fname=$(infer_filename_from_url "${u}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("ftp|${u}|${target}")
+    continue
+  fi
+  # sourceforge pattern or http(s)
+  if echo "${u}" | grep -Ei 'sourceforge.net|sf.net'; then
+    fname=$(infer_filename_from_url "${u}")
+    target="$(cache_path_for "${fname}")"
+    DOWNLOAD_JOBS+=("http|${u}|${target}")
+    continue
+  fi
+  # default to http(s)
+  fname=$(infer_filename_from_url "${u}")
+  target="$(cache_path_for "${fname}")"
+  DOWNLOAD_JOBS+=("http|${u}|${target}")
+done
+
+# If FILENAME provided in metafile, normalize first job to that filename target
+if [ -n "${FILENAME}" ]; then
+  # set first job's target to use FILENAME
+  if [ "${#DOWNLOAD_JOBS[@]}" -gt 0 ]; then
+    IFS='|' read -r t u f <<< "${DOWNLOAD_JOBS[0]}"
+    DOWNLOAD_JOBS[0]="${t}|${u}|$(cache_path_for "${FILENAME}")"
+  fi
+fi
+
+# ---------- Download worker functions ----------
+
+# download_http: uses curl if available, fallback to wget
+download_http() {
+  local url="$1"; local dest="$2"
+  adm_log INFO "HTTP(S) download: ${url} -> ${dest}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] curl -L -o '${dest}' '${url}'"
+    return 0
+  fi
+  mkdir -p "$(dirname "${dest}")"
+  if [ "${HAS_CURL}" -eq 1 ]; then
+    curl -L --fail --retry 5 --retry-delay 3 -o "${dest}.part" "${url}" && mv "${dest}.part" "${dest}"
+  elif [ "${HAS_WGET}" -eq 1 ]; then
+    wget -O "${dest}.part" "${url}" && mv "${dest}.part" "${dest}"
+  else
+    adm_log ERR "Nenhum cliente HTTP disponível (curl ou wget)."
+    return 1
+  fi
+  return 0
+}
+
+# download_ftp: use curl or wget
+download_ftp() {
+  local url="$1"; local dest="$2"
+  adm_log INFO "FTP download: ${url} -> ${dest}"
+  download_http "${url}" "${dest}"
+}
+
+# download_rsync
+download_rsync() {
+  local url="$1"; local dest="$2"
+  adm_log INFO "RSYNC download: ${url} -> ${dest}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rsync -a '${url}' '${TMPDIR}/rsync.tmp/'"
+    return 0
+  fi
+  if [ "${HAS_RSYNC}" -ne 1 ]; then
+    adm_log ERR "rsync não disponível"
+    return 1
+  fi
+  mkdir -p "${TMPDIR}/rsync.tmp"
+  rsync -a "${url}" "${TMPDIR}/rsync.tmp/" || {
+    adm_log ERR "rsync falhou para ${url}"
+    return 1
+  }
+  # create archive of rsync.tmp as dest
+  mkdir -p "$(dirname "${dest}")"
+  tar -C "${TMPDIR}/rsync.tmp" -caf "${dest}" .
+  return 0
+}
+
+# download_git: clone shallow and archive
+download_git() {
+  local url="$1"; local dest="$2"
+  adm_log INFO "GIT clone: ${url} -> ${dest}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] git clone --depth 1 '${url}' '${TMPDIR}/repo' && tar -C '${TMPDIR}/repo' -cJf '${dest}' ."
+    return 0
+  fi
+  if [ "${HAS_GIT}" -ne 1 ]; then
+    adm_log ERR "git não disponível"
+    return 1
+  fi
+  rm -rf "${TMPDIR}/repo"
+  git clone --depth 1 "${url}" "${TMPDIR}/repo" || {
+    adm_log ERR "git clone falhou: ${url}"
+    return 1
+  }
+  mkdir -p "$(dirname "${dest}")"
+  tar -C "${TMPDIR}/repo" -caf "${dest}" .
+  return 0
+}
+
+# download_file_local: copy or tar directory/file
+download_file_local() {
+  local src="$1"; local dest="$2"
+  adm_log INFO "Local copy/archive: ${src} -> ${dest}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] cp -a '${src}' '${dest}' or tar if directory"
+    return 0
+  fi
+  if [ -d "${src}" ]; then
+    mkdir -p "$(dirname "${dest}")"
+    tar -C "${src}" -caf "${dest}" . || { adm_log ERR "falha ao arquivar dir ${src}"; return 1; }
+  elif [ -f "${src}" ]; then
+    mkdir -p "$(dirname "${dest}")"
+    cp -a "${src}" "${dest}" || { adm_log ERR "falha ao copiar file ${src}"; return 1; }
+  else
+    adm_log ERR "Fonte local não encontrada: ${src}"
+    return 1
+  fi
+  return 0
+}
+
+# worker to process a single job entry
+process_job() {
+  local job="$1"
+  IFS='|' read -r type url dest <<< "${job}"
+  adm_log INFO "Job: type=${type} url=${url} dest=${dest}"
+  case "${type}" in
+    http) download_http "${url}" "${dest}" ;;
+    ftp) download_ftp "${url}" "${dest}" ;;
+    rsync) download_rsync "${url}" "${dest}" ;;
+    git) download_git "${url}" "${dest}" ;;
+    file) download_file_local "${url}" "${dest}" ;;
+    *)
+      adm_log ERR "Tipo desconhecido: ${type}"; return 1 ;;
+  esac
+}
+
+# concurrency manager: launch jobs with limit
+run_jobs_with_concurrency() {
+  local -n jobs_ref=$1
+  local concurrency=${2:-3}
+  local pids=()
+  local i=0
+  local total=${#jobs_ref[@]}
+  adm_log INFO "Iniciando ${total} jobs com concorrência=${concurrency}"
+  while [ "${i}" -lt "${total}" ]; do
+    # count active pids
+    while [ "$(jobs -rp | wc -l)" -ge "${concurrency}" ]; do
+      sleep 0.2
+    done
+    job="${jobs_ref[$i]}"
+    # run in background
+    (
+      process_job "${job}" || exit 1
+    ) &
+    pids+=($!)
+    i=$((i+1))
+  done
+  # wait for all
+  local failed=0
+  for pid in "${pids[@]}"; do
+    if ! wait "${pid}"; then
+      adm_log ERR "Job PID ${pid} falhou"
+      failed=1
+    fi
+  done
+  return "${failed}"
+}
+
+# ---------- Determine which job succeeded (first good file) ----------
+# ----- PARTE 2 -----
+
+pick_first_success() {
+  local -n jobs_ref=$1
+  for job in "${jobs_ref[@]}"; do
+    IFS='|' read -r _ _ dest <<< "${job}"
+    if [ -f "${dest}" ]; then
+      adm_log OK "Download encontrado: ${dest}"
+      echo "${dest}"
+      return 0
+    fi
+  done
+  adm_log ERR "Nenhum download válido encontrado."
+  return 1
+}
+
+# copy to chroot if requested
+copy_to_chroot_if_needed() {
+  local file="$1"
+  if [ -z "${CHROOT_ROOT}" ]; then return 0; fi
+  adm_log INFO "Copiando ${file} para chroot ${CHROOT_ROOT}/sources"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mkdir -p '${CHROOT_ROOT}/sources' && cp -a '${file}' '${CHROOT_ROOT}/sources/'"
+    return 0
+  fi
+  mkdir -p "${CHROOT_ROOT}/sources"
+  cp -a "${file}" "${CHROOT_ROOT}/sources/" || {
+    adm_log ERR "Falha ao copiar ${file} para ${CHROOT_ROOT}/sources"
+    return 1
+  }
+}
+
+write_cache_index() {
+  local file="$1"; local url="$2"
+  local cacheindex="${ADM_SOURCES_CACHE}/INDEX"
+  local size
+  size=$(stat -c "%s" "${file}" 2>/dev/null || echo 0)
+  local sha
+  sha=$(sha256sum "${file}" 2>/dev/null | awk '{print $1}')
+  local now
+  now=$(date '+%F %T')
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] registrar no INDEX"
+    return 0
+  fi
+  echo "${now} ${NAME} ${VERSION:-?} ${file} ${size} ${sha} ${url}" >> "${cacheindex}"
+  adm_log OK "INDEX atualizado: ${cacheindex}"
+}
+
+print_summary() {
+  printf "\n%bResumo do Download:%b\n" "${T_BOLD}" "${T_RESET}"
+  printf "  %bPacote:%b %s\n" "${T_CYAN}" "${T_RESET}" "${NAME}-${VERSION:-?}"
+  printf "  %bCategoria:%b %s\n" "${T_CYAN}" "${T_RESET}" "${CATEGORY}"
+  printf "  %bCache:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_SOURCES_CACHE}"
+  printf "  %bChroot:%b %s\n" "${T_CYAN}" "${T_RESET}" "${CHROOT_ROOT:-(não)}"
+  printf "  %bDry-run:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_DRYRUN}"
+  printf "\n"
+  adm_log INFO "Log desta execução: ${LOGFILE}"
+}
+
+# ---------- Execução Principal ----------
+
+print_header() {
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+  printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM DOWNLOAD" "${T_RESET}"
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+}
+
+print_header
+
+adm_log INFO "Pacote: ${NAME}-${VERSION:-?}"
+adm_log INFO "Categoria: ${CATEGORY}"
+adm_log INFO "URLs detectadas: ${#DOWNLOAD_JOBS[@]}"
+adm_log INFO "Concorrência: ${CONCURRENCY}"
+adm_log INFO "Dry-run: ${ADM_DRYRUN}, Force: ${ADM_FORCE}"
+
+# Se já houver arquivo válido em cache e checksum ok, pular download
+if [ -n "${FILENAME}" ]; then
+  existing="$(cache_path_for "${FILENAME}")"
+  if [ -f "${existing}" ]; then
+    adm_log HINT "Arquivo já existe no cache: ${existing}"
+    if verify_sha256 "${existing}" "${SHA256}"; then
+      adm_log OK "Usando arquivo já em cache."
+      copy_to_chroot_if_needed "${existing}"
+      print_summary
+      exit 0
+    fi
+    adm_log WARN "Cache inválido, será refeito."
+  fi
+fi
+
+# Run all download jobs
+if run_jobs_with_concurrency DOWNLOAD_JOBS "${CONCURRENCY}"; then
+  adm_log OK "Todos os jobs executados (alguns podem ter falhado)."
+else
+  adm_log WARN "Alguns jobs falharam, tentando detectar sucesso..."
+fi
+
+# pick first success
+FILE_SUCCESS=$(pick_first_success DOWNLOAD_JOBS) || {
+  adm_log ERR "Nenhum arquivo baixado com sucesso."
+  exit 1
+}
+
+# verify checksum
+if ! verify_sha256 "${FILE_SUCCESS}" "${SHA256}"; then
+  adm_log ERR "Checksum incorreto — removendo arquivo corrompido."
+  if [ "${ADM_DRYRUN}" -eq 0 ]; then
+    rm -f "${FILE_SUCCESS}"
+  fi
+  exit 1
+fi
+
+# copy to chroot if requested
+copy_to_chroot_if_needed "${FILE_SUCCESS}"
+
+# update cache index
+write_cache_index "${FILE_SUCCESS}" "${URLS[0]}"
+
+print_summary
+adm_log OK "Download concluído com sucesso para ${NAME}-${VERSION:-?}."
+adm_log INFO "Arquivo: ${FILE_SUCCESS}"
+
+exit 0
