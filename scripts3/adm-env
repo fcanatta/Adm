@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# adm-env — Gerenciador de profile e Setup inicial do ADM
+# - Cria/valida toda a árvore /usr/src/adm
+# - Gera e gerencia perfis de build (profile.*)
+# - Idempotente: pode rodar n vezes sem quebrar estado
+# - Integra com adm-common.sh (cores, logs, flags, helpers)
+#
+# USO:
+#   adm-env init [--no-dry-run] [--force]
+#   adm-env status
+#   adm-env check              # valida e sugere correções
+#   adm-env fix-perms          # ajusta permissões (requer --force)
+#   adm-env list               # lista perfis
+#   adm-env show <name>        # mostra profile.<name>
+#   adm-env create <name> [KEY=VAL ...] [--from-current]
+#   adm-env set-default <name> # troca profile.default -> profile.<name>
+#   adm-env delete <name>      # remove profile.<name> (não remove default)
+#   adm-env export [<name>]    # imprime export das vars do profile para usar em shell atual
+#
+# Flags globais (de adm-common.sh):
+#   --no-dry-run   Executa de fato (por padrão, dry-run)
+#   --force        Exige confirmação extra em operações potencialmente perigosas
+#   --profile FILE Usa profile custom (p/ comandos que leem profile default)
+#
+# Saída colorida usa tput (fallback ANSI) definida em adm-common.sh
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- Carrega núcleo compartilhado ---
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------- Utilidades internas ----------
+
+print_header() {
+  local title="$1"
+  printf "%b%s%b %b%s%b\n" "${T_BOLD}" "──" "${T_RESET}" "${T_CYAN}" "${title}" "${T_RESET}"
+}
+
+usage() {
+  cat <<EOF
+Uso:
+  $(basename "$0") init [--no-dry-run] [--force]
+  $(basename "$0") status
+  $(basename "$0") check
+  $(basename "$0") fix-perms        # requer --force
+  $(basename "$0") list
+  $(basename "$0") show <name>
+  $(basename "$0") create <name> [KEY=VAL ...] [--from-current]
+  $(basename "$0") set-default <name>
+  $(basename "$0") delete <name>
+  $(basename "$0") export [<name>]
+EOF
+}
+
+# cria arquivo de profile com conteúdo padrão + overrides
+create_profile_file() {
+  local name="$1"; shift || true
+  local pf="${ADM_BASE}/profile.${name}"
+  local from_current=0
+  local kv=()
+
+  # Parse mini-flags locais
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from-current) from_current=1; shift ;;
+      *=*) kv+=("$1"); shift ;;
+      *) adm_log WARN "Ignorando argumento desconhecido no create: $1"; shift ;;
+    esac
+  done
+
+  if [ "${from_current}" -eq 1 ]; then
+    adm_log INFO "Criando profile a partir do ambiente atual (--from-current)"
+  fi
+
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] criar ${pf}"
+    return 0
+  fi
+
+  umask 022
+  {
+    echo "# profile.${name} — gerado por adm-env ($(date '+%F %T'))"
+    echo "# Ajuste conforme necessário. Use 'adm-env export ${name}' para aplicar no shell atual."
+    if [ "${from_current}" -eq 1 ]; then
+      echo "CC=\"${CC:-gcc}\""
+      echo "CXX=\"${CXX:-g++}\""
+      echo "CFLAGS=\"${CFLAGS:--O2 -pipe}\""
+      echo "CXXFLAGS=\"${CXXFLAGS:--O2 -pipe}\""
+      echo "MAKEFLAGS=\"${MAKEFLAGS:--j$(nproc)}\""
+      echo "PREFIX=\"${PREFIX:-/usr}\""
+      echo "PKG_CONFIG_PATH=\"${PKG_CONFIG_PATH:-}\""
+    else
+      cat <<'EODEF'
+CC="gcc"
+CXX="g++"
+CFLAGS="-O2 -pipe"
+CXXFLAGS="-O2 -pipe"
+MAKEFLAGS="-j$(nproc)"
+PREFIX="/usr"
+PKG_CONFIG_PATH=""
+EODEF
+    fi
+    # overrides KEY=VAL
+    if [ "${#kv[@]}" -gt 0 ]; then
+      for pair in "${kv[@]}"; do
+        # normaliza e salva como KEY="VAL"
+        local k="${pair%%=*}"
+        local v="${pair#*=}"
+        printf '%s="%s"\n' "$k" "$v"
+      done
+    fi
+  } > "${pf}"
+
+  adm_log OK "Profile criado/atualizado: ${pf}"
+}
+
+# valida árvore base esperada
+validate_tree() {
+  local ok=1
+  local need=(
+    "${ADM_BASE}"
+    "${ADM_SCRIPTS}"
+    "${ADM_METAFILES}"
+    "${ADM_DB}"
+    "${ADM_UPDATE}"
+    "${ADM_CACHE}"
+    "${ADM_SOURCES_CACHE}"
+    "${ADM_BOOTSTRAP}"
+    "${ADM_LOG}"
+    "${ADM_DESTDIR}"
+    "${ADM_TEMP}"
+    "${ADM_PACKAGES}"
+    "${ADM_HOOKS_GLOBAL}"
+    "${ADM_PATCHES_GLOBAL}"
+  )
+  for d in "${need[@]}"; do
+    if [ -d "${d}" ]; then
+      adm_log OK "OK: ${d}"
+    else
+      adm_log WARN "FALTA: ${d}"
+      ok=0
+    fi
+  done
+  return "${ok}"
+}
+
+# cria estrutura padrão para um "programa" dentro de uma categoria
+# /usr/src/adm/metafiles/<categoria>/<programa>/{metafile,hooks,patch}
+ensure_program_layout() {
+  local category="$1"; local program="$2"
+  [ -n "${category}" ] && [ -n "${program}" ] || return 0
+  local base="${ADM_METAFILES}/${category}/${program}"
+  run_cmd "mkdir -p '${base}/hooks' '${base}/patch'"
+  # cria metafile vazio se não existir
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] criar ${base}/metafile"
+  else
+    if [ ! -f "${base}/metafile" ]; then
+      cat > "${base}/metafile" <<EOF
+NAME="${program}"
+VERSION=""
+CATEGORY="${category}"
+URLS=""
+SHA256=""
+BUILD_SYSTEM=""
+BUILD_DEPS=""
+RUN_DEPS=""
+OPT_DEPS=""
+EOF
+      adm_log OK "Metafile criado: ${base}/metafile"
+    fi
+  fi
+}
+
+# ---------- Comandos ----------
+
+cmd="${1:-}"; shift || true
+if ! adm_parse_common_flags "$@"; then
+  adm_log ERR "Falha ao processar flags globais."
+  exit 1
+fi
+
+# Recomprõe apenas os args do comando (sem flags globais)
+# A abordagem: extrai e remove --force/--no-dry-run/--profile do $@
+# (adm_parse_common_flags já exportou ADM_*; aqui regeneramos "$@")
+# Estratégia: re-scan e descartar flags conhecidas
+filter_args() {
+  local out=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|--no-dry-run)
+        shift ;;
+      --profile)
+        shift 2 ;;
+      *)
+        out+=("$1"); shift ;;
+    esac
+  done
+  printf '%s\n' "${out[@]+"${out[@]}"}"
+}
+
+mapfile -t ARGS < <(filter_args "$@")
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+case "${cmd}" in
+  init)
+    print_header "Inicializando estrutura ADM"
+    # Para criar em /usr/src/adm é recomendado root (mas tentamos assim mesmo)
+    if [ "${ADM_DRYRUN}" -eq 0 ]; then
+      if [ "$(id -u)" -ne 0 ]; then
+        adm_log WARN "Não está rodando como root — pode falhar ao criar alguns diretórios."
+      fi
+    fi
+    adm_ensure_dirs
+    adm_ensure_profile
+    adm_log OK "Estrutura básica garantida (dry-run=${ADM_DRYRUN})."
+
+    # Opcional: criar exemplo de layout para 'core/bash'
+    ensure_program_layout "core" "bash"
+    ensure_program_layout "toolchain" "binutils"
+    ensure_program_layout "toolchain" "gcc"
+    ensure_program_layout "toolchain" "glibc"
+    ;;
+
+  status)
+    print_header "Status da Estrutura ADM"
+    validate_tree || true
+    adm_log HINT "Profiles disponíveis:"
+    ls -1 "${ADM_BASE}"/profile.* 2>/dev/null || adm_log WARN "Nenhum profile.* encontrado"
+    ;;
+
+  check)
+    print_header "Checagem do Ambiente"
+    local ok=1
+    validate_tree || ok=0
+
+    # Programas necessários mínimos
+    local progs=(gcc make tar xz sha256sum curl git rsync patch awk sed grep find tput)
+    for p in "${progs[@]}"; do
+      if command -v "${p}" >/dev/null 2>&1; then
+        adm_log OK "found: ${p}"
+      else
+        adm_log WARN "missing: ${p}"
+        ok=0
+      fi
+    done
+
+    # Permissões básicas
+    for d in "${ADM_BASE}" "${ADM_CACHE}" "${ADM_TEMP}" "${ADM_LOG}" "${ADM_DB}" "${ADM_PACKAGES}"; do
+      if [ -d "${d}" ] && [ ! -w "${d}" ]; then
+        adm_log WARN "sem escrita: ${d} (considere 'adm-env fix-perms --force --no-dry-run')"
+      fi
+    done
+
+    if [ "${ok}" -eq 1 ]; then
+      adm_log OK "Check OK."
+      exit 0
+    else
+      adm_log ERR "Check encontrou problemas."
+      exit 2
+    fi
+    ;;
+
+  fix-perms)
+    print_header "Ajuste de permissões"
+    require_root || {
+      adm_log ERR "fix-perms requer root."
+      exit 1
+    }
+    run_critical "Ajustar permissões do /usr/src/adm (recursivo, segura)" \
+      "chown -R root:root '${ADM_BASE}' && chmod -R a+rX '${ADM_BASE}' && chmod -R u+w '${ADM_CACHE}' '${ADM_TEMP}' '${ADM_LOG}' '${ADM_DB}' '${ADM_PACKAGES}'"
+    adm_log OK "fix-perms concluído (dry-run=${ADM_DRYRUN})."
+    ;;
+
+  list)
+    print_header "Perfis disponíveis"
+    ls -1 "${ADM_BASE}"/profile.* 2>/dev/null | sed "s#${ADM_BASE}/##" || {
+      adm_log WARN "Nenhum profile.* encontrado"
+      exit 0
+    }
+    ;;
+
+  show)
+    print_header "Mostrar profile"
+    name="${1:-}"
+    if [ -z "${name}" ]; then adm_log ERR "Informe o nome do profile"; exit 1; fi
+    pf="${ADM_BASE}/profile.${name}"
+    if [ ! -f "${pf}" ]; then
+      adm_log ERR "Profile não existe: ${pf}"
+      exit 1
+    fi
+    adm_log OK "Exibindo ${pf}:"
+    cat "${pf}"
+    ;;
+
+  create)
+    print_header "Criar/Atualizar profile"
+    name="${1:-}"
+    shift || true
+    if [ -z "${name}" ]; then adm_log ERR "Uso: adm-env create <name> [KEY=VAL ...] [--from-current]"; exit 1; fi
+    create_profile_file "${name}" "$@"
+    ;;
+
+  set-default)
+    print_header "Definir profile default"
+    name="${1:-}"
+    if [ -z "${name}" ]; then adm_log ERR "Uso: adm-env set-default <name>"; exit 1; fi
+    src="${ADM_BASE}/profile.${name}"
+    dst="${ADM_BASE}/profile.default"
+    if [ ! -f "${src}" ]; then adm_log ERR "Profile inexistente: ${src}"; exit 1; fi
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] copiar ${src} -> ${dst}"
+    else
+      cp -f "${src}" "${dst}"
+      adm_log OK "profile.default agora é ${src}"
+    fi
+    ;;
+
+  delete)
+    print_header "Remover profile"
+    name="${1:-}"
+    if [ -z "${name}" ]; then adm_log ERR "Uso: adm-env delete <name>"; exit 1; fi
+    pf="${ADM_BASE}/profile.${name}"
+    if [ ! -f "${pf}" ]; then adm_log ERR "Profile não encontrado: ${pf}"; exit 1; fi
+    if [ "${pf}" = "${ADM_BASE}/profile.default" ]; then
+      adm_log ERR "Não é permitido remover profile.default"
+      exit 1
+    fi
+    run_critical "Remover ${pf}" "rm -f '${pf}'"
+    ;;
+
+  export)
+    # imprime exports para 'eval "$(adm-env export <name>)"'
+    print_header "Exportar variáveis de profile"
+    name="${1:-}"
+    if [ -z "${name}" ]; then
+      pf="${ADM_PROFILE}"
+    else
+      pf="${ADM_BASE}/profile.${name}"
+    fi
+    if [ ! -f "${pf}" ]; then adm_log ERR "Profile não encontrado: ${pf}"; exit 1; fi
+    adm_log OK "Gerando exports de ${pf} (redirecione para eval se quiser aplicar no shell atual)"
+    # shellcheck disable=SC2016
+    awk -F= '
+      /^[[:space:]]*#/ {next}
+      NF>=1 && $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {
+        key=$1
+        val=$0; sub("^[^=]*=","",val)
+        gsub(/^[ \t]+|[ \t]+$/,"",val)
+        gsub(/^"/,"",val); gsub(/"$/,"",val)
+        gsub(/^'\''/,"",val); gsub(/'\''$/,"",val)
+        printf("export %s=\"%s\"\n", key, val)
+      }' "${pf}"
+    ;;
+
+  *)
+    usage
+    exit 1
+    ;;
+esac
+
+exit 0
