@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+#
+# adm-clean v1.0.1-dev
+# Sistema de limpeza e manutenção do ambiente ADM
+# Integra-se com adm-db para log, métricas e auditoria
+#
+# Autor: Sistema ADM Automático
+# Data: 2025-11-06
+#
+set -euo pipefail
+
+### Variáveis principais
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_DB="${ADM_ROOT}/db"
+ADM_LOG="${ADM_ROOT}/logs"
+ADM_BIN="${ADM_ROOT}/bin"
+ADM_CACHE="${ADM_ROOT}/cache"
+ADM_WORK="${ADM_ROOT}/work"
+ADM_BOOTSTRAP="${ADM_ROOT}/bootstrap"
+ADM_VERSION="v1.0.1-dev"
+
+# Arquivos de banco de dados
+DB_LOGS="${ADM_DB}/logs.jsonl"
+DB_AUDIT="${ADM_DB}/audit.jsonl"
+DB_METRICS="${ADM_DB}/metrics.jsonl"
+DB_PKGS="${ADM_DB}/packages.jsonl"
+
+# Carrega o adm-db se existir
+if [ -f "${ADM_BIN}/adm-db" ]; then
+  # shellcheck source=/dev/null
+  source "${ADM_BIN}/adm-db"
+else
+  echo "⚠️  aviso: adm-db não encontrado, logs locais apenas."
+  db_log() { printf "[%s] %s\n" "$(date -u +%H:%M:%S)" "$*"; }
+  db_info() { db_log INFO "$*"; }
+  db_ok() { db_log OK "$*"; }
+  db_warn() { db_log WARN "$*"; }
+  db_error() { db_log ERROR "$*"; }
+fi
+
+# Detecta TTY para saída colorida
+IS_TTY=false
+if [ -t 1 ]; then IS_TTY=true; fi
+
+if $IS_TTY; then
+  _BOLD="$(tput bold)"; _NORM="$(tput sgr0)"
+  _RED="$(tput setaf 1)"; _GRN="$(tput setaf 2)"
+  _YEL="$(tput setaf 3)"; _BLU="$(tput setaf 4)"
+  _CYA="$(tput setaf 6)"
+else
+  _BOLD=""; _NORM=""; _RED=""; _GRN=""; _YEL=""; _BLU=""; _CYA=""
+fi
+
+### Configuração padrão
+MODE=""
+DRY_RUN=false
+FORCE=false
+DAYS=30
+KEEP=5
+VERBOSE=false
+PROFILE="normal"
+
+### Parse de argumentos
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      cache|logs|work|orphans|db|bootstrap|all|full-reset)
+        MODE="$1"; shift ;;
+      --dry-run) DRY_RUN=true; shift ;;
+      --force) FORCE=true; shift ;;
+      --days) DAYS="$2"; shift 2 ;;
+      --keep) KEEP="$2"; shift 2 ;;
+      --verbose) VERBOSE=true; shift ;;
+      --profile) PROFILE="$2"; shift 2 ;;
+      -h|--help)
+        show_help; exit 0 ;;
+      *)
+        echo "Argumento inválido: $1"; show_help; exit 1 ;;
+    esac
+  done
+
+  if [ -z "$MODE" ]; then
+    echo "Uso: adm-clean <modo> [opções]"
+    show_help; exit 1
+  fi
+}
+
+show_help() {
+  cat <<EOF
+adm-clean ${ADM_VERSION}
+Utilitário de limpeza e manutenção do ambiente ADM
+
+Modos disponíveis:
+  cache        Limpa cache de fontes/tarballs
+  logs         Remove ou compacta logs antigos
+  work         Limpa diretórios temporários de compilação
+  orphans      Remove pacotes órfãos
+  db           Compacta e repara DBs JSONL
+  bootstrap    Limpa estágios bootstrap (requer --force)
+  all          Executa todas as limpezas seguras
+  full-reset   Destroi tudo (requer --force + confirmação textual)
+
+Opções:
+  --dry-run        Simula a limpeza sem executar
+  --force          Ignora confirmações
+  --days <N>       Remove arquivos com mais de N dias (padrão 30)
+  --keep <N>       Mantém os N arquivos mais recentes
+  --verbose        Mostra detalhes
+  --profile <tipo> safe|normal|aggressive|purge
+
+Exemplos:
+  adm-clean all --dry-run
+  adm-clean cache --days 15 --keep 3 --force
+EOF
+}
+### Funções auxiliares
+
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+
+# Conversão de bytes → tamanho humano
+human_size() {
+  local bytes=$1
+  local kib=$((bytes / 1024))
+  local mib=$((kib / 1024))
+  local gib=$((mib / 1024))
+  if (( gib > 0 )); then printf "%d GB" "$gib"
+  elif (( mib > 0 )); then printf "%d MB" "$mib"
+  else printf "%d KB" "$kib"; fi
+}
+
+# Verifica se arquivo tem mais de N dias
+is_older_than() {
+  local file=$1 days=$2
+  find "$file" -mtime +"$days" -print -quit 2>/dev/null | grep -q .
+}
+
+# Calcula uso de disco em bytes
+get_disk_usage() {
+  du -sb "$ADM_ROOT" 2>/dev/null | awk '{print $1}'
+}
+
+# Funções seguras de remoção
+safe_rm() {
+  local target="$1"
+  if [ ! -e "$target" ]; then return 0; fi
+  if $DRY_RUN; then
+    printf "[DRY-RUN] Remover: %s\n" "$target"
+    return 0
+  fi
+  if rm -rf --one-file-system "$target" 2>/dev/null; then
+    $VERBOSE && echo "✔️ Removido: $target"
+  else
+    db_error "Falha ao remover $target"
+    return 1
+  fi
+}
+
+safe_rmdir() {
+  local dir="$1"
+  if [ -d "$dir" ] && [ -z "$(ls -A "$dir")" ]; then
+    safe_rm "$dir"
+  fi
+}
+
+# Confirmação
+confirm_action() {
+  local message="$1"
+  if $FORCE; then return 0; fi
+  echo ""
+  echo "${_YEL}${_BOLD}$message${_NORM}"
+  read -rp "Confirmar? (y/N): " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || { echo "Operação cancelada."; exit 1; }
+}
+
+# Medidor de tempo
+start_time=0
+end_time=0
+timer_start() { start_time=$(date +%s.%N); }
+timer_end() {
+  end_time=$(date +%s.%N)
+  awk "BEGIN {printf \"%.2f\", $end_time - $start_time}"
+}
+clean_cache() {
+  db_log INFO "adm-clean" "cache" "" "Iniciando limpeza de cache"
+  local dir_tar="${ADM_CACHE}/tarballs"
+  local dir_src="${ADM_CACHE}/sources"
+  local total_removed=0 total_size=0
+  for d in "$dir_tar" "$dir_src"; do
+    [ -d "$d" ] || continue
+    while IFS= read -r file; do
+      ((total_removed++))
+      size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+      ((total_size+=size))
+      safe_rm "$file"
+    done < <(find "$d" -type f -mtime +"$DAYS" 2>/dev/null)
+  done
+  db_log OK "adm-clean" "cache" "" "Cache limpo (${total_removed} arquivos, $(human_size $total_size))"
+}
+
+clean_logs() {
+  db_log INFO "adm-clean" "logs" "" "Limpando logs antigos..."
+  local count=0
+  mkdir -p "$ADM_LOG"
+  local files=( $(find "$ADM_LOG" -type f -name '*.log' -mtime +"$DAYS" 2>/dev/null | sort) )
+  for f in "${files[@]:0:-KEEP}"; do
+    ((count++))
+    $DRY_RUN && echo "[DRY-RUN] Remover $f" && continue
+    gzip -9f "$f" 2>/dev/null || safe_rm "$f"
+  done
+  db_log OK "adm-clean" "logs" "" "${count} logs antigos removidos ou compactados"
+}
+
+clean_work() {
+  db_log INFO "adm-clean" "work" "" "Limpando diretórios temporários..."
+  if pgrep -f adm-build >/dev/null; then
+    db_warn "adm-clean" "work" "" "Build em execução — limpeza adiada"
+    return
+  fi
+  find "$ADM_WORK" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | while IFS= read -r -d '' dir; do
+    safe_rm "$dir"
+  done
+  db_ok "adm-clean" "work" "" "Diretórios de build limpos"
+}
+
+clean_orphans() {
+  db_log INFO "adm-clean" "orphans" "" "Verificando pacotes órfãos..."
+  local pkgs_db pkgs_cache orphan_count=0
+  pkgs_db=$(grep -o '"package":"[^"]*"' "$DB_PKGS" 2>/dev/null | cut -d: -f2 | tr -d '"' | sort -u)
+  for pkg in $(find "$ADM_CACHE/tarballs" -type f -printf "%f\n" | cut -d- -f1 | sort -u); do
+    if ! grep -q "$pkg" <<<"$pkgs_db"; then
+      ((orphan_count++))
+      safe_rm "${ADM_CACHE}/tarballs/${pkg}"*
+    fi
+  done
+  db_log OK "adm-clean" "orphans" "" "${orphan_count} pacotes órfãos removidos"
+}
+
+clean_db() {
+  db_log INFO "adm-clean" "db" "" "Compactando DBs JSONL..."
+  for dbfile in "$ADM_DB"/*.jsonl; do
+    [ -f "$dbfile" ] || continue
+    cp "$dbfile" "$dbfile.bak"
+    awk 'NF && $1!~/^#/ {print}' "$dbfile" | sort -u > "$dbfile.tmp"
+    mv "$dbfile.tmp" "$dbfile"
+  done
+  db_ok "adm-clean" "db" "" "DBs compactados e corrigidos"
+}
+
+clean_bootstrap() {
+  confirm_action "Deseja realmente limpar os estágios bootstrap? Isso é irreversível."
+  db_log INFO "adm-clean" "bootstrap" "" "Limpando diretórios bootstrap..."
+  find "$ADM_BOOTSTRAP" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' dir; do
+    safe_rm "$dir"
+  done
+  db_ok "adm-clean" "bootstrap" "" "Bootstrap limpo com sucesso"
+}
+clean_all() {
+  timer_start
+  clean_cache
+  clean_logs
+  clean_work
+  clean_orphans
+  clean_db
+  local dur
+  dur=$(timer_end)
+  db_ok "adm-clean" "all" "" "Limpeza completa concluída em ${dur}s"
+}
+
+clean_full_reset() {
+  if ! $FORCE; then
+    echo "❌ --force é obrigatório para full-reset"
+    exit 1
+  fi
+  echo "⚠️  DESTRUIRÁ TODO O CONTEÚDO DE /usr/src/adm EXCETO adm-db E adm-clean"
+  read -rp "Digite 'DELETE ALL' para confirmar: " ans
+  [[ "$ans" == "DELETE ALL" ]] || { echo "Abortado."; exit 1; }
+
+  find "$ADM_ROOT" -mindepth 1 -maxdepth 1 ! -name bin -print0 | while IFS= read -r -d '' path; do
+    safe_rm "$path"
+  done
+  find "$ADM_BIN" -type f ! -name 'adm-db' ! -name 'adm-clean' -delete
+  db_ok "adm-clean" "full-reset" "" "Sistema ADM resetado com sucesso"
+}
+
+print_summary() {
+  echo "──────────────────────────────────────────────────────────────"
+  echo "🧹 ${_BOLD}Resumo da limpeza ADM${_NORM}"
+  echo "Modo: ${MODE}"
+  echo "Dry-run: $DRY_RUN"
+  echo "Forçado: $FORCE"
+  echo "──────────────────────────────────────────────────────────────"
+  du -sh "$ADM_ROOT"/* 2>/dev/null || true
+}
+
+main() {
+  parse_args "$@"
+  db_log BEGIN "adm-clean" "$MODE" "" "Iniciando modo ${MODE}"
+  case "$MODE" in
+    cache) clean_cache ;;
+    logs) clean_logs ;;
+    work) clean_work ;;
+    orphans) clean_orphans ;;
+    db) clean_db ;;
+    bootstrap) clean_bootstrap ;;
+    all) clean_all ;;
+    full-reset) clean_full_reset ;;
+  esac
+  print_summary
+  db_log END "adm-clean" "$MODE" "" "Finalizado modo ${MODE}"
+}
+
+main "$@"
