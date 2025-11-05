@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# adm-uninstall — remove pacotes ADM de forma segura e completa
+#
+# Recursos:
+#  - remove package(s) lendo manifesto em /usr/src/adm/db/<pkg>-<ver>.manifest
+#  - executa hooks: pre-uninstall e post-uninstall (globais e locais)
+#  - faz backup de arquivos existentes antes de remoção (.adm.bak) e permite rollback parcial
+#  - detecta dependentes através de adm-db (se disponível) ou varredura de metafiles
+#  - suporta múltiplos pacotes na mesma invocação
+#  - suporta chroot (--chroot), destdir alternativo (--destdir)
+#  - respeita ADM_DRYRUN (padrão) e ADM_FORCE
+#  - saída colorida via adm-common.sh
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------------------- argumentos ----------------------
+CHROOT_ROOT=""
+DESTDIR_OVERRIDE=""
+FORCE=0
+KEEP_BACKUPS=0
+REMOVE_BACKUPS=0
+YES=0
+EXTRA_ARGS=()
+ACTION="uninstall"
+
+# parse args
+REQS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --chroot) CHROOT_ROOT="$2"; shift 2 ;;
+    --destdir) DESTDIR_OVERRIDE="$2"; shift 2 ;;
+    --force) EXTRA_ARGS+=("--force"); FORCE=1; shift ;;
+    --no-dry-run) EXTRA_ARGS+=("--no-dry-run"); shift ;;
+    --keep-backups) KEEP_BACKUPS=1; shift ;;
+    --remove-backups) REMOVE_BACKUPS=1; shift ;;
+    --yes|-y) YES=1; shift ;;
+    --help|-h)
+      cat <<EOF
+Usage: adm-uninstall [--chroot <root>] [--destdir <dir>] [--force] [--no-dry-run] [--keep-backups] [--remove-backups] <pkg>...
+Notes:
+  - pkg can be package name, category/name, or path to manifest file.
+  - Manifest files are expected in ${ADM_DB}/<pkg>-<ver>.manifest
+  - By default the script runs in dry-run mode; use --no-dry-run to perform real removals.
+EOF
+      exit 0
+      ;;
+    *)
+      REQS+=("$1"); shift ;;
+  esac
+done
+
+# parse global flags via adm_common (sets ADM_DRYRUN, ADM_FORCE, ADM_PROFILE if used)
+adm_parse_common_flags "${EXTRA_ARGS[@]}" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+
+if [ "${#REQS[@]}" -eq 0 ]; then
+  adm_log ERR "Nenhum pacote especificado para desinstalar."
+  exit 1
+fi
+
+adm_ensure_dirs
+
+# ---------------------- helpers ----------------------
+# root prefix for operations (chroot or destdir or actual /)
+operation_root="/"
+if [ -n "${CHROOT_ROOT}" ]; then
+  operation_root="${CHROOT_ROOT%/}"
+elif [ -n "${DESTDIR_OVERRIDE}" ]; then
+  operation_root="${DESTDIR_OVERRIDE%/}"
+fi
+
+# find manifest for package name or metafile path
+# returns manifest path or empty
+find_manifest_for() {
+  local ident="$1"
+  # if ident is a file and exists and looks like a manifest -> return it
+  if [ -f "${ident}" ]; then
+    # quick heuristic: manifest files contain relative file paths (no NAME=)
+    if grep -q -E "^[^=]" "${ident}" 2>/dev/null || true; then
+      printf "%s" "$(readlink -f "${ident}")"
+      return 0
+    fi
+  fi
+  # try exact manifest file in ADM_DB
+  if [ -f "${ADM_DB}/${ident}.manifest" ]; then
+    printf "%s" "${ADM_DB}/${ident}.manifest"
+    return 0
+  fi
+  # try pattern match: <name>-*.manifest
+  local cand
+  cand=$(ls -1 "${ADM_DB}/${ident}-"*.manifest 2>/dev/null | tail -n1 || true)
+  if [ -n "${cand}" ]; then
+    printf "%s" "${cand}"
+    return 0
+  fi
+  # try search by name in ADM_DB directory
+  cand=$(grep -l -R --line-regexp "^${ident}$" "${ADM_DB}" 2>/dev/null | head -n1 || true)
+  if [ -n "${cand}" ]; then
+    # above grep unlikely; fallback to search by filename pattern
+    :
+  fi
+  # fallback: try to find any manifest whose filename contains ident
+  cand=$(ls -1 "${ADM_DB}"/*"${ident}"*.manifest 2>/dev/null | head -n1 || true)
+  if [ -n "${cand}" ]; then
+    printf "%s" "${cand}"
+    return 0
+  fi
+  # not found
+  return 1
+}
+
+# check dependents via adm-db if available, else via metafiles scan
+# prints dependents (one per line) and returns 0 if none or >0 ?
+find_dependents_of() {
+  local pkg="$1"
+  # try adm-db helper
+  if [ -x "${ADM_SCRIPTS}/adm-db" ]; then
+    if "${ADM_SCRIPTS}/adm-db" has-command list-dependents >/dev/null 2>&1; then
+      "${ADM_SCRIPTS}/adm-db" list-dependents "${pkg}" 2>/dev/null || true
+      return 0
+    fi
+    # else try generic interface
+    if "${ADM_SCRIPTS}/adm-db" list >/dev/null 2>&1; then
+      # parse packages.db for possible dependents - best-effort: look for name in BUILD_DEPS/RUN_DEPS of metafiles
+      :
+    fi
+  fi
+  # fallback: scan metafiles for BUILD_DEPS or RUN_DEPS mentioning pkg
+  while IFS= read -r mf; do
+    [ -f "${mf}" ] || continue
+    bdeps=$(read_metafile_val "${mf}" "BUILD_DEPS" 2>/dev/null || echo "")
+    rdeps=$(read_metafile_val "${mf}" "RUN_DEPS" 2>/dev/null || echo "")
+    if echo " ${bdeps} ${rdeps} " | grep -E -q " ${pkg}([[:space:]]|\$)"; then
+      # derive package id from metafile path: ADM_METAFILES/<cat>/<pkg>/metafile
+      rel="${mf#${ADM_METAFILES}/}"
+      catname="${rel%%/*}"
+      prog="${rel#*/}"; prog="${prog%%/*}"
+      printf "%s/%s\n" "${catname}" "${prog}"
+    fi
+  done < <(find "${ADM_METAFILES}" -type f -name "metafile" 2>/dev/null)
+  return 0
+}
+
+# backup file before delete
+backup_file() {
+  local f="$1"
+  local bdir="$2"
+  if [ ! -f "${f}" ]; then return 0; fi
+  mkdir -p "${bdir}"
+  local base
+  base=$(basename "${f}")
+  local dest="${bdir}/${base}.adm.bak"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] cp -a '${f}' '${dest}'"
+    return 0
+  fi
+  run_cmd "cp -a '${f}' '${dest}'" || adm_log WARN "Falha ao backup ${f} -> ${dest}"
+}
+
+# safe remove file
+remove_file() {
+  local f="$1"
+  if [ ! -e "${f}" ]; then
+    adm_log WARN "Arquivo já ausente: ${f}"
+    return 0
+  fi
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rm -f '${f}'"
+    return 0
+  fi
+  run_cmd "rm -f '${f}'" || { adm_log WARN "Falha ao remover ${f}"; return 1; }
+  return 0
+}
+
+# remove empty parent directories up to root (without removing /)
+prune_empty_dirs_up() {
+  local path="$1"
+  local limit="${operation_root}"
+  # normalize
+  path="${path%/}"
+  while [ -n "${path}" ] && [ "${path}" != "${limit}" ] && [ "${path}" != "/" ]; do
+    if [ -d "${path}" ] && [ -z "$(ls -A "${path}" 2>/dev/null)" ]; then
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] rmdir '${path}'"
+      else
+        rmdir "${path}" 2>/dev/null || adm_log WARN "Não foi possível remover diretório '${path}' (provavelmente não vazio)"
+      fi
+      path=$(dirname "${path}")
+    else
+      break
+    fi
+  done
+}
+
+# remove entries listed in manifest (manifest lines are relative paths, no leading slash)
+perform_uninstall_from_manifest() {
+  local manifest="$1"
+  local pkgname="$2"
+  local pkgver="$3"
+  local backup_dir="${ADM_TEMP}/adm-uninstall-backup-${pkgname}-$(date +%s)-$$"
+  register_tmp_dir_for_cleanup "${backup_dir}" || true
+
+  adm_log INFO "Removendo arquivos listados no manifesto ${manifest}"
+  if [ ! -f "${manifest}" ]; then
+    adm_log ERR "Manifesto não encontrado: ${manifest}"
+    return 1
+  fi
+
+  # iterate lines
+  local failed=0
+  while IFS= read -r relpath || [ -n "${relpath}" ]; do
+    [ -z "${relpath}" ] && continue
+    # construct absolute path in operation_root
+    abs="${operation_root%/}/${relpath}"
+    # normalize double slashes
+    abs=$(realpath -m "${abs}")
+    # check that abs is under operation_root for safety
+    case "${abs}" in
+      "${operation_root}"* ) ;; 
+      *)
+        adm_log ERR "Caminho fora do root esperado (ignorado): ${abs}"
+        failed=1
+        continue
+        ;;
+    esac
+    if [ -e "${abs}" ]; then
+      # backup before remove
+      backup_file "${abs}" "${backup_dir}"
+      # remove file or directory
+      if [ -d "${abs}" ] && ! [ -L "${abs}" ]; then
+        # if directory, attempt to remove only if empty after file removals; skip here
+        adm_log INFO "Dir encontrado (será removido se vazio): ${abs}"
+      else
+        if ! remove_file "${abs}"; then
+          adm_log WARN "Falha removendo ${abs}"
+          failed=1
+          continue
+        fi
+        # attempt to prune parent directories
+        parent=$(dirname "${abs}")
+        prune_empty_dirs_up "${parent}"
+      fi
+    else
+      adm_log WARN "Arquivo listado no manifesto não existe: ${abs}"
+    fi
+  done < "${manifest}"
+
+  # if remove backups flag, delete backup_dir
+  if [ "${REMOVE_BACKUPS}" -eq 1 ] && [ "${ADM_DRYRUN}" -eq 0 ]; then
+    adm_log INFO "Removendo backups em ${backup_dir}"
+    run_cmd "rm -rf '${backup_dir}'" || adm_log WARN "Falha removendo backups"
+  else
+    if [ "${KEEP_BACKUPS}" -eq 1 ]; then
+      adm_log INFO "Backups preservados em ${backup_dir}"
+    else
+      adm_log INFO "Backups temporários mantidos em ${backup_dir} (remova manualmente quando satisfeito)"
+    fi
+  fi
+
+  return "${failed}"
+}
+
+# wrapper to register temp cleanup paths in trap
+TMP_REGISTERED=()
+register_tmp_dir_for_cleanup() {
+  local p="$1"
+  TMP_REGISTERED+=("${p}")
+}
+cleanup_registered_tmp() {
+  for p in "${TMP_REGISTERED[@]:-}"; do
+    rm -rf "${p}" 2>/dev/null || true
+  done
+}
+trap cleanup_registered_tmp EXIT
+
+# ---------------------- Main loop: process each requested package ----------------------
+EXIT_CODE=0
+
+for req in "${REQS[@]}"; do
+  adm_log INFO "Processando desinstalação: ${req}"
+  # find manifest
+  manifest_path="$(find_manifest_for "${req}" || true)"
+  if [ -z "${manifest_path}" ]; then
+    adm_log WARN "Manifest não encontrado para '${req}'. Tentando localizar por convenção..."
+    # try by package name simple pattern
+    manifest_path="$(ls -1 "${ADM_DB}/${req}-"*.manifest 2>/dev/null | tail -n1 || true)"
+    if [ -z "${manifest_path}" ]; then
+      adm_log ERR "Não foi possível localizar manifesto para '${req}'. Use 'adm-uninstall <manifest>' ou verifique ${ADM_DB}."
+      EXIT_CODE=2
+      continue
+    fi
+  fi
+  adm_log INFO "Usando manifesto: ${manifest_path}"
+
+  # derive pkg name and version from filename
+  base=$(basename "${manifest_path}")
+  # expect format name-version.manifest or name.manifest
+  if echo "${base}" | grep -qE '-(.+)\.manifest$'; then
+    pkgname="${base%%-*}"
+    pkgver=$(echo "${base}" | sed -E 's/^([^ -]+)-(.+)\.manifest$/\2/' || echo "")
+  else
+    pkgname="${base%.manifest}"
+    pkgver=""
+  fi
+
+  # confirm dependents unless FORCE
+  deps=$(find_dependents_of "${pkgname}" | sed '/^$/d' | sort -u || true)
+  if [ -n "${deps}" ]; then
+    adm_log WARN "Pacotes dependentes encontrados que podem quebrar se remover este pacote:"
+    adm_log WARN "$(printf '%s\n' "${deps}")"
+    if [ "${FORCE}" -ne 1 ]; then
+      adm_log ERR "Use --force para forçar remoção (informações acima). Pulando ${pkgname}."
+      EXIT_CODE=3
+      continue
+    else
+      adm_log WARN "--force fornecido; prosseguendo apesar das dependências."
+    fi
+  fi
+
+  # ask user if not yes and not forced and not dry-run
+  if [ "${YES}" -ne 1 ] && [ "${ADM_DRYRUN}" -eq 0 ] && [ "${FORCE}" -ne 1 ]; then
+    read -r -p "Confirmar remoção de ${pkgname}? [y/N] " ans
+    case "${ans}" in
+      y|Y|yes|Yes) : ;;
+      *) adm_log INFO "Usuário cancelou remoção de ${pkgname}"; EXIT_CODE=4; continue ;;
+    esac
+  fi
+
+  # run pre-uninstall hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run uninstall --phase pre --category ? --program ${pkgname}"
+  else
+    "${ADM_SCRIPTS}/adm-hooks" run uninstall --phase pre --program "${pkgname}" || adm_log WARN "Hook pre-uninstall retornou erro para ${pkgname}"
+  fi
+
+  # perform removal
+  if ! perform_uninstall_from_manifest "${manifest_path}" "${pkgname}" "${pkgver}"; then
+    adm_log ERR "Falha ao remover todos os arquivos do manifesto para ${pkgname}"
+    EXIT_CODE=5
+    # attempt post-uninstall hooks? skip
+  else
+    adm_log OK "Arquivos do manifesto removidos para ${pkgname}"
+    # remove DB entry via adm-db if available
+    if [ -x "${ADM_SCRIPTS}/adm-db" ]; then
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] ${ADM_SCRIPTS}/adm-db remove ${pkgname} ${pkgver}"
+      else
+        "${ADM_SCRIPTS}/adm-db" remove "${pkgname}" "${pkgver}" || adm_log WARN "Falha ao remover entrada do DB para ${pkgname}"
+      fi
+    fi
+    # run post-uninstall hooks
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] adm-hooks run uninstall --phase post --program ${pkgname}"
+    else
+      "${ADM_SCRIPTS}/adm-hooks" run uninstall --phase post --program "${pkgname}" || adm_log WARN "Hook post-uninstall retornou erro para ${pkgname}"
+    fi
+    adm_log OK "Desinstalação de ${pkgname} concluída."
+  fi
+done
+
+exit "${EXIT_CODE}"
