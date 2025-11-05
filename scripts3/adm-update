@@ -1,0 +1,918 @@
+#!/usr/bin/env bash
+# adm-update — gerenciador de atualizações ADM (parte 1/3)
+# Funções:
+#  - check upstream (git/http/ftp/sourceforge)
+#  - list updates
+#  - generate metafile with new version
+#  - robust flags: --dry-run, --force, --jobs, --chroot
+#  - logging, locks, atomic writes, integration with adm-* scripts
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado: ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ------------- Config -------------
+UPDATE_BASE="${ADM_UPDATE:-/usr/src/adm/update}"
+LOG_DIR="${ADM_LOG:-/usr/src/adm/log}"
+TMP_DIR="${ADM_TEMP:-/tmp}/adm-update-$$"
+DB_SCRIPT="${ADM_SCRIPTS}/adm-db"
+DOWNLOAD_SCRIPT="${ADM_SCRIPTS}/adm-download"
+DETECT_SCRIPT="${ADM_SCRIPTS}/adm-detect"
+RESOLVER_SCRIPT="${ADM_SCRIPTS}/adm-resolver"
+BUILD_SCRIPT="${ADM_SCRIPTS}/adm-build"
+INSTALL_SCRIPT="${ADM_SCRIPTS}/adm-install"
+HOOKS_SCRIPT="${ADM_SCRIPTS}/adm-hooks"
+LOCK_DIR="${UPDATE_BASE}/.lock"
+mkdir -p "${UPDATE_BASE}" "${LOG_DIR}" "${TMP_DIR}"
+
+# fallback style vars
+: "${T_BOLD:=$(tput bold 2>/dev/null || printf '')}"
+: "${T_RESET:=$(tput sgr0 2>/dev/null || printf '')}"
+: "${T_PINK:=$(tput setaf 5 2>/dev/null || printf '')}"    # use magenta as pink
+: "${T_GREEN:=$(tput setaf 2 2>/dev/null || printf '')}"
+: "${T_YELLOW:=$(tput setaf 3 2>/dev/null || printf '')}"
+: "${T_RED:=$(tput setaf 1 2>/dev/null || printf '')}"
+: "${T_CYAN:=$(tput setaf 6 2>/dev/null || printf '')}"
+
+# ------------- Helpers -------------
+lock_acquire() {
+  local tries=0
+  while ! mkdir -p "${LOCK_DIR}/lock" 2>/dev/null; do
+    tries=$((tries+1)); sleep 0.05
+    if [ "${tries}" -gt 200 ]; then
+      adm_log ERR "Não foi possível adquirir lock em ${LOCK_DIR}"
+      return 1
+    fi
+  done
+  return 0
+}
+lock_release() {
+  rm -rf "${LOCK_DIR}/lock" 2>/dev/null || true
+}
+
+timestamp_now() { date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+atomic_write_file() {
+  # atomic_write_file <dest> <<<content
+  local dest="$1"; local tmp="${TMP_DIR}/.$(basename "${dest}").$$"
+  cat > "${tmp}"
+  mv -f "${tmp}" "${dest}"
+}
+
+json_escape_inline() {
+  local s="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import json,sys; print(json.dumps(sys.argv[1]))" "${s}"
+  else
+    printf '"%s"' "$(printf "%s" "${s}" | sed -e 's/\\/\\\\/g' -e 's/\"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')"
+  fi
+}
+
+# version compare: semver-aware fallback to lexical numeric parts
+# returns: 0 if v1 == v2, 1 if v1 > v2, 2 if v1 < v2
+version_cmp() {
+  local v1="$1"; local v2="$2"
+  # normalize common separators
+  if [ "${v1}" = "${v2}" ]; then return 0; fi
+  # try sort -V if available (version sort)
+  if command -v sort >/dev/null 2>&1 && printf "%s\n%s\n" "${v1}" "${v2}" | sort -V -C 2>/dev/null; then
+    # if v1 <= v2, then v1 is lesser or equal; but sort -C only checks, so fallback to compare
+    if [ "${v1}" = "${v2}" ]; then return 0; fi
+  fi
+  # break into numeric parts
+  IFS='.-_' read -ra a1 <<<"${v1}"
+  IFS='.-_' read -ra a2 <<<"${v2}"
+  local i max
+  max=$(( ${#a1[@]} > ${#a2[@]} ? ${#a1[@]} : ${#a2[@]} ))
+  for ((i=0;i<max;i++)); do
+    p1="${a1[i]:-0}"; p2="${a2[i]:-0}"
+    # numeric compare if both numeric
+    if printf '%s\n' "${p1}" "${p2}" | grep -Eq '^[0-9]+$' >/dev/null 2>&1 && printf '%s\n' "${p1}" "${p2}" | sort -n -C >/dev/null 2>&1; then
+      if [ "${p1}" -gt "${p2}" ]; then return 1; fi
+      if [ "${p1}" -lt "${p2}" ]; then return 2; fi
+    else
+      # lexical
+      if [ "${p1}" \> "${p2}" ]; then return 1; fi
+      if [ "${p1}" \< "${p2}" ]; then return 2; fi
+    fi
+  done
+  return 0
+}
+
+# read local version for a package from adm-db or metafile
+local_version_of() {
+  local pkg="$1" # category/name or name
+  # try adm-db query
+  if [ -x "${DB_SCRIPT}" ]; then
+    local out
+    out="$("${DB_SCRIPT}" query "${pkg}" 2>/dev/null || true)"
+    if [ -n "${out}" ]; then
+      # try to extract "version": "X"
+      ver="$(printf '%s' "${out}" | awk -F'"' '/"version"/{print $4; exit}')"
+      [ -n "${ver}" ] && { printf "%s" "${ver}"; return 0; }
+    fi
+  fi
+  # fallback: try metafile
+  mf="$(find_metafile_for "${pkg}" 2>/dev/null || true)"
+  if [ -n "${mf}" ]; then
+    ver="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+    [ -n "${ver}" ] && { printf "%s" "${ver}"; return 0; }
+  fi
+  return 1
+}
+
+# decide upstream type (git/http/ftp/sourceforge/local) from metafile or URL
+detect_upstream_type() {
+  local url="$1"
+  case "${url}" in
+    git://*|https://*/*.git|ssh://*|git@*:* ) printf "git"; return 0 ;;
+    *sourceforge.net* ) printf "sourceforge"; return 0 ;;
+    ftp://* ) printf "ftp"; return 0 ;;
+    http://*|https://* ) printf "http"; return 0 ;;
+    file://* ) printf "local"; return 0 ;;
+    *) printf "unknown"; return 0 ;;
+  esac
+}
+
+# probe git tags or latest commit hash for version
+probe_git_latest_tag() {
+  local repo="$1"
+  # try ls-remote --tags, prefer annotated tags, fallback to HEAD short hash
+  if command -v git >/dev/null 2>&1; then
+    out="$(git ls-remote --tags --refs "${repo}" 2>/dev/null || true)"
+    if [ -n "${out}" ]; then
+      # get tag names, attempt semver-like selection
+      tags="$(printf '%s\n' "${out}" | awk '{print $2}' | sed -E 's#refs/tags/##' | sed 's/\^{}$//' | sort -u)"
+      # prefer highest using version_cmp; naive pick last lexicographically if version_cmp not available
+      best=""
+      for t in ${tags}; do
+        if [ -z "${best}" ]; then best="${t}"; continue; fi
+        version_cmp "${t}" "${best}"; rc=$?
+        if [ "${rc}" -eq 1 ]; then best="${t}"; fi
+      done
+      [ -n "${best}" ] && { printf "%s" "${best}"; return 0; }
+    fi
+    # fallback to commit hash of HEAD
+    commit="$(git ls-remote "${repo}" HEAD 2>/dev/null | awk '{print $1}' | head -n1 || true)"
+    if [ -n "${commit}" ]; then printf "%s" "${commit:0:12}"; return 0; fi
+  fi
+  return 1
+}
+
+# probe HTTP directory listing for versions (basic)
+probe_http_versions() {
+  local url="$1" name="$2"
+  # try to fetch index and search for patterns name-version.ext
+  local html
+  html="$(curl -fsSL "${url}" 2>/dev/null || true)"
+  if [ -z "${html}" ]; then return 1; fi
+  # find tokens like name-1.2.3 or name_1.2
+  versions="$(printf '%s' "${html}" | grep -Eo "${name}[-_][0-9]+([0-9A-Za-z_.+-])*" | sed -E "s#^${name}[-_]##" | sort -u || true)"
+  if [ -n "${versions}" ]; then
+    best=""
+    for v in ${versions}; do
+      if [ -z "${best}" ]; then best="${v}"; continue; fi
+      version_cmp "${v}" "${best}"; rc=$?
+      if [ "${rc}" -eq 1 ]; then best="${v}"; fi
+    done
+    [ -n "${best}" ] && { printf "%s" "${best}"; return 0; }
+  fi
+  return 1
+}
+
+# probe sourceforge: use sf API (project's files page) — naive scraping fallback
+probe_sourceforge_latest() {
+  local sf_url="$1"; local name="$2"
+  # given https://sourceforge.net/projects/pkg/files/latest/download or base project URL
+  page="$(curl -fsSL "${sf_url}" 2>/dev/null || true)"
+  if [ -z "${page}" ]; then return 1; fi
+  # attempt find filenames with name-version
+  versions="$(printf '%s' "${page}" | grep -Eo "${name}[-_][0-9]+([0-9A-Za-z_.+-])*" | sed -E "s#^${name}[-_]##" | sort -u || true)"
+  if [ -n "${versions}" ]; then
+    best=""
+    for v in ${versions}; do
+      if [ -z "${best}" ]; then best="${v}"; continue; fi
+      version_cmp "${v}" "${best}"; rc=$?
+      if [ "${rc}" -eq 1 ]; then best="${v}"; fi
+    done
+    [ -n "${best}" ] && { printf "%s" "${best}"; return 0; }
+  fi
+  return 1
+}
+
+# get upstream candidates from metafile (URLs) or ADM metadata
+get_upstream_candidates_from_metafile() {
+  local mf="$1"
+  [ -f "${mf}" ] || return 1
+  # read URLS key from metafile
+  urls="$(read_metafile_val "${mf}" "URLS" 2>/dev/null || true)"
+  # split on spaces/newlines/commas
+  printf '%s\n' "${urls}" | tr ',' '\n' | tr ' ' '\n' | awk '{$1=$1;print}' | sed '/^$/d'
+}
+# adm-update — parte 2/3
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- check upstream for a single metafile or identifier ----------
+# check_upstream_for <metafile|category/name|name>
+check_upstream_for() {
+  local ident="$1"
+  local mf=""
+  if [ -f "${ident}" ] && grep -q '^NAME=' "${ident}" 2>/dev/null; then
+    mf="${ident}"
+  else
+    mf="$(find_metafile_for "${ident}" 2>/dev/null || true)"
+  fi
+  if [ -z "${mf}" ]; then
+    adm_log ERR "Metafile não encontrado para ${ident}"
+    return 1
+  fi
+
+  name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+  category="$(read_metafile_val "${mf}" "CATEGORY" 2>/dev/null || true)"
+  cur_ver="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+  urls="$(get_upstream_candidates_from_metafile "${mf}")"
+
+  if [ -z "${urls}" ]; then
+    adm_log WARN "Nenhuma URL upstream definida no metafile ${mf}"
+    return 2
+  fi
+
+  # try each url candidate
+  best_ver=""
+  best_url=""
+  for u in ${urls}; do
+    utype="$(detect_upstream_type "${u}")"
+    adm_log INFO "Probing upstream (${utype}): ${u}"
+    case "${utype}" in
+      git)
+        v="$(probe_git_latest_tag "${u}" 2>/dev/null || true)"
+        ;;
+      sourceforge)
+        v="$(probe_sourceforge_latest "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      http)
+        v="$(probe_http_versions "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      ftp)
+        # reuse http probe (ftp listing similar)
+        v="$(probe_http_versions "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      local)
+        # local file path, attempt to list versions in directory
+        dir="${u#file://}"
+        if [ -d "${dir}" ]; then
+          v="$(ls -1 "${dir}" | grep -E "${name}[-_][0-9]" | sed -E "s#${name}[-_]##" | sort -u | tail -n1 || true)"
+        fi
+        ;;
+      *)
+        v=""
+        ;;
+    esac
+
+    if [ -n "${v}" ]; then
+      if [ -z "${best_ver}" ]; then
+        best_ver="${v}"; best_url="${u}";
+      else
+        version_cmp "${v}" "${best_ver}"; rc=$?
+        if [ "${rc}" -eq 1 ]; then
+          best_ver="${v}"; best_url="${u}"
+        fi
+      fi
+    fi
+  done
+
+  if [ -z "${best_ver}" ]; then
+    adm_log INFO "Nenhuma versão upstream detectada para ${name}"
+    return 0
+  fi
+
+  # compare with current
+  if [ -n "${cur_ver}" ]; then
+    version_cmp "${best_ver}" "${cur_ver}"; cmp_rc=$?
+    case "${cmp_rc}" in
+      0) adm_log INFO "Versão upstream igual (${best_ver}) para ${name}"; return 0 ;;
+      1) adm_log INFO "Versão upstream maior detectada para ${name}: ${cur_ver} -> ${best_ver}" ;;
+      2) adm_log INFO "Versão upstream menor que local (${best_ver} < ${cur_ver}), ignorando" ; return 0 ;;
+    esac
+  else
+    adm_log INFO "Versão local não encontrada; upstream detectado: ${best_ver}"
+  fi
+
+  # write candidate to update dir
+  update_dir="${UPDATE_BASE}/${category:-misc}/${name}"
+  mkdir -p "${update_dir}"
+  meta_out="${update_dir}/metafile"
+  adm_log INFO "Gerando metafile de atualização em ${meta_out}"
+  # read original metafile values and update VERSION and URLS (preserve other keys)
+  awk -v nv="${best_ver}" -v bu="${best_url}" 'BEGIN{FS=OFS="="} 
+  /^VERSION=/ {print "VERSION=\"" nv "\""; next} 
+  /^URLS=/ {print "URLS=\"" bu "\""; next} 
+  {print $0}' "${mf}" > "${meta_out}.tmp" || cp -a "${mf}" "${meta_out}.tmp"
+  mv -f "${meta_out}.tmp" "${meta_out}" || { adm_log ERR "Falha ao salvar metafile de update"; return 1; }
+  adm_log OK "Metafile de update criado: ${meta_out}"
+  printf "%s|%s|%s\n" "${category:-misc}/${name}" "${cur_ver:-unknown}" "${best_ver}" > "${update_dir}/version.info"
+  return 0
+}
+
+# ---------- list all updates available (scan update dir or scan all metafiles) ----------
+list_updates() {
+  # prefer explicit UPDATE_BASE entries
+  found=0
+  while IFS= read -r d; do
+    [ -z "${d}" ] && continue
+    if [ -f "${d}/metafile" ]; then
+      found=1
+      name="$(basename "${d}")"
+      info="$(cat "${d}/version.info" 2>/dev/null || true)"
+      printf "%s : %s\n" "${d}" "${info:-(unknown)}"
+    fi
+  done < <(find "${UPDATE_BASE}" -mindepth 2 -maxdepth 3 -type d 2>/dev/null)
+  if [ "${found}" -eq 0 ]; then
+    adm_log INFO "Nenhuma atualização detectada em ${UPDATE_BASE}"
+  fi
+}
+
+# ---------- download new source for update candidate ----------
+# download_update <category/name>
+download_update() {
+  local id="$1"
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile de update não encontrado: ${mf}"; return 1; fi
+  # call adm-download with metafile and concurrency
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${DOWNLOAD_SCRIPT} '${mf}' --concurrency 4"
+    return 0
+  fi
+  if [ ! -x "${DOWNLOAD_SCRIPT}" ]; then adm_log ERR "adm-download não encontrado: ${DOWNLOAD_SCRIPT}"; return 1; fi
+  "${DOWNLOAD_SCRIPT}" "${mf}" --concurrency 4 || { adm_log ERR "adm-download falhou para ${mf}"; return 1; }
+  # ensure cache file exists and sha256 matches metafile SHA256 if provided
+  FILENAME="$(read_metafile_val "${mf}" "FILENAME" 2>/dev/null || true)"
+  SHA256_EXPECT="$(read_metafile_val "${mf}" "SHA256" 2>/dev/null || true)"
+  if [ -n "${FILENAME}" ]; then
+    cached="$(cache_path_for "${FILENAME}" 2>/dev/null || true)"
+    if [ -z "${cached}" ] || [ ! -f "${cached}" ]; then
+      adm_log WARN "Arquivo esperado ${FILENAME} não localizado no cache após download"
+    else
+      if [ -n "${SHA256_EXPECT}" ]; then
+        SHA_ACTUAL="$(sha256sum "${cached}" | awk '{print $1}')"
+        if [ "${SHA_ACTUAL}" != "${SHA256_EXPECT}" ]; then
+          adm_log ERR "SHA256 mismatch for ${cached}: expected ${SHA256_EXPECT} got ${SHA_ACTUAL}"
+          return 2
+        fi
+      fi
+      adm_log OK "Fonte baixada e verificada: ${cached}"
+    fi
+  fi
+  return 0
+}
+
+# ---------- generate metafile explicitly (copy created metafile to metafiles area) ----------
+generate_metafile_to_metafiles_repo() {
+  local id="$1"  # category/name
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile de update não encontrado: ${mf}"; return 1; fi
+  # target dir in metafiles repo
+  catname="$(echo "${id}" | cut -d'/' -f1)"
+  pname="$(echo "${id}" | cut -d'/' -f2)"
+  target_dir="${ADM_METAFILES}/${catname}/${pname}"
+  mkdir -p "${target_dir}"
+  target="${target_dir}/metafile"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] cp ${mf} -> ${target}"
+    return 0
+  fi
+  cp -a "${mf}" "${target}" || { adm_log ERR "Falha copiando metafile para ${target}"; return 1; }
+  adm_log OK "Metafile atualizado no repositório: ${target}"
+  return 0
+}
+
+# ---------- apply update (build + install) ----------
+# apply_update <category/name> [--no-install] [--keep-artifact] [--chroot <root>]
+apply_update() {
+  local id="$1"; shift
+  local no_install=0; local keep_artifact=0; local chroot_root=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-install) no_install=1; shift ;;
+      --keep-artifact) keep_artifact=1; shift ;;
+      --chroot) chroot_root="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile não encontrado para aplicar: ${mf}"; return 1; fi
+
+  # read values
+  pkg_name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+  pkg_ver_new="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+  pkg_cat="$(read_metafile_val "${mf}" "CATEGORY" 2>/dev/null || true)"
+  if [ -z "${pkg_name}" ] || [ -z "${pkg_ver_new}" ]; then
+    adm_log ERR "Metafile incompleto (NAME or VERSION faltando): ${mf}"; return 1
+  fi
+
+  # pre-update hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run update --phase pre --category ${pkg_cat} --program ${pkg_name}"
+  else
+    "${HOOKS_SCRIPT}" run update --phase pre --category "${pkg_cat}" --program "${pkg_name}" || adm_log WARN "Hooks pre-update retornaram erro"
+  fi
+
+  # download sources if not present
+  if ! download_update "${pkg_cat}/${pkg_name}"; then
+    adm_log ERR "Falha no download da fonte para ${id}"
+    return 1
+  fi
+
+  # build artifact (use adm-build). adm-build will package and register in adm-db.
+  if [ ! -x "${BUILD_SCRIPT}" ]; then adm_log ERR "adm-build não encontrado: ${BUILD_SCRIPT}"; return 1; fi
+
+  # call build
+  build_cmd=( "${BUILD_SCRIPT}" --metafile "${mf}" )
+  [ -n "${chroot_root}" ] && build_cmd+=( --chroot "${chroot_root}" )
+  build_cmd+=( --no-dry-run )
+  adm_log INFO "Executando build: ${build_cmd[*]}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${build_cmd[*]}"
+  else
+    if ! "${build_cmd[@]}"; then
+      adm_log ERR "Build falhou para ${id}"
+      # post-update hook on failure
+      "${HOOKS_SCRIPT}" run update --phase fail --category "${pkg_cat}" --program "${pkg_name}" || true
+      return 1
+    fi
+  fi
+
+  # optionally install
+  if [ "${no_install}" -eq 0 ]; then
+    # locate package archive in ADM_PACKAGES
+    pkg_archive="$(find_package_archive_in_repo "${pkg_name}-${pkg_ver_new}" || true)"
+    if [ -z "${pkg_archive}" ]; then
+      # try without version
+      pkg_archive="$(find_package_archive_in_repo "${pkg_name}" || true)"
+    fi
+    if [ -z "${pkg_archive}" ]; then
+      adm_log WARN "Arquivo empacotado não encontrado em ${ADM_PACKAGES}; tentando instalar from destdir"
+      destcand="$(find "${ADM_DESTDIR}" -maxdepth 2 -type d -name "${pkg_name}*" 2>/dev/null | head -n1 || true)"
+      if [ -n "${destcand}" ]; then
+        pkg_archive="${destcand}"
+      fi
+    fi
+
+    if [ -z "${pkg_archive}" ]; then
+      adm_log ERR "Não localizei artefato para instalar ${pkg_name}-${pkg_ver_new}"
+      return 2
+    fi
+
+    # install using adm-install
+    if [ ! -x "${INSTALL_SCRIPT}" ]; then adm_log ERR "adm-install não encontrado: ${INSTALL_SCRIPT}"; return 1; fi
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${INSTALL_SCRIPT} install ${pkg_archive} --manifest ${ADM_DB}/${pkg_name}-${pkg_ver_new}.manifest"
+    else
+      if ! "${INSTALL_SCRIPT}" install "${pkg_archive}" --manifest "${ADM_DB}/${pkg_name}-${pkg_ver_new}.manifest"; then
+        adm_log ERR "adm-install falhou para ${pkg_archive}"
+        # attempt rollback automatically
+        adm_log WARN "Iniciando rollback automático para ${pkg_name}"
+        rollback_update "${id}" || adm_log ERR "Rollback automático falhou para ${id}"
+        return 1
+      fi
+      adm_log OK "Instalação concluída para ${pkg_name}-${pkg_ver_new}"
+    fi
+  else
+    adm_log INFO "--no-install especificado; pulando instalação"
+  fi
+
+  # post-update hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run update --phase post --category ${pkg_cat} --program ${pkg_name}"
+  else
+    "${HOOKS_SCRIPT}" run update --phase post --category "${pkg_cat}" --program "${pkg_name}" || adm_log WARN "Hooks post-update retornaram erro"
+  fi
+
+  # keep artifact if requested
+  if [ "${keep_artifact}" -eq 1 ]; then
+    adm_log INFO "Preservando artefato para ${id}"
+  else
+    adm_log INFO "Limpeza de artefatos temporários opcional (não implementado automaticamente)"
+    # leave artifacts; user can remove from ADM_PACKAGES or ADM_DESTDIR
+  fi
+
+  # record update log
+  printf "%s : applied update %s -> %s\n" "$(timestamp_now)" "${pkg_name}" "${pkg_ver_new}" >> "${LOG_DIR}/adm-update.log"
+
+  return 0
+}
+
+# ---------- rollback update (restore previous version) ----------
+# rollback_update <category/name>
+rollback_update() {
+  local id="$1"
+  local update_dir="${UPDATE_BASE}/${id}"
+  local info="${update_dir}/version.info"
+  if [ ! -f "${info}" ]; then adm_log ERR "version.info não encontrado para ${id}"; return 1; fi
+  prev="$(awk -F'|' '{print $2}' "${info}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  pkg_name="$(basename "${id}")"
+  if [ -z "${prev}" ] || [ "${prev}" = "unknown" ]; then
+    adm_log ERR "Nenhuma versão anterior conhecida para ${id}"
+    return 1
+  fi
+  adm_log INFO "Tentando rollback de ${pkg_name} para ${prev}"
+  # find manifest of previous version
+  manifest="${ADM_DB}/${pkg_name}-${prev}.manifest"
+  if [ ! -f "${manifest}" ]; then
+    # maybe in manifests dir
+    manifest="${ADM_DB}/manifests/${pkg_name}-${prev}.manifest"
+  fi
+  if [ ! -f "${manifest}" ]; then
+    adm_log ERR "Manifesto da versão anterior não encontrado: ${manifest}"
+    return 1
+  fi
+  # uninstall current version (best-effort)
+  current="$(awk -F'|' '/^'"${pkg_name}"'\|/{print $2; exit}' "${ADM_DB}/packages.db" 2>/dev/null || true)"
+  if [ -n "${current}" ]; then
+    adm_log INFO "Removendo versão atual ${pkg_name}-${current}"
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${ADM_SCRIPTS}/adm-uninstall ${pkg_name}"
+    else
+      "${ADM_SCRIPTS}/adm-uninstall" "${pkg_name}" || adm_log WARN "Falha ao desinstalar versão atual ${pkg_name}-${current}"
+    fi
+  fi
+  # install previous using adm-install with manifest path if possible
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-install install --manifest ${manifest} (install from manifest not direct supported?)"
+    return 0
+  fi
+  # adm-install expects package archive or destdir; we try to locate archive for prev
+  archive="$(find_package_archive_in_repo "${pkg_name}-${prev}" || true)"
+  if [ -z "${archive}" ]; then
+    adm_log WARN "Arquivo da versão anterior não encontrado; instalação a partir de manifest pode não ser suportada automaticamente"
+    return 1
+  fi
+  if ! "${INSTALL_SCRIPT}" install "${archive}" --manifest "${manifest}"; then
+    adm_log ERR "Falha ao instalar versão anterior ${pkg_name}-${prev}"
+    return 1
+  fi
+  adm_log OK "Rollback completado: ${pkg_name} -> ${prev}"
+  return 0
+}
+# adm-update — parte 2/3
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- check upstream for a single metafile or identifier ----------
+# check_upstream_for <metafile|category/name|name>
+check_upstream_for() {
+  local ident="$1"
+  local mf=""
+  if [ -f "${ident}" ] && grep -q '^NAME=' "${ident}" 2>/dev/null; then
+    mf="${ident}"
+  else
+    mf="$(find_metafile_for "${ident}" 2>/dev/null || true)"
+  fi
+  if [ -z "${mf}" ]; then
+    adm_log ERR "Metafile não encontrado para ${ident}"
+    return 1
+  fi
+
+  name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+  category="$(read_metafile_val "${mf}" "CATEGORY" 2>/dev/null || true)"
+  cur_ver="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+  urls="$(get_upstream_candidates_from_metafile "${mf}")"
+
+  if [ -z "${urls}" ]; then
+    adm_log WARN "Nenhuma URL upstream definida no metafile ${mf}"
+    return 2
+  fi
+
+  # try each url candidate
+  best_ver=""
+  best_url=""
+  for u in ${urls}; do
+    utype="$(detect_upstream_type "${u}")"
+    adm_log INFO "Probing upstream (${utype}): ${u}"
+    case "${utype}" in
+      git)
+        v="$(probe_git_latest_tag "${u}" 2>/dev/null || true)"
+        ;;
+      sourceforge)
+        v="$(probe_sourceforge_latest "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      http)
+        v="$(probe_http_versions "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      ftp)
+        # reuse http probe (ftp listing similar)
+        v="$(probe_http_versions "${u}" "${name}" 2>/dev/null || true)"
+        ;;
+      local)
+        # local file path, attempt to list versions in directory
+        dir="${u#file://}"
+        if [ -d "${dir}" ]; then
+          v="$(ls -1 "${dir}" | grep -E "${name}[-_][0-9]" | sed -E "s#${name}[-_]##" | sort -u | tail -n1 || true)"
+        fi
+        ;;
+      *)
+        v=""
+        ;;
+    esac
+
+    if [ -n "${v}" ]; then
+      if [ -z "${best_ver}" ]; then
+        best_ver="${v}"; best_url="${u}";
+      else
+        version_cmp "${v}" "${best_ver}"; rc=$?
+        if [ "${rc}" -eq 1 ]; then
+          best_ver="${v}"; best_url="${u}"
+        fi
+      fi
+    fi
+  done
+
+  if [ -z "${best_ver}" ]; then
+    adm_log INFO "Nenhuma versão upstream detectada para ${name}"
+    return 0
+  fi
+
+  # compare with current
+  if [ -n "${cur_ver}" ]; then
+    version_cmp "${best_ver}" "${cur_ver}"; cmp_rc=$?
+    case "${cmp_rc}" in
+      0) adm_log INFO "Versão upstream igual (${best_ver}) para ${name}"; return 0 ;;
+      1) adm_log INFO "Versão upstream maior detectada para ${name}: ${cur_ver} -> ${best_ver}" ;;
+      2) adm_log INFO "Versão upstream menor que local (${best_ver} < ${cur_ver}), ignorando" ; return 0 ;;
+    esac
+  else
+    adm_log INFO "Versão local não encontrada; upstream detectado: ${best_ver}"
+  fi
+
+  # write candidate to update dir
+  update_dir="${UPDATE_BASE}/${category:-misc}/${name}"
+  mkdir -p "${update_dir}"
+  meta_out="${update_dir}/metafile"
+  adm_log INFO "Gerando metafile de atualização em ${meta_out}"
+  # read original metafile values and update VERSION and URLS (preserve other keys)
+  awk -v nv="${best_ver}" -v bu="${best_url}" 'BEGIN{FS=OFS="="} 
+  /^VERSION=/ {print "VERSION=\"" nv "\""; next} 
+  /^URLS=/ {print "URLS=\"" bu "\""; next} 
+  {print $0}' "${mf}" > "${meta_out}.tmp" || cp -a "${mf}" "${meta_out}.tmp"
+  mv -f "${meta_out}.tmp" "${meta_out}" || { adm_log ERR "Falha ao salvar metafile de update"; return 1; }
+  adm_log OK "Metafile de update criado: ${meta_out}"
+  printf "%s|%s|%s\n" "${category:-misc}/${name}" "${cur_ver:-unknown}" "${best_ver}" > "${update_dir}/version.info"
+  return 0
+}
+
+# ---------- list all updates available (scan update dir or scan all metafiles) ----------
+list_updates() {
+  # prefer explicit UPDATE_BASE entries
+  found=0
+  while IFS= read -r d; do
+    [ -z "${d}" ] && continue
+    if [ -f "${d}/metafile" ]; then
+      found=1
+      name="$(basename "${d}")"
+      info="$(cat "${d}/version.info" 2>/dev/null || true)"
+      printf "%s : %s\n" "${d}" "${info:-(unknown)}"
+    fi
+  done < <(find "${UPDATE_BASE}" -mindepth 2 -maxdepth 3 -type d 2>/dev/null)
+  if [ "${found}" -eq 0 ]; then
+    adm_log INFO "Nenhuma atualização detectada em ${UPDATE_BASE}"
+  fi
+}
+
+# ---------- download new source for update candidate ----------
+# download_update <category/name>
+download_update() {
+  local id="$1"
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile de update não encontrado: ${mf}"; return 1; fi
+  # call adm-download with metafile and concurrency
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${DOWNLOAD_SCRIPT} '${mf}' --concurrency 4"
+    return 0
+  fi
+  if [ ! -x "${DOWNLOAD_SCRIPT}" ]; then adm_log ERR "adm-download não encontrado: ${DOWNLOAD_SCRIPT}"; return 1; fi
+  "${DOWNLOAD_SCRIPT}" "${mf}" --concurrency 4 || { adm_log ERR "adm-download falhou para ${mf}"; return 1; }
+  # ensure cache file exists and sha256 matches metafile SHA256 if provided
+  FILENAME="$(read_metafile_val "${mf}" "FILENAME" 2>/dev/null || true)"
+  SHA256_EXPECT="$(read_metafile_val "${mf}" "SHA256" 2>/dev/null || true)"
+  if [ -n "${FILENAME}" ]; then
+    cached="$(cache_path_for "${FILENAME}" 2>/dev/null || true)"
+    if [ -z "${cached}" ] || [ ! -f "${cached}" ]; then
+      adm_log WARN "Arquivo esperado ${FILENAME} não localizado no cache após download"
+    else
+      if [ -n "${SHA256_EXPECT}" ]; then
+        SHA_ACTUAL="$(sha256sum "${cached}" | awk '{print $1}')"
+        if [ "${SHA_ACTUAL}" != "${SHA256_EXPECT}" ]; then
+          adm_log ERR "SHA256 mismatch for ${cached}: expected ${SHA256_EXPECT} got ${SHA_ACTUAL}"
+          return 2
+        fi
+      fi
+      adm_log OK "Fonte baixada e verificada: ${cached}"
+    fi
+  fi
+  return 0
+}
+
+# ---------- generate metafile explicitly (copy created metafile to metafiles area) ----------
+generate_metafile_to_metafiles_repo() {
+  local id="$1"  # category/name
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile de update não encontrado: ${mf}"; return 1; fi
+  # target dir in metafiles repo
+  catname="$(echo "${id}" | cut -d'/' -f1)"
+  pname="$(echo "${id}" | cut -d'/' -f2)"
+  target_dir="${ADM_METAFILES}/${catname}/${pname}"
+  mkdir -p "${target_dir}"
+  target="${target_dir}/metafile"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] cp ${mf} -> ${target}"
+    return 0
+  fi
+  cp -a "${mf}" "${target}" || { adm_log ERR "Falha copiando metafile para ${target}"; return 1; }
+  adm_log OK "Metafile atualizado no repositório: ${target}"
+  return 0
+}
+
+# ---------- apply update (build + install) ----------
+# apply_update <category/name> [--no-install] [--keep-artifact] [--chroot <root>]
+apply_update() {
+  local id="$1"; shift
+  local no_install=0; local keep_artifact=0; local chroot_root=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-install) no_install=1; shift ;;
+      --keep-artifact) keep_artifact=1; shift ;;
+      --chroot) chroot_root="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  local update_dir="${UPDATE_BASE}/${id}"
+  local mf="${update_dir}/metafile"
+  if [ ! -f "${mf}" ]; then adm_log ERR "Metafile não encontrado para aplicar: ${mf}"; return 1; fi
+
+  # read values
+  pkg_name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+  pkg_ver_new="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+  pkg_cat="$(read_metafile_val "${mf}" "CATEGORY" 2>/dev/null || true)"
+  if [ -z "${pkg_name}" ] || [ -z "${pkg_ver_new}" ]; then
+    adm_log ERR "Metafile incompleto (NAME or VERSION faltando): ${mf}"; return 1
+  fi
+
+  # pre-update hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run update --phase pre --category ${pkg_cat} --program ${pkg_name}"
+  else
+    "${HOOKS_SCRIPT}" run update --phase pre --category "${pkg_cat}" --program "${pkg_name}" || adm_log WARN "Hooks pre-update retornaram erro"
+  fi
+
+  # download sources if not present
+  if ! download_update "${pkg_cat}/${pkg_name}"; then
+    adm_log ERR "Falha no download da fonte para ${id}"
+    return 1
+  fi
+
+  # build artifact (use adm-build). adm-build will package and register in adm-db.
+  if [ ! -x "${BUILD_SCRIPT}" ]; then adm_log ERR "adm-build não encontrado: ${BUILD_SCRIPT}"; return 1; fi
+
+  # call build
+  build_cmd=( "${BUILD_SCRIPT}" --metafile "${mf}" )
+  [ -n "${chroot_root}" ] && build_cmd+=( --chroot "${chroot_root}" )
+  build_cmd+=( --no-dry-run )
+  adm_log INFO "Executando build: ${build_cmd[*]}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${build_cmd[*]}"
+  else
+    if ! "${build_cmd[@]}"; then
+      adm_log ERR "Build falhou para ${id}"
+      # post-update hook on failure
+      "${HOOKS_SCRIPT}" run update --phase fail --category "${pkg_cat}" --program "${pkg_name}" || true
+      return 1
+    fi
+  fi
+
+  # optionally install
+  if [ "${no_install}" -eq 0 ]; then
+    # locate package archive in ADM_PACKAGES
+    pkg_archive="$(find_package_archive_in_repo "${pkg_name}-${pkg_ver_new}" || true)"
+    if [ -z "${pkg_archive}" ]; then
+      # try without version
+      pkg_archive="$(find_package_archive_in_repo "${pkg_name}" || true)"
+    fi
+    if [ -z "${pkg_archive}" ]; then
+      adm_log WARN "Arquivo empacotado não encontrado em ${ADM_PACKAGES}; tentando instalar from destdir"
+      destcand="$(find "${ADM_DESTDIR}" -maxdepth 2 -type d -name "${pkg_name}*" 2>/dev/null | head -n1 || true)"
+      if [ -n "${destcand}" ]; then
+        pkg_archive="${destcand}"
+      fi
+    fi
+
+    if [ -z "${pkg_archive}" ]; then
+      adm_log ERR "Não localizei artefato para instalar ${pkg_name}-${pkg_ver_new}"
+      return 2
+    fi
+
+    # install using adm-install
+    if [ ! -x "${INSTALL_SCRIPT}" ]; then adm_log ERR "adm-install não encontrado: ${INSTALL_SCRIPT}"; return 1; fi
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${INSTALL_SCRIPT} install ${pkg_archive} --manifest ${ADM_DB}/${pkg_name}-${pkg_ver_new}.manifest"
+    else
+      if ! "${INSTALL_SCRIPT}" install "${pkg_archive}" --manifest "${ADM_DB}/${pkg_name}-${pkg_ver_new}.manifest"; then
+        adm_log ERR "adm-install falhou para ${pkg_archive}"
+        # attempt rollback automatically
+        adm_log WARN "Iniciando rollback automático para ${pkg_name}"
+        rollback_update "${id}" || adm_log ERR "Rollback automático falhou para ${id}"
+        return 1
+      fi
+      adm_log OK "Instalação concluída para ${pkg_name}-${pkg_ver_new}"
+    fi
+  else
+    adm_log INFO "--no-install especificado; pulando instalação"
+  fi
+
+  # post-update hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run update --phase post --category ${pkg_cat} --program ${pkg_name}"
+  else
+    "${HOOKS_SCRIPT}" run update --phase post --category "${pkg_cat}" --program "${pkg_name}" || adm_log WARN "Hooks post-update retornaram erro"
+  fi
+
+  # keep artifact if requested
+  if [ "${keep_artifact}" -eq 1 ]; then
+    adm_log INFO "Preservando artefato para ${id}"
+  else
+    adm_log INFO "Limpeza de artefatos temporários opcional (não implementado automaticamente)"
+    # leave artifacts; user can remove from ADM_PACKAGES or ADM_DESTDIR
+  fi
+
+  # record update log
+  printf "%s : applied update %s -> %s\n" "$(timestamp_now)" "${pkg_name}" "${pkg_ver_new}" >> "${LOG_DIR}/adm-update.log"
+
+  return 0
+}
+
+# ---------- rollback update (restore previous version) ----------
+# rollback_update <category/name>
+rollback_update() {
+  local id="$1"
+  local update_dir="${UPDATE_BASE}/${id}"
+  local info="${update_dir}/version.info"
+  if [ ! -f "${info}" ]; then adm_log ERR "version.info não encontrado para ${id}"; return 1; fi
+  prev="$(awk -F'|' '{print $2}' "${info}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  pkg_name="$(basename "${id}")"
+  if [ -z "${prev}" ] || [ "${prev}" = "unknown" ]; then
+    adm_log ERR "Nenhuma versão anterior conhecida para ${id}"
+    return 1
+  fi
+  adm_log INFO "Tentando rollback de ${pkg_name} para ${prev}"
+  # find manifest of previous version
+  manifest="${ADM_DB}/${pkg_name}-${prev}.manifest"
+  if [ ! -f "${manifest}" ]; then
+    # maybe in manifests dir
+    manifest="${ADM_DB}/manifests/${pkg_name}-${prev}.manifest"
+  fi
+  if [ ! -f "${manifest}" ]; then
+    adm_log ERR "Manifesto da versão anterior não encontrado: ${manifest}"
+    return 1
+  fi
+  # uninstall current version (best-effort)
+  current="$(awk -F'|' '/^'"${pkg_name}"'\|/{print $2; exit}' "${ADM_DB}/packages.db" 2>/dev/null || true)"
+  if [ -n "${current}" ]; then
+    adm_log INFO "Removendo versão atual ${pkg_name}-${current}"
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${ADM_SCRIPTS}/adm-uninstall ${pkg_name}"
+    else
+      "${ADM_SCRIPTS}/adm-uninstall" "${pkg_name}" || adm_log WARN "Falha ao desinstalar versão atual ${pkg_name}-${current}"
+    fi
+  fi
+  # install previous using adm-install with manifest path if possible
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-install install --manifest ${manifest} (install from manifest not direct supported?)"
+    return 0
+  fi
+  # adm-install expects package archive or destdir; we try to locate archive for prev
+  archive="$(find_package_archive_in_repo "${pkg_name}-${prev}" || true)"
+  if [ -z "${archive}" ]; then
+    adm_log WARN "Arquivo da versão anterior não encontrado; instalação a partir de manifest pode não ser suportada automaticamente"
+    return 1
+  fi
+  if ! "${INSTALL_SCRIPT}" install "${archive}" --manifest "${manifest}"; then
+    adm_log ERR "Falha ao instalar versão anterior ${pkg_name}-${prev}"
+    return 1
+  fi
+  adm_log OK "Rollback completado: ${pkg_name} -> ${prev}"
+  return 0
+}
