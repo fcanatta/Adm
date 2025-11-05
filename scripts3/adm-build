@@ -1,0 +1,774 @@
+#!/usr/bin/env bash
+# adm-build (parte 1/4)
+# Orquestrador de construção ADM
+#
+# Funções:
+#  - ler metafile(s) KEY=VAL
+#  - resolver dependências (chama adm-resolver)
+#  - baixar fontes (chama adm-download)
+#  - aplicar patches (adm-patch)
+#  - executar hooks (adm-hooks pre/post build/install)
+#  - compilar com suporte a muitos build systems (autotools, cmake, meson, make, cargo, go, python, node, zig)
+#  - instalar em destdir temporário e gerar manifesto
+#  - empacotar em .tar.zst (ou .tar.xz)
+#  - opcionalmente instalar no / via adm-install
+#  - suporte a chroot (usando safe_mounts/safe_umounts)
+#
+# Uso:
+#  adm-build --metafile <path> [--chroot <root>] [--destdir <dir>] [--jobs N] [--package-only] [--install] [--no-dry-run] [--force] [--profile <file>]
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado: ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ----------------- Defaults -----------------
+METAFILE=""
+CHROOT_ROOT=""
+DESTDIR_OVERRIDE=""
+JOBS="$(nproc || echo 1)"
+PACKAGE_ONLY=0
+DO_INSTALL=0
+OUTPACK="${ADM_PACKAGES}"
+MAKEFLAGS=""
+BUILD_ONLY_PKG=""
+EXTRA_ARGS=()
+
+# ----------------- Parse args -----------------
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --metafile) METAFILE="$2"; shift 2 ;;
+    --chroot) CHROOT_ROOT="$2"; shift 2 ;;
+    --destdir) DESTDIR_OVERRIDE="$2"; shift 2 ;;
+    --jobs) JOBS="$2"; shift 2 ;;
+    --package-only) PACKAGE_ONLY=1; shift ;;
+    --install) DO_INSTALL=1; shift ;;
+    --profile) ADM_PROFILE="$2"; shift 2 ;;
+    --no-dry-run|--force) EXTRA_ARGS+=("$1"); shift ;;
+    --help|-h)
+      cat <<EOF
+Usage: $(basename "$0") --metafile <metafile> [--chroot <root>] [--destdir <dir>] [--jobs N] [--package-only] [--install] [--profile <file>] [--no-dry-run] [--force]
+EOF
+      exit 0
+      ;;
+    *)
+      EXTRA_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# Parse common flags if present in EXTRA_ARGS
+adm_parse_common_flags "${EXTRA_ARGS[@]}" || { adm_log ERR "Falha ao processar flags comuns"; exit 1; }
+
+if [ -z "${METAFILE}" ]; then
+  adm_log ERR "Você deve especificar --metafile <path>"
+  exit 1
+fi
+
+if [ ! -f "${METAFILE}" ]; then
+  adm_log ERR "Metafile não encontrado: ${METAFILE}"
+  exit 1
+fi
+
+# Load metafile variables into environment (but keep them local via names)
+declare NAME VERSION CATEGORY URLS FILENAME SHA256 BUILD_SYSTEM BUILD_DEPS RUN_DEPS OPT_DEPS PATCH_DIR HOOKS_DIR
+# Use adm_source_metafile which exports variables; we'll capture safe copies
+# To avoid polluting global env, source in a subshell and read values
+# but adm_source_metafile exports into environment — acceptable for this script
+adm_source_metafile "${METAFILE}" || { adm_log WARN "Falha ao source metafile (parcial)"; }
+
+# After adm_source_metafile, variables like NAME, VERSION etc should be present
+NAME="${NAME:-$(read_metafile_val "${METAFILE}" "NAME" || echo "unnamed")}"
+VERSION="${VERSION:-$(read_metafile_val "${METAFILE}" "VERSION" || echo "")}"
+CATEGORY="${CATEGORY:-$(read_metafile_val "${METAFILE}" "CATEGORY" || echo "misc")}"
+URLS="${URLS:-$(read_metafile_val "${METAFILE}" "URLS" || echo "")}"
+FILENAME="${FILENAME:-$(read_metafile_val "${METAFILE}" "FILENAME" || echo "")}"
+SHA256="${SHA256:-$(read_metafile_val "${METAFILE}" "SHA256" || echo "")}"
+BUILD_SYSTEM="${BUILD_SYSTEM:-$(read_metafile_val "${METAFILE}" "BUILD_SYSTEM" || echo "")}"
+PATCH_DIR="${PATCH_DIR:-$(read_metafile_val "${METAFILE}" "PATCH_DIR" || echo "")}"
+HOOKS_DIR="${HOOKS_DIR:-$(read_metafile_val "${METAFILE}" "HOOKS_DIR" || echo "")}"
+
+# default destdir for build/install staging
+if [ -n "${DESTDIR_OVERRIDE}" ]; then
+  BUILD_DESTDIR="${DESTDIR_OVERRIDE}"
+else
+  BUILD_DESTDIR="${ADM_DESTDIR}/${NAME}-${VERSION:-$(date +%s)}"
+fi
+
+# logs and tmp
+RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+LOGPATH="${ADM_LOG}/${NAME}-${VERSION:-noversion}_${RUN_TIMESTAMP}.log"
+TMPWORK="$(mktempdir)"
+trap 'rm -rf "${TMPWORK}" 2>/dev/null || true' EXIT
+
+adm_log INFO "Iniciando build: ${NAME} ${VERSION} (category=${CATEGORY})"
+adm_log INFO "Metafile: ${METAFILE}"
+adm_log INFO "Workdir temporário: ${TMPWORK}"
+adm_log INFO "Logfile: ${LOGPATH}"
+adm_log INFO "Destdir (staging): ${BUILD_DESTDIR}"
+
+# Ensure required dirs
+mkdir -p "${OUTPACK}" "${ADM_PACKAGES}" "${ADM_SOURCES_CACHE}" "${ADM_TEMP}" "${ADM_LOG}"
+
+# If BUILD_DEPS etc not set, read again robustly
+BUILD_DEPS="${BUILD_DEPS:-$(read_metafile_val "${METAFILE}" "BUILD_DEPS" || echo "")}"
+RUN_DEPS="${RUN_DEPS:-$(read_metafile_val "${METAFILE}" "RUN_DEPS" || echo "")}"
+OPT_DEPS="${OPT_DEPS:-$(read_metafile_val "${METAFILE}" "OPT_DEPS" || echo "")}"
+
+# Helper: show brief header
+show_header() {
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+  printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM BUILD: ${NAME}-${VERSION:-?}" "${T_RESET}"
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+}
+
+show_header
+
+# ---------- Step 0: pre-checks ----------
+require_root_for_chroot=0
+if [ -n "${CHROOT_ROOT}" ]; then
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_log ERR "Para usar --chroot é necessário rodar como root."
+    exit 1
+  fi
+  require_root_for_chroot=1
+fi
+
+# ---------- Step 1: resolve dependencies (call adm-resolver) ----------
+# We'll prefer to call adm-resolver to produce an order for full build if metafile lists BUILD_DEPS
+RESOLVER_PLAN=""
+RESOLVER_JSON="${ADM_TEMP}/resolver-${NAME}-${RUN_TIMESTAMP}.json"
+if [ -n "${BUILD_DEPS}" ] || [ -n "${RUN_DEPS}" ]; then
+  adm_log INFO "Invocando adm-resolver para gerar plano de dependências..."
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-resolver ${METAFILE} --json ${RESOLVER_JSON} --plan"
+  else
+    # adm-resolver accepts metafile path; it will try to find metafile for node
+    # Use category/name for clarity: METAFILE path -> derive node
+    node="${CATEGORY}/${NAME}"
+    /bin/sh "${ADM_SCRIPTS}/adm-resolver" "${METAFILE}" --json "${RESOLVER_JSON}" --plan || {
+      adm_log WARN "adm-resolver retornou erro; prosseguindo mesmo assim (é possível que não haja dependências ou haja ciclo)"
+    }
+  fi
+else
+  adm_log INFO "Nenhuma BUILD_DEPS definida; pulando adm-resolver."
+fi
+
+# ---------- Step 2: download sources (call adm-download) ----------
+# adm-download expects a metafile path
+adm_log INFO "Baixando fontes via adm-download..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-download ${METAFILE} --concurrency ${JOBS}"
+else
+  "${ADM_SCRIPTS}/adm-download" "${METAFILE}" --concurrency "${JOBS}" || {
+    adm_log ERR "adm-download falhou."
+    exit 1
+  }
+fi
+
+# find cached file path (if FILENAME specified, use that; else try index)
+if [ -n "${FILENAME}" ]; then
+  CACHE_FILE="$(cache_path_for "${FILENAME}")"
+else
+  # attempt to find a matching file in cache by name pattern (NAME-VERSION or NAME)
+  CACHE_FILE="$(ls -1 "${ADM_SOURCES_CACHE}" 2>/dev/null | grep -E "${NAME}.*${VERSION:-}" | head -n1 || true)"
+  if [ -n "${CACHE_FILE}" ]; then
+    CACHE_FILE="${ADM_SOURCES_CACHE}/${CACHE_FILE}"
+  else
+    # fallback: if single file in cache matches NAME prefix
+    CACHE_FILE="$(ls -1 "${ADM_SOURCES_CACHE}" 2>/dev/null | grep -E "^${NAME}" | head -n1 || true)"
+    if [ -n "${CACHE_FILE}" ]; then CACHE_FILE="${ADM_SOURCES_CACHE}/${CACHE_FILE}"; fi
+  fi
+fi
+
+if [ -z "${CACHE_FILE}" ] || [ ! -f "${CACHE_FILE}" ]; then
+  adm_log WARN "Arquivo fonte não encontrado em cache automaticamente (esperado: ${FILENAME}). Tentando localizar por pattern."
+  # try to find any file that contains name
+  CACHE_FILE="$(find "${ADM_SOURCES_CACHE}" -type f -iname "*${NAME}*" | head -n1 || true)"
+fi
+
+if [ -z "${CACHE_FILE}" ]; then
+  adm_log ERR "Não foi possível localizar o arquivo fonte no cache (${ADM_SOURCES_CACHE})."
+  exit 1
+fi
+
+adm_log OK "Fonte localizada: ${CACHE_FILE}"
+
+# Extract source into workdir
+SRCDIR="${TMPWORK}/${NAME}-${VERSION:-src}"
+mkdir -p "${SRCDIR}"
+adm_log INFO "Extraindo fonte para ${SRCDIR}..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] tar -xaf '${CACHE_FILE}' -C '${SRCDIR}' --strip-components=1"
+else
+  # try to detect archive type
+  case "${CACHE_FILE}" in
+    *.tar.gz|*.tgz) tar -xzf "${CACHE_FILE}" -C "${SRCDIR}" --strip-components=1 ;;
+    *.tar.xz|*.txz) tar -xJf "${CACHE_FILE}" -C "${SRCDIR}" --strip-components=1 ;;
+    *.tar.bz2|*.tbz2) tar -xjf "${CACHE_FILE}" -C "${SRCDIR}" --strip-components=1 ;;
+    *.zip) unzip -q "${CACHE_FILE}" -d "${SRCDIR}" ;; 
+    *.tar) tar -xf "${CACHE_FILE}" -C "${SRCDIR}" --strip-components=1 ;;
+    *.tar.zst|*.tzst)
+      if command -v zstd >/dev/null 2>&1; then
+        zstd -d --stdout "${CACHE_FILE}" | tar -x -C "${SRCDIR}" --strip-components=1
+      else
+        adm_log ERR "Arquivo .zst encontrado mas 'zstd' não está disponível."
+        exit 1
+      fi
+      ;;
+    *)
+      # if it's a directory archive or git tar, try tar
+      if file "${CACHE_FILE}" | grep -q 'tar archive'; then
+        tar -xf "${CACHE_FILE}" -C "${SRCDIR}" --strip-components=1
+      else
+        adm_log WARN "Formato desconhecido, tentando 'cp' para workdir."
+        mkdir -p "${SRCDIR}/raw"
+        cp -a "${CACHE_FILE}" "${SRCDIR}/raw/" || { adm_log ERR "Falha ao copiar fonte"; exit 1; }
+      fi
+      ;;
+  esac
+fi
+
+# Ensure srctree exists
+if [ ! -d "${SRCDIR}" ]; then
+  adm_log ERR "Diretório de fonte não existe após extração: ${SRCDIR}"
+  exit 1
+fi
+
+# ---------- Step 3: run pre-build hooks ----------
+adm_log INFO "Executando hooks pré-build (globais e locais)..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-hooks run build --phase pre --category ${CATEGORY} --program ${NAME}"
+else
+  "${ADM_SCRIPTS}/adm-hooks" run build --phase pre --category "${CATEGORY}" --program "${NAME}" || {
+    adm_log ERR "Hooks pré-build falharam."
+    exit 1
+  }
+fi
+
+# ---------- Step 4: apply patches ----------
+adm_log INFO "Aplicando patches (se houver) para ${CATEGORY}/${NAME}..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-patch ${SRCDIR} ${CATEGORY} ${NAME} ${CHROOT_ROOT:+--chroot ${CHROOT_ROOT}}"
+else
+  "${ADM_SCRIPTS}/adm-patch" "${SRCDIR}" "${CATEGORY}" "${NAME}" ${CHROOT_ROOT:+--chroot "${CHROOT_ROOT}"} || {
+    adm_log ERR "adm-patch retornou erro."
+    exit 1
+  }
+fi
+
+# ---------- Prepare build environment (profile) ----------
+# Source the selected profile into a subshell env for commands
+if [ -f "${ADM_PROFILE}" ]; then
+  adm_log INFO "Carregando profile: ${ADM_PROFILE}"
+  # safe source, preserve variables
+  # Use a subshell environment for running build steps with profile vars
+fi
+
+# ---------- Build orchestration begins ----------
+# We'll implement per-BUILD_SYSTEM handlers below
+# adm-build (parte 2/4) - continuação
+set -euo pipefail
+IFS=$'\n\t'
+
+# Helper: run in build chroot or locally
+# Usage: run_in_build_env "<command...>"
+run_in_build_env() {
+  local cmd="$*"
+  if [ -n "${CHROOT_ROOT}" ]; then
+    adm_log INFO "Executando no chroot ${CHROOT_ROOT}: ${cmd}"
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] chroot '${CHROOT_ROOT}' sh -c '${cmd}'"
+      return 0
+    fi
+    chroot "${CHROOT_ROOT}" /bin/sh -c "${cmd}"
+  else
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${cmd}"
+      return 0
+    fi
+    # run in subshell so environment modifications are local
+    ( /bin/sh -c "${cmd}" )
+  fi
+}
+
+# Helper: prepare build environment variables string from profile
+prepare_build_env_cmds() {
+  # export variables from profile file
+  if [ -f "${ADM_PROFILE}" ]; then
+    # create a temporary exports file to source in build commands
+    local expf="${TMPWORK}/profile.exports"
+    awk -F= '/^[A-Za-z_][A-Za-z0-9_]*=/{gsub(/^"|"$|^'\''|'\''$/,"",$2); printf("export %s=\"%s\"\n",$1,$2)}' "${ADM_PROFILE}" > "${expf}"
+    printf " . '%s' ; " "${expf}"
+  else
+    printf ""
+  fi
+}
+
+# Helper: detect/build function selection
+run_autotools_build() {
+  adm_log INFO "Construindo com autotools (./configure && make && make install DESTDIR=...)"
+  local envcmd; envcmd=$(prepare_build_env_cmds)
+  local cfgopts="--prefix=${ADM_PROFILE:+$(grep '^PREFIX=' ${ADM_PROFILE} 2>/dev/null | cut -d= -f2 | sed 's/^\"//;s/\"$//'):-/usr}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${SRCDIR}' && ${envcmd} ./configure ${cfgopts} && make -j${JOBS} && make DESTDIR='${BUILD_DESTDIR}' install)"
+    return 0
+  fi
+  (cd "${SRCDIR}" && eval "${envcmd} ./configure ${cfgopts}") || { adm_log ERR "configure falhou"; return 1; }
+  (cd "${SRCDIR}" && make -j"${JOBS}") || { adm_log ERR "make falhou"; return 1; }
+  # install into staging destdir
+  mkdir -p "${BUILD_DESTDIR}"
+  (cd "${SRCDIR}" && make DESTDIR="${BUILD_DESTDIR}" install) || { adm_log ERR "make install falhou"; return 1; }
+  return 0
+}
+
+run_cmake_build() {
+  adm_log INFO "Construindo com CMake"
+  local builddir="${SRCDIR}/_build"
+  mkdir -p "${builddir}"
+  local envcmd; envcmd=$(prepare_build_env_cmds)
+  local prefix="${ADM_PROFILE:+$(grep '^PREFIX=' ${ADM_PROFILE} 2>/dev/null | cut -d= -f2 | sed 's/^\"//;s/\"$//'):-/usr}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${builddir}' && ${envcmd} cmake .. -DCMAKE_INSTALL_PREFIX=${prefix} && make -j${JOBS} && make DESTDIR='${BUILD_DESTDIR}' install)"
+    return 0
+  fi
+  (cd "${builddir}" && eval "${envcmd} cmake .. -DCMAKE_INSTALL_PREFIX=${prefix}") || { adm_log ERR "cmake configure falhou"; return 1; }
+  (cd "${builddir}" && make -j"${JOBS}") || { adm_log ERR "cmake make falhou"; return 1; }
+  mkdir -p "${BUILD_DESTDIR}"
+  (cd "${builddir}" && make DESTDIR="${BUILD_DESTDIR}" install) || { adm_log ERR "cmake install falhou"; return 1; }
+  return 0
+}
+
+run_meson_build() {
+  adm_log INFO "Construindo com Meson"
+  local builddir="${SRCDIR}/_build"
+  local prefix="${ADM_PROFILE:+$(grep '^PREFIX=' ${ADM_PROFILE} 2>/dev/null | cut -d= -f2 | sed 's/^\"//;s/\"$//'):-/usr}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] meson setup '${builddir}' --prefix=${prefix} ; ninja -C '${builddir}' ; ninja -C '${builddir}' install DESTDIR='${BUILD_DESTDIR}'"
+    return 0
+  fi
+  meson setup "${builddir}" --prefix="${prefix}" || { adm_log ERR "meson setup falhou"; return 1; }
+  ninja -C "${builddir}" -j "${JOBS}" || { adm_log ERR "ninja build falhou"; return 1; }
+  mkdir -p "${BUILD_DESTDIR}"
+  ninja -C "${builddir}" install DESTDIR="${BUILD_DESTDIR}" || { adm_log ERR "meson install falhou"; return 1; }
+  return 0
+}
+
+run_make_only() {
+  adm_log INFO "Construindo com make"
+  local envcmd; envcmd=$(prepare_build_env_cmds)
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${SRCDIR}' && ${envcmd} make -j${JOBS} && make DESTDIR='${BUILD_DESTDIR}' install)"
+    return 0
+  fi
+  (cd "${SRCDIR}" && eval "${envcmd} make -j${JOBS}") || { adm_log ERR "make falhou"; return 1; }
+  mkdir -p "${BUILD_DESTDIR}"
+  (cd "${SRCDIR}" && eval "${envcmd} make DESTDIR='${BUILD_DESTDIR}' install") || { adm_log ERR "make install falhou"; return 1; }
+  return 0
+}
+
+run_python_build() {
+  adm_log INFO "Construindo Python package (setup.py/pyproject)"
+  local envcmd; envcmd=$(prepare_build_env_cmds)
+  if [ -f "${SRCDIR}/pyproject.toml" ]; then
+    # try PEP517 build via pip wheel install into destdir? We'll use build backend if available
+    if command -v python3 >/dev/null 2>&1 && python3 -c "import build" >/dev/null 2>&1; then
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] python3 -m build --wheel --outdir '${TMPWORK}' '${SRCDIR}'"
+        return 0
+      fi
+      (cd "${SRCDIR}" && python3 -m build --wheel --outdir "${TMPWORK}") || { adm_log ERR "python build wheel falhou"; return 1; }
+      # install wheel into destdir using pip install --root
+      mkdir -p "${BUILD_DESTDIR}"
+      for w in "${TMPWORK}"/*.whl; do
+        [ -f "${w}" ] || continue
+        pip3 install --no-deps --root "${BUILD_DESTDIR}" "${w}" || { adm_log ERR "pip install wheel falhou"; return 1; }
+      done
+      return 0
+    fi
+  fi
+  # fallback to setup.py
+  if [ -f "${SRCDIR}/setup.py" ]; then
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] (cd '${SRCDIR}' && ${envcmd} python3 setup.py build && ${envcmd} python3 setup.py install --root='${BUILD_DESTDIR}')"
+      return 0
+    fi
+    (cd "${SRCDIR}" && eval "${envcmd} python3 setup.py build") || { adm_log ERR "python build falhou"; return 1; }
+    mkdir -p "${BUILD_DESTDIR}"
+    (cd "${SRCDIR}" && eval "${envcmd} python3 setup.py install --root='${BUILD_DESTDIR}'") || { adm_log ERR "python install falhou"; return 1; }
+    return 0
+  fi
+  adm_log ERR "Nenhum sistema Python detectado (setup.py/pyproject)"
+  return 1
+}
+
+run_cargo_build() {
+  adm_log INFO "Construindo Rust (cargo)"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${SRCDIR}' && cargo build --release && cargo install --path . --root '${BUILD_DESTDIR}')"
+    return 0
+  fi
+  (cd "${SRCDIR}" && cargo build --release) || { adm_log ERR "cargo build falhou"; return 1; }
+  mkdir -p "${BUILD_DESTDIR}"
+  (cd "${SRCDIR}" && cargo install --path . --root "${BUILD_DESTDIR}") || { adm_log ERR "cargo install falhou"; return 1; }
+  return 0
+}
+
+run_go_build() {
+  adm_log INFO "Construindo Go"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${SRCDIR}' && go build ./... ; install binaries to ${BUILD_DESTDIR}/usr/bin )"
+    return 0
+  fi
+  (cd "${SRCDIR}" && go build ./...) || { adm_log ERR "go build falhou"; return 1; }
+  mkdir -p "${BUILD_DESTDIR}/usr/bin"
+  # try to move built binaries (heuristic: look for executables in ./)
+  find "${SRCDIR}" -maxdepth 2 -type f -perm /a+x -exec cp -a {} "${BUILD_DESTDIR}/usr/bin/" \; || true
+  return 0
+}
+
+run_node_build() {
+  adm_log INFO "Construindo Node.js (npm/yarn)"
+  if [ -f "${SRCDIR}/package.json" ]; then
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] (cd '${SRCDIR}' && npm install && npm run build && npm pack or npm install --prefix ${BUILD_DESTDIR})"
+      return 0
+    fi
+    (cd "${SRCDIR}" && npm install) || { adm_log ERR "npm install falhou"; return 1; }
+    mkdir -p "${BUILD_DESTDIR}/usr/lib/node_modules"
+    (cd "${SRCDIR}" && npm pack --silent) || true
+    # attempt global-style installation to destdir
+    (cd "${SRCDIR}" && npm install --prefix "${BUILD_DESTDIR}") || true
+    return 0
+  fi
+  adm_log ERR "package.json não encontrado para Node build"
+  return 1
+}
+
+run_zig_build() {
+  adm_log INFO "Construindo Zig"
+  # Zig build system: 'zig build' usually installs to zig-out/bin; we'll run build then copy
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${SRCDIR}' && zig build -Drelease-safe=true && copy outputs to ${BUILD_DESTDIR})"
+    return 0
+  fi
+  (cd "${SRCDIR}" && zig build -Drelease-safe=true) || { adm_log ERR "zig build falhou"; return 1; }
+  # copy likely binaries
+  find "${SRCDIR}" -path "*/zig-out/bin/*" -type f -exec mkdir -p "${BUILD_DESTDIR}/usr/bin" \; -exec cp -a {} "${BUILD_DESTDIR}/usr/bin/" \; || true
+  return 0
+}
+
+# Generic handler mapping
+dispatch_build_by_system() {
+  local bs="$1"
+  case "${bs}" in
+    autotools) run_autotools_build ;;
+    cmake) run_cmake_build ;;
+    meson) run_meson_build ;;
+    make|gnu-make) run_make_only ;;
+    python) run_python_build ;;
+    cargo|rust) run_cargo_build ;;
+    go) run_go_build ;;
+    node) run_node_build ;;
+    zig) run_zig_build ;;
+    *) 
+      # fallback try autotools -> cmake -> make
+      adm_log WARN "Build system '${bs}' desconhecido; tentando heurísticas (configure/make/cmake)"
+      if [ -f "${SRCDIR}/configure" ] || [ -f "${SRCDIR}/configure.ac" ]; then run_autotools_build; return $?; fi
+      if [ -f "${SRCDIR}/CMakeLists.txt" ]; then run_cmake_build; return $?; fi
+      if [ -f "${SRCDIR}/Makefile" ]; then run_make_only; return $?; fi
+      adm_log ERR "Não consegui detectar um build system apropriado."
+      return 1
+      ;;
+  esac
+}
+
+# ---------- Auto-detect build system if not set ----------
+if [ -z "${BUILD_SYSTEM}" ]; then
+  adm_log INFO "BUILD_SYSTEM não definido no metafile — detectando automaticamente..."
+  # naive detection: presence of files
+  if [ -f "${SRCDIR}/configure" ] || [ -f "${SRCDIR}/configure.ac" ]; then BUILD_SYSTEM="autotools"; fi
+  if [ -f "${SRCDIR}/CMakeLists.txt" ]; then BUILD_SYSTEM="cmake"; fi
+  if [ -f "${SRCDIR}/meson.build" ]; then BUILD_SYSTEM="meson"; fi
+  if [ -f "${SRCDIR}/Cargo.toml" ]; then BUILD_SYSTEM="cargo"; fi
+  if [ -f "${SRCDIR}/setup.py" ] || [ -f "${SRCDIR}/pyproject.toml" ]; then BUILD_SYSTEM="python"; fi
+  if [ -f "${SRCDIR}/package.json" ]; then BUILD_SYSTEM="node"; fi
+  if [ -f "${SRCDIR}/build.zig" ]; then BUILD_SYSTEM="zig"; fi
+  if [ -z "${BUILD_SYSTEM}" ]; then
+    # fallback to plain make if Makefile present
+    if [ -f "${SRCDIR}/Makefile" ]; then BUILD_SYSTEM="make"; fi
+  fi
+  adm_log INFO "BUILD_SYSTEM detectado: ${BUILD_SYSTEM:-(unknown)}"
+fi
+
+# ---------- Prepare staging destdir cleanly ----------
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] preparar destdir ${BUILD_DESTDIR} (mkdir -p)"
+else
+  # create destdir and ensure clean workspace
+  if [ -d "${BUILD_DESTDIR}" ]; then
+    adm_log WARN "Destdir já existe: ${BUILD_DESTDIR} ; limpando conteúdo"
+    run_cmd "find '${BUILD_DESTDIR}' -mindepth 1 -delete"
+  else
+    run_cmd "mkdir -p '${BUILD_DESTDIR}'"
+  fi
+fi
+
+# ---------- If in chroot, mount pseudo-filesystems ----------
+if [ -n "${CHROOT_ROOT}" ]; then
+  adm_log INFO "Preparando chroot em ${CHROOT_ROOT}"
+  safe_mounts "${CHROOT_ROOT}"
+  # Copy sources into chroot (workdir)
+  CHROOT_SRCDIR="${CHROOT_ROOT}/tmp/adm-src-${NAME}-${RUN_TIMESTAMP}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mkdir -p '${CHROOT_SRCDIR}' && cp -a '${SRCDIR}/.' '${CHROOT_SRCDIR}/'"
+  else
+    run_cmd "mkdir -p '${CHROOT_SRCDIR}'"
+    run_cmd "cp -a '${SRCDIR}/.' '${CHROOT_SRCDIR}/'"
+  fi
+  # set SRCDIR inside chroot to this path
+  SRCDIR_IN_CHROOT="${CHROOT_SRCDIR}"
+fi
+
+# ---------- Actual build invocation ----------
+adm_log INFO "Iniciando etapa de compilação para ${NAME} com BUILD_SYSTEM=${BUILD_SYSTEM}"
+# adm-build (parte 3/4) - continuação
+set -euo pipefail
+IFS=$'\n\t'
+
+# Execute build using dispatch (in chroot or host)
+build_failed=0
+if [ -n "${CHROOT_ROOT}" ]; then
+  # inside chroot run dispatch referring to SRCDIR_IN_CHROOT and BUILD_DESTDIR mapped into chroot?
+  # We'll create a staging destdir inside chroot, then copy back to host BUILD_DESTDIR
+  CHROOT_BUILD_DEST="/tmp/adm-dest-${NAME}-${RUN_TIMESTAMP}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] Dentro do chroot: criar '${CHROOT_BUILD_DEST}' e executar build with BUILD_DESTDIR -> '${CHROOT_BUILD_DEST}'"
+  else
+    run_cmd "mkdir -p '${CHROOT_ROOT}${CHROOT_BUILD_DEST}'"
+  fi
+
+  # dispatch inside chroot: we run a script snippet via chroot sh -c
+  build_cmds_sh=""
+  # ensure profile exports available inside chroot by copying profile if exists
+  if [ -f "${ADM_PROFILE}" ]; then
+    run_cmd "mkdir -p '${CHROOT_ROOT}/etc/adm-profile.d' || true"
+    if [ "${ADM_DRYRUN}" -eq 0 ]; then
+      cp -a "${ADM_PROFILE}" "${CHROOT_ROOT}/etc/adm-profile.d/profile.default"
+    fi
+  fi
+
+  # choose the invocation based on BUILD_SYSTEM
+  case "${BUILD_SYSTEM}" in
+    autotools)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && ./configure --prefix=/usr && make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install"
+      ;;
+    cmake)
+      build_cmds_sh="mkdir -p '${SRCDIR_IN_CHROOT}/_build' && cd '${SRCDIR_IN_CHROOT}/_build' && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install"
+      ;;
+    meson)
+      build_cmds_sh="meson setup '${SRCDIR_IN_CHROOT}/_build' --prefix=/usr && ninja -C '${SRCDIR_IN_CHROOT}/_build' -j ${JOBS} && ninja -C '${SRCDIR_IN_CHROOT}/_build' install DESTDIR='${CHROOT_BUILD_DEST}'"
+      ;;
+    cargo)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && cargo build --release && cargo install --path . --root '${CHROOT_BUILD_DEST}'"
+      ;;
+    python)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && python3 setup.py build && python3 setup.py install --root='${CHROOT_BUILD_DEST}'"
+      ;;
+    make)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install"
+      ;;
+    node)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && npm install && npm run build || true && npm install --prefix '${CHROOT_BUILD_DEST}'"
+      ;;
+    go)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && go build ./... && mkdir -p '${CHROOT_BUILD_DEST}/usr/bin' && cp -a $(find . -maxdepth 2 -type f -perm /a+x | tr '\n' ' ') '${CHROOT_BUILD_DEST}/usr/bin/' || true"
+      ;;
+    zig)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && zig build -Drelease-safe=true && cp -a zig-out/bin/* '${CHROOT_BUILD_DEST}/usr/bin/' || true"
+      ;;
+    *)
+      build_cmds_sh="cd '${SRCDIR_IN_CHROOT}' && if [ -f configure ]; then ./configure --prefix=/usr && make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install; elif [ -f CMakeLists.txt ]; then mkdir -p _build && cd _build && cmake .. -DCMAKE_INSTALL_PREFIX=/usr && make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install; elif [ -f Makefile ]; then make -j${JOBS} && make DESTDIR='${CHROOT_BUILD_DEST}' install; else echo 'no-build-system'; exit 1; fi"
+      ;;
+  esac
+
+  adm_log INFO "Executando comando de build dentro do chroot..."
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] chroot '${CHROOT_ROOT}' sh -c \"${build_cmds_sh}\""
+  else
+    if ! chroot "${CHROOT_ROOT}" /bin/sh -c "${build_cmds_sh}"; then
+      adm_log ERR "Build dentro do chroot falhou."
+      build_failed=1
+    fi
+  fi
+
+  # If successful, copy from chroot CHROOT_BUILD_DEST to host BUILD_DESTDIR
+  if [ "${build_failed}" -eq 0 ]; then
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] copiar '${CHROOT_ROOT}${CHROOT_BUILD_DEST}/.' -> '${BUILD_DESTDIR}/'"
+    else
+      run_cmd "mkdir -p '${BUILD_DESTDIR}'"
+      # Use rsync if available for efficiency
+      if command -v rsync >/dev/null 2>&1; then
+        run_cmd "rsync -a --delete '${CHROOT_ROOT}${CHROOT_BUILD_DEST}/' '${BUILD_DESTDIR}/'"
+      else
+        run_cmd "chroot '${CHROOT_ROOT}' sh -c \"cd '${CHROOT_BUILD_DEST}' && tar -cf - .\" | tar -C '${BUILD_DESTDIR}' -xf -"
+      fi
+    fi
+  fi
+
+  # cleanup chroot tmp
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rm -rf '${CHROOT_ROOT}${CHROOT_BUILD_DEST}'"
+  else
+    run_cmd "rm -rf '${CHROOT_ROOT}${CHROOT_BUILD_DEST}'"
+  fi
+
+else
+  # Non-chroot build (host)
+  if ! dispatch_build_by_system "${BUILD_SYSTEM}"; then
+    adm_log ERR "Build falhou no host (BUILD_SYSTEM=${BUILD_SYSTEM})"
+    build_failed=1
+  fi
+fi
+
+# If build failed, abort (but ensure umount if chroot)
+if [ "${build_failed}" -ne 0 ]; then
+  if [ -n "${CHROOT_ROOT}" ]; then
+    adm_log INFO "Desmontando pseudo-filesystems do chroot devido a erro"
+    safe_umounts "${CHROOT_ROOT}"
+  fi
+  adm_log ERR "Falha na etapa de build, abortando."
+  exit 1
+fi
+
+adm_log OK "Build concluído com sucesso."
+
+# ---------- Step: post-build hooks ----------
+adm_log INFO "Executando hooks pós-build..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-hooks run build --phase post --category ${CATEGORY} --program ${NAME}"
+else
+  "${ADM_SCRIPTS}/adm-hooks" run build --phase post --category "${CATEGORY}" --program "${NAME}" || {
+    adm_log WARN "Hooks pós-build retornaram erro, prosseguindo (hooks devem ser analisados)."
+  }
+fi
+
+# ---------- Step: generate manifest of files installed in BUILD_DESTDIR ----------
+MANIFEST_FILE="${ADM_DB}/${NAME}-${VERSION:-unknown}.manifest"
+adm_log INFO "Gerando manifesto em ${MANIFEST_FILE} (lista de arquivos instalados)"
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] find '${BUILD_DESTDIR}' -type f > ${MANIFEST_FILE}"
+else
+  if [ -d "${BUILD_DESTDIR}" ]; then
+    find "${BUILD_DESTDIR}" -type f | sed "s#^${BUILD_DESTDIR}##" | sed 's#^/##' > "${MANIFEST_FILE}"
+    adm_log OK "Manifesto escrito: ${MANIFEST_FILE}"
+  else
+    adm_log WARN "BUILD_DESTDIR não existe para gerar manifesto"
+    touch "${MANIFEST_FILE}"
+  fi
+fi
+
+# ---------- Step: package into tar.zst or tar.xz ----------
+PKGNAME="${NAME}-${VERSION:-${RUN_TIMESTAMP}}"
+PKGFILE_ZST="${OUTPACK}/${PKGNAME}.tar.zst"
+PKGFILE_XZ="${OUTPACK}/${PKGNAME}.tar.xz"
+adm_log INFO "Empacotando ${PKGNAME} em ${OUTPACK}..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] tar -C '${BUILD_DESTDIR}' -cf - . | zstd -T0 -o '${PKGFILE_ZST}'"
+else
+  if command -v zstd >/dev/null 2>&1; then
+    # create tar and compress with zstd streaming
+    (cd "${BUILD_DESTDIR}" && tar -cf - .) | zstd -T0 -o "${PKGFILE_ZST}" || { adm_log ERR "Falha ao criar tar.zst"; exit 1; }
+    PACKED_FILE="${PKGFILE_ZST}"
+  else
+    (cd "${BUILD_DESTDIR}" && tar -caf "${PKGFILE_XZ}" .) || { adm_log ERR "Falha ao criar tar.xz"; exit 1; }
+    PACKED_FILE="${PKGFILE_XZ}"
+  fi
+  adm_log OK "Empacotamento gerado: ${PACKED_FILE}"
+fi
+
+# ---------- If chroot: umount pseudo-filesystems now ----------
+if [ -n "${CHROOT_ROOT}" ]; then
+  adm_log INFO "Desmontando pseudo-filesystems do chroot..."
+  safe_umounts "${CHROOT_ROOT}"
+fi
+# adm-build (parte 4/4) - finalização, registration, optional install, cleanup
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- Step: register package in adm-db ----------
+adm_log INFO "Registrando pacote no DB (adm-db add)..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-db add ${NAME} ${VERSION} ${PACKED_FILE} ${MANIFEST_FILE}"
+else
+  "${ADM_SCRIPTS}/adm-db" add "${NAME}" "${VERSION}" "${PACKED_FILE}" "${MANIFEST_FILE}" || {
+    adm_log WARN "Falha ao registrar pacote no DB (continuando)"
+  }
+fi
+
+# ---------- Step: optional install to real / (via adm-install) ----------
+if [ "${DO_INSTALL}" -eq 1 ]; then
+  adm_log INFO "Instalação solicitada: chamando adm-install para ${PACKED_FILE}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${ADM_SCRIPTS}/adm-install install ${PACKED_FILE} --manifest ${MANIFEST_FILE}"
+  else
+    # adm-install may accept package path or metafile; we assume it can accept package archive path
+    if [ -x "${ADM_SCRIPTS}/adm-install" ]; then
+      "${ADM_SCRIPTS}/adm-install" install "${PACKED_FILE}" --manifest "${MANIFEST_FILE}" || {
+        adm_log ERR "adm-install falhou para ${PACKED_FILE}"
+        # do not abort; user may want to inspect
+      }
+    else
+      adm_log WARN "adm-install não encontrado; saltando instalação automática."
+    fi
+  fi
+fi
+
+# ---------- Step: run post-install hooks (if installed into /) ----------
+# Note: we executed post-build hooks earlier. post-install hooks would be called by adm-install.
+# We'll still fire post-package hooks
+adm_log INFO "Executando hooks pós-package..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-hooks run package --phase post --category ${CATEGORY} --program ${NAME}"
+else
+  "${ADM_SCRIPTS}/adm-hooks" run package --phase post --category "${CATEGORY}" --program "${NAME}" || {
+    adm_log WARN "Hooks pós-package retornaram erro"
+  }
+fi
+
+# ---------- Summary output ----------
+print_result() {
+  printf "\n%bBuild Summary:%b\n" "${T_BOLD}" "${T_RESET}"
+  printf "  %bPackage:%b %s\n" "${T_CYAN}" "${T_RESET}" "${NAME}-${VERSION:-unknown}"
+  printf "  %bPacked:%b %s\n" "${T_CYAN}" "${T_RESET}" "${PACKED_FILE:-(none)}"
+  printf "  %bManifest:%b %s\n" "${T_CYAN}" "${T_RESET}" "${MANIFEST_FILE}"
+  printf "  %bDestdir:%b %s\n" "${T_CYAN}" "${T_RESET}" "${BUILD_DESTDIR}"
+  printf "  %bLog:%b %s\n" "${T_CYAN}" "${T_RESET}" "${LOGPATH}"
+  printf "  %bDry-run:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_DRYRUN}"
+  printf "\n"
+}
+print_result
+
+adm_log OK "Build orchestration finalizada com sucesso para ${NAME}-${VERSION:-unknown}."
+
+# ---------- Cleanup: optionally keep staging or remove -->
+# If user did not specify a persistent DESTDIR_OVERRIDE, we can remove staging to save space
+if [ -z "${DESTDIR_OVERRIDE}" ]; then
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] remover staging: rm -rf '${BUILD_DESTDIR}'"
+  else
+    adm_log INFO "Removendo staging: ${BUILD_DESTDIR}"
+    run_cmd "rm -rf '${BUILD_DESTDIR}'"
+  fi
+else
+  adm_log INFO "Preservando staging em ${BUILD_DESTDIR} (destdir override fornecido)"
+fi
+
+# Exit cleanly
+exit 0
