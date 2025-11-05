@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# adm-resolver
+#
+# Resolve dependências a partir de metafiles KEY=VAL e (opcional) detect JSON.
+# - Topological ordering (Kahn)
+# - Expansão de metapacotes via MEMBERS="a b c"
+# - Integra BUILD_DEPS, RUN_DEPS, OPT_DEPS e dependências detectadas (detect JSON)
+# - Detecta e reporta ciclos com detalhes
+# - Exporta plano em texto colorido, JSON ou DOT (graphviz)
+# - Busca metafiles por nome em /usr/src/adm/metafiles/<category>/<program>/metafile
+# - Interface:
+#     adm-resolver <pkg-or-metafile> [<pkg> ...] [--detect <detect.json>] [--plan] [--json out.json] [--dot out.dot] [--verbose]
+#
+# Nota: um "pkg" pode ser:
+#   - caminho para metafile (/usr/src/adm/metafiles/<cat>/<pkg>/metafile)
+#   - "category/name"
+#   - "name" (o script tentará encontrar um metafile com esse name em qualquer categoria)
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# load common
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------- parse args ----------
+OUTPUT_JSON=""
+OUTPUT_DOT=""
+PLAN=0
+VERBOSE=0
+DETECT_JSON=""
+ARGS=()
+
+# consume args
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --plan) PLAN=1; shift ;;
+    --json) OUTPUT_JSON="$2"; shift 2 ;;
+    --dot) OUTPUT_DOT="$2"; shift 2 ;;
+    --detect) DETECT_JSON="$2"; shift 2 ;;
+    --verbose|-v) VERBOSE=1; shift ;;
+    --no-dry-run|--force|--profile) # let adm_parse_common_flags handle
+      ARGS+=("$1"); shift ;;
+    --help|-h)
+      cat <<EOF
+Usage: $(basename "$0") <pkg-or-metafile> [<pkg> ...] [--detect detect.json] [--plan] [--json out.json] [--dot out.dot] [--verbose]
+Examples:
+  adm-resolver core/bash --plan
+  adm-resolver /usr/src/adm/metafiles/core/bash/metafile --plan
+  adm-resolver firefox kde --detect /tmp/detect-firefox.json --json plan.json
+EOF
+      exit 0
+      ;;
+    *)
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+# parse common flags from ARGS to capture --no-dry-run / --force
+adm_parse_common_flags "${ARGS[@]}" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+
+# rebuild positional package args (filtering global flags left in ARGS)
+PKG_ARGS=()
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  a="${ARGS[$i]}"
+  case "${a}" in
+    --no-dry-run|--force) i=$((i+1)); continue ;;
+    --profile) i=$((i+2)); continue ;;
+    *)
+      PKG_ARGS+=("${a}"); i=$((i+1)) ;;
+  esac
+done
+
+if [ "${#PKG_ARGS[@]}" -eq 0 ]; then
+  adm_log ERR "Nenhum pacote/metafile especificado."
+  exit 1
+fi
+
+adm_ensure_dirs
+
+# ---------- helpers ----------
+# resolve a package identifier to a metafile path.
+# accepts:
+#  - absolute path to metafile
+#  - category/name
+#  - name -> search across categories (first match)
+find_metafile_for() {
+  local id="$1"
+  # absolute path?
+  if [ -f "${id}" ]; then
+    echo "${id}"; return 0
+  fi
+  # category/name?
+  if [[ "${id}" == */* ]]; then
+    local mf="${ADM_METAFILES}/${id}/metafile"
+    if [ -f "${mf}" ]; then
+      echo "${mf}"; return 0
+    fi
+  fi
+  # search across categories by NAME field or directory name
+  # direct directory candidate
+  for cand in "${ADM_METAFILES}"/*/"${id}"; do
+    if [ -d "${cand}" ] && [ -f "${cand}/metafile" ]; then
+      echo "${cand}/metafile"; return 0
+    fi
+  done
+  # search by NAME inside metafiles
+  local found=0
+  while IFS= read -r mf; do
+    [ -f "${mf}" ] || continue
+    nm=$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)
+    if [ "${nm}" = "${id}" ]; then
+      echo "${mf}"; return 0
+    fi
+  done < <(find "${ADM_METAFILES}" -type f -name "metafile" 2>/dev/null)
+  return 1
+}
+
+# read dependency lists from metafile via read_metafile_val
+read_meta_deps() {
+  local mf="$1"
+  local key="$2"
+  local raw
+  raw=$(read_metafile_val "${mf}" "${key}" 2>/dev/null || echo "")
+  # normalize: space-separated (allow commas/newlines)
+  if [ -z "${raw}" ]; then
+    echo ""
+    return 0
+  fi
+  # replace commas with spaces, trim
+  raw=$(printf "%s" "${raw}" | tr '\n' ' ' | tr ',' ' ')
+  # collapse multiple spaces
+  echo "${raw}" | awk '{$1=$1;print}'
+}
+
+# if metafile contains MEMBERS (meta-package), return members expanded list
+read_meta_members() {
+  local mf="$1"
+  local mem
+  mem=$(read_metafile_val "${mf}" "MEMBERS" 2>/dev/null || echo "")
+  if [ -z "${mem}" ]; then
+    echo ""
+    return 0
+  fi
+  mem=$(printf "%s" "${mem}" | tr ',' ' ' | awk '{$1=$1;print}')
+  echo "${mem}"
+}
+
+# Load detect JSON if provided – parse build_deps & run_deps arrays (simple parsing)
+parse_detect_json() {
+  local dj="$1"
+  if [ -z "${dj}" ] || [ ! -f "${dj}" ]; then
+    return 0
+  fi
+  # Use python3 to parse reliably if available, else fallback to grep-based (less reliable)
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY
+import json,sys
+p=sys.argv[1]
+j=json.load(open(p))
+for k in ('build_deps','run_deps'):
+    if k in j and j[k]:
+        for dep in j[k]:
+            print(k,dep)
+PY
+  else
+    # fallback: crude extraction
+    grep -E '"(build_deps|run_deps)"' -n "${dj}" 2>/dev/null || true
+  fi
+}
+
+# ---------- Graph structures ----------
+# We'll use bash associative arrays (requires bash >=4)
+declare -A NODE_EXISTS   # node -> 1
+declare -A ADJ          # adjacency list as space-separated string: ADJ["A"]="B C"
+declare -A IN_DEGREE    # node -> count
+declare -A METAFILE_OF  # node -> metafile path (if known)
+declare -A NODE_TYPE    # node -> type (package|metapackage|external)
+declare -A MARK         # for cycle detection / DFS if needed
+
+# add node helper
+add_node() {
+  local node="$1"
+  [ -n "${node}" ] || return 1
+  if [ -z "${NODE_EXISTS[${node}]:-}" ]; then
+    NODE_EXISTS["${node}"]=1
+    ADJ["${node}"]=""
+    IN_DEGREE["${node}"]=0
+    NODE_TYPE["${node}"]="package"
+  fi
+}
+
+# add edge u -> v (u depends on v; means v must be built before u)
+add_edge() {
+  local u="$1"; local v="$2"
+  add_node "${u}"; add_node "${v}"
+  # prevent duplicate edges
+  # check if v already in ADJ[u]
+  local cur="${ADJ[$u]}"
+  case " ${cur} " in
+    *" ${v} "*) return 0 ;;
+  esac
+  ADJ["$u"]="${cur} ${v}"
+  IN_DEGREE["${v}"]=$((IN_DEGREE["${v}"] + 1))
+}
+
+# normalize dep token to node id and load metafile if available
+resolve_dep_to_node() {
+  local dep="$1"
+  # trim
+  dep=$(printf "%s" "${dep}" | awk '{$1=$1;print}')
+  [ -n "${dep}" ] || return 1
+  # if dep already a known node, return it
+  if [ -n "${NODE_EXISTS[${dep}]:-}" ]; then
+    printf "%s" "${dep}"; return 0
+  fi
+  # try find metafile for dep
+  mf=$(find_metafile_for "${dep}" 2>/dev/null || true)
+  if [ -n "${mf}" ]; then
+    # generate canonical node id as category/name relative path
+    # extract category and program from mf path: ${ADM_METAFILES}/<category>/<program>/metafile
+    rel="${mf#${ADM_METAFILES}/}"
+    category="${rel%%/*}"
+    program="${rel#*/}"; program="${program%%/*}"
+    node="${category}/${program}"
+    METAFILE_OF["${node}"]="${mf}"
+    NODE_TYPE["${node}"]="package"
+    add_node "${node}"
+    printf "%s" "${node}"
+    return 0
+  fi
+  # otherwise treat as external package name (no metafile)
+  node="external:${dep}"
+  NODE_TYPE["${node}"]="external"
+  add_node "${node}"
+  printf "%s" "${node}"
+  return 0
+}
+
+# ---------- Build graph from inputs ----------
+# Iterate over requested pkgs and expand recursively
+declare -a WORK_QUEUE=()
+declare -A QUEUED
+
+enqueue_if_needed() {
+  local n="$1"
+  if [ -z "${QUEUED[${n}]:-}" ]; then
+    WORK_QUEUE+=("${n}")
+    QUEUED["${n}"]=1
+  fi
+}
+
+# Seed initial nodes from PKG_ARGS
+for p in "${PKG_ARGS[@]}"; do
+  # allow user to pass category/name or name or metafile path
+  mf="$(find_metafile_for "${p}" 2>/dev/null || true)"
+  if [ -n "${mf}" ]; then
+    # derive node
+    rel="${mf#${ADM_METAFILES}/}"
+    catname="${rel%%/*}"
+    prog="${rel#*/}"; prog="${prog%%/*}"
+    node="${catname}/${prog}"
+    METAFILE_OF["${node}"]="${mf}"
+    add_node "${node}"
+    enqueue_if_needed "${node}"
+  else
+    # if no metafile, treat as external node by name
+    node="external:${p}"
+    add_node "${node}"
+    enqueue_if_needed "${node}"
+  fi
+done
+
+# If detect JSON provided, parse and add its dependencies as external nodes attached to a virtual "detected" node
+DETECT_NODE=""
+if [ -n "${DETECT_JSON}" ]; then
+  if [ ! -f "${DETECT_JSON}" ]; then
+    adm_log WARN "detect JSON não encontrado: ${DETECT_JSON}"
+  else
+    DETECT_NODE="__detect_input__"
+    add_node "${DETECT_NODE}"
+    NODE_TYPE["${DETECT_NODE}"]="detect"
+    enqueue_if_needed "${DETECT_NODE}"
+    # parse and attach build/run deps
+    if command -v python3 >/dev/null 2>&1; then
+      while IFS= read -r kind dep; do
+        [ -z "${dep}" ] && continue
+        depnode=$(resolve_dep_to_node "${dep}")
+        # connect detect_node -> depnode
+        add_edge "${DETECT_NODE}" "${depnode}"
+      done < <(python3 - <<PY
+import json,sys
+p=sys.argv[1]
+j=json.load(open(p))
+for k in ('build_deps','run_deps'):
+    if k in j and j[k]:
+        for dep in j[k]:
+            print(k,dep)
+PY
+"${DETECT_JSON}")
+    else
+      # fallback
+      parse_detect_json "${DETECT_JSON}" | while read -r kind dep; do
+        depnode=$(resolve_dep_to_node "${dep}")
+        add_edge "${DETECT_NODE}" "${depnode}"
+      done
+    fi
+  fi
+fi
+
+# BFS-style expansion: for each queued node that has a metafile, read its deps and add edges
+while [ "${#WORK_QUEUE[@]}" -gt 0 ]; do
+  cur="${WORK_QUEUE[0]}"
+  WORK_QUEUE=("${WORK_QUEUE[@]:1}")
+  mf="${METAFILE_OF[${cur}]:-}"
+  # if cur is external or detect node, skip reading metafile
+  if [ -z "${mf}" ]; then
+    # nothing to expand
+    continue
+  fi
+  # expand members if metapackage
+  members=$(read_meta_members "${mf}")
+  if [ -n "${members}" ]; then
+    NODE_TYPE["${cur}"]="metapackage"
+    for m in ${members}; do
+      # resolve each member to node
+      mn=$(resolve_dep_to_node "${m}")
+      add_edge "${cur}" "${mn}"
+      enqueue_if_needed "${mn}"
+    done
+    # continue expanding other keys as well
+  fi
+
+  # read build/run/opt deps
+  bdeps=$(read_meta_deps "${mf}" "BUILD_DEPS")
+  rdeps=$(read_meta_deps "${mf}" "RUN_DEPS")
+  odeps=$(read_meta_deps "${mf}" "OPT_DEPS")
+
+  # add edges cur -> depnode (cur depends on depnode)
+  for d in ${bdeps}; do
+    depnode=$(resolve_dep_to_node "${d}")
+    add_edge "${cur}" "${depnode}"
+    enqueue_if_needed "${depnode}"
+  done
+  for d in ${rdeps}; do
+    depnode=$(resolve_dep_to_node "${d}")
+    add_edge "${cur}" "${depnode}"
+    enqueue_if_needed "${depnode}"
+  done
+  for d in ${odeps}; do
+    depnode=$(resolve_dep_to_node "${d}")
+    add_edge "${cur}" "${depnode}"
+    enqueue_if_needed "${depnode}"
+  done
+done
+
+# ---------- Topological sort (Kahn) ----------
+# We'll produce an order that satisfies dependencies: items with indegree 0 can be built first.
+# Note: our edges u->v mean "u depends on v", so v must come before u. For topological sort we invert:
+# We'll compute in-degree based on ADJ as built (IN_DEGREE already reflects dependency counts).
+declare -a Q=()
+declare -a ORDER=()
+
+# Enqueue nodes with indegree 0
+for n in "${!NODE_EXISTS[@]}"; do
+  if [ "${IN_DEGREE[${n}]:-0}" -eq 0 ]; then
+    Q+=("${n}")
+  fi
+done
+
+# Kahn algorithm
+while [ ${#Q[@]} -gt 0 ]; do
+  n="${Q[0]}"; Q=("${Q[@]:1}")
+  ORDER+=("${n}")
+  # for each m in ADJ[n] (n depends on m) -- but we must reduce indegree of m? careful:
+  # Our ADJ is built as ADJ[u] = "v1 v2" where u depends on v1,v2
+  # When we "remove" n, we need to reduce indegree for nodes that depend on n.
+  # So we must traverse all nodes and find those that have n in their adjacency? That's O(N^2).
+  # Better: build reverse adjacency revAdj[v] list of nodes that depend on v.
+  :
+done
+
+# To implement Kahn efficiently we reconstruct reverse adjacency (revAdj[v] = nodes that depend on v)
+declare -A REVADJ
+for u in "${!ADJ[@]}"; do
+  for v in ${ADJ[$u]}; do
+    REVADJ["${v}"]="${REVADJ[${v}]} ${u}"
+  done
+done
+
+# Re-init indegree copy (safe)
+declare -A INDEG_COPY
+for k in "${!IN_DEGREE[@]}"; do INDEG_COPY["$k"]="${IN_DEGREE[$k]}"; done
+
+# Initialize queue with zero indegree nodes
+Q=()
+for n in "${!NODE_EXISTS[@]}"; do
+  if [ "${INDEG_COPY[${n}]:-0}" -eq 0 ]; then Q+=("${n}"); fi
+done
+
+ORDER=()
+while [ ${#Q[@]} -gt 0 ]; do
+  n="${Q[0]}"; Q=("${Q[@]:1}")
+  ORDER+=("${n}")
+  for m in ${REVADJ[${n}]:-}; do
+    INDEG_COPY["${m}"]=$((INDEG_COPY["${m}"] - 1))
+    if [ "${INDEG_COPY[${m}]}" -eq 0 ]; then
+      Q+=("${m}")
+    fi
+  done
+done
+
+# If not all nodes processed, cycle exists
+total_nodes=0
+for k in "${!NODE_EXISTS[@]}"; do total_nodes=$((total_nodes+1)); done
+processed=${#ORDER[@]}
+
+if [ "${processed}" -ne "${total_nodes}" ]; then
+  adm_log ERR "Ciclo detectado nas dependências! (processados=${processed}, total=${total_nodes})"
+  # find nodes in cycle: those with INDEG_COPY > 0
+  adm_log ERR "Nós envolvidos no ciclo:"
+  for k in "${!INDEG_COPY[@]}"; do
+    if [ "${INDEG_COPY[${k}]:-0}" -gt 0 ]; then
+      adm_log ERR "  - ${k} (tipo=${NODE_TYPE[${k}]:-unknown})"
+      # show what it depends on
+      adm_log ERR "    depende de: ${ADJ[${k}]:-(none)}"
+    fi
+  done
+  adm_log ERR "SUGESTÃO: verifique metafiles para dependências circulares ou criar hooks pre/post para quebrar o ciclo."
+  # produce partial order (ORDER) and exit non-zero with details
+  if [ "${PLAN}" -eq 1 ] || [ -n "${OUTPUT_JSON}" ]; then
+    adm_log INFO "Gerando plano parcial (nodes não resolvidos listados ao final)."
+  fi
+  # continue to produce partial JSON/DOT/plan with note about cycle
+  CYCLE_DETECTED=1
+else
+  CYCLE_DETECTED=0
+fi
+
+# Prepare output structures: we want to output build order that places dependencies earlier.
+# ORDER currently is valid topological order where dependencies appear before dependents.
+# For usability, filter out DETECT_NODE if present
+FINAL_ORDER=()
+for n in "${ORDER[@]}"; do
+  [ "${n}" = "${DETECT_NODE}" ] && continue
+  FINAL_ORDER+=("${n}")
+done
+
+# ---------- Output: plan (text) ----------
+print_plan_text() {
+  print_header() {
+    printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+    printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM RESOLVER - PLAN" "${T_RESET}"
+    printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+  }
+  print_header
+  adm_log INFO "Dependências resolvidas (ordem de compilação/instalação: dependências primeiro):"
+  local idx=1
+  for n in "${FINAL_ORDER[@]}"; do
+    local type="${NODE_TYPE[${n}]:-unknown}"
+    local mf="${METAFILE_OF[${n}]:-}"
+    if [ -n "${mf}" ]; then
+      local ver
+      ver=$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || echo "")
+      printf "%3d) %b%s%b  %s %s\n" "${idx}" "${T_BOLD}${T_GREEN}" "${n}" "${T_RESET}" "${ver:+(v:${ver})}" "${type}"
+    else
+      printf "%3d) %b%s%b  %s\n" "${idx}" "${T_BOLD}${T_YELLOW}" "${n}" "${T_RESET}" "(external)"
+    fi
+    idx=$((idx+1))
+  done
+  if [ "${CYCLE_DETECTED}" -eq 1 ]; then
+    adm_log WARN "Ciclos detectados — plano parcial gerado. Corrija metafiles para remover ciclo."
+  fi
+}
+
+# ---------- Output: JSON ----------
+write_json() {
+  local out="${1:-${OUTPUT_JSON}}"
+  [ -n "${out}" ] || return 0
+  # build JSON arrays stable order: use FINAL_ORDER, and include metadata for each node
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] gerar JSON em ${out}"
+    return 0
+  fi
+  mkdir -p "$(dirname "${out}")" 2>/dev/null || true
+  python3 - <<PY > "${out}"
+import json
+order = ${FINAL_ORDER:+${FINAL_ORDER[@]//\"/\\\"} } # placeholder
+PY
+  # We cannot easily write complex JSON in pure bash reliably; fallback constructive method:
+  tmpjson="$(mktemp "${ADM_TEMP}/adm-resolver.XXXXXX.json")"
+  echo "{" > "${tmpjson}"
+  echo "  \"plan\": [" >> "${tmpjson}"
+  first=1
+  for n in "${FINAL_ORDER[@]}"; do
+    if [ "${first}" -eq 0 ]; then echo "    ," >> "${tmpjson}"; fi
+    first=0
+    mf="${METAFILE_OF[${n}]:-}"
+    type="${NODE_TYPE[${n}]:-unknown}"
+    name_json=$(json_escape "${n}")
+    ver=""
+    if [ -n "${mf}" ]; then
+      ver=$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)
+    fi
+    echo "    {" >> "${tmpjson}"
+    echo "      \"node\": ${name_json}," >> "${tmpjson}"
+    echo "      \"type\": \"${type}\"," >> "${tmpjson}"
+    echo "      \"metafile\": $(json_escape "${mf}") ," >> "${tmpjson}"
+    echo "      \"version\": $(json_escape "${ver}")" >> "${tmpjson}"
+    echo "    }" >> "${tmpjson}"
+  done
+  echo "  ]," >> "${tmpjson}"
+  echo "  \"cycle_detected\": ${CYCLE_DETECTED}" >> "${tmpjson}"
+  echo "}" >> "${tmpjson}"
+  mv "${tmpjson}" "${out}"
+  adm_log OK "JSON de plano escrito em ${out}"
+}
+
+# ---------- Output: DOT ----------
+write_dot() {
+  local out="${1:-${OUTPUT_DOT}}"
+  [ -n "${out}" ] || return 0
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] gerar DOT em ${out}"
+    return 0
+  fi
+  mkdir -p "$(dirname "${out}")" 2>/dev/null || true
+  {
+    echo "digraph adm_resolver {"
+    echo "  rankdir=LR;"
+    # nodes
+    for n in "${!NODE_EXISTS[@]}"; do
+      label="${n}"
+      case "${NODE_TYPE[${n}]:-}" in
+        metapackage) color="pink" ;;
+        external) color="gray" ;;
+        detect) color="cyan" ;;
+        *) color="lightblue" ;;
+      esac
+      echo "  \"${n}\" [label=\"${label}\" style=filled fillcolor=\"${color}\"];"
+    done
+    # edges (u depends on v -> edge v -> u to show dependency flow)
+    for u in "${!ADJ[@]}"; do
+      for v in ${ADJ[$u]}; do
+        echo "  \"${v}\" -> \"${u}\";"
+      done
+    done
+    echo "}"
+  } > "${out}"
+  adm_log OK "DOT escrito em ${out}"
+}
+
+# ---------- Final reporting ----------
+if [ "${PLAN}" -eq 1 ]; then
+  print_plan_text
+fi
+
+if [ -n "${OUTPUT_JSON}" ]; then
+  write_json "${OUTPUT_JSON}"
+fi
+
+if [ -n "${OUTPUT_DOT}" ]; then
+  write_dot "${OUTPUT_DOT}"
+fi
+
+# if verbose, print adjacency lists
+if [ "${VERBOSE}" -eq 1 ]; then
+  adm_log INFO "Adjacency list (u -> deps):"
+  for u in "${!ADJ[@]}"; do
+    adm_log INFO "  ${u} -> ${ADJ[$u]}"
+  done
+fi
+
+# summary
+adm_log OK "Resolver finalizado. Nodes considered: ${total_nodes}, processed: ${processed}."
+if [ "${CYCLE_DETECTED}" -eq 1 ]; then
+  exit 2
+fi
+exit 0
