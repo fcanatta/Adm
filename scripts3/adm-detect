@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# adm-detect (parte 1/2)
+# Detecta build-systems, linguagens, compiladores e dependências heurísticas a partir do source tree.
+#
+# Saída:
+#  - exibe resumo colorido na tela
+#  - grava JSON em ${ADM_TEMP}/detect-<pkgbasename>.json
+#
+# Uso:
+#  adm-detect <sourcedir> [--out <path>] [--name <pkgname>]
+#
+# Dependências: awk, sed, grep, find, tar, pkg-config (opcional)
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado: ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---- parse args ----
+OUTFILE=""
+NAME_OVERRIDE=""
+SRC="$1"
+shift || true
+
+if [ -z "${SRC}" ] || [ ! -d "${SRC}" ]; then
+  adm_log ERR "Usage: $(basename "$0") <sourcedir> [--out <path>] [--name <pkgname>]"
+  exit 1
+fi
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out) OUTFILE="$2"; shift 2 ;;
+    --name) NAME_OVERRIDE="$2"; shift 2 ;;
+    --no-dry-run|--force|--profile) # ignore for detect
+      shift ;;
+    *) adm_log WARN "Argumento desconhecido: $1"; shift ;;
+  esac
+done
+
+# normalize SRC to absolute path
+SRC="$(cd "${SRC}" && pwd -P)"
+
+# basename for naming output
+PKG_BASENAME="$(basename "${SRC}")"
+if [ -n "${NAME_OVERRIDE}" ]; then PKG_BASENAME="${NAME_OVERRIDE}"; fi
+
+# default outfile
+if [ -z "${OUTFILE}" ]; then
+  OUTFILE="${ADM_TEMP}/detect-${PKG_BASENAME}.json"
+fi
+
+adm_log INFO "Detectando em: ${SRC}"
+adm_log INFO "Resultado será gravado em: ${OUTFILE}"
+
+# create temp file for results to avoid partial writes
+TMP_OUT="$(mktempdir)/detect.json.tmp"
+
+# ---- helpers ----
+
+# safe grepping: return 0 if pattern found
+safe_grep() {
+  local pattern="$1"
+  # Use grep -I to ignore binary files, -R to recurse but avoid .git
+  if grep -R -I -n -E "${pattern}" "${SRC}" 2>/dev/null | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+# search for files ignoring .git and build directories
+find_src() {
+  local pattern="$1"
+  find "${SRC}" -type f -iname "${pattern}" -not -path "*/.git/*" -not -path "*/.cache/*" 2>/dev/null
+}
+
+# read first line match for given file pattern
+first_match_file() {
+  local pattern="$1"
+  find_src "${pattern}" | head -n1 || true
+}
+
+# push into arrays safely
+append_unique() {
+  local -n arr=$1; shift
+  local val="$1"
+  for e in "${arr[@]:-}"; do
+    [ "${e}" = "${val}" ] && return 0
+  done
+  arr+=("${val}")
+}
+
+# pretty print JSON string (escape)
+json_escape() {
+  printf '%s' "$1" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || {
+    # fallback simplistic
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+  }
+}
+
+# ---- detection containers ----
+declare -a BUILD_SYSTEMS=()
+declare -a LANGUAGES=()
+declare -a COMPILERS=()
+declare -a BUILD_TOOLS=()
+declare -a LIB_DEPS=()       # libs referenced via pkg-config or configure
+declare -a RUNTIME_DEPS=()   # run-time deps heuristics
+declare -a NOTES=()
+
+# ---- detect build systems by file names ----
+adm_log INFO "Detectando build systems..."
+# autotools (configure.ac or configure)
+if [ -f "${SRC}/configure" ] || [ -f "${SRC}/configure.ac" ] || [ -f "${SRC}/configure.in" ]; then
+  append_unique BUILD_SYSTEMS "autotools"
+  append_unique BUILD_TOOLS "autoconf"
+fi
+# plain Makefile (common)
+if [ -f "${SRC}/Makefile" ] || first_match_file "Makefile" >/dev/null; then
+  append_unique BUILD_SYSTEMS "make"
+  append_unique BUILD_TOOLS "make"
+fi
+# cmake
+if [ -f "${SRC}/CMakeLists.txt" ] || first_match_file "CMakeLists.txt" >/dev/null; then
+  append_unique BUILD_SYSTEMS "cmake"
+  append_unique BUILD_TOOLS "cmake"
+fi
+# meson
+if [ -f "${SRC}/meson.build" ] || first_match_file "meson.build" >/dev/null; then
+  append_unique BUILD_SYSTEMS "meson"
+  append_unique BUILD_TOOLS "meson"
+fi
+# scons
+if first_match_file "SConstruct" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "scons"
+  append_unique BUILD_TOOLS "scons"
+fi
+# waf
+if safe_grep " waf " || first_match_file "wscript" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "waf"
+  append_unique BUILD_TOOLS "waf"
+fi
+# ninja
+if safe_grep "Ninja:" || first_match_file "build.ninja" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "ninja"
+  append_unique BUILD_TOOLS "ninja"
+fi
+# python - setup.py / pyproject
+if [ -f "${SRC}/setup.py" ] || [ -f "${SRC}/pyproject.toml" ] || first_match_file "setup.cfg" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "python"
+  append_unique BUILD_TOOLS "python3"
+fi
+# cargo (Rust)
+if [ -f "${SRC}/Cargo.toml" ] || first_match_file "Cargo.toml" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "cargo"
+  append_unique BUILD_TOOLS "cargo"
+fi
+# go modules
+if [ -f "${SRC}/go.mod" ] || first_match_file "go.mod" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "go"
+  append_unique BUILD_TOOLS "go"
+fi
+# node (npm/yarn)
+if [ -f "${SRC}/package.json" ] || first_match_file "package.json" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "node"
+  append_unique BUILD_TOOLS "npm"
+fi
+# gradle / maven (java)
+if [ -f "${SRC}/build.gradle" ] || [ -f "${SRC}/pom.xml" ] || first_match_file "build.gradle" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "java"
+  append_unique BUILD_TOOLS "gradle,maven"
+fi
+# stack / cabal (haskell)
+if [ -f "${SRC}/stack.yaml" ] || first_match_file "stack.yaml" >/dev/null 2>&1 || first_match_file "*.cabal" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "haskell"
+  append_unique BUILD_TOOLS "stack,cabal"
+fi
+# zig
+if first_match_file "build.zig" >/dev/null 2>&1 || safe_grep "zig build" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "zig"
+  append_unique BUILD_TOOLS "zig"
+fi
+# R packages (DESCRIPTION)
+if first_match_file "DESCRIPTION" >/dev/null 2>&1 && safe_grep "Package:" >/dev/null 2>&1; then
+  append_unique BUILD_SYSTEMS "R"
+  append_unique BUILD_TOOLS "R"
+fi
+
+# ---- detect languages by file extensions and content ----
+adm_log INFO "Detectando linguagens por extensões e conteúdo..."
+
+# helper for extension detection
+has_ext() {
+  local ext="$1"
+  if find "${SRC}" -type f -name "*.${ext}" -not -path "*/.git/*" | grep -q .; then
+    return 0
+  fi
+  return 1
+}
+
+# C
+if has_ext c || safe_grep "#include <" >/dev/null 2>&1; then
+  append_unique LANGUAGES "c"
+  append_unique COMPILERS "gcc"
+fi
+# C++
+if has_ext cpp || has_ext cc || has_ext cxx || safe_grep "#include <iostream>" >/dev/null 2>&1; then
+  append_unique LANGUAGES "cpp"
+  append_unique COMPILERS "g++"
+fi
+# Fortran
+if has_ext f90 || has_ext f95 || safe_grep "PROGRAM" >/dev/null 2>&1 && has_ext f90; then
+  append_unique LANGUAGES "fortran"
+  append_unique COMPILERS "gfortran"
+fi
+# Rust
+if has_ext rs || [ -f "${SRC}/Cargo.toml" ]; then
+  append_unique LANGUAGES "rust"
+  append_unique COMPILERS "rustc"
+fi
+# Go
+if has_ext go || [ -f "${SRC}/go.mod" ]; then
+  append_unique LANGUAGES "go"
+  append_unique COMPILERS "go"
+fi
+# Zig
+if has_ext zig || first_match_file "build.zig" >/dev/null 2>&1; then
+  append_unique LANGUAGES "zig"
+  append_unique COMPILERS "zig"
+fi
+# Java
+if has_ext java || [ -f "${SRC}/pom.xml" ] || [ -f "${SRC}/build.gradle" ]; then
+  append_unique LANGUAGES "java"
+  append_unique COMPILERS "javac"
+fi
+# Python
+if has_ext py || [ -f "${SRC}/setup.py" ] || [ -f "${SRC}/pyproject.toml" ] || find "${SRC}" -name "__init__.py" | grep -q .; then
+  append_unique LANGUAGES "python"
+  append_unique COMPILERS "python3"
+fi
+# Node / JS / TS
+if has_ext js || has_ext ts || [ -f "${SRC}/package.json" ]; then
+  append_unique LANGUAGES "javascript"
+  append_unique COMPILERS "node"
+fi
+# Haskell
+if has_ext hs || first_match_file "*.cabal" >/dev/null 2>&1 || [ -f "${SRC}/stack.yaml" ]; then
+  append_unique LANGUAGES "haskell"
+  append_unique COMPILERS "ghc"
+fi
+# Lua
+if has_ext lua; then
+  append_unique LANGUAGES "lua"
+  append_unique COMPILERS "lua"
+fi
+# R
+if has_ext R || has_ext r || first_match_file "DESCRIPTION" >/dev/null 2>&1; then
+  append_unique LANGUAGES "R"
+  append_unique COMPILERS "R"
+fi
+
+# record detected build systems and languages as notes for resolver
+if [ "${#BUILD_SYSTEMS[@]}" -eq 0 ]; then
+  append_unique NOTES "no-build-system-detected"
+fi
+
+# ---- detect compiler/tool availability on host (best-effort) ----
+adm_log INFO "Verificando ferramentas instaladas no host (gcc, clang, rustc, go, etc.)..."
+for c in gcc clang g++ clang++ rustc cargo go zig javac python3 node npm yarn cmake meson make pkg-config; do
+  if command -v "${c}" >/dev/null 2>&1; then
+    append_unique BUILD_TOOLS "${c}"
+  fi
+done
+
+# end of part 1
+# ----- PARTE 2/2 -----
+# Continua detecção: parsers de dependências, geração JSON e sumário
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado: ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# helpers for parsing common dependency files
+parse_requirements_txt() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line%%;*}"
+    line="${line## }"
+    line="${line%% }"
+    [ -z "${line}" ] && continue
+    dep="${line%%[<>=!~]*}"
+    dep="${dep%%[[:space:]]*}"
+    append_unique RUNTIME_DEPS "${dep}"
+  done < "${file}"
+}
+
+parse_setup_py() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    out=$(python3 - "${file}" <<'PY' 2>/dev/null
+import ast,sys
+p=sys.argv[1]
+with open(p,'r',encoding='utf-8',errors='ignore') as f:
+    src=f.read()
+try:
+    tree=ast.parse(src)
+except Exception:
+    sys.exit(0)
+reqs=[]
+for node in ast.walk(tree):
+    if isinstance(node,ast.Call) and getattr(node.func,'id','') in ('setup','setuptools.setup'):
+        for kw in node.keywords:
+            if kw.arg=='install_requires':
+                try:
+                    for elt in kw.value.elts:
+                        reqs.append(elt.s)
+                except Exception:
+                    pass
+print('\n'.join(reqs))
+PY
+) || out=""
+    for dep in ${out}; do
+      append_unique RUNTIME_DEPS "${dep}"
+    done
+  else
+    grep -E "install_requires" -n "${file}" >/dev/null 2>&1 || return 0
+    local list
+    list=$(sed -n 's/.*install_requires *= *\[\(.*\)\].*/\1/p' "${file}" 2>/dev/null || true)
+    for dep in $(echo "${list}" | sed "s/[',]//g"); do
+      append_unique RUNTIME_DEPS "${dep}"
+    done
+  fi
+}
+
+parse_pyproject_toml() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    out=$(python3 - "${file}" <<'PY' 2>/dev/null
+import sys
+try:
+    import tomllib as tl
+except Exception:
+    try: import toml as tl
+    except Exception:
+        sys.exit(0)
+p=sys.argv[1]
+data=tl.load(open(p,'rb'))
+deps=[]
+if 'project' in data and 'dependencies' in data['project']:
+    deps=data['project']['dependencies']
+if 'tool' in data and 'poetry' in data['tool'] and 'dependencies' in data['tool']['poetry']:
+    deps += list(data['tool']['poetry']['dependencies'].keys())
+print('\n'.join(map(str,deps)))
+PY
+) || out=""
+    for dep in ${out}; do append_unique RUNTIME_DEPS "${dep}"; done
+  else
+    adm_log WARN "python3 missing -> can't parse pyproject.toml reliably"
+  fi
+}
+
+parse_cargo_toml() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  local deps
+  deps=$(awk '/^\[dependencies\]/, /^\[/{ if ($0 ~ /^\[.*\]/ && $0 !~ /^\[dependencies\]/) exit; if ($0 !~ /^\[.*\]/) print }' "${file}" 2>/dev/null || true)
+  for line in ${deps}; do
+    line="${line%%#*}"
+    dep=$(echo "${line}" | sed -E 's/ *=.*//g' | tr -d ' ' )
+    [ -z "${dep}" ] && continue
+    append_unique BUILD_DEPS "${dep}"
+  done
+  deps=$(awk '/^\[dev-dependencies\]/, /^\[/{ if ($0 ~ /^\[.*\]/ && $0 !~ /^\[dev-dependencies\]/) exit; if ($0 !~ /^\[.*\]/) print }' "${file}" 2>/dev/null || true)
+  for line in ${deps}; do
+    line="${line%%#*}"
+    dep=$(echo "${line}" | sed -E 's/ *=.*//g' | tr -d ' ' )
+    [ -z "${dep}" ] && continue
+    append_unique BUILD_DEPS "${dep}"
+  done
+}
+
+parse_package_json() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    out=$(python3 - "${file}" <<'PY' 2>/dev/null
+import json,sys
+p=sys.argv[1]
+try:
+    j=json.load(open(p))
+except Exception:
+    sys.exit(0)
+deps=[]
+for k in ('dependencies','devDependencies','peerDependencies','optionalDependencies'):
+    if k in j:
+        deps += list(j[k].keys())
+print('\n'.join(deps))
+PY
+) || out=""
+    for dep in ${out}; do append_unique RUNTIME_DEPS "${dep}"; done
+  else
+    adm_log WARN "python3 missing -> can't parse package.json reliably"
+  fi
+}
+
+parse_go_mod() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  awk '/^require/ {flag=1; next} /^)/{flag=0} flag==1{print $1}' "${file}" 2>/dev/null | while read -r d; do append_unique BUILD_DEPS "${d}"; done
+}
+
+parse_configure_ac() {
+  local file="$1"
+  [ -f "${file}" ] || return 0
+  if grep -E "PKG_CHECK_MODULES\\(" "${file}" >/dev/null 2>&1; then
+    local pkgs
+    pkgs=$(grep -Eo "PKG_CHECK_MODULES\\([^)]*\\)" "${file}" 2>/dev/null | sed -E 's/PKG_CHECK_MODULES\\(.*,//; s/\\).*//; s/,/ /g' | sed -E 's/[^A-Za-z0-9_-]/ /g')
+    for p in ${pkgs}; do append_unique LIB_DEPS "${p}"; done
+  fi
+}
+
+scan_for_pkgconfig_and_includes() {
+  if safe_grep "pkg-config" >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      if echo "${line}" | grep -q "pkg-config"; then
+        tokens=$(echo "${line}" | sed -n 's/.*pkg-config[^A-Za-z0-9_-]*//p' 2>/dev/null || true)
+        for t in ${tokens}; do
+          if echo "${t}" | grep -Eq '^--'; then continue; fi
+          t=$(echo "${t}" | sed 's/[",]//g')
+          append_unique LIB_DEPS "${t}"
+        done
+      fi
+    done < <(grep -R --line-number "pkg-config" "${SRC}" 2>/dev/null || true)
+  fi
+  if safe_grep "#include <openssl/" >/dev/null 2>&1; then append_unique LIB_DEPS "openssl"; fi
+  if safe_grep "#include <curl/" >/dev/null 2>&1; then append_unique LIB_DEPS "libcurl"; fi
+  if safe_grep "#include <zlib.h" >/dev/null 2>&1; then append_unique LIB_DEPS "zlib"; fi
+}
+
+# Run parsers
+adm_log INFO "Analisando arquivos de dependência comuns..."
+for f in $(find_src "requirements*.txt"); do parse_requirements_txt "${f}"; done
+[ -f "${SRC}/setup.py" ] && parse_setup_py "${SRC}/setup.py"
+[ -f "${SRC}/pyproject.toml" ] && parse_pyproject_toml "${SRC}/pyproject.toml"
+[ -f "${SRC}/package.json" ] && parse_package_json "${SRC}/package.json"
+[ -f "${SRC}/Cargo.toml" ] && parse_cargo_toml "${SRC}/Cargo.toml"
+[ -f "${SRC}/go.mod" ] && parse_go_mod "${SRC}/go.mod"
+[ -f "${SRC}/configure.ac" ] && parse_configure_ac "${SRC}/configure.ac"
+scan_for_pkgconfig_and_includes
+
+# promote LIB_DEPS into build and runtime deps
+for l in "${LIB_DEPS[@]:-}"; do
+  append_unique BUILD_DEPS "${l}"
+  append_unique RUNTIME_DEPS "${l}"
+done
+
+# JSON output helpers
+ADM_TEMP_JSON="${TMP_OUT}"
+array_to_json() {
+  local -n a=$1
+  local out="["
+  local sep=""
+  for v in "${a[@]:-}"; do
+    esc=$(json_escape "${v}") || esc="\"$(printf '%s' "${v}" | sed 's/\"/\\\\\"/g')\""
+    out="${out}${sep}${esc}"
+    sep=","
+  done
+  out="${out}]"
+  printf "%s" "${out}"
+}
+
+build_systems_json=$(array_to_json BUILD_SYSTEMS)
+languages_json=$(array_to_json LANGUAGES)
+compilers_json=$(array_to_json COMPILERS)
+build_tools_json=$(array_to_json BUILD_TOOLS)
+build_deps_json=$(array_to_json BUILD_DEPS)
+run_deps_json=$(array_to_json RUNTIME_DEPS)
+lib_deps_json=$(array_to_json LIB_DEPS)
+notes_json=$(array_to_json NOTES)
+
+mkdir -p "$(dirname "${OUTFILE}")" 2>/dev/null || true
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] escrever JSON em ${OUTFILE} (arquivo temporário em ${ADM_TEMP_JSON})"
+  cat > "${ADM_TEMP_JSON}" <<EOF
+{
+  "source": $(json_escape "${SRC}"),
+  "name": $(json_escape "${PKG_BASENAME}"),
+  "build_systems": ${build_systems_json},
+  "languages": ${languages_json},
+  "compilers": ${compilers_json},
+  "build_tools": ${build_tools_json},
+  "build_deps": ${build_deps_json},
+  "run_deps": ${run_deps_json},
+  "lib_deps": ${lib_deps_json},
+  "notes": ${notes_json}
+}
+EOF
+else
+  cat > "${ADM_TEMP_JSON}" <<EOF
+{
+  "source": $(json_escape "${SRC}"),
+  "name": $(json_escape "${PKG_BASENAME}"),
+  "build_systems": ${build_systems_json},
+  "languages": ${languages_json},
+  "compilers": ${compilers_json},
+  "build_tools": ${build_tools_json},
+  "build_deps": ${build_deps_json},
+  "run_deps": ${run_deps_json},
+  "lib_deps": ${lib_deps_json},
+  "notes": ${notes_json}
+}
+EOF
+  mv "${ADM_TEMP_JSON}" "${OUTFILE}"
+  adm_log OK "Detect result gravado em ${OUTFILE}"
+fi
+
+print_summary() {
+  printf "\n%bDetect Summary:%b\n" "${T_BOLD}" "${T_RESET}"
+  printf "  %bSource:%b %s\n" "${T_CYAN}" "${T_RESET}" "${SRC}"
+  printf "  %bBuild systems:%b %s\n" "${T_CYAN}" "${T_RESET}" "${BUILD_SYSTEMS[*]:-none}"
+  printf "  %bLanguages:%b %s\n" "${T_CYAN}" "${T_RESET}" "${LANGUAGES[*]:-none}"
+  printf "  %bCompilers:%b %s\n" "${T_CYAN}" "${T_RESET}" "${COMPILERS[*]:-none}"
+  printf "  %bBuild tools:%b %s\n" "${T_CYAN}" "${T_RESET}" "${BUILD_TOOLS[*]:-none}"
+  printf "  %bBuild deps:%b %s\n" "${T_CYAN}" "${T_RESET}" "${BUILD_DEPS[*]:-none}"
+  printf "  %bRun deps:%b %s\n" "${T_CYAN}" "${T_RESET}" "${RUNTIME_DEPS[*]:-none}"
+  printf "  %bLib deps:%b %s\n" "${T_CYAN}" "${T_RESET}" "${LIB_DEPS[*]:-none}"
+  printf "  %bNotes:%b %s\n" "${T_CYAN}" "${T_RESET}" "${NOTES[*]:-none}"
+  printf "\n"
+  adm_log INFO "Output detect JSON: ${OUTFILE}"
+  adm_log INFO "Log: ${LOGFILE}"
+}
+
+print_summary
+adm_log OK "adm-detect finalizado com sucesso."
+exit 0
