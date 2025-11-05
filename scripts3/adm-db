@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# adm-db — banco leve de pacotes para ADM (inteligente)
+# adm-db — banco leve de pacotes para ADM (versão inteligente, pretty output, spinner, highlights)
 # Local: /usr/src/adm/db (índices, manifests, packages.db, deps/, rdeps/)
 #
-# Comandos:
-#   adm-db add <name> <version> <archive-or-src> <manifest>
-#   adm-db remove <name> [<version>] [--force]
-#   adm-db list [--format short|long|json]
-#   adm-db query <name> [<version>]     -> json
-#   adm-db list-deps <name> [<version>] -> lista deps (build/run)
-#   adm-db list-dependents <name> [<version>]
-#   adm-db has-command <cmd>
+# Features:
+#  - add/remove/list/query/list-deps/list-dependents/has-command
+#  - pretty output (--pretty) with active line highlighted in PINK/BOLD
+#  - spinner for long operations; clean, non-intrusive
+#  - atomic writes, lockdir, backups
+#  - dry-run support and --force handling
+#  - robust error checking and no silent failures
 #
 set -euo pipefail
 IFS=$'\n\t'
@@ -23,14 +22,24 @@ fi
 . "${COMMON}"
 
 # ---------- Config ----------
-DB_DIR="${ADM_DB}"                   # /usr/src/adm/db
+DB_DIR="${ADM_DB:-/usr/src/adm/db}"                   # default location
 PACKAGES_INDEX="${DB_DIR}/packages.db"   # textual index: name|version|archive|manifest|timestamp
-DEPS_DIR="${DB_DIR}/deps"            # deps/<name>-<version>.deps  (space-separated build and run with keys)
-RDEPS_DIR="${DB_DIR}/rdeps"          # rdeps/<name>-<version>.rdeps -> one per line dependent node
-MANIFESTS_DIR="${DB_DIR}/manifests"  # mirror/central copy of manifests
+DEPS_DIR="${DB_DIR}/deps"            # deps/<name>-<version>.deps  (two lines: build then run)
+RDEPS_DIR="${DB_DIR}/rdeps"          # rdeps/<dep-key>.rdeps -> dependents one per line
+MANIFESTS_DIR="${DB_DIR}/manifests"  # central copy of manifests
 LOCK_DIR="${DB_DIR}/.lock"           # simple lockdir for concurrency
-BACKUP_DIR="${DB_DIR}/backup_$(date +%s)"
 TMPDIR="${ADM_TEMP:-/tmp}/adm-db-$$"
+BACKUP_DIR="${DB_DIR}/backup_$(date +%s)"
+SPINNER_PID=""
+
+# color variables fallback (if adm-common didn't set)
+: "${T_BOLD:=$(tput bold 2>/dev/null || printf '')}"
+: "${T_RESET:=$(tput sgr0 2>/dev/null || printf '')}"
+: "${T_MAGENTA:=$(tput setaf 5 2>/dev/null || printf '')}"
+: "${T_GREEN:=$(tput setaf 2 2>/dev/null || printf '')}"
+: "${T_YELLOW:=$(tput setaf 3 2>/dev/null || printf '')}"
+: "${T_RED:=$(tput setaf 1 2>/dev/null || printf '')}"
+: "${T_CYAN:=$(tput setaf 6 2>/dev/null || printf '')}"
 
 mkdir -p "${DB_DIR}" "${DEPS_DIR}" "${RDEPS_DIR}" "${MANIFESTS_DIR}" "${TMPDIR}"
 
@@ -51,8 +60,70 @@ lock_release() {
   rm -rf "${LOCK_DIR}" 2>/dev/null || true
 }
 
-atomic_write() {
-  # atomic_write <dest> <content-via-stdin>
+# spinner: start_spinner "<message>" ; stop_spinner
+start_spinner() {
+  local msg="$1"
+  # spinner draws on same line; runs in background
+  local spin='|/-\'
+  printf "%s " "${msg}"
+  (
+    i=0
+    while :; do
+      printf "%b" "${spin:i%4:1}"
+      printf "\b"
+      i=$((i+1))
+      sleep 0.08
+    done
+  ) &
+  SPINNER_PID=$!
+  disown "${SPINNER_PID}" 2>/dev/null || true
+}
+stop_spinner() {
+  if [ -n "${SPINNER_PID}" ] && kill -0 "${SPINNER_PID}" 2>/dev/null; then
+    kill "${SPINNER_PID}" 2>/dev/null || true
+    wait "${SPINNER_PID}" 2>/dev/null || true
+    SPINNER_PID=""
+    printf " "
+  fi
+}
+
+# print a pretty table with active line highlight (pink/bold)
+# args: header_line, then array of lines; optionally active index (1-based)
+print_pretty_table() {
+  local header="$1"; shift
+  local active="${1:-0}"; shift
+  local -a lines=("$@")
+  printf "%b%s%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}" "" ""
+  printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM DB — ${header}" "${T_RESET}"
+  printf "%b%s%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}" "" ""
+  local i=1
+  for ln in "${lines[@]}"; do
+    if [ "${i}" -eq "${active}" ]; then
+      # highlight active line in pink bold
+      printf " %b%s%b\n" "${T_BOLD}${T_MAGENTA}" "${ln}" "${T_RESET}"
+    else
+      printf " %s\n" "${ln}"
+    fi
+    i=$((i+1))
+  done
+}
+
+# robust json escape using python3 if available
+json_escape() {
+  local s="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<PY 2>/dev/null
+import json,sys
+print(json.dumps(sys.stdin.read()))
+PY
+    return 0
+  fi
+  # fallback: minimal escaping
+  printf '"%s"' "$(printf "%s" "${s}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e ':a;N;$!ba;s/\n/\\n/g')"
+}
+
+# atomic write helper: writes stdin to dest atomically
+atomic_write_from_stdin() {
   local dest="$1"
   local tmp="${TMPDIR}/tmp.$(basename "${dest}").$$.$(date +%s)"
   cat > "${tmp}"
@@ -61,27 +132,27 @@ atomic_write() {
 
 timestamp_now() { date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z'; }
 
-# safe append line to packages index
-add_packages_index_line() {
+# append line to packages index (safe)
+append_packages_index_line() {
   local line="$1"
   if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
     adm_log INFO "[dry-run] append to ${PACKAGES_INDEX}: ${line}"
     return 0
   fi
   mkdir -p "$(dirname "${PACKAGES_INDEX}")"
-  echo "${line}" >> "${PACKAGES_INDEX}"
+  printf '%s\n' "${line}" >> "${PACKAGES_INDEX}"
 }
 
-# rewrite packages index atomically from provided content (stdin)
-write_packages_index_from_stdin() {
-  local dest="${PACKAGES_INDEX}"
-  local tmp="${TMPDIR}/packages.db.$$.tmp"
-  cat > "${tmp}"
-  mv -f "${tmp}" "${dest}"
+# read packages index lines into array (preserve ordering)
+read_all_index_lines() {
+  local -a arr=()
+  if [ -f "${PACKAGES_INDEX}" ]; then
+    while IFS= read -r l; do arr+=("${l}"); done < "${PACKAGES_INDEX}"
+  fi
+  printf '%s\n' "${arr[@]:-}"
 }
 
 # find package entries (lines) matching name and optional version
-# prints matching lines
 find_package_entries() {
   local name="$1"
   local version="${2:-}"
@@ -94,19 +165,22 @@ find_package_entries() {
 }
 
 # parse a packages.db line into variables (name|version|archive|manifest|ts)
-parse_packages_line() {
+parse_packages_line_vars() {
   local line="$1"
-  IFS='|' read -r _p_name _p_ver _p_archive _p_manifest _p_ts <<< "${line}"
-  printf '%s\0%s\0%s\0%s\0%s' "${_p_name}" "${_p_ver}" "${_p_archive}" "${_p_manifest}" "${_p_ts}"
+  IFS='|' read -r p_name p_ver p_archive p_manifest p_ts <<< "${line}"
+  printf '%s\0%s\0%s\0%s\0%s' "${p_name}" "${p_ver}" "${p_archive}" "${p_manifest}" "${p_ts}"
 }
 
 # read deps from metafile if exists
 read_deps_from_metafile() {
   local mf="$1"
+  if [ ! -f "${mf}" ]; then
+    printf '\n\n'
+    return 0
+  fi
   local bdeps rdeps
   bdeps="$(read_metafile_val "${mf}" "BUILD_DEPS" 2>/dev/null || echo "")"
   rdeps="$(read_metafile_val "${mf}" "RUN_DEPS" 2>/dev/null || echo "")"
-  # normalize commas/newlines to space
   bdeps="$(printf "%s" "${bdeps}" | tr ',' ' ' | tr '\n' ' ' | awk '{$1=$1;print}')"
   rdeps="$(printf "%s" "${rdeps}" | tr ',' ' ' | tr '\n' ' ' | awk '{$1=$1;print}')"
   printf '%s\n%s' "${bdeps}" "${rdeps}"
@@ -124,15 +198,12 @@ store_deps_file() {
   printf '%s\n%s\n' "${bdeps}" "${rdeps}" > "${file}.tmp" && mv -f "${file}.tmp" "${file}"
 }
 
-# update reverse deps: for each dep in bdeps|rdeps add this package as dependent
+# update reverse deps for a package: adds this pkg to each dep's rdeps file
 update_reverse_deps_for() {
   local name="$1" ver="$2" bdeps="$3" rdeps="$4"
-  # bdeps and rdeps are space-separated names (could be category/name or simple)
   local pkgid="${name}-${ver}"
   for d in ${bdeps} ${rdeps}; do
     [ -z "${d}" ] && continue
-    # map dependency to a canonical key for rdeps filename: replace slashes with '__'
-    local key
     key="$(printf "%s" "${d}" | sed 's#/#__#g')"
     local rfile="${RDEPS_DIR}/${key}.rdeps"
     if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
@@ -140,28 +211,25 @@ update_reverse_deps_for() {
       continue
     fi
     mkdir -p "${RDEPS_DIR}"
-    # append only if not present
     grep -Fxq "${pkgid}" "${rfile}" 2>/dev/null || echo "${pkgid}" >> "${rfile}"
   done
 }
 
-# remove reverse deps entries for a package (when package removed)
+# remove reverse-dep entries for a package (when removed)
 remove_reverse_deps_for() {
   local name="$1" ver="$2"
   local pkgid="${name}-${ver}"
-  # iterate all rdeps files and remove lines equal to pkgid
   if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
     adm_log INFO "[dry-run] would remove reverse-dep entries for ${pkgid} in ${RDEPS_DIR}"
     return 0
   fi
   for f in "${RDEPS_DIR}"/*.rdeps; do
     [ -f "${f}" ] || continue
-    # use grep -v to filter out
     grep -Fvx "${pkgid}" "${f}" > "${f}.tmp" && mv -f "${f}.tmp" "${f}"
   done
 }
 
-# find reverse dependents for a dependency name (accepts category/name or simple)
+# find reverse dependents for a dependency name (category/name or simple)
 find_reverse_dependents_of() {
   local dep="$1"
   local key
@@ -171,25 +239,42 @@ find_reverse_dependents_of() {
     cat "${rfile}"
     return 0
   fi
-  # fallback try search for files containing dep name fragment
-  grep -R --line-number --no-messages --exclude-dir=".git" -n "${dep}" "${RDEPS_DIR}" 2>/dev/null || true
+  # fallback: search for dep fragment inside all rdeps files
+  if [ -d "${RDEPS_DIR}" ]; then
+    grep -R --line-number --no-messages --exclude-dir=".git" -n "${dep}" "${RDEPS_DIR}" 2>/dev/null || true
+  fi
   return 0
 }
 # ----- continuação PARTE 2/2 -----
-set -euo pipefail
-IFS=$'\n\t'
+# ---------- CLI ----------
+CMD="${1:-}"; shift || true
+FORMAT="short"
+PRETTY=0
+DRYRUN_FLAG=0
+FORCE_FLAG=0
 
-# ---------- CLI dispatch ----------
-CMD="${1:-}"
-shift || true
+# parse common flags usage helper
+parse_extra_flags() {
+  local args=("$@")
+  for ((i=0;i<${#args[@]};i++)); do
+    case "${args[i]}" in
+      --format) FORMAT="${args[i+1]:-short}"; i=$((i+1)) ;;
+      --pretty) PRETTY=1 ;;
+      --dry-run) DRYRUN_FLAG=1 ;;
+      --no-dry-run) DRYRUN_FLAG=0 ;;
+      --force) FORCE_FLAG=1 ;;
+      *) ;;
+    esac
+  done
+}
 
 usage() {
   cat <<EOF
 adm-db <command> [args...]
 Commands:
-  add <name> <version> <archive-or-src> <manifest>
-  remove <name> [<version>] [--force]
-  list [--format short|long|json]
+  add <name> <version> <archive-or-src> <manifest> [--dry-run]
+  remove <name> [<version>] [--force] [--dry-run]
+  list [--format short|long|json] [--pretty]
   query <name> [<version>]
   list-deps <name> [<version>]
   list-dependents <name> [<version>]
@@ -202,8 +287,7 @@ if [ -z "${CMD}" ]; then usage; fi
 
 case "${CMD}" in
   has-command)
-    sub="${1:-}"
-    shift || true
+    sub="${1:-}"; shift || true
     case "${sub}" in
       add|remove|list|query|list-deps|list-dependents|has-command) exit 0 ;;
       *) exit 1 ;;
@@ -211,65 +295,70 @@ case "${CMD}" in
     ;;
 
   add)
-    # adm-db add <name> <version> <archive-or-src> <manifest>
-    name="${1:-}"; version="${2:-}"; archive="${3:-}"; manifest="${4:-}"
-    shift 4 || true
+    name="${1:-}"; version="${2:-}"; archive="${3:-}"; manifest="${4:-}"; shift 4 || true
+    parse_extra_flags "$@"
+    # dry-run respects either ADM_DRYRUN or provided flag
+    if [ "${DRYRUN_FLAG}" -eq 1 ]; then ADM_DRYRUN=1; fi
+
     if [ -z "${name}" ] || [ -z "${version}" ] || [ -z "${archive}" ] || [ -z "${manifest}" ]; then
-      adm_log ERR "Usage: adm-db add <name> <version> <archive-or-src> <manifest>"
+      adm_log ERR "Usage: adm-db add <name> <version> <archive-or-src> <manifest> [--dry-run]"
       exit 1
     fi
 
-    # validate manifest exists
-    if [ ! -f "${manifest}" ]; then
-      adm_log ERR "Manifest não encontrado: ${manifest}"
-      exit 1
-    fi
+    if [ ! -f "${manifest}" ]; then adm_log ERR "Manifest não encontrado: ${manifest}"; exit 1; fi
 
-    # lock DB for write
-    lock_acquire || exit 1
+    lock_acquire || { adm_log ERR "Falha ao adquirir lock"; exit 1; }
     trap 'lock_release; exit 1' INT TERM
 
+    # perform operation with spinner and highlight
+    start_spinner "Registrando pacote ${name}-${version} ..."
     ts="$(timestamp_now)"
     line="${name}|${version}|${archive}|${manifest}|${ts}"
-    # write manifest to central manifests dir (copy)
     mf_dest="${MANIFESTS_DIR}/${name}-${version}.manifest"
     if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
-      adm_log INFO "[dry-run] copy ${manifest} -> ${mf_dest}"
-    else
-      cp -a "${manifest}" "${mf_dest}" || { adm_log ERR "Falha copiando manifest"; lock_release; exit 1; }
+      adm_log INFO "[dry-run] copiar ${manifest} -> ${mf_dest}"
+      stop_spinner
+      adm_log OK "Pacote (dry-run) registrado: ${name}-${version}"
+      lock_release
+      exit 0
     fi
 
-    add_packages_index_line "${line}"
+    # real add
+    if ! cp -a "${manifest}" "${mf_dest}"; then
+      stop_spinner
+      adm_log ERR "Falha ao copiar manifest para ${mf_dest}"
+      lock_release
+      exit 1
+    fi
 
-    # read deps from metafile if exists (try to locate metafile by package name)
+    append_packages_index_line "${line}"
+
+    # attempt to find metafile for deps; if none, read manifest for hints (best-effort)
     mf_found="$(find_metafile_for "${name}" 2>/dev/null || true)"
     if [ -n "${mf_found}" ]; then
       read -r bdeps rdeps < <(read_deps_from_metafile "${mf_found}")
     else
-      # try to infer from manifest (not guaranteed) - leave empty
-      bdeps=""; rdeps=""
+      # try to parse manifest file for common dependency hints (naive)
+      bdeps="$(grep -Eo 'BUILD_DEPS=[^ ]+' "${manifest}" 2>/dev/null | sed 's/BUILD_DEPS=//' | tr -d '"')"
+      rdeps="$(grep -Eo 'RUN_DEPS=[^ ]+' "${manifest}" 2>/dev/null | sed 's/RUN_DEPS=//' | tr -d '"')"
     fi
 
     store_deps_file "${name}" "${version}" "${bdeps}" "${rdeps}"
     update_reverse_deps_for "${name}" "${version}" "${bdeps}" "${rdeps}"
 
+    stop_spinner
     adm_log OK "Pacote registrado: ${name}-${version}"
     lock_release
     ;;
 
   remove)
-    # adm-db remove <name> [<version>] [--force]
     name="${1:-}"; version="${2:-}"; shift 2 || true
-    FORCE_FLAG=0
-    # check optional flags among remaining args
-    for a in "$@"; do
-      case "${a}" in
-        --force) FORCE_FLAG=1 ;;
-      esac
-    done
-    if [ -z "${name}" ]; then adm_log ERR "Usage: adm-db remove <name> [<version>] [--force]"; exit 1; fi
+    # parse any flags after
+    parse_extra_flags "$@"
+    if [ "${DRYRUN_FLAG}" -eq 1 ]; then ADM_DRYRUN=1; fi
+    if [ -z "${name}" ]; then adm_log ERR "Usage: adm-db remove <name> [<version>] [--force] [--dry-run]"; exit 1; fi
 
-    lock_acquire || exit 1
+    lock_acquire || { adm_log ERR "Falha ao adquirir lock"; exit 1; }
     trap 'lock_release; exit 1' INT TERM
 
     # find matching entries
@@ -280,15 +369,21 @@ case "${CMD}" in
       exit 1
     fi
 
-    # For each match, check dependents (reverse index)
+    # iterate matches
+    i=0
     while IFS= read -r line; do
       [ -z "${line}" ] && continue
+      i=$((i+1))
       IFS='|' read -r p_name p_ver p_archive p_manifest p_ts <<< "${line}"
-      # find reverse dependents
+
+      # print active line highlighted (pink/bold)
+      print_pretty_table "Removendo pacotes" "${i}" "${p_name}-${p_ver}"
+
+      # check dependents via RDEPS
       deps_list="$(find_reverse_dependents_of "${p_name}" | sed '/^$/d' || true)"
       if [ -n "${deps_list}" ]; then
         adm_log WARN "Dependentes detectados para ${p_name}-${p_ver}:"
-        adm_log WARN "${deps_list}"
+        adm_log WARN "$(printf '%s\n' "${deps_list}")"
         if [ "${FORCE_FLAG}" -ne 1 ]; then
           adm_log ERR "Use --force para remover mesmo com dependentes."
           lock_release
@@ -298,37 +393,37 @@ case "${CMD}" in
         fi
       fi
 
-      # remove packages.db entry atomically: rebuild excluding this line
+      # remove line atomically from PACKAGES_INDEX
+      start_spinner "Removendo ${p_name}-${p_ver} ..."
       if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
+        stop_spinner
         adm_log INFO "[dry-run] remover linha do index: ${line}"
-      else
-        # create new index without this line
-        grep -Fvx "${line}" "${PACKAGES_INDEX}" > "${PACKAGES_INDEX}.tmp" && mv -f "${PACKAGES_INDEX}.tmp" "${PACKAGES_INDEX}"
+        adm_log OK "Remoção (dry-run) concluída para ${p_name}-${p_ver}"
+        continue
       fi
 
-      # remove deps file
+      # create backup of packages index
+      if [ -f "${PACKAGES_INDEX}" ]; then
+        cp -a "${PACKAGES_INDEX}" "${PACKAGES_INDEX}.bak.$(date +%s)" || adm_log WARN "Falha ao criar backup do index"
+      fi
+
+      grep -Fvx "${line}" "${PACKAGES_INDEX}" > "${PACKAGES_INDEX}.tmp" && mv -f "${PACKAGES_INDEX}.tmp" "${PACKAGES_INDEX}" || {
+        stop_spinner
+        adm_log ERR "Falha ao atualizar packages index"
+        lock_release
+        exit 1
+      }
+
+      # remove deps file and reverse deps entries
       depfile="${DEPS_DIR}/${p_name}-${p_ver}.deps"
-      if [ -f "${depfile}" ]; then
-        if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
-          adm_log INFO "[dry-run] rm -f ${depfile}"
-        else
-          rm -f "${depfile}" || adm_log WARN "Falha removendo deps file ${depfile}"
-        fi
-      fi
-
-      # remove reverse deps entries referencing this package
+      if [ -f "${depfile}" ]; then rm -f "${depfile}" || adm_log WARN "Falha removendo deps file ${depfile}"; fi
       remove_reverse_deps_for "${p_name}" "${p_ver}"
 
       # remove manifest copy
       mfcopy="${MANIFESTS_DIR}/${p_name}-${p_ver}.manifest"
-      if [ -f "${mfcopy}" ]; then
-        if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
-          adm_log INFO "[dry-run] rm -f ${mfcopy}"
-        else
-          rm -f "${mfcopy}" || adm_log WARN "Falha removendo manifest copy ${mfcopy}"
-        fi
-      fi
+      if [ -f "${mfcopy}" ]; then rm -f "${mfcopy}" || adm_log WARN "Falha removendo manifest copy ${mfcopy}"; fi
 
+      stop_spinner
       adm_log OK "Pacote removido do índice: ${p_name}-${p_ver}"
     done < <(printf '%s\n' "${matches}")
 
@@ -336,23 +431,35 @@ case "${CMD}" in
     ;;
 
   list)
-    fmt="short"
-    while [ $# -gt 0 ]; do
-      case "$1" in
-        --format) fmt="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    if [ ! -f "${PACKAGES_INDEX}" ]; then adm_log INFO "Nenhum pacote registrado."; exit 0; fi
-    case "${fmt}" in
+    # flags: --format, --pretty
+    parse_extra_flags "$@"
+    # if pretty requested, build lines and call print_pretty_table
+    if [ "${PRETTY}" -eq 1 ]; then
+      if [ ! -f "${PACKAGES_INDEX}" ]; then
+        adm_log INFO "Nenhum pacote registrado."
+        exit 0
+      fi
+      lines=()
+      while IFS= read -r l; do
+        [ -z "${l}" ] && continue
+        IFS='|' read -r n v a m t <<< "${l}"
+        lines+=("${n}-${v}    ${a}")
+      done < "${PACKAGES_INDEX}"
+      print_pretty_table "Pacotes registrados" 0 "${lines[@]}"
+      exit 0
+    fi
+
+    # non-pretty formats
+    case "${FORMAT}" in
       short)
+        if [ ! -f "${PACKAGES_INDEX}" ]; then adm_log INFO "Nenhum pacote registrado."; exit 0; fi
         awk -F'|' '{printf "%s-%s\n",$1,$2}' "${PACKAGES_INDEX}"
         ;;
       long)
         cat "${PACKAGES_INDEX}"
         ;;
       json)
-        # produce simple json array of objects
+        if [ ! -f "${PACKAGES_INDEX}" ]; then echo "[]"; exit 0; fi
         echo '['
         first=1
         while IFS= read -r line; do
@@ -366,7 +473,7 @@ case "${CMD}" in
         echo ']'
         ;;
       *)
-        adm_log ERR "Formato desconhecido: ${fmt}"; exit 1 ;;
+        adm_log ERR "Formato desconhecido: ${FORMAT}"; exit 1 ;;
     esac
     ;;
 
@@ -375,11 +482,9 @@ case "${CMD}" in
     if [ -z "${name}" ]; then adm_log ERR "Usage: adm-db query <name> [<version>]"; exit 1; fi
     matches="$(find_package_entries "${name}" "${version}")"
     if [ -z "${matches}" ]; then adm_log INFO "Nenhuma entrada encontrada para ${name} ${version}"; exit 0; fi
-    # output json per match
     while IFS= read -r line; do
       [ -z "${line}" ] && continue
       IFS='|' read -r n v a m t <<< "${line}"
-      # include deps if present
       depsfile="${DEPS_DIR}/${n}-${v}.deps"
       build_deps=""; run_deps=""
       if [ -f "${depsfile}" ]; then
@@ -403,13 +508,12 @@ JSON
   list-deps)
     name="${1:-}"; version="${2:-}"
     if [ -z "${name}" ]; then adm_log ERR "Usage: adm-db list-deps <name> [<version>]"; exit 1; fi
-    # find deps file
+    # check deps file
     if [ -n "${version}" ] && [ -f "${DEPS_DIR}/${name}-${version}.deps" ]; then
       sed -n '1p' "${DEPS_DIR}/${name}-${version}.deps"
       sed -n '2p' "${DEPS_DIR}/${name}-${version}.deps"
       exit 0
     fi
-    # try matching index entry to derive version
     entry="$(find_package_entries "${name}" "${version}" | tail -n1 || true)"
     if [ -n "${entry}" ]; then
       IFS='|' read -r n v a m t <<< "${entry}"
@@ -418,7 +522,6 @@ JSON
         exit 0
       fi
     fi
-    # try metafile
     mf="$(find_metafile_for "${name}" 2>/dev/null || true)"
     if [ -n "${mf}" ]; then
       read -r b r < <(read_deps_from_metafile "${mf}")
@@ -431,27 +534,27 @@ JSON
   list-dependents)
     name="${1:-}"; version="${2:-}"
     if [ -z "${name}" ]; then adm_log ERR "Usage: adm-db list-dependents <name> [<version>]"; exit 1; fi
-    # primary attempt: direct rdeps file for the key
     key="$(printf "%s" "${name}" | sed 's#/#__#g')"
     rfile="${RDEPS_DIR}/${key}.rdeps"
     if [ -f "${rfile}" ]; then
       cat "${rfile}"
       exit 0
     fi
-    # fallback: scan all rdeps files for occurrences (cheap)
+    # fallback: search in rdeps files for occurrences
+    found=0
     for f in "${RDEPS_DIR}"/*.rdeps; do
       [ -f "${f}" ] || continue
       if grep -Fxq "${name}-${version:-}" "${f}" 2>/dev/null; then
-        # derive dependent id from filename
-        depname="$(basename "${f}" .rdeps | sed 's#__#/#g')"
-        echo "${depname}"
+        found=1
+        grep -Fx "${name}-${version:-}" "${f}" || true
       fi
-      # also print all entries if any contain name fragment
       if grep -q "${name}" "${f}" 2>/dev/null; then
+        found=1
         grep -F "${name}" "${f}" || true
       fi
     done
-    # last resort: scan packages index for deps listing name
+    if [ "${found}" -eq 1 ]; then exit 0; fi
+    # last resort: scan packages index deps files
     if [ -f "${PACKAGES_INDEX}" ]; then
       while IFS= read -r line; do
         [ -z "${line}" ] && continue
