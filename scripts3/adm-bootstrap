@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# adm-bootstrap — construir bootstrap & toolchain stages (stage0..stage3)
+# Local padrão: /usr/src/adm/bootstrap
+#
+# Funções:
+#  - criar chroot bootstrap seguro
+#  - montar/desmontar pseudo filesystems (safe_mounts/safe_umounts)
+#  - orquestrar stages: download/build/install toolchain em ordem
+#  - hooks pre/post (global e por-stage)
+#  - suporte --resume, --clean, --rebuild-stage, --list-stages, --dry-run, --force
+#  - logs coloridos e saída resumida
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------------- defaults & config ----------------
+BOOT_DIR="${ADM_BOOTSTRAP:-/usr/src/adm/bootstrap}"
+STAGES=(stage0 stage1 stage2 stage3)
+CHROOT_ROOT=""
+RESUME=0
+CLEAN=0
+REBUILD_STAGE=""
+LIST_STAGES=0
+JOBS="$(nproc || echo 1)"
+DRYRUN_FLAG=0
+FORCE_FLAG=0
+EXTRA_ARGS=()
+LOGFILE="${ADM_LOG}/adm-bootstrap.$(date +%Y%m%d-%H%M%S).log"
+
+# parse args
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --chroot) CHROOT_ROOT="$2"; shift 2 ;;
+    --resume) RESUME=1; shift ;;
+    --clean) CLEAN=1; shift ;;
+    --rebuild-stage) REBUILD_STAGE="$2"; shift 2 ;;
+    --list-stages) LIST_STAGES=1; shift ;;
+    --jobs) JOBS="$2"; shift 2 ;;
+    --no-dry-run) EXTRA_ARGS+=("--no-dry-run"); shift ;;
+    --dry-run) EXTRA_ARGS+=("--dry-run"); shift ;;
+    --force) EXTRA_ARGS+=("--force"); shift ;;
+    --help|-h)
+      cat <<EOF
+Usage: $(basename "$0") [--chroot <root>] [--resume] [--clean] [--rebuild-stage <stage>] [--list-stages] [--jobs N] [--dry-run] [--force]
+Stages: ${STAGES[*]}
+Examples:
+  adm-bootstrap --clean
+  adm-bootstrap --resume
+  adm-bootstrap --rebuild-stage stage1 --no-dry-run
+EOF
+      exit 0
+      ;;
+    *)
+      EXTRA_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# parse global flags
+adm_parse_common_flags "${EXTRA_ARGS[@]}" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+[ -d "${BOOT_DIR}" ] || mkdir -p "${BOOT_DIR}"
+
+# helper: stage dirs
+stage_dir() {
+  local s="$1"
+  printf "%s/%s" "${BOOT_DIR}" "${s}"
+}
+
+# helper: meta file that records completed stages
+BOOT_META="${BOOT_DIR}/bootstrap.meta"
+stage_completed_file() {
+  local s="$1"
+  printf "%s/%s.completed" "$(stage_dir "${s}")" "${s}"
+}
+
+# helper: ensure prerequisites
+require_root_for_chroot=0
+if [ -n "${CHROOT_ROOT}" ] && [ "$(id -u)" -ne 0 ]; then
+  adm_log ERR "Para operar com --chroot é necessário rodar como root."
+  exit 1
+fi
+
+# ---------- functions for safe mount/unmount ----------
+safe_mounts() {
+  local root="$1"
+  # bind mount /proc /sys /dev /dev/pts /run into chroot
+  adm_log INFO "Montando pseudo-filesystems em ${root}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mount --bind /proc ${root}/proc ; mount --bind /sys ${root}/sys ; mount --bind /dev ${root}/dev ; mount --bind /dev/pts ${root}/dev/pts ; mount --bind /run ${root}/run"
+    return 0
+  fi
+  mkdir -p "${root}/proc" "${root}/sys" "${root}/dev" "${root}/dev/pts" "${root}/run"
+  mount --bind /proc "${root}/proc"
+  mount --bind /sys "${root}/sys"
+  mount --bind /dev "${root}/dev"
+  mount --bind /dev/pts "${root}/dev/pts" || true
+  mount --bind /run "${root}/run" || true
+}
+
+safe_umounts() {
+  local root="$1"
+  adm_log INFO "Desmontando pseudo-filesystems em ${root}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] umount ${root}/proc ; umount ${root}/sys ; umount ${root}/dev/pts ; umount ${root}/dev ; umount ${root}/run"
+    return 0
+  fi
+  for m in proc sys dev/pts dev run dev; do
+    if mountpoint -q "${root}/${m}"; then
+      umount -l "${root}/${m}" || adm_log WARN "Falha ao desmontar ${root}/${m}"
+    fi
+  done
+}
+
+# ---------- hook wrappers ----------
+run_hooks() {
+  # run_hooks <phase> <stage-or-global> <category?> <program?>
+  local phase="$1"; local target="$2"; shift 2
+  adm_log INFO "Executando hooks: phase=${phase} target=${target}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run bootstrap --phase ${phase} --target ${target}"
+    return 0
+  fi
+  "${ADM_SCRIPTS}/adm-hooks" run bootstrap --phase "${phase}" --target "${target}" || adm_log WARN "Hooks retornaram erro (phase=${phase} target=${target})"
+}
+
+# ---------- utility: run command in chroot (if CHROOT_ROOT set) ----------
+run_in_chroot() {
+  local cr="$1"; shift
+  local cmd="$*"
+  if [ -z "${cr}" ]; then
+    /bin/sh -c "${cmd}"
+  else
+    chroot "${cr}" /bin/sh -c "${cmd}"
+  fi
+}
+
+# ---------- stage orchestration helpers ----------
+stage_needs_run() {
+  local s="$1"
+  local completed="$(stage_completed_file "${s}")"
+  if [ "${RESUME}" -eq 1 ] && [ -f "${completed}" ]; then
+    adm_log INFO "Stage ${s} já completado; pulando (--resume ativo)"
+    return 1
+  fi
+  if [ -n "${REBUILD_STAGE}" ] && [ "${REBUILD_STAGE}" != "${s}" ]; then
+    # if rebuild specified for another stage, skip this one only if rebuild-stage set
+    return 1
+  fi
+  return 0
+}
+
+mark_stage_completed() {
+  local s="$1"
+  local f
+  f="$(stage_completed_file "${s}")"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] marcar stage complete ${s} -> ${f}"
+    return 0
+  fi
+  mkdir -p "$(dirname "${f}")"
+  echo "$(timestamp_now)" > "${f}"
+}
+
+clear_stage_completed() {
+  local s="$1"
+  local f; f="$(stage_completed_file "${s}")"
+  if [ -f "${f}" ]; then rm -f "${f}"; fi
+}
+
+# ---------- stage build core ----------
+# For each stage, we expect to have a metafile list in:
+#   ${BOOT_DIR}/<stage>/packages.list  (one metafile path per line or package id)
+# The script supports generating such lists via adm-update or manual edit.
+# ---------- load stage package list ----------
+load_stage_packages() {
+  local s="$1"
+  local listf="${BOOT_DIR}/${s}/packages.list"
+  if [ ! -f "${listf}" ]; then
+    adm_log WARN "Lista de pacotes não encontrada para ${s}: ${listf}"
+    echo ""
+    return 0
+  fi
+  awk '{$1=$1;print}' "${listf}"
+}
+
+# ---------- build one package (metafile id) inside stage -->
+# This will call adm-build with --metafile and install into stage destdir
+build_pkg_in_stage() {
+  local s="$1"; local mf="$2"; local stage_root_dir
+  stage_root_dir="$(stage_dir "${s}")/root"
+  adm_log INFO "Construir pacote ${mf} para stage ${s} (destdir=${stage_root_dir})"
+  # ensure stage root exists
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mkdir -p ${stage_root_dir} ; adm-build --metafile '${mf}' --chroot '${CHROOT_ROOT:-}' --destdir '${stage_root_dir}' --no-dry-run"
+    return 0
+  fi
+  mkdir -p "${stage_root_dir}"
+  # call adm-build - installs and produces package archive and manifest; ensure adm-build exists
+  if [ ! -x "${ADM_SCRIPTS}/adm-build" ]; then
+    adm_log ERR "adm-build não encontrado em ${ADM_SCRIPTS}/adm-build"
+    return 1
+  fi
+  "${ADM_SCRIPTS}/adm-build" --metafile "${mf}" ${CHROOT_ROOT:+--chroot "${CHROOT_ROOT}"} --destdir "${stage_root_dir}" --no-dry-run --jobs "${JOBS}" || {
+    adm_log ERR "adm-build falhou para ${mf} em stage ${s}"
+    return 1
+  }
+  return 0
+}
+
+# ---------- build a stage (list of metafiles) ----------
+build_stage() {
+  local s="$1"
+  adm_log INFO "Iniciando build do stage ${s}"
+  local sdir; sdir="$(stage_dir "${s}")"
+  mkdir -p "${sdir}" "${sdir}/root" "${sdir}/logs"
+  # pre-stage hooks
+  run_hooks pre "${s}"
+
+  # mount chroot if requested
+  if [ -n "${CHROOT_ROOT}" ]; then
+    safe_mounts "${CHROOT_ROOT}"
+  fi
+
+  # iterate package list
+  local pkg
+  local idx=0
+  local pkgs
+  IFS=$'\n' read -r -d '' -a pkgs < <(printf '%s\0' "$(load_stage_packages "${s}")") || true
+  if [ "${#pkgs[@]}" -eq 0 ]; then
+    adm_log WARN "Nenhum pacote listado para stage ${s}; pulando."
+    run_hooks post "${s}"
+    if [ -n "${CHROOT_ROOT}" ]; then safe_umounts "${CHROOT_ROOT}"; fi
+    return 0
+  fi
+
+  for pkg in "${pkgs[@]}"; do
+    idx=$((idx+1))
+    # highlight active line in pretty output
+    print_pretty_table "Building ${s}" "${idx}" "${pkg}"
+    # build package
+    if ! build_pkg_in_stage "${s}" "${pkg}"; then
+      adm_log ERR "Erro construindo ${pkg} em stage ${s}"
+      # If not forced, abort stage
+      if [ "${FORCE_FLAG}" -ne 1 ]; then
+        if [ -n "${CHROOT_ROOT}" ]; then safe_umounts "${CHROOT_ROOT}"; fi
+        return 1
+      else
+        adm_log WARN "--force ativo: ignorando falha de ${pkg} e prosseguindo"
+      fi
+    fi
+  done
+
+  # post-stage hooks
+  run_hooks post "${s}"
+
+  # mark stage completed
+  mark_stage_completed "${s}"
+
+  # unmount chroot
+  if [ -n "${CHROOT_ROOT}" ]; then
+    safe_umounts "${CHROOT_ROOT}"
+  fi
+
+  adm_log OK "Stage ${s} concluído com sucesso"
+  return 0
+}
+
+# ---------- main orchestration ----------
+if [ "${CLEAN}" -eq 1 ]; then
+  adm_log INFO "Limpeza completa do bootstrap em ${BOOT_DIR}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rm -rf ${BOOT_DIR}/*"
+    exit 0
+  fi
+  rm -rf "${BOOT_DIR}"/*
+  adm_log OK "Bootstrap limpo"
+  exit 0
+fi
+
+if [ "${LIST_STAGES}" -eq 1 ]; then
+  printf "%s\n" "${STAGES[@]}"
+  exit 0
+fi
+
+# If rebuild stage specified, clear marker for that stage and subsequent
+if [ -n "${REBUILD_STAGE}" ]; then
+  adm_log INFO "Rebuild solicitado para ${REBUILD_STAGE}"
+  clear_stage_completed "${REBUILD_STAGE}"
+  # also clear later stages
+  found=0
+  for s in "${STAGES[@]}"; do
+    if [ "${s}" = "${REBUILD_STAGE}" ]; then found=1; fi
+    if [ "${found}" -eq 1 ]; then clear_stage_completed "${s}"; fi
+  done
+fi
+
+# iterate stages and run those that need run
+for s in "${STAGES[@]}"; do
+  if ! stage_needs_run "${s}"; then
+    continue
+  fi
+  # create package lists dir if absent
+  mkdir -p "$(stage_dir "${s}")"
+  adm_log INFO "Executando stage: ${s}"
+  if ! build_stage "${s}"; then
+    adm_log ERR "Falha no stage ${s}; abortando bootstrap"
+    exit 1
+  fi
+done
+
+adm_log OK "Bootstrap concluído: todas as stages processadas."
+exit 0
