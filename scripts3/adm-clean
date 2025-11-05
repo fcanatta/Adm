@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# adm-clean — Limpeza completa do sistema ADM
+#
+# Funções:
+#   - Limpa diretórios internos do sistema ADM (cache, temp, log, db, destdir, packages)
+#   - Pode (opcionalmente) limpar o sistema real '/' (apenas com --force e --no-dry-run)
+#   - Suporte a modo dry-run e execução segura (integra com adm-common.sh)
+#   - Todos os comandos potencialmente destrutivos são comentados, mas prontos
+#
+# Uso:
+#   adm-clean adm               # limpa apenas ambiente ADM
+#   adm-clean system [--force]  # limpa sistema real (perigoso, comentado)
+#   adm-clean all [--force]     # limpa ADM e sistema
+#
+# Flags:
+#   --no-dry-run   executa de fato (por padrão, dry-run)
+#   --force        exigido para system/all
+#
+# Seguro para rodar quantas vezes quiser.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+adm_parse_common_flags "$@" || { adm_log ERR "Falha ao processar flags globais."; exit 1; }
+
+cmd="${1:-adm}"; shift || true
+
+print_banner() {
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+  printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM CLEAN" "${T_RESET}"
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+}
+
+confirm_force() {
+  if [ "${ADM_FORCE}" -ne 1 ]; then
+    adm_log ERR "Operação requer --force."
+    exit 1
+  fi
+}
+
+clean_adm() {
+  print_banner
+  adm_log INFO "Iniciando limpeza do ambiente ADM..."
+  local dirs=("${ADM_CACHE}" "${ADM_TEMP}" "${ADM_LOG}" "${ADM_DB}" "${ADM_DESTDIR}" "${ADM_PACKAGES}")
+  for d in "${dirs[@]}"; do
+    if [ -d "${d}" ]; then
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] limpar conteúdo de ${d}"
+      else
+        adm_log WARN "Removendo conteúdo de ${d}"
+        run_cmd "find '${d}' -mindepth 1 -delete"
+      fi
+    else
+      adm_log WARN "Diretório não existe: ${d}"
+    fi
+  done
+  adm_log OK "Limpeza do ambiente ADM concluída (dry-run=${ADM_DRYRUN})."
+}
+
+clean_system() {
+  print_banner
+  adm_log WARN "⚠️  Limpeza do sistema real / solicitada."
+  confirm_force
+
+  adm_log WARN "Comandos perigosos estão comentados por segurança."
+  adm_log WARN "Para ativar, revise este script manualmente."
+
+  # Exemplo (comentado):
+  # run_critical "Remover cache temporário do sistema" "rm -rf /tmp/* /var/tmp/*"
+  # run_critical "Limpar logs antigos" "find /var/log -type f -name '*.log' -delete"
+  # run_critical "Remover pacotes órfãos" "apt-get autoremove -y"
+  # run_critical "Limpar cache de pacotes" "apt-get clean"
+  adm_log OK "Limpeza do sistema concluída (modo seguro, sem executar comandos reais)."
+}
+
+clean_all() {
+  print_banner
+  adm_log WARN "Limpeza completa (ADM + Sistema) iniciada."
+  confirm_force
+  clean_adm
+  clean_system
+  adm_log OK "Limpeza total concluída (dry-run=${ADM_DRYRUN})."
+}
+
+summarize_result() {
+  printf "\n%bResumo da limpeza:%b\n" "${T_BOLD}" "${T_RESET}"
+  printf "  %bCache:%b     %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_CACHE}"
+  printf "  %bTemp:%b      %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_TEMP}"
+  printf "  %bLog:%b       %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_LOG}"
+  printf "  %bDB:%b        %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_DB}"
+  printf "  %bPackages:%b  %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_PACKAGES}"
+  printf "  %bDestdir:%b   %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_DESTDIR}"
+  printf "\n"
+  adm_log INFO "Log desta execução: ${LOGFILE}"
+}
+
+# ---------- Dispatcher ----------
+case "${cmd}" in
+  adm)
+    clean_adm
+    summarize_result
+    ;;
+  system)
+    clean_system
+    summarize_result
+    ;;
+  all)
+    clean_all
+    summarize_result
+    ;;
+  *)
+    cat <<EOF
+Uso:
+  adm-clean adm
+  adm-clean system [--force]
+  adm-clean all [--force]
+EOF
+    ;;
+esac
+
+exit 0
