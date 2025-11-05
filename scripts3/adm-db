@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+# adm-db — Sistema de registro e banco de dados simples do ADM
+#
+# Funções:
+#   - Registrar logs e eventos com timestamps.
+#   - Consultar banco de pacotes instalados.
+#   - Adicionar, remover e listar pacotes no DB.
+#   - Integrar logs e DB em formato legível e colorido.
+#
+# Estrutura de DB:
+#   /usr/src/adm/db/packages.db  → lista de pacotes instalados:
+#       <epoch> <pkgname> <version> <status> <archive_path> <manifest_path>
+#
+# Uso:
+#   adm-db log <LEVEL> <MESSAGE...>
+#   adm-db add <PKG> <VERSION> <ARCHIVE> <MANIFEST>
+#   adm-db remove <PKG>
+#   adm-db list
+#   adm-db info <PKG>
+#   adm-db tail [N]
+#   adm-db clear [--force]
+#
+# Flags globais (opcionais): --no-dry-run, --force
+# Requer: adm-common.sh
+
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+DB_FILE="${ADM_DB}/packages.db"
+
+adm_parse_common_flags "$@" || {
+  adm_log ERR "Falha ao processar flags globais"
+  exit 1
+}
+
+# Remover flags globais de $@
+filter_args() {
+  local out=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|--no-dry-run|--profile)
+        shift
+        [[ "$1" = "--profile" ]] && shift || true
+        ;;
+      *)
+        out+=("$1"); shift ;;
+    esac
+  done
+  printf '%s\n' "${out[@]+"${out[@]}"}"
+}
+mapfile -t ARGS < <(filter_args "$@")
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+cmd="${1:-}"; shift || true
+
+# ---------- Funções principais ----------
+
+ensure_db_exists() {
+  if [ ! -f "${DB_FILE}" ]; then
+    adm_log WARN "Banco de dados não encontrado — criando ${DB_FILE}"
+    if [ "${ADM_DRYRUN}" -eq 0 ]; then
+      touch "${DB_FILE}"
+    fi
+  fi
+}
+
+add_pkg() {
+  local pkg="$1"; local ver="$2"; local arch="$3"; local mani="$4"
+  ensure_db_exists
+  local epoch
+  epoch=$(date +%s)
+  local line="${epoch} ${pkg} ${ver} installed ${arch} ${mani}"
+  if grep -qE "^[0-9]+[[:space:]]+${pkg}[[:space:]]+" "${DB_FILE}" 2>/dev/null; then
+    adm_log WARN "Pacote ${pkg} já registrado — substituindo"
+    if [ "${ADM_DRYRUN}" -eq 0 ]; then
+      grep -vE "^[0-9]+[[:space:]]+${pkg}[[:space:]]+" "${DB_FILE}" > "${DB_FILE}.tmp"
+      echo "${line}" >> "${DB_FILE}.tmp"
+      mv "${DB_FILE}.tmp" "${DB_FILE}"
+    else
+      adm_log INFO "[dry-run] substituir linha de ${pkg} no DB"
+    fi
+  else
+    if [ "${ADM_DRYRUN}" -eq 0 ]; then
+      echo "${line}" >> "${DB_FILE}"
+    else
+      adm_log INFO "[dry-run] adicionar linha ${line}"
+    fi
+  fi
+  adm_log OK "Pacote registrado: ${pkg} ${ver}"
+}
+
+remove_pkg() {
+  local pkg="$1"
+  ensure_db_exists
+  if ! grep -qE "^[0-9]+[[:space:]]+${pkg}[[:space:]]+" "${DB_FILE}" 2>/dev/null; then
+    adm_log WARN "Pacote ${pkg} não encontrado no DB."
+    return 0
+  fi
+  run_critical "Remover pacote ${pkg} do DB" \
+    "grep -vE '^[0-9]+[[:space:]]+${pkg}[[:space:]]+' '${DB_FILE}' > '${DB_FILE}.tmp' && mv '${DB_FILE}.tmp' '${DB_FILE}'"
+  adm_log OK "Removido ${pkg} do DB"
+}
+
+list_pkgs() {
+  ensure_db_exists
+  if [ ! -s "${DB_FILE}" ]; then
+    adm_log WARN "Banco de dados vazio."
+    return 0
+  fi
+  printf "%b%-20s %-12s %-10s%b\n" "${T_BOLD}" "PACOTE" "VERSÃO" "STATUS" "${T_RESET}"
+  awk '{printf "  %-20s %-12s %-10s\n", $2, $3, $4}' "${DB_FILE}" | sort
+}
+
+info_pkg() {
+  local pkg="$1"
+  ensure_db_exists
+  if ! grep -qE "^[0-9]+[[:space:]]+${pkg}[[:space:]]+" "${DB_FILE}" 2>/dev/null; then
+    adm_log ERR "Pacote não encontrado: ${pkg}"
+    return 1
+  fi
+  grep -E "^[0-9]+[[:space:]]+${pkg}[[:space:]]+" "${DB_FILE}" | while read -r epoch name ver status arch mani; do
+    printf "%bPacote:%b %s\n" "${T_CYAN}" "${T_RESET}" "${name}"
+    printf "%bVersão:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ver}"
+    printf "%bStatus:%b %s\n" "${T_CYAN}" "${T_RESET}" "${status}"
+    printf "%bRegistrado em:%b %s\n" "${T_CYAN}" "${T_RESET}" "$(date -d @"${epoch}" '+%F %T' 2>/dev/null || echo "${epoch}")"
+    printf "%bPacote:%b %s\n" "${T_CYAN}" "${T_RESET}" "${arch}"
+    printf "%bManifesto:%b %s\n" "${T_CYAN}" "${T_RESET}" "${mani}"
+  done
+}
+
+clear_db() {
+  ensure_db_exists
+  run_critical "Limpar banco de pacotes" "truncate -s 0 '${DB_FILE}'"
+  adm_log OK "Banco limpo (dry-run=${ADM_DRYRUN})"
+}
+
+tail_log() {
+  local n="${1:-50}"
+  if [ ! -f "${LOGFILE}" ]; then
+    adm_log ERR "Logfile não existe: ${LOGFILE}"
+    return 1
+  fi
+  tail -n "${n}" "${LOGFILE}"
+}
+
+log_event() {
+  local level="${1:-INFO}"; shift || true
+  local msg="$*"
+  adm_log "${level}" "${msg}"
+}
+
+# ---------- Dispatcher ----------
+
+case "${cmd}" in
+  log)
+    log_event "${1:-INFO}" "${*:2}"
+    ;;
+  add)
+    if [ $# -lt 4 ]; then
+      adm_log ERR "Uso: adm-db add <PKG> <VER> <ARCHIVE> <MANIFEST>"
+      exit 1
+    fi
+    add_pkg "$@"
+    ;;
+  remove)
+    if [ $# -lt 1 ]; then adm_log ERR "Uso: adm-db remove <PKG>"; exit 1; fi
+    remove_pkg "$1"
+    ;;
+  list)
+    list_pkgs
+    ;;
+  info)
+    if [ $# -lt 1 ]; then adm_log ERR "Uso: adm-db info <PKG>"; exit 1; fi
+    info_pkg "$1"
+    ;;
+  clear)
+    clear_db
+    ;;
+  tail)
+    tail_log "${1:-50}"
+    ;;
+  *)
+    cat <<EOF
+Uso:
+  adm-db log <LEVEL> <MSG>
+  adm-db add <PKG> <VER> <ARCHIVE> <MANIFEST>
+  adm-db remove <PKG>
+  adm-db list
+  adm-db info <PKG>
+  adm-db tail [N]
+  adm-db clear [--force]
+EOF
+    ;;
+esac
+exit 0
