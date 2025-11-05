@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# adm-patch - aplica patches automaticamente de pacotes (local e global)
+#
+# Uso:
+#   adm-patch <workdir> <category> <program> [--chroot <rootdir>] [--no-dry-run] [--force]
+#
+# Regras:
+#  - Patches esperados em: /usr/src/adm/metafiles/<category>/<program>/patch/
+#  - Não há subpastas de patches (um único nível)
+#  - Também verifica patches em ${ADM_PATCHES_GLOBAL}/${category}/${program} e ${ADM_PATCHES_GLOBAL}/${program}
+#  - Tenta aplicar com patch -p1; se falhar, tenta -p0
+#  - Em chroot, copia o patch para o chroot e executa lá (mantendo paths relativos)
+#  - Respeita ADM_DRYRUN e ADM_FORCE de adm-common.sh
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# Parse minimal args manually so we can accept --chroot
+CHROOT_ROOT=""
+# collect non-global flags temporarily
+raw_args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --chroot)
+      CHROOT_ROOT="$2"; shift 2 ;;
+    --help|-h)
+      cat <<EOF
+Usage: $(basename "$0") <workdir> <category> <program> [--chroot <rootdir>] [--no-dry-run] [--force]
+Aplica patches de:
+  ${ADM_METAFILES}/<category>/<program>/patch/
+Também procura patches em:
+  ${ADM_PATCHES_GLOBAL}/<category>/<program> and ${ADM_PATCHES_GLOBAL}/<program>
+EOF
+      exit 0
+      ;;
+    *)
+      raw_args+=("$1"); shift ;;
+  esac
+done
+
+# feed global flags into adm_parse_common_flags (search raw_args for --no-dry-run/--force/--profile)
+adm_parse_common_flags "${raw_args[@]}" || { adm_log ERR "Falha ao processar flags"; exit 1; }
+
+# rebuild positional args (workdir, category, program)
+POS=()
+for a in "${raw_args[@]}"; do
+  case "${a}" in
+    --no-dry-run|--force|--profile) 
+      # skip the flag (and its value if profile)
+      if [ "${a}" = "--profile" ]; then
+        # remove next (profile file) from raw_args - but already handled in parse; ignore here
+        :
+      fi
+      ;;
+    *)
+      POS+=("${a}") ;;
+  esac
+done
+
+workdir="${POS[0]:-}"
+category="${POS[1]:-}"
+program="${POS[2]:-}"
+
+if [ -z "${workdir}" ] || [ -z "${category}" ] || [ -z "${program}" ]; then
+  adm_log ERR "Uso: adm-patch <workdir> <category> <program> [--chroot <rootdir>] [--no-dry-run] [--force]"
+  exit 1
+fi
+
+# verify workdir exists
+if [ ! -d "${workdir}" ]; then
+  adm_log ERR "workdir não existe: ${workdir}"
+  exit 1
+fi
+
+# gather patch directories (package-local first, then globals)
+pkg_patch_dir="${ADM_METAFILES}/${category}/${program}/patch"
+global_pkg_dir1="${ADM_PATCHES_GLOBAL}/${category}/${program}"
+global_pkg_dir2="${ADM_PATCHES_GLOBAL}/${program}"
+
+# build list of patch files (lexicographic)
+declare -a PATCH_FILES=()
+
+add_patches_from_dir() {
+  local dir="$1"
+  if [ -d "${dir}" ]; then
+    for p in "${dir}"/*; do
+      [ -f "${p}" ] || continue
+      case "${p}" in
+        *.patch|*.diff) PATCH_FILES+=("${p}") ;;
+        *) adm_log INFO "Ignorando não-patch: ${p}" ;;
+      esac
+    done
+  fi
+}
+
+add_patches_from_dir "${pkg_patch_dir}"
+add_patches_from_dir "${global_pkg_dir1}"
+add_patches_from_dir "${global_pkg_dir2}"
+
+if [ "${#PATCH_FILES[@]}" -eq 0 ]; then
+  adm_log INFO "Nenhum patch encontrado para ${category}/${program} em:"
+  adm_log INFO "  ${pkg_patch_dir}"
+  adm_log INFO "  ${global_pkg_dir1}"
+  adm_log INFO "  ${global_pkg_dir2}"
+  exit 0
+fi
+
+# sort PATCH_FILES lexicographically
+IFS=$'\n' PATCH_FILES=($(sort <<<"${PATCH_FILES[*]}"))
+unset IFS
+
+adm_log INFO "Patches encontrados: ${#PATCH_FILES[@]}"
+
+# helper: apply a single patch file in a target directory (either local or via chroot)
+# tries p1 then p0
+apply_patch_local() {
+  local patchfile="$1"
+  local targetdir="$2"  # path on host where we run patch (workdir)
+  adm_log INFO "Aplicando patch ${patchfile} em ${targetdir} (tentativa p1 -> p0)"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] (cd '${targetdir}' && patch -p1 < '${patchfile}')"
+    adm_log INFO "[dry-run] se p1 falhar, tentar p0"
+    return 0
+  fi
+
+  # Try p1
+  if (cd "${targetdir}" && patch -p1 --backup --verbose < "${patchfile}"); then
+    adm_log OK "Patch aplicado com patch -p1: ${patchfile}"
+    return 0
+  fi
+
+  adm_log WARN "patch -p1 falhou, tentando -p0 for ${patchfile}"
+  # try p0
+  if (cd "${targetdir}" && patch -p0 --backup --verbose < "${patchfile}"); then
+    adm_log OK "Patch aplicado com patch -p0: ${patchfile}"
+    return 0
+  fi
+
+  adm_log ERR "Falha ao aplicar patch ${patchfile} em ${targetdir}"
+  return 1
+}
+
+# helper: apply a single patch inside chroot
+apply_patch_chroot() {
+  local patchfile="$1"
+  local chroot_root="$2"
+  local targetdir="$3"   # path inside chroot to apply (absolute inside chroot)
+  adm_log INFO "Aplicando patch (chroot) ${patchfile} em ${chroot_root}:${targetdir}"
+  # compute where to copy patch inside chroot
+  local patch_basename
+  patch_basename=$(basename "${patchfile}")
+  local dest_in_chroot="/tmp/adm-patches/${patch_basename}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mkdir -p '${chroot_root}/tmp/adm-patches' && cp '${patchfile}' '${chroot_root}${dest_in_chroot}'"
+    adm_log INFO "[dry-run] chroot '${chroot_root}' sh -c 'cd \"${targetdir}\" && patch -p1 < \"${dest_in_chroot}\" || patch -p0 < \"${dest_in_chroot}\"'"
+    return 0
+  fi
+
+  # ensure tmp dir in chroot
+  run_cmd "mkdir -p '${chroot_root}/tmp/adm-patches' && cp -a '${patchfile}' '${chroot_root}${dest_in_chroot}'"
+  # try p1 then p0 inside chroot
+  if chroot "${chroot_root}" /bin/sh -c "cd '${targetdir}' && patch -p1 --backup --verbose < '${dest_in_chroot}'"; then
+    adm_log OK "Patch aplicado com -p1 dentro do chroot: ${patch_basename}"
+    return 0
+  fi
+  adm_log WARN "patch -p1 dentro do chroot falhou, tentando -p0"
+  if chroot "${chroot_root}" /bin/sh -c "cd '${targetdir}' && patch -p0 --backup --verbose < '${dest_in_chroot}'"; then
+    adm_log OK "Patch aplicado com -p0 dentro do chroot: ${patch_basename}"
+    return 0
+  fi
+
+  adm_log ERR "Falha ao aplicar patch dentro do chroot: ${patch_basename}"
+  return 1
+}
+
+# Iterate through patches and apply
+failed_count=0
+applied_count=0
+
+for p in "${PATCH_FILES[@]}"; do
+  adm_log INFO "Processando patch: ${p}"
+  # Sanitize: ensure no path traversal (patch file must be inside ADM tree)
+  case "${p}" in
+    ${ADM_BASE}/*) ;; # ok
+    *)
+      adm_log ERR "Patch fora do ADM_BASE, ignorando: ${p}"
+      continue
+      ;;
+  esac
+
+  if [ -n "${CHROOT_ROOT}" ]; then
+    # Need to determine targetdir relative path inside chroot.
+    # If workdir is under chroot root (e.g., /usr/src/adm/temp/... inside chroot), then compute relative path.
+    # Otherwise, we copy source tree into chroot's temporary workspace and apply there.
+    if [[ "${workdir}" = "${CHROOT_ROOT}"* ]]; then
+      # workdir inside chroot already; compute chroot-internal path
+      target_in_chroot="${workdir#${CHROOT_ROOT}}"
+      if [ -z "${target_in_chroot}" ]; then target_in_chroot="/"; fi
+      # ensure leading slash
+      if [[ "${target_in_chroot}" != /* ]]; then target_in_chroot="/${target_in_chroot}"; fi
+      if ! apply_patch_chroot "${p}" "${CHROOT_ROOT}" "${target_in_chroot}"; then
+        failed_count=$((failed_count+1))
+        # stop on failure to avoid corrupting source
+        adm_log ERR "Interrompendo por patch com falha: ${p}"
+        break
+      fi
+    else
+      # workdir not inside chroot: copy entire workdir into chroot temporary location, apply there, then copy back
+      tmp_chroot_work="/tmp/adm-work-$(date +%s)"
+      adm_log INFO "workdir não está dentro do chroot; copiar ${workdir} -> ${CHROOT_ROOT}${tmp_chroot_work}"
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] mkdir -p '${CHROOT_ROOT}${tmp_chroot_work}' && cp -a '${workdir}' '${CHROOT_ROOT}${tmp_chroot_work}/'"
+        adm_log INFO "[dry-run] aplicar patch dentro do chroot em ${tmp_chroot_work}"
+        # In dry-run mode we won't copy back
+        if ! apply_patch_chroot "${p}" "${CHROOT_ROOT}" "${tmp_chroot_work}"; then
+          failed_count=$((failed_count+1))
+          break
+        fi
+      else
+        run_cmd "mkdir -p '${CHROOT_ROOT}${tmp_chroot_work}' && cp -a '${workdir}/.' '${CHROOT_ROOT}${tmp_chroot_work}/'"
+        if ! apply_patch_chroot "${p}" "${CHROOT_ROOT}" "${tmp_chroot_work}"; then
+          failed_count=$((failed_count+1))
+          adm_log ERR "Falha aplicando patch em chroot"
+          break
+        fi
+        # copy back changes from chroot tmp to original workdir (rsync if available, fallback to tar)
+        if command -v rsync >/dev/null 2>&1; then
+          run_cmd "rsync -a --delete '${CHROOT_ROOT}${tmp_chroot_work}/' '${workdir}/'"
+        else
+          # tar over STDOUT/STDIN via chroot (careful)
+          run_cmd "chroot '${CHROOT_ROOT}' sh -c \"cd '${tmp_chroot_work}' && tar -cf - .\" | tar -C '${workdir}' -xf -"
+        fi
+        # cleanup tmp within chroot
+        run_cmd "rm -rf '${CHROOT_ROOT}${tmp_chroot_work}'"
+      fi
+    fi
+  else
+    # apply directly on host workdir
+    if ! apply_patch_local "${p}" "${workdir}"; then
+      failed_count=$((failed_count+1))
+      adm_log ERR "Falha aplicando patch ${p}"
+      break
+    fi
+  fi
+
+  applied_count=$((applied_count+1))
+done
+
+if [ "${failed_count}" -eq 0 ]; then
+  adm_log OK "Todos os patches aplicados com sucesso: ${applied_count} patches"
+  exit 0
+else
+  adm_log ERR "Alguns patches falharam: aplicados=${applied_count}, falhas=${failed_count}"
+  exit 2
+fi
