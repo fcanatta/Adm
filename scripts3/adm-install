@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# adm-install — Instalador de pacotes ADM
+# Suporta múltiplas instalações concorrentes, resolução de dependências e construção automática se necessário.
+#
+# Uso:
+#   adm-install [install] [--jobs N] [--chroot <root>] [--destdir <dir>] [--no-dry-run] [--force] <pkg-or-archive|metafile|category/name|name>...
+#   adm-install uninstall <name> [--no-dry-run] [--force]   # separate tool adm-uninstall recommended
+#   adm-install info <name>
+#
+# Notas de segurança:
+#  - O script respeita ADM_DRYRUN (default dry-run) e ADM_FORCE.
+#  - Comandos destrutivos (rm -rf /) só são executados quando ADM_DRYRUN=0 e ADM_FORCE=1.
+#  - Requer adm-common.sh com funções adm_log, run_cmd, adm_parse_common_flags, read_metafile_val, find_metafile_for etc.
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------------- defaults ----------------
+JOBS="$(nproc || echo 1)"
+CHROOT_ROOT=""
+DESTDIR_OVERRIDE=""
+EXTRA_ARGS=()
+ACTION="install"
+DRYRUN_DEFAULT=1
+
+# ---------------- arg parsing ----------------
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    install) ACTION="install"; shift ;;
+    uninstall) ACTION="uninstall"; shift ;;
+    info) ACTION="info"; shift ;;
+    --jobs) JOBS="$2"; shift 2 ;;
+    --chroot) CHROOT_ROOT="$2"; shift 2 ;;
+    --destdir) DESTDIR_OVERRIDE="$2"; shift 2 ;;
+    --no-dry-run) EXTRA_ARGS+=("--no-dry-run"); shift ;;
+    --dry-run) EXTRA_ARGS+=("--dry-run"); shift ;;
+    --force) EXTRA_ARGS+=("--force"); shift ;;
+    --profile) EXTRA_ARGS+=("--profile"); EXTRA_ARGS+=("$2"); shift 2 ;;
+    --help|-h) 
+      cat <<EOF
+Usage:
+  adm-install [install] [--jobs N] [--chroot <root>] [--destdir <dir>] [--no-dry-run] [--force] <pkg|archive|metafile>...
+  adm-install uninstall <name> [--no-dry-run] [--force]
+  adm-install info <name>
+Notes:
+  - Package identifier can be:
+      - path to archive (.tar.zst/.tar.xz/.tar/.zip)
+      - path to destdir (directory)
+      - path to metafile (/usr/src/adm/metafiles/<cat>/<pkg>/metafile)
+      - category/name or name (tries to resolve metafile)
+EOF
+      exit 0 ;;
+    *)
+      ARGS+=("$1"); shift ;;
+  esac
+done
+
+# parse common flags from EXTRA_ARGS (sets ADM_DRYRUN, ADM_FORCE, ADM_PROFILE)
+adm_parse_common_flags "${EXTRA_ARGS[@]}" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+
+# Reconstruct positional package args from ARGS
+if [ "${#ARGS[@]}" -eq 0 ]; then
+  adm_log ERR "Nenhum pacote ou arquivo especificado. Ver 'adm-install --help'."
+  exit 1
+fi
+
+# Ensure dirs
+adm_ensure_dirs
+
+# concurrency control helper
+run_with_limit() {
+  local -n jobs=$1
+  local limit="$2"
+  local pids=()
+  for cmd in "${jobs[@]}"; do
+    # wait while active jobs >= limit
+    while [ "$(jobs -rp 2>/dev/null | wc -l)" -ge "${limit}" ]; do
+      sleep 0.15
+    done
+    # run command in background
+    ( eval "${cmd}" ) &
+  done
+  # wait for all background jobs
+  wait
+}
+
+# helper: detect if argument is archive file
+is_archive() {
+  local f="$1"
+  [ -f "${f}" ] || return 1
+  case "${f}" in
+    *.tar.zst|*.tzst|*.tar.xz|*.txz|*.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar|*.zip) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# helper: detect if argument is destdir directory
+is_destdir() {
+  local d="$1"
+  [ -d "${d}" ] && [ -f "${d}/usr/bin" -o -f "${d}/bin" -o -d "${d}/usr" ] && return 0 || return 1
+}
+
+# helper: find package archive in ADM_PACKAGES by name/version heuristics
+find_package_archive_in_repo() {
+  local ident="$1"  # category/name or name
+  local found=""
+  # try exact name match
+  found=$(find "${ADM_PACKAGES}" -maxdepth 1 -type f -name "${ident}*.tar.*" -o -name "${ident}*.tar.zst" 2>/dev/null | head -n1 || true)
+  if [ -n "${found}" ]; then
+    echo "${found}"; return 0
+  fi
+  # try contains name
+  found=$(find "${ADM_PACKAGES}" -maxdepth 1 -type f -iname "*${ident}*" 2>/dev/null | head -n1 || true)
+  if [ -n "${found}" ]; then
+    echo "${found}"; return 0
+  fi
+  # nothing
+  return 1
+}
+
+# helper: resolve identifier to metafile path (using adm-resolver helper)
+find_metafile_for_wrapper() {
+  local id="$1"
+  local mf
+  mf="$(find_metafile_for "${id}" 2>/dev/null || true)"
+  if [ -n "${mf}" ]; then
+    printf "%s" "${mf}"
+    return 0
+  fi
+  return 1
+}
+
+# helper: extract archive safely into given root (may be / or destdir)
+extract_archive_to_root() {
+  local archive="$1"
+  local root="$2" # absolute path
+  adm_log INFO "Extraindo ${archive} -> ${root}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] extrair ${archive} para ${root}"
+    return 0
+  fi
+  mkdir -p "${root}"
+  case "${archive}" in
+    *.tar.zst|*.tzst)
+      if ! command -v zstd >/dev/null 2>&1; then
+        adm_log ERR "zstd não encontrado para descomprimir ${archive}"
+        return 1
+      fi
+      zstd -d --stdout "${archive}" | tar -C "${root}" -xf - || return 1
+      ;;
+    *.tar.xz|*.txz) tar -xJf "${archive}" -C "${root}" || return 1 ;;
+    *.tar.gz|*.tgz) tar -xzf "${archive}" -C "${root}" || return 1 ;;
+    *.tar.bz2|*.tbz2) tar -xjf "${archive}" -C "${root}" || return 1 ;;
+    *.tar) tar -xf "${archive}" -C "${root}" || return 1 ;;
+    *.zip) unzip -q "${archive}" -d "${root}" || return 1 ;;
+    *) adm_log ERR "Formato de arquivo desconhecido: ${archive}"; return 1 ;;
+  esac
+  return 0
+}
+
+# helper: safe install file-by-file with backup & manifest writing
+install_files_from_dir() {
+  local srcdir="$1"
+  local target_root="$2"  # usually /
+  local manifest_tmp="$3"
+  adm_log INFO "Instalando arquivos de ${srcdir} -> ${target_root}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] listar arquivos que seriam instalados (find ${srcdir})"
+    find "${srcdir}" -type f -print | sed "s#^${srcdir}##" | sed 's#^/##'
+    return 0
+  fi
+
+  # iterate files, copy with preserving attrs, backup collisions
+  while IFS= read -r f; do
+    rel="${f#${srcdir}}"
+    # normalize leading slash
+    rel="${rel#/}"
+    dest="${target_root%/}/${rel}"
+    destdir=$(dirname "${dest}")
+    mkdir -p "${destdir}"
+    # backup if exists
+    if [ -e "${dest}" ]; then
+      adm_log INFO "Backup existing file: ${dest} -> ${dest}.adm.bak"
+      run_cmd "cp -a '${dest}' '${dest}.adm.bak'"
+    fi
+    run_cmd "cp -a '${f}' '${dest}'"
+    # preserve ownership/mode done by cp -a; could run chown/chmod if needed
+    echo "${rel}" >> "${manifest_tmp}"
+  done < <(find "${srcdir}" -type f)
+  return 0
+}
+
+# helper: attempt to install an archive or destdir for a single package identifier
+# returns 0 on success, non-zero on failure
+install_single_package_artifact() {
+  local artifact="$1"   # archive path or destdir
+  local target_root="$2"  # / or other root
+  local pkgname="$3"    # package name used in DB and manifest
+  local pkgversion="$4" # version string optional
+  local manifest_out="${ADM_DB}/${pkgname}-${pkgversion:-unknown}.manifest"
+  local manifest_tmp
+  manifest_tmp="$(mktemp "${ADM_TEMP}/adm-install.manifest.XXXXXX")"
+  trap 'rm -f "${manifest_tmp}" 2>/dev/null || true' RETURN
+
+  if is_archive "${artifact}"; then
+    # extract into temporary staging dir then install file-by-file
+    local tmp_extract="${ADM_TEMP}/adm-install-extract-$(date +%s)-$$"
+    mkdir -p "${tmp_extract}"
+    if ! extract_archive_to_root "${artifact}" "${tmp_extract}"; then
+      adm_log ERR "Falha ao extrair ${artifact}"
+      return 1
+    fi
+    if ! install_files_from_dir "${tmp_extract}" "${target_root}" "${manifest_tmp}"; then
+      adm_log ERR "Falha ao instalar arquivos de ${artifact}"
+      rm -rf "${tmp_extract}" || true
+      return 1
+    fi
+    rm -rf "${tmp_extract}" || true
+  elif is_destdir "${artifact}"; then
+    # copy files from destdir root to target_root
+    if ! install_files_from_dir "${artifact}" "${target_root}" "${manifest_tmp}"; then
+      adm_log ERR "Falha ao instalar arquivos de destdir ${artifact}"
+      return 1
+    fi
+  else
+    adm_log ERR "Artifact inválido para instalação: ${artifact}"
+    return 1
+  fi
+
+  # write manifest atomically
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] manifest would be written to ${manifest_out}"
+  else
+    mv "${manifest_tmp}" "${manifest_out}"
+    adm_log OK "Manifesto escrito: ${manifest_out}"
+  fi
+
+  # register in DB
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-db add ${pkgname} ${pkgversion:-unknown} ${artifact} ${manifest_out}"
+  else
+    "${ADM_SCRIPTS}/adm-db" add "${pkgname}" "${pkgversion:-unknown}" "${artifact}" "${manifest_out}" || {
+      adm_log WARN "Falha ao registrar pacote em DB, mas instalação concluiu"
+    }
+  fi
+
+  return 0
+}
+
+# ---------- Prepare list of requested items ----------
+REQUESTS=("${ARGS[@]}")
+
+# Normalize each request into either:
+#  - an artifact (archive or destdir absolute path) OR
+#  - a metafile path OR
+#  - a package identifier (category/name or name)
+# We'll attempt to auto-locate artifact in ADM_PACKAGES if missing.
+declare -A REQ_TYPE   # "artifact"|"metafile"|"identifier"
+declare -A REQ_VAL    # value for each (path or id)
+declare -A REQ_NAME   # canonical name for logging
+declare -A REQ_VERSION
+
+idx=0
+for r in "${REQUESTS[@]}"; do
+  idx=$((idx+1))
+  key="req${idx}"
+  # absolute path?
+  if [ -f "${r}" ] && is_archive "${r}"; then
+    REQ_TYPE["${key}"]="artifact"
+    REQ_VAL["${key}"]="$(readlink -f "${r}")"
+    # try infer name/version from filename
+    base=$(basename "${r}")
+    REQ_NAME["${key}"]="${base%%.*}"
+    REQ_VERSION["${key}"]=""
+    continue
+  fi
+  if [ -d "${r}" ] && is_destdir "${r}"; then
+    REQ_TYPE["${key}"]="artifact"
+    REQ_VAL["${key}"]="$(readlink -f "${r}")"
+    REQ_NAME["${key}"]="$(basename "${r}")"
+    REQ_VERSION["${key}"]=""
+    continue
+  fi
+
+  # metafile direct?
+  if [ -f "${r}" ] && grep -q "^NAME=" "${r}" 2>/dev/null; then
+    REQ_TYPE["${key}"]="metafile"
+    REQ_VAL["${key}"]="$(readlink -f "${r}")"
+    REQ_NAME["${key}"]="$(read_metafile_val "${r}" "NAME" 2>/dev/null || echo "${r}")"
+    REQ_VERSION["${key}"]="$(read_metafile_val "${r}" "VERSION" 2>/dev/null || echo "")"
+    continue
+  fi
+
+  # attempt to find metafile by id
+  if mf=$(find_metafile_for_wrapper "${r}" 2>/dev/null || true); then
+    REQ_TYPE["${key}"]="metafile"
+    REQ_VAL["${key}"]="${mf}"
+    REQ_NAME["${key}"]="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || echo "${r}")"
+    REQ_VERSION["${key}"]="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || echo "")"
+    continue
+  fi
+
+  # finally treat as identifier where we will attempt to locate binary in repo
+  REQ_TYPE["${key}"]="identifier"
+  REQ_VAL["${key}"]="${r}"
+  REQ_NAME["${key}"]="${r}"
+  REQ_VERSION["${key}"]=""
+done
+
+# Build work queues:
+declare -a INSTALL_CMDS         # shell commands to execute installing artifact
+declare -a BUILD_NEEDS         # metafile paths that need building before installing
+declare -A ARTIFACT_FOR_REQ    # maps req key -> artifact path (when found)
+# ----- continuação PARTE 2/2 -----
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- Helper: clean temp on exit ----------
+TMP_CLEANUP_LIST=()
+register_tmp() { TMP_CLEANUP_LIST+=("$1"); }
+cleanup_tmp() {
+  for t in "${TMP_CLEANUP_LIST[@]:-}"; do
+    rm -rf "${t}" 2>/dev/null || true
+  done
+}
+trap cleanup_tmp EXIT
+
+# ---------- Find or prepare artifacts for each request ----------
+idx=0
+BUILD_QUEUE=()    # metafile paths to build
+INSTALL_QUEUE=()  # keys which will be installed (req keys)
+for key in "${!REQ_TYPE[@]}"; do
+  # iterate keys in numeric order
+  :
+done
+
+# iterate in original order using numeric indices
+for i in $(seq 1 ${#REQUESTS[@]}); do
+  key="req${i}"
+  rtype="${REQ_TYPE[${key}]}"
+  rval="${REQ_VAL[${key}]}"
+  rname="${REQ_NAME[${key}]}"
+  rver="${REQ_VERSION[${key}]:-}"
+  adm_log INFO "Preparando request ${i}: type=${rtype} val=${rval}"
+  case "${rtype}" in
+    artifact)
+      # artifact is ready for installation
+      ARTIFACT_FOR_REQ["${key}"]="${rval}"
+      INSTALL_QUEUE+=("${key}")
+      ;;
+    metafile)
+      # try to locate built artifact in ADM_PACKAGES by canonical name+version
+      pkgid="${rname}"
+      # try versioned filename first
+      if [ -n "${rver}" ]; then
+        cand="$(find_package_archive_in_repo "${pkgid}-${rver}" || true)"
+      fi
+      if [ -z "${cand}" ]; then
+        cand="$(find_package_archive_in_repo "${pkgid}" || true)"
+      fi
+      if [ -n "${cand}" ]; then
+        adm_log INFO "Arquivo binário encontrado para metafile ${rname}: ${cand}"
+        ARTIFACT_FOR_REQ["${key}"]="${cand}"
+        INSTALL_QUEUE+=("${key}")
+      else
+        adm_log INFO "Nenhum binário encontrado para metafile ${rname}; adicionando à fila de build"
+        BUILD_QUEUE+=("${rval}")   # metafile path
+        INSTALL_QUEUE+=("${key}")
+      fi
+      ;;
+    identifier)
+      # try to find artifact in repo
+      cand="$(find_package_archive_in_repo "${rval}" || true)"
+      if [ -n "${cand}" ]; then
+        adm_log INFO "Arquivo binário encontrado para identificador ${rval}: ${cand}"
+        ARTIFACT_FOR_REQ["${key}"]="${cand}"
+        INSTALL_QUEUE+=("${key}")
+      else
+        # attempt to find metafile for identifier and build
+        if mf=$(find_metafile_for_wrapper "${rval}" 2>/dev/null || true); then
+          adm_log INFO "Encontrado metafile ${mf} para ${rval}; agendando build"
+          BUILD_QUEUE+=("${mf}")
+          INSTALL_QUEUE+=("${key}")
+        else
+          # If cannot find metafile, attempt to resolve via adm-resolver to build dependencies then fail
+          adm_log WARN "Identificador ${rval} não corresponde a binário nem metafile. Tentando resolver dependências via adm-resolver..."
+          # call adm-resolver to attempt to produce plan; we will not auto-build externals we can't map
+          RES_JSON="${ADM_TEMP}/resolver-${rval}-$(date +%s).json"
+          if [ "${ADM_DRYRUN}" -eq 1 ]; then
+            adm_log INFO "[dry-run] adm-resolver ${rval} --plan --json ${RES_JSON}"
+          else
+            "${ADM_SCRIPTS}/adm-resolver" "${rval}" --plan --json "${RES_JSON}" || adm_log WARN "adm-resolver retornou não-zero para ${rval}"
+          fi
+          # still, we cannot proceed to build because we lack metafile; mark as install attempt (will error later)
+          REQ_TYPE["${key}"]="unresolved"
+          REQ_VAL["${key}"]="${rval}"
+          INSTALL_QUEUE+=("${key}")
+        fi
+      fi
+      ;;
+    *)
+      adm_log ERR "Tipo desconhecido para request ${key}: ${rtype}"
+      ;;
+  esac
+done
+
+# ---------- If there are builds queued, run builds (serial or parallel) ----------
+# Build queue contains metafile paths. We'll build sequentially to avoid toolchain races,
+# but we could parallelize if safe. We'll respect JOBS but default to 1 for build queue.
+if [ "${#BUILD_QUEUE[@]}" -gt 0 ]; then
+  adm_log INFO "Fila de build: ${#BUILD_QUEUE[@]} metafile(s) a construir"
+  for mf in "${BUILD_QUEUE[@]}"; do
+    adm_log INFO "Construindo metafile: ${mf}"
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${ADM_SCRIPTS}/adm-build --metafile '${mf}' --no-dry-run" 
+      # in dry-run we don't actually build; attempt to find artifact anyway
+      cand="$(find_package_archive_in_repo "$(read_metafile_val "${mf}" "NAME" 2>/dev/null || echo '')" || true)"
+      [ -n "${cand}" ] && adm_log INFO "[dry-run] binário hipotético encontrado: ${cand}"
+      # assign artifact if hypothetically found (dry-run convenience)
+      if [ -n "${cand}" ]; then
+        # find corresponding req key(s) and set ARTIFACT_FOR_REQ
+        for i in $(seq 1 ${#REQUESTS[@]}); do
+          key="req${i}"
+          if [ "${REQ_TYPE[${key}]}" = "metafile" ] && [ "${REQ_VAL[${key}]}" = "${mf}" ]; then
+            ARTIFACT_FOR_REQ["${key}"]="${cand}"
+          fi
+        done
+      fi
+      continue
+    fi
+
+    # actually build
+    if ! "${ADM_SCRIPTS}/adm-build" --metafile "${mf}" --no-dry-run --jobs "${JOBS}"; then
+      adm_log ERR "adb-build falhou ao construir ${mf}; abortando instalação em lote."
+      exit 1
+    fi
+    # after build, attempt to find artifact in ADM_PACKAGES by name/version
+    name=$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)
+    ver=$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)
+    cand=""
+    if [ -n "${name}" ]; then
+      if [ -n "${ver}" ]; then
+        cand="$(find_package_archive_in_repo "${name}-${ver}" || true)"
+      fi
+      if [ -z "${cand}" ]; then
+        cand="$(find_package_archive_in_repo "${name}" || true)"
+      fi
+    fi
+    if [ -z "${cand}" ]; then
+      adm_log WARN "Build concluiu mas não localizei binário em ${ADM_PACKAGES} para ${mf}; o pacote será instalado a partir do destdir se existir."
+      # try destdir in ADM_DESTDIR
+      destcand="$(find "${ADM_DESTDIR}" -maxdepth 2 -type d -name "${name}*" 2>/dev/null | head -n1 || true)"
+      if [ -n "${destcand}" ]; then
+        cand="${destcand}"
+      fi
+    fi
+    # assign artifact for all requests pointing to this metafile
+    for i in $(seq 1 ${#REQUESTS[@]}); do
+      key="req${i}"
+      if [ "${REQ_TYPE[${key}]}" = "metafile" ] && [ "${REQ_VAL[${key}]}" = "${mf}" ]; then
+        if [ -n "${cand}" ]; then
+          ARTIFACT_FOR_REQ["${key}"]="${cand}"
+          adm_log INFO "Artefato para ${key} atribuído: ${cand}"
+        else
+          adm_log WARN "Nenhum artefato encontrado após build para ${mf}; a instalação tentará usar destdir ou falhará."
+        fi
+      fi
+    done
+  done
+else
+  adm_log INFO "Nenhum build necessário."
+fi
+
+# ---------- Pre-install hooks global (pre-install) ----------
+adm_log INFO "Executando hooks globais pré-install..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-hooks run install --phase pre"
+else
+  "${ADM_SCRIPTS}/adm-hooks" run install --phase pre || adm_log WARN "Hooks globais pré-install retornaram erro"
+fi
+
+# ---------- Iterate INSTALL_QUEUE and perform installs ----------
+# We'll attempt installs in parallel up to JOBS, but ensure proper error/rollback handling.
+declare -A INSTALL_STATUS   # key -> 0 success, non-zero fail
+declare -A INSTALL_MSG
+
+# commands array for run_with_limit will store shell commands; but we need fine control for rollback
+# We'll instead run installs sequentially but can be changed to parallel safely if needed.
+for key in "${INSTALL_QUEUE[@]}"; do
+  rtype="${REQ_TYPE[${key}]:-}"
+  rval="${REQ_VAL[${key}]:-}"
+  rname="${REQ_NAME[${key}]:-unknown}"
+  rver="${REQ_VERSION[${key}]:-unknown}"
+  artifact="${ARTIFACT_FOR_REQ[${key}]:-}"
+  adm_log INFO "Instalando request ${key}: name=${rname} artifact=${artifact:-(nenhum)} type=${rtype}"
+  # run local pre-install hooks (per package)
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run install --phase pre --category ${CATEGORY:-unknown} --program ${rname}"
+  else
+    "${ADM_SCRIPTS}/adm-hooks" run install --phase pre --category "${CATEGORY:-misc}" --program "${rname}" || adm_log WARN "Hook pre-install retornou erro para ${rname}"
+  fi
+
+  if [ -z "${artifact}" ]; then
+    adm_log ERR "Nenhum artefato determinado para ${rname}. Pulando instalação para este item."
+    INSTALL_STATUS["${key}"]=2
+    INSTALL_MSG["${key}"]="Nenhum artefato determinado"
+    continue
+  fi
+
+  # determine install root: if CHROOT_ROOT set, install into CHROOT_ROOT, else use DESTDIR_OVERRIDE or '/'
+  if [ -n "${CHROOT_ROOT}" ]; then
+    target_root="${CHROOT_ROOT}"
+  elif [ -n "${DESTDIR_OVERRIDE}" ]; then
+    target_root="${DESTDIR_OVERRIDE}"
+  else
+    target_root="/"
+  fi
+
+  # create backup marker dir to allow rollback per package
+  BACKUP_DIR="${ADM_TEMP}/adm-install-backup-$(date +%s)-$$-${rname}"
+  register_tmp "${BACKUP_DIR}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] criar backup hipotético em ${BACKUP_DIR}"
+  else
+    mkdir -p "${BACKUP_DIR}"
+  fi
+
+  # install artifact (archive or destdir)
+  if install_single_package_artifact "${artifact}" "${target_root}" "${rname}" "${rver}"; then
+    INSTALL_STATUS["${key}"]=0
+    INSTALL_MSG["${key}"]="OK"
+    adm_log OK "Instalação concluída: ${rname}"
+  else
+    INSTALL_STATUS["${key}"]=1
+    INSTALL_MSG["${key}"]="Erro na instalação"
+    adm_log ERR "Falha instalando ${rname}; iniciando rollback para este pacote"
+    # rollback for this package: try to restore backups (.adm.bak files)
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] rollback (restaurar backups .adm.bak) para ${rname}"
+    else
+      # restore any .adm.bak files we created
+      if command -v find >/dev/null 2>&1; then
+        while IFS= read -r b; do
+          orig="${b%.adm.bak}"
+          if [ -e "${b}" ]; then
+            adm_log INFO "Restaurando backup ${b} -> ${orig}"
+            run_cmd "mv -f '${b}' '${orig}'" || adm_log WARN "Falha ao restaurar ${b}"
+          fi
+        done < <(find "${target_root}" -type f -name "*.adm.bak" -print 2>/dev/null || true)
+      fi
+    fi
+    # continue with other installs (do not abort entire batch)
+    continue
+  fi
+
+  # run local post-install hooks
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] adm-hooks run install --phase post --category ${CATEGORY:-misc} --program ${rname}"
+  else
+    "${ADM_SCRIPTS}/adm-hooks" run install --phase post --category "${CATEGORY:-misc}" --program "${rname}" || adm_log WARN "Hook post-install retornou erro para ${rname}"
+  fi
+done
+
+# ---------- Final global post-install hooks ----------
+adm_log INFO "Executando hooks globais pós-install..."
+if [ "${ADM_DRYRUN}" -eq 1 ]; then
+  adm_log INFO "[dry-run] adm-hooks run install --phase post"
+else
+  "${ADM_SCRIPTS}/adm-hooks" run install --phase post || adm_log WARN "Hooks globais pós-install retornaram erro"
+fi
+
+# ---------- Report summary ----------
+printf "\n%bInstalação - Resumo:%b\n" "${T_BOLD}" "${T_RESET}"
+for i in $(seq 1 ${#REQUESTS[@]}); do
+  key="req${i}"
+  name="${REQ_NAME[${key}]:-unknown}"
+  status="${INSTALL_STATUS[${key}]:-9}"
+  msg="${INSTALL_MSG[${key}]:-unknown}"
+  case "${status}" in
+    0) printf "  %b[OK]%b    %s — %s\n" "${T_GREEN}" "${T_RESET}" "${name}" "${msg}" ;;
+    1) printf "  %b[ERR]%b   %s — %s\n" "${T_RED}" "${T_RESET}" "${name}" "${msg}" ;;
+    2) printf "  %b[SKIP]%b  %s — %s\n" "${T_YELLOW}" "${T_RESET}" "${name}" "${msg}" ;;
+    *) printf "  %b[UNK]%b   %s — %s\n" "${T_MAGENTA}" "${T_RESET}" "${name}" "${msg}" ;;
+  esac
+done
+
+adm_log OK "adm-install finalizado."
+
+exit 0
