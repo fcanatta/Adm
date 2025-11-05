@@ -1,300 +1,665 @@
 #!/usr/bin/env bash
 #
-# adm-clean v1.0.1-dev
-# Sistema de limpeza e manutenção do ambiente ADM
-# Integra-se com adm-db para log, métricas e auditoria
+# adm-clean v1.1.0-dev
+# Limpeza inteligente do ambiente ADM com integração completa:
+#   - adm-db (logs/metrics/spinner/progress)
+#   - adm-hooks (pre/post hooks)
+#   - adm-profile (adaptação de comportamento por perfil)
+#   - adm-resolver (checagem de dependências após remoção)
 #
-# Autor: Sistema ADM Automático
-# Data: 2025-11-06
+# Use com --dry-run até estar seguro.
 #
 set -euo pipefail
+IFS=$'\n\t'
 
-### Variáveis principais
+### ------------- Configuration -------------
 ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
-ADM_DB="${ADM_ROOT}/db"
-ADM_LOG="${ADM_ROOT}/logs"
-ADM_BIN="${ADM_ROOT}/bin"
-ADM_CACHE="${ADM_ROOT}/cache"
-ADM_WORK="${ADM_ROOT}/work"
-ADM_BOOTSTRAP="${ADM_ROOT}/bootstrap"
-ADM_VERSION="v1.0.1-dev"
+ADM_BIN="${ADM_BIN:-${ADM_ROOT}/bin}"
+ADM_DB_DIR="${ADM_DB_DIR:-${ADM_ROOT}/db}"
+ADM_LOG="${ADM_LOG:-${ADM_ROOT}/logs}"
+ADM_CACHE="${ADM_CACHE:-${ADM_ROOT}/cache}"
+ADM_WORK="${ADM_WORK:-${ADM_ROOT}/work}"
+ADM_BOOTSTRAP="${ADM_BOOTSTRAP:-${ADM_ROOT}/bootstrap}"
+ADM_VERSION="v1.1.0-dev"
 
-# Arquivos de banco de dados
-DB_LOGS="${ADM_DB}/logs.jsonl"
-DB_AUDIT="${ADM_DB}/audit.jsonl"
-DB_METRICS="${ADM_DB}/metrics.jsonl"
-DB_PKGS="${ADM_DB}/packages.jsonl"
+DB_GLOBAL="${ADM_DB_DIR}/logs.jsonl"
+DB_AUDIT="${ADM_DB_DIR}/audit.jsonl"
+DB_METRICS="${ADM_DB_DIR}/metrics.jsonl"
+DB_QUEUE="${ADM_DB_DIR}/queue.jsonl"
+DB_PKGS="${ADM_DB_DIR}/packages.jsonl"
 
-# Carrega o adm-db se existir
-if [ -f "${ADM_BIN}/adm-db" ]; then
-  # shellcheck source=/dev/null
-  source "${ADM_BIN}/adm-db"
-else
-  echo "⚠️  aviso: adm-db não encontrado, logs locais apenas."
-  db_log() { printf "[%s] %s\n" "$(date -u +%H:%M:%S)" "$*"; }
-  db_info() { db_log INFO "$*"; }
-  db_ok() { db_log OK "$*"; }
-  db_warn() { db_log WARN "$*"; }
-  db_error() { db_log ERROR "$*"; }
-fi
-
-# Detecta TTY para saída colorida
-IS_TTY=false
-if [ -t 1 ]; then IS_TTY=true; fi
-
-if $IS_TTY; then
-  _BOLD="$(tput bold)"; _NORM="$(tput sgr0)"
-  _RED="$(tput setaf 1)"; _GRN="$(tput setaf 2)"
-  _YEL="$(tput setaf 3)"; _BLU="$(tput setaf 4)"
-  _CYA="$(tput setaf 6)"
-else
-  _BOLD=""; _NORM=""; _RED=""; _GRN=""; _YEL=""; _BLU=""; _CYA=""
-fi
-
-### Configuração padrão
+# Defaults
 MODE=""
 DRY_RUN=false
 FORCE=false
 DAYS=30
 KEEP=5
 VERBOSE=false
-PROFILE="normal"
+PROFILE=""
+QUIET=false
 
-### Parse de argumentos
+# Terminal detection
+IS_TTY=false
+if [ -t 1 ]; then IS_TTY=true; fi
+
+# Colors / formatting
+if $IS_TTY; then
+  BOLD="$(tput bold 2>/dev/null || echo '')"
+  NORM="$(tput sgr0 2>/dev/null || echo '')"
+  RED="$(tput setaf 1 2>/dev/null || echo '')"
+  GRN="$(tput setaf 2 2>/dev/null || echo '')"
+  YEL="$(tput setaf 3 2>/dev/null || echo '')"
+  BLU="$(tput setaf 4 2>/dev/null || echo '')"
+  MAG="$(tput setaf 5 2>/dev/null || echo '')"
+  CYA="$(tput setaf 6 2>/dev/null || echo '')"
+else
+  BOLD=""; NORM=""; RED=""; GRN=""; YEL=""; BLU=""; MAG=""; CYA=""
+fi
+
+ICON_CLEAN="🧹"
+ICON_OK="✔️"
+ICON_WARN="⚠️"
+ICON_ERR="✖️"
+ICON_INFO="🌀"
+ICON_PKG="📦"
+ICON_QUEUE="🧩"
+
+# Traps
+on_error() {
+  local rc=$?
+  echo "${RED}[ERROR] adm-clean encountered an error (exit ${rc})${NORM}" >&2
+  # Attempt to record in adm-db if available
+  if type db_log >/dev/null 2>&1; then
+    db_log ERROR "adm-clean" "$MODE" "" "adm-clean aborted with code ${rc}"
+    db_log END "adm-clean" "$MODE" "" "aborted"
+  fi
+  exit $rc
+}
+trap on_error ERR
+
+on_exit() {
+  # any cleanup here
+  true
+}
+trap on_exit EXIT
+
+### ------------- Integration: adm-db, adm-hooks, adm-profile, adm-resolver -------------
+# Load adm-db functions if present (for spinner, progress, logging)
+if [ -x "${ADM_BIN}/adm-db" ]; then
+  # source rather than execute so functions like db_spinner_start are available
+  # shellcheck source=/dev/null
+  source "${ADM_BIN}/adm-db"
+  HAS_ADM_DB=true
+else
+  HAS_ADM_DB=false
+  # fallback: minimal logging functions
+  db_log() { local level="$1"; shift; printf "[%s] %s\n" "$level" "$*"; }
+  db_info() { db_log INFO "$*"; }
+  db_ok() { db_log OK "$*"; }
+  db_warn() { db_log WARN "$*"; }
+  db_error() { db_log ERROR "$*"; }
+  db_begin() { db_log BEGIN "$*"; }
+  db_end() { db_log END "$*"; }
+  db_spinner_start() { :; }
+  db_spinner_stop() { :; }
+  db_progress() { :; }
+fi
+
+# adm-hooks (optional)
+if [ -x "${ADM_BIN}/adm-hooks" ]; then
+  ADMH_HOOKS_CMD="${ADM_BIN}/adm-hooks"
+else
+  ADMH_HOOKS_CMD=""
+fi
+
+# adm-profile (optional)
+if [ -x "${ADM_BIN}/adm-profile" ]; then
+  ADMH_PROFILE_CMD="${ADM_BIN}/adm-profile"
+else
+  ADMH_PROFILE_CMD=""
+fi
+
+# adm-resolver (optional; used for dependency integrity check after orphan removal)
+if [ -x "${ADM_BIN}/adm-resolver" ]; then
+  ADMH_RESOLVER_CMD="${ADM_BIN}/adm-resolver"
+else
+  ADMH_RESOLVER_CMD=""
+fi
+
+### ------------- Ensure dirs exist (idempotent) -------------
+mkdir -p "${ADM_LOG}" "${ADM_DB_DIR}" "${ADM_CACHE}" "${ADM_WORK}" "${ADM_BOOTSTRAP}" "${ADM_BIN}"
+# Touch DB files to ensure existence
+: > "${DB_GLOBAL}" 2>/dev/null || true
+: > "${DB_AUDIT}" 2>/dev/null || true
+: > "${DB_METRICS}" 2>/dev/null || true
+: > "${DB_QUEUE}" 2>/dev/null || true
+: > "${DB_PKGS}" 2>/dev/null || true
+
+### ------------- Helpers -------------
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+now_sec() { date +%s.%N; }
+file_age_days() { local f="$1"; [ -e "$f" ] || return 1; printf "%d" $(( ( $(date +%s) - $(stat -c %Y "$f") ) / 86400 )); }
+
+# JSON-escape minimal
+json_escape() {
+  local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; printf "%s" "$s"
+}
+
+# Atomic append using flock on DB directory lock
+atomic_append_db() {
+  local file="$1"; shift
+  local line="$*"
+  mkdir -p "$(dirname "$file")"
+  exec 9>"${ADM_DB_DIR}/.adm_clean_lock"
+  flock -x 9
+  printf "%s\n" "$line" >> "$file" || true
+  flock -u 9
+  exec 9>&-
+}
+
+# safe overwrite with backup
+safe_overwrite_file() {
+  local dest="$1"; local content="$2"
+  mkdir -p "$(dirname "$dest")"
+  local tmp; tmp="$(mktemp "$(dirname "$dest")/.tmp.XXXXXX")"
+  printf "%s\n" "$content" > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$dest"
+}
+
+# safety: ensure path inside ADM_ROOT
+inside_adm_root() {
+  local p="$1"
+  case "$p" in
+    "$ADM_ROOT"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# safe remove wrapper (records removed size + path)
+safe_rm_record() {
+  local target="$1"
+  if [ ! -e "$target" ]; then return 0; fi
+  if ! inside_adm_root "$target"; then
+    db_warn "adm-clean" "$MODE" "" "Refusing to remove outside ADM_ROOT: $target"
+    return 1
+  fi
+  local size=0
+  if [ -f "$target" ]; then size=$(stat -c%s "$target" 2>/dev/null || echo 0); fi
+  if $DRY_RUN; then
+    printf "[DRY-RUN] would remove: %s (size=%s)\n" "$target" "$(human_size "$size")"
+    # record dry-run removal in audit file
+    atomic_append_db "${DB_AUDIT}" "$(printf '{"timestamp":"%s","script":"adm-clean","mode":"%s","action":"dry_remove","path":"%s","size":%d}' "$(json_escape "$(timestamp)")" "$(json_escape "$MODE")" "$(json_escape "$target")" "$size")"
+    return 0
+  fi
+  # perform removal and record
+  if rm -rf --one-file-system "$target" 2>/dev/null; then
+    atomic_append_db "${DB_AUDIT}" "$(printf '{"timestamp":"%s","script":"adm-clean","mode":"%s","action":"removed","path":"%s","size":%d}' "$(json_escape "$(timestamp)")" "$(json_escape "$MODE")" "$(json_escape "$target")" "$size")"
+    if $VERBOSE || $IS_TTY; then printf "%s Removed: %s (size=%s)\n" "$ICON_OK" "$target" "$(human_size "$size")"; fi
+    return 0
+  else
+    atomic_append_db "${DB_AUDIT}" "$(printf '{"timestamp":"%s","script":"adm-clean","mode":"%s","action":"remove_failed","path":"%s"}' "$(json_escape "$(timestamp)")" "$(json_escape "$MODE")" "$(json_escape "$target")")"
+    db_warn "adm-clean" "$MODE" "" "Failed to remove $target"
+    return 1
+  fi
+}
+
+# human_size function
+human_size() {
+  local bytes="$1"
+  if [ -z "$bytes" ] || [ "$bytes" -le 0 ]; then echo "0B"; return; fi
+  awk -v b="$bytes" 'function round(x){return int(x+0.5)} \
+    BEGIN{ if(b>=1099511627776){printf "%.2f TB", b/1099511627776} \
+      else if(b>=1073741824){printf "%.2f GB", b/1073741824} \
+      else if(b>=1048576){printf "%.2f MB", b/1048576} \
+      else if(b>=1024){printf "%.2f KB", b/1024} \
+      else{printf "%d B", b}}'
+}
+
+# run adm-hooks if available - safe wrapper
+run_hooks() {
+  local hook_stage="$1"   # e.g., pre-clean, post-clean, pre-clean-cache
+  if [ -n "$ADMH_HOOKS_CMD" ]; then
+    if $DRY_RUN; then
+      db_info "adm-clean" "$MODE" "" "DRY-RUN: would run hooks: $hook_stage"
+      return 0
+    fi
+    if ! "$ADMH_HOOKS_CMD" "${ADM_ROOT}/metafiles" "$hook_stage" --dry-run >/dev/null 2>&1; then
+      # Try without --dry-run; if hook fails and not forced, abort
+      if ! "$ADMH_HOOKS_CMD" "${ADM_ROOT}/metafiles" "$hook_stage"; then
+        db_warn "adm-clean" "$MODE" "" "hooks $hook_stage failed"
+        if ! $FORCE; then
+          db_error "adm-clean" "$MODE" "" "Hook $hook_stage failed and --force not set; aborting."
+          exit 1
+        fi
+      fi
+    fi
+  fi
+}
+
+# query active profile via adm-profile (if available)
+load_active_profile() {
+  PROFILE="unknown"
+  if [ -x "${ADM_BIN}/adm-profile" ]; then
+    if $DRY_RUN; then
+      db_info "adm-clean" "$MODE" "" "DRY-RUN: would query adm-profile current"
+    else
+      PROFILE="$("${ADM_BIN}/adm-profile" current 2>/dev/null | sed -n 's/^Perfil atual: //p' | head -n1 || true)"
+      # fallback: read db/profile.conf
+      if [ -z "$PROFILE" ]; then
+        if [ -f "${ADM_DB_DIR}/profile.conf" ]; then
+          PROFILE="$(grep '^ACTIVE_PROFILE=' "${ADM_DB_DIR}/profile.conf" 2>/dev/null | cut -d= -f2 | tr -d '"')"
+        fi
+      fi
+    fi
+  fi
+  [ -z "$PROFILE" ] && PROFILE="default"
+  db_info "adm-clean" "$MODE" "" "Active profile: ${PROFILE}"
+}
+### ------------- Cleaning functions ------------- 
+
+# clean_cache: remove tarballs and sources older than $DAYS while respecting $KEEP recent files
+clean_cache() {
+  MODE="cache"
+  db_begin "clean:cache" "${ADM_CACHE}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-cache" || true
+  load_active_profile
+
+  local removed_count=0 removed_bytes=0
+  # handle tarballs
+  local tar_dir="${ADM_CACHE}/tarballs"
+  mkdir -p "$tar_dir"
+  # list files sorted by modification time ascending (oldest first)
+  mapfile -t files < <(find "$tar_dir" -type f -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}')
+  local total="${#files[@]}"
+  if [ "$total" -le "$KEEP" ]; then
+    db_info "adm-clean" "$MODE" "" "No tarballs eligible for removal (keep=${KEEP})."
+  else
+    # delete oldest, keep last $KEEP
+    local to_delete=$(( total - KEEP ))
+    local i=0
+    for f in "${files[@]}"; do
+      i=$((i+1))
+      if [ "$i" -le "$to_delete" ]; then
+        local sz=0
+        if [ -f "$f" ]; then sz=$(stat -c%s "$f" 2>/dev/null || echo 0); fi
+        if safe_rm_record "$f"; then
+          removed_count=$((removed_count+1))
+          removed_bytes=$((removed_bytes+sz))
+        fi
+      fi
+    done
+  fi
+
+  # handle sources: delete whole extracted source dirs older than DAYS
+  local src_dir="${ADM_CACHE}/sources"
+  if [ -d "$src_dir" ]; then
+    while IFS= read -r -d '' dir; do
+      if is_older_than "$dir" "$DAYS"; then
+        local dirsize=$(du -sb "$dir" 2>/dev/null | awk '{print $1}' || echo 0)
+        if safe_rm_record "$dir"; then
+          removed_count=$((removed_count+1))
+          removed_bytes=$((removed_bytes+dirsize))
+        fi
+      fi
+    done < <(find "$src_dir" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null)
+  fi
+
+  # record metrics
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"cache_removed_count","value":%d}' "$(json_escape "$(timestamp)")" "$removed_count")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"cache_removed_bytes","value":%d}' "$(json_escape "$(timestamp)")" "$removed_bytes")"
+  db_end "clean:cache" ok "adm-clean" "" ""
+  db_ok "adm-clean" "cache" "" "${removed_count} files removed, freed $(human_size $removed_bytes)"
+  run_hooks "post-clean-cache" || true
+}
+
+# clean_logs: compress older logs and remove excessively old ones
+clean_logs() {
+  MODE="logs"
+  db_begin "clean:logs" "${ADM_LOG}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-logs" || true
+
+  local gz_count=0 rm_count=0 freed=0
+  mkdir -p "${ADM_LOG}"
+  # compress logs older than 7 days and keep last $KEEP uncompressed
+  mapfile -t logs < <(find "${ADM_LOG}" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null | sort -n | awk '{print $2}')
+  local total="${#logs[@]}"
+  local keep="$KEEP"
+  for i in "${!logs[@]}"; do
+    idx=$((i+1))
+    logfile="${logs[i]}"
+    if [ "$idx" -le $((total - keep)) ]; then
+      # compress or remove if too old
+      if is_older_than "$logfile" "$DAYS"; then
+        if $DRY_RUN; then
+          printf "[DRY-RUN] would gzip %s\n" "$logfile"
+        else
+          if gzip -9f "$logfile" 2>/dev/null; then
+            gz_count=$((gz_count+1))
+            freed=$((freed + $(stat -c%s "${logfile}.gz" 2>/dev/null || echo 0)))
+          else
+            # if gzip fails, remove
+            if rm -f "$logfile"; then
+              rm_count=$((rm_count+1))
+            fi
+          fi
+        fi
+      fi
+    fi
+  done
+
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"logs_compressed","value":%d}' "$(json_escape "$(timestamp)")" "$gz_count")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"logs_removed","value":%d}' "$(json_escape "$(timestamp)")" "$rm_count")"
+  db_end "clean:logs" ok "adm-clean" "" ""
+  db_ok "adm-clean" "logs" "" "Compressed: ${gz_count}, removed: ${rm_count}"
+  run_hooks "post-clean-logs" || true
+}
+
+# clean_work: remove work directories not currently used
+clean_work() {
+  MODE="work"
+  db_begin "clean:work" "${ADM_WORK}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-work" || true
+
+  local removed=0 freed=0
+  # detect active builds by looking for pid files or running processes referencing ADM_WORK
+  if pgrep -f adm-build >/dev/null 2>&1 || pgrep -f build >/dev/null 2>&1; then
+    db_warn "adm-clean" "work" "" "Build-related processes detected; skipping work cleanup."
+    db_end "clean:work" ok "adm-clean" "" ""
+    return 0
+  fi
+
+  if [ -d "${ADM_WORK}" ]; then
+    while IFS= read -r -d '' dir; do
+      # ensure inside ADM_ROOT
+      if ! inside_adm_root "$dir"; then continue; fi
+      dirsize=$(du -sb "$dir" 2>/dev/null | awk '{print $1}' || echo 0)
+      if $DRY_RUN; then
+        printf "[DRY-RUN] would remove work dir: %s\n" "$dir"
+      else
+        if safe_rm_record "$dir"; then
+          removed=$((removed+1))
+          freed=$((freed+dirsize))
+        fi
+      fi
+    done < <(find "${ADM_WORK}" -mindepth 1 -maxdepth 2 -type d -print0 2>/dev/null)
+  fi
+
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"work_removed_count","value":%d}' "$(json_escape "$(timestamp)")" "$removed")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"work_removed_bytes","value":%d}' "$(json_escape "$(timestamp)")" "$freed")"
+  db_end "clean:work" ok "adm-clean" "" ""
+  db_ok "adm-clean" "work" "" "Removed ${removed} dirs, freed $(human_size $freed)"
+  run_hooks "post-clean-work" || true
+}
+
+# clean_orphans: detect tarballs or cached packages not registered in DB_PKGS
+clean_orphans() {
+  MODE="orphans"
+  db_begin "clean:orphans" "${ADM_CACHE}/tarballs" "adm-clean" "" "" || true
+  run_hooks "pre-clean-orphans" || true
+
+  local removed=0 freed=0
+  local registered_pkgs
+  registered_pkgs="$(awk -F'"' '/"package":/ {print $4}' "${DB_PKGS}" 2>/dev/null | sort -u || true)"
+
+  # iterate tarballs
+  local tar_dir="${ADM_CACHE}/tarballs"
+  if [ -d "$tar_dir" ]; then
+    while IFS= read -r -d '' tar; do
+      # get base name (pkg-version.tar.*) extract pkg name (before first -)
+      base="$(basename "$tar")"
+      pkgname="$(echo "$base" | sed -E 's/^([^.-]+).*/\1/')"
+      if ! grep -qx "$pkgname" <<<"$registered_pkgs"; then
+        # orphan
+        fsize=$(stat -c%s "$tar" 2>/dev/null || echo 0)
+        if $DRY_RUN; then
+          printf "[DRY-RUN] orphan: %s\n" "$tar"
+        else
+          if safe_rm_record "$tar"; then
+            removed=$((removed+1))
+            freed=$((freed+fsize))
+            # record orphan removal list separately
+            atomic_append_db "${ADM_DB_DIR}/orphans.jsonl" "$(printf '{"timestamp":"%s","action":"removed_orphan","path":"%s","size":%d}' "$(json_escape "$(timestamp)")" "$(json_escape "$tar")" "$fsize")"
+          fi
+        fi
+      fi
+    done < <(find "$tar_dir" -type f -print0 2>/dev/null)
+  fi
+
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"orphans_removed_count","value":%d}' "$(json_escape "$(timestamp)")" "$removed")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"orphans_removed_bytes","value":%d}' "$(json_escape "$(timestamp)")" "$freed")"
+
+  db_end "clean:orphans" ok "adm-clean" "" ""
+  db_ok "adm-clean" "orphans" "" "Removed ${removed} orphan files, freed $(human_size $freed)"
+
+  # If we removed anything and adm-resolver exists, trigger integrity check
+  if [ -n "${ADMH_RESOLVER_CMD:-}" ] && [ "$removed" -gt 0 ]; then
+    if $DRY_RUN; then
+      db_info "adm-clean" "orphans" "" "DRY-RUN: would invoke adm-resolver --check-integrity"
+    else
+      if "${ADMH_RESOLVER_CMD}" --check-integrity >/dev/null 2>&1; then
+        db_ok "adm-clean" "orphans" "" "adm-resolver integrity check OK"
+      else
+        db_warn "adm-clean" "orphans" "" "adm-resolver reported issues"
+      fi
+    fi
+  fi
+  run_hooks "post-clean-orphans" || true
+}
+
+# clean_db: compact and validate JSONL DBs; backup before write
+clean_db() {
+  MODE="db"
+  db_begin "clean:db" "${ADM_DB_DIR}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-db" || true
+
+  local processed=0 reduced_bytes=0
+  for f in "${ADM_DB_DIR}"/*.jsonl; do
+    [ -f "$f" ] || continue
+    cp -a "$f" "${f}.bak" || { db_warn "adm-clean" "db" "" "backup failed for $f"; continue; }
+    # remove empty lines and duplicates
+    local tmp; tmp="$(mktemp "${ADM_DB_DIR}/.tmp.XXXXXX")"
+    awk 'NF' "$f" | sort -u > "$tmp" || { db_warn "adm-clean" "db" "" "compact failed for $f"; rm -f "$tmp"; continue; }
+    local oldsz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    local newsz=$(stat -c%s "$tmp" 2>/dev/null || echo 0)
+    mv "$tmp" "$f"
+    processed=$((processed+1))
+    reduced_bytes=$((reduced_bytes + (oldsz - newsz)))
+    atomic_append_db "${DB_AUDIT}" "$(printf '{"timestamp":"%s","script":"adm-clean","action":"db_compact","file":"%s","old":%d,"new":%d}' "$(json_escape "$(timestamp)")" "$(json_escape "$f")" "$oldsz" "$newsz")"
+  done
+
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"db_compacted_files","value":%d}' "$(json_escape "$(timestamp)")" "$processed")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"db_reduced_bytes","value":%d}' "$(json_escape "$(timestamp)")" "$reduced_bytes")"
+  db_end "clean:db" ok "adm-clean" "" ""
+  db_ok "adm-clean" "db" "" "DB compactado (${processed} arquivos, saved $(human_size "$reduced_bytes"))"
+  run_hooks "post-clean-db" || true
+}
+
+# clean_bootstrap: removes bootstrap stages; requires --force
+clean_bootstrap() {
+  MODE="bootstrap"
+  if ! $FORCE; then
+    db_warn "adm-clean" "bootstrap" "" "--force requerido para limpar bootstrap"
+    echo "${YEL}Use --force para confirmar limpeza de bootstrap.${NORM}"
+    return 1
+  fi
+  db_begin "clean:bootstrap" "${ADM_BOOTSTRAP}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-bootstrap" || true
+
+  local removed=0 freed=0
+  if [ -d "${ADM_BOOTSTRAP}" ]; then
+    while IFS= read -r -d '' d; do
+      if safe_rm_record "$d"; then
+        removed=$((removed+1))
+        freed=$((freed + $(du -sb "$d" 2>/dev/null | awk '{print $1}' || echo 0)))
+      fi
+    done < <(find "${ADM_BOOTSTRAP}" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+  fi
+
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"bootstrap_removed","value":%d}' "$(json_escape "$(timestamp)")" "$removed")"
+  db_end "clean:bootstrap" ok "adm-clean" "" ""
+  db_ok "adm-clean" "bootstrap" "" "Bootstrap cleaned: ${removed} dirs, freed $(human_size $freed)"
+  run_hooks "post-clean-bootstrap" || true
+}
+
+# full_reset: destructive; keeps only adm-db and adm-clean in bin
+clean_full_reset() {
+  MODE="full-reset"
+  if ! $FORCE; then
+    db_error "adm-clean" "$MODE" "" "--force obrigatório para full-reset"
+    echo "${RED}full-reset requer --force. Aborting.${NORM}"
+    exit 1
+  fi
+  echo "${YEL}${BOLD}WARNING: This will DELETE most of ${ADM_ROOT}${NORM}"
+  read -rp "Type 'DELETE ALL' to confirm: " conf
+  if [ "$conf" != "DELETE ALL" ]; then
+    echo "Confirmation failed. Aborting."
+    exit 1
+  fi
+
+  db_begin "clean:full-reset" "${ADM_ROOT}" "adm-clean" "" "" || true
+  run_hooks "pre-clean-full-reset" || true
+
+  # remove everything except bin/adm-db and bin/adm-clean
+  for p in "${ADM_ROOT}"/*; do
+    case "$(basename "$p")" in
+      bin)
+        # inside bin, remove everything except adm-db and adm-clean
+        for f in "${p}"/*; do
+          case "$(basename "$f")" in
+            adm-db|adm-clean) continue ;;
+            *) safe_rm_record "$f" ;;
+          esac
+        done
+        ;;
+      *) safe_rm_record "$p" ;;
+    esac
+  done
+
+  atomic_append_db "${DB_AUDIT}" "$(printf '{"timestamp":"%s","script":"adm-clean","action":"full_reset","status":"ok"}' "$(json_escape "$(timestamp)")")"
+  db_end "clean:full-reset" ok "adm-clean" "" ""
+  db_ok "adm-clean" "full-reset" "" "Full reset executed (preserved adm-db and adm-clean)"
+  run_hooks "post-clean-full-reset" || true
+}
+
+### ------------- Queue and installation-aware helpers -------------
+# show queue (uses DB_QUEUE)
+queue_show() {
+  if [ ! -f "${DB_QUEUE}" ] || [ ! -s "${DB_QUEUE}" ]; then
+    echo "Queue empty."
+    return
+  fi
+  echo "╭─────────────────────────────────────────────────────────────╮"
+  echo "│ ${ICON_QUEUE} Queue for installation/builds                │"
+  echo "├────┬──────────────┬─────────┬───────────────────────────────┤"
+  printf "│ %-2s │ %-12s │ %-7s │ %-29s │\n" "#" "Pacote" "Versão" "Dependências"
+  echo "├────┼──────────────┼─────────┼───────────────────────────────┤"
+  local i=0
+  while IFS= read -r line; do
+    i=$((i+1))
+    pkg="$(echo "$line" | sed -n 's/.*"package":"\([^"]*\)".*/\1/p')"
+    ver="$(echo "$line" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+    deps="$(echo "$line" | sed -n 's/.*"deps":\(\[[^]]*\]\).*/\1/p')"
+    deps="$(echo "$deps" | sed 's/\["\([^"]*\)"\]/\1/' | sed 's/","/, /g' )"
+    printf "│ %02d │ %-12s │ %-7s │ %-29s │\n" "$i" "$pkg" "$ver" "${deps:--}"
+  done < "${DB_QUEUE}"
+  echo "└────┴──────────────┴─────────┴───────────────────────────────┘"
+}
+
+# register package removal impacts for resolver
+notify_resolver_if_needed() {
+  if [ -n "${ADMH_RESOLVER_CMD:-}" ]; then
+    if $DRY_RUN; then
+      db_info "adm-clean" "" "" "DRY-RUN: would notify adm-resolver to re-evaluate deps"
+    else
+      if "${ADMH_RESOLVER_CMD}" --check-integrity >/dev/null 2>&1; then
+        db_ok "adm-clean" "" "" "adm-resolver reports OK"
+      else
+        db_warn "adm-clean" "" "" "adm-resolver found issues after cleanup"
+      fi
+    fi
+  fi
+}
+
+### ------------- Composite operations -------------
+clean_all() {
+  timer_start=$(now_sec)
+  db_begin "clean:all" "${ADM_ROOT}" "adm-clean" "" "" || true
+  run_hooks "pre-clean" || true
+  clean_cache || true
+  clean_logs || true
+  clean_work || true
+  clean_orphans || true
+  clean_db || true
+  run_hooks "post-clean" || true
+  timer_end=$(now_sec)
+  duration="$(awk "BEGIN{printf \"%.2f\", $timer_end - $timer_start}")"
+  atomic_append_db "${DB_METRICS}" "$(printf '{"timestamp":"%s","metric":"clean_all_duration_s","value":"%s"}' "$(json_escape "$(timestamp)")" "$duration")"
+  db_ok "adm-clean" "all" "" "All cleaning stages finished in ${duration}s"
+}
+
+# Print summary and final logs path
+print_summary() {
+  local total_bytes
+  total_bytes=$(du -sb "${ADM_ROOT}" 2>/dev/null | awk '{print $1}' || echo 0)
+  echo "──────────────────────────────────────────────────────────────"
+  printf "%b %bSummary%b\n" "$ICON_CLEAN" "$BOLD" "$NORM"
+  echo "Mode: ${MODE}"
+  echo "Profile: ${PROFILE}"
+  echo "Dry-run: ${DRY_RUN}"
+  echo "ADM root: ${ADM_ROOT}"
+  echo "Total size: $(human_size "${total_bytes}")"
+  echo "Logs: ${ADM_LOG}"
+  echo "DB: ${ADM_DB_DIR}"
+  echo "──────────────────────────────────────────────────────────────"
+}
+
+### ------------- Argument parsing and main -------------
+show_help() {
+  cat <<EOF
+adm-clean ${ADM_VERSION}
+Usage: adm-clean <mode> [options]
+Modes: cache logs work orphans db bootstrap all full-reset
+Options:
+  --dry-run        Simulate actions
+  --force          Force without confirmation
+  --days <N>       Older than N days (default ${DAYS})
+  --keep <N>       Keep N most recent items (default ${KEEP})
+  --verbose
+EOF
+}
+
 parse_args() {
-  while [[ $# -gt 0 ]]; do
+  if [ $# -lt 1 ]; then show_help; exit 1; fi
+  MODE="$1"; shift
+  while [ $# -gt 0 ]; do
     case "$1" in
-      cache|logs|work|orphans|db|bootstrap|all|full-reset)
-        MODE="$1"; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       --force) FORCE=true; shift ;;
       --days) DAYS="$2"; shift 2 ;;
       --keep) KEEP="$2"; shift 2 ;;
       --verbose) VERBOSE=true; shift ;;
       --profile) PROFILE="$2"; shift 2 ;;
-      -h|--help)
-        show_help; exit 0 ;;
-      *)
-        echo "Argumento inválido: $1"; show_help; exit 1 ;;
+      -h|--help) show_help; exit 0 ;;
+      *) echo "Unknown arg: $1"; show_help; exit 1 ;;
     esac
   done
-
-  if [ -z "$MODE" ]; then
-    echo "Uso: adm-clean <modo> [opções]"
-    show_help; exit 1
-  fi
-}
-
-show_help() {
-  cat <<EOF
-adm-clean ${ADM_VERSION}
-Utilitário de limpeza e manutenção do ambiente ADM
-
-Modos disponíveis:
-  cache        Limpa cache de fontes/tarballs
-  logs         Remove ou compacta logs antigos
-  work         Limpa diretórios temporários de compilação
-  orphans      Remove pacotes órfãos
-  db           Compacta e repara DBs JSONL
-  bootstrap    Limpa estágios bootstrap (requer --force)
-  all          Executa todas as limpezas seguras
-  full-reset   Destroi tudo (requer --force + confirmação textual)
-
-Opções:
-  --dry-run        Simula a limpeza sem executar
-  --force          Ignora confirmações
-  --days <N>       Remove arquivos com mais de N dias (padrão 30)
-  --keep <N>       Mantém os N arquivos mais recentes
-  --verbose        Mostra detalhes
-  --profile <tipo> safe|normal|aggressive|purge
-
-Exemplos:
-  adm-clean all --dry-run
-  adm-clean cache --days 15 --keep 3 --force
-EOF
-}
-### Funções auxiliares
-
-timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
-
-# Conversão de bytes → tamanho humano
-human_size() {
-  local bytes=$1
-  local kib=$((bytes / 1024))
-  local mib=$((kib / 1024))
-  local gib=$((mib / 1024))
-  if (( gib > 0 )); then printf "%d GB" "$gib"
-  elif (( mib > 0 )); then printf "%d MB" "$mib"
-  else printf "%d KB" "$kib"; fi
-}
-
-# Verifica se arquivo tem mais de N dias
-is_older_than() {
-  local file=$1 days=$2
-  find "$file" -mtime +"$days" -print -quit 2>/dev/null | grep -q .
-}
-
-# Calcula uso de disco em bytes
-get_disk_usage() {
-  du -sb "$ADM_ROOT" 2>/dev/null | awk '{print $1}'
-}
-
-# Funções seguras de remoção
-safe_rm() {
-  local target="$1"
-  if [ ! -e "$target" ]; then return 0; fi
-  if $DRY_RUN; then
-    printf "[DRY-RUN] Remover: %s\n" "$target"
-    return 0
-  fi
-  if rm -rf --one-file-system "$target" 2>/dev/null; then
-    $VERBOSE && echo "✔️ Removido: $target"
-  else
-    db_error "Falha ao remover $target"
-    return 1
-  fi
-}
-
-safe_rmdir() {
-  local dir="$1"
-  if [ -d "$dir" ] && [ -z "$(ls -A "$dir")" ]; then
-    safe_rm "$dir"
-  fi
-}
-
-# Confirmação
-confirm_action() {
-  local message="$1"
-  if $FORCE; then return 0; fi
-  echo ""
-  echo "${_YEL}${_BOLD}$message${_NORM}"
-  read -rp "Confirmar? (y/N): " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { echo "Operação cancelada."; exit 1; }
-}
-
-# Medidor de tempo
-start_time=0
-end_time=0
-timer_start() { start_time=$(date +%s.%N); }
-timer_end() {
-  end_time=$(date +%s.%N)
-  awk "BEGIN {printf \"%.2f\", $end_time - $start_time}"
-}
-clean_cache() {
-  db_log INFO "adm-clean" "cache" "" "Iniciando limpeza de cache"
-  local dir_tar="${ADM_CACHE}/tarballs"
-  local dir_src="${ADM_CACHE}/sources"
-  local total_removed=0 total_size=0
-  for d in "$dir_tar" "$dir_src"; do
-    [ -d "$d" ] || continue
-    while IFS= read -r file; do
-      ((total_removed++))
-      size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-      ((total_size+=size))
-      safe_rm "$file"
-    done < <(find "$d" -type f -mtime +"$DAYS" 2>/dev/null)
-  done
-  db_log OK "adm-clean" "cache" "" "Cache limpo (${total_removed} arquivos, $(human_size $total_size))"
-}
-
-clean_logs() {
-  db_log INFO "adm-clean" "logs" "" "Limpando logs antigos..."
-  local count=0
-  mkdir -p "$ADM_LOG"
-  local files=( $(find "$ADM_LOG" -type f -name '*.log' -mtime +"$DAYS" 2>/dev/null | sort) )
-  for f in "${files[@]:0:-KEEP}"; do
-    ((count++))
-    $DRY_RUN && echo "[DRY-RUN] Remover $f" && continue
-    gzip -9f "$f" 2>/dev/null || safe_rm "$f"
-  done
-  db_log OK "adm-clean" "logs" "" "${count} logs antigos removidos ou compactados"
-}
-
-clean_work() {
-  db_log INFO "adm-clean" "work" "" "Limpando diretórios temporários..."
-  if pgrep -f adm-build >/dev/null; then
-    db_warn "adm-clean" "work" "" "Build em execução — limpeza adiada"
-    return
-  fi
-  find "$ADM_WORK" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | while IFS= read -r -d '' dir; do
-    safe_rm "$dir"
-  done
-  db_ok "adm-clean" "work" "" "Diretórios de build limpos"
-}
-
-clean_orphans() {
-  db_log INFO "adm-clean" "orphans" "" "Verificando pacotes órfãos..."
-  local pkgs_db pkgs_cache orphan_count=0
-  pkgs_db=$(grep -o '"package":"[^"]*"' "$DB_PKGS" 2>/dev/null | cut -d: -f2 | tr -d '"' | sort -u)
-  for pkg in $(find "$ADM_CACHE/tarballs" -type f -printf "%f\n" | cut -d- -f1 | sort -u); do
-    if ! grep -q "$pkg" <<<"$pkgs_db"; then
-      ((orphan_count++))
-      safe_rm "${ADM_CACHE}/tarballs/${pkg}"*
-    fi
-  done
-  db_log OK "adm-clean" "orphans" "" "${orphan_count} pacotes órfãos removidos"
-}
-
-clean_db() {
-  db_log INFO "adm-clean" "db" "" "Compactando DBs JSONL..."
-  for dbfile in "$ADM_DB"/*.jsonl; do
-    [ -f "$dbfile" ] || continue
-    cp "$dbfile" "$dbfile.bak"
-    awk 'NF && $1!~/^#/ {print}' "$dbfile" | sort -u > "$dbfile.tmp"
-    mv "$dbfile.tmp" "$dbfile"
-  done
-  db_ok "adm-clean" "db" "" "DBs compactados e corrigidos"
-}
-
-clean_bootstrap() {
-  confirm_action "Deseja realmente limpar os estágios bootstrap? Isso é irreversível."
-  db_log INFO "adm-clean" "bootstrap" "" "Limpando diretórios bootstrap..."
-  find "$ADM_BOOTSTRAP" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' dir; do
-    safe_rm "$dir"
-  done
-  db_ok "adm-clean" "bootstrap" "" "Bootstrap limpo com sucesso"
-}
-clean_all() {
-  timer_start
-  clean_cache
-  clean_logs
-  clean_work
-  clean_orphans
-  clean_db
-  local dur
-  dur=$(timer_end)
-  db_ok "adm-clean" "all" "" "Limpeza completa concluída em ${dur}s"
-}
-
-clean_full_reset() {
-  if ! $FORCE; then
-    echo "❌ --force é obrigatório para full-reset"
-    exit 1
-  fi
-  echo "⚠️  DESTRUIRÁ TODO O CONTEÚDO DE /usr/src/adm EXCETO adm-db E adm-clean"
-  read -rp "Digite 'DELETE ALL' para confirmar: " ans
-  [[ "$ans" == "DELETE ALL" ]] || { echo "Abortado."; exit 1; }
-
-  find "$ADM_ROOT" -mindepth 1 -maxdepth 1 ! -name bin -print0 | while IFS= read -r -d '' path; do
-    safe_rm "$path"
-  done
-  find "$ADM_BIN" -type f ! -name 'adm-db' ! -name 'adm-clean' -delete
-  db_ok "adm-clean" "full-reset" "" "Sistema ADM resetado com sucesso"
-}
-
-print_summary() {
-  echo "──────────────────────────────────────────────────────────────"
-  echo "🧹 ${_BOLD}Resumo da limpeza ADM${_NORM}"
-  echo "Modo: ${MODE}"
-  echo "Dry-run: $DRY_RUN"
-  echo "Forçado: $FORCE"
-  echo "──────────────────────────────────────────────────────────────"
-  du -sh "$ADM_ROOT"/* 2>/dev/null || true
 }
 
 main() {
   parse_args "$@"
-  db_log BEGIN "adm-clean" "$MODE" "" "Iniciando modo ${MODE}"
+  # ensure mode valid
+  case "$MODE" in
+    cache|logs|work|orphans|db|bootstrap|all|full-reset) ;;
+    *) echo "Invalid mode: $MODE"; show_help; exit 1 ;;
+  esac
+
+  # announce start
+  db_begin "adm-clean:$MODE" "${ADM_ROOT}" "adm-clean" "" ""
+  # load profile
+  load_active_profile
+
+  # run selected mode
   case "$MODE" in
     cache) clean_cache ;;
     logs) clean_logs ;;
@@ -305,8 +670,15 @@ main() {
     all) clean_all ;;
     full-reset) clean_full_reset ;;
   esac
+
   print_summary
-  db_log END "adm-clean" "$MODE" "" "Finalizado modo ${MODE}"
+  db_end "adm-clean:$MODE" ok "adm-clean" "" ""
 }
 
-main "$@"
+# If script executed (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
+
+# Export functions for sourcing by other scripts
+export -f clean_cache clean_logs clean_work clean_orphans clean_db clean_bootstrap clean_all clean_full_reset queue_show notify_resolver_if_needed
