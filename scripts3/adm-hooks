@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# adm-hooks — Gerenciador de execução automática de hooks globais e locais
+#
+# Uso:
+#   adm-hooks run <stage> [--category <cat>] [--program <name>] [--phase pre|post]
+#   adm-hooks list [--all]
+#
+# Exemplos:
+#   adm-hooks run build --phase pre
+#   adm-hooks run install --category core --program bash --phase post
+#   adm-hooks list --all
+#
+# Hooks são buscados em:
+#   Global: ${ADM_HOOKS_GLOBAL}/(pre|post)-<stage>/
+#   Local:  ${ADM_METAFILES}/<category>/<program>/hooks/(pre|post)-<stage>/
+#
+# Suporta chroot e dry-run.
+# Respeita ADM_DRYRUN e ADM_FORCE (de adm-common.sh)
+# Saída colorida, spinner e logs padronizados.
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# --- Flags e argumentos ---
+CATEGORY=""
+PROGRAM=""
+PHASE=""
+ACTION="${1:-}"
+shift || true
+
+# parse simples
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --category) CATEGORY="$2"; shift 2 ;;
+    --program) PROGRAM="$2"; shift 2 ;;
+    --phase) PHASE="$2"; shift 2 ;;
+    --help|-h)
+      cat <<EOF
+Uso:
+  adm-hooks run <stage> [--category <cat>] [--program <name>] [--phase pre|post]
+  adm-hooks list [--all]
+EOF
+      exit 0 ;;
+    *) break ;;
+  esac
+done
+
+adm_parse_common_flags "$@" || { adm_log ERR "Falha ao processar flags globais"; exit 1; }
+
+# util: spinner para execução visual
+spinner() {
+  local pid=$1 delay=0.1 spinstr='|/-\\'
+  while kill -0 $pid 2>/dev/null; do
+    local temp=${spinstr#?}
+    printf " [%c]  " "$spinstr"
+    spinstr=$temp${spinstr%"$temp"}
+    sleep $delay
+    printf "\b\b\b\b\b\b"
+  done
+  printf "    \b\b\b\b"
+}
+
+# encontra hooks (globais e locais)
+find_hooks() {
+  local stage="$1" phase="$2"
+  local list=()
+  local gdir="${ADM_HOOKS_GLOBAL}/${phase}-${stage}"
+  if [ -d "${gdir}" ]; then
+    while read -r f; do
+      [ -f "${f}" ] && list+=("${f}")
+    done < <(find "${gdir}" -maxdepth 1 -type f -executable | sort)
+  fi
+
+  # hooks locais se category/program definidos
+  if [ -n "${CATEGORY}" ] && [ -n "${PROGRAM}" ]; then
+    local ldir="${ADM_METAFILES}/${CATEGORY}/${PROGRAM}/hooks"
+    if [ -d "${ldir}" ]; then
+      while read -r f; do
+        [ -f "${f}" ] && list+=("${f}")
+      done < <(find "${ldir}" -maxdepth 1 -type f -name "${phase}-${stage}*" -executable | sort)
+    fi
+  fi
+  printf '%s\n' "${list[@]+"${list[@]}"}"
+}
+
+# executa hook (localmente ou no chroot, se necessário)
+execute_hook() {
+  local script="$1"
+  local name; name=$(basename "${script}")
+  adm_log INFO "Executando hook: ${name}"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] ${script}"
+    return 0
+  fi
+
+  if [ -x "${script}" ]; then
+    (
+      bash "${script}" >> "${LOGFILE}" 2>&1 &
+      pid=$!
+      spinner $pid
+      wait $pid || { adm_log ERR "Hook ${name} retornou erro"; return 1; }
+    )
+    adm_log OK "Hook ${name} concluído."
+  else
+    adm_log WARN "Hook não executável: ${script}"
+  fi
+}
+
+# executa sequência de hooks para um estágio
+run_hooks_stage() {
+  local stage="$1" phase="$2"
+  local hooks=()
+  mapfile -t hooks < <(find_hooks "${stage}" "${phase}")
+  if [ "${#hooks[@]}" -eq 0 ]; then
+    adm_log INFO "Nenhum hook ${phase}-${stage} encontrado."
+    return 0
+  fi
+  adm_log INFO "Executando ${#hooks[@]} hook(s) ${phase}-${stage}..."
+  local failed=0
+  for h in "${hooks[@]}"; do
+    if ! execute_hook "${h}"; then
+      failed=1
+      adm_log ERR "Falha no hook: ${h}"
+      break
+    fi
+  done
+  return "${failed}"
+}
+
+# lista hooks global/local
+list_hooks() {
+  local all="${1:-0}"
+  printf "%bHooks globais:%b\n" "${T_BOLD}" "${T_RESET}"
+  find "${ADM_HOOKS_GLOBAL}" -type f -executable | sort 2>/dev/null || true
+  if [ "${all}" -eq 1 ]; then
+    printf "\n%bHooks locais:%b\n" "${T_BOLD}" "${T_RESET}"
+    find "${ADM_METAFILES}" -type f -path '*/hooks/*' -executable | sort 2>/dev/null || true
+  fi
+}
+
+# --- Dispatcher ---
+case "${ACTION}" in
+  run)
+    STAGE="${1:-}"
+    if [ -z "${STAGE}" ]; then
+      adm_log ERR "Uso: adm-hooks run <stage> [--phase pre|post]"
+      exit 1
+    fi
+    [ -z "${PHASE}" ] && PHASE="pre"
+    print_header() {
+      printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+      printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM HOOKS (${PHASE}-${STAGE})" "${T_RESET}"
+      printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+    }
+    print_header
+    run_hooks_stage "${STAGE}" "${PHASE}" || {
+      adm_log ERR "Falha durante execução de hooks ${PHASE}-${STAGE}"
+      exit 2
+    }
+    adm_log OK "Hooks ${PHASE}-${STAGE} executados com sucesso."
+    ;;
+  list)
+    list_hooks 0
+    ;;
+  list-all|--all)
+    list_hooks 1
+    ;;
+  *)
+    cat <<EOF
+Uso:
+  adm-hooks run <stage> [--phase pre|post] [--category <cat>] [--program <prog>]
+  adm-hooks list [--all]
+EOF
+    ;;
+esac
+
+exit 0
