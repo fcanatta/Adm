@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# adm-diagnose — Diagnóstico completo do sistema ADM
+#
+# Verifica:
+#  - existência/permissões dos diretórios principais
+#  - presença de programas essenciais (gcc, make, tar, curl, git, rsync, patch, sha256sum, tput)
+#  - integridade do DB (packages.db)
+#  - presença de profiles
+#  - integridade do cache de fontes
+#  - hooks/patches em metafiles
+#  - recomendações para correção
+#
+# Uso:
+#   adm-diagnose [--no-dry-run] [--force]
+#
+# Observação:
+#   - O script é seguro e não executa ações destrutivas por padrão.
+#   - Onde for sugerido "fix", o comando será mostrado; para aplicá-lo, rode com --no-dry-run e --force.
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+adm_parse_common_flags "$@" || { adm_log ERR "Falha ao processar flags"; exit 1; }
+
+print_banner() {
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+  printf "%b %s %b\n" "${T_BOLD}${T_CYAN}" "ADM DIAGNOSE" "${T_RESET}"
+  printf "%b\n" "${T_BOLD}${T_MAGENTA}────────────────────────────────────────────────────────────${T_RESET}"
+}
+
+check_dirs() {
+  adm_log INFO "Verificando diretórios principais..."
+  local required=(
+    "${ADM_BASE}"
+    "${ADM_SCRIPTS}"
+    "${ADM_METAFILES}"
+    "${ADM_DB}"
+    "${ADM_UPDATE}"
+    "${ADM_CACHE}"
+    "${ADM_SOURCES_CACHE}"
+    "${ADM_BOOTSTRAP}"
+    "${ADM_LOG}"
+    "${ADM_DESTDIR}"
+    "${ADM_TEMP}"
+    "${ADM_PACKAGES}"
+    "${ADM_HOOKS_GLOBAL}"
+    "${ADM_PATCHES_GLOBAL}"
+  )
+  local missing=0
+  for d in "${required[@]}"; do
+    if [ -d "${d}" ]; then
+      adm_log OK "OK: ${d}"
+      # check writability for relevant dirs
+      if [ -w "${d}" ]; then
+        adm_log HINT "Writable: ${d}"
+      else
+        adm_log WARN "Sem permissão de escrita: ${d}"
+      fi
+    else
+      adm_log ERR "MISSING: ${d}"
+      missing=1
+    fi
+  done
+
+  if [ "${missing}" -eq 1 ]; then
+    adm_log WARN "Alguns diretórios faltam. Sugestão para criar (dry-run mostrado):"
+    adm_log INFO "mkdir -p ${ADM_BASE} && mkdir -p ${ADM_SCRIPTS} ${ADM_METAFILES} ${ADM_DB} ${ADM_UPDATE} ${ADM_CACHE} ${ADM_BOOTSTRAP} ${ADM_LOG} ${ADM_DESTDIR} ${ADM_TEMP} ${ADM_PACKAGES} ${ADM_HOOKS_GLOBAL} ${ADM_PATCHES_GLOBAL}"
+  fi
+}
+
+check_programs() {
+  adm_log INFO "Verificando programas essenciais..."
+  local progs=(gcc g++ make tar xz sha256sum curl git rsync patch awk sed grep find tput python3)
+  local miss=0
+  for p in "${progs[@]}"; do
+    if command -v "${p}" >/dev/null 2>&1; then
+      adm_log OK "found: ${p}"
+    else
+      adm_log WARN "missing: ${p}"
+      miss=1
+    fi
+  done
+  if [ "${miss}" -eq 1 ]; then
+    adm_log WARN "Alguns programas essenciais estão faltando. Exemplo de instalação (Debian/Ubuntu):"
+    adm_log INFO "apt-get update && apt-get install -y build-essential curl git rsync xz-utils bzip2 file python3"
+  fi
+}
+
+check_profiles() {
+  adm_log INFO "Checando profiles em ${ADM_BASE}..."
+  local found=0
+  for f in "${ADM_BASE}"/profile.*; do
+    [ -f "${f}" ] || continue
+    adm_log OK "profile: $(basename "${f}")"
+    found=1
+  done
+  if [ "${found}" -eq 0 ]; then
+    adm_log WARN "Nenhum profile encontrado. Rode 'adm-env create default' ou 'adm-env init'."
+    adm_log INFO "Sugestão: adm-env init --no-dry-run --force"
+  fi
+}
+
+check_db() {
+  adm_log INFO "Checando banco de pacotes: ${ADM_DB}/packages.db"
+  local dbf="${ADM_DB}/packages.db"
+  if [ ! -f "${dbf}" ]; then
+    adm_log WARN "DB não existe: ${dbf}"
+    if [ "${ADM_DRYRUN}" -eq 1 ]; then
+      adm_log INFO "[dry-run] touch ${dbf}"
+    else
+      run_cmd "touch '${dbf}'"
+    fi
+    return 0
+  fi
+  if [ ! -s "${dbf}" ]; then
+    adm_log WARN "DB existe mas está vazio."
+    return 0
+  fi
+  adm_log INFO "Validando formato das linhas do DB..."
+  local bad=0
+  while read -r line; do
+    # Expect at least 6 fields: epoch name ver status archive manifest
+    local nf
+    nf=$(awk '{print NF}' <<<"${line}")
+    if [ "${nf}" -lt 6 ]; then
+      adm_log ERR "Linha inválida no DB: ${line}"
+      bad=1
+    fi
+  done < "${dbf}"
+  if [ "${bad}" -eq 1 ]; then
+    adm_log WARN "Há linhas inválidas no DB. Considere editar ${dbf} manualmente ou limpar com adm-db clear --force --no-dry-run"
+  else
+    adm_log OK "DB parece consistente."
+  fi
+}
+
+check_cache_sources() {
+  adm_log INFO "Verificando cache de fontes em ${ADM_SOURCES_CACHE}..."
+  if [ ! -d "${ADM_SOURCES_CACHE}" ]; then
+    adm_log WARN "Cache de fontes ausente: ${ADM_SOURCES_CACHE}"
+    return 0
+  fi
+  local count
+  count=$(find "${ADM_SOURCES_CACHE}" -type f | wc -l || echo 0)
+  adm_log INFO "Arquivos em cache: ${count}"
+  if [ "${count}" -eq 0 ]; then
+    adm_log WARN "Cache vazio. Se esperava fontes, execute adm-download contra seus metafiles."
+  fi
+}
+
+check_metafiles_structure() {
+  adm_log INFO "Analisando estrutura de metafiles (${ADM_METAFILES})..."
+  if [ ! -d "${ADM_METAFILES}" ]; then
+    adm_log WARN "Metafiles ausentes."
+    return 0
+  fi
+  local problems=0
+  # Expect structure: /metafiles/<category>/<program>/{metafile,hooks,patch}
+  find "${ADM_METAFILES}" -mindepth 2 -maxdepth 3 -type d | while read -r dir; do
+    # If dir is program dir, check presence of metafile
+    # program dir depth is 2 under ADM_METAFILES
+    # obtain depth
+    rel="${dir#${ADM_METAFILES}/}"
+    # If rel contains '/', it's category/program or deeper
+    # check if metafile exists in category/program
+    # We'll iterate categories
+    true
+  done
+
+  # Simple scan: find all program dirs and check for metafile
+  local missing_meta=0
+  for progdir in "${ADM_METAFILES}"/*/*; do
+    [ -d "${progdir}" ] || continue
+    if [ ! -f "${progdir}/metafile" ]; then
+      adm_log WARN "Falta metafile em ${progdir}"
+      missing_meta=1
+    else
+      adm_log OK "metafile OK: ${progdir}/metafile"
+    fi
+    # Hooks and patch should be directories (no subfolders inside as requested)
+    if [ -d "${progdir}/hooks" ]; then
+      local hkcount
+      hkcount=$(find "${progdir}/hooks" -maxdepth 1 -type f | wc -l || echo 0)
+      adm_log INFO "Hooks em ${progdir}: ${hkcount}"
+    fi
+    if [ -d "${progdir}/patch" ]; then
+      local pc
+      pc=$(find "${progdir}/patch" -maxdepth 1 -type f | wc -l || echo 0)
+      adm_log INFO "Patches em ${progdir}: ${pc}"
+    fi
+  done
+
+  if [ "${missing_meta}" -eq 1 ]; then
+    adm_log WARN "Alguns programas não possuem metafile. Use ensure_program_layout ou crie metafiles manualmente."
+  fi
+}
+
+check_hooks_global() {
+  adm_log INFO "Verificando hooks globais (${ADM_HOOKS_GLOBAL})..."
+  if [ ! -d "${ADM_HOOKS_GLOBAL}" ]; then
+    adm_log WARN "Hooks globais ausentes."
+    return 0
+  fi
+  local stages=$(ls -1 "${ADM_HOOKS_GLOBAL}" 2>/dev/null || true)
+  if [ -z "${stages}" ]; then
+    adm_log WARN "Nenhum stage de hook encontrado em ${ADM_HOOKS_GLOBAL}."
+    return 0
+  fi
+  for s in ${stages}; do
+    adm_log INFO "stage: ${s}"
+    if [ -d "${ADM_HOOKS_GLOBAL}/${s}" ]; then
+      local c
+      c=$(find "${ADM_HOOKS_GLOBAL}/${s}" -maxdepth 1 -type f | wc -l || echo 0)
+      adm_log INFO "  scripts: ${c}"
+    fi
+  done
+}
+
+check_chroot_capability() {
+  adm_log INFO "Verificando capacidade de uso de chroot..."
+  # Check for debootstrap or ability to use busybox or tar-based chroot
+  if command -v debootstrap >/dev/null 2>&1; then
+    adm_log OK "debootstrap disponível"
+  else
+    adm_log WARN "debootstrap ausente (pode ser necessário para criar chroots facilmente)."
+  fi
+  # Check mount privileges
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_log WARN "Não root: não será possível montar pseudo-filesystems em chroot sem privilégios"
+  else
+    adm_log OK "Root: montagens de pseudo-filesystems permitidas"
+  fi
+}
+
+check_permissions_and_owner() {
+  adm_log INFO "Verificando propriedade e permissões essenciais em ${ADM_BASE}..."
+  local issues=0
+  for d in "${ADM_BASE}" "${ADM_CACHE}" "${ADM_TEMP}" "${ADM_LOG}" "${ADM_DB}" "${ADM_PACKAGES}"; do
+    if [ -e "${d}" ]; then
+      local owner
+      owner=$(stat -c "%U:%G" "${d}" 2>/dev/null || echo "unknown")
+      adm_log INFO "  ${d} owner=${owner}"
+      if [ ! -w "${d}" ]; then
+        adm_log WARN "  sem permissão de escrita: ${d}"
+        issues=1
+      fi
+    else
+      adm_log WARN "  não existe: ${d}"
+      issues=1
+    fi
+  done
+
+  if [ "${issues}" -eq 1 ]; then
+    adm_log HINT "Se desejar ajustar permissões: adm-env fix-perms --no-dry-run --force"
+  fi
+}
+
+summary_report() {
+  adm_log INFO "Compilando relatório resumido..."
+  printf "\n%bResumo: %b\n" "${T_BOLD}" "${T_RESET}"
+  printf "  %bBase:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_BASE}"
+  printf "  %bScripts:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_SCRIPTS}"
+  printf "  %bMetafiles:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_METAFILES}"
+  printf "  %bPackages DB:%b %s\n" "${T_CYAN}" "${T_RESET}" "${ADM_DB}/packages.db"
+  printf "  %bCache fontes:%b %s (count=$(find "${ADM_SOURCES_CACHE}" -type f 2>/dev/null | wc -l || echo 0))\n" "${T_CYAN}" "${T_RESET}" "${ADM_SOURCES_CACHE}"
+  printf "  %bLog:%b %s\n" "${T_CYAN}" "${T_RESET}" "${LOGFILE}"
+  printf "\n"
+  adm_log OK "Diagnóstico concluído. Veja recomendações acima."
+  adm_log INFO "Log desta execução: ${LOGFILE}"
+}
+
+# ---------- Execução principal ----------
+print_banner
+check_dirs
+check_programs
+check_profiles
+check_db
+check_cache_sources
+check_metafiles_structure
+check_hooks_global
+check_chroot_capability
+check_permissions_and_owner
+summary_report
+
+exit 0
