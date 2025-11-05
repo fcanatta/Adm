@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# adm-chroot — gerenciador seguro de chroots para ADM
+# Integração com adm-bootstrap, adm-build, adm-install
+# Funções: create, mount, enter, exec, umount, destroy, list, status, repair
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+COMMON="$(dirname "$0")/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "[ERR] adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+ADM_CHROOT_BASE="${ADM_CHROOT_BASE:-/usr/src/adm/chroot}"
+ADM_LOGDIR="${ADM_LOG:-/usr/src/adm/log}"
+CHROOT_LOCKDIR="${ADM_CHROOT_BASE}/.locks"
+mkdir -p "${ADM_CHROOT_BASE}" "${ADM_LOGDIR}" "${CHROOT_LOCKDIR}"
+
+# fallback colors
+: "${T_RED:=$(tput setaf 1 2>/dev/null || echo '')}"
+: "${T_GREEN:=$(tput setaf 2 2>/dev/null || echo '')}"
+: "${T_YELLOW:=$(tput setaf 3 2>/dev/null || echo '')}"
+: "${T_CYAN:=$(tput setaf 6 2>/dev/null || echo '')}"
+: "${T_MAGENTA:=$(tput setaf 5 2>/dev/null || echo '')}"
+: "${T_BOLD:=$(tput bold 2>/dev/null || echo '')}"
+: "${T_RESET:=$(tput sgr0 2>/dev/null || echo '')}"
+
+# lock management
+lock_chroot() {
+  local name="$1"
+  local lock="${CHROOT_LOCKDIR}/${name}.lock"
+  local tries=0
+  while ! mkdir "${lock}" 2>/dev/null; do
+    tries=$((tries+1))
+    sleep 0.05
+    if [ "${tries}" -gt 200 ]; then
+      adm_log ERR "Não foi possível adquirir lock para chroot ${name}"
+      return 1
+    fi
+  done
+}
+unlock_chroot() {
+  local name="$1"
+  rm -rf "${CHROOT_LOCKDIR}/${name}.lock" 2>/dev/null || true
+}
+
+# helper to check root
+require_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_log ERR "É necessário ser root para esta operação."
+    exit 1
+  fi
+}
+
+# safe mounts/unmounts — with validation and logging
+safe_mount_chroot() {
+  local root="$1"
+  adm_log INFO "Montando pseudo-filesystems em ${root}"
+  [ ! -d "${root}" ] && { adm_log ERR "Diretório ${root} inexistente"; return 1; }
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mount --bind /proc ${root}/proc ; mount --bind /sys ${root}/sys ..."
+    return 0
+  fi
+  mkdir -p "${root}/proc" "${root}/sys" "${root}/dev" "${root}/dev/pts" "${root}/run"
+  for m in proc sys dev dev/pts run; do
+    mountpoint -q "${root}/${m}" || {
+      case "${m}" in
+        dev|dev/pts)
+          mount --bind "/${m}" "${root}/${m}" ;;
+        *)
+          mount --bind "/${m}" "${root}/${m}" ;;
+      esac
+      adm_log OK "Montado: ${root}/${m}"
+    }
+  done
+}
+
+safe_umount_chroot() {
+  local root="$1"; local force="${2:-0}"
+  adm_log INFO "Desmontando pseudo-filesystems de ${root}"
+  local targets=(proc sys dev/pts dev run)
+  for m in "${targets[@]}"; do
+    if mountpoint -q "${root}/${m}"; then
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then
+        adm_log INFO "[dry-run] umount ${root}/${m}"
+        continue
+      fi
+      if ! umount "${root}/${m}" 2>/dev/null; then
+        if [ "${force}" -eq 1 ]; then
+          adm_log WARN "Forçando desmontagem de ${root}/${m}"
+          umount -l "${root}/${m}" || true
+        else
+          adm_log WARN "Falha ao desmontar ${root}/${m}"
+        fi
+      else
+        adm_log OK "Desmontado: ${root}/${m}"
+      fi
+    fi
+  done
+}
+
+# detect if chroot is mounted
+chroot_is_mounted() {
+  local root="$1"
+  grep -q " ${root}/proc " /proc/mounts 2>/dev/null && return 0 || return 1
+}
+
+# safe path guard
+is_safe_path() {
+  local path="$1"
+  case "${path}" in
+    /|/boot|/dev|/proc|/sys|/usr|/var|/bin|/sbin)
+      return 1 ;;
+    *)
+      return 0 ;;
+  esac
+}
+
+# create chroot structure
+create_chroot() {
+  local name="$1"; local root="${ADM_CHROOT_BASE}/${name}"
+  require_root
+  if ! is_safe_path "${root}"; then
+    adm_log ERR "Caminho inseguro: ${root}"
+    exit 1
+  fi
+  if [ -d "${root}" ]; then
+    adm_log WARN "Chroot ${name} já existe em ${root}"
+    return 0
+  fi
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] mkdir -p ${root}/{bin,boot,dev,etc,proc,sys,tmp,usr,var,run}"
+    return 0
+  fi
+  mkdir -p "${root}"/{bin,boot,dev,etc,proc,sys,tmp,usr,var,run,lib,lib64,home}
+  chmod 755 "${root}"
+  adm_log OK "Chroot criado: ${root}"
+  return 0
+}
+
+# destroy chroot safely
+destroy_chroot() {
+  local name="$1"; local force="${2:-0}"
+  local root="${ADM_CHROOT_BASE}/${name}"
+  require_root
+  if ! is_safe_path "${root}"; then
+    adm_log ERR "Tentativa de destruir caminho inseguro: ${root}"
+    exit 1
+  fi
+  if chroot_is_mounted "${root}"; then
+    if [ "${force}" -eq 1 ]; then
+      adm_log WARN "Chroot ${name} montado; forçando desmontagem."
+      safe_umount_chroot "${root}" 1
+    else
+      adm_log ERR "Chroot ${name} ainda montado. Use --force para remover."
+      exit 1
+    fi
+  fi
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rm -rf ${root}"
+    return 0
+  fi
+  rm -rf "${root}"
+  adm_log OK "Chroot ${name} removido."
+}
+# ----- continuação PARTE 2/2 -----
+set -euo pipefail
+IFS=$'\n\t'
+
+enter_chroot() {
+  local name="$1"; local shell="${2:-/bin/bash}"
+  local root="${ADM_CHROOT_BASE}/${name}"
+  require_root
+  if [ ! -d "${root}" ]; then
+    adm_log ERR "Chroot ${name} inexistente: ${root}"
+    exit 1
+  fi
+  safe_mount_chroot "${root}"
+  adm_log INFO "Entrando no chroot ${name}"
+  chroot "${root}" "${shell}" || adm_log WARN "Sessão encerrada com status $?"
+  safe_umount_chroot "${root}"
+  adm_log OK "Chroot ${name} desmontado após saída."
+}
+
+exec_in_chroot() {
+  local name="$1"; shift
+  local root="${ADM_CHROOT_BASE}/${name}"
+  require_root
+  if [ ! -d "${root}" ]; then
+    adm_log ERR "Chroot ${name} inexistente."
+    exit 1
+  fi
+  safe_mount_chroot "${root}"
+  adm_log INFO "Executando dentro de ${name}: $*"
+  chroot "${root}" /bin/sh -c "$*" || adm_log WARN "Comando retornou código $?"
+  safe_umount_chroot "${root}"
+}
+
+list_chroots() {
+  adm_log INFO "Listando chroots em ${ADM_CHROOT_BASE}"
+  for d in "${ADM_CHROOT_BASE}"/*; do
+    [ -d "${d}" ] || continue
+    name="$(basename "${d}")"
+    status="desmontado"
+    chroot_is_mounted "${d}" && status="montado"
+    printf "  %-20s %s\n" "${name}" "${status}"
+  done
+}
+
+status_chroot() {
+  local name="$1"
+  local root="${ADM_CHROOT_BASE}/${name}"
+  if [ ! -d "${root}" ]; then
+    adm_log ERR "Chroot ${name} inexistente."
+    exit 1
+  fi
+  if chroot_is_mounted "${root}"; then
+    adm_log OK "Chroot ${name} está montado e ativo."
+  else
+    adm_log INFO "Chroot ${name} desmontado."
+  fi
+}
+
+repair_chroot() {
+  local name="$1"
+  local root="${ADM_CHROOT_BASE}/${name}"
+  adm_log INFO "Verificando chroot ${name}"
+  [ -d "${root}" ] || { adm_log ERR "Chroot ausente: ${root}"; exit 1; }
+  for sub in proc sys dev dev/pts run tmp; do
+    [ -d "${root}/${sub}" ] || mkdir -p "${root}/${sub}"
+  done
+  if chroot_is_mounted "${root}"; then
+    adm_log OK "Montagens ok em ${root}"
+  else
+    adm_log WARN "Montagens ausentes; montando novamente."
+    safe_mount_chroot "${root}"
+  fi
+  adm_log OK "Chroot ${name} reparado."
+}
+
+# CLI dispatcher
+CMD="${1:-}"; shift || true
+case "${CMD}" in
+  create)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot create <nome>"; exit 1; }
+    create_chroot "${name}"
+    ;;
+  mount)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot mount <nome>"; exit 1; }
+    safe_mount_chroot "${ADM_CHROOT_BASE}/${name}"
+    ;;
+  enter)
+    name="${1:-}"; shift || true
+    shell="${1:-/bin/bash}"
+    enter_chroot "${name}" "${shell}"
+    ;;
+  exec)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot exec <nome> <comando>"; exit 1; }
+    exec_in_chroot "${name}" "$@"
+    ;;
+  umount)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot umount <nome>"; exit 1; }
+    safe_umount_chroot "${ADM_CHROOT_BASE}/${name}"
+    ;;
+  destroy)
+    name="${1:-}"; shift || true
+    destroy_chroot "${name}" 1
+    ;;
+  list)
+    list_chroots
+    ;;
+  status)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot status <nome>"; exit 1; }
+    status_chroot "${name}"
+    ;;
+  repair)
+    name="${1:-}"; shift || true
+    [ -z "${name}" ] && { adm_log ERR "Uso: adm-chroot repair <nome>"; exit 1; }
+    repair_chroot "${name}"
+    ;;
+  *)
+    cat <<EOF
+Uso: adm-chroot <comando> [args...]
+Comandos:
+  create <nome>          Criar novo chroot
+  mount <nome>           Montar pseudo-filesystems
+  enter <nome> [shell]   Entrar no chroot
+  exec <nome> <cmd>      Executar comando dentro do chroot
+  umount <nome>          Desmontar chroot
+  destroy <nome>         Remover chroot (forçado)
+  list                   Listar chroots existentes
+  status <nome>          Mostrar status do chroot
+  repair <nome>          Corrigir estrutura e montagens
+EOF
+    ;;
+esac
+
+exit 0
