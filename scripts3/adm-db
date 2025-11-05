@@ -1,0 +1,616 @@
+#!/usr/bin/env bash
+#
+# adm-db v1.0.0-dev
+# Central logging, queue and UX helper for ADM system
+#
+# Features:
+#  - colorized/styled terminal output (bold names, icons)
+#  - atomic JSONL writes with flock
+#  - spinner, progress bar
+#  - queue management for builds/installs (with dependencies)
+#  - package registration (path of tarballs), install summary
+#  - begin/end events with timing
+#  - metrics recording
+#  - tailing / live view
+#
+# Usage (script mode):
+#   adm-db init
+#   adm-db log info "message"
+#   adm-db begin "build:coreutils" "/usr/src/adm/work/coreutils-9.5"
+#   adm-db spinner_start "Compilando coreutils"
+#   adm-db spinner_stop ok
+#   adm-db pkg_register coreutils 9.5 "/usr/src/adm/cache/tarballs/core/coreutils-9.5.tar.zst"
+#   adm-db install_summary coreutils "/usr"
+#   adm-db end "build:coreutils" ok
+#
+# Sourced usage (in other scripts):
+#   source /usr/src/adm/bin/adm-db
+#   db_begin "build:pkg" "/path"
+#   db_info "..."
+#   db_pkg_register "pkg" "1.2.3" "/path/to/tar.zst"
+#
+set -euo pipefail
+
+### Configurable root (can be overridden via env)
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+VERSION="adm-db v1.0.0-dev"
+# Directories and files
+ADM_BIN="${ADM_ROOT}/bin"
+ADM_LOG="${ADM_ROOT}/logs"
+ADM_DB="${ADM_ROOT}/db"
+ADM_QUEUE_DIR="${ADM_LOG}/queue"
+DB_GLOBAL="${ADM_DB}/logs.jsonl"
+DB_METRICS="${ADM_DB}/metrics.jsonl"
+DB_QUEUE="${ADM_DB}/queue.jsonl"
+DB_PKGS="${ADM_DB}/packages.jsonl"
+DB_AUDIT="${ADM_DB}/audit.jsonl"
+LOCK_FILE="${ADM_DB}/.lock"
+# ensure directories exist
+mkdir -p "${ADM_LOG}" "${ADM_DB}" "${ADM_QUEUE_DIR}"
+
+# Terminal detection
+IS_TTY=false
+if [ -t 1 ]; then IS_TTY=true; fi
+
+# Colors and styles (only if TTY)
+if $IS_TTY; then
+  _BOLD="$(tput bold 2>/dev/null || echo '')"
+  _NORM="$(tput sgr0 2>/dev/null || echo '')"
+  _RED="$(tput setaf 1 2>/dev/null || echo '')"
+  _GRN="$(tput setaf 2 2>/dev/null || echo '')"
+  _YEL="$(tput setaf 3 2>/dev/null || echo '')"
+  _BLU="$(tput setaf 4 2>/dev/null || echo '')"
+  _MAG="$(tput setaf 5 2>/dev/null || echo '')"
+  _CYA="$(tput setaf 6 2>/dev/null || echo '')"
+else
+  _BOLD=""; _NORM=""; _RED=""; _GRN=""; _YEL=""; _BLU=""; _MAG=""; _CYA=""
+fi
+
+# Icons
+ICON_INFO="🌀"
+ICON_OK="✔️"
+ICON_WARN="⚠️"
+ICON_ERR="✖️"
+ICON_BEGIN="⏳"
+ICON_END="✅"
+ICON_PKG="📦"
+ICON_QUEUE="🧩"
+ICON_METRIC="📊"
+
+# small helpers
+timestamp() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+now_sec() { date +%s.%N; }
+# JSON escape (minimal, safe)
+db_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\r'/}"
+  s="${s//$'\n'/\\n}"
+  printf "%s" "$s"
+}
+
+# atomic append to file using flock
+# usage: atomic_append "/path/file" "line to append"
+atomic_append() {
+  local file="$1"; shift
+  local line="$*"
+  # ensure dir
+  mkdir -p "$(dirname "$file")"
+  # open lock fd, append, close
+  exec 200>"${LOCK_FILE}"
+  flock -x 200
+  printf "%s\n" "$line" >> "$file" || { flock -u 200; exec 200>&-; return 1; }
+  flock -u 200
+  exec 200>&-
+  return 0
+}
+
+# safe write (overwrite) with tmp and move
+safe_overwrite() {
+  local file="$1"; shift
+  local content="$*"
+  mkdir -p "$(dirname "$file")"
+  local tmp
+  tmp="$(mktemp "$(dirname "$file")/.tmp.XXXXXX")"
+  printf "%s\n" "$content" > "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$file"
+}
+
+# create JSON line wrapper
+db_record_json() {
+  local jsonline="$1"
+  atomic_append "$DB_GLOBAL" "$jsonline"
+}
+
+# Quick console printers (and record)
+# db_log <level> <script> <stage> <package> <message> [extra_json]
+# script/stage/package can be "" if not relevant
+db_log() {
+  local level="$1"; shift
+  local script="$1"; shift
+  local stage="$1"; shift
+  local package="$1"; shift
+  local message="$1"; shift
+  local extra="${*:-}"
+  local ts; ts="$(timestamp)"
+  local pid="$$"
+  local version="${VERSION}"
+  local path_log_var="${ADM_LOG}/adm-${script:-global}-$(date +%Y%m%d%H%M%S).log"
+  # Compose JSON object piece by piece
+  local jmsg; jmsg="$(db_json_escape "$message")"
+  local jscript; jscript="$(db_json_escape "$script")"
+  local jstage; jstage="$(db_json_escape "$stage")"
+  local jpkg; jpkg="$(db_json_escape "$package")"
+  local jextra
+  if [ -n "$extra" ]; then
+    jextra=",\"extra\":\"$(db_json_escape "$extra")\""
+  else
+    jextra=""
+  fi
+  local json
+  json="$(printf '{"timestamp":"%s","script":"%s","version":"%s","pid":%s,"level":"%s","stage":"%s","package":"%s","message":"%s"%s,"path_log":"%s"}' \
+    "$ts" "$jscript" "$version" "$pid" "$level" "$jstage" "$jpkg" "$jmsg" "$jextra" "$path_log_var")"
+  # write to DB_GLOBAL atomically
+  atomic_append "$DB_GLOBAL" "$json" || true
+
+  # Console output (colorized)
+  case "$level" in
+    INFO) icon="$ICON_INFO"; color="$_BLU"; ;;
+    OK)   icon="$ICON_OK";   color="$_GRN"; ;;
+    WARN) icon="$ICON_WARN"; color="$_YEL"; ;;
+    ERROR) icon="$ICON_ERR"; color="$_RED"; ;;
+    BEGIN) icon="$ICON_BEGIN"; color="$_CYA"; ;;
+    END) icon="$ICON_END"; color="$_GRN"; ;;
+    METRIC) icon="$ICON_METRIC"; color="$_MAG"; ;;
+    QUEUE) icon="$ICON_QUEUE"; color="$_BLU"; ;;
+    *) icon="$ICON_INFO"; color="$_BLU"; ;;
+  esac
+
+  if $IS_TTY; then
+    printf "%b %s [%s] %s\n" "$icon" "$ts" "${level}" "${message}"
+  else
+    printf "%s %s %s\n" "$ts" "${level}" "${message}"
+  fi
+}
+
+# Convenience wrappers
+db_info()  { db_log INFO "$1" "$2" "$3" "$4"; }
+db_ok()    { db_log OK   "$1" "$2" "$3" "$4"; }
+db_warn()  { db_log WARN "$1" "$2" "$3" "$4"; }
+db_error() { db_log ERROR "$1" "$2" "$3" "$4"; }
+db_metric(){ db_log METRIC "$1" "$2" "$3" "$4"; }
+
+# BEGIN / END events with timing and pretty header/footer
+# db_begin <label> <path> <script> <package> <pkg_version>
+# label: e.g., "build:coreutils"
+db_begin() {
+  local label="${1:-}"
+  local path="${2:-}"
+  local script="${3:-adm}"
+  local package="${4:-}"
+  local pkg_version="${5:-}"
+  local ts="$(timestamp)"
+  # print header with bold step name and path
+  if $IS_TTY; then
+    printf "\n%s\n" "──────────────────────────────────────────────────────────────"
+    printf "%b %s: %s%b\n" "${_BOLD}${ICON_BEGIN}" "${_BOLD}Etapa" "${label}" "${_NORM}"
+    printf "📁 Caminho: %s\n" "$path"
+    printf "📘 Log: %s\n" "${ADM_LOG}/adm-${script}-${package:-global}-$(date +%Y%m%d%H%M%S).log"
+    printf "%s\n\n" "──────────────────────────────────────────────────────────────"
+  else
+    printf "BEGIN %s %s\n" "$label" "$path"
+  fi
+  # record begin event in DB_GLOBAL
+  local tssec; tssec="$(now_sec)"
+  local json
+  json="$(printf '{"timestamp":"%s","event":"begin","label":"%s","script":"%s","package":"%s","package_version":"%s","path_stage":"%s","ts_start":%s,"pid":%s}' \
+    "$(db_json_escape "$ts")" "$(db_json_escape "$label")" "$(db_json_escape "$script")" "$(db_json_escape "$package")" "$(db_json_escape "$pkg_version")" "$(db_json_escape "$path")" "$tssec" "$$")"
+  atomic_append "$DB_GLOBAL" "$json" || true
+  # store start time in associative array for later end
+  __ADM_DB_BEGINS["$label"]="$tssec"
+}
+
+# maintain associative array for starts
+declare -Ag __ADM_DB_BEGINS
+# db_end <label> <status> <script> <package> <output_pkg_path>
+db_end() {
+  local label="${1:-}"
+  local status="${2:-ok}"   # ok|error
+  local script="${3:-adm}"
+  local package="${4:-}"
+  local output_pkg="${5:-}"
+  local ts="$(timestamp)"
+  local tsend; tsend="$(now_sec)"
+  local tsstart="${__ADM_DB_BEGINS[$label]:-0}"
+  local duration="0"
+  if [ "$tsstart" != "0" ]; then
+    duration="$(awk "BEGIN{printf \"%.3f\", ($tsend - $tsstart)}")"
+  fi
+  # console footer
+  if $IS_TTY; then
+    printf "%s\n" "──────────────────────────────────────────────────────────────"
+    if [ "$status" = "ok" ]; then
+      printf "%b Etapa %b%s%b concluída com sucesso\n" "$ICON_END" "$_BOLD" "$label" "$_NORM"
+    else
+      printf "%b Etapa %b%s%b finalizada com status: %s\n" "$ICON_ERR" "$_BOLD" "$label" "$_NORM" "$status"
+    fi
+    printf "🕓 Tempo total: %s\n" "$(awk "BEGIN{printf \"%02d:%02d:%04.1f\", int($duration/3600), int(($duration%3600)/60), ($duration%60)}")"
+    printf "%s\n\n" "──────────────────────────────────────────────────────────────"
+  else
+    printf "END %s %s duration=%s\n" "$label" "$status" "$duration"
+  fi
+  # write event record
+  local json
+  json="$(printf '{"timestamp":"%s","event":"end","label":"%s","script":"%s","package":"%s","status":"%s","duration":%s,"output_pkg":"%s","pid":%s}' \
+    "$(db_json_escape "$ts")" "$(db_json_escape "$label")" "$(db_json_escape "$script")" "$(db_json_escape "$package")" "$(db_json_escape "$status")" "$duration" "$(db_json_escape "$output_pkg")" "$$")"
+  atomic_append "$DB_GLOBAL" "$json" || true
+  # cleanup start
+  unset __ADM_DB_BEGINS["$label"]
+}
+
+# Spinner implementation
+SPINNER_PID=""
+SPINNER_MSG=""
+SPINNER_FRAME=0
+spinner_run() {
+  local msg="$1"
+  local i sp='|/-\'
+  while :; do
+    i=$(( (SPINNER_FRAME=SPINNER_FRAME+1) %4 ))
+    printf "\r%s %s %s" "${sp:i:1}" "$msg" " " >&2
+    sleep 0.08
+  done
+}
+db_spinner_start() {
+  local msg="$1"
+  if ! $IS_TTY; then return 0; fi
+  if [ -n "${SPINNER_PID:-}" ] && kill -0 "$SPINNER_PID" >/dev/null 2>&1; then
+    # already running
+    return 0
+  fi
+  SPINNER_MSG="$msg"
+  ( spinner_run "$msg" ) &
+  SPINNER_PID=$!
+  disown "$SPINNER_PID"
+}
+db_spinner_stop() {
+  local result="${1:-ok}" # ok|fail
+  if ! $IS_TTY; then
+    db_log "${result^^}" "adm-db" "" "" "$SPINNER_MSG"
+    SPINNER_PID=""
+    return 0
+  fi
+  if [ -n "${SPINNER_PID:-}" ] && kill -0 "$SPINNER_PID" >/dev/null 2>&1; then
+    kill "$SPINNER_PID" >/dev/null 2>&1 || true
+    wait "$SPINNER_PID" 2>/dev/null || true
+    SPINNER_PID=""
+  fi
+  if [ "$result" = "ok" ]; then
+    printf "\r%s %s\n" "$ICON_OK" "$SPINNER_MSG"
+  else
+    printf "\r%s %s\n" "$ICON_ERR" "$SPINNER_MSG"
+  fi
+}
+
+# Progress bar (current/total)
+db_progress() {
+  local current="$1"
+  local total="$2"
+  local width=40
+  if ! $IS_TTY; then
+    printf "PROGRESS %s/%s\n" "$current" "$total"
+    return 0
+  fi
+  local pct=0
+  if [ "$total" -gt 0 ]; then
+    pct=$(( 100 * current / total ))
+  fi
+  local filled=$(( width * current / total ))
+  local empty=$(( width - filled ))
+  local bar
+  bar="$(printf "%0.s▰" $(seq 1 $filled))$(printf "%0.s▱" $(seq 1 $empty))"
+  printf "\r%s %3s%% %s (%s/%s) " "$ICON_PKG" "$pct" "$bar" "$current" "$total"
+  if [ "$current" -eq "$total" ]; then printf "\n"; fi
+}
+
+# Queue management
+# Each queue entry is JSON line in DB_QUEUE. Fields: id, package, version, deps(array), status, logfile
+# db_queue_add <package> <version> "<dep1,dep2,...>" [logfile]
+db_queue_add() {
+  local package="$1"
+  local version="$2"
+  local deps_csv="$3"
+  local logfile="${4:-}"
+  mkdir -p "$(dirname "$DB_QUEUE")" "$(dirname "$ADM_QUEUE_DIR")"
+  # compute next id
+  local nextid
+  if [ -f "$DB_QUEUE" ]; then
+    nextid=$(( $(wc -l < "$DB_QUEUE" 2>/dev/null || echo 0) + 1 ))
+  else
+    nextid=1
+  fi
+  local deps_json="[]"
+  if [ -n "$deps_csv" ]; then
+    # convert comma separated deps to JSON array
+    IFS=',' read -ra arr <<< "$deps_csv"
+    deps_json="["
+    local first=true
+    for d in "${arr[@]}"; do
+      d="$(echo "$d" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+      if $first; then deps_json="${deps_json}\"$(db_json_escape "$d")\""; first=false; else deps_json="${deps_json},\"$(db_json_escape "$d")\""; fi
+    done
+    deps_json="${deps_json}]"
+  fi
+  if [ -z "$logfile" ]; then
+    logfile="${ADM_QUEUE_DIR}/$(printf "%02d-%s.log" "$nextid" "$package")"
+  fi
+  local json
+  json="$(printf '{"id":%d,"package":"%s","version":"%s","deps":%s,"status":"pending","logfile":"%s","added":"%s"}' \
+    "$nextid" "$(db_json_escape "$package")" "$(db_json_escape "$version")" "$deps_json" "$(db_json_escape "$logfile")" "$(timestamp)")"
+  atomic_append "$DB_QUEUE" "$json"
+  # create empty log file
+  : > "$logfile"
+  # console output
+  if $IS_TTY; then
+    printf "%b  %s added to queue as #%02d (deps: %s)\n" "$ICON_QUEUE" "$package" "$nextid" "$deps_csv"
+  else
+    printf "QUEUE ADD %02d %s %s\n" "$nextid" "$package" "$version"
+  fi
+}
+
+# show queue in table form
+db_queue_show() {
+  # read all lines
+  if [ ! -f "$DB_QUEUE" ] || [ ! -s "$DB_QUEUE" ]; then
+    echo "Queue empty."
+    return 0
+  fi
+  # build simple ascii table
+  # header
+  echo "╭─────────────────────────────────────────────────────────────╮"
+  echo "│ ${ICON_QUEUE} Fila de Instalação — $(wc -l < "$DB_QUEUE" | tr -d ' ') programas                     │"
+  echo "├────┬──────────────┬─────────┬───────────────────────────────┤"
+  printf "│ %-2s │ %-12s │ %-7s │ %-29s │\n" "#" "Pacote" "Versão" "Dependências"
+  echo "├────┼──────────────┼─────────┼───────────────────────────────┤"
+  local i=0
+  while IFS= read -r line; do
+    i=$((i+1))
+    # parse json minimally: extract fields using sed (safe because we write known format)
+    pkg="$(echo "$line" | sed -n 's/.*"package":"\([^"]*\)".*/\1/p')"
+    ver="$(echo "$line" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+    deps="$(echo "$line" | sed -n 's/.*"deps":\(\[[^]]*\]\).*/\1/p')"
+    deps="$(echo "$deps" | sed 's/\["\([^"]*\)"\]/\1/' | sed 's/","/, /g' )"
+    printf "│ %02d │ %-12s │ %-7s │ %-29s │\n" "$i" "$pkg" "$ver" "${deps:--}"
+  done < "$DB_QUEUE"
+  echo "└────┴──────────────┴─────────┴───────────────────────────────┘"
+}
+
+# db_queue_next - get next pending id (prints id or empty)
+db_queue_next() {
+  if [ ! -f "$DB_QUEUE" ]; then return 0; fi
+  # find first line with "status":"pending"
+  local i=0
+  while IFS= read -r line; do
+    i=$((i+1))
+    status="$(echo "$line" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+    if [ "$status" = "pending" ]; then
+      echo "$i"
+      return 0
+    fi
+  done < "$DB_QUEUE"
+  return 1
+}
+
+# mark queue item as running/completed
+# db_queue_update <id> <status>
+db_queue_update() {
+  local id="$1"
+  local status="$2"  # pending|running|ok|error
+  local tmp
+  tmp="$(mktemp "${ADM_DB}/.qtmp.XXXXXX")"
+  local lineno=0
+  if [ ! -f "$DB_QUEUE" ]; then return 1; fi
+  while IFS= read -r line; do
+    lineno=$((lineno+1))
+    if [ "$lineno" -eq "$id" ]; then
+      # replace status field
+      newline="$(echo "$line" | sed -E "s/\"status\":\"[^\"]*\"/\"status\":\"${status}\"/")"
+      printf "%s\n" "$newline" >> "$tmp"
+    else
+      printf "%s\n" "$line" >> "$tmp"
+    fi
+  done < "$DB_QUEUE"
+  mv "$tmp" "$DB_QUEUE"
+}
+
+# Register package (empacotamento)
+# db_pkg_register <package> <version> <tarball_path>
+db_pkg_register() {
+  local pkg="$1"; shift
+  local ver="$1"; shift
+  local tar="$1"; shift
+  local ts="$(timestamp)"
+  local sha=""
+  if [ -f "$tar" ] && command -v sha256sum >/dev/null 2>&1; then
+    sha="$(sha256sum "$tar" | awk '{print $1}')"
+  fi
+  local json
+  json="$(printf '{"timestamp":"%s","package":"%s","version":"%s","tarball":"%s","sha256":"%s","path_log":"%s"}' \
+    "$(db_json_escape "$ts")" "$(db_json_escape "$pkg")" "$(db_json_escape "$ver")" "$(db_json_escape "$tar")" "$sha" "$(db_json_escape "${ADM_LOG}/adm-${pkg}-${ver}-$(date +%Y%m%d%H%M%S).log")")"
+  atomic_append "$DB_PKGS" "$json"
+  # console output
+  if $IS_TTY; then
+    echo ""
+    printf "%s Pacote gerado:\n    %s\n" "$ICON_PKG" "$tar"
+  else
+    printf "PKG %s %s %s\n" "$pkg" "$ver" "$tar"
+  fi
+}
+
+# Install summary (where installed)
+db_install_summary() {
+  local pkg="$1"
+  local target="$2" # e.g., /usr or chroot path
+  local ts="$(timestamp)"
+  local json
+  json="$(printf '{"timestamp":"%s","event":"install_summary","package":"%s","target":"%s","pid":%s}' "$(db_json_escape "$ts")" "$(db_json_escape "$pkg")" "$(db_json_escape "$target")" "$$")"
+  atomic_append "$DB_GLOBAL" "$json"
+  if $IS_TTY; then
+    printf "%s Instalado em:\n    %s\n" "$ICON_INFO" "$target"
+  else
+    printf "INSTALL %s %s\n" "$pkg" "$target"
+  fi
+}
+
+# metrics collector
+db_metrics() {
+  local key="$1"
+  local val="$2"
+  local ts="$(timestamp)"
+  local json
+  json="$(printf '{"timestamp":"%s","metric":"%s","value":"%s","pid":%s}' "$(db_json_escape "$ts")" "$(db_json_escape "$key")" "$(db_json_escape "$val")" "$$")"
+  atomic_append "$DB_METRICS" "$json"
+}
+
+# tail logs (type optional -> logs.jsonl or specific DB)
+db_tail() {
+  local type="${1:-logs}"
+  local file
+  case "$type" in
+    logs) file="$DB_GLOBAL";;
+    queue) file="$DB_QUEUE";;
+    pkgs) file="$DB_PKGS";;
+    metrics) file="$DB_METRICS";;
+    *) file="$ADM_DB/$type.jsonl";;
+  esac
+  if [ ! -f "$file" ]; then
+    echo "No log file: $file"
+    return 1
+  fi
+  # follow with colorized pretty output - simple approach: print raw JSON lines
+  tail -F "$file"
+}
+
+# summary: print short summary of recent events (last N lines)
+db_summary() {
+  local n="${1:-10}"
+  echo "════════════════════ ADM SUMMARY ════════════════════"
+  echo "Version: $VERSION"
+  echo "Time: $(timestamp)"
+  echo ""
+  echo "Last $n events (global logs):"
+  if [ -f "$DB_GLOBAL" ]; then
+    tail -n "$n" "$DB_GLOBAL" | sed -n '1,200p'
+  else
+    echo "(no events)"
+  fi
+  echo "════════════════════════════════════════════════════="
+}
+
+# init CLI to create DB skeletons, with version header
+adm_db_init() {
+  mkdir -p "$ADM_LOG" "$ADM_DB" "$ADM_QUEUE_DIR"
+  : > "$DB_GLOBAL"
+  : > "$DB_METRICS"
+  : > "$DB_QUEUE"
+  : > "$DB_PKGS"
+  : > "$DB_AUDIT"
+  # write version to audit
+  local json
+  json="$(printf '{"timestamp":"%s","event":"init","version":"%s","adm_root":"%s"}' "$(db_json_escape "$(timestamp)")" "$(db_json_escape "$VERSION")" "$(db_json_escape "$ADM_ROOT")")"
+  atomic_append "$DB_AUDIT" "$json"
+  printf "%s initialized (version %s) - DB at %s\n" "$ICON_OK" "$VERSION" "$ADM_DB"
+}
+
+### CLI handling
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  # run as CLI
+  cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    init)
+      adm_db_init
+      ;;
+    log)
+      # adm-db log <level> <script> <stage> <package> <message>
+      level="${1:-INFO}"; script="${2:-adm}"; stage="${3:-}"; package="${4:-}"; shift 4
+      message="${*:-}"
+      db_log "$level" "$script" "$stage" "$package" "$message"
+      ;;
+    begin)
+      label="${1:-}"; path="${2:-}"; script="${3:-adm}"; pkg="${4:-}"; ver="${5:-}"
+      db_begin "$label" "$path" "$script" "$pkg" "$ver"
+      ;;
+    end)
+      label="${1:-}"; status="${2:-ok}"; script="${3:-adm}"; pkg="${4:-}"; out="${5:-}"
+      db_end "$label" "$status" "$script" "$pkg" "$out"
+      ;;
+    spinner_start)
+      db_spinner_start "$*"
+      ;;
+    spinner_stop)
+      db_spinner_stop "${1:-ok}"
+      ;;
+    progress)
+      db_progress "$1" "$2"
+      ;;
+    queue_add)
+      db_queue_add "$1" "$2" "$3" "$4"
+      ;;
+    queue_show)
+      db_queue_show
+      ;;
+    queue_next)
+      db_queue_next
+      ;;
+    queue_update)
+      db_queue_update "$1" "$2"
+      ;;
+    pkg_register|pkg_register)
+      db_pkg_register "$1" "$2" "$3"
+      ;;
+    install_summary)
+      db_install_summary "$1" "$2"
+      ;;
+    metrics)
+      db_metrics "$1" "$2"
+      ;;
+    tail)
+      db_tail "${1:-logs}"
+      ;;
+    summary)
+      db_summary "${1:-10}"
+      ;;
+    help|--help|-h)
+      cat <<EOF
+adm-db CLI - Usage:
+  adm-db init
+  adm-db log <LEVEL> <script> <stage> <package> <message>
+  adm-db begin <label> <path> [script] [package] [pkg_version]
+  adm-db end <label> <status> [script] [package] [output_pkg]
+  adm-db spinner_start <msg>
+  adm-db spinner_stop [ok|fail]
+  adm-db progress <current> <total>
+  adm-db queue_add <pkg> <version> "<dep,dep2>" [logfile]
+  adm-db queue_show
+  adm-db queue_next
+  adm-db queue_update <id> <status>
+  adm-db pkg_register <pkg> <ver> <tar_path>
+  adm-db install_summary <pkg> <target>
+  adm-db metrics <key> <val>
+  adm-db tail [type]
+  adm-db summary [N]
+EOF
+      ;;
+    *)
+      echo "Unknown command: $cmd"
+      exit 1
+      ;;
+  esac
+fi
+
+# when sourced, export functions for other scripts
+# Provide short aliases for sourcing usage
+# (No automatic action on source)
+export -f db_log db_info db_ok db_warn db_error db_metric db_begin db_end db_spinner_start db_spinner_stop db_progress db_queue_add db_queue_show db_queue_next db_queue_update db_pkg_register db_install_summary db_metrics db_tail db_summary
