@@ -1,0 +1,869 @@
+#!/usr/bin/env bash
+#
+# adm-build v1.1.0
+# Build system: discover compilers & build systems, build, test, install to destdir, package, record.
+#
+# Save as: /usr/src/adm/bin/adm-build
+# Usage:
+#   adm-build <metafile|package> [--jobs N] [--dry-run] [--chroot] [--rootfs /path] [--compress zst|xz] [--test] [--keep-work] [--force]
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------- Basic configuration -------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_BIN="${ADM_BIN:-${ADM_ROOT}/bin}"
+ADM_DB_DIR="${ADM_DB_DIR:-${ADM_ROOT}/db}"
+ADM_LOG_DIR="${ADM_LOG_DIR:-${ADM_ROOT}/logs}"
+ADM_CACHE="${ADM_CACHE:-${ADM_ROOT}/cache}"
+ADM_WORK="${ADM_WORK:-${ADM_ROOT}/work}"
+ADM_PKGS_CACHE="${ADM_PKGS_CACHE:-${ADM_CACHE}/packages}"
+ADM_VERSION="v1.1.0"
+
+# DB files
+DB_BUILDS="${ADM_DB_DIR}/builds.jsonl"
+DB_PKGS="${ADM_DB_DIR}/packages.jsonl"
+DB_DEPS_DIR="${ADM_DB_DIR}/deps"
+DB_LOGS="${ADM_DB_DIR}/logs.jsonl"
+DB_GLOBAL="${ADM_DB_DIR}/logs.jsonl"
+
+# make sure directories exist
+mkdir -p "${ADM_BIN}" "${ADM_DB_DIR}" "${ADM_LOG_DIR}" "${ADM_CACHE}/tarballs" "${ADM_CACHE}/sources" "${ADM_WORK}" "${ADM_PKGS_CACHE}" "${DB_DEPS_DIR}"
+
+# Defaults
+JOBS="$(nproc 2>/dev/null || echo 1)"
+DRY_RUN=false
+FORCE=false
+CHROOT=false
+ROOTFS=""
+BOOTSTRAP=false
+COMPRESS="${COMPRESS:-zst}"   # zst or xz
+DO_TESTS=false
+KEEP_WORK=false
+VERBOSE=false
+
+# Input args
+TARGET="$1" || true   # metafile path or package identifier
+shift || true
+
+# TTY detection for spinners/pretty output
+IS_TTY=false
+if [ -t 1 ]; then IS_TTY=true; fi
+
+# Colors
+if $IS_TTY; then
+  BOLD="$(tput bold 2>/dev/null || echo '')"
+  NORM="$(tput sgr0 2>/dev/null || echo '')"
+  RED="$(tput setaf 1 2>/dev/null || echo '')"
+  GRN="$(tput setaf 2 2>/dev/null || echo '')"
+  YEL="$(tput setaf 3 2>/dev/null || echo '')"
+  BLU="$(tput setaf 4 2>/dev/null || echo '')"
+  CYA="$(tput setaf 6 2>/dev/null || echo '')"
+else
+  BOLD=""; NORM=""; RED=""; GRN=""; YEL=""; BLU=""; CYA=""
+fi
+
+ICON_INFO="🌀"; ICON_OK="✔️"; ICON_WARN="⚠️"; ICON_ERR="✖️"; ICON_PKG="📦"; ICON_BEGIN="⏳"; ICON_END="✅"
+
+# traps - ensure failures are logged
+on_error() {
+  local rc=$?
+  printf "%s %s\n" "${ICON_ERR}" "adm-build failed with code ${rc}" >&2
+  if type db_log >/dev/null 2>&1; then
+    db_log ERROR "adm-build" "" "" "build aborted (rc=${rc})"
+    db_end "adm-build" error "adm-build" "" ""
+  fi
+  exit "$rc"
+}
+trap on_error ERR
+
+# minimal db logging fallback (if adm-db not installed)
+if [ -x "${ADM_BIN}/adm-db" ]; then
+  # shellcheck source=/dev/null
+  source "${ADM_BIN}/adm-db"
+  HAS_ADMDB=true
+else
+  HAS_ADMDB=false
+  db_log() { local level="$1"; shift; printf "[%s] %s\n" "$level" "$*"; }
+  db_begin() { db_log BEGIN "$*"; }
+  db_end() { db_log END "$*"; }
+  db_ok() { db_log OK "$*"; }
+  db_info() { db_log INFO "$*"; }
+  db_warn() { db_log WARN "$*"; }
+  db_error() { db_log ERROR "$*"; }
+  db_pkg_register() { :; }
+  db_install_summary() { :; }
+fi
+
+# utils: JSON escape
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  printf "%s" "$s"
+}
+
+# atomic append to file using flock file descriptor 9
+atomic_append() {
+  local file="$1"; shift
+  local line="$*"
+  mkdir -p "$(dirname "$file")"
+  exec 9>"${ADM_DB_DIR}/.lock"
+  flock -x 9
+  printf "%s\n" "$line" >> "$file" || true
+  flock -u 9
+  exec 9>&-
+}
+
+# record build event (builds.jsonl)
+record_build_event() {
+  local json="$1"
+  atomic_append "${DB_BUILDS}" "$json"
+  atomic_append "${DB_GLOBAL}" "$json"
+}
+
+# record package metadata (packages.jsonl)
+record_package() {
+  local json="$1"
+  atomic_append "${DB_PKGS}" "$json"
+}
+
+# compute sha256
+sha256_file() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
+# check required binaries
+require_cmds() {
+  local missing=()
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
+    fi
+  done
+  if [ ${#missing[@]} -gt 0 ]; then
+    db_warn "adm-build" "" "" "Missing commands: ${missing[*]}"
+    return 1
+  fi
+  return 0
+}
+
+# safe chdir
+safe_cd() { cd "$1" || (db_error "adm-build" "" "" "cd $1 failed" && exit 1); }
+
+# human readable sizes
+human_size() {
+  local b="$1"
+  if [ -z "$b" ] || [ "$b" -le 0 ]; then echo "0B"; return; fi
+  awk -v b="$b" 'BEGIN{if(b>=1073741824)printf "%.2f GB",b/1073741824; else if(b>=1048576)printf "%.2f MB",b/1048576; else if(b>=1024)printf "%.2f KB",b/1024; else printf "%d B",b}'
+}
+
+# parse args
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --jobs) JOBS="$2"; shift 2;;
+      -j) JOBS="$2"; shift 2;;
+      --dry-run) DRY_RUN=true; shift;;
+      --force) FORCE=true; shift;;
+      --chroot) CHROOT=true; shift;;
+      --rootfs) ROOTFS="$2"; shift 2;;
+      --bootstrap) BOOTSTRAP=true; shift;;
+      --compress) COMPRESS="$2"; shift 2;;
+      --test) DO_TESTS=true; shift;;
+      --keep-work) KEEP_WORK=true; shift;;
+      --verbose) VERBOSE=true; shift;;
+      --help|-h) echo "Usage: adm-build <metafile> [options]"; exit 0;;
+      *) # unknown; leave for main
+        break;;
+    esac
+  done
+}
+
+# call parse_args with remaining args
+parse_args "$@"
+
+# ----------------- Metafile reading -----------------
+# Expected metafile (simple as user requested earlier): description,name,version,build_number,source,sha256sum,run_deps,build_deps,opt_deps,url
+# Support multiple source entries separated by newline; also support multiple download formats.
+read_metafile() {
+  local mf="$1"
+  if [ ! -f "$mf" ]; then
+    db_error "adm-build" "" "" "metafile not found: $mf"
+    exit 1
+  fi
+  # read key=val lines (simple parser)
+  MF_NAME="$(grep -E '^name=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_VERSION="$(grep -E '^version=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_BUILD="$(grep -E '^build_number=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_SOURCE_LINES="$(grep -E '^source=' "$mf" | sed -E 's/^source=//' | sed 's/^"//;s/"$//' || true)"
+  MF_SHA256="$(grep -E '^sha256sum=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_RUN_DEPS="$(grep -E '^run_deps=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_BUILD_DEPS="$(grep -E '^build_deps=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_OPT_DEPS="$(grep -E '^opt_deps=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  MF_URL="$(grep -E '^url=' "$mf" | head -n1 | cut -d'=' -f2- | tr -d '"')"
+  # fallback
+  MF_NAME="${MF_NAME:-unknown}"
+  MF_VERSION="${MF_VERSION:-0}"
+  MF_BUILD="${MF_BUILD:-1}"
+  MF_RUN_DEPS="${MF_RUN_DEPS:-}"
+  MF_BUILD_DEPS="${MF_BUILD_DEPS:-}"
+  MF_OPT_DEPS="${MF_OPT_DEPS:-}"
+}
+
+# ------------- Source retrieval from cache -------------
+# Try to find tarball in ADM_CACHE/tarballs matching source or name-version
+find_source_tarball() {
+  local prefer="$1"
+  # if prefer is a path and exists, return it
+  if [ -n "$prefer" ] && [ -f "$prefer" ]; then
+    printf "%s" "$prefer"; return 0
+  fi
+  # try patterns
+  local patterns=()
+  [ -n "$MF_SOURCE_LINES" ] && patterns+=($MF_SOURCE_LINES)
+  patterns+=("${ADM_CACHE}/tarballs/${MF_NAME}-${MF_VERSION}"*)
+  patterns+=("${ADM_CACHE}/tarballs/${MF_NAME}"*)
+  # scan
+  for p in "${patterns[@]}"; do
+    for f in $p; do
+      [ -f "$f" ] || continue
+      printf "%s" "$f"; return 0
+    done
+  done
+  # not found
+  return 1
+}
+
+# extract source into workdir: returns builddir path
+prepare_source_tree() {
+  local tarball="$1"
+  local workdir="$2"
+  mkdir -p "$workdir"
+  db_info "adm-build" "" "" "Extracting $tarball -> $workdir"
+  if $DRY_RUN; then
+    printf "[DRY-RUN] Would extract %s into %s\n" "$tarball" "$workdir"
+    echo "$workdir"
+    return 0
+  fi
+  case "$tarball" in
+    *.tar.gz|*.tgz) tar -xzf "$tarball" -C "$workdir" || return 1 ;;
+    *.tar.xz) tar -xJf "$tarball" -C "$workdir" || return 1 ;;
+    *.tar.zst) if command -v zstd >/dev/null 2>&1; then \
+                  tar --use-compress-program=unzstd -xf "$tarball" -C "$workdir" || return 1; \
+                else
+                  db_warn "adm-build" "" "" "zstd missing to extract $tarball"; tar -xf "$tarball" -C "$workdir" || return 1; fi ;;
+    *.zip) unzip -q "$tarball" -d "$workdir" || return 1 ;;
+    *) db_warn "adm-build" "" "" "Unknown archive type for $tarball; attempting tar -xf"; tar -xf "$tarball" -C "$workdir" || return 1 ;;
+  esac
+  # detect single top-level dir and return that
+  local top
+  top="$(find "$workdir" -mindepth 1 -maxdepth 1 -type d -print | head -n1 || true)"
+  if [ -z "$top" ]; then
+    # maybe files extracted directly -> use workdir
+    top="$workdir"
+  fi
+  echo "$top"
+}
+
+# apply patches using adm-patch if available, else try to apply any patch/patches in metafile folder
+apply_patches() {
+  local builddir="$1"
+  local meta_dir="$2"   # path to metafiles/<category>/<pkg>/
+  if [ -x "${ADM_BIN}/adm-patch" ]; then
+    if $DRY_RUN; then
+      db_info "adm-build" "" "" "DRY-RUN would run adm-patch on $builddir"
+    else
+      "${ADM_BIN}/adm-patch" "$meta_dir" "$builddir" || db_warn "adm-build" "" "" "adm-patch returned non-zero"
+    fi
+  else
+    # local heuristic: if meta_dir/patch contains files, try git apply or patch -p1
+    if [ -d "${meta_dir}/patch" ]; then
+      for p in "${meta_dir}/patch/"*; do
+        [ -f "$p" ] || continue
+        if $DRY_RUN; then
+          printf "[DRY-RUN] Would apply patch %s to %s\n" "$p" "$builddir"
+          continue
+        fi
+        if command -v git >/dev/null 2>&1; then
+          (cd "$builddir" && git init -q && git apply "$p") || (cd "$builddir" && patch -p1 < "$p") || db_warn "adm-build" "" "" "Failed to apply patch $p"
+        else
+          (cd "$builddir" && patch -p1 < "$p") || db_warn "adm-build" "" "" "Failed to apply patch $p"
+        fi
+      done
+    fi
+  fi
+}
+
+# ----------------- Build system detection -----------------
+detect_build_system() {
+  local src="$1"
+  # returns a token and optionally extra info printed to stdout
+  # Priority: custom build.sh, CMake, Meson, Cargo, Go, Autotools (configure), Python (pyproject/setup.py), Node (package.json), Gradle/Maven, Makefile
+  if [ -f "${src}/build.sh" ] || [ -f "${src}/build.bash" ]; then
+    echo "custom"
+    return 0
+  fi
+  if [ -f "${src}/Cargo.toml" ]; then echo "cargo"; return 0; fi
+  if [ -f "${src}/go.mod" ]; then echo "go"; return 0; fi
+  if [ -f "${src}/pyproject.toml" ] || [ -f "${src}/setup.py" ]; then echo "python"; return 0; fi
+  if [ -f "${src}/package.json" ]; then echo "node"; return 0; fi
+  if [ -f "${src}/CMakeLists.txt" ]; then echo "cmake"; return 0; fi
+  if [ -f "${src}/meson.build" ]; then echo "meson"; return 0; fi
+  if [ -x "${src}/configure" ] || [ -f "${src}/configure.ac" ] || [ -f "${src}/configure.in" ]; then echo "autotools"; return 0; fi
+  if [ -f "${src}/Makefile" ] || [ -f "${src}/makefile" ]; then echo "make"; return 0; fi
+  if [ -f "${src}/pom.xml" ] || [ -f "${src}/build.gradle" ]; then
+    # java/maven/gradle
+    if [ -f "${src}/pom.xml" ]; then echo "maven"; else echo "gradle"; fi
+    return 0
+  fi
+  # fallback: check for source files to guess language
+  if find "$src" -name '*.go' | read -r _; then echo "go"; return 0; fi
+  if find "$src" -name '*.rs' | read -r _; then echo "cargo"; return 0; fi
+  if find "$src" -name '*.py' | read -r _; then echo "python"; return 0; fi
+  if find "$src" -name '*.java' | read -r _; then echo "java"; return 0; fi
+  # unknown
+  echo "unknown"
+}
+
+# ----------------- Compiler / language discovery -----------------
+discover_compilers_and_tools() {
+  # produce these globals:
+  # HAVE_GCC, HAVE_CLANG, HAVE_GXX, HAVE_GFORTRAN, HAVE_CCACHE, HAVE_CMAKE, HAVE_MESON, HAVE_NINJA, HAVE_PYTHON, HAVE_PIP, HAVE_PYTHON_BUILD_TOOLS, HAVE_GO, HAVE_CARGO, HAVE_NODE, HAVE_NPM, HAVE_RUSTC
+  HAVE_GCC=false; HAVE_CLANG=false; HAVE_GXX=false; HAVE_GFORTRAN=false; HAVE_CCACHE=false
+  HAVE_CMAKE=false; HAVE_MESON=false; HAVE_NINJA=false
+  HAVE_PYTHON=false; HAVE_PIP=false; HAVE_PYTHON_BUILD_TOOLS=false
+  HAVE_GO=false; HAVE_CARGO=false
+  HAVE_NODE=false; HAVE_NPM=false; HAVE_YARN=false
+  HAVE_RUST=false; HAVE_RUSTC=false; HAVE_CABAL=false; HAVE_STACK=false
+  HAVE_MVN=false; HAVE_GRADLE=false
+  HAVE_PKGCONFIG=false
+  # check commands
+  command -v gcc >/dev/null 2>&1 && HAVE_GCC=true
+  command -v clang >/dev/null 2>&1 && HAVE_CLANG=true
+  command -v g++ >/dev/null 2>&1 && HAVE_GXX=true
+  command -v gfortran >/dev/null 2>&1 && HAVE_GFORTRAN=true
+  command -v ccache >/dev/null 2>&1 && HAVE_CCACHE=true
+  command -v cmake >/dev/null 2>&1 && HAVE_CMAKE=true
+  command -v meson >/dev/null 2>&1 && HAVE_MESON=true
+  command -v ninja >/dev/null 2>&1 && HAVE_NINJA=true
+  command -v python3 >/dev/null 2>&1 && HAVE_PYTHON=true
+  command -v pip3 >/dev/null 2>&1 && HAVE_PIP=true
+  # python build tools: setuptools, wheel, build - check via python -c
+  if $HAVE_PYTHON; then
+    if python3 - <<'PY' 2>/dev/null
+import sys
+try:
+  import setuptools, wheel
+  print("ok")
+except Exception:
+  pass
+PY
+    then HAVE_PYTHON_BUILD_TOOLS=true; fi
+  fi
+  command -v go >/dev/null 2>&1 && HAVE_GO=true
+  command -v cargo >/dev/null 2>&1 && HAVE_CARGO=true
+  command -v node >/dev/null 2>&1 && HAVE_NODE=true
+  command -v npm >/dev/null 2>&1 && HAVE_NPM=true
+  command -v yarn >/dev/null 2>&1 && HAVE_YARN=true
+  command -v rustc >/dev/null 2>&1 && HAVE_RUSTC=true && HAVE_RUST=true
+  command -v ghc >/dev/null 2>&1 && HAVE_CABAL=true
+  command -v stack >/dev/null 2>&1 && HAVE_STACK=true
+  command -v mvn >/dev/null 2>&1 && HAVE_MVN=true
+  command -v gradle >/dev/null 2>&1 && HAVE_GRADLE=true
+  command -v pkg-config >/dev/null 2>&1 && HAVE_PKGCONFIG=true
+
+  # print summary if verbose
+  if $VERBOSE; then
+    db_info "adm-build" "" "" "Compiler/toolchain summary: GCC=${HAVE_GCC} CLANG=${HAVE_CLANG} GXX=${HAVE_GXX} CMAKE=${HAVE_CMAKE} MESON=${HAVE_MESON} PYTHON=${HAVE_PYTHON} GO=${HAVE_GO} CARGO=${HAVE_CARGO} NODE=${HAVE_NODE}"
+  fi
+}
+# ----------------- dynamic dependency analysis helpers -----------------
+# scan source for C/C++ includes, python imports, go modules, rust crates, node require/import lines, pkg-config usage
+static_dep_analysis() {
+  local src="$1"
+  local outdeps="$2"  # path to output json
+  local build_deps_list="" run_deps_list=""
+  # C/C++: grep for #include <...> and pkg-config macros
+  # Try to map common includes to packages heuristically (glibc headers, readline => readline)
+  if find "$src" -name '*.[ch]' -o -name '*.[ch]pp' -print -quit | read -r _; then
+    # scan includes
+    includes=$(grep -R --include='*.[ch]*' -hE '^#include *[<"].+[>"]' "$src" 2>/dev/null | sed -E 's/#include *[<"]([^">]+)[">].*/\1/' | sort -u || true)
+    # heuristics mapping
+    for inc in $includes; do
+      case "$inc" in
+        stdio.h|stdlib.h|string.h) ;; # libc
+        readline*) run_deps_list="${run_deps_list} readline";;
+        curses*|ncurses*) run_deps_list="${run_deps_list} ncurses";;
+        openssl/*|openssl.h) run_deps_list="${run_deps_list} openssl";;
+        zlib.h) run_deps_list="${run_deps_list} zlib";;
+        libxml*|xml*) run_deps_list="${run_deps_list} libxml2";;
+        *) ;; 
+      esac
+    done
+  fi
+
+  # pkg-config usage
+  if grep -R --exclude-dir=build -h "PKG_CHECK_MODULES" "$src" 2>/dev/null | read -r _; then
+    # naive: extract names within PKG_CHECK_MODULES([...] ...)
+    pc=$(grep -R --exclude-dir=build -h "PKG_CHECK_MODULES" "$src" 2>/dev/null | sed -n 's/.*PKG_CHECK_MODULES([^,]*,\s*\(.*\)).*/\1/p' | tr -d '()' | tr ' ' '\n' | tr -d ',' | sort -u || true)
+    for p in $pc; do run_deps_list="${run_deps_list} ${p}"; done
+  fi
+
+  # python: look for import statements and setup.cfg/pyproject
+  if find "$src" -name '*.py' -print -quit | read -r _; then
+    pyimports=$(grep -R --include='*.py' -hE '^(from|import) ' "$src" 2>/dev/null | sed -E 's/^(from|import) +([a-zA-Z0-9_\.]+).*/\2/' | cut -d'.' -f1 | sort -u || true)
+    for m in $pyimports; do
+      # ignore stdlib heuristics is hard; keep as opt-dep
+      run_deps_list="${run_deps_list} python3-${m}"
+    done
+  fi
+
+  # go modules: parse go.mod requires
+  if [ -f "${src}/go.mod" ]; then
+    gomods=$(awk '/^require/ {flag=1; next} flag && /^}/ {flag=0; next} flag {print}' "${src}/go.mod" 2>/dev/null || true)
+    # we record as build deps the go tool itself
+    build_deps_list="${build_deps_list} go"
+  fi
+
+  # rust: Cargo.toml deps
+  if [ -f "${src}/Cargo.toml" ]; then
+    build_deps_list="${build_deps_list} cargo rustc"
+  fi
+
+  # node: package.json dependencies parsed with grep (naive)
+  if [ -f "${src}/package.json" ]; then
+    build_deps_list="${build_deps_list} node npm"
+  fi
+
+  # uniq and format JSON
+  build_deps_list="$(printf "%s" "$build_deps_list" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  run_deps_list="$(printf "%s" "$run_deps_list" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+
+  # write file (simple json)
+  mkdir -p "$(dirname "$outdeps")"
+  printf '{"package":"%s","version":"%s","build_deps":"%s","run_deps":"%s","detected_by":"static"}\n' "$(json_escape "$MF_NAME")" "$(json_escape "$MF_VERSION")" "$(json_escape "$build_deps_list")" "$(json_escape "$run_deps_list")" > "$outdeps"
+}
+
+# dynamic analysis: after building, run ldd on all ELF executables to find libs
+dynamic_dep_analysis() {
+  local instroot="$1"  # destdir root where installed files are placed
+  local outjson="$2"
+  local runlibs=""
+  if [ -d "$instroot" ]; then
+    while IFS= read -r -d '' f; do
+      # only executable ELF files
+      if file "$f" | grep -q 'ELF'; then
+        # run ldd
+        if ldd "$f" >/dev/null 2>&1; then
+          libs=$(ldd "$f" 2>/dev/null | awk '/=>/ {print $1}' | sort -u || true)
+          for l in $libs; do
+            runlibs="${runlibs} ${l}"
+          done
+        fi
+      fi
+    done < <(find "$instroot" -type f -print0 2>/dev/null)
+  fi
+  # naive mapping libs to package names impossible reliably, but record libs
+  runlibs="$(printf "%s" "$runlibs" | tr ' ' '\n' | awk 'NF' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+  printf '{"package":"%s","version":"%s","run_libs":"%s","detected_by":"dynamic"}\n' "$(json_escape "$MF_NAME")" "$(json_escape "$MF_VERSION")" "$(json_escape "$runlibs")" > "$outjson"
+  # also append to deps.jsonl for adm-resolver
+  atomic_append "${DB_DEPS_DIR}/deps.jsonl" "$(printf '{"timestamp":"%s","package":"%s","version":"%s","run_libs":"%s","type":"dynamic"}' "$(json_escape "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" "$(json_escape "$MF_NAME")" "$(json_escape "$MF_VERSION")" "$(json_escape "$runlibs")")"
+}
+
+# ----------------- chroot support helper -----------------
+# run a command inside rootfs with minimal safety if root and rootfs present.
+run_in_chroot() {
+  local rootfs="$1"; shift
+  if [ ! -d "$rootfs" ]; then
+    db_error "adm-build" "" "" "rootfs not found: $rootfs"
+    return 1
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    db_warn "adm-build" "" "" "chroot requested but not running as root; skipping chroot and running in host"
+    "$@"
+    return $?
+  fi
+  # basic bind-mount /proc and /dev if not already mounted
+  mountpoint -q "${rootfs}/proc" || mount -t proc proc "${rootfs}/proc" || true
+  mountpoint -q "${rootfs}/dev" || mount --rbind /dev "${rootfs}/dev" || true
+  # copy setup script into rootfs tmp and chroot run
+  local script
+  script="$(mktemp /tmp/adm-build-chroot.XXXX.sh)"
+  printf "%s\n" "#!/bin/sh" "$*" > "$script"
+  chmod +x "$script"
+  cp "$script" "${rootfs}/tmp/adm-build-chroot-run.sh"
+  chroot "$rootfs" /bin/sh "/tmp/adm-build-chroot-run.sh"
+  local rc=$?
+  rm -f "$script" "${rootfs}/tmp/adm-build-chroot-run.sh" || true
+  return $rc
+}
+
+# ----------------- build commands per system -----------------
+# each function executes the build steps inside $srcdir (source tree root) and uses $builddir as work dir and $destdir as install root.
+
+build_with_autotools() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  # run autoreconf if configure not present
+  if [ ! -x "./configure" ] && [ -f "configure.ac" ] || [ -f "configure.in" ]; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run autoreconf -vi"; else autoreconf -vfi; fi
+  fi
+  mkdir -p "$builddir"
+  # configure
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run ./configure --prefix=/usr --host=..."; else ./configure --prefix=/usr --disable-dependency-tracking --with-sysroot="${destdir}" || return 1; fi
+  # build
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run make -j${JOBS}"; else make -j"${JOBS}" || return 1; fi
+  # tests
+  if $DO_TESTS; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run make check"; else make check || { db_warn "adm-build" "" "" "make check failed"; }; fi
+  fi
+  # install to destdir
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run make DESTDIR=${destdir} install"; else make DESTDIR="${destdir}" install || return 1; fi
+  return 0
+}
+
+build_with_cmake() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  mkdir -p "$builddir"
+  safe_cd "$builddir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run cmake ${srcdir} -DCMAKE_INSTALL_PREFIX=/usr"; else cmake "${srcdir}" -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release || return 1; fi
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run cmake --build . -- -j ${JOBS}"; else cmake --build . -- -j "${JOBS}" || return 1; fi
+  if $DO_TESTS; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run ctest"; else ctest --output-on-failure || db_warn "adm-build" "" "" "ctest reported failures"; fi
+  fi
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run cmake --install . --prefix=/usr --strip --verbose"; else cmake --install . --prefix=/usr --strip || return 1; fi
+  # if cmake install doesn't support DESTDIR older versions, fallback to DESTDIR env
+  if [ -d "$builddir" ] && [ -n "$destdir" ] && [ ! -z "$destdir" ]; then
+    # attempt to use DESTDIR by setting DESTDIR for install step
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run DESTDIR=${destdir} cmake --install ."; else DESTDIR="${destdir}" cmake --install . || return 1; fi
+  fi
+  return 0
+}
+
+build_with_meson() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  mkdir -p "$builddir"
+  safe_cd "$builddir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run meson setup ${builddir} ${srcdir}"; else meson setup "${builddir}" "${srcdir}" || return 1; fi
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run ninja -C ${builddir} -j ${JOBS}"; else ninja -C "${builddir}" -j "${JOBS}" || return 1; fi
+  if $DO_TESTS; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run ninja -C ${builddir} test"; else ninja -C "${builddir}" test || db_warn "adm-build" "" "" "meson tests returned non-zero"; fi
+  fi
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run DESTDIR=${destdir} ninja -C ${builddir} install"; else ninja -C "${builddir}" install DESTDIR="${destdir}" || return 1; fi
+  return 0
+}
+
+build_with_cargo() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run cargo build --release"; else cargo build --release --jobs "${JOBS}" || return 1; fi
+  if $DO_TESTS; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: cargo test --release"; else cargo test --release || db_warn "adm-build" "" "" "cargo tests failed"; fi
+  fi
+  # install: for cargo, use cargo install --path . --root destdir
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run cargo install --path . --root ${destdir}"; else cargo install --path . --root "${destdir}" || return 1; fi
+  return 0
+}
+
+build_with_go() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: go build"; else go build ./... || return 1; fi
+  # install - installing go binaries manually: place into destdir/usr/bin
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: go install to ${destdir}/usr/bin"; else
+    mkdir -p "${destdir}/usr/bin"
+    # find built binaries in srcdir (very heuristic)
+    for f in $(find . -maxdepth 2 -type f -perm /111 -print 2>/dev/null); do
+      cp "$f" "${destdir}/usr/bin/" || true
+    done
+  fi
+  return 0
+}
+
+build_with_python() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  # try pep517 / build if available
+  if $DRY_RUN; then
+    db_info "adm-build" "" "" "DRY-RUN: python build/install into ${destdir}"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    # prefer pip wheel then install to destdir
+    if command -v pip3 >/dev/null 2>&1; then
+      python3 -m pip wheel . -w "${builddir}/wheels" || db_warn "adm-build" "" "" "pip wheel failed"
+      mkdir -p "${destdir}"
+      python3 -m pip install --prefix="${destdir}/usr" --no-deps "${builddir}/wheels"/*.whl || db_warn "adm-build" "" "" "pip install into destdir failed"
+    else
+      # fallback to setup.py
+      if [ -f setup.py ]; then
+        python3 setup.py build || db_warn "adm-build" "" "" "setup.py build failed"
+        python3 setup.py install --prefix="${destdir}/usr" --root="${destdir}" || db_warn "adm-build" "" "" "setup.py install failed"
+      fi
+    fi
+  else
+    db_warn "adm-build" "" "" "python3 missing"
+  fi
+  return 0
+}
+
+build_with_node() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: node/npm install & build"; return 0; fi
+  if command -v npm >/dev/null 2>&1; then
+    npm ci || db_warn "adm-build" "" "" "npm ci failed"
+    if [ -f package.json ] && grep -q "\"build\"" package.json; then
+      npm run build || db_warn "adm-build" "" "" "npm run build failed"
+    fi
+    # gather build artifacts into destdir (heuristic: dist/ or build/)
+    if [ -d dist ]; then
+      mkdir -p "${destdir}/usr/share/${MF_NAME}"
+      cp -a dist/* "${destdir}/usr/share/${MF_NAME}/" || true
+    elif [ -d build ]; then
+      mkdir -p "${destdir}/usr/share/${MF_NAME}"
+      cp -a build/* "${destdir}/usr/share/${MF_NAME}/" || true
+    fi
+  else
+    db_warn "adm-build" "" "" "npm missing"
+  fi
+  return 0
+}
+
+build_generic_make() {
+  local srcdir="$1"; local builddir="$2"; local destdir="$3"
+  safe_cd "$srcdir"
+  if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: make -j${JOBS} && make DESTDIR=${destdir} install"; return 0; fi
+  make -j"${JOBS}" || return 1
+  if $DO_TESTS; then make check || db_warn "adm-build" "" "" "make check failed"; fi
+  make DESTDIR="${destdir}" install || return 1
+  return 0
+}
+
+# ----------------- packaging (tar.zst / tar.xz) -----------------
+package_destdir() {
+  local destdir="$1"   # the root dir containing usr/ etc
+  local outdir="$2"
+  local pkgname="$3"
+  local pkgver="$4"
+  local buildnum="$5"
+  mkdir -p "$outdir"
+  local fname
+  fname="${outdir}/${pkgname}-${pkgver}-${buildnum}.tar"
+  if $DRY_RUN; then
+    printf "[DRY-RUN] Would create package tar from %s to %s\n" "$destdir" "$fname"
+    echo "$fname"
+    return 0
+  fi
+  # create tar in temp and compress
+  local tmptar; tmptar="$(mktemp "${outdir}/.tmp.XXXXXX.tar")"
+  (cd "$destdir" && tar -cf "$tmptar" .) || { db_warn "adm-build" "" "" "tar creation failed"; return 1; }
+  local outpath
+  if [ "$COMPRESS" = "zst" ]; then
+    if command -v zstd >/dev/null 2>&1; then
+      outpath="${tmptar}.zst"
+      zstd -19 -T0 -o "${outpath}" "$tmptar" || { db_warn "adm-build" "" "" "zstd compression failed"; mv "$tmptar" "${outdir}/$(basename "$fname")"; outpath="${outdir}/$(basename "$fname")"; }
+    else
+      # fallback to gzip
+      outpath="${tmptar}.gz"
+      gzip -9f "$tmptar"
+    fi
+  else
+    # xz
+    if command -v xz >/dev/null 2>&1; then
+      outpath="${tmptar}.xz"
+      xz -9 -T0 "$tmptar" || { db_warn "adm-build" "" "" "xz compression failed"; mv "$tmptar" "${outdir}/$(basename "$fname")"; outpath="${outdir}/$(basename "$fname")"; }
+    else
+      outpath="${tmptar}.gz"
+      gzip -9f "$tmptar"
+    fi
+  fi
+  # move to final name
+  local finalname="${outdir}/${pkgname}-${pkgver}-${buildnum}.tar"
+  case "$outpath" in
+    *.zst) mv "$outpath" "${finalname}.tar.zst" ;; 
+    *.xz) mv "$outpath" "${finalname}.tar.xz" ;;
+    *.gz) mv "${outpath}" "${finalname}.tar.gz" ;;
+    *) mv "$outpath" "${finalname}.tar" ;;
+  esac
+  # compute sha256
+  local final
+  final="$(ls -1 "${outdir}/${pkgname}-${pkgver}-${buildnum}.tar."* 2>/dev/null | head -n1 || true)"
+  local sha=""
+  [ -n "$final" ] && sha="$(sha256_file "$final" || true)"
+  # record package
+  local pkgjson
+  pkgjson="$(printf '{"timestamp":"%s","package":"%s","version":"%s","build":%s,"path":"%s","sha256":"%s"}' "$(json_escape "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" "$(json_escape "$pkgname")" "$(json_escape "$pkgver")" "$(json_escape "$buildnum")" "$(json_escape "$final")" "$(json_escape "$sha")")"
+  record_package "$pkgjson"
+  db_info "adm-build" "" "" "Packaged at $final (sha256=$sha)"
+  echo "$final"
+}
+
+# ----------------- install to destdir orchestration -----------------
+install_to_destdir() {
+  local buildsystem="$1"
+  local srcdir="$2"
+  local builddir="$3"
+  local destdir="$4"
+  mkdir -p "$destdir"
+  case "$buildsystem" in
+    autotools) build_with_autotools "$srcdir" "$builddir" "$destdir" ;;
+    cmake) build_with_cmake "$srcdir" "$builddir" "$destdir" ;;
+    meson) build_with_meson "$srcdir" "$builddir" "$destdir" ;;
+    cargo) build_with_cargo "$srcdir" "$builddir" "$destdir" ;;
+    go) build_with_go "$srcdir" "$builddir" "$destdir" ;;
+    python) build_with_python "$srcdir" "$builddir" "$destdir" ;;
+    node) build_with_node "$srcdir" "$builddir" "$destdir" ;;
+    make) build_generic_make "$srcdir" "$builddir" "$destdir" ;;
+    custom) safe_cd "$srcdir"; if [ -x ./build.sh ]; then ./build.sh "$destdir"; else db_warn "adm-build" "" "" "custom build but no build.sh"; fi ;;
+    unknown) db_warn "adm-build" "" "" "Unknown build system; attempting generic make"; build_generic_make "$srcdir" "$builddir" "$destdir" ;;
+    *) db_warn "adm-build" "" "" "Unhandled buildsystem $buildsystem"; build_generic_make "$srcdir" "$builddir" "$destdir" ;;
+  esac
+}
+
+# ----------------- main orchestration -----------------
+main() {
+  if [ -z "$TARGET" ]; then
+    echo "Usage: adm-build <metafile> [options]"
+    exit 1
+  fi
+
+  # if target is a directory or file metafile, use it; otherwise try to find metafile under metafiles dir
+  METAFILE="$TARGET"
+  if [ ! -f "$METAFILE" ]; then
+    # try metafiles/<pkg>/metafile
+    if [ -f "${ADM_ROOT}/metafiles/${TARGET}/metafile" ]; then
+      METAFILE="${ADM_ROOT}/metafiles/${TARGET}/metafile"
+    else
+      db_error "adm-build" "" "" "Metafile not found: $TARGET"
+      exit 1
+    fi
+  fi
+
+  # read metafile keys
+  read_metafile "$METAFILE"
+  local pkg="${MF_NAME}"
+  local ver="${MF_VERSION}"
+  local buildnum="${MF_BUILD}"
+  db_begin "adm-build:${pkg}" "${ADM_WORK}" "adm-build" "${pkg}" "${ver}" || true
+  db_info "adm-build" "" "" "Starting build for ${pkg}-${ver} (build ${buildnum})"
+
+  # discover compilers/tools
+  discover_compilers_and_tools
+
+  # find tarball
+  TAR="$(find_source_tarball "$MF_SOURCE_LINES" || true)"
+  if [ -z "$TAR" ]; then
+    db_error "adm-build" "" "" "Source tarball not found for ${pkg}-${ver}"
+    db_end "adm-build" error "adm-build" "" ""
+    exit 1
+  fi
+
+  # prepare workdir
+  local build_workdir
+  build_workdir="${ADM_WORK}/${pkg}-${ver}-${buildnum}-work"
+  mkdir -p "$build_workdir"
+  local src_top
+  src_top="$(prepare_source_tree "$TAR" "$build_workdir")" || { db_error "adm-build" "" "" "extract failed"; exit 1; }
+
+  # apply patches
+  # get meta dir
+  METADIR="$(dirname "$METAFILE")"
+  apply_patches "$src_top" "$METADIR" || true
+
+  # detect build system
+  buildsys="$(detect_build_system "$src_top")"
+  db_info "adm-build" "" "" "Detected build system: $buildsys"
+
+  # static deps analysis
+  mkdir -p "${DB_DEPS_DIR}"
+  static_deps_file="${DB_DEPS_DIR}/${pkg}-${ver}-static.json"
+  static_dep_analysis "$src_top" "$static_deps_file"
+  db_info "adm-build" "" "" "Static deps written to ${static_deps_file}"
+
+  # create destdir
+  destdir="${build_workdir}/destdir"
+  mkdir -p "$destdir"
+
+  # pre-build hooks
+  if [ -x "${ADM_BIN}/adm-hooks" ]; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run adm-hooks pre-build"; else "${ADM_BIN}/adm-hooks" pre-build "${MF_NAME}" || db_warn "adm-build" "" "" "adm-hooks pre-build failed"; fi
+  fi
+
+  # if chroot requested, either use run_in_chroot wrapper or run locally
+  if $CHROOT && [ -n "$ROOTFS" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+      db_warn "adm-build" "" "" "chroot requested but not root; proceeding without chroot"
+      install_to_destdir "$buildsys" "$src_top" "${build_workdir}" "$destdir"
+    else
+      # create a small script to run inside chroot performing the build steps
+      # For safety, we will run install_to_destdir in host if chroot not available
+      run_in_chroot "$ROOTFS" "sh -c 'cd /tmp && exit 0'" || db_warn "adm-build" "" "" "chroot execution failed; fallback to host build"
+      install_to_destdir "$buildsys" "$src_top" "${build_workdir}" "$destdir"
+    fi
+  else
+    install_to_destdir "$buildsys" "$src_top" "${build_workdir}" "$destdir"
+  fi
+
+  # dynamic dependency analysis
+  dynfile="${DB_DEPS_DIR}/${pkg}-${ver}-dynamic.json"
+  dynamic_dep_analysis "$destdir" "$dynfile"
+  db_info "adm-build" "" "" "Dynamic deps written to ${dynfile}"
+
+  # packaging
+  mkdir -p "${ADM_PKGS_CACHE}/${pkg}"
+  packaged="$(package_destdir "$destdir" "${ADM_PKGS_CACHE}/${pkg}" "$pkg" "$ver" "$buildnum")"
+  if [ -n "$packaged" ]; then
+    sha="$(sha256_file "$packaged" || true)"
+    build_record="$(printf '{"timestamp":"%s","package":"%s","version":"%s","build":%s,"path":"%s","sha256":"%s","build_system":"%s"}' "$(json_escape "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" "$(json_escape "$pkg")" "$(json_escape "$ver")" "$(json_escape "$buildnum")" "$(json_escape "$packaged")" "$(json_escape "$sha")" "$(json_escape "$buildsys")")"
+    record_build_event "$build_record"
+    db_ok "adm-build" "" "" "Build and package recorded"
+  fi
+
+  # post-package hooks
+  if [ -x "${ADM_BIN}/adm-hooks" ]; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would run adm-hooks post-package"; else "${ADM_BIN}/adm-hooks" post-package "${MF_NAME}" "${packaged}" || db_warn "adm-build" "" "" "adm-hooks post-package failed"; fi
+  fi
+
+  # if not KEEP_WORK, invoke adm-clean work for this build
+  if ! $KEEP_WORK; then
+    if [ -x "${ADM_BIN}/adm-clean" ]; then
+      if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN would call adm-clean work"; else "${ADM_BIN}/adm-clean" work --force || db_warn "adm-build" "" "" "adm-clean work returned non-zero"; fi
+    else
+      # fallback: remove workdir
+      if $DRY_RUN; then printf "[DRY-RUN] Would remove workdir %s\n" "$build_workdir"; else rm -rf "$build_workdir" || db_warn "adm-build" "" "" "Failed to cleanup $build_workdir"; fi
+    fi
+  fi
+
+  # register deps for adm-resolver: combine static and dynamic into deps.jsonl
+  if [ -f "$static_deps_file" ]; then
+    sjson="$(cat "$static_deps_file")"
+  else sjson="{}"; fi
+  djson="$(cat "$dynfile" 2>/dev/null || echo '{}')"
+  combined="$(printf '{"timestamp":"%s","package":"%s","version":"%s","static":%s,"dynamic":%s}' "$(json_escape "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" "$(json_escape "$pkg")" "$(json_escape "$ver")" "$sjson" "$djson")"
+  atomic_append "${DB_DEPS_DIR}/deps.jsonl" "$combined"
+
+  # optionally call adm-resolver
+  if [ -x "${ADM_BIN}/adm-resolver" ]; then
+    if $DRY_RUN; then db_info "adm-build" "" "" "DRY-RUN: would call adm-resolver to register deps"; else "${ADM_BIN}/adm-resolver" register "${DB_DEPS_DIR}/deps.jsonl" || db_warn "adm-build" "" "" "adm-resolver register returned non-zero"; fi
+  fi
+
+  db_end "adm-build:${pkg}" ok "adm-build" "${pkg}" "${ver}"
+  db_ok "adm-build" "" "" "Build complete for ${pkg}-${ver}"
+  echo "${ICON_OK} Build completed: ${pkg}-${ver} package: ${packaged:-(none)}"
+}
+
+# run
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi
+
+# Export functions for other scripts if sourced
+export -f detect_build_system discover_compilers_and_tools prepare_source_tree apply_patches static_dep_analysis dynamic_dep_analysis package_destdir install_to_destdir
