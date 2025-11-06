@@ -1,0 +1,21 @@
+NAME="binutils"
+VERSION="2.43.1"
+CATEGORY="toolchain"
+BUILD_SYSTEM="autotools"
+
+# múltiplos links de download — o sistema tentará cada um automaticamente
+URLS="
+https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+ftp://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+rsync://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+git://sourceware.org/git/binutils-gdb.git
+sourceforge://gnu-binutils/binutils-2.43.1.tar.xz
+"
+
+# checksum oficial da versão 2.43.1
+SHA256="adf29d325d586f1d8f0c56e72e1b23a3c1d69d5fbcf1d92ac545eeefb6e2232c"
+
+# dependências detectadas automaticamente e compatíveis com bootstrap
+BUILD_DEPS="gcc make texinfo m4 autoconf automake libtool zlib"
+RUN_DEPS="zlib"
+OPT_DEPS=""
