@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# pre-build (firefox) — $1=WORKDIR, $2=DESTDIR
+set -euo pipefail
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+log(){ printf '[firefox pre-build] %s\n' "$*"; }
+
+log "workdir=${WORKDIR} destdir=${DESTDIR}"
+
+# 1) garantir fonte disponível (adm-download preferido)
+# adm-build normalmente já extrai fonte em WORKDIR; aqui apenas fallback checks
+if [ ! -d "${WORKDIR}" ] || [ -z "$(ls -A "${WORKDIR}")" ]; then
+  log "Fonte ausente no WORKDIR; verifique adm-download/adm-fetch"
+fi
+
+# 2) preparar mozconfig (artifact-builds recomendadas p/ dev)
+# Ajuste MOZ_OBJDIR para saída fora da source tree; personalize conforme perfil.
+cat > "${WORKDIR}/mozconfig" <<'EOF'
+# Basic mozconfig for ADM builds
+# Use artifact builds to speed up if allowed
+ac_add_options --enable-artifact-builds
+# Objdir: where build artifacts go (keep under WORKDIR)
+mk_add_options MOZ_OBJDIR=${WORKDIR}/objfirefox
+# Build a release browser; change if you want nightly/dev
+ac_add_options --enable-project=browser/installer
+ac_add_options --with-branding=browser/branding/unofficial
+ac_add_options --disable-debug
+ac_add_options --enable-optimize
+# If you want to build package:
+mk_add_options MOZ_PKG_PROJECT=browser
+# If you need X11/Xwayland specifics, add here
+EOF
+
+log "mozconfig written to ${WORKDIR}/mozconfig"
+
+# 3) run ./mach bootstrap non-interactive (installs python packages / rust toolchain if needed)
+# NB: in some systems this tries to call system package manager; prefer to run only python/rust bootstrap steps.
+cd "${WORKDIR}" || exit 1
+
+# Prefer using mach bootstrap python-only to avoid package manager interaction:
+if command -v ./mach >/dev/null 2>&1; then
+  log "Running './mach bootstrap' (may request network + package installs)"
+  # --no-interactive to avoid prompts; choice may vary per version; fall back if unsupported
+  set +e
+  ./mach bootstrap --no-interactive --no-system-packages 2>&1 | tee "${WORKDIR}/mach-bootstrap.log"
+  rc=$?
+  set -e
+  if [ ${rc} -ne 0 ]; then
+    log "mach bootstrap returned ${rc}; check ${WORKDIR}/mach-bootstrap.log"
+  else
+    log "mach bootstrap finished"
+  fi
+else
+  log "WARN: ./mach not found in WORKDIR; ensure source layout is correct."
+fi
+
+# 4) ensure rust + node toolchains available (mach bootstrap normally handles Rust)
+if ! command -v cargo >/dev/null 2>&1; then
+  log "WARN: cargo not found; mach bootstrap should have installed rustup/cargo in tools. Check logs."
+fi
+
+# 5) create artifact cache dir if wanted
+mkdir -p "${WORKDIR}/artifact-cache"
+export MOZ_ARTIFACT_DIRECTORY="${WORKDIR}/artifact-cache"
+
+log "pre-build complete"
+exit 0
