@@ -1,0 +1,3 @@
+PREFIX="/usr"
+BUILD_DEPS="gcc make texinfo zlib"
+RUN_DEPS="zlib"
