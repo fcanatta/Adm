@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# post-install (stage1) — ajustes após make install para integração com chroot
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[adm-hook stage1 post-install] ajustes pós-instalação..."
+
+# exemplo: criar link 'cc' para gcc no DESTDIR
+if [ -x "${DESTDIR}/usr/bin/gcc" ]; then
+  ln -sf gcc "${DESTDIR}/usr/bin/cc" || true
+  echo "[adm-hook] link cc -> gcc criado em ${DESTDIR}/usr/bin/cc"
+fi
+
+# verificar versão instalada (no staging)
+if [ -x "${DESTDIR}/usr/bin/gcc" ]; then
+  "${DESTDIR}/usr/bin/gcc" --version | head -n1
+fi
+
+# salvar marca no db local (se adm-db disponível)
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db add --name gcc --version "${VERSION:-unknown}" --file "${DESTDIR}" --category toolchain || true
+fi
+
+echo "[adm-hook stage1 post-install] concluído."
+exit 0
