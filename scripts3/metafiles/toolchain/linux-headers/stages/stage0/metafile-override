@@ -1,0 +1,19 @@
+# Linux API Headers stage0 (bootstrap)
+PREFIX="/usr"
+
+# Sistema de construção é custom (não usa autotools, cmake, meson)
+BUILD_SYSTEM="custom"
+
+# Nenhuma dependência real além de tar e make
+BUILD_DEPS="make"
+RUN_DEPS=""
+
+# Flags e ambiente mínimos (toolchain cruzado opcional)
+ENV_STAGE0="
+PATH=/tools/bin:/usr/bin:/bin
+LC_ALL=C
+"
+
+# Marcação de bootstrap
+STAGE_ROLE="kernel-headers"
+BOOTSTRAP_ROLE="toolchain-bootstrap"
