@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# post-install (glibc stage1) — ajustes após make install dentro do DESTDIR
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+LFS="${LFS:-${DESTDIR}}"
+
+echo "[glibc stage1 post-install] ajustes pós-instalação em ${DESTDIR}..."
+
+# fix ldd RTLDLIST ajuste (garantir que ldd funcione no ambiente)
+if [ -f "${LFS}/usr/bin/ldd" ]; then
+  echo "[adm-hook] aplicando sed em ldd (remover /usr de RTLDLIST se presente)"
+  sed '/RTLDLIST=/s@/usr@@g' -i "${LFS}/usr/bin/ldd" || true
+fi
+
+# criar nsswitch.conf em /etc dentro do DESTDIR (recomendado pelo LFS)
+if [ ! -f "${DESTDIR}/etc/nsswitch.conf" ]; then
+  echo "[adm-hook] criando ${DESTDIR}/etc/nsswitch.conf"
+  mkdir -p "${DESTDIR}/etc"
+  cat > "${DESTDIR}/etc/nsswitch.conf" <<'EOF'
+# Begin /etc/nsswitch.conf
+passwd: files
+group: files
+shadow: files
+
+hosts: files dns
+networks: files
+
+protocols: files
+services: files
+ethers: files
+rpc: files
+# End /etc/nsswitch.conf
+EOF
+fi
+
+# tocar /etc/ld.so.conf se ainda não existe (evitar warning)
+if [ ! -f "${DESTDIR}/etc/ld.so.conf" ]; then
+  : > "${DESTDIR}/etc/ld.so.conf"
+fi
+
+# (Opcional) instalar um conjunto mínimo de locales necessários para testes — execute somente se requisitado
+if [ "${INSTALL_MINIMAL_LOCALES:-0}" -eq 1 ]; then
+  echo "[adm-hook] instalando locais mínimos..."
+  chroot "${DESTDIR}" /usr/sbin/localedef -i C -f UTF-8 C.UTF-8 || true
+  chroot "${DESTDIR}" /usr/sbin/localedef -i en_US -f UTF-8 en_US.UTF-8 || true
+fi
+
+# registrar status no adm-db se disponível
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db add --name glibc --version "${VERSION:-unknown}" --file "${DESTDIR}" --category toolchain || true
+fi
+
+echo "[glibc stage1 post-install] concluído."
+exit 0
