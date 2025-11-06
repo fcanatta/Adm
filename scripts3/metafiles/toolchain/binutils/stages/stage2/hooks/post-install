@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage2 post-install] verificando linker final..."
+"${DESTDIR}/usr/bin/ld" --version | head -n1
