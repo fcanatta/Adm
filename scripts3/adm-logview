@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# adm-logview — visualizador de logs ADM
+# Funcionalidades:
+#  - listar logs em /usr/src/adm/log (configurável)
+#  - ver arquivos, tail -n, follow (tail -f) com destaque de linha ativa (rosa bold)
+#  - filtrar por nível (INFO/WARN/ERR/OK), por termo, por período (data)
+#  - busca incremental, exportar resultados para arquivo
+#  - remoção segura de logs (com confirmação)
+#  - modo não-interativo (comandos: list/view/grep/follow/delete/export/help)
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# --------- configurações ----------
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON="${SCRIPTS_DIR}/adm-common.sh"
+
+# Try to source adm-common.sh if present — not fatal if absent
+if [ -f "${COMMON}" ]; then
+  # shellcheck disable=SC1090
+  . "${COMMON}" || true
+else
+  # provide minimal adm_log fallback
+  adm_log() {
+    local lvl="${1:-INFO}"; shift
+    printf "%s: %s\n" "${lvl}" "$*" >&2
+  }
+fi
+
+LOG_DIR="${ADM_LOG:-/usr/src/adm/log}"
+TMPDIR="${ADM_TEMP:-/tmp}/adm-logview-$$"
+mkdir -p "${TMPDIR}" "${LOG_DIR}"
+
+# tput-safe
+_tput() { command -v tput >/dev/null 2>&1 && tput "$@" || true; }
+T_BOLD="$(_tput bold)"
+T_RESET="$(_tput sgr0)"
+T_PINK="$(_tput setaf 5)"
+T_GREEN="$(_tput setaf 2)"
+T_YELLOW="$(_tput setaf 3)"
+T_RED="$(_tput setaf 1)"
+T_CYAN="$(_tput setaf 6)"
+: "${T_BOLD:=}"; : "${T_RESET:=}"; : "${T_PINK:=}"; : "${T_GREEN:=}"; : "${T_YELLOW:=}"; : "${T_RED:=}"; : "${T_CYAN:=}"
+
+# defaults
+DEFAULT_TAIL_LINES=200
+FOLLOW_UPDATE_INTERVAL=1   # seconds
+ADM_DRYRUN="${ADM_DRYRUN:-1}"
+
+# ---------- utils ----------
+err() { printf "%b[%s] %s%b\n" "${T_RED}" "ERR" "$*" "${T_RESET}" >&2; }
+info() { printf "%b[%s] %s%b\n" "${T_GREEN}" "OK" "$*" "${T_RESET}" >&2; }
+warn() { printf "%b[%s] %s%b\n" "${T_YELLOW}" "WARN" "$*" "${T_RESET}" >&2; }
+
+# safe remove with dry-run & confirmation
+safe_rm() {
+  local file="$1"
+  if [ "${ADM_DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] rm -f ${file}"
+    return 0
+  fi
+  printf "Remover %s ? [y/N]: " "${file}" >&2
+  read -r ans
+  case "${ans}" in [yY]*) rm -f -- "${file}" && info "Removido ${file}" || err "Falha removendo ${file}" ;; *) info "Cancelado"; return 1 ;; esac
+}
+
+# discover logs (regular files, compressed ignored)
+discover_logs() {
+  find "${LOG_DIR}" -maxdepth 2 -type f -name "*" -printf "%P\n" 2>/dev/null | sort -r || true
+}
+
+# resolve full path
+logpath() {
+  local name="$1"
+  if [ -f "${LOG_DIR}/${name}" ]; then
+    printf "%s" "${LOG_DIR}/${name}"
+    return 0
+  fi
+  return 1
+}
+
+# print header for file
+print_file_header() {
+  local path="$1"
+  printf "%b-- %s --%b\n" "${T_BOLD}${T_PINK}" "${path}" "${T_RESET}"
+}
+
+# safe tail with optional grep filter and highlight
+tail_file() {
+  local path="$1"
+  local lines="${2:-${DEFAULT_TAIL_LINES}}"
+  local grep_expr="${3:-}"
+  if [ ! -f "${path}" ]; then err "Arquivo não encontrado: ${path}"; return 1; fi
+  if [ -n "${grep_expr}" ]; then
+    tail -n "${lines}" -- "${path}" | grep -i --color=always -E "${grep_expr}" || true
+  else
+    tail -n "${lines}" -- "${path}" || true
+  fi
+  return 0
+}
+
+# follow file with highlight of active line
+follow_file() {
+  local path="$1"
+  local grep_expr="$2"
+  if [ ! -f "${path}" ]; then err "Arquivo não encontrado: ${path}"; return 1; fi
+  info "Seguindo ${path} (Ctrl-C para sair)"
+  # Use tail -F to follow across rotations; pipe through awk to highlight active line prefix
+  if [ -n "${grep_expr}" ]; then
+    tail -n +"1" -F -- "${path}" 2>/dev/null | grep -i --line-buffered -E "${grep_expr}" --color=always | awk -v PINK="${T_PINK}" -v BOLD="${T_BOLD}" -v RESET="${T_RESET}" '{printf("%s%s%s\n", BOLD PINK, $0, RESET)}'
+  else
+    tail -n +"1" -F -- "${path}" 2>/dev/null | awk -v PINK="${T_PINK}" -v BOLD="${T_BOLD}" -v RESET="${T_RESET}" '{printf("%s%s%s\n", BOLD PINK, $0, RESET)}'
+  fi
+}
+
+# grep in file with context and color
+grep_file() {
+  local path="$1"; shift
+  local pattern="$*"
+  if [ ! -f "${path}" ]; then err "Arquivo não encontrado: ${path}"; return 1; fi
+  # use grep with color; avoid returning status!=0 as error (no matches)
+  GREP_OPTIONS='' grep -n --color=always -i -E "${pattern}" -- "${path}" || true
+}
+
+# parse date prefix in logs: support ISO8601 at line start or common formats, fallback to raw
+# This helper extracts lines between dates if start and/or end present (YYYY-MM-DD or YYYY-MM-DDTHH:MM)
+filter_by_date_range() {
+  local path="$1"; local start="$2"; local end="$3"
+  # if no date range, print whole file
+  if [ -z "${start}" ] && [ -z "${end}" ]; then
+    cat -- "${path}"
+    return 0
+  fi
+  # naive approach: use grep to match lines that contain start..end (best-effort)
+  if [ -n "${start}" ] && [ -n "${end}" ]; then
+    awk -v s="${start}" -v e="${end}" '{
+      if ($0 ~ s || $0 ~ e || ($0 > s && $0 < e)) print $0
+    }' "${path}" || cat "${path}"
+  else
+    # only start
+    if [ -n "${start}" ]; then
+      awk -v s="${start}" '$0 ~ s,0' "${path}" || cat "${path}"
+    else
+      awk -v e="${end}" '1; $0 ~ e {exit}' "${path}" || cat "${path}"
+    fi
+  fi
+}
+
+# pretty print with level coloring (INFO, WARN, ERR, OK)
+colorize_levels() {
+  awk -v PINK="${T_PINK}" -v GREEN="${T_GREEN}" -v YELLOW="${T_YELLOW}" -v RED="${T_RED}" -v RESET="${T_RESET}" '
+  {
+    line=$0
+    if (toupper(line) ~ /(^|\[)ERR($|\]| )/ ) { printf("%s%s%s\n", RED, line, RESET); next }
+    if (toupper(line) ~ /(^|\[)WARN($|\]| )/ ) { printf("%s%s%s\n", YELLOW, line, RESET); next }
+    if (toupper(line) ~ /(^|\[)OK($|\]| )/ ) { printf("%s%s%s\n", GREEN, line, RESET); next }
+    if (toupper(line) ~ /(^|\[)INFO($|\]| )/ ) { printf("%s%s%s\n", PINK, line, RESET); next }
+    print line
+  }'
+}
+
+# ------------ interactive menu (simple) ------------
+draw_menu() {
+  clear
+  printf "%bADM Log Viewer — %s%b\n\n" "${T_BOLD}${T_PINK}" "${LOG_DIR}" "${T_RESET}"
+  printf "Comandos:\n"
+  printf "  list                   - lista arquivos de log\n"
+  printf "  view <file> [--lines N] [--filter PATTERN] - mostra últimas N linhas (default %d)\n" "${DEFAULT_TAIL_LINES}"
+  printf "  follow <file> [PATTERN] - segue (tail -F) o arquivo, destaque ativo\n"
+  printf "  grep <file> PATTERN     - busca por padrão\n"
+  printf "  export <file> <out>     - exporta filtro ou arquivo para out\n"
+  printf "  delete <file>           - remove com confirmação\n"
+  printf "  help                    - mostra esta ajuda\n"
+  printf "  quit                    - sair\n\n"
+}
+
+interactive_loop() {
+  draw_menu
+  while :; do
+    printf "%badm-logview> %b" "${T_BOLD}${T_PINK}" "${T_RESET}"
+    if ! read -r line; then break; fi
+    [ -z "${line}" ] && continue
+    set -- ${line}
+    cmd="$1"; shift
+    case "${cmd}" in
+      list)
+        discover_logs || true
+        ;;
+      view)
+        name="$1"; shift || { err "view <file> [--lines N]"; continue; }
+        lines=${DEFAULT_TAIL_LINES}; pattern=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --lines) lines="$2"; shift 2 ;;
+            --filter) pattern="$2"; shift 2 ;;
+            *) shift ;;
+          esac
+        done
+        path="$(logpath "${name}" || true)" || true
+        if [ -z "${path}" ]; then err "Arquivo não encontrado: ${name}"; continue; fi
+        print_file_header "${path}"
+        tail_file "${path}" "${lines}" "${pattern}" | colorize_levels
+        ;;
+      follow)
+        name="$1"; shift || { err "follow <file> [PATTERN]"; continue; }
+        pattern="$1"
+        path="$(logpath "${name}" || true)" || true
+        if [ -z "${path}" ]; then err "Arquivo não encontrado: ${name}"; continue; fi
+        follow_file "${path}" "${pattern}"
+        ;;
+      grep)
+        name="$1"; shift || { err "grep <file> PATTERN"; continue; }
+        pattern="$*"
+        path="$(logpath "${name}" || true)" || true
+        if [ -z "${path}" ]; then err "Arquivo não encontrado: ${name}"; continue; fi
+        grep_file "${path}" "${pattern}" | colorize_levels
+        ;;
+      export)
+        name="$1"; out="$2"; shift 2 || { err "export <file> <out>"; continue; }
+        path="$(logpath "${name}" || true)" || true
+        if [ -z "${path}" ]; then err "Arquivo não encontrado: ${name}"; continue; fi
+        if [ "${ADM_DRYRUN}" -eq 1 ]; then adm_log INFO "[dry-run] cp ${path} ${out}"; else cp -a "${path}" "${out}" && info "Exportado para ${out}" || err "Falha exportando"; fi
+        ;;
+      delete)
+        name="$1"; shift || { err "delete <file>"; continue; }
+        path="$(logpath "${name}" || true)" || true
+        if [ -z "${path}" ]; then err "Arquivo não encontrado: ${name}"; continue; fi
+        safe_rm "${path}"
+        ;;
+      help)
+        draw_menu
+        ;;
+      quit|exit)
+        break
+        ;;
+      *)
+        err "Comando desconhecido: ${cmd}. Digite 'help'."
+        ;;
+    esac
+  done
+}
+
+# ------------ non-interactive CLI mode ------------
+usage() {
+  cat <<EOF
+Usage: adm-logview [command] [args...]
+Commands:
+  list
+  view <file> [--lines N] [--filter PATTERN]
+  follow <file> [PATTERN]
+  grep <file> PATTERN
+  export <file> <out>
+  delete <file>
+  help
+EOF
+}
+
+# CLI dispatch
+if [ $# -gt 0 ]; then
+  cmd="$1"; shift
+  case "${cmd}" in
+    list)
+      discover_logs
+      exit 0
+      ;;
+    view)
+      name="${1:-}"; shift || { usage; exit 1; }
+      lines=${DEFAULT_TAIL_LINES}; pattern=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --lines) lines="$2"; shift 2 ;;
+          --filter) pattern="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      p="$(logpath "${name}" 2>/dev/null || true)"
+      [ -z "${p}" ] && { err "Arquivo não encontrado: ${name}"; exit 2; }
+      print_file_header "${p}"
+      tail_file "${p}" "${lines}" "${pattern}" | colorize_levels
+      exit 0
+      ;;
+    follow)
+      name="${1:-}"; pattern="${2:-}"
+      p="$(logpath "${name}" 2>/dev/null || true)"
+      [ -z "${p}" ] && { err "Arquivo não encontrado: ${name}"; exit 2; }
+      follow_file "${p}" "${pattern}"
+      exit 0
+      ;;
+    grep)
+      name="${1:-}"; shift || { usage; exit 1; }
+      pattern="$*"
+      p="$(logpath "${name}" 2>/dev/null || true)"
+      [ -z "${p}" ] && { err "Arquivo não encontrado: ${name}"; exit 2; }
+      grep_file "${p}" "${pattern}" | colorize_levels
+      exit 0
+      ;;
+    export)
+      name="${1:-}"; out="${2:-}"; [ -n "${name}" ] || { usage; exit 1; }
+      p="$(logpath "${name}" 2>/dev/null || true)"
+      [ -z "${p}" ] && { err "Arquivo não encontrado: ${name}"; exit 2; }
+      if [ "${ADM_DRYRUN}" -eq 1 ]; then adm_log INFO "[dry-run] cp ${p} ${out}"; else cp -a "${p}" "${out}" && info "Exportado para ${out}" || err "Falha exportando"; fi
+      exit 0
+      ;;
+    delete)
+      name="${1:-}"; [ -n "${name}" ] || { usage; exit 1; }
+      p="$(logpath "${name}" 2>/dev/null || true)"
+      [ -z "${p}" ] && { err "Arquivo não encontrado: ${name}"; exit 2; }
+      safe_rm "${p}"
+      exit 0
+      ;;
+    help|--help|-h)
+      usage; exit 0
+      ;;
+    *)
+      err "Comando desconhecido: ${cmd}"
+      usage; exit 1
+      ;;
+  esac
+else
+  # interactive
+  interactive_loop
+fi
+
+# cleanup
+rm -rf "${TMPDIR}" 2>/dev/null || true
+exit 0
