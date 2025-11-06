@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# post-build (stage1) — valida construído antes do install
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[adm-hook stage1 post-build] verificações básicas..."
+
+# verificar que compilador de stage1 foi gerado (xgcc/xg++)
+if [ -x "${WORKDIR}/build/gcc/xgcc" ] || command -v x86_64-pc-linux-gnu-gcc >/dev/null 2>&1; then
+  echo "[adm-hook] compilador stage1 presente."
+else
+  echo "[adm-hook] WARN: compilador stage1 não detectado; a build pode falhar." >&2
+fi
+
+# (opcional) executar alguns testes rápidos se houver tempo
+# evitar testes longos por padrão; o adm-build chama 'check' se configurado
+
+exit 0
