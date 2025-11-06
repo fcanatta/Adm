@@ -1,0 +1,14 @@
+# Metafile override para GCC - stage1 (GCC Pass 2)
+# Usado pelo adm-build/adn-bootstrap quando ADM_STAGE=stage1
+
+PREFIX="/usr"
+# dependências essenciais para este stage (dev headers e toolchain mínimo devem existir)
+BUILD_DEPS="binutils gmp mpfr mpc glibc linux-headers"
+RUN_DEPS="glibc"
+OPT_DEPS="isl"
+
+# sinaliza que este stage espera construir linguagens e libs padrão
+BUILD_LANGS="c,c++"
+# opções detectáveis pelo adm-build; adm-build escolherá pipeline automático
+# extras (se adm-build aplicar CONFIGURE_ARGS a partir do metafile-override)
+CONFIGURE_EXTRAS="--enable-languages=c,c++ --enable-shared --enable-threads=posix --enable-__cxa_atexit --disable-multilib --with-system-zlib"
