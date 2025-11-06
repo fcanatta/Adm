@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# firefox post-update-system — aplica atualização completa do Firefox
+# $1 = WORKDIR (temporário)
+# $2 = DESTDIR (raiz de instalação)
+set -euo pipefail
+
+WORKDIR="${1:-/usr/src/adm/temp/firefox-update}"
+DESTDIR="${2:-/usr/src/adm/destdir}"
+UPDATE_FILE="/usr/src/adm/update/browser/firefox/metafile"
+
+log() { printf "\033[1;35m[firefox post-update-system]\033[0m %s\n" "$*"; }
+notify() {
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "ADM Firefox Update" "$1" "$2"
+  else
+    log "Notificação: $1 — $2"
+  fi
+}
+
+log "Iniciando atualização automatizada do Firefox..."
+[ -f "${UPDATE_FILE}" ] || { log "ERRO: metafile de update não encontrado."; exit 1; }
+
+# Carregar variáveis do metafile
+# shellcheck disable=SC1090
+source "${UPDATE_FILE}"
+
+NAME="${NAME:-firefox}"
+NEW_VERSION="${NEW_VERSION:-unknown}"
+SOURCE_URL="${SOURCE_URL:-}"
+CHECKSUM="${CHECKSUM:-}"
+CATEGORY="${CATEGORY:-browser}"
+
+[ "${NEW_VERSION}" = "unknown" ] && { log "ERRO: versão nova inválida."; exit 1; }
+
+notify "Atualizando Firefox" "Versão nova: ${NEW_VERSION}"
+
+# Criar ambiente de trabalho
+mkdir -pv "${WORKDIR}"
+cd "${WORKDIR}"
+
+# 1️⃣ Baixar nova versão
+log "Baixando pacote ${SOURCE_URL}..."
+if ! curl -fL "${SOURCE_URL}" -o "firefox-${NEW_VERSION}.tar.xz"; then
+  log "ERRO: Falha ao baixar o tarball."
+  notify "Erro na atualização" "Falha ao baixar ${SOURCE_URL}"
+  exit 1
+fi
+
+# 2️⃣ Verificar checksum
+log "Verificando checksum SHA256..."
+DL_SUM="$(sha256sum "firefox-${NEW_VERSION}.tar.xz" | awk '{print $1}')"
+if [ -n "${CHECKSUM}" ] && [ "${CHECKSUM}" != "${DL_SUM}" ]; then
+  log "ERRO: checksum incorreto!"
+  notify "Falha de verificação" "SHA256 não confere."
+  exit 1
+fi
+
+# 3️⃣ Extrair e construir com adm-build
+log "Extraindo fonte..."
+tar -xf "firefox-${NEW_VERSION}.tar.xz"
+SRC_DIR="$(find . -maxdepth 1 -type d -name 'firefox*' | head -n1)"
+[ -n "${SRC_DIR}" ] || { log "ERRO: diretório fonte não encontrado após extração."; exit 1; }
+
+log "Chamando adm-build para construir nova versão..."
+if command -v adm-build >/dev/null 2>&1; then
+  adm-build --metafile "/usr/src/adm/metafiles/browser/firefox/metafile" \
+            --chroot "${CHROOT_PATH:-}" \
+            --destdir "${DESTDIR}" \
+            --no-dry-run || {
+    log "ERRO: falha ao construir com adm-build."
+    notify "Falha na compilação" "Erro ao executar adm-build para Firefox ${NEW_VERSION}"
+    exit 1
+  }
+else
+  log "ERRO: adm-build não encontrado."
+  exit 1
+fi
+
+# 4️⃣ Instalar e executar hooks de integração
+log "Executando integração pós-instalação..."
+HOOK_SYS="/usr/src/adm/metafiles/browser/firefox/hooks/post-install-system"
+if [ -x "${HOOK_SYS}" ]; then
+  "${HOOK_SYS}" "${WORKDIR}" "${DESTDIR}"
+else
+  log "Aviso: hook post-install-system não encontrado ou não executável."
+fi
+
+# 5️⃣ Atualizar adm-db
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db update --name "${NAME}" --version "${NEW_VERSION}" --category "${CATEGORY}" || true
+fi
+
+# 6️⃣ Limpar versões antigas
+OLD_DIR="${DESTDIR}/usr/lib/firefox-old"
+if [ -d "${OLD_DIR}" ]; then
+  log "Removendo versão anterior..."
+  rm -rfv "${OLD_DIR}" || true
+fi
+
+# 7️⃣ Registrar no update log
+mkdir -pv "/usr/src/adm/log"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Firefox atualizado para ${NEW_VERSION}" >> "/usr/src/adm/log/adm-update.log"
+
+# 8️⃣ Notificação visual final
+notify "Firefox atualizado com sucesso" "Nova versão instalada: ${NEW_VERSION}"
+
+log "Atualização do Firefox concluída com sucesso."
+exit 0
