@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage0 post-install] gerando header limits.h para bootstrap..."
+
+cd "${WORKDIR}"
+cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
+  "$(dirname $($LFS_TGT-gcc -print-libgcc-file-name))"/include/limits.h
+
+echo "[stage0 post-install] GCC Pass 1 concluído."
