@@ -1,0 +1,37 @@
+# Metafile override para Glibc stage0 (bootstrap / cross-toolchain)
+# Usado automaticamente pelo adm-build quando ADM_STAGE=stage0
+
+PREFIX="/tools"
+
+# Este é um build cruzado — o host é o sistema que está compilando,
+# e o target é o sistema sendo construído (definido por $LFS_TGT)
+BUILD_SYSTEM="autotools"
+CROSS_COMPILE="yes"
+
+# Dependências mínimas (o ambiente ainda não tem biblioteca C funcional)
+BUILD_DEPS="linux-headers binutils gcc"
+RUN_DEPS=""
+
+# Parâmetros adicionais para o configure
+# (o adm-build detecta autotools e aplica estes extras automaticamente)
+CONFIGURE_EXTRAS="
+--host=\${LFS_TGT}
+--build=\$(../scripts/config.guess)
+--prefix=/usr
+--disable-nscd
+libc_cv_slibdir=/usr/lib
+--enable-kernel=5.4
+"
+
+# Ambiente específico do stage0
+# (o adm-build injeta estas variáveis no ambiente antes do configure)
+ENV_STAGE0="
+CC=\${LFS_TGT}-gcc
+CXX=\${LFS_TGT}-g++
+AR=\${LFS_TGT}-ar
+RANLIB=\${LFS_TGT}-ranlib
+"
+
+# Flag para o adm-build registrar que este pacote é parte do toolchain bootstrap
+BOOTSTRAP_ROLE="c-library"
+STAGE_ROLE="bootstrap"
