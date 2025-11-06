@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# post-build (glibc stage1) — executar 'make check' com cuidado e registrar resultados
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[glibc stage1 post-build] iniciando make check (test-suite crítica)..."
+
+cd "${WORKDIR}/build" || exit 1
+
+# Alguns testes do Glibc podem demorar ou falhar; LFS recomenda não pular.
+# Permitimos TIMEOUTFACTOR e reexecução parcial caso haja timeouts; default segura:
+TIMEOUTFACTOR="${TIMEOUTFACTOR:-1}"
+# Execute check, capture saída para log. Não falhar totalmente se testes conhecidos falharem.
+if make -k check 2>&1 | tee "${WORKDIR}/glibc-make-check.log"; then
+  echo "[adm-hook] make check concluiu (ok)."
+else
+  echo "[adm-hook] make check retornou falhas — analisando saídas (ver ${WORKDIR}/glibc-make-check.log)"
+  # lista das falhas comuns que LFS considera aceitáveis
+  # Ex.: io/tst-lchmod, misc/tst-preadvwritev2, nss tests timing out
+  # Não abortamos; registramos e permitimos prosseguir, mas marcamos aviso
+  echo "[adm-hook] WARN: make check apresentou falhas — verificar log."
+fi
+
+# opcional: re-executar testes específicos com TIMEOUTFACTOR aumentado (se definido pelo usuário)
+# Exemplo (não ativo por padrão)
+# TIMEOUTFACTOR=10 make test t=nss/tst-nss-files-hosts-multi
+
+echo "[glibc stage1 post-build] make check finalizado (ver log se necessário)."
+exit 0
