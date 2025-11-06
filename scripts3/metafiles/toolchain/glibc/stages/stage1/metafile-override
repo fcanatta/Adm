@@ -1,0 +1,21 @@
+# Glibc stage1 (Glibc full build inside chroot/rootfs)
+PREFIX="/usr"
+BUILD_SYSTEM="autotools"
+
+# Dependências para stage1 (garantidas pelo adm-resolver)
+BUILD_DEPS="gcc make texinfo linux-headers"
+RUN_DEPS="glibc"
+OPT_DEPS=""
+
+# Extras de configure (adm-build deverá concatenar com os defaults)
+# Baseado nas recomendações do LFS: --prefix=/usr --disable-werror --disable-nscd libc_cv_slibdir=/usr/lib --enable-stack-protector=strong --enable-kernel=5.4
+CONFIGURE_EXTRAS="
+--prefix=/usr
+--disable-werror
+--disable-nscd
+libc_cv_slibdir=/usr/lib
+--enable-stack-protector=strong
+--enable-kernel=5.4
+"
+# Marca semântica para o bootstrap/orquestrador
+STAGE_ROLE="system-c-library"
