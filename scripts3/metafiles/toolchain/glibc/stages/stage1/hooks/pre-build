@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# pre-build (glibc stage1) — preparar build dir e fonte antes do configure
+# argumentos: $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[glibc stage1 pre-build] workdir=${WORKDIR} destdir=${DESTDIR}"
+
+# garantir diretório de build separado
+mkdir -p "${WORKDIR}/build"
+cd "${WORKDIR}/build" || exit 1
+
+# assegura que /etc/ld.so.conf exista no chroot para evitar avisos no make install
+# (no staging criamos o arquivo dentro do DESTDIR; adm-install tratará instalação final)
+if [ ! -f "${DESTDIR}/etc/ld.so.conf" ]; then
+  echo "[adm-hook] criando ${DESTDIR}/etc/ld.so.conf (evitar warning durante install)"
+  mkdir -p "$(dirname "${DESTDIR}/etc/ld.so.conf")"
+  : > "${DESTDIR}/etc/ld.so.conf"
+fi
+
+# LFS: evitar teste de instalação que falha em builds modernos:
+# aplica sed para alterar Makefile *antes* de executar 'make check'/'make install' quando necessário
+if [ -f "${WORKDIR}/../Makefile" ]; then
+  echo "[adm-hook] ajustando Makefile para pular test-installation check se necessário"
+  sed '/test-installation/s@$(PERL)@echo not running@' -i "${WORKDIR}/../Makefile" || true
+fi
+
+# Exportar variáveis seguras (adm-build / profiles podem sobrescrever)
+export CFLAGS="${CFLAGS:--O2 -g}"
+export LDFLAGS="${LDFLAGS:--Wl,-O1}"
+export LANG="${LANG:-C.UTF-8}"
+
+echo "[glibc stage1 pre-build] pronto."
+exit 0
