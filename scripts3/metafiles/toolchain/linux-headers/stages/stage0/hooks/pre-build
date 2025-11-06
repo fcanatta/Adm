@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# linux-headers stage0 pre-build — preparação antes de instalar cabeçalhos
+# Argumentos: $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[linux-headers stage0 pre-build] preparando diretório de build..."
+
+cd "${WORKDIR}" || exit 1
+
+# Garantir que a árvore está limpa (make mrproper)
+echo "[adm-hook] executando make mrproper..."
+make mrproper > "${WORKDIR}/make-mrproper.log" 2>&1
+
+echo "[linux-headers stage0 pre-build] pronto para gerar headers."
