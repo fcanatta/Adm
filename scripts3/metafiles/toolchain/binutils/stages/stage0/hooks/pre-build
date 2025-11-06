@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage0 pre-build] preparando ambiente inicial de bootstrap..."
+
+export PATH="/usr/bin:/bin"
+export CC=gcc
+export AR=ar
+export RANLIB=ranlib
+
+mkdir -p "${DESTDIR}/tools"
+echo "[stage0 pre-build] ambiente inicial preparado."
