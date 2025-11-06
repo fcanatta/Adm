@@ -1,0 +1,44 @@
+Submitted By:            Ken Moffat <ken@linuxfromscratch.org>
+Date:                    2024-02-02
+Initial Package Version: 2.42
+Origin:                  Upstream + LFS modifications
+Upstream Status:         Not submitted
+Description:             This patch modifies the installation paths of certain
+                         programs to conform to the Filesystem Hierarchy Standard
+                         (FHS). It relocates binaries like 'ldconfig', 'sln',
+                         and 'rpcgen' into /usr/sbin, and ensures compatibility
+                         during cross-toolchain bootstrap.
+
+diff -Naur glibc-2.42.orig/Makeconfig glibc-2.42/Makeconfig
+--- glibc-2.42.orig/Makeconfig  2024-02-02 10:15:00.000000000 +0000
++++ glibc-2.42/Makeconfig       2024-02-02 10:15:00.000000000 +0000
+@@ -100,7 +100,7 @@
+ 
+ # Directory for sbin programs, etc.
+ # Normally this should be $(exec_prefix)/sbin, but we want to conform to FHS.
+-sbindir = $(exec_prefix)/sbin
++sbindir = /usr/sbin
+
+ # The `rootsbindir' variable is used by Makefiles which install programs
+ # that are needed while bootstrapping the system.
+diff -Naur glibc-2.42.orig/Makefile glibc-2.42/Makefile
+--- glibc-2.42.orig/Makefile    2024-02-02 10:15:00.000000000 +0000
++++ glibc-2.42/Makefile         2024-02-02 10:15:00.000000000 +0000
+@@ -105,7 +105,7 @@
+ # These programs are installed in /sbin on some systems, but according to the
+ # FHS they belong in /usr/sbin.  We install them in /usr/sbin for consistency.
+ ifndef rootsbindir
+-rootsbindir = $(sbindir)
++rootsbindir = /usr/sbin
+ endif
+
+diff -Naur glibc-2.42.orig/sunrpc/Makefile glibc-2.42/sunrpc/Makefile
+--- glibc-2.42.orig/sunrpc/Makefile  2024-02-02 10:15:00.000000000 +0000
++++ glibc-2.42/sunrpc/Makefile       2024-02-02 10:15:00.000000000 +0000
+@@ -12,7 +12,7 @@
+ # The `rpcgen' program is installed in /usr/bin by default, but FHS recommends
+ # administrative binaries go to /usr/sbin.
+ ifndef rootsbindir
+-rootsbindir = $(bindir)
++rootsbindir = /usr/sbin
+ endif
