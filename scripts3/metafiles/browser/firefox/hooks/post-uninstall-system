@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# firefox post-uninstall-system — remoção limpa e atualização dos caches
+# $1 = WORKDIR (não usado), $2 = DESTDIR (raiz onde firefox estava instalado)
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/}}"
+
+log() { printf '[firefox post-uninstall-system] %s\n' "$*"; }
+
+log "Iniciando limpeza de integração do Firefox em ${DESTDIR}..."
+
+# Caminhos de referência
+BIN_LINK="${DESTDIR}/usr/bin/firefox"
+APP_FILE="${DESTDIR}/usr/share/applications/firefox.desktop"
+ICON_FILE="${DESTDIR}/usr/share/icons/hicolor/128x128/apps/firefox.png"
+FIREFOX_DIR="${DESTDIR}/usr/lib/firefox"
+UPDATE_FILE="/usr/src/adm/update/browser/firefox/metafile"
+
+# 🔗 Remover link simbólico
+if [ -L "${BIN_LINK}" ]; then
+  rm -fv "${BIN_LINK}"
+  log "Link simbólico /usr/bin/firefox removido."
+elif [ -f "${BIN_LINK}" ]; then
+  rm -fv "${BIN_LINK}"
+  log "Arquivo /usr/bin/firefox removido (não era link)."
+else
+  log "Nenhum link/arquivo /usr/bin/firefox encontrado."
+fi
+
+# 🗂️ Remover arquivo .desktop
+if [ -f "${APP_FILE}" ]; then
+  rm -fv "${APP_FILE}"
+  log "Arquivo .desktop removido."
+else
+  log "Nenhum arquivo .desktop encontrado."
+fi
+
+# 🖼️ Remover ícone
+if [ -f "${ICON_FILE}" ]; then
+  rm -fv "${ICON_FILE}"
+  log "Ícone firefox.png removido."
+else
+  log "Nenhum ícone encontrado em ${ICON_FILE}."
+fi
+
+# 🧹 Remover diretório do Firefox (se sobrou algo e não é compartilhado)
+if [ -d "${FIREFOX_DIR}" ]; then
+  log "Removendo diretório de instalação residual..."
+  rm -rfv "${FIREFOX_DIR}" || true
+fi
+
+# 🔄 Atualizar caches (desktop/mime/icons)
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "${DESTDIR}/usr/share/applications" || true
+fi
+if command -v update-mime-database >/dev/null 2>&1; then
+  update-mime-database "${DESTDIR}/usr/share/mime" || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -qf "${DESTDIR}/usr/share/icons/hicolor" || true
+fi
+
+# 🧾 Remover do adm-db (registro)
+if command -v adm-db >/dev/null 2>&1; then
+  log "Removendo registro do Firefox do adm-db..."
+  adm-db remove --name firefox --category browser || true
+fi
+
+# 🆙 Remover metafile de atualização
+if [ -f "${UPDATE_FILE}" ]; then
+  rm -fv "${UPDATE_FILE}"
+  log "Metafile de atualização removido (${UPDATE_FILE})."
+fi
+
+log "Limpeza de integração do Firefox concluída com sucesso."
+exit 0
