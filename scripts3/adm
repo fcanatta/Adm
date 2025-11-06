@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+# adm — CLI principal do ADM (parte 1/4)
+# Inicialização, config global, helpers, verificação de scripts ADM
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# local do script e paths padrão
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON="${SCRIPTS_DIR}/adm-common.sh"
+
+if [ ! -f "${COMMON}" ]; then
+  echo "ERRO: adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# Paths principais (podem ser sobrescritos por adm-common vars)
+: "${ADM_SCRIPTS:=${SCRIPTS_DIR}}"
+: "${ADM_METAFILES:=${ADM_METAFILES:-/usr/src/adm/metafiles}}"
+: "${ADM_PACKAGES:=${ADM_PACKAGES:-/usr/src/adm/packages}}"
+: "${ADM_DB:=${ADM_DB:-/usr/src/adm/db}}"
+: "${ADM_TEMP:=${ADM_TEMP:-/tmp}}"
+: "${ADM_LOG:=${ADM_LOG:-/usr/src/adm/log}}"
+
+# Sub-command scripts mapping
+declare -A ADM_BINMAP=(
+  [build]="${ADM_SCRIPTS}/adm-build"
+  [install]="${ADM_SCRIPTS}/adm-install"
+  [uninstall]="${ADM_SCRIPTS}/adm-uninstall"
+  [update]="${ADM_SCRIPTS}/adm-update"
+  [db]="${ADM_SCRIPTS}/adm-db"
+  [diagnose]="${ADM_SCRIPTS}/adm-diagnose"
+  [bootstrap]="${ADM_SCRIPTS}/adm-bootstrap"
+  [chroot]="${ADM_SCRIPTS}/adm-chroot"
+  [clean]="${ADM_SCRIPTS}/adm-clean"
+  [download]="${ADM_SCRIPTS}/adm-download"
+  [patch]="${ADM_SCRIPTS}/adm-patch"
+  [hooks]="${ADM_SCRIPTS}/adm-hooks"
+  [detect]="${ADM_SCRIPTS}/adm-detect"
+  [resolver]="${ADM_SCRIPTS}/adm-resolver"
+  [env]="${ADM_SCRIPTS}/adm-env"
+)
+
+# color fallbacks if adm-common didn't set
+: "${T_BOLD:=$(tput bold 2>/dev/null || printf '')}"
+: "${T_RESET:=$(tput sgr0 2>/dev/null || printf '')}"
+: "${T_PINK:=$(tput setaf 5 2>/dev/null || printf '')}"
+: "${T_GREEN:=$(tput setaf 2 2>/dev/null || printf '')}"
+: "${T_YELLOW:=$(tput setaf 3 2>/dev/null || printf '')}"
+: "${T_RED:=$(tput setaf 1 2>/dev/null || printf '')}"
+: "${T_CYAN:=$(tput setaf 6 2>/dev/null || printf '')}"
+
+# spinner utilities
+SPIN_PID=""
+start_spinner() {
+  local msg="$1"
+  printf "%s " "$msg"
+  ( local spin='|/-\' i=0
+    while :; do
+      printf "%b" "${spin:i%4:1}"
+      printf "\b"
+      i=$((i+1))
+      sleep 0.08
+    done ) &
+  SPIN_PID=$!
+  disown "${SPIN_PID}" 2>/dev/null || true
+}
+stop_spinner() {
+  if [ -n "${SPIN_PID}" ] && kill -0 "${SPIN_PID}" 2>/dev/null; then
+    kill "${SPIN_PID}" 2>/dev/null || true
+    wait "${SPIN_PID}" 2>/dev/null || true
+    SPIN_PID=""
+    printf " \n"
+  fi
+}
+
+# safe_exec: wrapper que registra, mostra spinner e retorna código
+# usage: safe_exec "label" cmd...
+safe_exec() {
+  local label="$1"; shift
+  adm_log INFO "EXEC: ${label}"
+  if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
+    adm_log INFO "[dry-run] $*"
+    return 0
+  fi
+  start_spinner "${T_PINK}${T_BOLD}${label}${T_RESET}"
+  set +e
+  "$@"
+  local rc=$?
+  set -e
+  stop_spinner
+  if [ "${rc}" -ne 0 ]; then
+    adm_log ERR "Comando retornou codigo ${rc}: ${label}"
+  else
+    adm_log OK "${label}"
+  fi
+  return "${rc}"
+}
+
+# highlight_line: print line highlighted as active (pink bold)
+highlight_line() {
+  local text="$1"
+  printf "%b%s%b\n" "${T_BOLD}${T_PINK}" "${text}" "${T_RESET}"
+}
+
+# ensure helper scripts exist and are executable
+check_required_scripts() {
+  local missing=0
+  for key in "${!ADM_BINMAP[@]}"; do
+    local path="${ADM_BINMAP[$key]}"
+    if [ ! -x "${path}" ]; then
+      adm_log WARN "Script ${key} ausente ou não executável: ${path}"
+      missing=1
+    fi
+  done
+  if [ "${missing}" -eq 1 ]; then
+    adm_log WARN "Alguns scripts ADM estão ausentes. Funções relacionadas podem falhar."
+  fi
+}
+
+# ensure directories
+mkdir -p "${ADM_TEMP}" "${ADM_LOG}" "${ADM_PACKAGES}" "${ADM_METAFILES}"
+
+# parse global flags for adm itself
+ADM_DRYRUN="${ADM_DRYRUN:-1}"   # por segurança, default dry-run
+ADM_FORCE="${ADM_FORCE:-0}"
+ADM_JOBS="${ADM_JOBS:-$(nproc || echo 1)}"
+ADM_CHROOT_ROOT="${ADM_CHROOT_ROOT:-}"
+
+# convenience: list all known commands
+adm_list_commands() {
+  printf "%s\n" "${!ADM_BINMAP[@]}" | sort
+}
+
+# helper: find metafile for identifier (wrap existing function if present)
+find_metafile_wrapper() {
+  local id="$1"
+  if command -v find_metafile_for >/dev/null 2>&1; then
+    find_metafile_for "${id}" 2>/dev/null || true
+    return
+  fi
+  # fallback: try standard location patterns
+  if [ -f "${ADM_METAFILES}/${id}/metafile" ]; then
+    printf "%s" "${ADM_METAFILES}/${id}/metafile"; return
+  fi
+  if [ -f "${id}" ] && grep -q '^NAME=' "${id}" 2>/dev/null; then
+    printf "%s" "${id}"; return
+  fi
+  return 1
+}
+
+# verify environment
+check_required_scripts
+# end of part 1
+# adm — parte 2/4
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- TUI: drawing helpers ----------
+draw_header() {
+  clear
+  printf "%b" "${T_BOLD}${T_PINK}"
+  printf "══════════════════════════════════════════════════════════════════\n"
+  printf "   ADM — Advanced Dependency Manager — Interactive Console\n"
+  printf "══════════════════════════════════════════════════════════════════\n"
+  printf "%b" "${T_RESET}"
+}
+
+draw_footer() {
+  printf "\n%b[?] Use números ou comandos. 'help' para ajuda. Ctrl-C para sair.%b\n" "${T_CYAN}" "${T_RESET}"
+}
+
+prompt_read() {
+  local prompt="$1"
+  printf "%b%s%b " "${T_BOLD}${T_PINK}" "${prompt}" "${T_RESET}"
+  read -r
+}
+
+# ---------- Search utilities ----------
+# adm_search <term> -> prints matches from adm-db, metafiles and package names
+adm_search() {
+  local term="$1"
+  adm_log INFO "Pesquisando por: ${term}"
+  # search in adm-db short list
+  if [ -x "${ADM_BINMAP[db]}" ]; then
+    "${ADM_BINMAP[db]}" list --format short 2>/dev/null | grep -i -- "${term}" || true
+  fi
+  # search in metafiles names and descriptions
+  if [ -d "${ADM_METAFILES}" ]; then
+    find "${ADM_METAFILES}" -type f -name "metafile" -print0 2>/dev/null | xargs -0 -n1 grep -i -E "NAME=|DESCRIPTION=" 2>/dev/null | grep -i -- "${term}" || true
+  fi
+  # search in update candidates
+  if [ -d "${ADM_UPDATE:-/usr/src/adm/update}" ]; then
+    find "${ADM_UPDATE:-/usr/src/adm/update}" -type f -name metafile -exec grep -H "NAME=" {} \; 2>/dev/null | grep -i "${term}" || true
+  fi
+}
+
+# ---------- Info about a program ----------
+adm_info() {
+  local ident="$1"
+  adm_log INFO "Coletando informações de: ${ident}"
+  # try adm-db query
+  if [ -x "${ADM_BINMAP[db]}" ]; then
+    printf "%b-- DB Info --%b\n" "${T_BOLD}${T_CYAN}" "${T_RESET}"
+    "${ADM_BINMAP[db]}" query "${ident}" 2>/dev/null || true
+  fi
+  # show metafile if present
+  mf="$(find_metafile_wrapper "${ident}" || true)"
+  if [ -n "${mf}" ]; then
+    printf "%b-- Metafile --%b %s\n" "${T_BOLD}${T_CYAN}" "${T_RESET}" "${mf}"
+    sed -n '1,200p' "${mf}" 2>/dev/null || true
+  fi
+  # detect build system if detect script exists
+  if [ -x "${ADM_BINMAP[detect]}" ]; then
+    printf "%b-- Detect (build system) --%b\n" "${T_BOLD}${T_CYAN}" "${T_RESET}"
+    "${ADM_BINMAP[detect]}" "${mf:-${ident}}" 2>/dev/null || true
+  fi
+  # show update candidate info
+  updir="${ADM_UPDATE:-/usr/src/adm/update}"
+  if [ -d "${updir}" ]; then
+    idpath="$(echo "${ident}" | sed 's#/#/#g')"
+    for f in $(find "${updir}" -type f -name metafile 2>/dev/null); do
+      if grep -q "NAME=.*${ident##*/}" "${f}" 2>/dev/null; then
+        printf "%b-- Update candidate --%b %s\n" "${T_BOLD}${T_CYAN}" "${T_RESET}" "${f}"
+        sed -n '1,120p' "${f}" 2>/dev/null || true
+      fi
+    done
+  fi
+}
+
+# ---------- simple menu actions ----------
+action_build() {
+  read -rp "Pacote (metafile|category/name|name): " pkg
+  [ -z "${pkg}" ] && { adm_log WARN "Entrada vazia"; return; }
+  read -rp "Jobs (default ${ADM_JOBS}): " jobs
+  jobs="${jobs:-${ADM_JOBS}}"
+  read -rp "Executar no chroot (opcional path): " chroot
+  chroot_opt=""
+  [ -n "${chroot}" ] && chroot_opt="--chroot ${chroot}"
+  safe_exec "adm-build ${pkg}" "${ADM_BINMAP[build]}" --metafile "${pkg}" --jobs "${jobs}" ${chroot:+--chroot "${chroot}"}
+}
+
+action_install_menu() {
+  read -rp "Pacote(s) (arquivo/archive|metafile|category/name|name) (separar por espaço): " pkgs
+  [ -z "${pkgs}" ] && { adm_log WARN "Entrada vazia"; return; }
+  read -rp "Deseja --resolve (construir dependências se faltar binário)? [y/N]: " ans
+  resolve=0
+  case "${ans}" in [yY]*) resolve=1 ;; esac
+  # build command
+  if [ "${resolve}" -eq 1 ]; then
+    # call internal install_resolve function (defined later)
+    adm_install_resolve ${pkgs}
+  else
+    for p in ${pkgs}; do
+      # prefer calling adm-install directly
+      safe_exec "adm-install ${p}" "${ADM_BINMAP[install]}" install "${p}"
+    done
+  fi
+}
+
+action_uninstall_menu() {
+  read -rp "Pacote(s) (name ou manifest): " pkgs
+  [ -z "${pkgs}" ] && { adm_log WARN "Entrada vazia"; return; }
+  read -rp "Confirmar remoção? (y/N): " ans
+  case "${ans}" in [yY]*) : ;; *) adm_log INFO "Cancelado"; return ;; esac
+  for p in ${pkgs}; do
+    safe_exec "adm-uninstall ${p}" "${ADM_BINMAP[uninstall]}" "${p}"
+  done
+}
+
+action_update_menu() {
+  read -rp "update apply/list/check [apply <id>|list|check <id>]: " cmd rest
+  case "${cmd}" in
+    apply) safe_exec "adm-update apply ${rest}" "${ADM_BINMAP[update]}" apply ${rest} ;;
+    list) safe_exec "adm-update list" "${ADM_BINMAP[update]}" list ;;
+    check) safe_exec "adm-update check ${rest}" "${ADM_BINMAP[update]}" check ${rest} ;;
+    *) adm_log WARN "Comando desconhecido" ;;
+  esac
+}
+
+# ---------- Search and info command wrappers for CLI mode ----------
+cmd_search() {
+  local term="$1"
+  adm_search "${term}"
+}
+
+cmd_info() {
+  local id="$1"
+  adm_info "${id}"
+}
+
+# end of part 2
+# adm — parte 3/4
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- resolver+build+install flow ----------
+# adm_install_resolve <pkg1> [pkg2 ...]
+# For each package: try to locate binary; if missing, call adm-resolver to get plan then adm-build for missing
+adm_install_resolve() {
+  local pkgs=( "$@" )
+  local to_install=()
+  local to_build=()
+  for p in "${pkgs[@]}"; do
+    # if path to archive or dir -> install directly
+    if [ -f "${p}" ] && [[ "${p}" =~ \.(tar\.zst|tar\.xz|tar\.gz|zip|tar)$ ]]; then
+      to_install+=( "${p}" )
+      continue
+    fi
+    if [ -d "${p}" ] && [ -e "${p}/usr" -o -e "${p}/bin" ]; then
+      to_install+=( "${p}" )
+      continue
+    fi
+    # try find package archive in ADM_PACKAGES
+    cand="$(find_package_archive_in_repo "${p}" 2>/dev/null || true)"
+    if [ -n "${cand}" ]; then
+      to_install+=( "${cand}" )
+      continue
+    fi
+    # try find metafile
+    mf="$(find_metafile_wrapper "${p}" || true)"
+    if [ -n "${mf}" ]; then
+      # check if built artifact exists
+      name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+      ver="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+      cand="$(find_package_archive_in_repo "${name}-${ver}" 2>/dev/null || true)"
+      if [ -n "${cand}" ]; then
+        to_install+=( "${cand}" )
+      else
+        to_build+=( "${mf}" )
+      fi
+      continue
+    fi
+    # last resort: treat as identifier, attempt adm-resolver to generate build plan
+    if [ -x "${ADM_BINMAP[resolver]}" ]; then
+      adm_log INFO "Resolvendo dependências para ${p} via adm-resolver..."
+      # adm-resolver should emit a list of metafiles to build; assume it can accept an output file
+      planfile="${ADM_TEMP}/resolver-plan-${p//\//_}.txt"
+      if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
+        adm_log INFO "[dry-run] ${ADM_BINMAP[resolver]} ${p} --plan --out ${planfile}"
+        # pretend we would build p
+        to_build+=( "${p}" )
+      else
+        "${ADM_BINMAP[resolver]}" "${p}" --plan --out "${planfile}" || adm_log WARN "adm-resolver retornou erro para ${p}"
+        if [ -f "${planfile}" ]; then
+          while IFS= read -r mfline; do
+            mfline="${mfline## }"
+            [ -z "${mfline}" ] && continue
+            to_build+=( "${mfline}" )
+          done < "${planfile}"
+        else
+          adm_log WARN "Plano não gerado para ${p}; adicionando para tentativa de build direto"
+          to_build+=( "${p}" )
+        fi
+      fi
+    else
+      adm_log WARN "adm-resolver ausente; adicionando ${p} à fila de build"
+      to_build+=( "${p}" )
+    fi
+  done
+
+  # build needed packages sequentially to avoid races; could parallelize respecting toolchain
+  for mf in "${to_build[@]:-}"; do
+    adm_log INFO "Construindo (resolve) metafile: ${mf}"
+    if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${ADM_BINMAP[build]} --metafile ${mf} --no-dry-run --jobs ${ADM_JOBS}"
+      # after dry-run we cannot produce artifact, so skip actual install
+      continue
+    fi
+    # call adm-build
+    if [ ! -x "${ADM_BINMAP[build]}" ]; then
+      adm_log ERR "adm-build não disponível: ${ADM_BINMAP[build]}"
+      return 1
+    fi
+    if ! "${ADM_BINMAP[build]}" --metafile "${mf}" --no-dry-run --jobs "${ADM_JOBS}"; then
+      adm_log ERR "Falha no build de ${mf}"
+      return 1
+    fi
+    # after build, try find produced artifact
+    name="$(read_metafile_val "${mf}" "NAME" 2>/dev/null || true)"
+    ver="$(read_metafile_val "${mf}" "VERSION" 2>/dev/null || true)"
+    prod="$(find_package_archive_in_repo "${name}-${ver}" 2>/dev/null || true)"
+    if [ -n "${prod}" ]; then
+      to_install+=( "${prod}" )
+    else
+      # try destdir
+      destcand="$(find "${ADM_DESTDIR:-/usr/src/adm/destdir}" -maxdepth 2 -type d -name "${name}*" 2>/dev/null | head -n1 || true)"
+      if [ -n "${destcand}" ]; then
+        to_install+=( "${destcand}" )
+      else
+        adm_log WARN "Artefato não encontrado após build: ${mf}"
+      fi
+    fi
+  done
+
+  # finally install everything in to_install
+  for art in "${to_install[@]:-}"; do
+    adm_log INFO "Instalando artefato: ${art}"
+    if [ "${ADM_DRYRUN:-1}" -eq 1 ]; then
+      adm_log INFO "[dry-run] ${ADM_BINMAP[install]} install ${art}"
+      continue
+    fi
+    if [ ! -x "${ADM_BINMAP[install]}" ]; then
+      adm_log ERR "adm-install não disponível: ${ADM_BINMAP[install]}"
+      return 1
+    fi
+    if ! "${ADM_BINMAP[install]}" install "${art}"; then
+      adm_log ERR "Falha instalando ${art}"
+      return 1
+    fi
+  done
+
+  adm_log OK "Operação install --resolve concluída"
+  return 0
+}
+
+# ---------- helper: find_package_archive_in_repo (fallback) ----------
+find_package_archive_in_repo() {
+  local ident="$1"
+  # look into ADM_PACKAGES for matching patterns
+  if [ -d "${ADM_PACKAGES}" ]; then
+    # exact or contains match
+    local found
+    found="$(find "${ADM_PACKAGES}" -maxdepth 2 -type f \( -iname "*${ident}*.tar.*" -o -iname "*${ident}*.zip" \) 2>/dev/null | head -n1 || true)"
+    if [ -n "${found}" ]; then
+      printf "%s" "${found}"; return 0
+    fi
+  fi
+  return 1
+}
+
+# ---------- CLI wrapper for search/info/install/resolver ----------
+cli_search() {
+  local term="$1"
+  cmd_search "${term}"
+}
+cli_info() {
+  local id="$1"
+  cmd_info "${id}"
+}
+cli_install() {
+  local args=( "$@" )
+  # detect --resolve
+  local resolve=0
+  for a in "${args[@]}"; do
+    [ "${a}" = "--resolve" ] && resolve=1
+  done
+  if [ "${resolve}" -eq 1 ]; then
+    # remove flag and call internal
+    local cleaned=()
+    for a in "${args[@]}"; do [ "${a}" = "--resolve" ] || cleaned+=( "${a}" ); done
+    adm_install_resolve "${cleaned[@]}"
+  else
+    # call adm-install directly
+    safe_exec "adm-install ${args[*]}" "${ADM_BINMAP[install]}" install "${args[@]}"
+  fi
+}
+
+# end of part 3
+# adm — parte 4/4
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- dispatcher: map adm subcommands to underlying scripts ----------
+dispatch_to_script() {
+  local cmd="$1"; shift
+  local script="${ADM_BINMAP[${cmd}):-}"
+  if [ -z "${script}" ]; then
+    adm_log ERR "Comando desconhecido: ${cmd}"
+    return 1
+  fi
+  if [ ! -x "${script}" ]; then
+    adm_log ERR "Script para '${cmd}' não encontrado ou não executável: ${script}"
+    return 1
+  fi
+  safe_exec "dispatch ${cmd} ${*}" "${script}" "$@"
+}
+
+# ---------- advanced menu items ----------
+action_search_menu() {
+  read -rp "Termo de busca: " term
+  [ -z "${term}" ] && { adm_log WARN "Termo vazio"; return; }
+  highlight_line "Resultados para: ${term}"
+  adm_search "${term}"
+  echo
+  read -rp "Ver info de algum resultado? (digite name ou enter): " sel
+  [ -z "${sel}" ] && return
+  adm_info "${sel}"
+}
+
+action_info_menu() {
+  read -rp "Programa (name|category/name|metafile): " id
+  [ -z "${id}" ] && { adm_log WARN "Entrada vazia"; return; }
+  adm_info "${id}"
+}
+
+action_chroot_menu() {
+  read -rp "Chroot comando (create|enter|exec|mount|umount|list|status|repair|destroy): " sub
+  case "${sub}" in
+    create)
+      read -rp "Nome do chroot: " name
+      dispatch_to_script chroot create "${name}" ;;
+    enter)
+      read -rp "Nome do chroot: " name
+      dispatch_to_script chroot enter "${name}" ;;
+    exec)
+      read -rp "Nome do chroot: " name
+      read -rp "Comando: " cmd
+      dispatch_to_script chroot exec "${name}" "${cmd}" ;;
+    mount|umount|list|status|repair|destroy)
+      read -rp "Nome do chroot (se aplicável): " name
+      case "${sub}" in
+        list) dispatch_to_script chroot list ;;
+        *) dispatch_to_script chroot "${sub}" "${name}" ;;
+      esac
+      ;;
+    *)
+      adm_log WARN "Subcomando chroot desconhecido"
+      ;;
+  esac
+}
+
+# ---------- help --------------------------------
+adm_help() {
+  cat <<EOF
+ADM — CLI central
+Uso:
+  adm [command] [args...]
+Se sem argumentos, abre menu interativo.
+
+Comandos principais:
+  build <metafile|name> [--jobs N]        -> adm-build
+  install <artifact|metafile|name> [--resolve] -> instala; --resolve constrói dependências
+  uninstall <name>                        -> adm-uninstall
+  update <check|list|apply|auto>          -> adm-update
+  db <subcmd>                             -> adm-db
+  diagnose                                -> adm-diagnose
+  bootstrap                               -> adm-bootstrap
+  chroot <subcmd>                         -> adm-chroot
+  search <term>                           -> pesquisa pacotes/metafiles
+  info <name|metafile>                    -> informações detalhadas
+  help                                    -> esta ajuda
+Flags globais:
+  --dry-run, --no-dry-run, --force, --jobs N, --chroot <root>
+EOF
+}
+
+# ---------- main menu loop ----------
+menu_loop() {
+  while :; do
+    draw_header
+    printf "%b1)%b Build    2)%b Install   3)%b Uninstall   4)%b Update\n" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}"
+    printf "%b5)%b Bootstrap 6)%b Chroot    7)%b Diagnose     8)%b Clean\n" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}"
+    printf "%b9)%b DB       10)%b Search    11)%b Info    12)%b Exit\n" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}" "${T_CYAN}" "${T_RESET}"
+    draw_footer
+    printf "%bEscolha:%b " "${T_BOLD}${T_PINK}" "${T_RESET}"
+    read -r choice
+    case "${choice}" in
+      1|build) action_build ;;
+      2|install) action_install_menu ;;
+      3|uninstall) action_uninstall_menu ;;
+      4|update) action_update_menu ;;
+      5|bootstrap) dispatch_to_script bootstrap ;;
+      6|chroot) action_chroot_menu ;;
+      7|diagnose) dispatch_to_script diagnose ;;
+      8|clean) dispatch_to_script clean ;;
+      9|db) dispatch_to_script db ;;
+      10|search) action_search_menu ;;
+      11|info) action_info_menu ;;
+      12|exit|q) adm_log INFO "Saindo..."; break ;;
+      help) adm_help ;;
+      *) adm_log WARN "Opção inválida: ${choice}" ;;
+    esac
+    printf "\n%bPressione ENTER para continuar...%b" "${T_CYAN}" "${T_RESET}"
+    read -r _
+  done
+}
+
+# ---------- CLI argument parsing ----------
+if [ $# -eq 0 ]; then
+  # interactive menu mode
+  menu_loop
+  exit 0
+fi
+
+# Parse first argument as command
+CMD="$1"; shift || true
+case "${CMD}" in
+  help|--help|-h) adm_help; exit 0 ;;
+  search) [ $# -ge 1 ] && cli_search "$*" || { adm_log ERR "Uso: adm search <term>"; exit 1; } ;;
+  info) [ $# -ge 1 ] && cli_info "$1" || { adm_log ERR "Uso: adm info <name>"; exit 1; } ;;
+  install) [ $# -ge 1 ] && cli_install "$@" || { adm_log ERR "Uso: adm install <pkg> [--resolve]"; exit 1; } ;;
+  build) dispatch_to_script build "$@" ;;
+  uninstall) dispatch_to_script uninstall "$@" ;;
+  update) dispatch_to_script update "$@" ;;
+  db) dispatch_to_script db "$@" ;;
+  diagnose) dispatch_to_script diagnose "$@" ;;
+  bootstrap) dispatch_to_script bootstrap "$@" ;;
+  chroot) dispatch_to_script chroot "$@" ;;
+  clean) dispatch_to_script clean "$@" ;;
+  download) dispatch_to_script download "$@" ;;
+  patch) dispatch_to_script patch "$@" ;;
+  hooks) dispatch_to_script hooks "$@" ;;
+  detect) dispatch_to_script detect "$@" ;;
+  resolver) dispatch_to_script resolver "$@" ;;
+  env) dispatch_to_script env "$@" ;;
+  *) 
+    adm_log WARN "Comando '${CMD}' não reconhecido. Entrando em modo interativo."
+    menu_loop
+    ;;
+esac
+
+# cleanup spinner if left behind
+stop_spinner 2>/dev/null || true
+exit 0
