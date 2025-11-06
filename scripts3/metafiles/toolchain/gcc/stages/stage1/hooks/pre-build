@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pre-build (stage1) — preparar ambiente para GCC Pass 2
+# $1 = WORKDIR (fornecido pelo adm-build), $2 = DESTDIR (staging)
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[adm-hook stage1 pre-build] workdir=${WORKDIR} destdir=${DESTDIR}"
+
+# garantir que dependências de stage1 estejam presentes (adaptação segura)
+# Não removemos ou alteramos o host; avisamos se algo crítico estiver ausente.
+_required() {
+  for cmd in "$@"; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "[adm-hook] WARN: comando ausente: $cmd" >&2
+    fi
+  done
+}
+
+# verificar ferramentas básicas
+_required gcc make ld ar ranlib
+
+# preparar árvore de build
+mkdir -p "${WORKDIR}/build"
+cd "${WORKDIR}/build" || exit 1
+
+# LFS recomenda configurar com o dir das dependências (gmp/mpfr/mpc)
+# Se fontes dos extras estiverem no diretório pai, mova-as para dentro do tree do gcc.
+# (adm-detect / adm-build normalmente já fazem isso; aqui só tentativa segura)
+for dep in gmp mpfr mpc isl; do
+  if [ -d "${WORKDIR}/../${dep}" ]; then
+    echo "[adm-hook] integrando ${dep} ao fonte do gcc"
+    rm -rf "${WORKDIR}/${dep}" 2>/dev/null || true
+    mv -v "${WORKDIR}/../${dep}" "${WORKDIR}/${dep}" 2>/dev/null || true
+  fi
+done
+
+# definir ambiente para compilar dentro do chroot (se aplicável)
+# adm-bootstrap costuma exportar LFS, LFS_TGT etc.; se existirem, respeitar
+: "${LFS:=}"
+: "${LFS_TGT:=}"
+
+if [ -n "${LFS_TGT:-}" ]; then
+  export CC="${LFS_TGT}-gcc"
+  export CXX="${LFS_TGT}-g++"
+  echo "[adm-hook] Usando toolchain alvo: ${LFS_TGT} (CC=${CC})"
+fi
+
+# CFLAGS/LDFLAGS: adm-build/apply profile deve prover; garantimos defaults seguros
+export CFLAGS="${CFLAGS:--O2 -g}"
+export CXXFLAGS="${CXXFLAGS:--O2 -g}"
+export LDFLAGS="${LDFLAGS:--Wl,-O1}"
+
+echo "[adm-hook stage1 pre-build] ambiente pronto."
+exit 0
