@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# pre-build — garantir ambiente limpo e preparado para o binutils
+
+set -e
+echo "[adm-hook] preparando ambiente para binutils..."
+
+# Definir prefixos básicos (para bootstrap)
+export PATH="/usr/bin:/bin"
+export CFLAGS="-O2 -pipe"
+export LDFLAGS="-Wl,-z,now -Wl,-z,relro"
+
+# Verificar se o diretório de destino existe
+mkdir -p "${DESTDIR}/usr" "${DESTDIR}/bin" "${DESTDIR}/lib"
+echo "[adm-hook] ambiente preparado."
