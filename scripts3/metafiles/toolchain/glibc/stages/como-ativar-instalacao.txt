@@ -1,0 +1,13 @@
+Antes de iniciar o build da glibc stage1 (por exemplo no adm-bootstrap ou no profile):
+
+export INSTALL_ALL_LOCALES=1
+
+Ou, se quiser adicionar permanentemente ao ambiente:
+
+/usr/src/adm/profile
+
+INSTALL_ALL_LOCALES=1
+export INSTALL_ALL_LOCALES
+
+Assim, toda vez que o ADM construir a glibc no stage1, ele fará o passo make localedata/install-locales.
+
