@@ -1,0 +1,18 @@
+NAME="linux-headers"
+VERSION="6.10.5"
+CATEGORY="toolchain"
+BUILD_SYSTEM="custom"
+
+# múltiplos mirrors
+URLS="
+https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+rsync://rsync.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+ftp://ftp.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+"
+
+SHA256="bda08fcb28cf4b97a481548a8baf39fd27f1a1b00a405ea46b189f987d3a97b0"
+
+BUILD_DEPS=""
+RUN_DEPS=""
+OPT_DEPS=""
