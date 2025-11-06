@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage1 pre-build] ajustando ambiente chroot inicial..."
+export PATH="/usr/bin:/bin"
