@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# post-install (firefox) — $1=WORKDIR, $2=DESTDIR
+set -euo pipefail
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+log(){ printf '[firefox post-install] %s\n' "$*"; }
+
+cd "${WORKDIR}" || exit 1
+
+# 1) create package with mach (if supported)
+if ./mach package >/dev/null 2>&1; then
+  log "mach package succeeded; locating package"
+  # example: objfirefox/dist/firefox-*.tar.bz2 or .zip
+  pkg="$(find "${WORKDIR}" -type f -path "*/dist/firefox-*.tar.*" -print -quit || true)"
+  if [ -n "${pkg}" ]; then
+    mkdir -p "${DESTDIR}/packages"
+    cp -av "${pkg}" "${DESTDIR}/packages/" || true
+    log "Package copied to ${DESTDIR}/packages/$(basename "${pkg}")"
+    # register package
+    if command -v adm-db >/dev/null 2>&1; then
+      adm-db add --name firefox --version "${VERSION:-unknown}" --file "${DESTDIR}/packages/$(basename "${pkg}")" --category browser || true
+    fi
+  else
+    log "WARN: package file not found after mach package"
+  fi
+else
+  log "mach package unsupported or failed; attempt manual packaging of objdir"
+  tar -C "${WORKDIR}/objfirefox" -cJf "${DESTDIR}/packages/firefox-objdir-${VERSION:-unknown}.tar.xz" .
+  if command -v adm-db >/dev/null 2>&1; then
+    adm-db add --name firefox --version "${VERSION:-unknown}" --file "${DESTDIR}/packages/firefox-objdir-${VERSION:-unknown}.tar.xz" --category browser || true
+  fi
+fi
+
+log "post-install finished"
+exit 0
