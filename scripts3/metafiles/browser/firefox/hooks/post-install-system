@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# firefox post-install-system — integração com o sistema após instalação
+# $1 = WORKDIR, $2 = DESTDIR (onde está o firefox instalado)
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+log() { printf '[firefox post-install-system] %s\n' "$*"; }
+
+log "Integrando Firefox no sistema..."
+
+# Diretório final esperado (pode variar conforme empacotamento)
+FIREFOX_DIR="${DESTDIR}/usr/lib/firefox"
+BIN_DIR="${DESTDIR}/usr/bin"
+APP_DIR="${DESTDIR}/usr/share/applications"
+ICON_DIR="${DESTDIR}/usr/share/icons/hicolor/128x128/apps"
+
+mkdir -pv "${BIN_DIR}" "${APP_DIR}" "${ICON_DIR}"
+
+# 🔗 Criar link simbólico executável
+if [ -x "${FIREFOX_DIR}/firefox" ]; then
+  ln -sfv "../lib/firefox/firefox" "${BIN_DIR}/firefox"
+  log "Link simbólico criado: /usr/bin/firefox → /usr/lib/firefox/firefox"
+else
+  log "WARN: binário firefox não encontrado em ${FIREFOX_DIR}"
+fi
+
+# 🖼️ Copiar ícone padrão (caso exista)
+ICON_SRC="$(find "${FIREFOX_DIR}" -type f -name 'firefox.png' -o -name 'browser.png' | head -n1 || true)"
+if [ -n "${ICON_SRC}" ]; then
+  cp -v "${ICON_SRC}" "${ICON_DIR}/firefox.png"
+  log "Ícone instalado em ${ICON_DIR}/firefox.png"
+else
+  log "WARN: ícone não encontrado."
+fi
+
+# 🗂️ Criar arquivo .desktop (lançador)
+cat > "${APP_DIR}/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox Web Browser
+GenericName=Web Browser
+Comment=Browse the Web
+Exec=firefox %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+EOF
+log "Arquivo .desktop criado em ${APP_DIR}/firefox.desktop"
+
+# 🔄 Atualizar bancos de dados de desktop/mime se ferramentas estiverem disponíveis
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "${DESTDIR}/usr/share/applications" || true
+fi
+if command -v update-mime-database >/dev/null 2>&1; then
+  update-mime-database "${DESTDIR}/usr/share/mime" || true
+fi
+
+# 🔄 Atualizar cache de ícones (se gtk-update-icon-cache disponível)
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -qf "${DESTDIR}/usr/share/icons/hicolor" || true
+fi
+
+# 🔎 Registrar no adm-db (se disponível)
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db add --name firefox --version "${VERSION:-unknown}" --file "${FIREFOX_DIR}" --category browser --tag system || true
+fi
+
+# 🆙 Criar entrada de atualização para o adm-update
+UPDATE_DIR="/usr/src/adm/update/browser/firefox"
+mkdir -pv "${UPDATE_DIR}"
+cat > "${UPDATE_DIR}/metafile" <<EOF
+NAME="firefox"
+INSTALLED_VERSION="${VERSION:-unknown}"
+LAST_UPDATE="$(date '+%Y-%m-%d %H:%M:%S')"
+SOURCE="mozilla"
+EOF
+log "Metafile de atualização criado em ${UPDATE_DIR}/metafile"
+
+log "Integração do Firefox concluída com sucesso."
+exit 0
