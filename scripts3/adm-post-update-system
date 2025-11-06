@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# adm-post-update-system
+# Universal post-update runner with backup + rollback + robust error handling
+# Designed for ADM: reads /usr/src/adm/update/<cat>/<pkg>/metafile and applies updates
+# - backups current install
+# - downloads, verifies, builds, installs via adm-build
+# - runs post-install-system hook
+# - on failure, automatically rollbacks
+#
+# Usage: /usr/src/adm/scripts/adm-post-update-system [--apply] [--destdir /path] [--keep-backups N]
+# Defaults: --apply (will apply any metafile found), DESTDIR=/usr/src/adm/destdir, keep 3 backups
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# --------- config ----------
+BASE_UPDATE_DIR=${BASE_UPDATE_DIR:-/usr/src/adm/update}
+WORKBASE=${WORKBASE:-/usr/src/adm/temp/update-run}
+LOGDIR=${LOGDIR:-/usr/src/adm/log}
+BACKUPDIR=${BACKUPDIR:-/usr/src/adm/backups}
+DESTDIR_DEFAULT=${DESTDIR_DEFAULT:-/usr/src/adm/destdir}
+KEEP_BACKUPS=${KEEP_BACKUPS:-3}
+ADM_BUILD=${ADM_BUILD:-adm-build}
+ADM_DB=${ADM_DB:-adm-db}
+
+# CLI args
+APPLY=1
+DESTDIR="${DESTDIR_DEFAULT}"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-apply) APPLY=0; shift ;;
+    --destdir) DESTDIR="$2"; shift 2 ;;
+    --keep-backups) KEEP_BACKUPS="$2"; shift 2 ;;
+    --help|-h) printf "Usage: %s [--no-apply] [--destdir PATH] [--keep-backups N]\n" "$0"; exit 0;;
+    *) echo "Unknown arg: $1"; shift ;;
+  esac
+done
+
+mkdir -pv "${WORKBASE}" "${LOGDIR}" "${BACKUPDIR}" "${DESTDIR}"
+
+log() { printf "\033[1;36m[adm-post-update]\033[0m %s\n" "$*"; }
+warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+err()  { printf "\033[1;31m[ERRO]\033[0m %s\n" "$*" >&2; }
+notify() {
+  local t="$1"; local m="$2"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "ADM Update" "$t" "$m" || true
+  else
+    log "$t - $m"
+  fi
+}
+
+# safe tar compressor selection
+choose_compressor() {
+  if command -v zstd >/dev/null 2>&1; then
+    echo "zstd"
+  elif command -v xz >/dev/null 2>&1; then
+    echo "xz"
+  else
+    echo "gz"
+  fi
+}
+
+compressor="$(choose_compressor)"
+
+# helper: create backup tarball of paths array
+create_backup() {
+  local name="$1"; shift
+  local timestamp; timestamp=$(date +%Y%m%dT%H%M%S)
+  local dest="${BACKUPDIR}/${name}-${timestamp}.tar"
+  case "${compressor}" in
+    zstd) dest+=".zst"; tar --warning=no-file-changed -C / -cf - "$@" | zstd -q -o "${dest}";;
+    xz)   dest+=".xz"; tar --warning=no-file-changed -C / -cf - "$@" | xz -z -c > "${dest}";;
+    gz)   dest+=".gz"; tar --warning=no-file-changed -C / -cf - "$@" | gzip -c > "${dest}";;
+  esac
+  printf "%s\n" "${dest}"
+}
+
+# helper: restore backup tarball to root (uses tar auto-detect)
+restore_backup() {
+  local archive="$1"
+  if [ ! -f "${archive}" ]; then
+    err "Backup archive ${archive} not found!"
+    return 1
+  fi
+  case "${archive}" in
+    *.zst) zstd -d -q "${archive}" -c | sudo tar -C / -xf - ;;
+    *.xz)  xz -d -c "${archive}" | sudo tar -C / -xf - ;;
+    *.gz)  gzip -d -c "${archive}" | sudo tar -C / -xf - ;;
+    *)     sudo tar -C / -xf "${archive}" ;;
+  esac
+}
+
+# helper: trim backups older than KEEP_BACKUPS for package
+trim_backups() {
+  local name="$1"
+  # find backups for name, sort by mtime, keep last N
+  mapfile -t files < <(ls -1t "${BACKUPDIR}/${name}-"* 2>/dev/null || true)
+  if [ "${#files[@]}" -le "${KEEP_BACKUPS}" ]; then return 0; fi
+  for ((i=KEEP_BACKUPS;i<${#files[@]};i++)); do
+    rm -f "${files[$i]}" || true
+  done
+}
+
+# gather update metafiles
+mapfile -t META_FILES < <(find "${BASE_UPDATE_DIR}" -type f -name metafile 2>/dev/null || true)
+if [ ${#META_FILES[@]} -eq 0 ]; then
+  log "Nenhum metafile de atualização encontrado em ${BASE_UPDATE_DIR}."
+  exit 0
+fi
+
+for UPDATE_FILE in "${META_FILES[@]}"; do
+  log "=== Processing update metafile: ${UPDATE_FILE} ==="
+
+  # sandbox local vars per package
+  (
+    set -euo pipefail
+    TMPDIR="$(mktemp -d "${WORKBASE}/tmp.XXXXXX")"
+    trap 'rm -rf "${TMPDIR}"' EXIT
+
+    # load metafile safely in a subshell to avoid env pollution
+    source "${UPDATE_FILE}" || { err "Falha ao carregar metafile ${UPDATE_FILE}"; notify "ADM Update" "Erro ao carregar metafile ${UPDATE_FILE}"; continue; }
+
+    NAME="${NAME:-unknown}"
+    CATEGORY="${CATEGORY:-unknown}"
+    NEW_VERSION="${NEW_VERSION:-unknown}"
+    SOURCE_URL="${SOURCE_URL:-}"
+    CHECKSUM="${CHECKSUM:-}"
+
+    if [ "${NAME}" = "unknown" ] || [ -z "${SOURCE_URL}" ] || [ "${NEW_VERSION}" = "unknown" ]; then
+      err "Metafile inválido: NAME/SOURCE_URL/NEW_VERSION são obrigatórios (${UPDATE_FILE})"
+      notify "ADM Update" "Metafile inválido: ${UPDATE_FILE}"
+      continue
+    fi
+
+    log "Package: ${NAME} Category: ${CATEGORY} Version: ${NEW_VERSION}"
+
+    # detect installed path via adm-db if available
+    INSTALLED_PATH=""
+    if command -v "${ADM_DB}" >/dev/null 2>&1; then
+      # adm-db info <name> is expected to print useful info; attempt to parse path
+      if INST_INFO="$(${ADM_DB} info "${NAME}" 2>/dev/null || true)"; then
+        INSTALLED_PATH="$(printf "%s\n" "${INST_INFO}" | awk -F': ' '/Path|File|Installed/{print $2; exit}' || true)"
+      fi
+    fi
+
+    # fallback: common locations to backup
+    CANDIDATES=()
+    [ -n "${INSTALLED_PATH}" ] && CANDIDATES+=("${INSTALLED_PATH}")
+    CANDIDATES+=("/usr/lib/${NAME}" "/usr/lib64/${NAME}" "/usr/lib/${NAME}-*")
+    CANDIDATES+=("/opt/${NAME}" "/usr/local/${NAME}" "/usr/share/${NAME}")
+
+    # build list of paths that actually exist under DESTDIR (we respect DESTDIR)
+    EXISTING_PATHS=()
+    for p in "${CANDIDATES[@]}"; do
+      # expand glob
+      for real in $(eval echo "${p}"); do
+        # consider both absolute and under DESTDIR
+        if [ -e "${DESTDIR}${real}" ]; then
+          EXISTING_PATHS+=("${DESTDIR}${real}")
+        elif [ -e "${real}" ]; then
+          EXISTING_PATHS+=("${real}")
+        fi
+      done
+    done
+
+    # If nothing found, try to detect by adm-db raw listing
+    if [ ${#EXISTING_PATHS[@]} -eq 0 ] && command -v "${ADM_DB}" >/dev/null 2>&1; then
+      mapfile -t paths < <(${ADM_DB} list-files --name "${NAME}" 2>/dev/null || true)
+      for p in "${paths[@]}"; do
+        [ -e "${p}" ] && EXISTING_PATHS+=("${p}")
+      done
+    fi
+
+    # prepare work area
+    cd "${TMPDIR}"
+    log "Workdir: ${TMPDIR}"
+
+    # 1) download tarball
+    TARFILE="${TMPDIR}/${NAME}-${NEW_VERSION}.tar.xz"
+    log "Downloading ${SOURCE_URL} -> ${TARFILE} ..."
+    if ! curl -fL --retry 5 --retry-delay 2 -o "${TARFILE}" "${SOURCE_URL}"; then
+      err "Falha ao baixar ${SOURCE_URL}"
+      notify "ADM Update" "Falha ao baixar ${NAME} ${NEW_VERSION}"
+      continue
+    fi
+
+    # 2) verify checksum if provided
+    if [ -n "${CHECKSUM}" ]; then
+      DL_SUM="$(sha256sum "${TARFILE}" | awk '{print $1}')"
+      if [ "${DL_SUM}" != "${CHECKSUM}" ]; then
+        err "Checksum mismatch: expected ${CHECKSUM}, got ${DL_SUM}"
+        notify "ADM Update" "Checksum inválido para ${NAME} ${NEW_VERSION}"
+        continue
+      fi
+    else
+      log "Aviso: CHECKSUM não fornecido no metafile; prosseguindo sem verificação."
+    fi
+
+    # 3) create backup of existing installation (if any)
+    BACKUP_ARCHIVE=""
+    if [ ${#EXISTING_PATHS[@]} -gt 0 ]; then
+      log "Criando backup das paths: ${EXISTING_PATHS[*]}"
+      # normalize backup name
+      safe_name="$(echo "${CATEGORY}-${NAME}" | tr ' /' '__')"
+      BACKUP_ARCHIVE="$(create_backup "${safe_name}" "${EXISTING_PATHS[@]}")" || {
+        err "Falha ao criar backup"
+        notify "ADM Update" "Falha ao criar backup de ${NAME}"
+        continue
+      }
+      log "Backup salvo em: ${BACKUP_ARCHIVE}"
+      trim_backups "${safe_name}"
+    else
+      log "Nenhuma instalação anterior detectada; nenhuma cópia de backup criada."
+    fi
+
+    # Setup trap in this subshell to restore on failure
+    ROLLBACK_NEEDED=0
+    cleanup_and_maybe_rollback() {
+      local rc=$?
+      if [ "${rc}" -ne 0 ]; then
+        warn "Error detected (rc=${rc}). Attempting rollback for ${NAME}..."
+        if [ -n "${BACKUP_ARCHIVE}" ]; then
+          warn "Restaurando backup ${BACKUP_ARCHIVE} ..."
+          restore_backup "${BACKUP_ARCHIVE}" || warn "Rollback falhou! Verifique manualmente ${BACKUP_ARCHIVE}"
+          notify "ADM Update" "Rollback automático executado para ${NAME}"
+        else
+          warn "Nenhum backup disponível para restaurar."
+        fi
+      fi
+    }
+    trap cleanup_and_maybe_rollback EXIT
+
+    # 4) extract and cd to source
+    tar -xf "${TARFILE}" -C "${TMPDIR}" || { err "Falha ao extrair tarball"; exit 1; }
+    SRC_DIR="$(find "${TMPDIR}" -maxdepth 2 -type d -name "${NAME}*" | head -n1 || true)"
+    if [ -z "${SRC_DIR}" ]; then
+      # try different heuristics
+      SRC_DIR="$(find "${TMPDIR}" -maxdepth 2 -type d -name '*src*' | head -n1 || true)"
+    fi
+    [ -n "${SRC_DIR}" ] || { err "Diretório fonte não encontrado após extração"; exit 1; }
+    log "Fonte extraída para ${SRC_DIR}"
+    cd "${SRC_DIR}"
+
+    # 5) find package metafile base and call adm-build
+    MF_BASE="/usr/src/adm/metafiles/${CATEGORY}/${NAME}/metafile"
+    if [ ! -f "${MF_BASE}" ]; then
+      err "Metafile base não encontrado: ${MF_BASE}"
+      notify "ADM Update" "Metafile base ausente para ${NAME}"
+      exit 1
+    fi
+
+    if [ "${APPLY}" -eq 0 ]; then
+      log "Dry-run mode (--no-apply). Skipping build/install for ${NAME}."
+      # cleanup trap will run but won't rollback since no backup created fate ok
+      trap - EXIT
+      rm -rf "${TMPDIR}"
+      continue
+    fi
+
+    # 6) run adm-build (capture output)
+    BUILD_LOG="${LOGDIR}/${CATEGORY}-${NAME}-${NEW_VERSION}-build.log"
+    log "Executando adm-build --metafile ${MF_BASE} --destdir ${DESTDIR} ..."
+    if ! ${ADM_BUILD} --metafile "${MF_BASE}" --destdir "${DESTDIR}" --no-dry-run 2>&1 | tee "${BUILD_LOG}"; then
+      err "adm-build falhou para ${NAME}. Ver logs em ${BUILD_LOG}"
+      notify "ADM Update" "Falha no build de ${NAME} ${NEW_VERSION} (ver logs)"
+      exit 1
+    fi
+
+    # 7) run post-install-system hook if exists
+    HOOK_SYS="/usr/src/adm/metafiles/${CATEGORY}/${NAME}/hooks/post-install-system"
+    if [ -x "${HOOK_SYS}" ]; then
+      log "Executando hook post-install-system..."
+      if ! "${HOOK_SYS}" "${SRC_DIR}" "${DESTDIR}" 2>&1 | tee -a "${BUILD_LOG}"; then
+        warn "post-install-system retornou erro (ver ${BUILD_LOG}). Continuando (não fatal)."
+      fi
+    else
+      log "Nenhum hook post-install-system encontrado para ${NAME} (pulando)."
+    fi
+
+    # 8) update adm-db
+    if command -v "${ADM_DB}" >/dev/null 2>&1; then
+      log "Atualizando adm-db: ${NAME} -> ${NEW_VERSION}"
+      # try update, fallback to add
+      if ! ${ADM_DB} update --name "${NAME}" --version "${NEW_VERSION}" --category "${CATEGORY}" 2>/dev/null; then
+        ${ADM_DB} add --name "${NAME}" --version "${NEW_VERSION}" --file "${DESTDIR}" --category "${CATEGORY}" || true
+      fi
+    fi
+
+    # 9) cleanup update metafile (only on success)
+    rm -f "${UPDATE_FILE}" || true
+
+    # 10) success notification and finalization
+    notify "ADM Update" "${NAME} atualizado -> ${NEW_VERSION}"
+    log "SUCCESS: ${NAME} ${NEW_VERSION} instalado com sucesso."
+
+    # disable trap since success
+    trap - EXIT
+
+  ) || {
+    # subshell returned non-zero -> error already handled by trap; continue to next metafile
+    warn "Processing of ${UPDATE_FILE} finished with errors; check logs."
+    continue
+  }
+done
+
+log "adm-post-update-system: all updates processed."
+exit 0
