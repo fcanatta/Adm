@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage2 pre-build] validando ambiente interno..."
+export PATH="/usr/bin:/bin"
