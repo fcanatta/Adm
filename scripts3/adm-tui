@@ -1,0 +1,542 @@
+#!/usr/bin/env bash
+# adm-tui — TUI interativo para ADM (parte 1/3)
+# Requisitos: bash, tput, adm-common.sh + scripts adm-*
+# Coloque em /usr/src/adm/scripts/adm-tui e chmod +x
+#
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- load adm-common ----------
+SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON="${SCRIPTS_DIR}/adm-common.sh"
+if [ ! -f "${COMMON}" ]; then
+  echo "ERRO: adm-common.sh não encontrado em ${COMMON}" >&2
+  exit 1
+fi
+# shellcheck disable=SC1090
+. "${COMMON}"
+
+# ---------- config & paths ----------
+: "${ADM_SCRIPTS:=${SCRIPTS_DIR}}"
+: "${ADM_METAFILES:=${ADM_METAFILES:-/usr/src/adm/metafiles}}"
+: "${ADM_PACKAGES:=${ADM_PACKAGES:-/usr/src/adm/packages}}"
+: "${ADM_DB:=${ADM_DB:-/usr/src/adm/db}}"
+: "${ADM_UPDATE:=${ADM_UPDATE:-/usr/src/adm/update}}"
+: "${ADM_TEMP:=${ADM_TEMP:-/tmp}}"
+: "${ADM_LOG:=${ADM_LOG:-/usr/src/adm/log}}"
+
+# map to underlying scripts if present
+ADM_DB_BIN="${ADM_SCRIPTS}/adm-db"
+ADM_BUILD_BIN="${ADM_SCRIPTS}/adm-build"
+ADM_INSTALL_BIN="${ADM_SCRIPTS}/adm-install"
+ADM_RESOLVER_BIN="${ADM_SCRIPTS}/adm-resolver"
+ADM_UPDATE_BIN="${ADM_SCRIPTS}/adm-update"
+ADM_DETECT_BIN="${ADM_SCRIPTS}/adm-detect"
+ADM_HOOKS_BIN="${ADM_SCRIPTS}/adm-hooks"
+ADM_CHROOT_BIN="${ADM_SCRIPTS}/adm-chroot"
+
+# ---------- terminal capabilities detection ----------
+if [ ! -t 1 ] || [ ! -t 0 ]; then
+  echo "adm-tui exige um terminal interativo (tty)." >&2
+  exit 1
+fi
+
+# tput safe wrappers
+_tput() { command -v tput >/dev/null 2>&1 && tput "$@" || true; }
+T_BOLD="$(_tput bold)"
+T_RESET="$(_tput sgr0)"
+T_PINK="$(_tput setaf 5)"
+T_GREEN="$(_tput setaf 2)"
+T_YELLOW="$(_tput setaf 3)"
+T_RED="$(_tput setaf 1)"
+T_CYAN="$(_tput setaf 6)"
+
+# ensure colors exist even if tput failed
+: "${T_BOLD:=}"
+: "${T_RESET:=}"
+: "${T_PINK:=}"
+: "${T_GREEN:=}"
+: "${T_YELLOW:=}"
+: "${T_RED:=}"
+: "${T_CYAN:=}"
+
+# ---------- global state ----------
+TERM_HEIGHT=$(tput lines)
+TERM_WIDTH=$(tput cols)
+LIST_COLS=1                # number of columns in list view (kept 1)
+LIST_WIDTH=$(( TERM_WIDTH * 50 / 100 ))     # 50% for list
+DETAIL_WIDTH=$(( TERM_WIDTH - LIST_WIDTH - 3 )) # 3 chars padding
+PAGE_SIZE=0                # computed later
+CUR_INDEX=0                # current selected index (0-based)
+TOP_INDEX=0                # top visible index for paging
+PKG_LIST=()                # array of package identifiers (category/name or name)
+PKG_DISPLAY=()             # array of human display titles
+SEARCH_TERM=""             # current search filter
+MODE="browse"              # browse | search | detail
+DRYRUN="${ADM_DRYRUN:-1}"  # default to dry-run safe
+CONFIRM_ON_ACTION=1
+# buffer for detail content caching
+declare -A DETAIL_CACHE
+
+# ---------- cleanup on exit ----------
+cleanup_and_exit() {
+  stty "$STTY_SAVE" || true
+  clear
+  tput cnorm 2>/dev/null || true
+  # restore cursor and exit
+  exit "${1:-0}"
+}
+trap 'cleanup_and_exit 0' INT TERM EXIT
+
+# save terminal settings
+STTY_SAVE="$(stty -g 2>/dev/null || true)"
+# hide cursor
+tput civis 2>/dev/null || true
+
+# ---------- helper: safe_exec wrapper (uses adm-common run_cmd / adm_log) ----------
+safe_exec_tui() {
+  # safe_exec_tui "label" cmd...
+  local label="$1"; shift
+  adm_log INFO "TUI EXEC: ${label}"
+  if [ "${DRYRUN}" -eq 1 ]; then
+    adm_log INFO "[dry-run] $*"
+    return 0
+  fi
+  # show a small status line while running
+  draw_status_line "RUN: ${label}"
+  "${@}"
+  local rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    adm_log ERR "Comando falhou (${rc}): ${label}"
+    return ${rc}
+  fi
+  adm_log OK "Comando OK: ${label}"
+  return 0
+}
+
+# ---------- helper: confirm prompt (yes/no) ----------
+confirm_prompt() {
+  local prompt="$1"
+  if [ "${CONFIRM_ON_ACTION}" -eq 0 ]; then return 0; fi
+  printf "%s [y/N]: " "${prompt}" >&2
+  read -r ans
+  case "${ans}" in
+    y|Y|yes|Yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- load list of packages ----------
+# Strategy: prefer adm-db list --format short; fallback to scanning metafiles; fallback to scanning ADM_PACKAGES
+load_pkg_list() {
+  PKG_LIST=(); PKG_DISPLAY=()
+  # try adm-db
+  if [ -x "${ADM_DB_BIN}" ]; then
+    mapfile -t lines < <("${ADM_DB_BIN}" list --format short 2>/dev/null || true)
+    if [ "${#lines[@]}" -gt 0 ]; then
+      for l in "${lines[@]}"; do
+        PKG_LIST+=( "${l}" )
+        PKG_DISPLAY+=( "${l}" )
+      done
+      return 0
+    fi
+  fi
+  # try metafiles
+  if [ -d "${ADM_METAFILES}" ]; then
+    while IFS= read -r -d '' mf; do
+      name="$(grep -E '^NAME=' "${mf}" 2>/dev/null | head -n1 | sed -E 's/^NAME="?([^"]+)"?/\1/')" || true
+      catg="$(dirname "${mf#${ADM_METAFILES}/}")"
+      id="${catg}/${name}"
+      PKG_LIST+=( "${id}" )
+      PKG_DISPLAY+=( "${name} (${catg})" )
+    done < <(find "${ADM_METAFILES}" -type f -name metafile -print0 2>/dev/null)
+    [ "${#PKG_LIST[@]}" -gt 0 ] && return 0
+  fi
+  # fallback: scanning packages dir for archives
+  if [ -d "${ADM_PACKAGES}" ]; then
+    while IFS= read -r -d '' f; do
+      base="$(basename "${f}")"
+      PKG_LIST+=( "${base}" )
+      PKG_DISPLAY+=( "${base}" )
+    done < <(find "${ADM_PACKAGES}" -maxdepth 2 -type f -print0 2>/dev/null)
+  fi
+  return 0
+}
+
+# initial load
+load_pkg_list
+
+# compute page size (leaving space for header/footer)
+recompute_layout() {
+  TERM_HEIGHT=$(tput lines)
+  TERM_WIDTH=$(tput cols)
+  LIST_WIDTH=$(( TERM_WIDTH * 50 / 100 ))
+  DETAIL_WIDTH=$(( TERM_WIDTH - LIST_WIDTH - 3 ))
+  PAGE_SIZE=$(( TERM_HEIGHT - 8 )) # header(3)+footer(3)+padding
+  [ "${PAGE_SIZE}" -lt 5 ] && PAGE_SIZE=5
+}
+recompute_layout
+
+# end of part 1
+# adm-tui — parte 2/3 (rendering, input, search, detail)
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- low-level draw helpers ----------
+draw_header() {
+  clear
+  printf "%b" "${T_BOLD}${T_PINK}"
+  printf " ADM — TUI Manager (press 'q' to quit, '/' search, 'i' install, 'b' build, Enter detail)\n"
+  printf "%b" "${T_RESET}"
+  printf "%b\n" "${T_CYAN}────────────────────────────────────────────────────────────────────────${T_RESET}"
+}
+
+draw_footer() {
+  printf "\n%bKeys:%b ↑/↓ Navigate  Enter Info  i Install  b Build  / Search  u Update  r Resolver  c Cmd  q Quit\n" "${T_YELLOW}" "${T_RESET}"
+  printf "%b%s%b\n" "${T_BOLD}${T_PINK}" "Active: ${PKG_DISPLAY[CUR_INDEX]:-none}" "${T_RESET}"
+}
+
+draw_status_line() {
+  local msg="$1"
+  tput cup $((TERM_HEIGHT-2)) 0
+  printf "%-${TERM_WIDTH}s\n" "${msg}"
+  tput cup 0 0
+}
+
+# ---------- list panel rendering ----------
+render_list_panel() {
+  local start=${TOP_INDEX}
+  local end=$(( start + PAGE_SIZE - 1 ))
+  local total=${#PKG_LIST[@]}
+  [ "${end}" -ge "${total}" ] && end=$(( total - 1 ))
+  # left column width = LIST_WIDTH
+  local i=0; local row=3
+  for (( idx=start; idx<=end; idx++ )); do
+    local disp="${PKG_DISPLAY[idx]}"
+    tput cup "${row}" 0
+    if [ "${idx}" -eq "${CUR_INDEX}" ]; then
+      # highlight active line in pink bold
+      printf "%b% -${LIST_WIDTH}s%b" "${T_BOLD}${T_PINK}" "${disp:0:LIST_WIDTH}" "${T_RESET}"
+    else
+      printf "% -${LIST_WIDTH}s" "${disp:0:LIST_WIDTH}"
+    fi
+    ((row++))
+  done
+  # fill remaining lines
+  for (( ; row<=$((PAGE_SIZE+2)); row++ )); do
+    tput cup "${row}" 0
+    printf "% -${LIST_WIDTH}s" " "
+  done
+  # draw vertical separator
+  for (( r=3; r<=PAGE_SIZE+2; r++ )); do
+    tput cup "${r}" $((LIST_WIDTH+1))
+    printf "|"
+  done
+}
+
+# ---------- detail panel rendering ----------
+render_detail_panel() {
+  local idx="${CUR_INDEX}"
+  local id="${PKG_LIST[idx]:-}"
+  local col0=$((LIST_WIDTH + 3))
+  tput cup 3 "${col0}"
+  if [ -z "${id}" ]; then
+    printf "%b% -${DETAIL_WIDTH}s%b" "${T_BOLD}" "No item selected" "${T_RESET}"
+    return
+  fi
+  # prefer cached detail
+  if [ -n "${DETAIL_CACHE[${id}]:-}" ]; then
+    detail="${DETAIL_CACHE[${id}]}"
+  else
+    # gather info: adm-db query, metafile content, detect output (limited)
+    detail=""
+    if [ -x "${ADM_DB_BIN}" ]; then
+      detail+="$(printf "%s\n" "== DB ==")"
+      detail+="$("${ADM_DB_BIN}" query "${id}" 2>/dev/null || echo "No db info")"
+      detail+=$'\n'
+    fi
+    mf="$(find_metafile_for "${id}" 2>/dev/null || true)"
+    if [ -n "${mf}" ]; then
+      detail+="$(printf "%s\n" "== Metafile: ${mf} ==")"
+      detail+="$(sed -n '1,120p' "${mf}" 2>/dev/null || true)"
+      detail+=$'\n'
+    fi
+    if [ -x "${ADM_DETECT_BIN}" ]; then
+      detail+="$(printf "%s\n" "== Detect ==")"
+      detail+="$("${ADM_DETECT_BIN}" "${mf:-${id}}" 2>/dev/null || echo "Detect not available")"
+    fi
+    DETAIL_CACHE[${id}]="${detail}"
+  fi
+  # print detail wrapped to DETAIL_WIDTH lines
+  local IFS=$'\n'
+  local r=3
+  for line in $(printf "%s" "${detail}" | sed -n '1,200p'); do
+    tput cup "${r}" "${col0}"
+    printf "% -${DETAIL_WIDTH}s" "${line:0:DETAIL_WIDTH}"
+    r=$((r+1))
+    [ "${r}" -gt $((PAGE_SIZE+2)) ] && break
+  done
+  # clear remaining area
+  for (( ; r<=PAGE_SIZE+2; r++ )); do
+    tput cup "${r}" "${col0}"
+    printf "% -${DETAIL_WIDTH}s" " "
+  done
+}
+
+# ---------- paging and movement ----------
+clamp_indexes() {
+  local total=${#PKG_LIST[@]}
+  [ "${CUR_INDEX}" -lt 0 ] && CUR_INDEX=0
+  [ "${CUR_INDEX}" -ge "${total}" ] && CUR_INDEX=$(( total - 1 ))
+  # ensure TOP_INDEX such that CUR_INDEX visible
+  if [ "${CUR_INDEX}" -lt "${TOP_INDEX}" ]; then
+    TOP_INDEX="${CUR_INDEX}"
+  elif [ "${CUR_INDEX}" -ge $(( TOP_INDEX + PAGE_SIZE )) ]; then
+    TOP_INDEX=$(( CUR_INDEX - PAGE_SIZE + 1 ))
+  fi
+  [ "${TOP_INDEX}" -lt 0 ] && TOP_INDEX=0
+}
+
+move_up() { CUR_INDEX=$((CUR_INDEX-1)); clamp_indexes; }
+move_down() { CUR_INDEX=$((CUR_INDEX+1)); clamp_indexes; }
+page_up() { CUR_INDEX=$((CUR_INDEX - PAGE_SIZE)); clamp_indexes; }
+page_down() { CUR_INDEX=$((CUR_INDEX + PAGE_SIZE)); clamp_indexes; }
+go_home() { CUR_INDEX=0; clamp_indexes; }
+go_end() { CUR_INDEX=$(( ${#PKG_LIST[@]} - 1 )); clamp_indexes; }
+
+# ---------- search (incremental) ----------
+do_search() {
+  local term="$1"
+  SEARCH_TERM="${term}"
+  # rebuild filtered lists
+  if [ -z "${term}" ]; then
+    load_pkg_list
+    CUR_INDEX=0; TOP_INDEX=0
+    return
+  fi
+  local new_list=(); local new_disp=()
+  for i in "${!PKG_LIST[@]}"; do
+    d="${PKG_DISPLAY[i]}"
+    id="${PKG_LIST[i]}"
+    if printf "%s\n" "${d}" | grep -i -- "${term}" >/dev/null 2>&1 || printf "%s\n" "${id}" | grep -i -- "${term}" >/dev/null 2>&1; then
+      new_list+=( "${id}" ); new_disp+=( "${d}" )
+    fi
+  done
+  PKG_LIST=( "${new_list[@]}" ); PKG_DISPLAY=( "${new_disp[@]}" )
+  CUR_INDEX=0; TOP_INDEX=0
+}
+
+# ---------- input loop (low-level reading) ----------
+read_key() {
+  # read one key (handles escape sequences)
+  IFS= read -rsn1 key 2>/dev/null || { echo ""; return 1; }
+  if [[ $key == $'\x1b' ]]; then
+    # possible sequence
+    IFS= read -rsn2 -t 0.0001 rest 2>/dev/null || true
+    key+="$rest"
+  fi
+  printf '%s' "$key"
+}
+
+# ---------- render full screen ----------
+render() {
+  draw_header
+  render_list_panel
+  render_detail_panel
+  draw_footer
+}
+
+# initial render
+render
+
+# end of part 2
+# adm-tui — parte 3/3 (key handling, actions and main loop)
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------- actions on selected item ----------
+get_selected_id() {
+  printf "%s" "${PKG_LIST[${CUR_INDEX}]:-}"
+}
+
+action_view_detail() {
+  local id
+  id="$(get_selected_id)"
+  if [ -z "${id}" ]; then adm_log WARN "Nenhum item selecionado."; return; fi
+  # show a pager-like full detail (temporary)
+  tput cnorm 2>/dev/null || true
+  stty sane
+  clear
+  printf "%bDetailed information for: %s%b\n\n" "${T_BOLD}${T_PINK}" "${id}" "${T_RESET}"
+  if [ -x "${ADM_DB_BIN}" ]; then
+    "${ADM_DB_BIN}" query "${id}" || true
+  fi
+  mf="$(find_metafile_for "${id}" 2>/dev/null || true)"
+  if [ -n "${mf}" ]; then
+    echo "== Metafile: ${mf} =="
+    sed -n '1,300p' "${mf}" || true
+  fi
+  if [ -x "${ADM_DETECT_BIN}" ]; then
+    echo "== Detect =="
+    "${ADM_DETECT_BIN}" "${mf:-${id}}" || true
+  fi
+  echo
+  read -rp "Press ENTER to return to TUI..."
+  # restore terminal drawing
+  stty "$STTY_SAVE" || true
+  tput civis 2>/dev/null || true
+  recompute_layout; render
+}
+
+action_build_selected() {
+  local id; id="$(get_selected_id)"
+  [ -z "${id}" ] && { adm_log WARN "Nenhum item selecionado"; return; }
+  mf="$(find_metafile_for "${id}" 2>/dev/null || true)"
+  if [ -z "${mf}" ]; then
+    # if user selected a package name without metafile, ask to input metafile
+    read -rp "Metafile não encontrado. Fornecer caminho para metafile (enter para cancelar): " mfinput
+    [ -z "${mfinput}" ] && { adm_log INFO "Cancelado"; return; }
+    mf="${mfinput}"
+  fi
+  # confirm
+  if ! confirm_prompt "Executar build de ${id} (metafile ${mf})?"; then adm_log INFO "Build cancelado"; return; fi
+  # call adm-build
+  if [ ! -x "${ADM_BUILD_BIN}" ]; then adm_log ERR "adm-build não disponível: ${ADM_BUILD_BIN}"; return; fi
+  safe_exec_tui "adm-build ${mf}" "${ADM_BUILD_BIN}" --metafile "${mf}" --no-dry-run --jobs "${ADM_JOBS:-1}"
+  # refresh list and details after build
+  load_pkg_list; recompute_layout; render
+}
+
+action_install_selected() {
+  local id; id="$(get_selected_id)"
+  [ -z "${id}" ] && { adm_log WARN "Nenhum item selecionado"; return; }
+  read -rp "Usar --resolve para construir dependências se necessário? [y/N]: " ans
+  local resolve=0
+  case "${ans}" in [yY]*) resolve=1 ;; esac
+  if [ "${resolve}" -eq 1 ]; then
+    # call internal resolve flow (we can invoke adm-tui's resolver helper via adm-resolver or adm script)
+    if [ -x "${ADM_RESOLVER_BIN}" ]; then
+      # ask for confirmation
+      if ! confirm_prompt "Instalar ${id} com resolução e build de dependências?"; then adm_log INFO "Instalação cancelada"; return; fi
+      safe_exec_tui "adm-resolver plan ${id}" "${ADM_RESOLVER_BIN}" "${id}" --plan --out "${ADM_TEMP}/resolver-plan-${id//\//_}.txt" || adm_log WARN "Resolver falhou (continua tentando)"
+      # attempt to build plan file if exists
+      planfile="${ADM_TEMP}/resolver-plan-${id//\//_}.txt"
+      if [ -f "${planfile}" ]; then
+        while IFS= read -r mf; do
+          [ -z "${mf}" ] && continue
+          safe_exec_tui "adm-build ${mf}" "${ADM_BUILD_BIN}" --metafile "${mf}" --no-dry-run --jobs "${ADM_JOBS:-1}"
+        done < "${planfile}"
+      else
+        adm_log WARN "Plano não encontrado; tentando build direto"
+        action_build_selected
+      fi
+      # finally call adm-install on produced artifacts
+      # try to find artifact by name/version
+      # simple attempt:
+      art="$(find_package_archive_in_repo "${id}" 2>/dev/null || true)"
+      if [ -n "${art}" ]; then
+        safe_exec_tui "adm-install ${art}" "${ADM_INSTALL_BIN}" install "${art}"
+      else
+        adm_log WARN "Artefato não localizado para ${id}; inspecione logs."
+      fi
+    else
+      adm_log WARN "adm-resolver ausente; usando build direto"
+      action_build_selected
+    fi
+  else
+    # prefer to install artifact if exists
+    art="$(find_package_archive_in_repo "${id}" 2>/dev/null || true)"
+    if [ -z "${art}" ]; then
+      read -rp "Artefato não encontrado. Deseja fornecer arquivo/destdir para instalar? (enter cancela): " cand
+      [ -z "${cand}" ] && { adm_log INFO "Instalação cancelada"; return; }
+      art="${cand}"
+    fi
+    if ! confirm_prompt "Instalar ${art}?"; then adm_log INFO "Instalação cancelada"; return; fi
+    if [ ! -x "${ADM_INSTALL_BIN}" ]; then adm_log ERR "adm-install não disponível"; return; fi
+    safe_exec_tui "adm-install ${art}" "${ADM_INSTALL_BIN}" install "${art}"
+  fi
+  # refresh lists
+  load_pkg_list; recompute_layout; render
+}
+
+action_update_selected() {
+  local id; id="$(get_selected_id)"; [ -z "${id}" ] && { adm_log WARN "Nenhum item selecionado"; return; }
+  if [ ! -x "${ADM_UPDATE_BIN}" ]; then adm_log ERR "adm-update indisponível"; return; fi
+  safe_exec_tui "adm-update check ${id}" "${ADM_UPDATE_BIN}" check "${id}"
+  # if update candidate exists, offer apply
+  upd_dir="${ADM_UPDATE}/${id}"
+  if [ -d "${upd_dir}" ] && [ -f "${upd_dir}/metafile" ]; then
+    read -rp "Aplicar atualização detectada para ${id}? [y/N]: " ans
+    case "${ans}" in [yY]*) safe_exec_tui "adm-update apply ${id}" "${ADM_UPDATE_BIN}" apply "${id}" ;; *) adm_log INFO "Atualização não aplicada" ;; esac
+  fi
+}
+
+action_resolver_selected() {
+  local id; id="$(get_selected_id)"; [ -z "${id}" ] && { adm_log WARN "Nenhum item selecionado"; return; }
+  if [ ! -x "${ADM_RESOLVER_BIN}" ]; then adm_log ERR "adm-resolver indisponível"; return; fi
+  safe_exec_tui "adm-resolver ${id}" "${ADM_RESOLVER_BIN}" "${id}"
+}
+
+action_exec_command() {
+  read -rp "Comando a executar (será executado no host): " cmd
+  [ -z "${cmd}" ] && { adm_log INFO "Cancelado"; return; }
+  if ! confirm_prompt "Executar no host: ${cmd}?"; then adm_log INFO "Cancelado"; return; fi
+  safe_exec_tui "exec ${cmd}" /bin/sh -c "${cmd}"
+}
+
+action_search_mode() {
+  # interactive search prompt
+  read -rp "Search term (empty to clear): " term
+  do_search "${term}"
+  recompute_layout; render
+}
+
+# ---------- helper: find_package_archive_in_repo (same logic as adm) ----------
+find_package_archive_in_repo() {
+  local ident="$1"
+  if [ -d "${ADM_PACKAGES}" ]; then
+    local found
+    found="$(find "${ADM_PACKAGES}" -maxdepth 2 -type f \( -iname "*${ident}*.tar.*" -o -iname "*${ident}*.zip" \) 2>/dev/null | head -n1 || true)"
+    if [ -n "${found}" ]; then printf "%s" "${found}"; return 0; fi
+  fi
+  return 1
+}
+
+# ---------- main input loop ----------
+main_loop() {
+  recompute_layout
+  render
+  while :; do
+    key="$(read_key || true)"
+    case "${key}" in
+      $'\x1b[A'|k) move_up; render ;;           # up
+      $'\x1b[B'|j) move_down; render ;;         # down
+      $'\x1b[5~') page_up; render ;;            # PgUp
+      $'\x1b[6~') page_down; render ;;          # PgDn
+      $'\x1b[H'|g) go_home; render ;;           # Home
+      $'\x1b[F'|G) go_end; render ;;            # End
+      "") action_view_detail; render ;;         # Enter (newline)
+      "/" ) action_search_mode; render ;;       # slash search
+      "b" ) action_build_selected; render ;;    # build
+      "i" ) action_install_selected; render ;;  # install
+      "u" ) action_update_selected; render ;;   # update check/apply
+      "r" ) action_resolver_selected; render ;; # resolver
+      "c" ) action_exec_command; render ;;      # exec arbitrary
+      $'\x1b'|q)  # ESC or q -> exit
+           if confirm_prompt "Sair do ADM TUI?"; then cleanup_and_exit 0; else render; fi
+           ;;
+      *) 
+        # ignore unknown, allow single-character fuzzy search
+        if [ "${#key}" -eq 1 ]; then
+          do_search "${key}"
+          render
+        fi
+        ;;
+    esac
+  done
+}
+
+# ---------- start loop ----------
+main_loop
+
+# cleanup (trap will call cleanup_and_exit)
