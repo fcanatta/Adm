@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# post-install — ajustar symlinks e preparar toolchain
+
+set -e
+echo "[adm-hook] ajustando links simbólicos do binutils..."
+
+# Corrigir links principais no chroot/bootstrap
+if [ -d "${DESTDIR}/usr/bin" ]; then
+  ln -sf ld "${DESTDIR}/usr/bin/ld.gold" 2>/dev/null || true
+  ln -sf ld "${DESTDIR}/usr/bin/ld.bfd" 2>/dev/null || true
+  ln -sf "${DESTDIR}/usr/bin/ld" "${DESTDIR}/bin/ld" 2>/dev/null || true
+fi
+
+# Registrar o caminho do linker padrão
+echo "/usr/bin/ld" > "${DESTDIR}/usr/src/adm/db/toolchain-linker-path"
+
+echo "[adm-hook] links e registros do toolchain atualizados."
