@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# glibc stage2 post-install — ajustes após make install do rebuild
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+LFS="${LFS:-${DESTDIR}}"
+
+echo "[glibc stage2 post-install] ajustes pós-instalação em ${DESTDIR}..."
+
+# Atualizar ld.so.cache no staging, se ldconfig disponível dentro do chroot/staging
+if [ -x "${DESTDIR}/sbin/ldconfig" ]; then
+  if [ -n "${CHROOT_PATH:-}" ] && command -v adm-chroot >/dev/null 2>&1; then
+    echo "[adm-hook] executando ldconfig dentro do chroot ${CHROOT_PATH}"
+    adm-chroot exec "${CHROOT_PATH}" -- /sbin/ldconfig || true
+  else
+    echo "[adm-hook] atualizando ld.so.cache no DESTDIR"
+    chroot "${DESTDIR}" /sbin/ldconfig || true
+  fi
+fi
+
+# Validar que bibliotecas críticas (libc.so, libm.so) estejam presentes
+if [ -f "${DESTDIR}/usr/lib/libc.so" ] || [ -f "${DESTDIR}/lib/libc.so" ] || [ -f "${DESTDIR}/lib64/libc.so" ]; then
+  echo "[adm-hook] libc encontrada no DESTDIR."
+else
+  echo "[adm-hook] WARN: libc não encontrada no DESTDIR (verificar instalação)." >&2
+fi
+
+# Rodar simples sanity compile test dentro do staging (se cross gcc disponível)
+echo 'int main(){}' > "${WORKDIR}/dummy.c"
+if [ -n "${CHROOT_PATH:-}" ] && command -v adm-chroot >/dev/null 2>&1; then
+  adm-chroot exec "${CHROOT_PATH}" -- sh -c "gcc -o /tmp/a.out /tmp/dummy.c" 2>/dev/null && echo "[adm-hook] sanity compile OK in chroot" || true
+else
+  if command -v gcc >/dev/null 2>&1; then
+    gcc -o "${WORKDIR}/a.out" "${WORKDIR}/dummy.c" 2>/dev/null && echo "[adm-hook] sanity compile OK" || true
+  fi
+fi
+rm -f "${WORKDIR}/dummy.c" "${WORKDIR}/a.out" 2>/dev/null || true
+
+# Registrar no adm-db se disponível
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db add --name glibc --version "${VERSION:-unknown}" --file "${DESTDIR}" --category toolchain || true
+fi
+
+echo "[glibc stage2 post-install] concluído."
+exit 0
