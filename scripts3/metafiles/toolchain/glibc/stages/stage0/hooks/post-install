@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# glibc stage0 post-install — ajustes e sanity checks após build cross-toolchain
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+LFS="${LFS:-${DESTDIR}}"
+
+echo "[glibc stage0 post-install] aplicando correções pós-instalação..."
+
+# --- Ajuste do ldd (remove /usr do RTLDLIST) ---
+if [ -f "${LFS}/usr/bin/ldd" ]; then
+  echo "[adm-hook] corrigindo RTLDLIST no ldd..."
+  sed '/RTLDLIST=/s@/usr@@g' -i "${LFS}/usr/bin/ldd"
+fi
+
+# --- Teste de sanidade (do LFS) ---
+echo "[adm-hook] executando sanity check de compilador..."
+echo 'int main(){}' | ${LFS_TGT:-x86_64-lfs-linux-gnu}-gcc -x c - -v -Wl,--verbose &> "${WORKDIR}/dummy.log" || true
+
+grep 'requesting program interpreter' "${WORKDIR}/dummy.log" || true
+grep -E '/lib(64)?/ld-linux' "${WORKDIR}/dummy.log" || true
+grep found "${WORKDIR}/dummy.log" || true
+rm -f "${WORKDIR}/a.out" "${WORKDIR}/dummy.log" 2>/dev/null || true
+
+echo "[glibc stage0 post-install] correções e sanity checks concluídos."
