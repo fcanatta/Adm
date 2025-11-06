@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage0 post-install] verificando instalação bootstrap de binutils..."
+"${DESTDIR}/tools/bin/ld" --version | head -n1
