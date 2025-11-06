@@ -1,0 +1,24 @@
+# Glibc stage2 (rebuild com toolchain interno)
+PREFIX="/usr"
+BUILD_SYSTEM="autotools"
+
+# Dependências para stage2 — espera-se que binutils e gcc "stage1" já estejam prontos
+BUILD_DEPS="gcc binutils make texinfo"
+RUN_DEPS="glibc"
+OPT_DEPS=""
+
+# Extras de configure recomendados para stage2 (ADM concatenará com defaults)
+# Usa opções estáveis: instalar em /usr, habilitar otimizações finais, sem nscd
+CONFIGURE_EXTRAS="
+--prefix=/usr
+--disable-werror
+--enable-kernel=5.4
+libc_cv_slibdir=/usr/lib
+--with-headers=/usr/include
+--enable-stack-protector=strong
+--enable-obsolete-rpc
+"
+
+# Marcação semântica para orquestrador
+STAGE_ROLE="rebuild-c-library"
+BOOTSTRAP_ROLE="toolchain-rebuild"
