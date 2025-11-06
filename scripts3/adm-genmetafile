@@ -1,375 +1,206 @@
 #!/usr/bin/env bash
+# adm-genmetafile — Gerador de metafiles reais para o sistema ADM
+# Autor: GPT-5 para o sistema ADM de Fernando
+# Versão: 2.0 (formato real funcional do ADM)
 #
-# adm-genmetafile
-# Gera automaticamente um metafile KEY=VAL para uma fonte (tarball, dir, git)
-# Adaptado para ADM: escreve em /usr/src/adm/metafiles/<category>/<name>/metafile
+# Gera metafile em: /usr/src/adm/metafiles/<categoria>/<pacote>/metafile
 #
-# Uso:
-#   adm-genmetafile <source> [--category <cat>] [--out-dir <dir>] [--dry-run] [--force]
-#   adm-genmetafile <source> [--name <name>] [--version <version>]
-#
-# Fonte pode ser:
-# - arquivo tarball (.tar.gz .tar.xz .tar.bz2 .tar.zst .zip)
-# - diretório local com fonte
-# - git URL (https://.../.git or git@...) -> tenta listar tags primeiro; faz clone shallow se necessário
-#
+# Detecta: nome, versão, build system, dependências, checksums, URLs múltiplas, etc.
+# Cria diretórios de hooks e patches automaticamente.
+# Segue a arquitetura do ADM (adm-detect, adm-build, adm-resolver, adm-download).
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------- CONFIG DEFAULTS (respeita env ADM_* se definido) ----------
-ADM_METAFILES="${ADM_METAFILES:-/usr/src/adm/metafiles}"
-ADM_TEMP="${ADM_TEMP:-/tmp}"
-ADM_DRYRUN_DEFAULT="${ADM_DRYRUN:-0}"
+ADM_METAFILES="/usr/src/adm/metafiles"
+TMPDIR="$(mktemp -d /tmp/adm-genmeta.XXXXXX)"
+trap 'rm -rf "$TMPDIR"' EXIT
 
-# ---------- HELP / USAGE ----------
-usage() {
-  cat <<EOF
-Usage: $(basename "$0") <source> [options]
+# ==== Funções utilitárias ====
+log() { printf "\033[1;36m[adm-genmetafile]\033[0m %s\n" "$*"; }
+warn() { printf "\033[1;33m[WARN]\033[0m %s\n" "$*"; }
+err() { printf "\033[1;31m[ERRO]\033[0m %s\n" "$*" >&2; exit 1; }
 
-source:
-  path/to/archive.tar.xz  directory/path  git@...:repo.git  https://.../repo.git
-
-options:
-  --category <cat>   Category (default: misc)
-  --out-dir <dir>    Base output dir for metafiles (default: ${ADM_METAFILES})
-  --dry-run          Show generated metafile, don't write
-  --force            Overwrite existing metafile
-  --name <name>      Force package name
-  --version <ver>    Force package version
-  -h|--help          Show this help
-EOF
-  exit 1
+# Detectar nome e versão a partir de um arquivo tarball
+detect_name_version() {
+  local file base
+  file="$1"
+  base="$(basename "$file")"
+  base="${base%.tar.xz}"; base="${base%.tar.gz}"; base="${base%.tar.bz2}"; base="${base%.tar.zst}"; base="${base%.zip}"
+  if [[ "$base" =~ ^([A-Za-z0-9._+-]+)-([0-9]+(\.[0-9]+)*.*)$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+  else
+    echo "$base unknown"
+  fi
 }
 
-# ---------- HELPERS ----------
-_has() { command -v "$1" >/dev/null 2>&1; }
-
-log()  { printf "\033[1;36m[genmeta]\033[0m %s\n" "$*" >&2; }
-info() { printf "\033[1;32m[info]\033[0m %s\n" "$*" >&2; }
-warn() { printf "\033[1;33m[warn]\033[0m %s\n" "$*" >&2; }
-die()  { printf "\033[1;31m[error]\033[0m %s\n" "$*" >&2; exit 1; }
-
-# safe sha256
 sha256_of() {
-  local f="$1"
-  if [ -f "$f" ]; then
-    if _has sha256sum; then sha256sum "$f" | awk '{print $1}'; return 0; fi
-    if _has shasum; then shasum -a 256 "$f" | awk '{print $1}'; return 0; fi
-  fi
-  return 1
-}
-
-# choose decompressor flags for tar
-extract_tarball() {
-  local tarfile="$1" dest="$2"
-  mkdir -p "$dest"
-  case "$tarfile" in
-    *.tar.xz) tar -xJf "$tarfile" -C "$dest" ;;
-    *.tar.gz|*.tgz) tar -xzf "$tarfile" -C "$dest" ;;
-    *.tar.bz2) tar -xjf "$tarfile" -C "$dest" ;;
-    *.tar.zst)
-      if _has zstd; then zstd -d -c "$tarfile" | tar -xf - -C "$dest"
-      elif _has unzstd; then unzstd -c "$tarfile" | tar -xf - -C "$dest"
-      else die "Extrair .zst requer 'zstd' ou 'unzstd'"; fi
-      ;;
-    *.zip) if _has unzip; then unzip -q "$tarfile" -d "$dest"; else die "zip detectado mas 'unzip' ausente"; fi ;;
-    *) tar -xf "$tarfile" -C "$dest" || die "Falha ao extrair $tarfile" ;;
-  esac
-}
-
-# shallow clone (safe) trying to avoid heavy clones
-git_shallow_clone() {
-  local url="$1" dest="$2"
-  if ! _has git; then die "git não disponível para clonar ${url}"; fi
-  mkdir -p "$dest"
-  # try to get default branch name
-  local default_branch
-  default_branch="$(git ls-remote --symref "$url" HEAD 2>/dev/null | awk '/ref:/{print $2}' | awk -F/ '{print $NF}' | head -n1 || true)"
-  default_branch="${default_branch:-master}"
-  # shallow clone default branch; if fails, fallback to depth 1 full clone
-  if ! git clone --depth 1 --branch "$default_branch" "$url" "$dest" 2>/dev/null; then
-    log "Clone shallow falhou; tentando clone depth 1 sem branch..."
-    git clone --depth 1 "$url" "$dest" 2>/dev/null || die "Clone git falhou para ${url}"
-  fi
-}
-
-# attempt to query remote tags without cloning
-git_latest_tag_remote() {
-  local url="$1"
-  if ! _has git; then return 1; fi
-  git ls-remote --tags --refs --sort="v:refname" "$url" 2>/dev/null | awk -F/ '{print $NF}' | tail -n1 || return 1
-}
-
-# remove temp cleanly
-safe_rmdir() {
-  local d="$1"
-  if [ -n "$d" ] && [[ "$d" == "$ADM_TEMP/"* || "$d" == /tmp/* ]]; then
-    rm -rf "$d" || true
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
   else
-    warn "Refusing to remove suspicious temp dir: $d"
+    echo ""
   fi
 }
 
-# ---------- ARG PARSING ----------
-SRC="${1:-}" || usage
-shift || true
-
-CATEGORY="misc"
-OUT_BASE="${ADM_METAFILES}"
-DRYRUN="${ADM_DRYRUN_DEFAULT}"
-FORCE=0
-FORCED_NAME=""
-FORCED_VER=""
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --category) CATEGORY="${2:-}"; shift 2 ;;
-    --out-dir)  OUT_BASE="${2:-}"; shift 2 ;;
-    --dry-run)  DRYRUN=1; shift ;;
-    --force)    FORCE=1; shift ;;
-    --name)     FORCED_NAME="${2:-}"; shift 2 ;;
-    --version)  FORCED_VER="${2:-}"; shift 2 ;;
-    -h|--help)  usage ;;
-    *) die "Unknown arg: $1" ;;
-  esac
-done
-
-[ -n "$SRC" ] || usage
-
-log "Source: $SRC"
-log "Category: $CATEGORY  Out: $OUT_BASE  dry-run:${DRYRUN} force:${FORCE}"
-
-# ---------- CREATE WORKDIR ----------
-TMPROOT="$(mktemp -d "${ADM_TEMP}/adm-genmeta.XXXXXX")"
-trap 'safe_rmdir "${TMPROOT}"' EXIT
-
-WORKDIR=""
-IS_TARBALL=0
-IS_DIR=0
-IS_GIT=0
-TARBALL_PATH=""
-
-if [ -d "$SRC" ]; then
-  IS_DIR=1
-  # copy source efficiently: rsync if available, else cp -a
-  if _has rsync; then rsync -a --delete "$SRC/" "${TMPROOT}/src/"; else cp -a "$SRC" "${TMPROOT}/src/"; fi
-  WORKDIR="${TMPROOT}/src"
-elif [[ "$SRC" =~ \.git$ ]] || [[ "$SRC" =~ ^git@ ]] || [[ "$SRC" =~ ^https?://.*\.git ]]; then
-  IS_GIT=1
-  log "Source looks like git URL; attempting to detect tags without cloning..."
-  TAG="$(git_latest_tag_remote "$SRC" 2>/dev/null || true)"
-  if [ -n "${TAG}" ]; then
-    info "Remote latest tag: ${TAG}"
-  else
-    info "Não foi possível obter tag remota; farei um clone shallow para inspeção"
-  fi
-  git_shallow_clone "$SRC" "${TMPROOT}/src"
-  WORKDIR="${TMPROOT}/src"
-else
-  # assume file - verify exists
-  if [ ! -f "$SRC" ]; then die "Arquivo fonte não encontrado: $SRC"; fi
-  IS_TARBALL=1
-  TARBALL_PATH="$(realpath "$SRC")"
-  log "Extrair tarball para inspeção..."
-  extract_tarball "$TARBALL_PATH" "${TMPROOT}/src"
-  # if extraction yields a single top-level dir, use it
-  # choose first directory under tmp/src that contains files
-  if [ -d "${TMPROOT}/src" ]; then
-    # find first subdir that is not empty
-    candidate="$(find "${TMPROOT}/src" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)"
-    if [ -n "$candidate" ]; then
-      WORKDIR="$candidate"
-    else
-      WORKDIR="${TMPROOT}/src"
-    fi
-  else
-    die "Erro ao extrair tarball para ${TMPROOT}/src"
-  fi
-fi
-
-[ -n "$WORKDIR" ] || die "Não foi possível preparar WORKDIR"
-
-log "Workdir preparado em: ${WORKDIR}"
-
-# ---------- INFER NAME / VERSION ----------
-NAME="" VERSION=""
-
-[ -n "$FORCED_NAME" ] && NAME="$FORCED_NAME"
-[ -n "$FORCED_VER" ]  && VERSION="$FORCED_VER"
-
-# If tarball, try infer from filename
-if [ "$IS_TARBALL" -eq 1 ] && [ -z "$NAME" ]; then
-  base="$(basename "$TARBALL_PATH")"
-  base="${base%.tar.xz}"; base="${base%.tar.gz}"; base="${base%.tgz}"; base="${base%.tar.bz2}"; base="${base%.tar.zst}"; base="${base%.zip}"
-  if [[ "$base" =~ ^(.+)-([0-9]+\.[0-9]+.*)$ ]]; then
-    NAME="${BASH_REMATCH[1]}"
-    VERSION="${BASH_REMATCH[2]}"
-  elif [[ "$base" =~ ^(.+)_([0-9]+\.[0-9]+.*)$ ]]; then
-    NAME="${BASH_REMATCH[1]}"
-    VERSION="${BASH_REMATCH[2]}"
-  else
-    NAME="$base"
-  fi
-fi
-
-# parse configure.ac AC_INIT if present
-if [ -z "$NAME" ] || [ -z "$VERSION" ]; then
-  if [ -f "${WORKDIR}/configure.ac" ]; then
-    ac_line="$(grep -Eo "AC_INIT\\([^)]*\\)" "${WORKDIR}/configure.ac" | head -n1 || true)"
-    if [ -n "$ac_line" ]; then
-      inner="$(printf "%s" "$ac_line" | sed -E 's/^[^(]*\((.*)\).*$/\1/')"
-      # split by comma, remove quotes
-      name_guess="$(printf "%s" "$inner" | awk -F, '{print $1}' | sed -E 's/["'\'' ]//g' | xargs)"
-      ver_guess="$(printf "%s" "$inner" | awk -F, '{print $2}' | sed -E 's/["'\'' ]//g' | xargs)"
-      [ -n "$name_guess" ] && [ -z "$NAME" ] && NAME="$name_guess"
-      [ -n "$ver_guess" ] && [ -z "$VERSION" ] && VERSION="$ver_guess"
-    fi
-  fi
-fi
-
-# package.json
-if [ -z "$NAME" ] && [ -f "${WORKDIR}/package.json" ]; then
-  name="$(grep -E '"name"' "${WORKDIR}/package.json" | head -n1 | sed -E 's/.*:[[:space:]]*"(.*)".*/\1/')" || true
-  [ -n "$name" ] && NAME="$name"
-fi
-
-# Cargo.toml
-if [ -z "$NAME" ] && [ -f "${WORKDIR}/Cargo.toml" ]; then
-  name="$(awk -F= '/^name/{gsub(/"/,"",$2); print $2; exit}' "${WORKDIR}/Cargo.toml" | xargs)" || true
-  [ -n "$name" ] && NAME="$name"
-fi
-
-# fallback to git describe for version
-if [ -z "$VERSION" ] && [ -d "${WORKDIR}/.git" ] && _has git; then
-  ver="$(git -C "${WORKDIR}" describe --tags --abbrev=0 2>/dev/null || true)"
-  ver="${ver#v}"
-  [ -n "$ver" ] && VERSION="$ver"
-fi
-
-# fallback name from folder
-if [ -z "$NAME" ]; then
-  NAME="$(basename "${WORKDIR}")"
-fi
-
-# fallback version empty is allowed but warn
-if [ -z "$VERSION" ]; then
-  warn "Versão não detectada; metafile terá VERSION=\"\""
-fi
-
-log "Detected NAME=${NAME} VERSION=${VERSION}"
-
-# ---------- DETECT BUILD SYSTEM & FEATURES ----------
 detect_build_system() {
   local d="$1"
-  local bs="unknown"
-  [ -f "${d}/configure" ]    && bs="autotools"
-  [ -f "${d}/CMakeLists.txt" ] && bs="cmake"
-  [ -f "${d}/meson.build" ]  && bs="meson"
-  [ -f "${d}/setup.py" ]     && bs="python"
-  [ -f "${d}/pyproject.toml" ] && bs="python"
-  [ -f "${d}/Cargo.toml" ]   && bs="cargo"
-  [ -f "${d}/package.json" ] && bs="node"
-  [ -f "${d}/Makefile" ] && [ "${bs}" = "unknown" ] && bs="make"
-  local feats=""
-  # quick scan for rust files
-  if find "${d}" -type f -name '*.rs' | grep -q . 2>/dev/null; then feats="${feats} rust"; fi
-  printf "%s|%s" "${bs}" "${feats}"
+  if [ -f "$d/configure" ] || [ -f "$d/configure.ac" ]; then
+    echo "autotools"
+  elif [ -f "$d/CMakeLists.txt" ]; then
+    echo "cmake"
+  elif [ -f "$d/meson.build" ]; then
+    echo "meson"
+  elif [ -f "$d/setup.py" ] || [ -f "$d/pyproject.toml" ]; then
+    echo "python"
+  elif [ -f "$d/Cargo.toml" ]; then
+    echo "cargo"
+  elif [ -f "$d/package.json" ]; then
+    echo "node"
+  elif [ -f "$d/Makefile" ]; then
+    echo "make"
+  else
+    echo "manual"
+  fi
 }
-bs_feat="$(detect_build_system "${WORKDIR}")"
-BUILD_SYSTEM="${bs_feat%%|*}"
-FEATURES="${bs_feat##*|}"
-log "Build system: ${BUILD_SYSTEM}  features:${FEATURES}"
 
-# ---------- GUESS DEPENDENCIES ----------
-guess_build_deps() {
+build_deps_for() {
   case "$1" in
     autotools) echo "gcc make autoconf automake libtool m4 texinfo" ;;
-    cmake)     echo "cmake make gcc" ;;
-    meson)     echo "meson ninja gcc python3" ;;
-    python)    echo "python3 python3-setuptools python3-pip" ;;
-    cargo)     echo "rustc cargo" ;;
-    node)      echo "node npm" ;;
-    make)      echo "gcc make" ;;
-    *)         echo "gcc make" ;;
+    cmake) echo "gcc make cmake" ;;
+    meson) echo "gcc meson ninja python3" ;;
+    cargo) echo "rustc cargo" ;;
+    python) echo "python3 setuptools" ;;
+    node) echo "node npm" ;;
+    make) echo "gcc make" ;;
+    manual) echo "gcc make" ;;
+    *) echo "gcc make" ;;
   esac
 }
-guess_run_deps() {
+
+run_deps_for() {
   case "$1" in
     python) echo "python3" ;;
-    node)   echo "node" ;;
-    *)      echo "" ;;
+    node) echo "node" ;;
+    *) echo "" ;;
   esac
 }
-BUILD_DEPS="$(guess_build_deps "${BUILD_SYSTEM}")"
-RUN_DEPS="$(guess_run_deps "${BUILD_SYSTEM}")"
 
-# ---------- SHA256 (if tarball available) ----------
+# ==== Entrada e parsing ====
+SRC="${1:-}"
+CATEGORY="${2:-misc}"
+
+[ -z "$SRC" ] && err "Uso: adm-genmetafile <arquivo|diretorio|git> [categoria]"
+
+OUT_BASE="${ADM_METAFILES}/${CATEGORY}"
+
+mkdir -p "$OUT_BASE"
+
+# ==== Determinar tipo de fonte ====
+if [[ "$SRC" =~ \.tar.*$ || "$SRC" =~ \.zip$ ]]; then
+  TYPE="tarball"
+elif [[ "$SRC" =~ \.git$ || "$SRC" =~ ^git@ || "$SRC" =~ ^https?://.*\.git ]]; then
+  TYPE="git"
+elif [ -d "$SRC" ]; then
+  TYPE="dir"
+else
+  err "Fonte inválida: $SRC"
+fi
+
+# ==== Preparar nome e versão ====
+NAME=""; VERSION=""
+
+if [ "$TYPE" = "tarball" ]; then
+  read -r NAME VERSION < <(detect_name_version "$SRC")
+elif [ "$TYPE" = "git" ]; then
+  NAME="$(basename "$SRC" .git)"
+  VERSION="$(git ls-remote --tags "$SRC" | awk -F/ '{print $NF}' | sort -V | tail -n1)"
+  VERSION="${VERSION:-git-latest}"
+else
+  NAME="$(basename "$SRC")"
+  VERSION="dev"
+fi
+
+[ -n "$NAME" ] || err "Não foi possível detectar o nome"
+[ -n "$VERSION" ] || VERSION="unknown"
+
+WORKDIR="${TMPDIR}/${NAME}-${VERSION}"
+mkdir -p "$WORKDIR"
+
+# ==== Detectar build system e deps (opcionalmente extraindo tarball) ====
+if [ "$TYPE" = "tarball" ]; then
+  tar -tf "$SRC" >/dev/null 2>&1 || err "Arquivo inválido: $SRC"
+  tar -xf "$SRC" -C "$TMPDIR"
+  subdir="$(find "$TMPDIR" -maxdepth 1 -type d ! -path "$TMPDIR" | head -n1)"
+  BUILD_SYSTEM="$(detect_build_system "$subdir")"
+elif [ "$TYPE" = "dir" ]; then
+  BUILD_SYSTEM="$(detect_build_system "$SRC")"
+elif [ "$TYPE" = "git" ]; then
+  TMP_GIT="${TMPDIR}/repo"
+  git clone --depth 1 "$SRC" "$TMP_GIT" >/dev/null 2>&1 || err "Falha ao clonar repositório git"
+  BUILD_SYSTEM="$(detect_build_system "$TMP_GIT")"
+else
+  BUILD_SYSTEM="manual"
+fi
+
+BUILD_DEPS="$(build_deps_for "$BUILD_SYSTEM")"
+RUN_DEPS="$(run_deps_for "$BUILD_SYSTEM")"
+OPT_DEPS=""
+
 SHA256=""
-if [ "$IS_TARBALL" -eq 1 ]; then
-  if sha256_of "$TARBALL_PATH" >/dev/null 2>&1; then
-    SHA256="$(sha256_of "$TARBALL_PATH")"
-    log "SHA256 computed: ${SHA256}"
-  else
-    warn "Não foi possível calcular SHA256 do tarball (ferramenta ausente?)"
-  fi
+if [ "$TYPE" = "tarball" ]; then
+  SHA256="$(sha256_of "$SRC")"
 fi
 
-# ---------- PREPARE OUTPUT PATH ----------
-OUT_DIR="${OUT_BASE%/}/${CATEGORY}/${NAME}"
-METAFILE="${OUT_DIR}/metafile"
-
-if [ -f "${METAFILE}" ] && [ "${FORCE}" -ne 1 ]; then
-  die "Metafile já existe em ${METAFILE} (use --force para sobrescrever)"
+# ==== Gerar bloco de URLs múltiplas ====
+URLS=""
+if [ "$TYPE" = "tarball" ]; then
+  base="$(basename "$SRC")"
+  URLS="
+https://ftp.gnu.org/gnu/${NAME}/${base}
+ftp://ftp.gnu.org/gnu/${NAME}/${base}
+rsync://ftp.gnu.org/gnu/${NAME}/${base}
+git://git.savannah.gnu.org/${NAME}.git
+sourceforge://${NAME}/${base}
+"
+elif [ "$TYPE" = "git" ]; then
+  URLS="
+${SRC}
+"
+else
+  URLS="file://${SRC}"
 fi
 
-# ---------- BUILD metafile content ----------
-NOW="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-FILENAME=""
-if [ "$IS_TARBALL" -eq 1 ]; then FILENAME="$(basename "$TARBALL_PATH")"; fi
+# ==== Criar diretório final ====
+DEST_DIR="${OUT_BASE}/${NAME}"
+mkdir -p "${DEST_DIR}/hooks" "${DEST_DIR}/patches"
 
-cat > "${TMPROOT}/adm-genmetafile.out" <<EOF
+# ==== Gerar metafile funcional ADM ====
+METAFILE="${DEST_DIR}/metafile"
+
+cat > "$METAFILE" <<EOF
+# Metafile gerado automaticamente pelo adm-genmetafile (formato funcional ADM)
 NAME="${NAME}"
 VERSION="${VERSION}"
 CATEGORY="${CATEGORY}"
-SUMMARY="${NAME}"
-DESCRIPTION="Auto-generated metafile for ${NAME}"
-HOMEPAGE=""
-URLS="${SRC}"
-FILENAME="${FILENAME}"
-SHA256="${SHA256}"
 BUILD_SYSTEM="${BUILD_SYSTEM}"
-BUILD_DIR="\${WORKDIR:-/usr/src/adm/builds/${CATEGORY}/${NAME}}"
-PREFIX="/usr"
-DESTDIR="\${ADM_DESTDIR:-/usr/src/adm/destdir/${CATEGORY}/${NAME}}"
-CONFIGURE_ARGS=""
-MAKE_ARGS=""
-INSTALL_ARGS=""
+
+URLS="${URLS}"
+SHA256="${SHA256}"
+
 BUILD_DEPS="${BUILD_DEPS}"
 RUN_DEPS="${RUN_DEPS}"
-OPT_DEPS=""
-PATCHES=""
-HOOKS=""
-ADM_GENERATED_BY="adm-genmetafile"
-ADM_GENERATED_ON="${NOW}"
-ADM_META_FORMAT="kv"
-ADM_META_VERSION="1"
+OPT_DEPS="${OPT_DEPS}"
+
+# Campos internos de integração ADM
+STAGE="0"
+PROFILE="system"
+HOOKS_AUTO="1"
 EOF
 
-# ---------- OUTPUT or WRITE ----------
-if [ "${DRYRUN}" -eq 1 ]; then
-  info "[dry-run] metafile content:"
-  sed -n '1,200p' "${TMPROOT}/adm-genmetafile.out"
-  safe_rmdir "${TMPROOT}"
-  exit 0
-fi
+log "Metafile criado: ${METAFILE}"
+log "Estrutura completa:"
+tree -L 2 "${OUT_BASE}/${NAME}" 2>/dev/null || find "${OUT_BASE}/${NAME}" -maxdepth 2
 
-# ensure outdir exists and write file atomically
-mkdir -p "${OUT_DIR}"
-tmpdest="${OUT_DIR}/metafile.tmp.$$"
-mv "${TMPROOT}/adm-genmetafile.out" "${tmpdest}" || die "Falha ao mover metafile temporário"
-mv -f "${tmpdest}" "${METAFILE}" || die "Falha ao salvar metafile final"
-chmod 0644 "${METAFILE}"
-info "Metafile salvo em: ${METAFILE}"
-
-# cleanup handled by trap
 exit 0
