@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# glibc stage1 hook: install-locales
+# instala todos os locales disponíveis (make localedata/install-locales)
+# Executado automaticamente após post-install se INSTALL_ALL_LOCALES=1
+# Argumentos: $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[glibc stage1 install-locales] preparando instalação completa de locales..."
+
+if [ "${INSTALL_ALL_LOCALES:-0}" -ne 1 ]; then
+  echo "[adm-hook] INSTALL_ALL_LOCALES não ativado — ignorando hook."
+  exit 0
+fi
+
+cd "${WORKDIR}/build" || exit 1
+
+# Criar diretório alvo de locales no DESTDIR
+mkdir -p "${DESTDIR}/usr/lib/locale"
+
+echo "[adm-hook] executando make localedata/install-locales (isso pode demorar vários minutos)..."
+
+# Executar make localedata/install-locales com redirecionamento de log
+if make localedata/install-locales DESTDIR="${DESTDIR}" 2>&1 | tee "${WORKDIR}/glibc-install-locales.log"; then
+  echo "[adm-hook] instalação de locales concluída com sucesso."
+else
+  echo "[adm-hook] WARN: alguns locais podem ter falhado (ver log ${WORKDIR}/glibc-install-locales.log)"
+fi
+
+# Validar que C.UTF-8 e en_US.UTF-8 foram instalados
+for loc in C.UTF-8 en_US.UTF-8; do
+  if [ -d "${DESTDIR}/usr/lib/locale/${loc}" ]; then
+    echo "[adm-hook] locale ${loc} instalado."
+  else
+    echo "[adm-hook] WARN: locale ${loc} não encontrado." >&2
+  fi
+done
+
+# Registrar no ADM-DB (se disponível)
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db log "glibc" "locales installed (stage1)" "${WORKDIR}/glibc-install-locales.log" || true
+fi
+
+echo "[glibc stage1 install-locales] finalizado."
+exit 0
