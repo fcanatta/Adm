@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# glibc stage2 pre-build — preparar ambiente para rebuild do glibc usando toolchain interno
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[glibc stage2 pre-build] workdir=${WORKDIR} destdir=${DESTDIR}"
+
+# Garantir build dir separado
+mkdir -p "${WORKDIR}/build"
+cd "${WORKDIR}/build" || exit 1
+
+# Verificar se o toolchain (gcc, ld) instalado pelo stage1 está disponível no staging/chroot
+# adm-build pode definir CHROOT_PATH; se definido, preferimos checar dentro do chroot via adm-chroot exec
+if [ -n "${CHROOT_PATH:-}" ] && command -v adm-chroot >/dev/null 2>&1; then
+  echo "[adm-hook] verificando toolchain dentro do chroot ${CHROOT_PATH}..."
+  adm-chroot exec "${CHROOT_PATH}" -- sh -c "command -v gcc && command -v ld" || {
+    echo "[adm-hook] WARN: toolchain não detectado no chroot ${CHROOT_PATH}"
+  }
+else
+  for cmd in gcc ld; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "[adm-hook] WARN: $cmd não encontrado no PATH (espera-se toolchain stage1 disponível)" >&2
+    fi
+  done
+fi
+
+# Assegurar que /etc/ld.so.conf existe no DESTDIR para evitar warnings
+mkdir -p "$(dirname "${DESTDIR}/etc/ld.so.conf")"
+: > "${DESTDIR}/etc/ld.so.conf"
+
+# Exportar flags seguras (profiles/adm-build podem sobrepor)
+export CFLAGS="${CFLAGS:--O2 -g}"
+export LDFLAGS="${LDFLAGS:--Wl,-O1}"
+export LANG="${LANG:-C.UTF-8}"
+
+echo "[glibc stage2 pre-build] pronto."
+exit 0
