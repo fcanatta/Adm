@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage3 post-install] integrando binutils final ao sistema..."
+ln -sf ld "${DESTDIR}/usr/bin/ld.bfd" || true
+ln -sf ld "${DESTDIR}/usr/bin/ld.gold" || true
+echo "[stage3 post-install] integração concluída."
