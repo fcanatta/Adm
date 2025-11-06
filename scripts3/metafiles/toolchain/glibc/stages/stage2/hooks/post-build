@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# glibc stage2 post-build — executar checks e preparar para install
+# $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[glibc stage2 post-build] iniciando verificações pós-compilação..."
+
+cd "${WORKDIR}/build" || exit 1
+
+# make check é importante mas pode ser custoso; rodamos com make -k check e coletamos logs
+echo "[adm-hook] executando make -k check (stage2) — logs: ${WORKDIR}/glibc-stage2-make-check.log"
+if make -k check 2>&1 | tee "${WORKDIR}/glibc-stage2-make-check.log"; then
+  echo "[adm-hook] make check (stage2) concluído com sucesso."
+else
+  echo "[adm-hook] WARN: make check (stage2) relatou falhas — consulte ${WORKDIR}/glibc-stage2-make-check.log"
+  # Não abortamos automaticamente; deixar adm operator decidir. Se preferir abortar, ative strict mode.
+fi
+
+# Opcional: re-executar testes problemáticos com TIMEOUTFACTOR maior (não ativo por padrão)
+# Exemplo:
+# TIMEOUTFACTOR=5 make -k check TESTS="nss/tst-nss-files-hosts-multi"
+
+echo "[glibc stage2 post-build] verificações concluídas."
+exit 0
