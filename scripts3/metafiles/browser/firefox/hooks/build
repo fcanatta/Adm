@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# build (firefox) — $1=WORKDIR, $2=DESTDIR
+set -euo pipefail
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+log(){ printf '[firefox build] %s\n' "$*"; }
+
+cd "${WORKDIR}" || exit 1
+
+# Ensure objdir exists
+OBJDIR="${WORKDIR}/objfirefox"
+mkdir -p "${OBJDIR}"
+
+# Use mach to build; respects mozconfig
+log "Starting ./mach build (this will take long). Output in ${WORKDIR}/mach-build.log"
+# Use nice/ionice if desired to reduce host impact
+./mach build 2>&1 | tee "${WORKDIR}/mach-build.log"
+rc=${PIPESTATUS[0]}
+if [ ${rc} -ne 0 ]; then
+  log "ERROR: build failed (see ${WORKDIR}/mach-build.log)"
+  exit ${rc}
+fi
+
+log "Build finished successfully"
+
+# Optionally run a smoke run (./mach run) in chroot if desired; skip here.
+
+exit 0
