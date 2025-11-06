@@ -1,0 +1,20 @@
+NAME="gcc"
+VERSION="14.2.0"
+CATEGORY="toolchain"
+BUILD_SYSTEM="autotools"
+
+# múltiplos links de download — o sistema ADM testará todos
+URLS="
+https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+ftp://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+rsync://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+git://gcc.gnu.org/git/gcc.git
+sourceforge://gnu-gcc/gcc-14.2.0.tar.xz
+"
+
+SHA256="7fb46e442b2dbf7f2c6d36e0c49f254bd79a00e1ef5a30d1e2346a4b6e25a556"
+
+# dependências padrão (detectadas automaticamente no adm-detect)
+BUILD_DEPS="binutils gmp mpfr mpc isl make texinfo zlib"
+RUN_DEPS="glibc zlib"
+OPT_DEPS="gdb"
