@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# linux-headers stage0 post-install — instalação dos headers no DESTDIR
+# Argumentos: $1 = WORKDIR, $2 = DESTDIR
+set -euo pipefail
+
+WORKDIR="${1:-${WORKDIR:-.}}"
+DESTDIR="${2:-${DESTDIR:-/usr/src/adm/destdir}}"
+
+echo "[linux-headers stage0 post-install] gerando e instalando headers no ${DESTDIR}/usr/include ..."
+
+cd "${WORKDIR}" || exit 1
+
+# Gerar headers (igual ao LFS: make headers)
+echo "[adm-hook] executando make headers..."
+make headers > "${WORKDIR}/make-headers.log" 2>&1
+
+# Remover tudo que não for .h
+echo "[adm-hook] limpando arquivos não .h..."
+find usr/include \( -name .install -o -name ..install.cmd \) -delete
+
+# Criar diretório destino
+mkdir -pv "${DESTDIR}/usr"
+cp -rv usr/include "${DESTDIR}/usr/" > "${WORKDIR}/headers-copy.log" 2>&1
+
+# Validar resultado
+if [ -d "${DESTDIR}/usr/include/linux" ]; then
+  echo "[adm-hook] Linux headers instalados com sucesso em ${DESTDIR}/usr/include."
+else
+  echo "[adm-hook] ERRO: diretório linux/ não encontrado após instalação." >&2
+  exit 1
+fi
+
+# Registrar no adm-db se disponível
+if command -v adm-db >/dev/null 2>&1; then
+  adm-db add --name linux-headers --version "${VERSION:-unknown}" \
+    --file "${DESTDIR}/usr/include" --category toolchain || true
+fi
+
+echo "[linux-headers stage0 post-install] concluído."
