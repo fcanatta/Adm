@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -e
+echo "[stage1 post-install] validando ferramentas instaladas..."
+"${DESTDIR}/usr/bin/ld" --version | head -n1
