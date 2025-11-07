@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+#==========================================================
+# ADM-DETECT - Sistema de detecção e preparação de builds
+#==========================================================
+# Responsável por ler metafiles, baixar, validar, extrair e
+# detectar build system, compiladores e dependências.
+#==========================================================
+
+set -Eeuo pipefail
+shopt -s extglob nullglob
+
+ADM_ROOT="/usr/src/adm"
+ADM_CACHE="$ADM_ROOT/cache"
+ADM_META="$ADM_ROOT/metafile"
+ADM_LOG="$ADM_ROOT/var/log/adm-detect.log"
+STATE_DIR="$ADM_ROOT/var/state/detect"
+mkdir -p "$ADM_CACHE" "$STATE_DIR" "$(dirname "$ADM_LOG")"
+
+#----------------------------------------------------------
+# Dependências obrigatórias
+#----------------------------------------------------------
+REQUIRED_TOOLS=(curl wget git rsync tar unzip 7z sha256sum sha512sum md5sum awk grep sed)
+
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "[ERR] Ferramenta obrigatória ausente: $tool" >&2
+        exit 1
+    }
+done
+
+#----------------------------------------------------------
+# Funções de logging
+#----------------------------------------------------------
+log() { adm-logger "${1:-info}" "${2:-}"; }
+err_exit() { log error "$1"; exit "${2:-1}"; }
+
+#----------------------------------------------------------
+# Hooks pré e pós execução
+#----------------------------------------------------------
+run_hook() {
+    local phase=$1
+    local name=$2
+    if command -v adm-hooks >/dev/null 2>&1; then
+        adm-hooks run "${phase}-detect" "$name" || true
+    fi
+}
+
+#----------------------------------------------------------
+# Leitura do metafile
+#----------------------------------------------------------
+read_metafile() {
+    local metafile="$1"
+    [[ -f "$metafile" ]] || err_exit "Metafile não encontrado: $metafile"
+
+    declare -gA META=()
+    while IFS='=' read -r key value; do
+        [[ "$key" =~ ^#|^$ ]] && continue
+        key=$(echo "$key" | tr -d ' ')
+        value=$(echo "$value" | sed 's/^ *//;s/ *$//')
+        META["$key"]="$value"
+    done <"$metafile"
+
+    [[ -n "${META[NAME]:-}" && -n "${META[SOURCE]:-}" ]] || \
+        err_exit "Metafile inválido: faltam campos obrigatórios (NAME, SOURCE)"
+}
+
+#----------------------------------------------------------
+# Verificação de integridade
+#----------------------------------------------------------
+verify_checksum() {
+    local file="$1"
+    local algo="$2"
+    local expected="$3"
+
+    [[ -f "$file" ]] || err_exit "Arquivo ausente para verificação: $file"
+    local actual
+    case "$algo" in
+        md5) actual=$(md5sum "$file" | awk '{print $1}') ;;
+        sha1) actual=$(sha1sum "$file" | awk '{print $1}') ;;
+        sha256) actual=$(sha256sum "$file" | awk '{print $1}') ;;
+        sha512) actual=$(sha512sum "$file" | awk '{print $1}') ;;
+        *) err_exit "Algoritmo de checksum inválido: $algo" ;;
+    esac
+
+    if [[ "$actual" != "$expected" ]]; then
+        err_exit "Checksum incorreto para $file (esperado: $expected, obtido: $actual)"
+    fi
+    log ok "Checksum verificado com sucesso ($algo)"
+}
+
+#----------------------------------------------------------
+# Download de fontes (HTTP, FTP, GIT, RSYNC, local)
+#----------------------------------------------------------
+download_source() {
+    local url="$1"
+    local dest="$ADM_CACHE/$(basename "$url")"
+
+    case "$url" in
+        http*|ftp*)
+            log info "Baixando fonte: $url"
+            curl -L --retry 3 -o "$dest" "$url" || wget -O "$dest" "$url" || err_exit "Falha no download: $url"
+            ;;
+        git+*)
+            local repo="${url#git+}"
+            log info "Clonando repositório git: $repo"
+            git clone --depth=1 "$repo" "$ADM_CACHE/$(basename "$repo" .git)" || err_exit "Falha no clone: $repo"
+            return
+            ;;
+        rsync://*)
+            log info "Sincronizando via rsync: $url"
+            rsync -av --delete "$url" "$ADM_CACHE/" || err_exit "Falha no rsync: $url"
+            return
+            ;;
+        file://*)
+            cp -r "${url#file://}" "$ADM_CACHE/" || err_exit "Falha ao copiar fonte local"
+            return
+            ;;
+        *)
+            err_exit "Protocolo não suportado: $url"
+            ;;
+    esac
+
+    log ok "Download concluído: $dest"
+    echo "$dest"
+}
+#==========================================================
+# Continuação: adm-detect (Parte 2)
+#==========================================================
+
+#----------------------------------------------------------
+# Extração de fontes em múltiplos formatos
+#----------------------------------------------------------
+extract_source() {
+    local src_file="$1"
+    local dest_dir="$2"
+    mkdir -p "$dest_dir"
+
+    log info "Extraindo $src_file para $dest_dir"
+    case "$src_file" in
+        *.tar.gz|*.tgz)      tar -xzf "$src_file" -C "$dest_dir" ;;
+        *.tar.bz2|*.tbz2)    tar -xjf "$src_file" -C "$dest_dir" ;;
+        *.tar.xz)            tar -xJf "$src_file" -C "$dest_dir" ;;
+        *.tar.zst)           tar --zstd -xf "$src_file" -C "$dest_dir" ;;
+        *.tar)               tar -xf "$src_file" -C "$dest_dir" ;;
+        *.zip)               unzip -oq "$src_file" -d "$dest_dir" ;;
+        *.7z)                7z x -y "$src_file" -o"$dest_dir" >/dev/null ;;
+        *)                   err_exit "Formato de arquivo não suportado: $src_file" ;;
+    esac
+
+    log ok "Extração concluída"
+}
+
+#----------------------------------------------------------
+# Detectar linguagens de programação usadas
+#----------------------------------------------------------
+detect_languages() {
+    local src_dir="$1"
+    local langs=()
+
+    [[ -d "$src_dir" ]] || err_exit "Diretório de fontes inexistente: $src_dir"
+
+    if find "$src_dir" -name "*.c" -o -name "*.cpp" -o -name "*.h" | grep -q .; then langs+=("C/C++"); fi
+    if find "$src_dir" -name "*.rs" | grep -q .; then langs+=("Rust"); fi
+    if find "$src_dir" -name "*.go" | grep -q .; then langs+=("Go"); fi
+    if find "$src_dir" -name "*.py" | grep -q .; then langs+=("Python"); fi
+    if find "$src_dir" -name "*.pl" | grep -q .; then langs+=("Perl"); fi
+    if find "$src_dir" -name "*.lua" | grep -q .; then langs+=("Lua"); fi
+    if find "$src_dir" -name "*.java" | grep -q .; then langs+=("Java"); fi
+    if find "$src_dir" -name "*.sh" | grep -q .; then langs+=("Shell"); fi
+
+    if [[ ${#langs[@]} -eq 0 ]]; then
+        log warn "Nenhuma linguagem detectada"
+    else
+        log ok "Linguagens detectadas: ${langs[*]}"
+    fi
+
+    DETECTED_LANGS=("${langs[@]}")
+}
+
+#----------------------------------------------------------
+# Detectar tipo de sistema de build
+#----------------------------------------------------------
+detect_build_system() {
+    local src_dir="$1"
+    local buildsys=""
+
+    if [[ -f "$src_dir/configure" ]]; then
+        buildsys="autotools"
+    elif [[ -f "$src_dir/CMakeLists.txt" ]]; then
+        buildsys="cmake"
+    elif [[ -f "$src_dir/meson.build" ]]; then
+        buildsys="meson"
+    elif [[ -f "$src_dir/Makefile" ]]; then
+        buildsys="make"
+    elif [[ -f "$src_dir/SConstruct" ]]; then
+        buildsys="scons"
+    elif [[ -f "$src_dir/setup.py" || -f "$src_dir/pyproject.toml" ]]; then
+        buildsys="python"
+    elif [[ -f "$src_dir/package.json" ]]; then
+        buildsys="nodejs"
+    else
+        log warn "Sistema de build não detectado — requer intervenção manual"
+    fi
+
+    log info "Sistema de build detectado: ${buildsys:-desconhecido}"
+    DETECTED_BUILD_SYSTEM="$buildsys"
+}
+
+#----------------------------------------------------------
+# Detectar compiladores disponíveis
+#----------------------------------------------------------
+detect_compilers() {
+    local compilers=()
+    local tools=(gcc g++ clang clang++ rustc go javac python3 perl lua)
+
+    for tool in "${tools[@]}"; do
+        if command -v "$tool" >/dev/null 2>&1; then
+            local ver="$($tool --version 2>/dev/null | head -n1)"
+            compilers+=("$ver")
+        fi
+    done
+
+    if [[ ${#compilers[@]} -eq 0 ]]; then
+        log warn "Nenhum compilador detectado"
+    else
+        log ok "Compiladores detectados:"
+        for c in "${compilers[@]}"; do log info "  - $c"; done
+    fi
+
+    DETECTED_COMPILERS=("${compilers[@]}")
+}
+
+#----------------------------------------------------------
+# Detectar dependências de build básicas
+#----------------------------------------------------------
+detect_dependencies() {
+    local src_dir="$1"
+    local deps=()
+
+    # Procurar por includes e imports
+    while IFS= read -r line; do
+        [[ "$line" =~ ^#include ]] && deps+=("$(echo "$line" | awk -F'[<>"]' '{print $2}')")
+    done < <(find "$src_dir" -type f -name "*.[ch]" -print0 | xargs -0 grep -h "^#include" || true)
+
+    while IFS= read -r line; do
+        [[ "$line" =~ ^import ]] && deps+=("$(echo "$line" | awk '{print $2}' | tr -d '\"')") 
+    done < <(find "$src_dir" -type f -name "*.py" -print0 | xargs -0 grep -h "^import" || true)
+
+    mapfile -t UNIQUE_DEPS < <(printf '%s\n' "${deps[@]}" | sort -u)
+
+    if [[ ${#UNIQUE_DEPS[@]} -eq 0 ]]; then
+        log warn "Nenhuma dependência explícita detectada"
+    else
+        log ok "Dependências detectadas: ${UNIQUE_DEPS[*]}"
+    fi
+
+    DETECTED_DEPS=("${UNIQUE_DEPS[@]}")
+}
+
+#----------------------------------------------------------
+# Integração com adm-bootstrap e adm-resolver
+#----------------------------------------------------------
+integrate_with_bootstrap() {
+    local pkg="$1"
+
+    if command -v adm-bootstrap >/dev/null 2>&1; then
+        log info "Integrando com adm-bootstrap..."
+        adm-bootstrap register "$pkg" "${META[SOURCE]}" "${META[VERSION]:-unknown}" || \
+            log warn "Falha na integração com adm-bootstrap"
+    else
+        log warn "adm-bootstrap não encontrado — integração ignorada"
+    fi
+}
+
+integrate_with_resolver() {
+    local pkg="$1"
+    if command -v adm-resolver >/dev/null 2>&1; then
+        log info "Registrando dependências em adm-resolver..."
+        adm-resolver update "$pkg" "${DETECTED_DEPS[*]:-}" || \
+            log warn "Falha ao registrar dependências"
+    else
+        log warn "adm-resolver não encontrado — ignorando"
+    fi
+}
+
+#----------------------------------------------------------
+# Salvar estado em JSON
+#----------------------------------------------------------
+save_detect_state() {
+    local pkg="$1"
+    local outfile="$STATE_DIR/${pkg}_state.json"
+
+    {
+        echo "{"
+        echo "  \"name\": \"${pkg}\","
+        echo "  \"source\": \"${META[SOURCE]}\","
+        echo "  \"languages\": [$(printf '"%s",' "${DETECTED_LANGS[@]}" | sed 's/,$//')],"
+        echo "  \"build_system\": \"${DETECTED_BUILD_SYSTEM:-unknown}\","
+        echo "  \"compilers\": [$(printf '"%s",' "${DETECTED_COMPILERS[@]}" | sed 's/,$//')],"
+        echo "  \"dependencies\": [$(printf '"%s",' "${DETECTED_DEPS[@]}" | sed 's/,$//')],"
+        echo "  \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+        echo "}"
+    } >"$outfile"
+
+    log ok "Estado de detecção salvo em $outfile"
+}
+#==========================================================
+# Continuação e finalização: adm-detect (Parte 3)
+#==========================================================
+
+#----------------------------------------------------------
+# Função principal de detecção
+#----------------------------------------------------------
+run_detect() {
+    local metafile="$1"
+    [[ -f "$metafile" ]] || err_exit "Metafile inexistente: $metafile"
+
+    read_metafile "$metafile"
+    local pkg="${META[NAME]}"
+    local version="${META[VERSION]:-unknown}"
+    local source="${META[SOURCE]}"
+    local checksum="${META[CHECKSUM]:-}"
+    local algo="${META[CHECKTYPE]:-sha256}"
+
+    log info "Iniciando detecção para pacote: $pkg ($version)"
+    run_hook pre "$pkg"
+
+    #------------------------------------------------------
+    # 1. Download das fontes
+    #------------------------------------------------------
+    local srcfile
+    srcfile="$(download_source "$source")"
+
+    #------------------------------------------------------
+    # 2. Verificar checksum se disponível
+    #------------------------------------------------------
+    if [[ -n "$checksum" ]]; then
+        verify_checksum "$srcfile" "$algo" "$checksum"
+    else
+        log warn "Checksum não definido no metafile — recomendável adicioná-lo"
+    fi
+
+    #------------------------------------------------------
+    # 3. Extrair fontes
+    #------------------------------------------------------
+    local extract_dir="$ADM_CACHE/${pkg}-${version}-src"
+    rm -rf "$extract_dir"
+    extract_source "$srcfile" "$extract_dir"
+
+    #------------------------------------------------------
+    # 4. Detectar linguagens e sistemas de build
+    #------------------------------------------------------
+    detect_languages "$extract_dir"
+    detect_build_system "$extract_dir"
+    detect_compilers
+    detect_dependencies "$extract_dir"
+
+    #------------------------------------------------------
+    # 5. Integrações externas
+    #------------------------------------------------------
+    integrate_with_bootstrap "$pkg"
+    integrate_with_resolver "$pkg"
+
+    #------------------------------------------------------
+    # 6. Salvar estado
+    #------------------------------------------------------
+    save_detect_state "$pkg"
+
+    run_hook post "$pkg"
+    log ok "Detecção concluída com sucesso para $pkg"
+}
+
+#----------------------------------------------------------
+# Exibir resumo legível
+#----------------------------------------------------------
+show_summary() {
+    local pkg="$1"
+    local state="$STATE_DIR/${pkg}_state.json"
+    [[ -f "$state" ]] || err_exit "Nenhum estado encontrado para $pkg"
+
+    log info "Resumo de detecção para $pkg:"
+    grep -E '"(name|languages|build_system|compilers|dependencies)"' "$state" \
+        | sed 's/[",{}]//g;s/^ *//;s/: /=/' \
+        | while IFS='=' read -r k v; do
+            printf "  %-15s %s\n" "$k:" "$v"
+        done
+}
+
+#----------------------------------------------------------
+# Função de ajuda
+#----------------------------------------------------------
+show_help() {
+    cat <<EOF
+Uso: adm-detect <comando> [opções]
+
+Comandos:
+  run <metafile>         Executa a detecção completa a partir do metafile
+  summary <pacote>       Exibe o resumo da última detecção do pacote
+  json <pacote>          Mostra o arquivo JSON gerado da última detecção
+  fix <metafile>         Reexecuta detecção corrigindo inconsistências
+  help                   Mostra esta ajuda
+
+Opções:
+  --verbose              Mostra saída detalhada
+  --quiet                Saída mínima
+  --log <arquivo>        Define log personalizado
+
+Exemplo:
+  adm-detect run /usr/src/adm/metafile/core/binutils.meta
+EOF
+}
+
+#----------------------------------------------------------
+# Função de correção automática (--fix)
+#----------------------------------------------------------
+fix_detect() {
+    local metafile="$1"
+    log info "Executando modo de correção automática (--fix)"
+    if command -v adm-clean >/dev/null 2>&1; then
+        adm-clean --cache --temp || log warn "Limpeza parcial falhou"
+    fi
+    run_detect "$metafile"
+}
+
+#----------------------------------------------------------
+# CLI principal
+#----------------------------------------------------------
+main() {
+    [[ $# -lt 1 ]] && show_help && exit 0
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        run)
+            [[ $# -eq 0 ]] && err_exit "Uso: adm-detect run <metafile>"
+            run_detect "$1"
+            ;;
+        summary)
+            [[ $# -eq 0 ]] && err_exit "Uso: adm-detect summary <pacote>"
+            show_summary "$1"
+            ;;
+        json)
+            [[ $# -eq 0 ]] && err_exit "Uso: adm-detect json <pacote>"
+            local file="$STATE_DIR/${1}_state.json"
+            [[ -f "$file" ]] && cat "$file" || err_exit "Arquivo JSON não encontrado"
+            ;;
+        fix)
+            [[ $# -eq 0 ]] && err_exit "Uso: adm-detect fix <metafile>"
+            fix_detect "$1"
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        *)
+            err_exit "Comando desconhecido: $cmd"
+            ;;
+    esac
+}
+
+#----------------------------------------------------------
+# Execução segura
+#----------------------------------------------------------
+trap 'log error "Erro inesperado na linha $LINENO"; exit 1' ERR
+trap 'log info "Encerrando adm-detect"; exit 0' EXIT
+
+main "$@"
