@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# adm-logger — Camada de logging do ADM
+# - Saída humana colorida + JSON Lines estruturado
+# - Arquivos de log por execução
+# - Rodapé/estatísticas
+# - Tratamento de erros (traps) e códigos padronizados
+# - Verbosidade (--quiet/--verbose via env ADM_LOG_QUIET/ADM_LOG_VERBOSE)
+
+# ======== Modo estrito e tratamento de erros ========
+set -Eeuo pipefail
+
+# ======== Códigos de saída padronizados ========
+ADM_OK=0
+ADM_ERR_MISSING_PREREQ=10
+ADM_ERR_DEPS=20
+ADM_ERR_VERIFY=30
+ADM_ERR_BUILD=40
+ADM_ERR_INSTALL=50
+ADM_ERR_HOOKS=60
+ADM_ERR_CLEAN=70
+ADM_ERR_USAGE=80
+ADM_ERR_INTERRUPTED=90
+ADM_ERR_INTERNAL=99
+
+# ======== Configuração e diretórios ========
+ADM_ROOT_DEFAULT="/usr/src/adm"
+ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+
+LOG_DIR="${ADM_ROOT}/logs"
+LOG_STRUCTURED_DIR="${LOG_DIR}/structured"
+LOG_RAW_DIR="${LOG_DIR}/raw"
+
+# ======== Estado da sessão de log ========
+EXECUTION_ID=""
+LOG_FILE=""
+JSONL_FILE=""
+LOG_CMD="unknown"      # ex.: adm-build
+LOG_PHASE="run"        # ex.: fetch/verify/compile/install/...
+LOG_SUBJECT=""         # ex.: pkg@ver ou alvo
+LOG_START_TS=0
+LOG_SUCCESS=0
+LOG_WARN=0
+LOG_FAIL=0
+LOG_ARTIFACTS=0
+
+# Verbosidade (0 normal, 1 quiet, 2 verbose)
+ADM_LOG_QUIET="${ADM_LOG_QUIET:-0}"
+ADM_LOG_VERBOSE="${ADM_LOG_VERBOSE:-0}"
+
+# ======== Cores (auto) ========
+_use_color() {
+  if [[ -n "${NO_COLOR:-}" ]]; then return 1; fi
+  if [[ -t 1 ]]; then return 0; fi
+  return 1
+}
+if _use_color; then
+  C_RESET=$'\033[0m'
+  C_INFO=$'\033[1;34m'   # azul
+  C_OK=$'\033[1;32m'     # verde
+  C_WARN=$'\033[1;33m'   # amarelo
+  C_ERR=$'\033[1;31m'    # vermelho
+  C_DIM=$'\033[2m'
+else
+  C_RESET=""; C_INFO=""; C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""
+fi
+
+# ======== Utilitários ========
+_ts_iso() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
+_ts_hms() { date +"%H:%M:%S"; }
+
+# Elapsed em segundos -> "MMmSSs" ou "HhMMmSSs"
+_fmt_elapsed() {
+  local total=${1:-0} h m s; h=$((total/3600)); m=$(((total%3600)/60)); s=$((total%60))
+  if (( h > 0 )); then printf "%02dh%02dm%02ds" "$h" "$m" "$s"; else printf "%02dm%02ds" "$m" "$s"; fi
+}
+
+# JSON escape (básico e seguro)
+_json_escape() {
+  local s=${1:-}
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/\\r}
+  s=${s//$'\t'/\\t}
+  # remove ASCII de controle exceto \n \t \r já escapados
+  printf '%s' "$s" | tr -d '\000-\010\013\014\016-\037'
+}
+
+# Garante diretórios, com fallback para /tmp em caso de erro
+_ensure_dirs() {
+  local d ok=0
+  for d in "$LOG_DIR" "$LOG_STRUCTURED_DIR" "$LOG_RAW_DIR"; do
+    if ! mkdir -p "$d" 2>/dev/null; then ok=1; fi
+  done
+  if (( ok == 1 )); then
+    # fallback
+    LOG_DIR="/tmp/adm-logs"
+    LOG_STRUCTURED_DIR="${LOG_DIR}/structured"
+    LOG_RAW_DIR="${LOG_DIR}/raw"
+    mkdir -p "$LOG_STRUCTURED_DIR" "$LOG_RAW_DIR"
+  fi
+}
+
+# ======== Inicialização da sessão ========
+log_start() {
+  # uso: log_start <cmd> [subject]
+  LOG_CMD="${1:-unknown}"
+  LOG_SUBJECT="${2:-}"
+  _ensure_dirs
+  EXECUTION_ID="${EXECUTION_ID:-$(date -u +"%Y%m%d-%H%M%S")-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+  LOG_FILE="${LOG_DIR}/exec-${EXECUTION_ID}.log"
+  JSONL_FILE="${LOG_STRUCTURED_DIR}/${EXECUTION_ID}.jsonl"
+  LOG_START_TS=$(date +%s || echo 0)
+
+  # Cabeçalho
+  local h="=== Iniciando ${LOG_CMD} (EXECUTION_ID=${EXECUTION_ID}) ==="
+  _print_human "INFO" "start" "$LOG_SUBJECT" "$h"
+  _append_raw "$h"
+  _append_json "INFO" "start" "$LOG_SUBJECT" "start" 0 0
+}
+
+# ======== Encerramento da sessão ========
+log_end() {
+  # uso: log_end <exit_code>
+  local code=${1:-0}
+  log_footer
+  local elapsed=$(( $(date +%s) - LOG_START_TS ))
+  local msg="Fim ${LOG_CMD} — exit=${code} — tempo=$(_fmt_elapsed "$elapsed")"
+  _print_human $([[ $code -eq 0 ]] && echo "OK" || echo "ERR") "end" "$LOG_SUBJECT" "$msg"
+  _append_raw "$msg"
+  _append_json $([[ $code -eq 0 ]] && echo "OK" || echo "ERR") "end" "$LOG_SUBJECT" "$msg" "$elapsed" "$code"
+}
+
+# ======== Fase e assunto ========
+log_set_phase() { LOG_PHASE="${1:-run}"; }
+log_set_subject() { LOG_SUBJECT="${1:-}"; }
+
+# ======== Impressão (humana/json/raw) ========
+_append_raw() { printf '%s\n' "$1" >>"$LOG_FILE" 2>/dev/null || true; }
+
+_append_json() {
+  # uso: _append_json <LEVEL> <phase> <subject> <msg> <elapsed_sec> <exit_code>
+  local level="$1" phase="$2" subj="$3" msg="$4" elapsed="${5:-0}" code="${6:-0}"
+  local jmsg; jmsg=$(_json_escape "$msg")
+  local jsubj; jsubj=$(_json_escape "$subj")
+  printf '{"ts":"%s","exec":"%s","level":"%s","cmd":"%s","phase":"%s","subject":"%s","msg":"%s","elapsed_sec":%s,"exit_code":%s}\n' \
+    "$(_ts_iso)" "$EXECUTION_ID" "$level" "$LOG_CMD" "$phase" "$jsubj" "$jmsg" "$elapsed" "$code" \
+    >>"$JSONL_FILE" 2>/dev/null || true
+}
+
+_print_human() {
+  # uso: _print_human <LEVEL> <phase> <subject> <message>
+  local level="$1" phase="$2" subj="$3" msg="$4" stamp prefix color
+  stamp="$(_ts_hms)"
+
+  case "$level" in
+    INFO) prefix="i"; color="$C_INFO" ;;
+    OK)   prefix="✓"; color="$C_OK" ;;
+    WARN) prefix="!"; color="$C_WARN" ;;
+    ERR)  prefix="✗"; color="$C_ERR" ;;
+    DEBUG)prefix="·"; color="$C_DIM" ;;
+    *)    prefix="i"; color="$C_INFO" ;;
+  esac
+
+  # Verbosidade
+  if [[ "$ADM_LOG_QUIET" == "1" && "$level" != "ERR" ]]; then
+    return 0
+  fi
+  if [[ "$ADM_LOG_VERBOSE" != "1" && "$level" == "DEBUG" ]]; then
+    return 0
+  fi
+
+  printf '%s[%s]%s %s%s%s %s:%s %s — %s\n' \
+    "$color" "$stamp" "$C_RESET" \
+    "$color" "$prefix" "$C_RESET" \
+    "$LOG_CMD" "$phase" "${subj:-"-"}" "$msg"
+  _append_raw "[$stamp] $level $LOG_CMD:$phase ${subj:-"-"} — $msg"
+}
+
+# ======== Funções de nível ========
+log_info()  { local m="${*:-}"; _print_human "INFO"  "${LOG_PHASE}" "$LOG_SUBJECT" "$m"; _append_json "INFO"  "${LOG_PHASE}" "$LOG_SUBJECT" "$m" "$(( $(date +%s)-LOG_START_TS ))" 0; }
+log_ok()    { local m="${*:-}"; ((LOG_SUCCESS++)); _print_human "OK"    "${LOG_PHASE}" "$LOG_SUBJECT" "$m"; _append_json "OK"    "${LOG_PHASE}" "$LOG_SUBJECT" "$m" "$(( $(date +%s)-LOG_START_TS ))" 0; }
+log_warn()  { local m="${*:-}"; ((LOG_WARN++));    _print_human "WARN"  "${LOG_PHASE}" "$LOG_SUBJECT" "$m"; _append_json "WARN"  "${LOG_PHASE}" "$LOG_SUBJECT" "$m" "$(( $(date +%s)-LOG_START_TS ))" 0; }
+log_err()   { local m="${*:-}"; ((LOG_FAIL++));    _print_human "ERR"   "${LOG_PHASE}" "$LOG_SUBJECT" "$m"; _append_json "ERR"   "${LOG_PHASE}" "$LOG_SUBJECT" "$m" "$(( $(date +%s)-LOG_START_TS ))" 1; }
+log_debug() { local m="${*:-}";                    _print_human "DEBUG" "${LOG_PHASE}" "$LOG_SUBJECT" "$m"; _append_json "DEBUG" "${LOG_PHASE}" "$LOG_SUBJECT" "$m" "$(( $(date +%s)-LOG_START_TS ))" 0; }
+
+# ======== Rodapé/Resumo ========
+log_inc_artifacts() { ((LOG_ARTIFACTS++)); }
+log_footer() {
+  local elapsed=$(( $(date +%s) - LOG_START_TS ))
+  local summary="Resumo: success=${LOG_SUCCESS} warn=${LOG_WARN} fail=${LOG_FAIL} tempo=$(_fmt_elapsed "$elapsed") artefatos=${LOG_ARTIFACTS}"
+  _print_human "INFO" "summary" "$LOG_SUBJECT" "$summary"
+  _append_json "INFO" "summary" "$LOG_SUBJECT" "$summary" "$elapsed" 0
+}
+
+# ======== Traps de erro e sinais ========
+_on_error() {
+  local line="$1" cmd="$2" code="$3"
+  log_err "Falha na linha ${line}: '${cmd}' (exit=${code})"
+  # Não finaliza aqui; deixa o chamador decidir ou use log_end fora
+}
+_on_interrupt() {
+  log_err "Execução interrompida por sinal"
+  log_end "$ADM_ERR_INTERRUPTED" || true
+  exit "$ADM_ERR_INTERRUPTED"
+}
+trap '_on_error "${LINENO}" "${BASH_COMMAND}" "$?"' ERR
+trap _on_interrupt INT TERM
+
+# ======== API utilitária ========
+log_set_cmd() { LOG_CMD="${1:-$LOG_CMD}"; }
+log_quiet_on() { ADM_LOG_QUIET=1; }
+log_quiet_off() { ADM_LOG_QUIET=0; }
+log_verbose_on() { ADM_LOG_VERBOSE=1; }
+log_verbose_off() { ADM_LOG_VERBOSE=0; }
+
+# ======== Modo standalone (auto-teste rápido) ========
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # Exemplo de uso: ./adm-logger demo
+  log_start "adm-logger-demo" "demo@1.0"
+  log_set_phase "prepare";  log_info "inicializando"; sleep 0.05
+  log_set_phase "fetch";    log_ok   "fonte baixada"
+  log_set_phase "verify";   log_ok   "sha256 ok"
+  log_set_phase "patch";    log_warn "patch 2 aplicado com rejeitos benignos"
+  log_set_phase "build";    log_debug "compilando com -j8"; sleep 0.05
+  log_set_phase "install";  log_ok   "arquivos instalados em DESTDIR"
+  log_inc_artifacts
+  log_set_phase "finalize"; log_info "limpeza temporários"
+  log_end $ADM_OK
+fi
