@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+# adm-patch — gerenciador de patches ADM
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# -------- exits --------
+ADM_OK=0
+ADM_ERR_USAGE=80
+ADM_ERR_VERIFY=30
+ADM_ERR_APPLY=40
+ADM_ERR_INTERNAL=99
+ADM_ERR_PERMISSION=70
+
+# -------- paths --------
+ADM_ROOT_DEFAULT="/usr/src/adm"
+ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+LOGGER="${ADM_ROOT}/bin/adm-logger"
+METAFILE_DIR="${ADM_ROOT}/metafile"
+ETC_PATCHES="${ADM_ROOT}/etc/patches"
+STATE_DIR="${ADM_ROOT}/var/state/patches"
+APPLIED_DIR="${STATE_DIR}/applied"
+LOG_DIR="${ADM_ROOT}/var/log/adm-patch"
+EXEC_ID="$(date -u +%Y%m%d-%H%M%S)-$$"
+
+# -------- load logger (fallback minimal) --------
+if [[ -f "$LOGGER" ]]; then
+  # shellcheck source=/usr/src/adm/bin/adm-logger
+  source "$LOGGER"
+else
+  log_start(){ :; } ; log_info(){ printf '[INFO] %s\n' "$*"; }
+  log_ok(){ printf '[OK] %s\n' "$*"; } ; log_warn(){ printf '[WARN] %s\n' "$*"; }
+  log_err(){ printf '[ERR] %s\n' "$*"; } ; log_end(){ :; }
+  log_set_phase(){ :; } ; log_set_subject(){ :; }
+fi
+
+# -------- utils --------
+_ensure_dirs(){
+  mkdir -p "$METAFILE_DIR" "$ETC_PATCHES" "$APPLIED_DIR" "$LOG_DIR"
+}
+_safe_path(){
+  local p="$1"
+  local cp; cp="$(readlink -f "$p" 2>/dev/null || true)"
+  [[ -n "$cp" ]] || return 1
+  case "$cp" in
+    "$ADM_ROOT"/*|"$ADM_ROOT") printf '%s' "$cp"; return 0;;
+    *) return 1;;
+  esac
+}
+_profile_msg(){ log_info "$*"; }
+
+# -------- patch discovery --------
+_patch_dir_for(){
+  local category="$1" pkg="$2"
+  local candidate="${METAFILE_DIR%/}/${category}/${pkg}/patches"
+  if [[ -d "$candidate" ]]; then printf '%s' "$candidate"; return 0; fi
+  # fallback to etc global
+  if [[ -d "${ETC_PATCHES%/}/global" ]]; then
+    printf '%s' "${ETC_PATCHES%/}/global"; return 0
+  fi
+  return 1
+}
+
+_list_from_series_or_dir(){
+  local dir="$1"
+  local series="${dir%/}/series"
+  if [[ -f "$series" ]]; then
+    # read series ignoring comments/blank
+    awk '!/^#/ && NF{print $1}' "$series"
+  else
+    # list .patch, .diff in lexical order
+    find "$dir" -maxdepth 1 -type f \( -name '*.patch' -o -name '*.diff' \) -printf '%f\n' | sort
+  fi
+}
+
+# -------- state management --------
+_mark_applied(){
+  local category="$1" pkg="$2" patchfile="$3"
+  local dir="${APPLIED_DIR%/}/${category}/${pkg}"
+  mkdir -p "$dir"
+  local mark="${dir}/$(basename "$patchfile").ok"
+  printf '%s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" > "${mark}.tmp" && mv -f "${mark}.tmp" "$mark"
+}
+_is_applied(){
+  local category="$1" pkg="$2" patchfile="$3"
+  [[ -f "${APPLIED_DIR%/}/${category}/${pkg}/$(basename "$patchfile").ok" ]]
+}
+_unmark_applied(){
+  local category="$1" pkg="$2" patchfile="$3"
+  rm -f "${APPLIED_DIR%/}/${category}/${pkg}/$(basename "$patchfile").ok" 2>/dev/null || true
+}
+
+# -------- validation & apply helpers --------
+_validate_patch_file(){
+  local patch="$1"
+  [[ -f "$patch" && -s "$patch" ]]
+}
+
+_apply_single_patch(){
+  local patch="$1" target="$2" dry="$3"
+  log_set_phase "patch"
+  log_info "Aplicando patch $(basename "$patch") em $target (dry=$dry)"
+  # dry-run check
+  if ! patch --dry-run -p1 -i "$patch" -d "$target" >/dev/null 2>&1; then
+    log_err "Dry-run falhou para $(basename "$patch")"
+    return 2
+  fi
+  if [[ "$dry" -eq 1 ]]; then
+    log_ok "Dry-run ok: $(basename "$patch")"
+    return 0
+  fi
+  # real apply (backup suffix .adm.bak)
+  if patch -p1 --backup --suffix=.adm.bak -i "$patch" -d "$target" >/dev/null 2>&1; then
+    log_ok "Patch aplicado: $(basename "$patch")"
+    return 0
+  else
+    log_err "Falha ao aplicar patch: $(basename "$patch")"
+    return 1
+  fi
+}
+
+_revert_single_patch(){
+  local patch="$1" target="$2"
+  log_set_phase "revert"
+  log_info "Tentando reverter $(basename "$patch") em $target"
+  # patch -R will attempt reverse; ignore errors but return code
+  if patch -R -p1 -i "$patch" -d "$target" >/dev/null 2>&1; then
+    log_ok "Revertido: $(basename "$patch")"
+    return 0
+  else
+    log_warn "Não foi possível reverter: $(basename "$patch")"
+    return 1
+  fi
+}
+
+# -------- core operations --------
+cmd_list(){
+  local category="$1" pkg="$2"
+  local dir
+  dir="$(_patch_dir_for "$category" "$pkg")" || { log_err "No patch dir for $category/$pkg"; return 1; }
+  _list_from_series_or_dir "$dir"
+}
+
+cmd_status(){
+  local category="$1" pkg="$2"
+  local dir; dir="$(_patch_dir_for "$category" "$pkg")" || { log_err "No patch dir"; return 1; }
+  log_info "Status patches for $category/$pkg"
+  while read -r p; do
+    local full="${dir%/}/$p"
+    if _is_applied "$category" "$pkg" "$p"; then
+      printf '%s\tAPPLIED\n' "$p"
+    else
+      printf '%s\tPENDING\n' "$p"
+    fi
+  done < <(_list_from_series_or_dir "$dir")
+}
+
+cmd_apply(){
+  local category="$1" pkg="$2" target="$3" dry="${4:-0}" force="${5:-0}"
+  if [[ -z "$category" || -z "$pkg" || -z "$target" ]]; then
+    log_err "Uso: adm-patch apply <categoria> <programa> <target_dir> [--dry] [--force]"
+    return $ADM_ERR_USAGE
+  fi
+  local target_real
+  target_real="$(readlink -f "$target" 2>/dev/null || true)"
+  if [[ -z "$target_real" || ! -d "$target_real" ]]; then
+    log_err "Target inexistente: $target"
+    return $ADM_ERR_USAGE
+  fi
+  local dir; dir="$(_patch_dir_for "$category" "$pkg")" || { log_warn "No patch dir; nada a aplicar"; return 0; }
+  mapfile -t patches < <(_list_from_series_or_dir "$dir")
+  if [[ "${#patches[@]}" -eq 0 ]]; then log_info "Nenhum patch para aplicar"; return 0; fi
+
+  # applied list to rollback if fail
+  local applied_list=()
+  for p in "${patches[@]}"; do
+    local patchfile="${dir%/}/$p"
+    if ! _validate_patch_file "$patchfile"; then
+      log_err "Patch inválido: $patchfile"; cmd_revert_list applied_list "$target_real"; return $ADM_ERR_VERIFY
+    fi
+    if _is_applied "$category" "$pkg" "$p" && [[ "$force" -ne 1 ]]; then
+      log_info "Ignorando já aplicado: $p"
+      continue
+    fi
+    # validate dry-run
+    if ! _apply_single_patch "$patchfile" "$target_real" 1; then
+      log_err "Patch $(basename "$patchfile") não aplicável (dry-run)"
+      cmd_revert_list applied_list "$target_real"
+      return $ADM_ERR_VERIFY
+    fi
+    # actual apply
+    if ! _apply_single_patch "$patchfile" "$target_real" 0; then
+      log_err "Falha aplicando $(basename "$patchfile") — iniciando rollback"
+      cmd_revert_list applied_list "$target_real"
+      return $ADM_ERR_APPLY
+    fi
+    _mark_applied "$category" "$pkg" "$p"
+    applied_list+=("$p")
+    # log persistent
+    printf '%s %s %s %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$category" "$pkg" "$p" >> "${STATE_DIR%/}/patches.log"
+  done
+  log_ok "Aplicação concluída para $category/$pkg"
+  return 0
+}
+
+cmd_revert_list(){
+  # args: array name + target
+  local -n arr=$1
+  local target="$2"
+  # revert in reverse order
+  for ((i=${#arr[@]}-1;i>=0;i--)); do
+    local p="${arr[i]}"
+    local patchpath
+    patchpath="$(_patch_dir_for "$category" "$pkg")/$p" 2>/dev/null || patchpath="$p"
+    _revert_single_patch "$patchpath" "$target" || true
+    _unmark_applied "$category" "$pkg" "$p"
+  done
+}
+
+cmd_revert(){
+  local category="$1" pkg="$2" target="$3"
+  if [[ -z "$category" || -z "$pkg" || -z "$target" ]]; then
+    log_err "Uso: adm-patch revert <categoria> <programa> <target_dir>"
+    return $ADM_ERR_USAGE
+  fi
+  local dir; dir="$(_patch_dir_for "$category" "$pkg")" || { log_warn "No patch dir"; return 0; }
+  mapfile -t patches < <(_list_from_series_or_dir "$dir")
+  for p in "${patches[@]}"; do
+    if _is_applied "$category" "$pkg" "$p"; then
+      local pf="${dir%/}/$p"
+      if _revert_single_patch "$pf" "$target"; then
+        _unmark_applied "$category" "$pkg" "$p"
+      else
+        log_warn "Falha ao reverter $p"
+      fi
+    else
+      log_info "Não aplicado: $p"
+    fi
+  done
+  log_ok "Reversão concluída para $category/$pkg"
+}
+
+cmd_clean(){
+  # clean state markers/logs
+  rm -rf "${APPLIED_DIR%/}"/* 2>/dev/null || true
+  : > "${STATE_DIR%/}/patches.log" 2>/dev/null || true
+  log_ok "Estado de patches limpo"
+}
+
+cmd_verify(){
+  local category="$1" pkg="$2"
+  local dir; dir="$(_patch_dir_for "$category" "$pkg")" || { log_err "No patch dir"; return 1; }
+  local ok=0 missing=0
+  mapfile -t patches < <(_list_from_series_or_dir "$dir")
+  for p in "${patches[@]}"; do
+    if _is_applied "$category" "$pkg" "$p"; then ((ok++)); else ((missing++)); fi
+  done
+  log_info "Verificação: applied=$ok missing=$missing"
+  if (( missing>0 )); then return 2; fi
+  return 0
+}
+
+# -------- CLI parse --------
+_usage(){
+  cat <<EOF
+adm-patch <cmd> [args]
+
+Commands:
+  list <category> <program>
+  status <category> <program>
+  apply <category> <program> <target_dir> [--dry] [--force]
+  verify <category> <program>
+  revert <category> <program> <target_dir>
+  clean
+  help
+EOF
+  exit $ADM_ERR_USAGE
+}
+
+main(){
+  log_start "adm-patch" "patch"
+  log_set_subject "adm-patch"
+  _ensure_dirs
+  if (( $# < 1 )); then _usage; fi
+  local cmd="$1"; shift
+  case "$cmd" in
+    list) [[ $# -eq 2 ]] || _usage; cmd_list "$1" "$2";;
+    status) [[ $# -eq 2 ]] || _usage; cmd_status "$1" "$2";;
+    apply) 
+      (( $# >= 3 )) || _usage
+      local cat="$1"; local pkg="$2"; local tgt="$3"; shift 3
+      local dry=0 force=0
+      while (( $# )); do case "$1" in --dry) dry=1;; --force) force=1;; *) log_warn "opção desconhecida $1";; esac; shift; done
+      cmd_apply "$cat" "$pkg" "$tgt" "$dry" "$force";;
+    verify) [[ $# -eq 2 ]] || _usage; cmd_verify "$1" "$2";;
+    revert) [[ $# -eq 3 ]] || _usage; cmd_revert "$1" "$2" "$3";;
+    clean) cmd_clean;;
+    help) _usage;;
+    *) log_err "Comando desconhecido: $cmd"; _usage;;
+  esac
+  log_end $ADM_OK
+}
+
+trap 'log_err "Interrompido"; log_end $ADM_ERR_INTERNAL; exit $ADM_ERR_INTERNAL' INT TERM
+main "$@"
