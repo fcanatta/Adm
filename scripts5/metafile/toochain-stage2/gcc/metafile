@@ -1,0 +1,10 @@
+NAME=gcc
+VERSION=14.2.0
+CATEGORY=toolchain-stage2
+HOMEPAGE=https://gcc.gnu.org/
+SOURCES=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz https://ftpmirror.gnu.org/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.26.tar.xz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=binutils musl kernel-headers gmp mpfr mpc isl zlib zstd
+RUNTIME_DEPS=musl zlib zstd
+OPTIONAL_DEPS=
+COUNT=0
