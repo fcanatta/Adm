@@ -1,0 +1,15 @@
+Como usar (sequência)
+
+1. (Já feitos) stage0: binutils, gcc (stage0), kernel-headers (stage0), musl (headers stage0).
+
+2. (Já feito) stage2: musl completo.
+
+3. Agora instale libstdc++ (stage1):
+
+adm install gcc-libstdcxx --category toolchain-stage1 --stage 1
+
+4. Depois, instale o gcc final (stage2)
+
+adm install gcc --category toolchain-stage2 --stage 2
+
+> Se preferir usar bibliotecas de sistema (gmp/mpfr/mpc/isl) em vez do vendor in-tree no stage2, instale/declare esses pacotes antes e exporte ADM_GCC_VENDOR_LIBS=0 ao chamar o adm install.
