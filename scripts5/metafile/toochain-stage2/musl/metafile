@@ -1,0 +1,10 @@
+NAME=musl
+VERSION=1.2.5
+CATEGORY=toolchain-stage2
+HOMEPAGE=https://musl.libc.org/
+SOURCES=https://musl.libc.org/releases/musl-1.2.5.tar.gz https://github.com/bminor/musl/releases/download/v1.2.5/musl-1.2.5.tar.gz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=linux-headers
+RUNTIME_DEPS=
+OPTIONAL_DEPS=
+COUNT=0
