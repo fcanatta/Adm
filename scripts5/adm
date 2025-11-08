@@ -1,0 +1,736 @@
+#!/usr/bin/env sh
+# adm — Front-end CLI/TUI para o ecossistema ADM (LFS do zero)
+# POSIX sh; compatível com dash/ash/bash. Sem dependências obrigatórias.
+set -u
+# =========================
+# 0) Config & defaults
+# =========================
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STAGE:=host}"
+: "${ADM_LOG_COLOR:=auto}"
+: "${ADM_PIPELINE:=adm}"
+
+BIN_DIR="$ADM_ROOT/bin"
+META_DIR="$ADM_ROOT/metafile"
+UPDATE_DIR="$ADM_ROOT/update"
+INDEX_DIR="$ADM_ROOT/index"
+REG_DIR="$ADM_ROOT/registry"
+LOG_DIR="$ADM_ROOT/logs/adm"
+
+JOB_ID=""
+TUI=0
+JSON=0
+YES=0
+VERBOSE=0
+PROFILE=""
+STAGE_USE=""
+WITH_OPTIONAL=0
+FORCE_REBUILD=0
+NO_PACK=0
+KEEP_WORK=0
+
+# =========================
+# 1) Cores + logging
+# =========================
+_is_tty(){ [ -t 1 ]; }
+_color_on=0
+_color_setup(){
+  if [ "${ADM_LOG_COLOR}" = "never" ] || [ -n "${NO_COLOR:-}" ] || [ "${TERM:-}" = "dumb" ]; then
+    _color_on=0
+  elif [ "${ADM_LOG_COLOR}" = "always" ] || _is_tty; then
+    _color_on=1
+  else
+    _color_on=0
+  fi
+}
+_b(){ [ $_color_on -eq 1 ] && printf '\033[1m'; }
+_rst(){ [ $_color_on -eq 1 ] && printf '\033[0m'; }
+_c_mag(){ [ $_color_on -eq 1 ] && printf '\033[35;1m'; }  # estágio rosa bold
+_c_yel(){ [ $_color_on -eq 1 ] && printf '\033[33;1m'; }  # caminho amarelo bold
+_c_cyn(){ [ $_color_on -eq 1 ] && printf '\033[36;1m'; }
+
+_ts(){ date +"%Y-%m-%dT%H:%M:%S%z" | sed 's/\([0-9][0-9]\)$/:\1/'; }
+_ctx(){
+  st="${ADM_STAGE:-host}"; pipe="${ADM_PIPELINE:-adm}"; job="${JOB_ID:-none}"
+  if [ $_color_on -eq 1 ]; then
+    printf "("; _c_mag; printf "%s" "$st"; _rst; printf ":"; _c_cyn; printf "%s" "$pipe"; _rst; printf " job="; _c_yel; printf "%s" "$job"; _rst; printf ")"
+  else
+    printf "(%s:%s job=%s)" "$st" "$pipe" "$job"
+  fi
+}
+
+say(){ # leve fallback se adm-log.sh não existir
+  lvl="$1"; shift; msg="${*:-}"
+  _color_setup
+  case "$lvl" in
+    INFO) tag="[INFO]";;
+    WARN) tag="[WARN]";;
+    ERROR) tag="[ERROR]";;
+    STEP) tag="[STEP]";;
+    OK) tag="[ OK ]";;
+    DEBUG) tag="[DEBUG]";;
+    *) tag="[$lvl]";;
+  esac
+  printf "%s [%s] %s %s\n" "$tag" "$(_ts)" "$(_ctx)" "$msg"
+}
+
+die(){ say ERROR "$*"; exit 40; }
+
+ensure_dirs(){
+  for d in "$BIN_DIR" "$META_DIR" "$INDEX_DIR" "$REG_DIR" "$LOG_DIR" "$UPDATE_DIR"; do
+    [ -d "$d" ] || mkdir -p "$d" || die "não foi possível criar: $d"
+  done
+}
+
+mk_job(){
+  ts="$(date +%Y%m%d-%H%M%S)"
+  JOB_ID="${ts}.$(printf "%08x" $$)"
+  jobd="$LOG_DIR/$JOB_ID"
+  mkdir -p "$jobd" || die "não foi possível criar job dir"
+  [ -L "$LOG_DIR/latest" ] && rm -f "$LOG_DIR/latest" 2>/dev/null || true
+  ln -sfn "$JOB_ID" "$LOG_DIR/latest" 2>/dev/null || true
+}
+
+tee_run(){ # tee para log do job
+  jobd="$LOG_DIR/$JOB_ID"
+  [ -d "$jobd" ] || mkdir -p "$jobd" || die "sem log dir"
+  logf="$jobd/$1.log"; shift
+  say STEP "exec: $*  (log: $logf)"
+  "$@" 2>&1 | tee -a "$logf"
+  rc="${PIPESTATUS:-${?}}"
+  return "$rc"
+}
+
+# =========================
+# 2) Utilidades
+# =========================
+lower(){ printf "%s" "$1" | tr 'A-Z' 'a-z'; }
+trim(){ printf "%s" "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
+kv_get(){ awk -F'=' -v k="$2" '$1==k{print substr($0,index($0,"=")+1)}' "$1" 2>/dev/null | head -n1; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+
+confirm(){
+  [ $YES -eq 1 ] && return 0
+  printf "%s Prosseguir? [y/N] " "$1" 1>&2
+  read -r ans || ans="n"
+  case "$(lower "$(trim "$ans")")" in y|yes) return 0;; *) say WARN "cancelado"; return 1;; esac
+}
+
+json_escape(){ printf "%s" "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+# =========================
+# 3) Índice e descoberta de metafile
+# =========================
+index_rebuild(){
+  ensure_dirs
+  idx="$INDEX_DIR/programs.idx"
+  say STEP "recriando índice de programas"
+  : >"$idx"
+  # formato: name<TAB>category<TAB>path
+  find "$META_DIR" -type f -name metafile 2>/dev/null | while read -r mf; do
+    catg="$(printf "%s" "$mf" | sed "s#^$META_DIR/##; s#/metafile\$##; s#/[^/]*\$##")"
+    name="$(kv_get "$mf" "NAME")"
+    [ -z "$name" ] && name="$(basename "$(dirname "$mf")")"
+    printf "%s\t%s\t%s\n" "$name" "$catg" "$mf" >>"$idx"
+  done
+  say OK
+}
+
+index_find_name(){
+  # $1=pattern (regex simples), retorna linhas name<TAB>category<TAB>path
+  idx="$INDEX_DIR/programs.idx"
+  [ -f "$idx" ] || index_rebuild
+  grep -Ei "$1" "$idx" 2>/dev/null || true
+}
+
+meta_find_exact(){
+  # $1=name, $2=category (opcional), ecoa path ou vazio
+  idx="$INDEX_DIR/programs.idx"
+  [ -f "$idx" ] || index_rebuild
+  if [ -n "${2:-}" ]; then
+    awk -v n="$1" -v c="$2" -F'\t' '$1==n && $2==c{print $3}' "$idx" | head -n1
+  else
+    awk -v n="$1" -F'\t' '$1==n{print $3}' "$idx" | head -n1
+  fi
+}
+
+# =========================
+# 4) Busca / Info / Lista
+# =========================
+cmd_search(){
+  pattern="${1:-}"
+  [ -n "$pattern" ] || { say ERROR "uso: adm search <padrão>"; exit 10; }
+  ensure_dirs
+  res="$(index_find_name "$pattern")"
+  if [ -z "$res" ]; then
+    say INFO "nada encontrado para '$pattern'"
+    exit 20
+  fi
+  if [ $JSON -eq 1 ]; then
+    echo "$res" | awk -F'\t' 'BEGIN{print "["} {printf("%s{\"name\":\"%s\",\"category\":\"%s\",\"metafile\":\"%s\"}", NR==1?"":",", $1,$2,$3)} END{print "]"}'
+    exit 0
+  fi
+  echo "$res" | while IFS="$(printf '\t')" read -r n c p; do
+    _c_yel; printf "%s" "$n"; _rst; printf "  [%s]  " "$c"; printf "%s\n" "$p"
+  done
+}
+
+cmd_info(){
+  name="${1:-}"
+  [ -n "$name" ] || { say ERROR "uso: adm info <programa> [--category <cat>] [--installed]"; exit 10; }
+  shift || true
+  CAT=""
+  SHOW_INST=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) shift; CAT="$1";;
+      --installed) SHOW_INST=1;;
+      --json) JSON=1;;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+  mf="$(meta_find_exact "$name" "$CAT")"
+  [ -n "$mf" ] || { say ERROR "metafile não encontrado para '$name'"; exit 20; }
+  ver="$(kv_get "$mf" "VERSION")"
+  catg="$(kv_get "$mf" "CATEGORY")"
+  home="$(kv_get "$mf" "HOMEPAGE")"
+  srcs="$(kv_get "$mf" "SOURCES")"
+  bdeps="$(kv_get "$mf" "BUILD_DEPS")"
+  rdeps="$(kv_get "$mf" "RUNTIME_DEPS")"
+  odeps="$(kv_get "$mf" "OPTIONAL_DEPS")"
+  if [ $JSON -eq 1 ]; then
+    printf '{"name":"%s","category":"%s","version":"%s","homepage":"%s","metafile":"%s","build_deps":"%s","runtime_deps":"%s","optional_deps":"%s"}\n' \
+      "$(json_escape "$name")" "$(json_escape "$catg")" "$(json_escape "$ver")" "$(json_escape "$home")" \
+      "$(json_escape "$mf")" "$(json_escape "$bdeps")" "$(json_escape "$rdeps")" "$(json_escape "$odeps")"
+    exit 0
+  fi
+  _c_yel; printf "%s" "$name"; _rst; printf " [%s]  ver=%s\n" "$catg" "$ver"
+  [ -n "$home" ] && printf "  homepage: %s\n" "$home"
+  printf "  sources:  %s\n" "$srcs"
+  printf "  deps:     build=[%s]  runtime=[%s]  optional=[%s]\n" "$bdeps" "$rdeps" "$odeps"
+  if [ $SHOW_INST -eq 1 ]; then
+    if [ -d "$REG_DIR/install/$name" ]; then
+      printf "  instalado: sim (registry: %s)\n" "$REG_DIR/install/$name"
+    else
+      printf "  instalado: não\n"
+    fi
+  fi
+}
+
+cmd_list(){
+  mode="available"
+  [ "${1:-}" = "--installed" ] && mode="installed"
+  [ "${1:-}" = "--built" ] && mode="built"
+  case "$mode" in
+    available) index_find_name ".";;
+    installed) ls -1 "$REG_DIR/install" 2>/dev/null | sed 's/$/\t(installed)/';;
+    built)     ls -1 "$REG_DIR/build" 2>/dev/null | sed 's/$/\t(built)/';;
+  esac
+}
+
+# =========================
+# 5) Resolver de dependências (toposort simples)
+# =========================
+dep_read_from_meta(){
+  mf="$1"; echo "$(kv_get "$mf" "BUILD_DEPS") $(kv_get "$mf" "RUNTIME_DEPS")"
+}
+
+dep_collect_graph(){
+  # ecoa linhas: parent<TAB>child
+  root_name="$1"; root_cat="$2"; visited=""
+  q="$root_name"
+  while [ -n "$q" ]; do
+    cur="$(printf "%s" "$q" | awk '{print $1}')"
+    q="$(printf "%s" "$q" | sed 's/^[^ ]* *//')"
+    echo "$visited" | grep -qx "$cur" 2>/dev/null && continue
+    visited="$(printf "%s\n%s" "$visited" "$cur" | sed '/^[[:space:]]*$/d')"
+    mf="$(meta_find_exact "$cur" "$root_cat")"
+    [ -n "$mf" ] || continue
+    deps="$(dep_read_from_meta "$mf")"
+    for d in $deps; do
+      [ -z "$d" ] && continue
+      printf "%s\t%s\n" "$cur" "$d"
+      q="$q $d"
+    done
+  done
+}
+
+dep_toposort(){
+  # entrada: linhas parent<TAB>child; saída ordem topológica única
+  # implem. Kahn simplificado
+  tmp="$(mktemp 2>/dev/null || echo "/tmp/adm-dep.$$")"
+  cat >"$tmp"
+  # construir conjuntos
+  all="$(awk -F'\t' '{print $1"\n"$2}' "$tmp" 2>/dev/null | sed '/^[[:space:]]*$/d' | sort -u)"
+  indeg_list=""
+  for n in $all; do
+    c="$(awk -F'\t' -v v="$n" '$2==v{c++} END{print c+0}' "$tmp" 2>/dev/null)"
+    printf "%s %s\n" "$n" "$c"
+  done | sort -k2,2n >"$tmp.indeg"
+  queue="$(awk '$2==0{print $1}' "$tmp.indeg" 2>/dev/null)"
+  out=""
+  while [ -n "$queue" ]; do
+    v="$(printf "%s" "$queue" | awk '{print $1}')"
+    queue="$(printf "%s" "$queue" | sed 's/^[^ ]* *//')"
+    out="$out $v"
+    # reduzir indegree dos vizinhos
+    for nb in $(awk -F'\t' -v u="$v" '$1==u{print $2}' "$tmp" 2>/dev/null); do
+      cur="$(awk -v n="$nb" '$1==n{print $2}' "$tmp.indeg" 2>/dev/null)"
+      new=$((cur-1)); awk -v n="$nb" -v w="$new" '$1==n{$2=w} 1' "$tmp.indeg" >"$tmp.indeg2" && mv "$tmp.indeg2" "$tmp.indeg"
+      [ $new -eq 0 ] && queue="$queue $nb"
+    done
+  done
+  echo "$out" | sed 's/^[[:space:]]*//'
+  rm -f "$tmp" "$tmp.indeg" 2>/dev/null || true
+}
+
+# =========================
+# 6) Fetch/Build/Pack/Install (pipeline)
+# =========================
+run_fetch(){
+  name="$1"; catg="$2"; mf="$3"
+  say STEP "FETCH $name"
+  srcs="$(kv_get "$mf" "SOURCES")"
+  [ -x "$BIN_DIR/adm-fetch.sh" ] || die "adm-fetch.sh não encontrado"
+  tee_run fetch "sh" "$BIN_DIR/adm-fetch.sh" --metafile "$mf" --max-par 4 >/dev/null
+}
+
+run_detect(){
+  name="$1"; catg="$2"; mf="$3"
+  [ -x "$BIN_DIR/adm-detect.sh" ] || { say INFO "adm-detect.sh ausente — pulando detect"; return 0; }
+  say STEP "DETECT $name"
+  tee_run detect "sh" "$BIN_DIR/adm-detect.sh" run "$catg" "$name" >/dev/null
+}
+
+run_build(){
+  name="$1"; catg="$2"; mf="$3"
+  say STEP "BUILD $name"
+  args=""
+  [ $WITH_OPTIONAL -eq 1 ] && args="$args --with-optional"
+  [ -n "$PROFILE" ] && args="$args --profile $PROFILE"
+  [ -n "$STAGE_USE" ] && args="$args --stage $STAGE_USE"
+  [ $FORCE_REBUILD -eq 1 ] && args="$args --force"
+  [ $NO_PACK -eq 1 ] && args="$args --no-pack"
+  [ -x "$BIN_DIR/adm-build.sh" ] || die "adm-build.sh não encontrado"
+  sh -c "sh \"$BIN_DIR/adm-build.sh\" run \"$catg\" \"$name\" $args" 2>&1 | tee -a "$LOG_DIR/$JOB_ID/build-$name.log"
+}
+
+run_pack(){
+  name="$1"; catg="$2"
+  [ $NO_PACK -eq 1 ] && { say INFO "pack desativado (--no-pack)"; return 0; }
+  [ -x "$BIN_DIR/adm-pack.sh" ] || { say INFO "adm-pack.sh ausente — pulando pack"; return 0; }
+  say STEP "PACK $name"
+  sh " $BIN_DIR/adm-pack.sh" 2>/dev/null >/dev/null # evita erro por citação; chamaremos com args no install
+  # pack é acionado via adm-build normalmente; deixamos wrapper aqui por compat.
+}
+
+run_install(){
+  name="$1"; catg="$2"; mf="$3"
+  say STEP "INSTALL $name"
+  args=""
+  [ -x "$BIN_DIR/adm-install.sh" ] || die "adm-install.sh não encontrado"
+  sh -c "sh \"$BIN_DIR/adm-install.sh\" run \"$catg\" \"$name\" $args" 2>&1 | tee -a "$LOG_DIR/$JOB_ID/install-$name.log"
+}
+
+run_registry_link(){
+  name="$1"
+  [ -x "$BIN_DIR/adm-registry.sh" ] || { say INFO "adm-registry.sh ausente — pulando registry link"; return 0; }
+  tee_run registry "sh" "$BIN_DIR/adm-registry.sh" link "$name" >/dev/null
+}
+
+run_kinit_if_needed(){
+  name="$1"
+  case "$name" in
+    linux|kernel|linux-*|kernel-*)
+      if [ -x "$BIN_DIR/adm-kinit.sh" ]; then
+        say STEP "KINIT (kernel afetado)"
+        tee_run kinit "sh" "$BIN_DIR/adm-kinit.sh" plan >/dev/null
+        tee_run kinit "sh" "$BIN_DIR/adm-kinit.sh" build >/dev/null
+        tee_run kinit "sh" "$BIN_DIR/adm-kinit.sh" install --keep-old 3 >/dev/null
+      fi
+      ;;
+    *) :;;
+  esac
+}
+
+# =========================
+# 7) Comandos de ação: install/build/remove/upgrade
+# =========================
+cmd_install(){
+  name="${1:-}"; shift || true
+  [ -n "$name" ] || { say ERROR "uso: adm install <programa> [--category <cat>] [--with-optional] [--profile <nome>] [--stage N] [--force-rebuild] [--no-pack] [--keep-work]"; exit 10; }
+  CAT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) shift; CAT="$1";;
+      --with-optional) WITH_OPTIONAL=1;;
+      --profile) shift; PROFILE="$1";;
+      --stage) shift; STAGE_USE="$1"; ADM_STAGE="stage$STAGE_USE";;
+      --force-rebuild) FORCE_REBUILD=1;;
+      --no-pack) NO_PACK=1;;
+      --keep-work) KEEP_WORK=1;;
+      --yes) YES=1;;
+      --verbose) VERBOSE=$((VERBOSE+1));;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+
+  ensure_dirs; mk_job
+  mf="$(meta_find_exact "$name" "$CAT")"
+  [ -n "$mf" ] || { say ERROR "metafile não encontrado para '$name'"; exit 20; }
+  catg="$(kv_get "$mf" "CATEGORY")"
+  ver="$(kv_get "$mf" "VERSION")"
+  say INFO "Alvo: $name [$catg] v$ver  metafile="; _c_yel; printf "%s\n" "$mf"; _rst
+
+  # resolver dependências
+  say STEP "resolvendo dependências"
+  g="$(dep_collect_graph "$name" "$catg")"
+  order="$(printf "%s\n" "$g" | dep_toposort)"
+  # garanta que o alvo esteja no fim, e inclua ele próprio
+  order="$(printf "%s %s" "$order" "$name" | awk 'BEGIN{RS=" "}{if($0!="")a[$0]=1}END{for(k in a)print k}' | tr '\n' ' ')"
+  say INFO "ordem de build: $order"
+
+  # construir/instalar cada dep na ordem
+  for pkg in $order; do
+    [ -z "$pkg" ] && continue
+    mf_i="$(meta_find_exact "$pkg" "$catg")"
+    [ -n "$mf_i" ] || { say WARN "sem metafile para dep '$pkg' — pulando"; continue; }
+    run_fetch  "$pkg" "$catg" "$mf_i" || die "fetch falhou: $pkg"
+    run_detect "$pkg" "$catg" "$mf_i" || true
+    run_build  "$pkg" "$catg" "$mf_i" || die "build falhou: $pkg"
+    run_install "$pkg" "$catg" "$mf_i" || die "install falhou: $pkg"
+    run_registry_link "$pkg" || true
+    run_kinit_if_needed "$pkg" || true
+  done
+
+  # limpeza pós-instalação (opcional)
+  if [ $KEEP_WORK -eq 0 ] && [ -x "$BIN_DIR/adm-clean.sh" ]; then
+    tee_run clean "sh" "$BIN_DIR/adm-clean.sh" build --work --pkg-tmp --yes >/dev/null
+  fi
+
+  say OK
+  exit 0
+}
+
+cmd_build_only(){
+  name="${1:-}"; shift || true
+  [ -n "$name" ] || { say ERROR "uso: adm build <programa> [--category <cat>] [--with-optional] [--profile <nome>] [--stage N] [--force-rebuild] [--no-pack]"; exit 10; }
+  CAT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) shift; CAT="$1";;
+      --with-optional) WITH_OPTIONAL=1;;
+      --profile) shift; PROFILE="$1";;
+      --stage) shift; STAGE_USE="$1"; ADM_STAGE="stage$STAGE_USE";;
+      --force-rebuild) FORCE_REBUILD=1;;
+      --no-pack) NO_PACK=1;;
+      --verbose) VERBOSE=$((VERBOSE+1));;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+  ensure_dirs; mk_job
+  mf="$(meta_find_exact "$name" "$CAT")" || true
+  [ -n "$mf" ] || { say ERROR "metafile não encontrado para '$name'"; exit 20; }
+  catg="$(kv_get "$mf" "CATEGORY")"
+  run_fetch  "$name" "$catg" "$mf" || die "fetch falhou"
+  run_detect "$name" "$catg" "$mf" || true
+  run_build  "$name" "$catg" "$mf" || die "build falhou"
+  say OK
+}
+# =========================
+# 8) Remove / Reinstall / Upgrade
+# =========================
+cmd_remove(){
+  name="${1:-}"; shift || true
+  [ -n "$name" ] || { say ERROR "uso: adm remove <programa> [--purge-orphans] [--yes]"; exit 10; }
+  PURGE=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --purge-orphans) PURGE=1;;
+      --yes) YES=1;;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-install.sh" ] || die "adm-install.sh não encontrado"
+  confirm "Desinstalar $name?" || exit 20
+  tee_run uninstall "sh" "$BIN_DIR/adm-install.sh" uninstall "$name" || die "uninstall falhou"
+  if [ $PURGE -eq 1 ] && [ -x "$BIN_DIR/adm-clean.sh" ]; then
+    tee_run clean "sh" "$BIN_DIR/adm-clean.sh" orphans --files --fix --yes >/dev/null
+  fi
+  say OK
+}
+
+cmd_reinstall(){
+  name="${1:-}"; shift || true
+  [ -n "$name" ] || { say ERROR "uso: adm reinstall <programa> [--category <cat>] [--no-deps]"; exit 10; }
+  NODEPS=0; CAT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category) shift; CAT="$1";;
+      --no-deps) NODEPS=1;;
+      --yes) YES=1;;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+  ensure_dirs; mk_job
+  mf="$(meta_find_exact "$name" "$CAT")" || true
+  [ -n "$mf" ] || { say ERROR "metafile não encontrado"; exit 20; }
+  catg="$(kv_get "$mf" "CATEGORY")"
+  run_fetch "$name" "$catg" "$mf" || die "fetch falhou"
+  run_detect "$name" "$catg" "$mf" || true
+  run_build "$name" "$catg" "$mf" || die "build falhou"
+  run_install "$name" "$catg" "$mf" || die "install falhou"
+  run_registry_link "$name" || true
+  run_kinit_if_needed "$name" || true
+  say OK
+}
+
+cmd_upgrade(){
+  target="${1:-}"; shift || true
+  [ -n "$target" ] || { say ERROR "uso: adm upgrade <programa|all> [--plan|--run] [--with-deps] [--yes]"; exit 10; }
+  PLAN=0; RUN=0; WITHDEPS=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan) PLAN=1;;
+      --run) RUN=1;;
+      --with-deps) WITHDEPS=1;;
+      --yes) YES=1;;
+      *) say WARN "flag desconhecida: $1";;
+    esac; shift || true
+  done
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-update.sh" ] || die "adm-update.sh não encontrado"
+  if [ "$target" = "all" ]; then
+    # percorre todos instalados
+    for n in $(ls -1 "$REG_DIR/install" 2>/dev/null); do
+      tee_run update "sh" "$BIN_DIR/adm-update.sh" plan "$(kv_get "$META_DIR/$n/metafile" "CATEGORY")" "$n" || true
+    done
+    [ $RUN -eq 1 ] && say INFO "Use 'adm install <prog>' para aplicar upgrades planejados."
+    say OK; exit 0
+  fi
+  catg="$(kv_get "$(meta_find_exact "$target")" "CATEGORY")"
+  [ -n "$catg" ] || { say ERROR "não encontrei categoria de '$target'"; exit 20; }
+  if [ $PLAN -eq 1 ]; then
+    tee_run update "sh" "$BIN_DIR/adm-update.sh" plan "$catg" "$target" || die "plan falhou"
+  fi
+  if [ $RUN -eq 1 ]; then
+    tee_run update "sh" "$BIN_DIR/adm-update.sh" run "$catg" "$target" || die "update run falhou"
+    # após gerar metafile em update/, podemos instalar a nova versão
+    say INFO "instalando versão atualizada…"
+    cmd_install "$target" --category "$catg" --yes
+  fi
+  say OK
+}
+
+# =========================
+# 9) Bootstrap / Stage / Repo / Registry / Kinit / Clean / Doctor / Profile / Config
+# =========================
+cmd_bootstrap(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-stage.sh" ] || die "adm-stage.sh não encontrado"
+  tee_run stage "sh" "$BIN_DIR/adm-stage.sh" bootstrap --stage 0 || die "bootstrap falhou"
+  say OK
+}
+
+cmd_stage(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-stage.sh" ] || die "adm-stage.sh não encontrado"
+  tee_run stage "sh" "$BIN_DIR/adm-stage.sh" "$@" || die "stage falhou"
+}
+
+cmd_repo(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-registry.sh" ] || die "adm-registry.sh não encontrado"
+  tee_run repo "sh" "$BIN_DIR/adm-registry.sh" repo "$@" || die "repo falhou"
+}
+
+cmd_registry(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-registry.sh" ] || die "adm-registry.sh não encontrado"
+  tee_run registry "sh" "$BIN_DIR/adm-registry.sh" "$@" || die "registry falhou"
+}
+
+cmd_kinit(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-kinit.sh" ] || die "adm-kinit.sh não encontrado"
+  tee_run kinit "sh" "$BIN_DIR/adm-kinit.sh" "$@" || die "kinit falhou"
+}
+
+cmd_clean(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-clean.sh" ] || die "adm-clean.sh não encontrado"
+  tee_run clean "sh" "$BIN_DIR/adm-clean.sh" "$@" || die "clean falhou"
+}
+
+cmd_doctor(){
+  ensure_dirs; mk_job
+  say STEP "checando ferramentas essenciais"
+  for t in curl sha256sum tar gzip xz zstd awk sed grep; do
+    if ! exists "$t"; then say WARN "ferramenta ausente: $t"; fi
+  done
+  for s in adm-fetch.sh adm-build.sh adm-install.sh adm-registry.sh adm-clean.sh; do
+    [ -x "$BIN_DIR/$s" ] || say WARN "script ausente: $s"
+  done
+  df -h "$ADM_ROOT" 2>/dev/null || true
+  say OK
+}
+
+cmd_profile(){
+  ensure_dirs; mk_job
+  [ -x "$BIN_DIR/adm-profile.sh" ] || die "adm-profile.sh não encontrado"
+  tee_run profile "sh" "$BIN_DIR/adm-profile.sh" "$@" || die "profile falhou"
+}
+
+cmd_config(){
+  ensure_dirs
+  cfg="$ADM_ROOT/adm.conf"
+  case "${1:-}" in
+    get) shift; k="${1:-}"; [ -n "$k" ] || { say ERROR "uso: adm config get KEY"; exit 10; }
+         grep -E "^$k=" "$cfg" 2>/dev/null | sed "s/^$k=//";;
+    set) shift; kv="${1:-}"; [ -n "$kv" ] || { say ERROR "uso: adm config set KEY=VAL"; exit 10; }
+         if grep -qE "^$(printf "%s" "$kv" | sed 's/=.*$//')=" "$cfg" 2>/dev/null; then
+           awk -v p="$kv" -F'=' 'BEGIN{split(p,a,"=")} $1==a[1]{$0=p} 1' "$cfg" >"$cfg.new" && mv "$cfg.new" "$cfg"
+         else
+           printf "%s\n" "$kv" >>"$cfg"
+         fi
+         say OK;;
+    *) say ERROR "uso: adm config get|set"; exit 10;;
+  esac
+}
+
+# =========================
+# 10) TUI (whiptail/dialog/fzf fallback)
+# =========================
+tui_picker(){
+  # lista programas para escolha
+  ensure_dirs
+  idx="$INDEX_DIR/programs.idx"; [ -f "$idx" ] || index_rebuild
+  if exists whiptail; then
+    # construir lista "TAG item"
+    list=""
+    while IFS="$(printf '\t')" read -r n c p; do
+      list="$list $n [$c] $p"
+    done <"$idx"
+    whiptail --title "ADM - Programas" --menu "Escolha um programa" 25 78 16 $list 2>"/tmp/adm-choice.$$" || return 1
+    cat "/tmp/adm-choice.$$"; rm -f "/tmp/adm-choice.$$"
+  elif exists dialog; then
+    list=""
+    while IFS="$(printf '\t')" read -r n c p; do
+      list="$list $n [$c] $p"
+    done <"$idx"
+    dialog --title "ADM - Programas" --menu "Escolha um programa" 25 78 16 $list 2>"/tmp/adm-choice.$$" || return 1
+    cat "/tmp/adm-choice.$$"; rm -f "/tmp/adm-choice.$$"
+  elif exists fzf; then
+    awk -F'\t' '{printf("%s\t[%s]\t%s\n",$1,$2,$3)}' "$idx" | fzf | awk -F'\t' '{print $1}'
+  else
+    # fallback: imprime lista e lê stdin
+    nl -ba "$idx"
+    printf "Digite o número ou nome: "
+    read -r sel || return 1
+    echo "$sel" | grep -Eq '^[0-9]+$' && awk -v n="$sel" 'NR==n{print $1}' "$idx" || echo "$sel"
+  fi
+}
+
+cmd_tui(){
+  choice="$(tui_picker)" || { say WARN "sem escolha"; exit 20; }
+  name="$choice"
+  say INFO "selecionado: $name"
+  # menu de ação mínima
+  if exists whiptail; then
+    action="$(whiptail --title "ADM" --menu "Ação para $name" 20 60 8 \
+              install "Construir e instalar" \
+              build "Apenas compilar" \
+              info "Informações" \
+              remove "Desinstalar" \
+              update "Plan/Run update" 2>"/tmp/adm-act.$$" && cat /tmp/adm-act.$$ || true)"
+    rm -f /tmp/adm-act.$$ 2>/dev/null || true
+  else
+    echo "Ações: install/build/info/remove/update"
+    printf "Escolha: "; read -r action || action="info"
+  fi
+  case "$action" in
+    install) cmd_install "$name" --yes;;
+    build)   cmd_build_only "$name";;
+    info)    cmd_info "$name";;
+    remove)  cmd_remove "$name" --yes;;
+    update)  cmd_upgrade "$name" --plan;;
+    *) say WARN "ação desconhecida";;
+  esac
+}
+# =========================
+# 11) Ajuda / Dispatcher
+# =========================
+usage(){
+  cat <<'EOF'
+adm — CLI do ecossistema ADM
+
+Uso rápido:
+  adm search <padrão>
+  adm info <programa> [--category <cat>] [--installed]
+  adm list [--installed|--built|--available]
+  adm install <programa> [--category <cat>] [--with-optional] [--profile <nome>] [--stage N] [--force-rebuild] [--no-pack] [--keep-work] [--yes]
+  adm build <programa> [mesmas opções do install]
+  adm remove <programa> [--purge-orphans] [--yes]
+  adm reinstall <programa>
+  adm upgrade <programa|all> [--plan|--run] [--with-deps] [--yes]
+  adm bootstrap
+  adm stage  <args...>        # proxy para adm-stage.sh
+  adm repo   <args...>        # proxy para adm-registry.sh repo ...
+  adm registry <args...>      # proxy para adm-registry.sh ...
+  adm kinit <args...>         # proxy para adm-kinit.sh
+  adm clean <args...>         # proxy para adm-clean.sh
+  adm doctor
+  adm profile <args...>       # proxy para adm-profile.sh
+  adm config get|set ...
+  adm tui                     # modo interativo
+
+Opções globais:
+  --json  --yes  --verbose
+EOF
+}
+
+parse_global(){
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) JSON=1;;
+      --yes) YES=1;;
+      --verbose) VERBOSE=$((VERBOSE+1));;
+      *) echo "$1";;
+    esac
+    shift || true
+  done
+}
+
+# =========================
+# 12) Main
+# =========================
+main(){
+  _color_setup
+  ensure_dirs
+  sub="${1:-}"; shift || true
+  case "$sub" in
+    search)   rem="$(parse_global "$@")"; set -- $rem; cmd_search "$@";;
+    info)     rem="$(parse_global "$@")"; set -- $rem; cmd_info "$@";;
+    list)     rem="$(parse_global "$@")"; set -- $rem; cmd_list "$@";;
+    install)  cmd_install "$@";;
+    build)    cmd_build_only "$@";;
+    remove)   cmd_remove "$@";;
+    reinstall) cmd_reinstall "$@";;
+    upgrade)  cmd_upgrade "$@";;
+    bootstrap) cmd_bootstrap "$@";;
+    stage)    cmd_stage "$@";;
+    repo)     cmd_repo "$@";;
+    registry) cmd_registry "$@";;
+    kinit)    cmd_kinit "$@";;
+    clean)    cmd_clean "$@";;
+    doctor)   cmd_doctor "$@";;
+    profile)  cmd_profile "$@";;
+    config)   cmd_config "$@";;
+    tui|"")   cmd_tui;;
+    -h|--help|help) usage; exit 0;;
+    *) say ERROR "subcomando desconhecido: $sub"; usage; exit 10;;
+  esac
+}
+
+main "$@"
