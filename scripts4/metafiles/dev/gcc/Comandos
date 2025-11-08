@@ -1,0 +1,8 @@
+1. Garanta binutils pass1 instalado no stage:
+adm build dev/binutils --root ${STAGE0_ROOT} --profile minimal
+
+2. export BOOTSTRAP_TARGET=x86_64-linux-gnu          # ajuste conforme sua arquitetura-alvo
+adm build dev/gcc --root ${STAGE0_ROOT} --profile minimal
+
+3. Verifique o relatório:
+${STAGE0_ROOT}/usr/src/adm/state/bootstrap/stage0/gcc-pass1/build.info
