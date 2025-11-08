@@ -1,6 +1,18 @@
 #!/usr/bin/env sh
 # adm-profile.sh — Gerenciador de perfis de build para o sistema ADM
 # POSIX sh; compatível com dash/ash/bash. Sem dependências obrigatórias.
+# # Listar perfis
+# /usr/src/adm/bin/adm-profile.sh list
+# Criar um perfil custom baseado em musl
+# /usr/src/adm/bin/adm-profile.sh create minha-musl --from=musl
+# Ajustar overrides na sessão e salvar no custom
+# /usr/src/adm/bin/adm-profile.sh set OPT_LEVEL=-Os LTO=off --save minha-musl
+# Selecionar perfis combinados (normal + clang)
+# /usr/src/adm/bin/adm-profile.sh select normal,clang
+# Ver efetivo (com validação e bonitinho)
+# /usr/src/adm/bin/adm-profile.sh validate
+# Exportar flags para o ambiente do build
+eval "$(/usr/src/adm/bin/adm-profile.sh export)"
 set -u
 # =========================
 # 0) Diretórios e estado
