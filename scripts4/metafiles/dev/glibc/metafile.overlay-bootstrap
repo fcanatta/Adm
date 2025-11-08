@@ -1,0 +1,15 @@
+# Overlay para glibc no bootstrap (instala headers+libc/rt/crt em /usr do stage).
+
+name=glibc
+version=2.40
+category=dev
+build_type=autotools
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU C Library (bootstrap: headers+crt+libc para TARGET)
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
