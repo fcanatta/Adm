@@ -1,0 +1,23 @@
+# Overlay de bootstrap stage0 para GCC (pass1)
+# - Apenas o que difere do pacote "normal".
+# - Os valores de sha256sums devem ser mantidos em sincronia com o metafile base do GCC.
+# - Caso você prefira "vendorizar" gmp/mpfr/mpc, inclua-os em 'sources' (opcional).
+
+name=gcc
+version=14.2.0
+category=dev
+build_type=autotools
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU Compiler Collection (bootstrap stage0 pass1: cross C only, without headers)
+homepage=https://gcc.gnu.org/
+maintainer=ADM Packaging <adm@example.local>
+
+# Se você optar por baixar as libs de precisão separadas, inclua-as em 'sources' (opcional).
+# Caso use 'contrib/download_prerequisites' no hook, mantenha apenas o tarball do GCC.
+# sha256sums DEVE ter o mesmo número de elementos de 'sources', na mesma ordem.
+# Preencha com os valores reais do seu metafile base.
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
