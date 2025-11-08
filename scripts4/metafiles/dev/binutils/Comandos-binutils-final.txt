@@ -1,0 +1,2 @@
+adm build dev/binutils --root /<stage-or-system-root> \
+    # opcional: BINUTILS_GOLD=1
