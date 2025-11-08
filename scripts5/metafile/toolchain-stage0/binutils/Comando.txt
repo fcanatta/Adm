@@ -1,0 +1,1 @@
+adm install binutils --category toolchain-stage0 --profile mínimo --stage 0
