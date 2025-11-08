@@ -1,0 +1,5 @@
+# Firmware instalar tudo
+adm install linux-firmware --category kernel
+
+# Firmware Intel,Wi-Fi
+ADM_FIRMWARE_FILTER="iwlwifi* amdgpu/*" adm install linux-firmware --category kernel
