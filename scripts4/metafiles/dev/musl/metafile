@@ -1,0 +1,15 @@
+# Overlay para musl no bootstrap (instala headers+libc/rt/crt em /usr do stage).
+
+name=musl
+version=1.2.5
+category=dev
+build_type=autotools
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=musl libc (bootstrap: headers+crt+libc para TARGET)
+homepage=https://musl.libc.org/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz
