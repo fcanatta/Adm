@@ -1,0 +1,9 @@
+# LLVM já instalado
+adm build dev/llvm --root /<root>
+
+# LLD
+adm build dev/lld  --root /<root>  # [LLD_DEFAULT_LD=1] para ld -> ld.lld
+
+# LLDB (requer clang, python3, swig, libedit, ncurses)
+adm build dev/clang --root /<root>
+adm build dev/lldb  --root /<root>  # [PY_BIN=/usr/bin/python3]
