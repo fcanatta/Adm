@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# adm-log.sh — Biblioteca de logging para o sistema ADM
+# /usr/src/adm/bin/adm-log.sh — Biblioteca de logging para o sistema ADM
 # Compatível com sh/dash/ash/bash. Sem dependências externas obrigatórias.
 # =========================
 # 0) Configuração padrão
