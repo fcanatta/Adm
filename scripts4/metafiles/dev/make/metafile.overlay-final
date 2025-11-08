@@ -1,0 +1,17 @@
+# GNU make — build final
+name=make
+version=4.4.1
+category=dev
+build_type=autotools
+run_deps=
+build_deps=gcc,binutils,texinfo
+opt_deps=zlib
+num_builds=0
+description=GNU make utility to maintain groups of programs (final)
+homepage=https://www.gnu.org/software/make/
+maintainer=ADM Packaging <adm@example.local>
+
+# Preencha com o SHA256 real do(s) tarball(s) que usar.
+# Os tarballs oficiais estão no FTP do GNU; há .tar.gz e .tar.lz para 4.4.1.
+sha256sums=
+sources=https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz,https://ftp.gnu.org/gnu/make/make-4.4.1.tar.lz
