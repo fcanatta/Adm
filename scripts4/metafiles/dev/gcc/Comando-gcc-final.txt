@@ -1,0 +1,3 @@
+adm build dev/gcc --root /<stage-or-system-root> \
+    # opcional: GCC_LANGS="c,c++,fortran" GCC_BOOTSTRAP=1 GCC_NLS=1 GCC_DISABLE_MULTILIB=1 GCC_VENDOR_PREREQS=1
+    # opcional (musl): GCC_SET_MUSL_SPECS=1
