@@ -1,0 +1,18 @@
+# Linux API Headers – Bootstrap overlay
+# Apenas instala os headers do kernel no rootfs do stage.
+
+name=linux-headers
+version=6.10.6
+category=sys
+build_type=custom
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux API Headers (bootstrap)
+homepage=https://www.kernel.org/
+maintainer=ADM Packaging <adm@example.local>
+
+# sha256 deve corresponder ao tarball real
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.10.6.tar.xz
