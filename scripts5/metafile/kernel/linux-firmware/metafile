@@ -1,0 +1,10 @@
+NAME=linux-firmware
+VERSION=2025.XX
+CATEGORY=kernel
+HOMEPAGE=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/
+SOURCES=https://mirrors.edge.kernel.org/pub/linux/kernel/firmware/linux-firmware-2025XX.tar.xz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=
+RUNTIME_DEPS=
+OPTIONAL_DEPS=
+COUNT=0
