@@ -1,0 +1,3 @@
+Kernel completo
+adm build sys/linux-kernel --root /<stage-or-system-root> \
+    # opcional: KCFG_LOCALMOD=1 KCFG_INITRAMFS=1 KCFG_UKI=1 KCFG_SIGN=gpg
