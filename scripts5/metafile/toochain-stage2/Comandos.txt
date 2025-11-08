@@ -1,0 +1,4 @@
+adm install binutils --category toolchain-stage2 --stage 2
+
+# Com testes
+ADM_RUN_TESTS=1 adm install binutils --category toolchain-stage2 --stage 2
