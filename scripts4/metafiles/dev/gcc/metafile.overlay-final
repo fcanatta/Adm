@@ -1,0 +1,14 @@
+# GCC (final) — C e C++ por padrão; outras linguagens podem ser ativadas via hook/env
+name=gcc
+version=14.2.0
+category=dev
+build_type=autotools
+run_deps=gettext
+build_deps=gmp,mpfr,mpc,isl,make,binutils,texinfo
+opt_deps=zstd,xz
+num_builds=0
+description=GNU Compiler Collection (final system compiler)
+homepage=https://gcc.gnu.org/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
