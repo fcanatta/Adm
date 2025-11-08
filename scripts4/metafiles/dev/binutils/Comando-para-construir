@@ -1,0 +1,1 @@
+adm build dev/binutils --root /usr/src/adm/state/bootstrap/stage0/rootfs --profile minimal
