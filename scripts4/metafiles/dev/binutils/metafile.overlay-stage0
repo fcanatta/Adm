@@ -1,0 +1,17 @@
+# Overlay de bootstrap stage0 para binutils
+# Apenas chaves admitidas pelo formato KEY=VALUE (sem campos custom).
+# Este overlay é aplicado quando o ADM está rodando em bootstrap stage0.
+
+name=binutils
+version=2.45
+category=dev
+build_type=autotools
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU binutils (bootstrap stage0 overlay: minimal, no plugins/NLS)
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=c50c0e7f9cb188980e2cc97e4537626b1672441815587f1eab69d2a1bfbef5d2,7f288c9a869582d53dc645bf1b9e90cc5123f6862738850472ddbca69def47a3
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.xz,https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.zst
