@@ -1,0 +1,2 @@
+adm install musl --category toolchain-stage0 --stage 0     # headers
+adm install musl --category toolchain-stage2 --stage 2     # libc completa
