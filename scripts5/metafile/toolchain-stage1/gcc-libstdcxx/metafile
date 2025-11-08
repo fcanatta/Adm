@@ -1,0 +1,10 @@
+NAME=gcc-libstdcxx
+VERSION=14.2.0
+CATEGORY=toolchain-stage1
+HOMEPAGE=https://gcc.gnu.org/
+SOURCES=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz https://ftpmirror.gnu.org/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=binutils musl kernel-headers
+RUNTIME_DEPS=musl
+OPTIONAL_DEPS=
+COUNT=0
