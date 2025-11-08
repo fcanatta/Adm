@@ -1,0 +1,2 @@
+adm build   linux --category kernel            # compila
+adm install linux --category kernel            # instala (o adm chamará o kinit)
