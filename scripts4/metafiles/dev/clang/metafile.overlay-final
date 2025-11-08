@@ -1,0 +1,14 @@
+# Clang/Clang-Tools — usa monorepo llvm-project com CMake (LLVM_ENABLE_PROJECTS=clang;clang-tools-extra)
+name=clang
+version=18.1.8
+category=dev
+build_type=cmake
+run_deps=llvm
+build_deps=cmake,ninja,python3,gcc,binutils,llvm
+opt_deps=libedit,ncurses,zstd,xz
+num_builds=0
+description=Clang C/C++/Objective-C compiler and Clang Tools (final)
+homepage=https://clang.llvm.org/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz
