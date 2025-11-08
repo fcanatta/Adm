@@ -1,0 +1,10 @@
+NAME=kernel-headers
+VERSION=6.10.999
+CATEGORY=toolchain-stage0
+HOMEPAGE=https://www.kernel.org/
+SOURCES=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.10.999.tar.xz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=
+RUNTIME_DEPS=
+OPTIONAL_DEPS=
+COUNT=0
