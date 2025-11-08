@@ -1,0 +1,10 @@
+NAME=linux
+VERSION=6.11.x
+CATEGORY=kernel
+HOMEPAGE=https://www.kernel.org/
+SOURCES=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.x.tar.xz
+SHA256SUMS=FILL_ME
+BUILD_DEPS=
+RUNTIME_DEPS=
+OPTIONAL_DEPS=
+COUNT=0
