@@ -1,0 +1,17 @@
+# CPython (Python 3) — build final
+name=python3
+version=3.13.9
+category=dev
+build_type=autotools
+run_deps=openssl,sqlite,libffi,ncurses,readline,expat,zlib,bzip2,xz
+build_deps=gcc,make,pkg-config,openssl,sqlite,libffi,ncurses,readline,expat,zlib,bzip2,xz
+opt_deps=gdbm,tcl,tk,xorg-libx11,xorg-libxext,xorg-libxrender,xorg-libxau,xorg-libxdmcp
+num_builds=0
+description=CPython 3.x (interprete, libs e ensurepip)
+homepage=https://www.python.org/
+maintainer=ADM Packaging <adm@example.local>
+
+# Preencha com o SHA256 real do tarball que você escolher (xz ou gz).
+# Os links oficiais estão nas páginas de releases; use 3.13.9, 2025-10-14.
+sha256sums=
+sources=https://www.python.org/ftp/python/3.13.9/Python-3.13.9.tar.xz,https://www.python.org/ftp/python/3.13.9/Python-3.13.9.tgz
