@@ -1,6 +1,12 @@
 #!/usr/bin/env sh
 # adm-pack.sh — Reempacotamento, assinatura, verificação e repositórios
 # POSIX sh; compatível com dash/ash/bash.
+# adm-pack.sh pack --from-destdir /usr/src/adm/build/foo-1.0/destdir \
+# --name foo --version 1.0 --category libs --format deb
+# adm-pack.sh pack --from-pkg ./foo_1.0_amd64.deb --format zst
+# adm-pack.sh convert --in ./bar-1.0.rpm --format zst
+# adm-pack.sh repo index --dir /usr/src/adm/build/foo-1.0/pkg
+# adm-pack.sh repo verify --dir /usr/src/adm/build/foo-1.0/pkg
 set -u
 # =========================
 # 0) Config & defaults
