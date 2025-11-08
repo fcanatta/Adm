@@ -1,0 +1,14 @@
+# LLVM (core) — bibliotecas e ferramentas LLVM; instalando em /usr
+name=llvm
+version=18.1.8
+category=dev
+build_type=cmake
+run_deps=
+build_deps=cmake,ninja,python3,gcc,binutils,zlib,libxml2
+opt_deps=zstd,xz
+num_builds=0
+description=LLVM Core libraries and tools (final)
+homepage=https://llvm.org/
+maintainer=ADM Packaging <adm@example.local>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz
