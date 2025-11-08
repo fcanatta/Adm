@@ -1,0 +1,6 @@
+adm install kernel-headers --category toolchain-stage0 --stage 0
+adm install musl           --category toolchain-stage0 --stage 0   # headers
+adm install binutils       --category toolchain-stage0 --stage 0
+
+# Gcc stage0
+adm install gcc --category toolchain-stage0 --stage 0
