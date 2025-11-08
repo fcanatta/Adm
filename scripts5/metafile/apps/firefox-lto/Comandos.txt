@@ -1,0 +1,6 @@
+# Build padrão sem LTO
+adm install firefox --category apps
+# Com PGO/LTO
+ADM_FIREFOX_PGO=1 ADM_FIREFOX_LTO=thin ADM_FIREFOX_ENABLE_WAYLAND=1 adm install firefox --category apps
+# LTO full App amor
+ADM_FIREFOX_LTO=full ADM_FIREFOX_INSTALL_APPARMOR=1 adm install firefox --category apps
