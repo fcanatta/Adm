@@ -1,0 +1,611 @@
+#!/usr/bin/env bash
+# adm-update — Descobre nova versão no upstream e gera metafile de update.
+# - Atualiza o pacote alvo e, opcionalmente, suas dependências recursivamente.
+# Saída: /usr/src/adm/update/<programa>/metafile (mínimo)
+# Licença: MIT
+# Atualizar apenas o pacote 'foo' (sem deps), versão estável, estrito:
+# adm-update --program=foo --deps=0 --strict=1
+# Atualizar 'foo' + deps diretas (profundidade 1), permitindo prerelease e pinando major 2:
+# adm-update --program=foo --deps=1 --max-depth=1 --allow-prerelease --pin-major=2
+# Forçar estratégia GitHub e usar template específico para URL:
+# adm-update --program=bar --prefer=github --source-template='https://github.com/org/bar/archive/refs/tags/v{version}.tar.gz'
+# Rodar como rascunho (não baixa, não escreve checksums), só para ver URLs:
+# adm-update --program=baz --dry-run --skip-checksum --print=1
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.1.0"
+
+# ===================== Cores / Log =====================
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ # level msg...
+  local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then
+    printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-update.log"; exit 2' ERR
+
+# ===================== Defaults / Paths =====================
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_META="${ADM_META:-${ROOT_BASE}/metafiles}"
+ADM_UPDATE="${ADM_UPDATE:-${ROOT_BASE}/update}"
+ADM_SOURCES="${ADM_SOURCES:-${ROOT_BASE}/sources}"
+
+mkdir -p "$ADM_LOGS" "$ADM_UPDATE" "$ADM_SOURCES"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-update.log" 2>&1
+
+# ===================== CLI =====================
+PROGRAM=""          # nome do programa (obrigatório)
+CATEGORY=""         # categoria (se omitir, tenta descobrir)
+ALLOW_PRERELEASE=0  # aceitar rc/beta/alpha
+PIN_MAJOR=""        # 1   → só 1.x
+PIN_MINOR=""        # 1.2 → só 1.2.x
+PREFER=""           # github|gitlab|sourceforge|git|http|template
+SOURCE_TEMPLATE=""  # URL com {version}
+DRY_RUN=0
+SKIP_CHECKSUM=0
+STRICT=1
+TIMEOUT=30          # segundos para HEAD/GET de upstream
+RETRIES=3
+DEPS=1              # 1 = atualiza dependências também
+MAX_DEPTH=2         # profundidade máxima (0=apenas o pacote; 1=deps diretas; etc.)
+PARALLEL=4          # deps simultâneas
+PRINT=1
+
+usage(){
+  cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} --program=<nome> [opções]
+
+Alvo:
+  --program=NAME              Nome do programa (obrigatório)
+  --category=CATEGORY         Categoria (se não informado, tenta detectar)
+  --deps=0|1                  Atualizar dependências também (default: 1)
+  --max-depth=N               Profundidade recursiva de deps (default: 2)
+  --parallel=N                Paralelismo para deps (default: 4)
+
+Descoberta de versão:
+  --allow-prerelease          Aceitar pré-release (rc/beta/alpha)
+  --pin-major=X               Fixa major (ex.: 1)
+  --pin-minor=X.Y             Fixa major.minor (ex.: 1.2)
+  --prefer=STRATEGY           github|gitlab|sourceforge|git|http|template
+  --source-template=URL       Ex.: https://.../foo-{version}.tar.xz
+
+Execução:
+  --dry-run                   Não grava; só exibe o que faria
+  --skip-checksum             Não baixa/calcula sha256 (apenas for protótipo)
+  --strict=0|1                Erros ambíguos viram fatais (default: 1)
+  --timeout=SECS              Timeout por request (default: 30)
+  --retries=N                 Retries por request (default: 3)
+  --print=0|1                 Resumo no stdout (default: 1)
+  -h|--help                   Esta ajuda
+EOF
+}
+
+for a in "$@"; do
+  case "$a" in
+    --program=*) PROGRAM="${a#*=}";;
+    --category=*) CATEGORY="${a#*=}";;
+    --allow-prerelease) ALLOW_PRERELEASE=1;;
+    --pin-major=*) PIN_MAJOR="${a#*=}";;
+    --pin-minor=*) PIN_MINOR="${a#*=}";;
+    --prefer=*) PREFER="${a#*=}";;
+    --source-template=*) SOURCE_TEMPLATE="${a#*=}";;
+    --dry-run) DRY_RUN=1;;
+    --skip-checksum) SKIP_CHECKSUM=1;;
+    --strict=0) STRICT=0;;
+    --strict=1) STRICT=1;;
+    --timeout=*) TIMEOUT="${a#*=}";;
+    --retries=*) RETRIES="${a#*=}";;
+    --deps=0) DEPS=0;;
+    --deps=1) DEPS=1;;
+    --max-depth=*) MAX_DEPTH="${a#*=}";;
+    --parallel=*) PARALLEL="${a#*=}";;
+    --print=0) PRINT=0;;
+    --print=1) PRINT=1;;
+    -h|--help) usage; exit 0;;
+    *) log WARN "Opção desconhecida: $a";;
+  esac
+done
+[ -n "$PROGRAM" ] || fatal "--program é obrigatório"
+
+# ===================== Helpers =====================
+has(){ command -v "$1" >/dev/null 2>&1; }
+trim(){ sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//' ; }
+lower(){ tr '[:upper:]' '[:lower:]'; }
+json_escape(){ python3 - <<'PY' 2>/dev/null || perl -MJSON::PP -ne 'print encode_json($_)' <<'PL'
+import json,sys
+s=sys.stdin.read()
+print(json.dumps(s)[1:-1])
+PY
+PL
+}
+url_head_ok(){ # HEAD/GET curta
+  local url="$1"
+  if has curl; then curl -sIL --connect-timeout 10 -m "$TIMEOUT" -o /dev/null -w '%{http_code}' "$url" || true
+  else wget -S --spider -T "$TIMEOUT" -q "$url" && echo 200 || echo 000
+  fi
+}
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+join_csv(){ local IFS=','; echo "$*"; }
+split_csv(){ IFS=',' read -r -a _a <<<"$1"; printf "%s\n" "${_a[@]}"; }
+
+mf_field(){ # arquivo, chave
+  local f="$1" k="$2"
+  awk -F'=' -v K="$k" '$0!~/^#/ && $0~"=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); if(key==K){$1="";sub(/^=/,"");print;exit}}' "$f" 2>/dev/null | trim
+}
+
+ensure_dir(){ mkdir -p "$1"; }
+
+# ===================== Leitura de metafile base =====================
+find_metafile(){
+  # tenta localizar metafile oficial pelo nome/categoria
+  local mf
+  if [ -n "$CATEGORY" ]; then
+    mf="${ADM_META}/${CATEGORY}/${PROGRAM}/metafile"
+    [ -f "$mf" ] && { echo "$mf"; return 0; }
+  fi
+  # procura por todas as categorias possíveis
+  mf="$(find "$ADM_META" -mindepth 2 -maxdepth 2 -type f -path "*/${PROGRAM}/metafile" -print -quit)"
+  [ -n "$mf" ] && { echo "$mf"; return 0; }
+  return 1
+}
+
+BASE_MF="$(find_metafile || true)"
+[ -n "$BASE_MF" ] || fatal "Metafile base não encontrado para '$PROGRAM' (use --category?)"
+CATEGORY="${CATEGORY:-$(basename "$(dirname "$BASE_MF")")}"
+
+NAME="$(mf_field "$BASE_MF" name)"
+VERSION_CUR="$(mf_field "$BASE_MF" version)"
+RUN_DEPS="$(mf_field "$BASE_MF" run_deps || true)"
+BUILD_DEPS="$(mf_field "$BASE_MF" build_deps || true)"
+OPT_DEPS="$(mf_field "$BASE_MF" opt_deps || true)"
+DESC="$(mf_field "$BASE_MF" description || true)"
+HOMEPAGE="$(mf_field "$BASE_MF" homepage || true)"
+MAINTAINER="$(mf_field "$BASE_MF" maintainer || true)"
+SOURCES_CUR="$(mf_field "$BASE_MF" sources || true)"
+SUMS_CUR="$(mf_field "$BASE_MF" sha256sums || true)"
+
+[ -n "$NAME" ] || NAME="$PROGRAM"
+[ -n "$VERSION_CUR" ] || VERSION_CUR="0"
+
+log INFO "Alvo: ${NAME} (${CATEGORY}) versão atual=${VERSION_CUR}"
+# ===================== Semver / Comparação =====================
+normalize_ver(){ # remove 'v' inicial e normaliza pontos
+  local v="$1"; v="${v#v}"; v="${v#V}"
+  echo "$v" | sed -E 's/[^0-9a-zA-Z.+_-]/-/g'
+}
+
+is_prerelease(){ # 0 = não; 1 = é pre
+  echo "$1" | grep -Eiq '(alpha|beta|rc|pre)' && echo 1 || echo 0
+}
+
+# Compara versões; retorna por status:
+# 0 => A == B ; 1 => A > B ; 2 => A < B
+ver_cmp(){
+  local a b
+  a="$(normalize_ver "$1")"; b="$(normalize_ver "$2")"
+  # tentamos python para comparação natural, senão awk simples
+  python3 - "$a" "$b" <<'PY' 2>/dev/null || awk -v A="$a" -v B="$b" '
+import sys
+from packaging.version import Version
+a=Version(sys.argv[1]); b=Version(sys.argv[2])
+print(0 if a==b else (1 if a>b else 2))
+PY
+BEGIN{
+  n=split(A,aa,/[._+-]/); m=split(B,bb,/[._+-]/);
+  for(i=1;i<= (n>m?n:m); i++){
+    xa=aa[i]; xb=bb[i];
+    if(xa==xb) continue;
+    if(xa ~ /^[0-9]+$/ && xb ~ /^[0-9]+$/){
+      if(xa+0 > xb+0){print 1; exit}
+      if(xa+0 < xb+0){print 2; exit}
+    } else {
+      if(xa>xb){print 1; exit}
+      if(xa<xb){print 2; exit}
+    }
+  }
+  print 0
+}'
+}
+
+ver_gt(){ [ "$(ver_cmp "$1" "$2")" -eq 1 ]; }
+ver_ge(){ c="$(ver_cmp "$1" "$2")"; [ "$c" -eq 1 ] || [ "$c" -eq 0 ]; }
+
+respect_pins(){ # 0 ok, 1 rejeita
+  local v="$1"
+  if [ -n "$PIN_MAJOR" ]; then
+    [ "${v%%.*}" = "$PIN_MAJOR" ] || return 1
+  fi
+  if [ -n "$PIN_MINOR" ]; then
+    local pm="$PIN_MINOR"
+    [ "${v%.*}" = "$pm" ] || { echo "$v" | grep -q "^${pm}\." || return 1; }
+  fi
+  return 0
+}
+
+# ===================== Detecção de provedor / Estratégias =====================
+guess_provider(){
+  local hp="$1" srcs="$2" p=""
+  if [ -n "$PREFER" ]; then echo "$PREFER"; return 0; fi
+  if echo "$hp" | grep -q 'github.com'; then p="github"
+  elif echo "$hp" | grep -q 'gitlab'; then p="gitlab"
+  elif echo "$hp" | grep -q 'sourceforge.net'; then p="sourceforge"
+  fi
+  if [ -z "$p" ] && echo "$srcs" | grep -q 'github.com'; then p="github"; fi
+  if [ -z "$p" ] && echo "$srcs" | grep -q 'gitlab'; then p="gitlab"; fi
+  if [ -z "$p" ] && echo "$srcs" | grep -q 'sourceforge.net'; then p="sourceforge"; fi
+  if [ -z "$p" ] && echo "$srcs" | grep -Eq '(\.git$|^git://|ssh://.*git)'; then p="git"; fi
+  echo "${p:-http}"
+}
+
+http_get(){ # stdout HTML/listagem
+  local url="$1" rc=0 body
+  if has curl; then body="$(curl -fsSL --connect-timeout 10 -m "$TIMEOUT" "$url" 2>/dev/null)" || rc=$?
+  else body="$(wget -q -O - --timeout="$TIMEOUT" "$url" 2>/dev/null)" || rc=$?
+  fi
+  [ $rc -eq 0 ] && { printf "%s" "$body"; return 0; }
+  return 1
+}
+
+# Listagem de versões por fornecedor/estratégia (retorna na stdout, uma por linha)
+list_versions_github(){
+  local hp="$1"
+  # tenta /releases e /tags (HTML), sem API
+  local base; base="$(echo "$hp" | sed -E 's|(/$)||')"
+  local html; html="$(http_get "${base}/releases" || true)"
+  [ -n "$html" ] || html="$(http_get "${base}/tags" || true)"
+  echo "$html" | grep -Eo 'href="[^"]*/(tag|releases/tag)/[^"]+"' | sed -E 's/.*\/(tag|releases\/tag)\/([^"]+)".*/\2/' | sed 's/%2F/\//g' | sort -u
+}
+list_versions_gitlab(){
+  local hp="$1" html
+  html="$(http_get "${hp%/}/-/releases" || true)"
+  [ -n "$html" ] || html="$(http_get "${hp%/}/-/tags" || true)"
+  echo "$html" | grep -Eo 'href="[^"]*/-/tags/[^"]+"' | sed -E 's/.*\/-\/tags\/([^"]+)".*/\1/' | sort -u
+}
+list_versions_sourceforge(){
+  local hp="$1" html
+  # tenta files page
+  html="$(http_get "$hp" || true)"
+  echo "$html" | grep -Eo '>[^<]*[0-9]+\.[0-9]+(\.[0-9]+)?[^<]*<' | tr -d '><' | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){1,3}$' | sort -Vu
+}
+list_versions_git(){
+  local srcs="$1" url
+  url="$(echo "$srcs" | tr ',' '\n' | grep -E '(\.git$|^git://|ssh://.*git)' -m1 || true)"
+  [ -n "$url" ] || return 0
+  git ls-remote --tags "$url" 2>/dev/null | awk '{print $2}' | sed -E 's|^refs/tags/||; s/\^\{\}$//' | sort -u
+}
+list_versions_http(){
+  local hp="$1" html
+  html="$(http_get "$hp" || true)"
+  echo "$html" | grep -Eo 'href="[^"]+"' | sed -E 's/href="([^"]+)".*/\1/' \
+    | grep -E '[0-9]+\.[0-9]+(\.[0-9]+)?' | sed -E 's/.*([0-9]+(\.[0-9]+){1,3}).*/\1/' | sort -Vu
+}
+list_versions_template(){
+  local tpl="$1" # precisa de lista candidata
+  # sem fonte de lista, devolve vazio (será usado para checar existência de uma versão já inferida)
+  :
+}
+
+pick_latest_version(){
+  local hp="$1" srcs="$2" latest="" cand pre ok
+  local prov; prov="$(guess_provider "$hp" "$srcs")"
+  log INFO "Detecção de versão (provider=$prov)"
+  local list=""
+  case "$prov" in
+    github)      list="$(list_versions_github "$hp" || true)";;
+    gitlab)      list="$(list_versions_gitlab "$hp" || true)";;
+    sourceforge) list="$(list_versions_sourceforge "$hp" || true)";;
+    git)         list="$(list_versions_git "$srcs" || true)";;
+    http|template|*) list="$(list_versions_http "$hp" || true)";;
+  esac
+  [ -n "$list" ] || { log WARN "Não encontrei lista de versões em $prov; tentarei heurísticas dos sources"; }
+
+  # junta também versões inferidas por sources atuais (substituição simples)
+  echo "$srcs" | tr ',' '\n' | sed -E 's/.*-([0-9]+(\.[0-9]+){1,3})\./\1/' | grep -E '^[0-9]+(\.[0-9]+){1,3}$' | sort -Vu >> /tmp/adm_versions.$$ 2>/dev/null || true
+  echo "$list" >> /tmp/adm_versions.$$ 2>/dev/null || true
+  sort -Vu /tmp/adm_versions.$$ | sed '/^$/d' > /tmp/adm_versions_sorted.$$ || true
+
+  while read -r cand; do
+    [ -n "$cand" ] || continue
+    cand="$(normalize_ver "$cand")"
+    pre="$(is_prerelease "$cand")"
+    [ $ALLOW_PRERELEASE -eq 1 ] || { [ "$pre" -eq 1 ] && continue; }
+    respect_pins "$cand" || continue
+    if [ -z "$latest" ] || ver_gt "$cand" "$latest"; then
+      latest="$cand"
+    fi
+  done < /tmp/adm_versions_sorted.$$
+  rm -f /tmp/adm_versions.$$ /tmp/adm_versions_sorted.$$ || true
+
+  [ -n "$latest" ] || { [ $STRICT -eq 1 ] && fatal "Não foi possível determinar versão nova"; return 0; }
+  echo "$latest"
+}
+
+# ===================== Construção de URLs dos sources =====================
+build_source_urls(){
+  # Args: homepage sources_cur version_new
+  local hp="$1" srcs="$2" vn="$3"
+  local prov; prov="$(guess_provider "$hp" "$srcs")"
+  local out=()
+
+  if [ -n "$SOURCE_TEMPLATE" ]; then
+    out+=("$(echo "$SOURCE_TEMPLATE" | sed "s/{version}/$vn/g")")
+  else
+    case "$prov" in
+      github)
+        # tenta inferir org/repo a partir da homepage
+        # formatos aceitos: https://github.com/org/repo
+        local org repo
+        org="$(echo "$hp" | awk -F'github.com/' '{print $2}' | cut -d'/' -f1)"
+        repo="$(echo "$hp" | awk -F'github.com/' '{print $2}' | cut -d'/' -f2)"
+        [ -n "$org" ] && [ -n "$repo" ] && out+=("https://github.com/${org}/${repo}/archive/refs/tags/v${vn}.tar.gz" "https://github.com/${org}/${repo}/archive/refs/tags/${vn}.tar.gz")
+        ;;
+      gitlab)
+        local proj
+        proj="$(echo "$hp" | awk -F'gitlab.com/' '{print $2}')"
+        [ -n "$proj" ] && out+=("https://gitlab.com/${proj%/}/-/archive/${vn}/${proj##*/}-${vn}.tar.gz")
+        ;;
+      sourceforge)
+        # tenta nome do projeto na homepage
+        local pj; pj="$(echo "$hp" | sed -nE 's|.*sourceforge\.net/projects/([^/]+)/?.*|\1|p')"
+        if [ -n "$pj" ]; then
+          out+=("https://downloads.sourceforge.net/project/${pj}/${NAME}-${vn}.tar.xz"
+                "https://downloads.sourceforge.net/project/${pj}/${NAME}-${vn}.tar.gz")
+        fi
+        ;;
+      git)
+        # não temos artefato pronto — usuário pode manter URL .git no metafile; deixamos vazio aqui,
+        # o adm-build sabe lidar com git. Ainda assim, tentamos tar do github/gitlab se possível.
+        ;;
+      http|*)
+        # Caso genérico: substitui versão no(s) source(s) atual(is) quando detectável
+        local s
+        while read -r s; do
+          [ -z "$s" ] && continue
+          s="$(echo "$s" | trim)"
+          if echo "$s" | grep -Eq '[0-9]+(\.[0-9]+){1,3}'; then
+            local oldv; oldv="$(echo "$s" | sed -E 's/.*([0-9]+(\.[0-9]+){1,3}).*/\1/')"
+            out+=("$(echo "$s" | sed "s/${oldv}/${vn}/g")")
+          fi
+        done <<<"$(echo "$srcs" | tr ',' '\n')"
+        ;;
+    esac
+  fi
+
+  # remove vazios/duplicados
+  printf "%s\n" "${out[@]}" | sed '/^$/d' | awk '!seen[$0]++'
+}
+# ===================== Download / Checksums =====================
+pick_downloader(){
+  if has aria2c; then echo "aria2"; return 0; fi
+  if has curl; then echo "curl"; return 0; fi
+  if has wget; then echo "wget"; return 0; fi
+  echo "curl"
+}
+dl_file(){
+  # $1=url $2=dest
+  local url="$1" out="$2" dl; dl="$(pick_downloader)"
+  case "$dl" in
+    aria2) aria2c -c -x16 -s16 --timeout="$TIMEOUT" --dir="$(dirname "$out")" --out="$(basename "$out")" "$url" ;;
+    curl)  curl -L --fail --retry "$RETRIES" --retry-delay 3 --connect-timeout 20 -m "$TIMEOUT" -C - -o "$out" "$url" ;;
+    wget)  wget -c --tries="$RETRIES" --timeout="$TIMEOUT" -O "$out" "$url" ;;
+    *)     curl -L --fail -C - -o "$out" "$url" ;;
+  esac
+}
+
+calc_sums_for_urls(){
+  # args: name version urls_csv -> outputs two lines: "urls_csv_out" and "sums_csv"
+  local name="$1" ver="$2" urls_csv="$3"
+  local -a urls sums
+  IFS=$'\n' read -r -d '' -a urls < <(echo "$urls_csv" | tr ',' '\n' && printf '\0')
+  local cache="${ADM_SOURCES}/${name}/${ver}"
+  ensure_dir "$cache"
+
+  local u dest oklist=() sumlist=()
+  for u in "${urls[@]}"; do
+    u="$(echo "$u" | trim)"
+    [ -n "$u" ] || continue
+    local base="${name}-${ver}-$(basename "$u")"
+    dest="${cache}/${base}"
+    local tries=0 ok=0
+    while [ $tries -lt "$RETRIES" ]; do
+      tries=$((tries+1))
+      log INFO "[$name] Baixando: $u (tentativa $tries)"
+      if dl_file "$u" "$dest"; then ok=1; break; fi
+      log WARN "[$name] Falha ao baixar: $u"
+    done
+    if [ $ok -ne 1 ]; then
+      if [ $STRICT -eq 1 ]; then fatal "[$name] Falha ao baixar $u"; else log WARN "[$name] prosseguindo sem $u (não estrito)"; continue; fi
+    fi
+    oklist+=("$u")
+    if [ $SKIP_CHECKSUM -eq 1 ]; then
+      sumlist+=("")
+    else
+      sumlist+=("$(sha256_file "$dest")")
+    fi
+  done
+  local urls_out sums_out
+  urls_out="$(printf "%s\n" "${oklist[@]:-}" | paste -sd, -)"
+  sums_out="$(printf "%s\n" "${sumlist[@]:-}" | paste -sd, -)"
+  echo "$urls_out"
+  echo "$sums_out"
+}
+
+# ===================== Escrita do metafile de update =====================
+write_update_metafile(){
+  # args: name category version run_deps build_deps opt_deps desc homepage maintainer sums_csv urls_csv
+  local name="$1" cat="$2" ver="$3" rdeps="$4" bdeps="$5" odeps="$6" desc="$7" home="$8" maint="$9" sums="${10}" urls="${11}"
+  local outdir="${ADM_UPDATE}/${name}"
+  ensure_dir "$outdir"
+  local mf="${outdir}/metafile"
+  cat > "$mf" <<EOF
+name=${name}
+version=${ver}
+category=${cat}
+run_deps=${rdeps}
+build_deps=${bdeps}
+opt_deps=${odeps}
+num_builds=0
+description=${desc}
+homepage=${home}
+maintainer=${maint}
+sha256sums=${sums}
+sources=${urls}
+EOF
+  log OK "Metafile de update gerado: $mf"
+  [ $PRINT -eq 1 ] && { echo "UPDATE MF: $mf"; } >&3
+}
+
+# ===================== Pipeline de um pacote =====================
+update_one_pkg(){
+  # args: name category base_mf depth
+  local name="$1" cat="$2" base_mf="$3" depth="$4"
+  log STEP "[$name] Verificando upstream (depth=${depth})"
+
+  local vcur rdeps bdeps odeps desc hp maint srcs sums
+  vcur="$(mf_field "$base_mf" version)"
+  rdeps="$(mf_field "$base_mf" run_deps || true)"
+  bdeps="$(mf_field "$base_mf" build_deps || true)"
+  odeps="$(mf_field "$base_mf" opt_deps || true)"
+  desc="$(mf_field "$base_mf" description || true)"
+  hp="$(mf_field "$base_mf" homepage || true)"
+  maint="$(mf_field "$base_mf" maintainer || true)"
+  srcs="$(mf_field "$base_mf" sources || true)"
+  sums="$(mf_field "$base_mf" sha256sums || true)"
+
+  [ -n "$vcur" ] || vcur="0"
+  local vnew; vnew="$(pick_latest_version "$hp" "$srcs" || true)"
+  if [ -z "$vnew" ]; then
+    log WARN "[$name] versão nova não encontrada; pulando"
+    return 0
+  fi
+  if ! ver_gt "$vnew" "$vcur"; then
+    log OK "[$name] já está atualizado (atual=${vcur}, upstream=${vnew})"
+    return 0
+  fi
+
+  log INFO "[$name] Nova versão: ${vnew} (atual=${vcur})"
+  local urls_list; urls_list="$(build_source_urls "$hp" "$srcs" "$vnew" || true)"
+  if [ -z "$urls_list" ]; then
+    if [ "$STRICT" -eq 1 ]; then fatal "[$name] Não consegui construir URLs para a versão ${vnew}"; else log WARN "[$name] Sem URLs; gravando template vazio (não estrito)"; fi
+  fi
+
+  local urls_csv sums_csv
+  if [ $DRY_RUN -eq 1 ]; then
+    urls_csv="$(printf "%s\n" $urls_list | paste -sd, -)"
+    sums_csv="$(printf "%s\n" | paste -sd, -)"
+  else
+    read -r urls_csv <<<"$(printf "%s\n" $urls_list | paste -sd, -)"
+    read -r urls_csv sums_csv < <(calc_sums_for_urls "$name" "$vnew" "$urls_csv")
+  fi
+
+  write_update_metafile "$name" "$cat" "$vnew" "${rdeps}" "${bdeps}" "${odeps}" "${desc}" "${hp}" "${maint}" "${sums_csv}" "${urls_csv}"
+
+  # retorno: lista de deps (para recursão)
+  echo "${rdeps},${bdeps},${odeps}" | tr ',' '\n' | sed '/^$/d' | sort -u
+}
+# ===================== Atualização recursiva de dependências =====================
+declare -A VISITED=()   # nome → 1 (evita loops)
+declare -a QUEUE=()
+
+find_dep_metafile(){
+  local dep="$1"
+  local mf
+  mf="$(find "$ADM_META" -mindepth 2 -maxdepth 2 -type f -path "*/${dep}/metafile" -print -quit || true)"
+  [ -n "$mf" ] && { echo "$mf"; return 0; }
+  return 1
+}
+
+push_queue(){ QUEUE+=("$1|$2|$3|$4"); } # name|cat|mf|depth
+
+worker_dep(){
+  # linha: name|cat|mf|depth
+  local line="$1"
+  local name cat mf depth
+  IFS='|' read -r name cat mf depth <<<"$line"
+  [ -n "$name" ] || return 0
+  [ -n "$mf" ] || return 0
+  [ -n "${VISITED[$name]:-}" ] && return 0
+  VISITED["$name"]=1
+
+  local subdeps
+  subdeps="$(update_one_pkg "$name" "$cat" "$mf" "$depth" || true)"
+
+  if [ "$DEPS" -eq 1 ] && [ "$depth" -lt "$MAX_DEPTH" ]; then
+    local d dmf dcat
+    while read -r d; do
+      [ -z "$d" ] && continue
+      [ -n "${VISITED[$d]:-}" ] && continue
+      dmf="$(find_dep_metafile "$d" || true)"
+      if [ -z "$dmf" ]; then
+        log WARN "[dep:$name] Metafile não encontrado para dependência: $d"
+        continue
+      fi
+      dcat="$(basename "$(dirname "$dmf")")"
+      push_queue "$d|$dcat|$dmf|$((depth+1))"
+    done <<<"$(echo "$subdeps")"
+  fi
+}
+
+run_queue_parallel(){
+  local k="$1"
+  [ "$k" -le 0 ] && k=1
+  local running=0
+  local item
+  while [ "${#QUEUE[@]}" -gt 0 ] || [ "$running" -gt 0 ]; do
+    while [ "$running" -lt "$k" ] && [ "${#QUEUE[@]}" -gt 0 ]; do
+      item="${QUEUE[0]}"
+      QUEUE=("${QUEUE[@]:1}")
+      ( set -Eeuo pipefail; worker_dep "$item" ) &
+      running=$((running+1))
+    done
+    wait -n || true
+    running=$((running-1))
+  done
+}
+
+# ===================== Main =====================
+main(){
+  log INFO "Iniciando ${SELF} v${VER}"
+  local mf="$BASE_MF" name="$NAME" cat="$CATEGORY"
+
+  # pacote raiz
+  VISITED["$name"]=1
+  local deps_root
+  deps_root="$(update_one_pkg "$name" "$cat" "$mf" 0 || true)"
+
+  if [ "$DEPS" -eq 1 ] && [ "$MAX_DEPTH" -gt 0 ]; then
+    local d dmf dcat
+    while read -r d; do
+      [ -z "$d" ] && continue
+      [ -n "${VISITED[$d]:-}" ] && continue
+      dmf="$(find_dep_metafile "$d" || true)"
+      if [ -z "$dmf" ]; then
+        log WARN "[root] Metafile não encontrado para dependência: $d"
+        continue
+      fi
+      dcat="$(basename "$(dirname "$dmf")")"
+      push_queue "$d|$dcat|$dmf|1"
+    done <<<"$(echo "$deps_root" | tr ',' '\n' | sed '/^$/d' | sort -u)"
+    run_queue_parallel "$PARALLEL"
+  fi
+
+  log OK "adm-update concluído."
+}
+
+main "$@"
+
+# restaurar stdout
+exec 1>&3 3>&-
