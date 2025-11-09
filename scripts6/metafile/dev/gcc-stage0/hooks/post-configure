@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# gcc-stage0: post-configure
+# Ajustes para garantir build da libgcc mínima
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_BUILD_DIR}"
+
+# Alguns ambientes precisam garantir que tools da target sejam preferidas (binutils-stage0)
+# Damos uma prioridade ao $TARGET_TRIPLET-*
+if [[ -n "${TARGET_TRIPLET:-}" ]]; then
+  export PATH="/usr/bin:${PATH}"
+  command -v "${TARGET_TRIPLET}-as" >/dev/null 2>&1 || true
+fi
