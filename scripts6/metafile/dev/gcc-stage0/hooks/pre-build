@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# gcc-stage0: pre-build
+# Objetivo: compilar GCC (cc1) e libgcc mínima
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_BUILD_DIR}"
+# Compila somente o necessário pro pass1
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" all-gcc
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" all-target-libgcc
