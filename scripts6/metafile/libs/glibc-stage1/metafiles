@@ -1,0 +1,12 @@
+name=glibc-stage1
+version=2.40
+category=libs
+run_deps=
+build_deps=linux-headers-stage0
+opt_deps=
+num_builds=0
+description=glibc Stage1 (headers + crt1/crti/crtn) para bootstrap do toolchain
+homepage=https://www.gnu.org/software/libc/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz,https://mirrors.kernel.org/gnu/libc/glibc-2.40.tar.xz
