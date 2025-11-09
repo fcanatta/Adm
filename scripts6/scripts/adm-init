@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+# adm-init — prepara ambiente, cria diretórios, define políticas e perfis de build.
+# Perfis suportados: aggressive, normal, minimo, glibc, musl
+# Licença: MIT (ajuste conforme desejar)
+# sudo ./adm-init --root=/usr/src/adm --profile=aggressive --libc=glibc --jobs=0 --color=auto
+set -Eeuo pipefail
+# --------------[ Traps e utilitários ]-----------------
+SELF_NAME="${0##*/}"
+VERSION="1.0.0"
+# Cores (auto detection; pode ser forçado por --color)
+COLOR_MODE="auto"
+if [ -t 1 ]; then
+  _IS_TTY=1
+else
+  _IS_TTY=0
+fi
+CLR_RESET="\033[0m"; CLR_BOLD="\033[1m"
+CLR_BLUE="\033[34m"; CLR_GREEN="\033[32m"; CLR_RED="\033[31m"; CLR_YELLOW="\033[33m"; CLR_CYAN="\033[36m"
+
+log_ts() { date +'%Y-%m-%d %H:%M:%S'; }
+cecho() {
+  local level="$1"; shift
+  local msg="$*"
+  local pfx sym col
+  case "$level" in
+    INFO)  sym="▶"; col="$CLR_CYAN" ;;
+    OK)    sym="✓"; col="$CLR_GREEN" ;;
+    WARN)  sym="!" ; col="$CLR_YELLOW" ;;
+    ERR)   sym="✗"; col="$CLR_RED" ;;
+    STEP)  sym="➜"; col="$CLR_BLUE" ;;
+    *)     sym="-"; col="$CLR_RESET" ;;
+  esac
+  if [[ "$COLOR_MODE" == "never" || ($_IS_TTY -eq 0 && "$COLOR_MODE" != "always") ]]; then
+    printf "%s %s %s\n" "$(log_ts)" "$sym" "$msg"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$CLR_BOLD" "$(log_ts)" "$CLR_RESET" "$col" "$sym" "$CLR_RESET" "$CLR_BOLD" "$msg" "$CLR_RESET"
+  fi
+}
+
+fatal() { cecho ERR "$*"; exit 10; }
+trap 'cecho ERR "Falha inesperada em ${SELF_NAME} (linha $LINENO). Veja logs/adm-init.log"; exit 2' ERR
+
+# --------------[ Defaults ]-----------------
+ADM_ROOT="/usr/src/adm"
+ADM_JOBS="0"
+ADM_PROXY_HTTP=""
+ADM_PROXY_HTTPS=""
+ADM_NO_PROXY=""
+ADM_UMASK="022"
+ADM_LOCALE="C.UTF-8"
+CHECK_NETWORK=1
+FORCE=0
+MIRRORS=""
+PROFILE="normal"   # aggressive|normal|minimo|glibc|musl
+LIBC="auto"        # glibc|musl|auto
+
+# --------------[ CLI ]-----------------
+usage() {
+  cat <<EOF
+${SELF_NAME} v${VERSION}
+Uso: ${SELF_NAME} [opções]
+
+Opções:
+  --root=DIR             Raiz de trabalho (default: /usr/src/adm)
+  --jobs=N               Paralelismo padrão (0=auto por CPU)
+  --color=auto|always|never
+  --quiet                (sem efeito ampliado aqui; mantemos fases concisas)
+  --proxy=http://...     Define http_proxy/https_proxy (repete a opção para ambos)
+  --mirror-priority=url1,url2  Ordena mirrors preferidos
+  --umask=022            Umask padrão (default 022)
+  --force                Cria/corrige permissões sem perguntar
+  --no-network-check     Pula teste de conectividade
+  --locale=pt_BR.UTF-8   Locale padrão (default C.UTF-8)
+  --profile=aggressive|normal|minimo|glibc|musl
+  --libc=glibc|musl|auto Seleciona libc (glibc/musl) ou auto (em perfis glibc/musl força)
+  -h|--help              Ajuda
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --root=*) ADM_ROOT="${arg#*=}";;
+    --jobs=*) ADM_JOBS="${arg#*=}";;
+    --color=*) COLOR_MODE="${arg#*=}";;
+    --quiet) : ;; # já somos concisos
+    --proxy=*) ADM_PROXY_HTTP="${arg#*=}"; ADM_PROXY_HTTPS="${arg#*=}";;
+    --mirror-priority=*) MIRRORS="${arg#*=}";;
+    --umask=*) ADM_UMASK="${arg#*=}";;
+    --force) FORCE=1;;
+    --no-network-check) CHECK_NETWORK=0;;
+    --locale=*) ADM_LOCALE="${arg#*=}";;
+    --profile=*) PROFILE="${arg#*=}";;
+    --libc=*) LIBC="${arg#*=}";;
+    -h|--help) usage; exit 0;;
+    *) cecho WARN "Opção desconhecida: $arg";;
+  esac
+done
+
+# --------------[ Paths derivados ]-----------------
+ADM_CACHE_SRC="" ; ADM_CACHE_PKG="" ; ADM_WORK="" ; ADM_LOGS="" ; ADM_REPO="" ; ADM_STATES="" ; ADM_META=""
+compute_paths() {
+  ADM_CACHE_SRC="${ADM_ROOT}/cache/sources"
+  ADM_CACHE_PKG="${ADM_ROOT}/cache/packages"
+  ADM_WORK="${ADM_ROOT}/work"
+  ADM_LOGS="${ADM_ROOT}/logs"
+  ADM_REPO="${ADM_ROOT}/repo"
+  ADM_STATES="${ADM_ROOT}/states"
+  ADM_META="${ADM_root_meta:-${ADM_ROOT}/metafiles}"
+}
+
+# --------------[ Helpers ]-----------------
+need_root_or_rw() {
+  if [ ! -w "${ADM_ROOT%/}" ]; then
+    if [ "$(id -u)" -ne 0 ]; then
+      fatal "Sem permissão para escrever em ${ADM_ROOT}; rode como root/sudo ou ajuste --root"
+    fi
+  fi
+}
+
+mkdirp() {
+  local d
+  for d in "$@"; do
+    if [ -d "$d" ]; then
+      continue
+    fi
+    mkdir -p "$d"
+    [ $FORCE -eq 1 ] && chmod 0755 "$d" || true
+  done
+}
+
+check_space() {
+  local p="$1" min_kb="${2:-1048576}" # default ~1GB
+  local avail_kb
+  avail_kb=$(df -Pk "$p" | awk 'NR==2{print $4}')
+  if [ -z "${avail_kb:-}" ]; then cecho WARN "Não foi possível checar espaço em $p"; return 0; fi
+  if [ "$avail_kb" -lt "$min_kb" ]; then fatal "Espaço insuficiente em $p (disp ${avail_kb}KB, req ${min_kb}KB)"; fi
+}
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+detect_cpus() {
+  local n=1
+  if has_cmd nproc; then n=$(nproc); else n=$(getconf _NPROCESSORS_ONLN || echo 1); fi
+  echo "${n:-1}"
+}
+
+# --------------[ Pré-checks ]-----------------
+prechecks() {
+  cecho STEP "Verificando permissões e sistema de arquivos"
+  need_root_or_rw
+  check_space "${ADM_ROOT%/}" 524288   # ~512MB mínimo
+  cecho OK "Permissões/espaco OK"
+
+  cecho STEP "Checando ferramentas essenciais"
+  local req=(sh bash coreutils find sed awk grep tar xz gzip bzip2 curl sha256sum gpg patch diff file)
+  local missing=()
+  for c in "${req[@]}"; do has_cmd "$c" || missing+=("$c"); done
+  if [ "${#missing[@]}" -gt 0 ]; then fatal "Ferramentas ausentes: ${missing[*]}"; fi
+  cecho OK "Ferramentas essenciais OK"
+
+  cecho STEP "Checando toolchain mínimo (gcc/clang)"
+  if ! has_cmd gcc && ! has_cmd clang; then fatal "Nenhum compilador encontrado (gcc ou clang)"; fi
+  has_cmd ld || fatal "ld não encontrado"
+  has_cmd ar || fatal "ar não encontrado"
+  has_cmd ranlib || fatal "ranlib não encontrado"
+  has_cmd strip || cecho WARN "strip não encontrado (não crítico)"
+  has_cmd pkg-config || cecho WARN "pkg-config não encontrado (recomendado)"
+  cecho OK "Toolchain mínimo OK"
+
+  if [ $CHECK_NETWORK -eq 1 ]; then
+    cecho STEP "Testando conectividade de rede (https)"
+    if ! curl -fsSL --max-time 5 https://example.org >/dev/null 2>&1; then
+      cecho WARN "Sem conectividade HTTPS (pule com --no-network-check se offline)"
+    else
+      cecho OK "Rede OK"
+    fi
+  fi
+
+  cecho STEP "Verificando locale/charset"
+  if ! locale -a 2>/dev/null | grep -qi "$(echo "$ADM_LOCALE" | tr '[:upper:]' '[:lower:]')"; then
+    cecho WARN "Locale $ADM_LOCALE indisponível; usarei C.UTF-8"
+    ADM_LOCALE="C.UTF-8"
+  fi
+  cecho OK "Locale OK ($ADM_LOCALE)"
+}
+
+# --------------[ Diretórios e logs ]-----------------
+prepare_dirs() {
+  cecho STEP "Criando/validando estrutura em ${ADM_ROOT}"
+  mkdirp "${ADM_ROOT%/}"
+  compute_paths
+  mkdirp "$ADM_CACHE_SRC" "$ADM_CACHE_PKG" "$ADM_WORK" "$ADM_LOGS" "$ADM_REPO" "$ADM_STATES" "$ADM_META"
+  cecho OK "Estrutura pronta"
+}
+
+# --------------[ Lock e idempotência ]-----------------
+LOCK_FILE=""
+acquire_lock() {
+  LOCK_FILE="${ADM_STATES}/adm-init.lock"
+  if [ -f "$LOCK_FILE" ]; then
+    cecho ERR "Outro adm-init em execução (lock presente: $LOCK_FILE)"; exit 14
+  fi
+  echo "$$" > "$LOCK_FILE"
+  trap 'rm -f "$LOCK_FILE" || true' EXIT
+}
+
+# --------------[ Normalização de ambiente ]-----------------
+normalize_env() {
+  cecho STEP "Normalizando ambiente (umask, jobs, proxy, color, locale)"
+  umask "$ADM_UMASK" || true
+  if [ "$ADM_JOBS" = "0" ]; then ADM_JOBS="$(detect_cpus)"; fi
+  export LANG="$ADM_LOCALE" LC_ALL="$ADM_LOCALE"
+  [ -n "$ADM_PROXY_HTTP" ] && export http_proxy="$ADM_PROXY_HTTP"
+  [ -n "$ADM_PROXY_HTTPS" ] && export https_proxy="$ADM_PROXY_HTTPS"
+  [ -n "$ADM_NO_PROXY" ] && export no_proxy="$ADM_NO_PROXY"
+  case "$COLOR_MODE" in auto|always|never) :;; *) COLOR_MODE="auto";; esac
+  cecho OK "Ambiente: jobs=$ADM_JOBS, umask=$ADM_UMASK, color=$COLOR_MODE"
+}
+
+# --------------[ Escolha de libc e perfil ]-----------------
+resolve_profile_and_libc() {
+  # Força libc pelos perfis dedicados
+  case "$PROFILE" in
+    glibc) LIBC="glibc" ;;
+    musl)  LIBC="musl"  ;;
+    aggressive|normal|minimo) [ "$LIBC" = "auto" ] && LIBC="glibc" ;; # padrão sensato
+    *) cecho WARN "Perfil desconhecido '$PROFILE' — usando 'normal'"; PROFILE="normal"; [ "$LIBC" = "auto" ] && LIBC="glibc" ;;
+  esac
+  if [[ "$LIBC" != "glibc" && "$LIBC" != "musl" ]]; then
+    cecho WARN "LIBC inválido '$LIBC' — usando glibc"; LIBC="glibc"
+  fi
+  cecho OK "Perfil selecionado: $PROFILE (libc=$LIBC)"
+}
+
+# --------------[ Linkers e aceleração ]-----------------
+pick_linker() {
+  # Preferir mold, depois lld, senão padrão
+  if has_cmd mold; then echo "mold"; return; fi
+  if has_cmd ld.lld; then echo "lld"; return; fi
+  echo "bfd"
+}
+
+# --------------[ Geração de perfis ]-----------------
+write_profile_file() {
+  local fpath="$1" ; local cflags="$2" ; local ldflags="$3" ; local extras="$4"
+  cat >"$fpath" <<EOF
+# Perfil gerado por adm-init — NÃO EDITAR MANUALMENTE
+export ADM_PROFILE="${PROFILE}"
+export ADM_LIBC="${LIBC}"
+
+# Toolchain preferido (ajuste pelos próximos estágios se necessário)
+export CC="\${CC:-cc}"
+export CXX="\${CXX:-c++}"
+export AR="\${AR:-ar}"
+export NM="\${NM:-nm}"
+export RANLIB="\${RANLIB:-ranlib}"
+export STRIP="\${STRIP:-strip}"
+
+# Paralelismo e make/ninja
+export ADM_JOBS="${ADM_JOBS}"
+export MAKEFLAGS="-j\${ADM_JOBS}"
+export NINJAFLAGS="-j\${ADM_JOBS}"
+
+# Flags principais
+export CPPFLAGS="\${CPPFLAGS:-}"
+export CFLAGS="${cflags}"
+export CXXFLAGS="${cflags}"
+export LDFLAGS="${ldflags}"
+
+# Políticas globais
+export ADM_STRICT_CHECKSUM=1
+export ADM_HOOKS_AUTO=1
+export ADM_PATCHES_AUTO=1
+export ADM_ALWAYS_DESTDIR=1
+export ADM_PACKAGE_FROM_DESTDIR=1
+
+# Extras / otimizações utilitárias
+${extras}
+
+# Limpeza de variáveis perigosas para reprodutibilidade
+unset LD_PRELOAD || true
+unset LD_LIBRARY_PATH || true
+EOF
+}
+
+generate_profiles() {
+  cecho STEP "Gerando perfis de construção"
+  local profdir="${ADM_STATES}/profiles"
+  mkdirp "$profdir"
+  local ld="$(pick_linker)"
+  local ldfrag=""
+  case "$ld" in
+    mold) ldfrag="-Wl,-O2 -Wl,--as-needed -fuse-ld=mold" ;;
+    lld)  ldfrag="-Wl,-O2 -Wl,--as-needed -fuse-ld=lld" ;;
+    *)    ldfrag="-Wl,-O2 -Wl,--as-needed" ;;
+  esac
+  local extra_common='
+# ccache se disponível
+if command -v ccache >/dev/null 2>&1; then
+  export CC="ccache ${CC}"
+  export CXX="ccache ${CXX}"
+fi
+# Strip agressivo ao instalar (quando suportado)
+export INSTALL_STRIP=1
+'
+
+  # aggressive (com march=native, LTO)
+  local c_agg="-O3 -pipe -fno-plt -flto -fuse-linker-plugin -march=native -mtune=native"
+  local l_agg="${ldfrag} -flto"
+  write_profile_file "${profdir}/aggressive.env" "$c_agg" "$l_agg" "$extra_common"
+
+  # normal (seguro para geral)
+  local c_norm="-O2 -pipe -fno-plt -fexceptions -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIC"
+  local l_norm="${ldfrag}"
+  write_profile_file "${profdir}/normal.env" "$c_norm" "$l_norm" "$extra_common"
+
+  # minimo (bootstrap: evita march=native e LTO)
+  local c_min="-O1 -pipe -fPIC"
+  local l_min="-Wl,-O1 -Wl,--as-needed"
+  write_profile_file "${profdir}/minimo.env" "$c_min" "$l_min" "$extra_common"
+
+  # glibc (aggressive + marca libc)
+  local c_glibc="${c_agg} -D_GNU_SOURCE"
+  local l_glibc="${l_agg}"
+  write_profile_file "${profdir}/glibc.env" "$c_glibc" "$l_glibc" "$extra_common"
+
+  # musl (aggressive + ajustes seguros para musl)
+  # Evitar suposições de glibc; definir _DEFAULT_SOURCE/_BSD_SOURCE para compat
+  local c_musl="${c_agg} -D_DEFAULT_SOURCE -D_BSD_SOURCE"
+  local l_musl="${l_agg}"
+  write_profile_file "${profdir}/musl.env" "$c_musl" "$l_musl" "$extra_common"
+
+  cecho OK "Perfis criados em ${profdir}"
+}
+
+# --------------[ Snapshot do host ]-----------------
+snapshot_host() {
+  cecho STEP "Gerando snapshot do host"
+  local snap="${ADM_STATES}/host.snap"
+  {
+    echo "timestamp=$(log_ts)"
+    echo "kernel=$(uname -srvo 2>/dev/null || true)"
+    echo "machine=$(uname -m 2>/dev/null || true)"
+    echo "distro=$(cat /etc/os-release 2>/dev/null | tr -d '\r' | sed -n 's/^PRETTY_NAME=//p' | tr -d '\"')"
+    echo "filesystem_root=$(df -T "${ADM_ROOT%/}" | awk 'NR==2{print $2}')"
+    echo "cpu_cores=$(detect_cpus)"
+    echo "locale=$ADM_LOCALE"
+    echo "umask=$ADM_UMASK"
+    echo "jobs=$ADM_JOBS"
+    echo "proxy_http=$ADM_PROXY_HTTP"
+    echo "proxy_https=$ADM_PROXY_HTTPS"
+    echo "path=$PATH"
+    echo "tools="
+    for t in sh bash gcc clang ld ar ranlib strip make ninja cmake meson pkg-config curl wget sha256sum gpg patch diff file; do
+      if has_cmd "$t"; then printf "  - %s: %s\n" "$t" "$($t --version 2>/dev/null | head -n1 || echo present)"; else printf "  - %s: missing\n" "$t"; fi
+    done
+  } > "$snap"
+  cecho OK "Snapshot salvo em $snap"
+}
+
+# --------------[ Persistência de config para os demais scripts ]-----------------
+write_env_exports() {
+  cecho STEP "Gravando variáveis globais e caminhos"
+  local envg="${ADM_STATES}/global.env"
+  local envp="${ADM_STATES}/paths.env"
+  local profdir="${ADM_STATES}/profiles"
+  local sel_prof="$PROFILE"
+  case "$PROFILE" in
+    aggressive|normal|minimo|glibc|musl) : ;;
+    *) sel_prof="normal" ;;
+  esac
+  # Se usuário escolheu libc explícita, e perfil não for glibc/musl, mantemos o perfil e passamos ADM_LIBC_OVERRIDE
+  local profile_file="${profdir}/${sel_prof}.env"
+
+  cat > "$envp" <<EOF
+export ADM_ROOT="${ADM_ROOT%/}"
+export ADM_CACHE_SRC="${ADM_CACHE_SRC}"
+export ADM_CACHE_PKG="${ADM_CACHE_PKG}"
+export ADM_WORK="${ADM_WORK}"
+export ADM_LOGS="${ADM_LOGS}"
+export ADM_REPO="${ADM_REPO}"
+export ADM_STATES="${ADM_STATES}"
+export ADM_META="${ADM_META}"
+EOF
+
+  cat > "$envg" <<EOF
+# Ambiente global para todos os scripts ADM
+export ADM_JOBS="${ADM_JOBS}"
+export ADM_COLOR="${COLOR_MODE}"
+export ADM_UMASK="${ADM_UMASK}"
+export ADM_LOCALE="${ADM_LOCALE}"
+export ADM_PROXY_HTTP="${ADM_PROXY_HTTP}"
+export ADM_PROXY_HTTPS="${ADM_PROXY_HTTPS}"
+export ADM_NO_PROXY="${ADM_NO_PROXY}"
+export ADM_MIRRORS="${MIRRORS}"
+
+# Políticas fortes exigidas
+export ADM_STRICT_CHECKSUM=1
+export ADM_HOOKS_AUTO=1
+export ADM_PATCHES_AUTO=1
+export ADM_ALWAYS_DESTDIR=1
+export ADM_PACKAGE_FROM_DESTDIR=1
+
+# Perfil selecionado para TODAS as construções
+export ADM_PROFILE="${sel_prof}"
+export ADM_PROFILE_FILE="${profile_file}"
+
+# Se --libc explícito e o perfil não foi glibc/musl, permitimos override
+export ADM_LIBC_OVERRIDE="${LIBC}"
+
+# Linker preferido global (usado por perfis também)
+export ADM_PREFERRED_LINKER="$(pick_linker)"
+EOF
+
+  cecho OK "Configs salvas: $envg e $envp"
+}
+
+# --------------[ Registro de log de execução ]-----------------
+begin_logging() {
+  mkdirp "$ADM_LOGS"
+  exec 3>&1
+  exec >> "${ADM_LOGS}/adm-init.log" 2>&1
+  cecho INFO "Iniciando ${SELF_NAME} v${VERSION}"
+}
+
+end_logging() {
+  cecho OK "Concluído ${SELF_NAME}"
+  # Restaura stdout
+  exec 1>&3 3>&-
+  echo
+  cecho OK "Ambiente pronto em ${ADM_ROOT}"
+  cecho OK "Perfis: ${ADM_STATES}/profiles  |  Global: ${ADM_STATES}/global.env"
+  cecho OK "Logs:    ${ADM_LOGS}/adm-init.log  |  Snapshot: ${ADM_STATES}/host.snap"
+}
+
+# --------------[ Execução ]-----------------
+main() {
+  compute_paths
+  begin_logging
+  cecho STEP "Preparando ambiente"
+  prechecks
+  prepare_dirs
+  acquire_lock
+  normalize_env
+  resolve_profile_and_libc
+  generate_profiles
+  snapshot_host
+  write_env_exports
+  end_logging
+}
+
+main "$@"
