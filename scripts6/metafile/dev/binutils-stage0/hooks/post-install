@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Hook: post-install para binutils-stage0
+# Objetivo: finalizar instalação no DESTDIR, normalizar e reduzir tamanho, garantir determinismo.
+set -Eeuo pipefail
+: "${ADM_DESTDIR:?}"
+
+# Remover arquivos desnecessários no stage0 (manuais, info e docs pesados)
+rm -rf "${ADM_DESTDIR}/usr/share/info" \
+       "${ADM_DESTDIR}/usr/share/man" \
+       "${ADM_DESTDIR}/usr/share/doc" 2>/dev/null || true
+
+# Assegurar links/alternativas básicas (ar, as, ld, nm, objcopy, objdump, ranlib, strip)
+# Normalmente já instalados; se necessário, criamos symlinks canônicos:
+for b in ar as ld nm objcopy objdump ranlib strip; do
+  [ -x "${ADM_DESTDIR}/usr/bin/${b}" ] || continue
+  ln -sf "${b}" "${ADM_DESTDIR}/usr/bin/${b}" 2>/dev/null || true
+done
+
+# Determinismo extra: remover timestamps variados quando possível
+find "${ADM_DESTDIR}" -type f -exec touch -h -d @${SOURCE_DATE_EPOCH:-0} {} + 2>/dev/null || true
