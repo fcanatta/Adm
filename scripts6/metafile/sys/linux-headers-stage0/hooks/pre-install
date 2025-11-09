@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# linux-headers-stage0: pre-install
+# Objetivo: instalar headers no DESTDIR em /usr/include
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+cd "${ADM_WORK_DIR}"
+# Instala os headers "limpos" para o sysroot alvo:
+make INSTALL_HDR_PATH="${ADM_DESTDIR}/usr" headers_install
+
+# Alguns tarballs deixam arquivos pontuais .install / ..install
+find "${ADM_DESTDIR}/usr/include" -name '.*install' -o -name '..install' -delete || true
