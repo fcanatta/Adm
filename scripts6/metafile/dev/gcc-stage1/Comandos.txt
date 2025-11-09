@@ -1,0 +1,3 @@
+adm-cli install glibc-stage1 --prefer-build
+adm-cli install musl-stage1 --prefer-build
+adm-cli install gcc-stage1 --prefer-build
