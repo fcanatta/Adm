@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# glibc-stage1: pre-configure — prepara build "mínimo" para instalar headers e csu (crt*.o).
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+# Triplets (build/host/target). Para Stage1 normalmente host==target.
+BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")}"
+HOST_TRIPLET="${HOST_TRIPLET:-${TARGET_TRIPLET:-$BUILD_TRIPLET}}"
+
+# O glibc recomenda build out-of-tree
+mkdir -p "${ADM_BUILD_DIR}"
+cd "${ADM_BUILD_DIR}"
+
+# A glibc precisa dos headers do kernel no sysroot (já vindos de linux-headers-stage0).
+# Configure para instalar apenas headers e bibliotecas de start (csu).
+CONFIG_OPTS=(
+  "--prefix=/usr"
+  "--build=${BUILD_TRIPLET}"
+  "--host=${HOST_TRIPLET}"
+  "--disable-werror"
+  # Em Stage1, passamos --with-headers para assegurar caminho correto:
+  "--with-headers=/usr/include"
+)
+
+# O configure da glibc exige CC e depende de binutils do target
+export CC="${HOST_TRIPLET}-gcc"
+export AR="${HOST_TRIPLET}-ar"
+export RANLIB="${HOST_TRIPLET}-ranlib"
+export AS="${HOST_TRIPLET}-as"
+export LD="${HOST_TRIPLET}-ld"
+
+"${ADM_WORK_DIR}/configure" "${CONFIG_OPTS[@]}"
