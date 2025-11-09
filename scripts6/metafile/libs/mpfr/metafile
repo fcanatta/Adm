@@ -1,0 +1,12 @@
+name=mpfr
+version=4.2.1
+category=libs
+run_deps=
+build_deps=gmp
+opt_deps=
+num_builds=0
+description=Aritmética de ponto flutuante multiprecisão (dep de GCC)
+homepage=https://www.mpfr.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://www.mpfr.org/mpfr-4.2.1/mpfr-4.2.1.tar.xz,https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
