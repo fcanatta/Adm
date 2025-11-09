@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+# adm-bootstrap-chroot — Constrói o sistema final dentro do chroot do bootstrap-root
+# - Executa TODO o pipeline dentro do chroot (download/verify/extract/patch/detect/build/stage/package/apply)
+# - Usa caches/estados/metafiles via bind mount
+# - Ordem por dependências (apenas pacotes com metafile local)
+# - Retomada: salva último sucesso e continua do ponto de falha (--resume)
+# - DESTDIR sempre; empacota a partir do DESTDIR; hooks e patches automáticos
+# - Perfis do adm-init; fingerprint evita rebuild
+#
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF_NAME="${0##*/}"
+VERSION="1.1.0"
+
+# ---------- Cores / logging conciso ----------
+COLOR_MODE="${ADM_COLOR:-auto}"
+CLR_RESET="\033[0m"; CLR_BOLD="\033[1m"
+CLR_BLUE="\033[34m"; CLR_GREEN="\033[32m"; CLR_RED="\033[31m"; CLR_YELLOW="\033[33m"; CLR_CYAN="\033[36m"
+log_ts(){ date +'%Y-%m-%d %H:%M:%S'; } ; _is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+cecho(){ local lvl="$1"; shift; local msg="$*"; local sym col;
+  case "$lvl" in INFO) sym="▶"; col="$CLR_CYAN";; OK) sym="✓"; col="$CLR_GREEN";; WARN) sym="!"; col="$CLR_YELLOW";; ERR) sym="✗"; col="$CLR_RED";; STEP) sym="➜"; col="$CLR_BLUE";; *) sym="-"; col="$CLR_RESET";; esac
+  if [[ "$COLOR_MODE" == "never" || $(_is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then printf "%s %s %s\n" "$(log_ts)" "$sym" "$msg"
+  else printf "%b%s%b %b%s%b %b%s%b\n" "$CLR_BOLD" "$(log_ts)" "$CLR_RESET" "$col" "$sym" "$CLR_RESET" "$CLR_BOLD" "$msg" "$CLR_RESET"; fi; }
+fatal(){ cecho ERR "$*"; exit 2; }
+trap 'cecho ERR "Falha em ${SELF_NAME} (linha $LINENO). Veja ${ADM_LOGS}/adm-bootstrap-chroot.log"; exit 2' ERR
+
+# ---------- CLI ----------
+BOOTSTRAP_STAGE="all"     # toolchain|base|world|all (filtro de conjuntos; ordenação continua global)
+ONLY_LIST=""              # --only=pkg1,pkg2
+REBUILD=0
+FAIL_FAST=0
+CONTINUE_ON_ERROR=0
+RESUME=0
+NO_MOUNTS=0
+ENTER_ONLY=0
+DRY_RUN=0
+
+usage(){ cat <<EOF
+${SELF_NAME} v${VERSION}
+Uso: ${SELF_NAME} [opções]
+  --stage=toolchain|base|world|all   Conjunto alvo (default: all)
+  --only=pkg1,pkg2                   Constrói apenas estes (e suas deps locais)
+  --rebuild                          Força rebuild
+  --fail-fast                        Para no primeiro erro
+  --continue-on-error                Tenta todos (sobrepõe fail-fast)
+  --resume                           Continua após o último sucesso salvo
+  --no-mounts                        Assume mounts já feitos
+  --enter                            Apenas entra no chroot com perfil carregado
+  --dry-run                          Mostra ordem e o que faria; não constrói
+  -h|--help                          Ajuda
+EOF
+}
+
+for a in "$@"; do
+  case "$a" in
+    --stage=*) BOOTSTRAP_STAGE="${a#*=}";;
+    --only=*) ONLY_LIST="${a#*=}";;
+    --rebuild) REBUILD=1;;
+    --fail-fast) FAIL_FAST=1;;
+    --continue-on-error) CONTINUE_ON_ERROR=1;;
+    --resume) RESUME=1;;
+    --no-mounts) NO_MOUNTS=1;;
+    --enter) ENTER_ONLY=1;;
+    --dry-run) DRY_RUN=1;;
+    -h|--help) usage; exit 0;;
+    *) cecho WARN "Opção desconhecida: $a";;
+  esac
+done
+[ $CONTINUE_ON_ERROR -eq 1 ] && FAIL_FAST=0
+
+# ---------- Carregar ambiente do adm-init ----------
+ROOT_DEFAULT="/usr/src/adm"
+ADM_STATES="${ADM_STATES:-${ROOT_DEFAULT}/states}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_DEFAULT}/logs}"
+[ -f "${ADM_STATES}/paths.env" ] || fatal "paths.env não encontrado (rode adm-init)"
+[ -f "${ADM_STATES}/global.env" ] || fatal "global.env não encontrado (rode adm-init)"
+
+mkdir -p "$ADM_LOGS"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-bootstrap-chroot.log" 2>&1
+cecho INFO "Iniciando ${SELF_NAME} v${VERSION}"
+
+# shellcheck disable=SC1090
+. "${ADM_STATES}/paths.env"
+# shellcheck disable=SC1090
+. "${ADM_STATES}/global.env"
+[ -n "${ADM_PROFILE_FILE:-}" ] && . "${ADM_PROFILE_FILE}"
+
+BOOTSTRAP_ROOT="${ADM_WORK}/bootstrap-root"
+[ -d "$BOOTSTRAP_ROOT" ] || fatal "bootstrap-root não existe: $BOOTSTRAP_ROOT (rode adm-bootstrap-host)"
+
+# ---------- Layout de binds e paths dentro do chroot ----------
+CH_ADM_CACHE_SRC="/adm-cache/sources"
+CH_ADM_CACHE_PKG="/adm-cache/packages"
+CH_ADM_STATES="/adm-states"
+CH_ADM_META="/adm-meta"
+CH_BUILD="/build"
+CH_LOGS="/adm-logs"   # para fácil visualização dentro do chroot
+
+mkdir -p "$ADM_CACHE_SRC" "$ADM_CACHE_PKG" "$ADM_STATES" "$ADM_META" "$ADM_LOGS"
+
+# ---------- Utilitários ----------
+has_cmd(){ command -v "$1" >/dev/null 2>&1; }
+to_lines(){ local IFS=','; read -r -a a <<< "$1"; printf "%s\n" "${a[@]}"; }
+trim(){ sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//' ; }
+split_csv(){ local csv="$1"; local arr=(); IFS=',' read -r -a arr <<< "$csv"; printf "%s\n" "${arr[@]}"; }
+read_field(){ awk -F'=' -v k="$2" '$0 !~ /^#/ && $0 ~ "=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); val=$0; sub(/^[^=]+=/,"",val); if (key==k){print val; exit}}' "$1" | trim; }
+sha256sum_str(){ printf "%s" "$1" | sha256sum | awk '{print $1}'; }
+
+# ---------- Mount helpers ----------
+is_mounted(){ mountpoint -q "$1"; }
+bind_mount(){ local src="$1" dst="$2"; [ -d "$src" ] || mkdir -p "$src"; mkdir -p "$BOOTSTRAP_ROOT$dst"; is_mounted "$BOOTSTRAP_ROOT$dst" || mount --bind "$src" "$BOOTSTRAP_ROOT$dst"; }
+
+mount_chroot(){
+  [ $NO_MOUNTS -eq 1 ] && return 0
+  cecho STEP "Montando chroot binds"
+  mountpoint -q "$BOOTSTRAP_ROOT/proc" || mount -t proc proc "$BOOTSTRAP_ROOT/proc"
+  mountpoint -q "$BOOTSTRAP_ROOT/sys"  || mount -t sysfs sys "$BOOTSTRAP_ROOT/sys"
+  mountpoint -q "$BOOTSTRAP_ROOT/dev"  || mount --bind /dev "$BOOTSTRAP_ROOT/dev"
+  bind_mount "$ADM_CACHE_SRC" "$CH_ADM_CACHE_SRC"
+  bind_mount "$ADM_CACHE_PKG" "$CH_ADM_CACHE_PKG"
+  bind_mount "$ADM_STATES" "$CH_ADM_STATES"
+  bind_mount "$ADM_META" "$CH_ADM_META"
+  bind_mount "$ADM_LOGS" "$CH_LOGS"
+  mkdir -p "$BOOTSTRAP_ROOT$CH_BUILD"
+  # DNS dentro do chroot
+  if [ -f /etc/resolv.conf ]; then mkdir -p "$BOOTSTRAP_ROOT/etc"; cp -f /etc/resolv.conf "$BOOTSTRAP_ROOT/etc/resolv.conf"; fi
+  cecho OK "Chroot montado"
+}
+
+umount_chroot(){
+  [ $NO_MOUNTS -eq 1 ] && return 0
+  cecho STEP "Desmontando binds do chroot"
+  local pts=("$CH_LOGS" "$CH_ADM_META" "$CH_ADM_STATES" "$CH_ADM_CACHE_PKG" "$CH_ADM_CACHE_SRC" "/dev" "/sys" "/proc")
+  for p in "${pts[@]}"; do
+    local full="$BOOTSTRAP_ROOT$p"
+    is_mounted "$full" && umount -lf "$full" || true
+  done
+  cecho OK "Chroot desmontado"
+}
+
+# ---------- Execução no chroot ----------
+ch_exec(){
+  # Executa comando dentro do chroot com ambiente limpo + perfil carregado
+  local cmd="$*"
+  chroot "$BOOTSTRAP_ROOT" /bin/bash -lc "
+set -Eeuo pipefail
+export LANG='${ADM_LOCALE:-C.UTF-8}'; export LC_ALL='${ADM_LOCALE:-C.UTF-8}'
+[ -f '${CH_ADM_STATES}/paths.env' ] && . '${CH_ADM_STATES}/paths.env' || true
+[ -f '${CH_ADM_STATES}/global.env' ] && . '${CH_ADM_STATES}/global.env' || true
+[ -f '${ADM_PROFILE_FILE:+${CH_ADM_STATES}/profiles/$(basename "$ADM_PROFILE_FILE")}' ] && . '${CH_ADM_STATES}/profiles/$(basename "$ADM_PROFILE_FILE")' || true
+export ADM_CACHE_SRC='${CH_ADM_CACHE_SRC}'; export ADM_CACHE_PKG='${CH_ADM_CACHE_PKG}'
+export ADM_STATES='${CH_ADM_STATES}'; export ADM_META='${CH_ADM_META}'
+export ADM_JOBS='${ADM_JOBS}'; export MAKEFLAGS='-j${ADM_JOBS}'
+export PATH=/usr/bin:/usr/sbin:/bin:/sbin:\$PATH
+$cmd"
+}
+
+# ---------- Indexar metafiles (dentro do host, mas usando estrutura em ADM_META) ----------
+declare -A PKG_META_PATH PKG_CATEGORY PKG_VERSION PKG_RUN_DEPS PKG_BUILD_DEPS PKG_OPT_DEPS PKG_SOURCES PKG_SHA256S
+
+scan_metafiles(){
+  find "${ADM_META}" -type f -name "metafile" -print0 2>/dev/null | while IFS= read -r -d '' f; do
+    local dir="$(dirname "$f")"; local prog="$(basename "$dir")"; local cat="$(basename "$(dirname "$dir")")"
+    printf "%s|%s|%s\n" "$cat" "$prog" "$f"
+  done | sort
+}
+
+load_meta(){
+  local mf="$1"
+  for k in name version category run_deps build_deps opt_deps num_builds description homepage maintainer sha256sums sources; do
+    local v; v="$(read_field "$mf" "$k" || true)"
+    printf "%s=%s\n" "$k" "$v"
+  done
+}
+
+index_metafiles(){
+  cecho STEP "Indexando metafiles em ${ADM_META}"
+  local line; while IFS= read -r line; do
+    local cat name mf; IFS='|' read -r cat name mf <<< "$line"
+    local tmp; tmp="$(load_meta "$mf")"
+    local v catl rd bd od ss src
+    v="$(printf "%s\n" "$tmp" | awk -F= '$1=="version"{print substr($0,index($0,$2))}')"
+    catl="$(printf "%s\n" "$tmp" | awk -F= '$1=="category"{print substr($0,index($0,$2))}')"
+    rd="$(printf "%s\n" "$tmp" | awk -F= '$1=="run_deps"{print substr($0,index($0,$2))}')"
+    bd="$(printf "%s\n" "$tmp" | awk -F= '$1=="build_deps"{print substr($0,index($0,$2))}')"
+    od="$(printf "%s\n" "$tmp" | awk -F= '$1=="opt_deps"{print substr($0,index($0,$2))}')"
+    ss="$(printf "%s\n" "$tmp" | awk -F= '$1=="sha256sums"{print substr($0,index($0,$2))}')"
+    src="$(printf "%s\n" "$tmp" | awk -F= '$1=="sources"{print substr($0,index($0,$2))}')"
+    PKG_META_PATH["$name"]="$mf"; PKG_CATEGORY["$name"]="$cat"; PKG_VERSION["$name"]="${v:-0}"
+    PKG_RUN_DEPS["$name"]="${rd:-}"; PKG_BUILD_DEPS["$name"]="${bd:-}"; PKG_OPT_DEPS["$name"]="${od:-}"
+    PKG_SOURCES["$name"]="${src:-}"; PKG_SHA256S["$name"]="${ss:-}"
+  done < <(scan_metafiles)
+  cecho OK "Indexação concluída"
+}
+# ---------- Seleção de conjuntos ----------
+choose_targets_default(){
+  # Heurística: toolchain + base + mundo (se existirem os nomes abaixo)
+  local wish_tool=(linux-headers binutils glibc musl gcc clang)
+  local wish_base=(busybox coreutils bash sed grep gawk findutils diffutils file tar xz gzip bzip2 zstd pkg-config make ninja util-linux ca-certificates tzdata)
+  local chosen=()
+  case "$BOOTSTRAP_STAGE" in
+    toolchain) for p in "${wish_tool[@]}"; do [ -n "${PKG_META_PATH[$p]+x}" ] && chosen+=("$p"); done;;
+    base) for p in "${wish_base[@]}"; do [ -n "${PKG_META_PATH[$p]+x}" ] && chosen+=("$p"); done;;
+    world) for n in "${!PKG_META_PATH[@]}"; do chosen+=("$n"); done;;
+    all|*) for p in "${wish_tool[@]}"; do [ -n "${PKG_META_PATH[$p]+x}" ] && chosen+=("$p"); done
+           for p in "${wish_base[@]}"; do [ -n "${PKG_META_PATH[$p]+x}" ] && chosen+=("$p"); done
+           for n in "${!PKG_META_PATH[@]}"; do chosen+=("$n"); done;;
+  esac
+  # remover duplicados mantendo ordem
+  awk '!seen[$0]++' < <(printf "%s\n" "${chosen[@]}")
+}
+
+apply_only_filter(){
+  local arr=("$@")
+  [ -z "$ONLY_LIST" ] && { printf "%s\n" "${arr[@]}"; return; }
+  declare -A only=(); local n; for n in $(to_lines "$ONLY_LIST"); do only["$n"]=1; done
+  local out=(); for n in "${arr[@]}"; do [ -n "${only[$n]+x}" ] && out+=("$n"); done
+  printf "%s\n" "${out[@]}"
+}
+
+# ---------- Topologia por deps locais ----------
+topo_sort(){
+  local targets=("$@")
+  declare -A needed=(); local queue=("${targets[@]}")
+  for t in "${targets[@]}"; do needed["$t"]=1; done
+  while [ "${#queue[@]}" -gt 0 ]; do
+    local cur="${queue[0]}"; queue=("${queue[@]:1}")
+    for depcsv in "${PKG_BUILD_DEPS[$cur]}" "${PKG_RUN_DEPS[$cur]}"; do
+      [ -z "$depcsv" ] && continue
+      local dep; for dep in $(split_csv "$depcsv"); do
+        dep="$(echo "$dep" | trim)"; [ -z "$dep" ] && continue
+        if [ -n "${PKG_META_PATH[$dep]+x}" ] && [ -z "${needed[$dep]+x}" ]; then
+          needed["$dep"]=1; queue+=("$dep")
+        fi
+      done
+    done
+  done
+  declare -A indeg adj
+  local n; for n in "${!needed[@]}"; do indeg["$n"]=0; done
+  for a in "${!needed[@]}"; do
+    for depcsv in "${PKG_BUILD_DEPS[$a]}" "${PKG_RUN_DEPS[$a]}"; do
+      [ -z "$depcsv" ] && continue
+      local d; for d in $(split_csv "$depcsv"); do
+        d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+        if [ -n "${PKG_META_PATH[$d]+x}" ] && [ -n "${needed[$d]+x}" ]; then
+          adj["$d"]+="${adj[$d]:+ }$a"; indeg["$a"]=$(( ${indeg[$a]} + 1 ))
+        fi
+      done
+    done
+  done
+  local order=() q=()
+  for n in "${!needed[@]}"; do [ "${indeg[$n]}" -eq 0 ] && q+=("$n"); done
+  while [ "${#q[@]}" -gt 0 ]; do
+    local u="${q[0]}"; q=("${q[@]:1}"); order+=("$u")
+    local v; for v in ${adj[$u]:-}; do indeg["$v"]=$(( ${indeg[$v]} - 1 )); [ "${indeg[$v]}" -eq 0 ] && q+=("$v"); done
+  done
+  [ "${#order[@]}" -eq "${#needed[@]}" ] || { cecho ERR "Ciclo detectado em dependências"; exit 4; }
+  printf "%s\n" "${order[@]}"
+}
+
+# ---------- Fingerprint e estados ----------
+pkg_fp(){
+  local name="$1"; local v="${PKG_VERSION[$name]}"; local src="${PKG_SOURCES[$name]}"; local sums="${PKG_SHA256S[$name]}"
+  local patchdir="${ADM_META}/${PKG_CATEGORY[$name]}/${name}/patches"; local ph="none"
+  [ -d "$patchdir" ] && ph="$(find "$patchdir" -maxdepth 1 -type f -print0 | xargs -0 -r sha256sum | sha256sum | awk '{print $1}')" || true
+  sha256sum_str "${name}|${v}|${src}|${sums}|${ph}"
+}
+is_built(){
+  local name="$1"; local v="${PKG_VERSION[$name]}"; local fp; fp="$(pkg_fp "$name")"
+  local stamp="${ADM_STATES}/built-chroot/${name}-${v}.fingerprint"
+  [ -f "$stamp" ] && grep -q "$fp" "$stamp"
+}
+mark_built(){
+  local name="$1"; local v="${PKG_VERSION[$name]}"; local fp; fp="$(pkg_fp "$name")"
+  mkdir -p "${ADM_STATES}/built-chroot"
+  printf "%s\n" "$fp" > "${ADM_STATES}/built-chroot/${name}-${v}.fingerprint"
+  echo "$name" > "${ADM_STATES}/chroot-progress/last_success"
+}
+
+# ---------- Progresso / retomada ----------
+progress_init(){
+  mkdir -p "${ADM_STATES}/chroot-progress"
+  : > "${ADM_STATES}/chroot-progress/failed.list"
+  : > "${ADM_STATES}/chroot-progress/order.list"
+}
+progress_append_order(){ echo "$1" >> "${ADM_STATES}/chroot-progress/order.list"; }
+progress_add_failed(){ echo "$1" >> "${ADM_STATES}/chroot-progress/failed.list"; }
+progress_last_success(){ [ -f "${ADM_STATES}/chroot-progress/last_success" ] && cat "${ADM_STATES}/chroot-progress/last_success" || true; }
+
+apply_resume_filter(){
+  local -a order=("$@")
+  [ $RESUME -eq 0 ] && { printf "%s\n" "${order[@]}"; return; }
+  local last; last="$(progress_last_success)"
+  [ -z "$last" ] && { printf "%s\n" "${order[@]}"; return; }
+  local out=(); local passed=0
+  for n in "${order[@]}"; do
+    if [ $passed -eq 0 ]; then
+      [ "$n" = "$last" ] && passed=1
+      continue
+    fi
+    out+=("$n")
+  done
+  [ "${#out[@]}" -eq 0 ] && cecho WARN "Nada a retomar após '$last' — tudo já construído?"
+  printf "%s\n" "${out[@]}"
+}
+
+# ---------- Enter chroot (opção) ----------
+enter_chroot_shell(){
+  cecho STEP "Abrindo shell no chroot (perfil carregado)"
+  mount_chroot
+  chroot "$BOOTSTRAP_ROOT" /bin/bash --login || true
+  umount_chroot
+}
+
+# ---------- Pipeline interno — dentro do chroot ----------
+# Para simplificar, mandamos um "script de fase" inline ao chroot via bash -lc
+# Esse script usa variáveis passadas e caminhos padronizados (/build, /adm-cache, /adm-meta, /adm-states)
+ch_phase(){
+  local name="$1"; local category="${PKG_CATEGORY[$name]}"; local version="${PKG_VERSION[$name]}"
+  local sources="${PKG_SOURCES[$name]}"; local sums="${PKG_SHA256S[$name]}"
+  local pkgdir="${CH_ADM_META}/${category}/${name}"
+  local workdir="${CH_BUILD}/${category}/${name}-${version}"
+  local srcdir="${workdir}/src"; local blddir="${workdir}/build"; local stag="${workdir}/staging"
+  local log="${CH_LOGS}/${name}.log"
+  local jobs="${ADM_JOBS}"
+
+  ch_exec "
+set -Eeuo pipefail
+ce(){ echo \"[\$(date +%H:%M:%S)] \$*\"; }
+run_hook(){ local ph=\"\$1\"; local h='${pkgdir}/hooks/'\"\$ph\"; [ -x \"\$h\" ] || return 0;
+  ADM_NAME='${name}' ADM_VERSION='${version}' ADM_CATEGORY='${category}' ADM_SRC_DIR='${srcdir}' ADM_WORK_DIR='${workdir}' ADM_STAGING_DIR='${stag}' ADM_METAFILE='${pkgdir}/metafile' ADM_NUM_BUILDS='${jobs}' ADM_SOURCES='${sources}' ADM_LOG='${log}' ADM_PHASE=\"\$ph\" \"\$h\"; }
+
+download(){
+  mkdir -p '${CH_ADM_CACHE_SRC}/${name}-${version}' '${workdir}' '${srcdir}'
+  : > '${log}'
+  IFS=',' read -r -a urls <<< '${sources}'
+  IFS=',' read -r -a sums <<< '${sums}'
+  ok=0
+  for i in \"\${!urls[@]}\"; do
+    url=\"\${urls[\$i]}\"; url=\${url%%\\?*}
+    [ -z \"\$url\" ] && continue
+    out='${CH_ADM_CACHE_SRC}/${name}-${version}/'\"\$(basename \"\$url\")\"
+    if [ ! -s \"\$out\" ]; then
+      ce \"baixando \$url\" | tee -a '${log}'
+      if command -v curl >/dev/null 2>&1; then curl -fL --retry 3 --retry-delay 2 -o \"\$out\" \"\$url\" || { rm -f \"\$out\"; continue; }
+      else wget -O \"\$out\" \"\$url\" || { rm -f \"\$out\"; continue; } fi
+    fi
+    exp=\"\${sums[\$i]:-}\"
+    if [ -n \"\$exp\" ]; then
+      got=\$(sha256sum \"\$out\" | awk '{print \$1}')
+      [ \"\$got\" = \"\$exp\" ] || { echo \"sha256 mismatch (\$got != \$exp)\" | tee -a '${log}'; rm -f \"\$out\"; continue; }
+    fi
+    echo \"\$out\"
+    ok=1; break
+  done
+  [ \"\$ok\" -eq 1 ] || { echo 'nenhum source válido' | tee -a '${log}'; exit 2; }
+}
+
+extract(){
+  f=\"\$1\"; rm -rf '${srcdir}'; mkdir -p '${srcdir}'
+  case \"\$f\" in
+    *.tar.gz|*.tgz)  tar -xzf \"\$f\" -C '${srcdir}' --strip-components=1 ;;
+    *.tar.xz)        tar -xJf \"\$f\" -C '${srcdir}' --strip-components=1 ;;
+    *.tar.bz2)       tar -xjf \"\$f\" -C '${srcdir}' --strip-components=1 ;;
+    *.zip)           command -v unzip >/dev/null 2>&1 || { echo 'unzip ausente' | tee -a '${log}'; exit 2; }
+                     unzip -q \"\$f\" -d '${srcdir}';
+                     if [ \"\$(find '${srcdir}' -mindepth 1 -maxdepth 1 -type d | wc -l)\" -eq 1 ] && [ \"\$(find '${srcdir}' -mindepth 1 -maxdepth 1 -type f | wc -l)\" -eq 0 ]; then
+                       inner=\$(find '${srcdir}' -mindepth 1 -maxdepth 1 -type d | head -n1); shopt -s dotglob; mv \"\$inner\"/* '${srcdir}'/; rmdir \"\$inner\"
+                     fi ;;
+    *) echo 'formato não suportado'; exit 2 ;;
+  esac
+}
+
+apply_patches(){
+  pd='${pkgdir}/patches'
+  [ -d \"\$pd\" ] || { ce 'sem patches'; return 0; }
+  for p in \$(find \"\$pd\" -maxdepth 1 -type f | sort); do
+    if patch -d '${srcdir}' -p1 --dry-run < \"\$p\" >/dev/null 2>&1; then patch -d '${srcdir}' -p1 < \"\$p\" >>'${log}' 2>&1
+    elif patch -d '${srcdir}' -p0 --dry-run < \"\$p\" >/dev/null 2>&1; then patch -d '${srcdir}' -p0 < \"\$p\" >>'${log}' 2>&1
+    else echo 'patch falhou: '\"\$p\" | tee -a '${log}'; exit 3; fi
+  done
+}
+
+detect_bs(){
+  s='${srcdir}'
+  [ -f \"\$s/CMakeLists.txt\" ] && { echo cmake; return; }
+  [ -f \"\$s/meson.build\" ] && { echo meson; return; }
+  [ -f \"\$s/configure\" ] || [ -f \"\$s/configure.ac\" ] || [ -f \"\$s/Makefile.am\" ] || [ -f \"\$s/autogen.sh\" ] && { echo autotools; return; }
+  [ -f \"\$s/setup.py\" ] || grep -q 'build-backend' \"\$s/pyproject.toml\" 2>/dev/null && { echo python; return; }
+  [ -f \"\$s/Cargo.toml\" ] && { echo cargo; return; }
+  [ -f \"\$s/go.mod\" ] || find \"\$s\" -name '*.go' -print -quit | grep -q . && { echo go; return; }
+  [ -f \"\$s/package.json\" ] && { echo node; return; }
+  [ -f \"\$s/Makefile\" ] && { echo make; return; }
+  echo unknown
+}
+
+do_build(){
+  bs=\$(detect_bs); mkdir -p '${blddir}' '${stag}'
+  case \"\$bs\" in
+    cmake) (cd '${blddir}'; run_hook pre-configure; cmake -S '${srcdir}' -B . -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release >>'${log}' 2>&1; run_hook post-configure; run_hook pre-build; cmake --build . -- -j'${jobs}' >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; DESTDIR='${stag}' cmake --install . >>'${log}' 2>&1; );
+      ;;
+    meson) (cd '${CH_BUILD}'; run_hook pre-configure; meson setup '${blddir}' '${srcdir}' --prefix=/usr >>'${log}' 2>&1; run_hook post-configure; run_hook pre-build; ninja -C '${blddir}' -j '${jobs}' >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; DESTDIR='${stag}' ninja -C '${blddir}' install >>'${log}' 2>&1; );
+      ;;
+    autotools) (cd '${srcdir}'; run_hook pre-configure; [ -x ./autogen.sh ] && ./autogen.sh >>'${log}' 2>&1 || true; [ -x ./configure ] || chmod +x ./configure || true; ./configure --prefix=/usr >>'${log}' 2>&1; run_hook post-configure; run_hook pre-build; make -j '${jobs}' >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; make DESTDIR='${stag}' install >>'${log}' 2>&1; );
+      ;;
+    python) (cd '${srcdir}'; run_hook pre-configure; run_hook post-configure; run_hook pre-build; if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi; if [ -f pyproject.toml ]; then \$PY -m pip wheel --no-deps -w '${blddir}/wheels' . >>'${log}' 2>&1; else \$PY setup.py bdist_wheel -d '${blddir}/wheels' >>'${log}' 2>&1; fi; run_hook post-build; run_hook pre-install; \$PY -m pip install --no-deps --no-index --find-links '${blddir}/wheels' --root '${stag}' . >>'${log}' 2>&1; );
+      ;;
+    cargo) (cd '${srcdir}'; run_hook pre-configure; run_hook post-configure; run_hook pre-build; cargo build --release -j '${jobs}' >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; mkdir -p '${stag}/usr/bin'; find target/release -maxdepth 1 -type f -perm -111 -exec cp -a {} '${stag}/usr/bin/' \\; >>'${log}' 2>&1; );
+      ;;
+    go)    (cd '${srcdir}'; run_hook pre-configure; run_hook post-configure; run_hook pre-build; GOFLAGS=\"-p ${jobs}\" go build ./... >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; mkdir -p '${stag}/usr/bin'; find . -maxdepth 2 -type f -perm -111 -exec cp -a {} '${stag}/usr/bin/' \\; >>'${log}' 2>&1; );
+      ;;
+    make)  (cd '${srcdir}'; run_hook pre-configure; run_hook post-configure; run_hook pre-build; make -j '${jobs}' >>'${log}' 2>&1; run_hook post-build; run_hook pre-install; make DESTDIR='${stag}' install >>'${log}' 2>&1 || { mkdir -p '${stag}/usr/bin'; find . -maxdepth 1 -type f -perm -111 -exec cp -a {} '${stag}/usr/bin/' \\; >>'${log}' 2>&1 || true; } );
+      ;;
+    *) echo 'sistema de build desconhecido'; exit 5 ;;
+  esac
+  run_hook post-install
+}
+
+package_and_apply(){
+  out='${CH_ADM_CACHE_PKG}/'\"${name}-${version}.tar.zst\"
+  (cd '${stag}' && tar --zstd -cf \"\$out\" .)
+  man='${CH_ADM_STATES}/manifests/'\"${name}-${version}.manifest\"
+  mkdir -p \"\$(dirname \"\$man\")\"; (cd '${stag}' && find . -type f -printf '%P\n' | sort) > \"\$man\"
+  rsync -aH --delete-after '${stag}/' '/'
+}
+
+# Ordem: download→extract→patch→build→package→apply
+run_hook pre-download
+f=\$(download)
+run_hook post-download
+extract \"\$f\"
+run_hook pre-patch
+apply_patches
+run_hook post-patch
+do_build
+run_hook pre-package
+package_and_apply
+run_hook post-package
+"
+}
+
+# ---------- Correções padrão no root do chroot ----------
+root_fixes(){
+  cecho STEP "Correções padrão do root no chroot"
+  ch_exec "
+set -Eeuo pipefail
+[ -d /usr/lib64 ] && [ ! -e /usr/lib ] && ln -s lib64 /usr/lib || true
+[ -d /etc ] || mkdir -p /etc
+[ -f /etc/ld.so.conf ] || printf '/usr/lib\n/usr/local/lib\n' > /etc/ld.so.conf
+mkdir -p /etc/profile.d
+cat > /etc/profile.d/adm-path.sh <<'EOP'
+export PKG_CONFIG_PATH=\"/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/local/lib/pkgconfig\${PKG_CONFIG_PATH:+:\$PKG_CONFIG_PATH}\"
+EOP
+"
+  cecho OK "Correções aplicadas"
+}
+
+# ---------- Build de um pacote ----------
+build_one(){
+  local name="$1"
+  if [ $REBUILD -eq 0 ] && is_built "$name"; then cecho OK "[${name}] já construído — pulando"; return 0; fi
+  cecho STEP "Construindo ${name} (${PKG_VERSION[$name]}) no chroot"
+  if ch_phase "$name"; then
+    mark_built "$name"; cecho OK "[${name}] concluído"; return 0
+  else
+    cecho ERR "[${name}] falhou no chroot"; progress_add_failed "$name"; return 1
+  fi
+}
+# ---------- Main ----------
+main(){
+  cecho STEP "Preparando chroot"
+  mount_chroot
+
+  [ $ENTER_ONLY -eq 1 ] && { enter_chroot_shell; umount_chroot; return 0; }
+
+  cecho STEP "Indexando pacotes"
+  index_metafiles
+
+  cecho STEP "Selecionando alvos"
+  mapfile -t defaults < <(choose_targets_default)
+  mapfile -t targets  < <(apply_only_filter "${defaults[@]}")
+  if [ "${#targets[@]}" -eq 0 ]; then cecho WARN "Sem alvos para construir (use --only=...)"; umount_chroot; return 0; fi
+
+  cecho STEP "Calculando ordem por dependências (topológica)"
+  mapfile -t order < <(topo_sort "${targets[@]}")
+  cecho INFO "Ordem global: ${order[*]}"
+
+  [ $DRY_RUN -eq 1 ] && { cecho OK "Dry-run: nada será construído."; for n in "${order[@]}"; do echo " - $n  (${PKG_VERSION[$n]})"; done; umount_chroot; return 0; }
+
+  progress_init
+  for n in "${order[@]}"; do progress_append_order "$n"; done
+  mapfile -t order <- <(apply_resume_filter "${order[@]}")
+
+  mkdir -p "${ADM_STATES}/manifests" "${ADM_STATES}/built-chroot"
+
+  local ok=0; local failed=()
+  for name in "${order[@]}"; do
+    if build_one "$name"; then ok=$((ok+1)); else
+      failed+=("$name")
+      [ $FAIL_FAST -eq 1 ] && break
+      [ $CONTINUE_ON_ERROR -eq 0 ] && break
+    fi
+  done
+
+  root_fixes
+  umount_chroot
+
+  if [ "${#failed[@]}" -gt 0 ]; then
+    cecho ERR "Falhas: ${failed[*]}"
+    cecho INFO "Último sucesso: $(progress_last_success || echo 'nenhum')"
+    cecho INFO "Você pode retomar com: ${SELF_NAME} --resume"
+    exit 5
+  fi
+
+  cecho OK "Construção no chroot concluída. Pacotes OK: $ok"
+}
+
+main "$@"
+# Restaurar stdout
+exec 1>&3 3>&-
