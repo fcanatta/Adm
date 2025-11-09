@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# musl-stage1: pre-configure — configura para compilar somente headers+crt.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")}"
+HOST_TRIPLET="${HOST_TRIPLET:-${TARGET_TRIPLET:-$BUILD_TRIPLET}}"
+
+# musl aceita ./configure simples; usar CC do target
+export CC="${HOST_TRIPLET}-gcc"
+# Em Stage1, não precisamos de opções específicas além do prefix
+./configure --prefix=/usr --target="${HOST_TRIPLET}"
+
+# Usaremos o próprio diretório de trabalho (musl não exige out-of-tree)
+mkdir -p "${ADM_BUILD_DIR}"
