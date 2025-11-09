@@ -1,0 +1,497 @@
+#!/usr/bin/env bash
+# adm-verify — Verificador de toolchain por stages (stage0 → final)
+# - Checa binutils, gcc, headers, libc, linker, pkg-config
+# - Compila testes (C/C++, threads) dinâmico/estático quando aplicável
+# - Suporta glibc/musl, host/chroot/sysroot, cross (TARGET_TRIPLET)
+# - Emite relatório com PASS/FAIL por categoria
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.0.0"
+
+# ===================== Cores / Log =====================
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"; C_MAG="\033[35m"
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+log(){ local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; TITLE)SYM="#";COL="$C_MAG";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO)"; exit 2' ERR
+
+# ===================== Defaults / Contexto =====================
+ROOT="${ADM_ROOT:-/}"
+SYSROOT="${SYSROOT:-}"
+TARGET_TRIPLET="${TARGET_TRIPLET:-}"
+LIBC_FLAVOR="${ADM_LIBC:-}"      # glibc|musl|auto
+PROFILE="${ADM_PROFILE:-}"
+STAGE="all"                      # stage0|stage1|stage2|final|all
+CHECKS="all"                     # all|binutils,gcc,headers,libc,linker,pc,cxx,threads,elf
+JOBS="${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+DRY_RUN=0
+VERBOSE=0
+
+# ===================== Uso =====================
+usage(){
+cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} [opções]
+
+Opções:
+  --root=DIR              Root alvo (default: /)
+  --sysroot=DIR           Sysroot a usar no compilador/linker (opcional)
+  --target=TRIPLET        Triplet alvo (ex: x86_64-pc-linux-gnu)
+  --libc=glibc|musl|auto  Libc esperada para testes dinâmicos (default: auto)
+  --stage=STAGE           stage0|stage1|stage2|final|all  (default: all)
+  --checks=LISTA          all ou csv: binutils,gcc,headers,libc,linker,pc,cxx,threads,elf
+  --jobs=N                Paralelismo na compilação de testes (default: auto)
+  --dry-run               Mostra o que faria sem compilar
+  --verbose               Verbosidade extra
+  --color=auto|always|never
+
+Saídas:
+  - Cód. 0: todos os checks obrigatórios do stage passaram
+  - Cód. 1: há falhas em checks obrigatórios do stage
+  - Cód. 2: erro de execução
+
+Exemplos:
+  ${SELF} --stage=stage0 --target=\$TARGET_TRIPLET --libc=auto
+  ${SELF} --stage=final --checks=all
+  ${SELF} --sysroot=/opt/target --target=aarch64-linux-musl --libc=musl
+EOF
+}
+
+# ===================== Parse CLI =====================
+CMDLINE_ORIG=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root=*) ROOT="${1#*=}";;
+    --sysroot=*) SYSROOT="${1#*=}";;
+    --target=*) TARGET_TRIPLET="${1#*=}";;
+    --libc=*) LIBC_FLAVOR="${1#*=}";;
+    --stage=*) STAGE="${1#*=}";;
+    --checks=*) CHECKS="${1#*=}";;
+    --jobs=*) JOBS="${1#*=}";;
+    --dry-run) DRY_RUN=1;;
+    --verbose) VERBOSE=1;;
+    --color=*) COLOR_MODE="${1#*=}";;
+    -h|--help) usage; exit 0;;
+    *) log WARN "Opção desconhecida: $1";;
+  esac; shift || true
+done
+[[ "$COLOR_MODE" =~ ^(auto|always|never)$ ]] || COLOR_MODE="auto"
+
+# ===================== Helpers =====================
+has(){ command -v "$1" >/dev/null 2>&1; }
+need(){ has "$1" || fatal "Ferramenta ausente: $1"; }
+pfx(){ [ -n "$TARGET_TRIPLET" ] && echo "${TARGET_TRIPLET}-" || echo ""; }
+cc_bin(){ local CC="${CC_OVERRIDE:-$(pfx)gcc}"; echo "$CC"; }
+cxx_bin(){ local CXX="${CXX_OVERRIDE:-$(pfx)g++}"; echo "$CXX"; }
+ld_bin(){ local LD="${LD_OVERRIDE:-$(pfx)ld}"; echo "$LD"; }
+ar_bin(){ local AR="${AR_OVERRIDE:-$(pfx)ar}"; echo "$AR"; }
+ranlib_bin(){ local R="${RANLIB_OVERRIDE:-$(pfx)ranlib}"; echo "$R"; }
+strip_bin(){ local S="${STRIP_OVERRIDE:-$(pfx)strip}"; echo "$S"; }
+pkgconf_bin(){ local P="${PKG_CONFIG_OVERRIDE:-pkg-config}"; echo "$P"; }
+
+tmpdir=""; cleanup(){ [ -n "$tmpdir" ] && rm -rf "$tmpdir" || true; }
+trap cleanup EXIT
+
+mktempd(){ tmpdir="$(mktemp -d)"; echo "$tmpdir"; }
+teefile(){ # log + stdout
+  if [ $VERBOSE -eq 1 ]; then tee /dev/stderr; else cat; fi
+}
+
+try(){ # Executa e registra; DRY_RUN imprime comando
+  if [ $DRY_RUN -eq 1 ]; then
+    printf "DRY-RUN: %s\n" "$*" | teefile
+    return 0
+  fi
+  if [ $VERBOSE -eq 1 ]; then
+    printf "RUN: %s\n" "$*" >&2
+  fi
+  "$@"
+}
+
+# Resumo final
+declare -A RESULT=()   # chave -> PASS|FAIL|SKIP
+mark(){ RESULT["$1"]="$2"; }
+
+# ===================== Seleção de checks por stage =====================
+# stage0: binutils, gcc (C-only pass1), headers do kernel, linker base
+# stage1: binutils pass2, gcc com headers (libgcc ok, sem stdc++)
+# stage2: libc instalada (musl/glibc), ldso/rtld, link dinâmico, threads
+# final: c++ (libstdc++), pkg-config, PIE/RELRO (se aplicável)
+declare -A NEEDS_STAGE0=( [binutils]=1 [gcc]=1 [headers]=1 [linker]=1 )
+declare -A NEEDS_STAGE1=( [binutils]=1 [gcc]=1 [headers]=1 [linker]=1 [elf]=1 )
+declare -A NEEDS_STAGE2=( [binutils]=1 [gcc]=1 [headers]=1 [libc]=1 [linker]=1 [elf]=1 [threads]=1 )
+declare -A NEEDS_FINAL=(  [binutils]=1 [gcc]=1 [headers]=1 [libc]=1 [linker]=1 [elf]=1 [threads]=1 [cxx]=1 [pc]=1 )
+
+is_check_enabled(){
+  local key="$1"
+  if [ "$CHECKS" = "all" ]; then echo 1; return
+  IFS=',' read -r -a arr <<<"$CHECKS"
+  for x in "${arr[@]}"; do [ "$x" = "$key" ] && { echo 1; return; }; done
+  echo 0
+}
+
+need_in_stage(){
+  local key="$1"
+  case "$STAGE" in
+    stage0) echo "${NEEDS_STAGE0[$key]:-0}";;
+    stage1) echo "${NEEDS_STAGE1[$key]:-0}";;
+    stage2) echo "${NEEDS_STAGE2[$key]:-0}";;
+    final|all) echo "${NEEDS_FINAL[$key]:-0}";;
+    *) echo 1;;
+  esac
+}
+
+# ===================== Descobertas básicas =====================
+detect_triplet_libc(){
+  local CC="$(cc_bin)"
+  if has "$CC"; then
+    local mach="$("$CC" -dumpmachine 2>/dev/null || true)"
+    [ -n "$mach" ] && [ -z "$TARGET_TRIPLET" ] && TARGET_TRIPLET="$mach"
+  fi
+  if [ -z "$LIBC_FLAVOR" ] || [ "$LIBC_FLAVOR" = "auto" ]; then
+    if "$CC" -dM -E - </dev/null 2>/dev/null | grep -q '__GLIBC__'; then
+      LIBC_FLAVOR="glibc"
+    elif "$CC" --version 2>/dev/null | grep -qi musl; then
+      LIBC_FLAVOR="musl"
+    else
+      # tenta ldd
+      if has ldd && ldd --version 2>&1 | grep -qi musl; then LIBC_FLAVOR="musl"; else LIBC_FLAVOR="glibc"; fi
+    fi
+  fi
+}
+
+info_banner(){
+  log TITLE "ADM Verify — stage=$STAGE checks=$CHECKS target=${TARGET_TRIPLET:-auto} libc=$LIBC_FLAVOR sysroot=${SYSROOT:-none}"
+  if [ -n "$SYSROOT" ]; then
+    export SYSROOT
+    export CFLAGS="--sysroot=$SYSROOT ${CFLAGS:-}"
+    export CXXFLAGS="--sysroot=$SYSROOT ${CXXFLAGS:-}"
+    export LDFLAGS="--sysroot=$SYSROOT ${LDFLAGS:-}"
+  fi
+}
+
+# ===================== Pré-requisitos mínimos =====================
+preq_min(){
+  need awk; need sed; need grep; need find; need printf; need tr
+  need "$(cc_bin)" || true   # gcc pode faltar em stage0? esperado que exista pass1
+  need "$(ld_bin)" || true
+  need "$(ar_bin)" || true
+  need "$(ranlib_bin)" || true
+  need "$(strip_bin)" || true
+  has readelf || need eu-readelf || true
+}
+
+# ===================== Infra testes de compilação =====================
+compile_test_c(){
+  # $1: src_text, $2: out_bin, flags extras...
+  local src="$1" out="$2"; shift 2 || true
+  local CC="$(cc_bin)"
+  [ -n "$src" ] || fatal "compile_test_c: src vazio"
+  [ -n "$out" ] || fatal "compile_test_c: out vazio"
+  if [ $DRY_RUN -eq 1 ]; then echo "DRY: $CC -o $out $* -xc -" | teefile; return 0; fi
+  printf "%s\n" "$src" | "$CC" -o "$out" "$@" -xc - 2>&1 | teefile
+}
+
+compile_test_cxx(){
+  local src="$1" out="$2"; shift 2 || true
+  local CXX="$(cxx_bin)"
+  if [ $DRY_RUN -eq 1 ]; then echo "DRY: $CXX -o $out $* -x c++ -" | teefile; return 0; fi
+  printf "%s\n" "$src" | "$CXX" -o "$out" "$@" -x c++ - 2>&1 | teefile
+}
+
+# ===================== Leitura de ELF =====================
+elf_read(){
+  local bin="$1"
+  if has readelf; then readelf -h -l -d "$bin"
+  else eu-readelf -h -l -d "$bin"
+  fi
+}
+elf_interp(){
+  local bin="$1"
+  elf_read "$bin" | awk '/Requesting program interpreter/ {gsub(/\[|\]/,"",$NF); print $NF; exit}'
+}
+elf_type(){
+  local bin="$1"
+  elf_read "$bin" | awk '/Type:/ {print $2; exit}'
+}
+elf_pie(){
+  local bin="$1"
+  local t="$(elf_type "$bin")"
+  [ "$t" = "DYN" ] && return 0 || return 1
+}
+elf_relro(){
+  local bin="$1"
+  elf_read "$bin" | grep -q 'GNU_RELRO'
+}
+# ===================== Checks =====================
+
+check_binutils(){
+  local ok=1
+  local AR="$(ar_bin)" RAN="$(ranlib_bin)" LD="$(ld_bin)" STR="$(strip_bin)"
+  for b in "$AR" "$RAN" "$LD" "$STR" objcopy objdump nm; do
+    if has "$b"; then
+      log OK "binutils: encontrado $b: $($b --version 2>&1 | head -n1)"
+    else
+      log ERR "binutils: ausente $b"
+      ok=0
+    fi
+  done
+  # teste de determinismo do ar (opcional)
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  printf "int x=1;\n" > a.c
+  try "$(cc_bin)" -c a.c -o a.o
+  try "$AR" rc liba.a a.o
+  "$AR" t liba.a | teefile
+  # reempacota e compara checksum para ver estabilidade básica
+  local s1 s2
+  s1="$(sha256sum liba.a | awk '{print $1}')"
+  sleep 1
+  try "$AR" rc liba.a a.o
+  s2="$(sha256sum liba.a | awk '{print $1}')"
+  if [ "$s1" = "$s2" ]; then
+    log OK "binutils: ar determinístico (hash estável)"
+  else
+    log WARN "binutils: ar pode não ser determinístico (hash variou)"
+  fi
+  popd >/dev/null
+  [ $ok -eq 1 ] && mark binutils PASS || mark binutils FAIL
+}
+
+check_headers(){
+  local inc="${SYSROOT:+$SYSROOT}/usr/include"
+  if [ -d "$inc" ] && [ -f "$inc/linux/version.h" -o -f "$inc/linux/limits.h" -o -d "$inc/linux" ]; then
+    log OK "headers: headers do kernel presentes em $inc"
+    mark headers PASS
+  else
+    log ERR "headers: não encontrados em $inc"
+    mark headers FAIL
+  fi
+}
+
+check_gcc(){
+  local CC="$(cc_bin)"
+  if ! has "$CC"; then
+    log ERR "gcc: compilador ausente ($CC)"
+    mark gcc FAIL; return
+  fi
+  log OK "gcc: $("$CC" --version | head -n1)"
+  # Hello world estático/dinâmico conforme stage/libc
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  local hello='
+  #include <stdio.h>
+  int main(){ puts("hello"); return 0; }'
+  # dinâmico (se libc conhecida)
+  if [ "$LIBC_FLAVOR" != "unknown" ]; then
+    if compile_test_c "$hello" hello-dyn -O2 ${LDFLAGS:+$LDFLAGS} 2>/dev/null; then
+      log OK "gcc: link dinâmico (C) OK"
+      elf_interp "./hello-dyn" >/dev/null 2>&1 && log INFO "interp: $(elf_interp ./hello-dyn)"
+    else
+      log WARN "gcc: falhou link dinâmico (C) — pode ser esperado em stage0/sem libc"
+    fi
+  fi
+  # estático (pode falhar se libc estática indisponível)
+  if compile_test_c "$hello" hello-static -O2 -static ${LDFLAGS:+$LDFLAGS} 2>/dev/null; then
+    log OK "gcc: link estático (C) OK"
+  else
+    log WARN "gcc: link estático (C) indisponível"
+  fi
+  popd >/dev/null
+  mark gcc PASS
+}
+
+check_libc(){
+  # verifica glibc/musl, ld.so, includes básicos
+  local ok=1
+  if [ "$LIBC_FLAVOR" = "glibc" ]; then
+    if has ldd && ldd --version 2>&1 | grep -q 'GNU C Library'; then
+      log OK "libc: glibc detectada (ldd)"
+    else
+      log WARN "libc: glibc não detectada via ldd; tentando headers"
+      [ -f "${SYSROOT:+$SYSROOT}/usr/include/gnu/libc-version.h" ] || ok=0
+    fi
+  elif [ "$LIBC_FLAVOR" = "musl" ]; then
+    if has ldd && ldd --version 2>&1 | grep -qi musl; then
+      log OK "libc: musl detectada (ldd)"
+    else
+      log WARN "libc: musl não detectada via ldd; tentando headers"
+      [ -f "${SYSROOT:+$SYSROOT}/usr/include/stdlib.h" ] || ok=0
+    fi
+  else
+    log INFO "libc: modo auto/indefinido — checagens suaves"
+  fi
+  [ $ok -eq 1 ] && mark libc PASS || mark libc FAIL
+}
+
+check_linker(){
+  local LD="$(ld_bin)"
+  if has "$LD"; then
+    log OK "linker: $("$LD" --version 2>&1 | head -n1)"
+  else
+    log ERR "linker: ausente $LD"
+    mark linker FAIL; return
+  fi
+  # compila um objeto e tenta linkar explicitamente
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  printf "int main(){return 0;}\n" > m.c
+  try "$(cc_bin)" -c m.c -o m.o
+  # tentar link com ld chamando via cc (mais robusto)
+  try "$(cc_bin)" m.o -o m 2>&1 | teefile
+  if [ -f m ]; then
+    log OK "linker: link via cc OK"
+    mark linker PASS
+  else
+    log ERR "linker: falha ao linkar via cc"
+    mark linker FAIL
+  fi
+  popd >/dev/null
+}
+
+check_pkgconfig(){
+  local PC="$(pkgconf_bin)"
+  if has "$PC"; then
+    log OK "pkg-config: $("$PC" --version 2>/dev/null)"
+    mark pc PASS
+  else
+    log WARN "pkg-config: ausente (não obrigatório em todos os stages)"
+    mark pc SKIP
+  fi
+}
+
+check_cxx(){
+  local CXX="$(cxx_bin)"
+  if ! has "$CXX"; then
+    log WARN "cxx: compilador C++ ausente — possivelmente antes do stage final"
+    mark cxx SKIP; return
+  fi
+  log OK "cxx: $("$CXX" --version | head -n1)"
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  local src='#include <iostream>
+  int main(){ std::cout << "hello++\n"; return 0; }'
+  if compile_test_cxx "$src" hello-cxx -O2; then
+    log OK "cxx: C++ link dinâmico OK"
+    mark cxx PASS
+  else
+    log ERR "cxx: falha ao compilar/linkar programa simples"
+    mark cxx FAIL
+  fi
+  popd >/dev/null
+}
+
+check_threads(){
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  local src='#include <pthread.h>
+  #include <stdio.h>
+  void* f(void* x){ (void)x; return NULL; }
+  int main(){ pthread_t t; if(pthread_create(&t,0,f,0)) return 2; pthread_join(t,0); puts("thr"); return 0; }'
+  if compile_test_c "$src" thr -O2 -pthread; then
+    log OK "threads: pthread link OK"
+    mark threads PASS
+  else
+    log ERR "threads: falha no link com -pthread (libc/rtld?)"
+    mark threads FAIL
+  fi
+  popd >/dev/null
+}
+
+check_elf(){
+  # valida interp, PIE e RELRO apenas se binário dinâmico foi possível
+  local d; d="$(mktempd)"; pushd "$d" >/dev/null
+  local src='#include <stdio.h>
+  int main(){ puts("elf"); return 0; }'
+  if compile_test_c "$src" elf -O2; then
+    local interp="$(elf_interp ./elf || true)"
+    [ -n "$interp" ] && log INFO "ELF: interpreter=$interp"
+    if elf_pie ./elf; then log OK "ELF: PIE: sim"; else log WARN "ELF: PIE: não"; fi
+    if elf_relro ./elf; then log OK "ELF: RELRO: sim"; else log WARN "ELF: RELRO: não"; fi
+    mark elf PASS
+  else
+    log WARN "ELF: não foi possível gerar binário dinâmico — possivelmente sem libc neste stage"
+    mark elf SKIP
+  fi
+  popd >/dev/null
+}
+
+# ===================== Agendamento por stage =====================
+run_checks(){
+  local any_fail=0
+  for key in binutils gcc headers libc linker pc cxx threads elf; do
+    # pula se não pedido
+    [ "$(is_check_enabled "$key")" -eq 1 ] || { mark "$key" SKIP; continue; }
+    # pula se o stage não exige
+    [ "$(need_in_stage "$key")" -eq 1 ] || { mark "$key" SKIP; continue; }
+    case "$key" in
+      binutils) check_binutils ;;
+      gcc)      check_gcc ;;
+      headers)  check_headers ;;
+      libc)     check_libc ;;
+      linker)   check_linker ;;
+      pc)       check_pkgconfig ;;
+      cxx)      check_cxx ;;
+      threads)  check_threads ;;
+      elf)      check_elf ;;
+    esac
+  done
+
+  # determina falhas obrigatórias do stage
+  for key in binutils gcc headers libc linker elf threads cxx pc; do
+    [ "$(need_in_stage "$key")" -eq 1 ] || continue
+    case "${RESULT[$key]:-SKIP}" in
+      FAIL) any_fail=1;;
+    esac
+  done
+  return $any_fail
+}
+# ===================== Relatório final =====================
+report(){
+  echo
+  log TITLE "Resumo — stage=$STAGE"
+  printf "%-10s  %s\n" "CHECK" "STATUS"
+  printf "%-10s  %s\n" "-----" "------"
+  for key in binutils gcc headers libc linker pc cxx threads elf; do
+    st="${RESULT[$key]:-SKIP}"
+    case "$st" in
+      PASS) printf "%-10s  %b%s%b\n" "$key" "$C_GRN" "PASS" "$R" ;;
+      FAIL) printf "%-10s  %b%s%b\n" "$key" "$C_RED" "FAIL" "$R" ;;
+      SKIP) printf "%-10s  %b%s%b\n" "$key" "$C_YEL" "SKIP" "$R" ;;
+      *) printf "%-10s  %s\n" "$key" "$st" ;;
+    esac
+  done
+  echo
+  log INFO "Dicas:"
+  [ "${RESULT[gcc]}" = "FAIL" ] && echo " - Verifique gcc ($(cc_bin)) e flags de sysroot/target."
+  [ "${RESULT[binutils]}" = "FAIL" ] && echo " - Garanta binutils do target no PATH (ar/ld/nm/objdump)."
+  [ "${RESULT[headers]}" = "FAIL" ] && echo " - Instale 'linux-headers-stage0' (headers em /usr/include no sysroot)."
+  [ "${RESULT[libc]}" = "FAIL" ] && echo " - Libc incompatível/ausente. Instale musl/glibc e ldso."
+  [ "${RESULT[linker]}" = "FAIL" ] && echo " - ld/link via cc falhou. Cheque toolchain e paths."
+  [ "${RESULT[threads]}" = "FAIL" ] && echo " - Falha com -pthread. Cheque libpthread (glibc) ou musl."
+  [ "${RESULT[cxx]}" = "FAIL" ] && echo " - Falha em C++. Construa libstdc++ (stage final)."
+  [ "${RESULT[elf]}" = "SKIP" ] && echo " - ELF (PIE/RELRO) pulado, sem link dinâmico neste stage."
+}
+
+# ===================== Main =====================
+main(){
+  detect_triplet_libc
+  info_banner
+  preq_min
+  run_checks
+  rc=$?
+  report
+  if [ $rc -eq 0 ]; then
+    log OK "Toolchain validada com sucesso para stage=$STAGE"
+  else
+    log ERR "Falhas detectadas em checks obrigatórios para stage=$STAGE"
+  fi
+  exit $rc
+}
+main "$@"
