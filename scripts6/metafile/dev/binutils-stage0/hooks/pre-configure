@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Hook: pre-configure para binutils-stage0
+# Objetivo: configurar build mínimo, estável e adequado ao bootstrap.
+set -Eeuo pipefail
+
+# Diretórios padrões do ADM (já exportados pelo ambiente)
+: "${ADM_BUILD_DIR:?}"; : "${ADM_WORK_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+# Flags agressivas NÃO são desejadas no stage0; usar algo estável e determinístico
+export CFLAGS="${CFLAGS_STAGE0:--O2 -g0 -fno-plt -fno-exceptions -fno-asynchronous-unwind-tables -U_FORTIFY_SOURCE}"
+export CXXFLAGS="${CXXFLAGS_STAGE0:--O2 -g0 -fno-plt -fno-exceptions -fno-asynchronous-unwind-tables -U_FORTIFY_SOURCE}"
+export LDFLAGS="${LDFLAGS_STAGE0:--Wl,--as-needed}"
+
+# Torna arquivos/arquivos gerados determinísticos quando suportado
+export ARFLAGS="rcsD"
+export RANLIBFLAGS="--plugin-option=deterministic-archives"
+
+# Evita gold, gprofng e NLS; reduz footprint; garante sysroot quando presente
+conf_args=(
+  --prefix=/usr
+  --with-sysroot="${SYSROOT:-/}"
+  --disable-nls
+  --disable-werror
+  --disable-gprofng
+  --disable-gdb
+  --disable-sim
+  --enable-deterministic-archives
+)
+
+# Em stage0 queremos apenas as peças essenciais:
+# bfd + binutils + gas + ld (sem gold). Em alguns tarballs, gold já fica de fora, mas reforçamos:
+conf_args+=( --disable-gold )
+
+# Se alvo for musl, evitar libintl etc. (já coberto por --disable-nls)
+# Se cross inicial (HOST != BUILD), permitir cross a partir do host:
+if [[ -n "${TARGET_TRIPLET:-}" ]]; then
+  conf_args+=( --host="${HOST_TRIPLET:-${TARGET_TRIPLET}}" --target="${TARGET_TRIPLET}" )
+fi
+
+# Configuração fora da árvore:
+mkdir -p "${ADM_BUILD_DIR}"; cd "${ADM_BUILD_DIR}"
+
+# Executa o configure
+"${ADM_WORK_DIR}/configure" "${conf_args[@]}"
