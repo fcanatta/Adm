@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# lib/exit-codes
+# Padronização de códigos de saída (RC), classes, mapeamento de comandos externos
+# e utilitários de encerramento/empacotamento de execução.
+# Sem set -e; todas as funções retornam status e reportam claramente.
+
+# ---------- Guarda de múltiplos sources ----------
+if [ -n "${__ADM_RC_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+__ADM_RC_SOURCED=1
+
+# ---------- Integrações opcionais ----------
+__rc_has_log=0
+if declare -F log::json >/dev/null 2>&1 && declare -F log::human >/dev/null 2>&1; then __rc_has_log=1; fi
+rc::__log_event(){ [ "$__rc_has_log" -eq 1 ] && log::json EVENT "$@" || true; }
+rc::__log_info(){  [ "$__rc_has_log" -eq 1 ] && log::info "$@" || printf '[INFO] %s\n' "$*" 1>&2; }
+rc::__log_warn(){  [ "$__rc_has_log" -eq 1 ] && log::warn "$@" || printf '[WARN] %s\n' "$*" 1>&2; }
+rc::__log_err(){   [ "$__rc_has_log" -eq 1 ] && log::error "$@" || printf '[ERROR] %s\n' "$*" 1>&2; }
+
+# Integração opcional com UI (para limpar spinner/ANSI ao sair)
+__rc_has_ui=0
+if declare -F ui::spinner_stop >/dev/null 2>&1; then __rc_has_ui=1; fi
+rc::__ui_cleanup(){ [ "$__rc_has_ui" -eq 1 ] && ui::spinner_stop >/dev/null 2>&1 || true; }
+
+# ---------- Utilidades internas ----------
+rc::__epoch_ms() {
+  if date +%s%3N >/dev/null 2>&1; then date +%s%3N; else printf '%s000' "$(date +%s)"; fi
+}
+
+rc::__duration_ms() {
+  # $1 start $2 end?
+  local s="${1:-0}" e="${2:-$(rc::__epoch_ms)}"
+  if ! [ "$s" -ge 0 ] 2>/dev/null; then s=0; fi
+  if ! [ "$e" -ge "$s" ] 2>/dev/null; then e="$s"; fi
+  printf '%s' $(( e - s ))
+}
+
+rc::__sanitize_msg() {
+  # Remoção simples de ANSI para logs sem cor (caso não use lib/logging)
+  sed -E 's/\x1b\[[0-9;]*m//g'
+}
+
+# ---------- Classes e faixas ----------
+# Retorna a classe textual para um RC padronizado
+rc::to_class() {
+  local rc="$1"
+  if ! [[ "$rc" =~ ^[0-9]+$ ]]; then echo "GENERIC"; return 0; fi
+  rc=$((rc & 255))
+  case "$rc" in
+    0) echo "OK" ;;
+    [1-9]) echo "GENERIC" ;;
+    1) : ;; 2) : ;; 3) : ;; 4) : ;; 5) : ;; 9) : ;;
+    1[0-9]) echo "CONFIG" ;;
+    2[0-9]|3[0-9]) echo "ENV/FS" ;;
+    4[0-9]|5[0-9]) echo "NETWORK/FETCH" ;;
+    6[0-9]|7[0-9]) echo "INTEGRITY" ;;
+    8[0-9]|9[0-9]) echo "PATCH/APPLY" ;;
+    1[0-1][0-9]|12[0-9]|13[0-9]) echo "BUILD" ;; # 100–139
+    14[0-9]|15[0-9]) echo "TEST" ;;
+    16[0-9]|17[0-9]) echo "INSTALL/PKG" ;;
+    18[0-9]|19[0-9]) echo "SOLVER/DEPS" ;;
+    20[0-1][0-9]|21[0-9]) echo "UPDATE" ;;
+    22[0-9]|23[0-9]) echo "SANDBOX/TOOLCHAIN" ;;
+    24[0-9]) echo "LOCKS" ;;
+    250|251|255) echo "FATAL" ;;
+    12[89]|13[0-1]|14[0-6]) echo "SIGNAL" ;; # 128+N (nem todos mapeados)
+    *) echo "UNKNOWN" ;;
+  esac
+}
+
+# Define se é recuperável (0 = sim; 1 = não)
+rc::is_retryable() {
+  local rc="$1"
+  [[ "$rc" =~ ^[0-9]+$ ]] || { echo 1; return 0; }
+  rc=$((rc & 255))
+  case "$rc" in
+    40|41|42|43|44|49) echo 0 ;;                                # NETWORK/FETCH
+    60) echo 0 ;;                                               # re-download
+    80|81|89) echo 0 ;;                                         # patch/hook pode ajustar e tentar
+    100|101|102|103) echo 0 ;;                                  # build falha: ajustes/retentativas
+    140|160|180|181|240) echo 0 ;;                              # testes, install, deps, lock
+    *) echo 1 ;;
+  esac
+}
+
+# Dicas curtas por código (fallback por classe)
+rc::hint() {
+  local rc="$1"
+  [[ "$rc" =~ ^[0-9]+$ ]] || { echo "Verifique argumentos e pré-condições."; return 0; }
+  rc=$((rc & 255))
+  case "$rc" in
+    1) echo "Use: adm <comando> [opções]. Veja --help." ;;
+    2) echo "Inicialize módulos/estados antes de usar esta função." ;;
+    3) echo "Operação restrita; garanta que o caminho está sob adm.root." ;;
+    4) echo "Recurso não encontrado; verifique caminhos e permissões." ;;
+    5) echo "Estado inconsistente; tente 'adm fix' ou limpe caches." ;;
+    9) echo "Cancelado pelo usuário." ;;
+
+    10|11|12|13|14|19) echo "Corrija configuração (adm.conf/profile) e tente novamente." ;;
+    20) echo "Libere espaço (sources/build). Ajuste thresholds ou mude de volume." ;;
+    21) echo "Permissão negada; use sudo/chown ou ajuste diretórios." ;;
+    22) echo "FS com noexec impede build; mova 'build/' para volume executável." ;;
+    23) echo "Operação bloquearia saída de adm.root; verifique caminhos." ;;
+    24) echo "Lock quebrado/ocupado; limpe lock ou aguarde o outro processo." ;;
+    29) echo "Erro de E/S; verifique disco cheio ou corrupção." ;;
+
+    40) echo "DNS falhou; revise rede/resolvers e tente novamente." ;;
+    41) echo "Conexão recusada/reset; tente outro mirror." ;;
+    42) echo "Timeout; aumente timeout/retries e tente novamente." ;;
+    43) echo "TLS/Cert inválido; verifique data/CA ou use mirrors confiáveis." ;;
+    44) echo "Protocolo não permitido pela política; habilite em fetch.allowed_protocols." ;;
+    49) echo "Todos os mirrors falharam; adicione novos mirrors ou tente mais tarde." ;;
+
+    60) echo "SHA256 mismatch; refaça download/limpe cache." ;;
+    61) echo "Assinatura GPG inválida; obtenha chave correta ou confie na origem." ;;
+    62) echo "Hash ausente no metafile; corrija o metafile." ;;
+    69) echo "Artefato corrompido; regenere pacote." ;;
+
+    80) echo "Patch falhou; ajuste strip/patch ou atualize patches." ;;
+    81) echo "Nível de strip incorreto; tente -p0/-p1/-p2." ;;
+    89) echo "Hook de pré-build falhou; verifique script/logs." ;;
+
+    100) echo "configure retornou erro; verifique dependências e flags." ;;
+    101) echo "Ferramenta de build ausente; instale binários (cmake, pkg-config…)." ;;
+    102) echo "Compilação falhou; revise logs e CFLAGS/LTO/PGO." ;;
+    103) echo "Linkagem falhou; verifique LDFLAGS/bibliotecas." ;;
+    109) echo "Toolchain inconsistente; recompile bootstrap/stage." ;;
+
+    140) echo "Falhas em testes; revise e ajuste." ;;
+    149) echo "Testes críticos falharam; necessário correção antes de prosseguir." ;;
+
+    160) echo "Falha no install (DESTDIR); revise PATH/perm/DESTDIR." ;;
+    161) echo "Colisão de arquivos no rootfs; consulte manifest e substituições." ;;
+    162) echo "Manifest inválido; gere novamente e tente." ;;
+    163) echo "Empacotamento falhou; verifique compressor/formato." ;;
+    169) echo "Sincronização rootfs→/ falhou; revise rsync perms." ;;
+
+    180) echo "Grafo impossível (ciclo); ajuste restrições." ;;
+    181) echo "Versão incompatível; relaxe/ajuste constraints." ;;
+    189) echo "Solução parcial; habilite opcionais se necessário." ;;
+
+    200) echo "Upstream não encontrado; verifique homepage/provider." ;;
+    201) echo "Parsing de versão falhou; ajuste regex/política." ;;
+    209) echo "Update causaria regressão; revise política de update." ;;
+
+    220) echo "Sandbox ausente; instale bwrap/chroot." ;;
+    221) echo "Sandbox não inicializa; revise permissões/namespaces." ;;
+    230) echo "Bootstrap stage0 falhou; revise toolchain base." ;;
+    231) echo "ABI incompatível; rebuild do toolchain requisitado." ;;
+
+    240) echo "Timeout de lock; aumente timeout ou libere lock." ;;
+    241) echo "Lock em uso por outro processo; aguarde ou force liberação." ;;
+
+    250) echo "Tripwire acusou fuga de root; corrija symlinks/caminhos." ;;
+    251) echo "Corrupção detectada; revalide fontes/artefatos." ;;
+    255) echo "Erro não classificado; veja logs detalhados." ;;
+
+    *)  # sinais, unknown
+        local class; class="$(rc::to_class "$rc")"
+        case "$class" in
+          SIGNAL) echo "Interrompido por sinal; tente novamente." ;;
+          *) echo "Consulte logs para detalhes." ;;
+        esac ;;
+  esac
+}
+
+# ---------- Conversões de sinal ----------
+rc::from_signal() {
+  local sig="$1"
+  [[ "$sig" =~ ^[0-9]+$ ]] || { echo 255; return 0; }
+  echo $(( 128 + sig ))
+}
+
+# ---------- Normalização ----------
+rc::normalize() {
+  local rc="$1"
+  [[ "$rc" =~ ^-?[0-9]+$ ]] || { echo 255; return 0; }
+  # mantém 0..255; negativos viram 255
+  if [ "$rc" -lt 0 ]; then echo 255; else echo $(( rc & 255 )); fi
+}
+
+# ---------- Mapeamento de RC de ferramentas externas ----------
+# Converte um RC arbitrário de uma ferramenta para o RC padronizado
+# context: configure|make|compile|link|ctest|rsync|git|curl|wget|gpg|patch|bwrap|chroot|pkgconf|strip|ar|ld
+rc::map_external() {
+  local context="$1" tool_rc="$2"
+  [[ -n "$context" && "$tool_rc" =~ ^[0-9]+$ ]] || { echo 255; return 0; }
+  tool_rc=$((tool_rc & 255))
+  # Se foi sinal, mantém 128+N
+  if [ "$tool_rc" -ge 128 ]; then echo "$tool_rc"; return 0; fi
+
+  case "$context" in
+    configure|pkgconf)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 100
+      ;;
+    make|compile)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 102
+      ;;
+    link|ld|ar|strip)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 103
+      ;;
+    ctest)
+      [ "$tool_rc" -eq 0 ] && echo 0 || { [ "$tool_rc" -eq 5 ] && echo 149 || echo 140; }
+      ;;
+    rsync)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 169
+      ;;
+    patch)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 80
+      ;;
+    git|curl|wget)
+      case "$tool_rc" in
+        6|7|28|35|56) echo 42 ;;   # timeout/reset/SSL
+        5|22|47|51|60) echo 43 ;;   # TLS/Cert/SSL
+        4|6|7) echo 41 ;;           # conn refused/resolve
+        3|5) echo 40 ;;             # url malformed/dns
+        *) echo 49 ;;               # mirrors esgotados/erro genérico de fetch
+      esac
+      ;;
+    gpg)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 61
+      ;;
+    bwrap|chroot)
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 221
+      ;;
+    *)
+      # desconhecido: generic
+      [ "$tool_rc" -eq 0 ] && echo 0 || echo 255
+      ;;
+  esac
+}
+
+# ---------- Wrap de execução ----------
+# rc::wrap <context> -- <cmd...>
+# - executa o comando, mede duração, loga exec/exec_result se possível,
+# - mapeia RC pelo contexto e retorna RC padronizado.
+rc::wrap() {
+  local context="$1"; shift || true
+  [ "$1" = "--" ] || { rc::__log_err "uso: rc::wrap <context> -- <cmd...>"; return 1; }
+  shift || true
+  [ $# -gt 0 ] || { rc::__log_err "rc::wrap: comando vazio"; return 1; }
+
+  local cmd_str
+  # Monta string segura de comando para log
+  cmd_str="$(printf '%q ' "$@")"
+  [ "$__rc_has_log" -eq 1 ] && log::json INFO "exec" cmd="$cmd_str"
+
+  local start end dur raw_rc mapped
+  start="$(rc::__epoch_ms)"
+  "$@"; raw_rc=$?
+  end="$(rc::__epoch_ms)"; dur="$(rc::__duration_ms "$start" "$end")"
+
+  mapped="$(rc::map_external "$context" "$raw_rc")"
+  [ "$__rc_has_log" -eq 1 ] && log::json INFO "exec_result" cmd="$cmd_str" rc="$mapped" duration_ms="$dur"
+
+  echo "$mapped"
+  return 0
+}
+
+# ---------- Encerramento padronizado ----------
+# rc::exit <rc> [msg ...]
+# - limpa spinner/ANSI (se lib/ui presente)
+# - emite evento 'exit' (se logging presente)
+# - imprime dica
+# - encerra com RC normalizado
+rc::exit() {
+  local rc="${1:-255}"; shift || true
+  rc="$(rc::normalize "$rc")"
+
+  # Mensagem opcional do chamador
+  local user_msg=""
+  if [ $# -gt 0 ]; then
+    user_msg="$(printf '%s' "$*" | rc::__sanitize_msg)"
+  fi
+
+  local class hint
+  class="$(rc::to_class "$rc")"
+  hint="$(rc::hint "$rc")"
+
+  # Log estruturado
+  rc::__log_event "exit" rc="$rc" class="$class" hint="$hint"
+  [ -n "$user_msg" ] && rc::__log_info "$user_msg"
+
+  # Limpa UI spinner
+  rc::__ui_cleanup
+
+  # Feedback humano resumido (quando sem logger)
+  if [ "$__rc_has_log" -eq 0 ]; then
+    printf '[%s] EXIT rc=%s class=%s\n' "$(date +%T)" "$rc" "$class" 1>&2
+    [ -n "$user_msg" ] && printf '  msg: %s\n' "$user_msg" 1>&2
+    printf '  hint: %s\n' "$hint" 1>&2
+  fi
+
+  exit "$rc"
+}
+
+# ---------- Helpers de fluxo ----------
+# rc::guard <ok_rc> <rc> [msg]
+# se rc != ok_rc → rc::exit rc msg
+rc::guard() {
+  local ok="$1" got="$2"; shift 2 || true
+  if ! [[ "$ok" =~ ^[0-9]+$ && "$got" =~ ^[0-9]+$ ]]; then
+    rc::exit 255 "rc::guard: parâmetros inválidos (ok=$ok got=$got)"
+  fi
+  if [ "$got" -ne "$ok" ]; then
+    rc::exit "$got" "$*"
+  fi
+  return 0
+}
+
+# rc::maybe_exit <rc> [msg...]
+# atalho para encerrar se rc != 0
+rc::maybe_exit() {
+  local rc="$1"; shift || true
+  [[ "$rc" =~ ^[0-9]+$ ]] || rc=255
+  [ "$rc" -eq 0 ] || rc::exit "$rc" "$@"
+  return 0
+}
+
+# ---------- Traps para sinais (opcional) ----------
+# rc::trap_signals [--quiet]
+# converte SIGINT/SIGTERM/SIGHUP em rc 130/143/129
+rc::trap_signals() {
+  local quiet=0
+  [ "${1:-}" = "--quiet" ] && quiet=1
+  trap '
+    __rc_sig=2
+    __rc_val=$((128 + __rc_sig))
+    [ '"$quiet"' -eq 1 ] || rc::__log_warn "interrompido por SIGINT"
+    rc::exit "$__rc_val" "Interrompido (SIGINT)"
+  ' INT
+  trap '
+    __rc_sig=15
+    __rc_val=$((128 + __rc_sig))
+    [ '"$quiet"' -eq 1 ] || rc::__log_warn "encerrado por SIGTERM"
+    rc::exit "$__rc_val" "Encerrado (SIGTERM)"
+  ' TERM
+  trap '
+    __rc_sig=1
+    __rc_val=$((128 + __rc_sig))
+    [ '"$quiet"' -eq 1 ] || rc::__log_warn "desconectado (SIGHUP)"
+    rc::exit "$__rc_val" "Desconectado (SIGHUP)"
+  ' HUP
+}
+
+# ---------- Demonstração rápida (opcional) ----------
+rc::demo() {
+  rc::__log_info "RC demo: iniciando"
+  local mapped
+  mapped="$(rc::map_external make 1)"
+  printf 'map(make,1) = %s class=%s hint="%s"\n' "$mapped" "$(rc::to_class "$mapped")" "$(rc::hint "$mapped")"
+  mapped="$(rc::map_external curl 28)"
+  printf 'map(curl,28) = %s class=%s hint="%s"\n' "$mapped" "$(rc::to_class "$mapped")" "$(rc::hint "$mapped")"
+  local got
+  got="$(rc::wrap make -- bash -c 'exit 1')"
+  printf 'wrap(make, exit 1) → %s (%s)\n' "$got" "$(rc::to_class "$got")"
+  rc::__log_info "RC demo: concluído"
+}
+
+# ---------- Fim seguro ----------
+return 0 2>/dev/null || true
