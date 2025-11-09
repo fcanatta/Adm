@@ -1,0 +1,12 @@
+name=gcc-stage1
+version=14.2.0
+category=dev
+run_deps=
+build_deps=binutils-stage0,linux-headers-stage0,glibc-stage1|musl-stage1
+opt_deps=
+num_builds=0
+description=GCC Stage1 (C, com headers da libc; instala gcc + libgcc)
+homepage=https://gcc.gnu.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz,https://mirrors.kernel.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
