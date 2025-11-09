@@ -1,0 +1,12 @@
+name=gmp
+version=6.3.0
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Biblioteca de inteiros de precisão arbitrária (dep de GCC)
+homepage=https://gmplib.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz,https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
