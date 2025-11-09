@@ -5,7 +5,13 @@
 # - Suporta glibc/musl, host/chroot/sysroot, cross (TARGET_TRIPLET)
 # - Emite relatório com PASS/FAIL por categoria
 # Licença: MIT
-
+# adm-verify --stage=stage0
+# adm-verify --target=x86_64-pc-linux-gnu
+# adm-verify --sysroot=/opt/sysroot
+# adm-verify --checks=binutils,gcc,headers #lista apenas alguns checks
+# adm-verify --libc=musl
+# adm-verify --verbose
+# adm-verify --libc=glibc
 set -Eeuo pipefail
 
 SELF="${0##*/}"
