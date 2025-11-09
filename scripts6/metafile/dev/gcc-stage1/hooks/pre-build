@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# gcc-stage1: pre-build — compila all-gcc e all-target-libgcc.
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_BUILD_DIR}"
+
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" all-gcc
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" all-target-libgcc
