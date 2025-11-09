@@ -1,0 +1,663 @@
+#!/usr/bin/env bash
+# lib/env
+# Prepara, valida e publica o ambiente de build/execução (bootstrap→toolchain→stages→sistema).
+# - Detecção abrangente de compiladores/linkers/toolchains e linguagens
+# - PATH/PKG_CONFIG_PATH/LD_LIBRARY_PATH por stage/profile
+# - Flags por profile (minimal|normal|aggressive) e libc (glibc|musl)
+# - Saneamento, export, snapshot e integração opcional com logging/config/exit-codes
+# Sem set -e; todas as funções retornam status e reportam claramente.
+
+# ---------- Guarda de múltiplos sources ----------
+if [ -n "${__ADM_ENV_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+__ADM_ENV_SOURCED=1
+
+# ---------- Integrações opcionais ----------
+__env_has_log=0
+if declare -F log::info >/dev/null 2>&1 && declare -F log::json >/dev/null 2>&1; then __env_has_log=1; fi
+env::__log_info(){ [ "$__env_has_log" -eq 1 ] && log::info "$@" || printf '[INFO] %s\n' "$*" 1>&2; }
+env::__log_warn(){ [ "$__env_has_log" -eq 1 ] && log::warn "$@" || printf '[WARN] %s\n' "$*" 1>&2; }
+env::__log_err(){  [ "$__env_has_log" -eq 1 ] && log::error "$@" || printf '[ERROR] %s\n' "$*" 1>&2; }
+env::__log_evt(){  [ "$__env_has_log" -eq 1 ] && log::json EVENT "$@" || true; }
+
+__env_has_cfg=0
+if declare -F config::get >/dev/null 2>&1; then __env_has_cfg=1; fi
+
+__env_has_rc=0
+if declare -F rc::exit >/dev/null 2>&1; then __env_has_rc=1; fi
+
+# ---------- Estado ----------
+__env_root="/usr/src/adm"            # adm.root
+__env_stage="0"                      # 0|1|2
+__env_profile="normal"               # minimal|normal|aggressive
+__env_libc="glibc"                   # glibc|musl
+__env_initialized=0
+__env_jobs="auto"
+__env_make_jobs="auto"
+
+# Deteções; arrays paralelos (name/bin/version/origin)
+__env_det_names=()
+__env_det_bins=()
+__env_det_vers=()
+__env_det_from=()   # toolchain|host|both
+
+# Seleções
+__env_cc=""; __env_cxx=""; __env_cpp=""
+__env_ld=""; __env_ar=""; __env_ranlib=""; __env_strip=""
+__env_nm=""; __env_readelf=""; __env_objcopy=""; __env_objdump=""
+__env_pkgconf=""; __env_make=""; __env_ninja=""
+__env_rustc=""; __env_cargo=""
+__env_go=""; __env_javac=""; __env_jar=""
+__env_python=""; __env_perl=""; __env_node=""; __env_npm=""
+__env_cmake=""; __env_meson=""
+
+# Caminhos derivados
+__env_tool_bin=""
+__env_stage_sysroot=""
+__env_stage_pc_paths=""
+__env_stage_pc_libdir=""
+
+# Flags efetivas
+__env_CFLAGS=""
+__env_CXXFLAGS=""
+__env_CPPFLAGS=""
+__env_LDFLAGS=""
+__env_RUSTFLAGS=""
+__env_GOFLAGS=""
+__env_MAKEFLAGS=""
+
+# Política de rede e sandbox
+__env_net_build="off"   # on|off
+__env_linker_policy="auto"  # auto|bfd|gold|lld|mold
+
+# ---------- Utilidades ----------
+env::__epoch_ms(){ if date +%s%3N >/dev/null 2>&1; then date +%s%3N; else printf '%s000' "$(date +%s)"; fi; }
+env::__sanitize(){
+  # Remove ANSI e redige segredos básicos (tokens)
+  sed -E '
+    s/\x1b\[[0-9;]*m//g;
+    s/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1***/Ig;
+    s/([Tt]oken|[Pp]assword|[Ss]ecret)[[:space:]]*=[[:space:]]*[^&[:space:]]+/\1=***/g;
+    s#(https?://)[^/:@]+:[^/@]+@#\1***:***@#g;
+  '
+}
+env::__kv(){ printf '%s=%s' "$1" "$2"; }
+env::__append_unique_csv(){
+  # $1 csv $2 item → csv sem duplicata
+  local csv="$1" item="$2"
+  [ -z "$item" ] && { printf '%s' "$csv"; return; }
+  case ",$csv," in *,"$item",*) printf '%s' "$csv";; * ) [ -z "$csv" ] && printf '%s' "$item" || printf '%s,%s' "$csv" "$item";; esac
+}
+env::__first_line(){ head -n1 2>/dev/null || true; }
+env::require_bin(){
+  local b="${1:-}"; [ -n "$b" ] || { env::__log_err "require_bin: bin vazio"; return 2; }
+  command -v "$b" >/dev/null 2>&1 || { env::__log_err "binário ausente" bin="$b"; return 127; }
+}
+
+# ---------- Paths por stage/profile ----------
+env::__tool_bin_for_stage(){
+  local st="${1:-$__env_stage}"
+  printf '%s/toolchain/stage%s/bin' "$__env_root" "$st"
+}
+env::__sysroot_for_stage(){
+  local st="${1:-$__env_stage}"
+  printf '%s/stage%s/rootfs' "$__env_root" "$st"
+}
+env::__pc_paths_for_stage(){
+  # PKG_CONFIG_PATH candidates dentro do sysroot
+  local sysroot; sysroot="$(env::__sysroot_for_stage "$1")"
+  printf '%s' "${sysroot}/usr/lib/pkgconfig:${sysroot}/usr/share/pkgconfig:${sysroot}/lib/pkgconfig"
+}
+env::__pc_libdir_for_stage(){
+  local sysroot; sysroot="$(env::__sysroot_for_stage "$1")"
+  printf '%s' "${sysroot}/usr/lib:${sysroot}/lib"
+}
+
+# ---------- Core: carregar config & preparar base ----------
+env::__load_config(){
+  if [ "$__env_has_cfg" -eq 1 ]; then
+    __env_root="$(config::get adm.root 2>/dev/null || echo /usr/src/adm)"
+    __env_stage="$(config::get adm.stage 2>/dev/null || echo 0)"
+    __env_profile="$(config::get adm.profile 2>/dev/null || echo normal)"
+    __env_libc="$(config::get profile.libc 2>/dev/null || echo glibc)"
+    __env_jobs="$(config::get adm.jobs 2>/dev/null || echo auto)"
+    __env_make_jobs="$(config::get adm.make_jobs 2>/dev/null || echo auto)"
+    __env_net_build="$(config::get build.network_during_build 2>/dev/null || echo off)"
+    __env_linker_policy="$(config::get build.linker 2>/dev/null || echo auto)"
+  fi
+  case "$__env_stage" in 0|1|2) ;; *) __env_stage="0";; esac
+  case "$__env_profile" in minimal|normal|aggressive) ;; *) __env_profile="normal";; esac
+  case "$__env_libc" in glibc|musl) ;; *) __env_libc="glibc";; esac
+}
+
+# ---------- PATH e ambiente base ----------
+env::__base_locale_repro(){
+  export LC_ALL=C.UTF-8 LANG=C.UTF-8 TZ=UTC
+  # SOURCE_DATE_EPOCH previsível (se já existir, mantém)
+  if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then export SOURCE_DATE_EPOCH=1704067200; fi # 2024-01-01
+}
+env::__base_tmp_umask(){
+  umask 0022 2>/dev/null || true
+  export TMPDIR="${__env_root}/tmp"
+  mkdir -p "$TMPDIR" 2>/dev/null || true
+}
+env::__clean_inherited_paths(){
+  # remove duplicatas e entradas vazias do PATH
+  local new="" IFS=":"
+  for p in $PATH; do
+    [ -z "$p" ] && continue
+    case ":$new:" in *":$p:"*) :;; *) new="${new:+$new:}$p";; esac
+  done
+  export PATH="$new"
+}
+env::prepend_path(){
+  local d="$1"
+  [ -n "$d" ] || { env::__log_err "prepend_path: dir vazio"; return 2; }
+  [ -d "$d" ] || return 0
+  case ":$PATH:" in *":$d:"*) :;; *) export PATH="$d:${PATH}";; esac
+}
+env::append_path(){
+  local d="$1"
+  [ -n "$d" ] || { env::__log_err "append_path: dir vazio"; return 2; }
+  [ -d "$d" ] || return 0
+  case ":$PATH:" in *":$d:"*) :;; *) export PATH="${PATH}:$d";; esac
+}
+
+# ---------- Detecção de ferramentas ----------
+env::__detect_one(){
+  # $1 name $2 candidates (csv)
+  local name="$1" csv="$2" b v from="host"
+  IFS=, read -r -a cand <<<"$csv"
+  for c in "${cand[@]}"; do
+    b="$(command -v "$c" 2>/dev/null || true)"
+    [ -x "$b" ] || continue
+    if "$b" --version >/dev/null 2>&1; then
+      v=$("$b" --version 2>/dev/null | env::__first_line)
+    else
+      v="$("$b" -v 2>/dev/null | env::__first_line)"
+    fi
+    # origem: se bin estiver no tool_bin atual, marca como toolchain
+    case "$b" in "$__env_tool_bin"/*) from="toolchain";; *) from="host";; esac
+    __env_det_names+=("$name"); __env_det_bins+=("$b"); __env_det_vers+=("${v:-unknown}"); __env_det_from+=("$from")
+    return 0
+  done
+  return 1
+}
+
+env::detect_compilers(){
+  __env_tool_bin="$(env::__tool_bin_for_stage "$__env_stage")"
+  __env_stage_sysroot="$(env::__sysroot_for_stage "$__env_stage")"
+  __env_stage_pc_paths="$(env::__pc_paths_for_stage "$__env_stage")"
+  __env_stage_pc_libdir="$(env::__pc_libdir_for_stage "$__env_stage")"
+
+  # Prioriza toolchain/bin no PATH para detecção
+  env::prepend_path "$__env_tool_bin"
+
+  # Limpa listas anteriores
+  __env_det_names=(); __env_det_bins=(); __env_det_vers=(); __env_det_from=()
+
+  # Compiladores C/C++ e frontends
+  env::__detect_one "cc"  "clang,gcc,cc"
+  env::__detect_one "cxx" "clang++,g++,c++"
+  env::__detect_one "cpp" "cpp,clang-cpp"
+
+  # Linkers
+  case "$__env_linker_policy" in
+    lld)   env::__detect_one "ld" "ld.lld,lld,clang-lld,ld";;
+    mold)  env::__detect_one "ld" "mold,ld.lld,ld.gold,ld.bfd,ld";;
+    gold)  env::__detect_one "ld" "ld.gold,ld.lld,ld.bfd,ld";;
+    bfd)   env::__detect_one "ld" "ld.bfd,ld.lld,ld";;
+    auto|*) env::__detect_one "ld" "ld.lld,mold,ld.gold,ld.bfd,ld";;
+  esac
+
+  # Binutils / LLVM utils
+  env::__detect_one "ar"      "llvm-ar,gar,ar"
+  env::__detect_one "ranlib"  "llvm-ranlib,granlib,ranlib"
+  env::__detect_one "strip"   "llvm-strip,strip"
+  env::__detect_one "nm"      "llvm-nm,nm"
+  env::__detect_one "readelf" "llvm-readelf,readelf"
+  env::__detect_one "objcopy" "llvm-objcopy,objcopy"
+  env::__detect_one "objdump" "llvm-objdump,objdump"
+
+  # Build systems / helpers
+  env::__detect_one "cmake"   "cmake"
+  env::__detect_one "meson"   "meson"
+  env::__detect_one "ninja"   "ninja,samu"
+  env::__detect_one "make"    "make,gmake"
+  env::__detect_one "pkgconf" "pkgconf,pkg-config"
+
+  # Linguagens adicionais
+  env::__detect_one "rustc" "rustc"
+  env::__detect_one "cargo" "cargo"
+  env::__detect_one "go"    "go"
+  env::__detect_one "javac" "javac"
+  env::__detect_one "jar"   "jar"
+  # Python: preferir versão 3.x
+  env::__detect_one "python" "python3,python3.12,python3.11,python3.10,python"
+  env::__detect_one "perl"   "perl"
+  env::__detect_one "node"   "node"
+  env::__detect_one "npm"    "npm"
+
+  env::__log_evt "env_detected" msg="tools detected" count="${#__env_det_names[@]}"
+  return 0
+}
+
+# ---------- Escolha preferencial (pós-detecção) ----------
+env::__pick(){
+  # $1 name → define seleção em variáveis __env_*
+  local name="$1" i
+  for i in "${!__env_det_names[@]}"; do
+    if [ "${__env_det_names[$i]}" = "$name" ]; then
+      local bin="${__env_det_bins[$i]}" from="${__env_det_from[$i]}"
+      # preferir toolchain se existir; se múltiplos, o primeiro no vetor já respeitou PATH
+      printf '%s\n' "$bin"
+      return 0
+    fi
+  done
+  return 1
+}
+
+env::__select_tools(){
+  __env_cc="$(env::__pick cc)";    __env_cxx="$(env::__pick cxx)"; __env_cpp="$(env::__pick cpp)"
+  __env_ld="$(env::__pick ld)";    __env_ar="$(env::__pick ar)";  __env_ranlib="$(env::__pick ranlib)"
+  __env_strip="$(env::__pick strip)"; __env_nm="$(env::__pick nm)"
+  __env_readelf="$(env::__pick readelf)"; __env_objcopy="$(env::__pick objcopy)"; __env_objdump="$(env::__pick objdump)"
+  __env_pkgconf="$(env::__pick pkgconf)"; __env_make="$(env::__pick make)"; __env_ninja="$(env::__pick ninja)"
+  __env_cmake="$(env::__pick cmake)"; __env_meson="$(env::__pick meson)"
+  __env_rustc="$(env::__pick rustc)"; __env_cargo="$(env::__pick cargo)"
+  __env_go="$(env::__pick go)"; __env_javac="$(env::__pick javac)"; __env_jar="$(env::__pick jar)"
+  __env_python="$(env::__pick python)"; __env_perl="$(env::__pick perl)"
+  __env_node="$(env::__pick node)"; __env_npm="$(env::__pick npm)"
+}
+
+env::compiler_for(){
+  case "${1,,}" in
+    c)   [ -n "$__env_cc" ] && printf '%s\n' "$__env_cc" && return 0 || return 1 ;;
+    cxx) [ -n "$__env_cxx" ] && printf '%s\n' "$__env_cxx" && return 0 || return 1 ;;
+    cpp) [ -n "$__env_cpp" ] && printf '%s\n' "$__env_cpp" && return 0 || return 1 ;;
+    rust|rs) [ -n "$__env_rustc" ] && printf '%s\n' "$__env_rustc" && return 0 || return 1 ;;
+    go)  [ -n "$__env_go" ] && printf '%s\n' "$__env_go" && return 0 || return 1 ;;
+    java) [ -n "$__env_javac" ] && printf '%s\n' "$__env_javac" && return 0 || return 1 ;;
+    python|py) [ -n "$__env_python" ] && printf '%s\n' "$__env_python" && return 0 || return 1 ;;
+    perl) [ -n "$__env_perl" ] && printf '%s\n' "$__env_perl" && return 0 || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+env::lang_for(){
+  case "${1,,}" in
+    *.c) echo c ;;
+    *.cc|*.cpp|*.cxx) echo cxx ;;
+    *.S|*.s) echo asm ;;
+    *.rs) echo rust ;;
+    *.go) echo go ;;
+    *.java) echo java ;;
+    *.py) echo python ;;
+    *.pl) echo perl ;;
+    *) echo unknown ;;
+  esac
+}
+
+# ---------- PKG-CONFIG ----------
+env::pkg_config_paths(){
+  printf '%s\n' "$__env_stage_pc_paths"
+  printf '%s\n' "$__env_stage_pc_libdir"
+}
+
+# ---------- Flags por profile/libc ----------
+env::__apply_profile_tuning_minimal(){
+  __env_CFLAGS="-O1 -g0 -fPIC -fno-omit-frame-pointer -fno-plt"
+  __env_CXXFLAGS="$__env_CFLAGS"
+  __env_CPPFLAGS=""
+  __env_LDFLAGS="-Wl,--as-needed -Wl,-z,relro"
+}
+env::__apply_profile_tuning_normal(){
+  __env_CFLAGS="-O2 -pipe -D_FORTIFY_SOURCE=2 -fstack-protector-strong -fPIE"
+  __env_CXXFLAGS="$__env_CFLAGS"
+  __env_CPPFLAGS=""
+  __env_LDFLAGS="-Wl,-z,relro -Wl,-z,now -pie"
+}
+env::__apply_profile_tuning_aggressive(){
+  local march; march="$([ "$__env_has_cfg" -eq 1 ] && config::get profile.march 2>/dev/null || echo native)"
+  __env_CFLAGS="-O3 -pipe -fstack-protector-strong -fno-semantic-interposition -fPIE -march=${march}"
+  __env_CXXFLAGS="$__env_CFLAGS"
+  __env_CPPFLAGS=""
+  __env_LDFLAGS="-Wl,-z,relro -Wl,-z,now -pie"
+  # LTO/PGO
+  local lto pgo
+  lto="$([ "$__env_has_cfg" -eq 1 ] && config::get build.lto 2>/dev/null || echo off)"
+  pgo="$([ "$__env_has_cfg" -eq 1 ] && config::get build.pgo 2>/dev/null || echo off)"
+  case "$lto" in thin) __env_CFLAGS="$__env_CFLAGS -flto=thin"; __env_CXXFLAGS="$__env_CXXFLAGS -flto=thin";;
+                  full) __env_CFLAGS="$__env_CFLAGS -flto";       __env_CXXFLAGS="$__env_CXXFLAGS -flto";; esac
+  case "$pgo" in gen) __env_CFLAGS="$__env_CFLAGS -fprofile-generate"; __env_CXXFLAGS="$__env_CXXFLAGS -fprofile-generate";;
+              use) __env_CFLAGS="$__env_CFLAGS -fprofile-use -fprofile-correction"; __env_CXXFLAGS="$__env_CXXFLAGS -fprofile-use -fprofile-correction";; esac
+}
+
+env::__apply_libc_adjustments(){
+  case "$__env_libc" in
+    musl)
+      # Evitar flags muito agressivas que quebrem resolução dinâmica
+      __env_LDFLAGS="$(printf '%s' "$__env_LDFLAGS" | sed 's/--as-needed//g')"
+      # opcional: estático PIE quando necessário
+      # __env_LDFLAGS="$__env_LDFLAGS -static-pie"
+      ;;
+    glibc)
+      # RELRO aprimorado quando suportado
+      __env_LDFLAGS="$__env_LDFLAGS -Wl,-z,pack-relative-relocs"
+      ;;
+  esac
+}
+
+env::apply_profile_tuning(){
+  case "$__env_profile" in
+    minimal)   env::__apply_profile_tuning_minimal ;;
+    normal)    env::__apply_profile_tuning_normal ;;
+    aggressive)env::__apply_profile_tuning_aggressive ;;
+  esac
+  env::__apply_libc_adjustments
+  # Linker explícito
+  case "$__env_linker_policy" in
+    lld)  [ -n "$__env_ld" ] && __env_LDFLAGS="$__env_LDFLAGS -fuse-ld=lld" ;;
+    mold) [ -n "$__env_ld" ] && __env_LDFLAGS="$__env_LDFLAGS -fuse-ld=mold" ;;
+    gold) [ -n "$__env_ld" ] && __env_LDFLAGS="$__env_LDFLAGS -fuse-ld=gold" ;;
+    bfd)  [ -n "$__env_ld" ] && __env_LDFLAGS="$__env_LDFLAGS -fuse-ld=bfd" ;;
+  esac
+}
+
+# ---------- Jobs / paralelismo ----------
+env::set_jobs(){
+  local n auto_guess
+  if [ "${__env_jobs}" = "auto" ]; then
+    if command -v nproc >/dev/null 2>&1; then n="$(nproc)"; else n=2; fi
+  else
+    n="$__env_jobs"
+  fi
+  [ "$n" -lt 1 ] 2>/dev/null && n=1
+  __env_MAKEFLAGS="-j${n}"
+}
+
+# ---------- Saneamento do ambiente ----------
+env::sanitize(){
+  # Remover variáveis perigosas/ruidosas
+  unset LD_PRELOAD DYLD_INSERT_LIBRARIES
+  # Política de rede durante build
+  if [ "$__env_net_build" = "off" ]; then
+    export http_proxy= https_proxy= all_proxy= HTTP_PROXY= HTTPS_PROXY= ALL_PROXY=
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CURL_VERBOSE=0
+  fi
+  # Normaliza PATH
+  env::__clean_inherited_paths
+}
+
+# ---------- Exportação do ambiente ----------
+env::export_build_env(){
+  # --print | --file <path>
+  local mode="print" file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --print) mode="print";;
+      --file) shift; file="${1:-}";;
+      *) env::__log_err "export_build_env: argumento desconhecido" arg="$1"; return 2;;
+    esac; shift || true
+  done
+  local out
+  out=$(
+    cat <<EOF
+export CC="${__env_cc}"
+export CXX="${__env_cxx}"
+export CPP="${__env_cpp}"
+export LD="${__env_ld}"
+export AR="${__env_ar}"
+export RANLIB="${__env_ranlib}"
+export STRIP="${__env_strip}"
+export NM="${__env_nm}"
+export READELF="${__env_readelf}"
+export OBJCOPY="${__env_objcopy}"
+export OBJDUMP="${__env_objdump}"
+export PKG_CONFIG="${__env_pkgconf}"
+export PKG_CONFIG_PATH="${__env_stage_pc_paths//:/:}"
+export PKG_CONFIG_LIBDIR="${__env_stage_pc_libdir//:/:}"
+export CFLAGS="${__env_CFLAGS}"
+export CXXFLAGS="${__env_CXXFLAGS}"
+export CPPFLAGS="${__env_CPPFLAGS}"
+export LDFLAGS="${__env_LDFLAGS}"
+export RUSTC="${__env_rustc}"
+export CARGO="${__env_cargo}"
+export RUSTFLAGS="${__env_RUSTFLAGS}"
+export GO="${__env_go}"
+export GOFLAGS="${__env_GOFLAGS}"
+export MAKEFLAGS="${__env_MAKEFLAGS}"
+export TMPDIR="${TMPDIR}"
+export PATH="${PATH}"
+export LC_ALL="${LC_ALL}"; export LANG="${LANG}"; export TZ="${TZ}"
+EOF
+  )
+  case "$mode" in
+    print) printf '%s\n' "$out";;
+    *)
+      [ -n "$file" ] || { env::__log_err "export_build_env: --file requer caminho"; return 2; }
+      mkdir -p "$(dirname "$file")" 2>/dev/null || true
+      printf '%s\n' "$out" > "$file" || { env::__log_err "falha ao escrever env file" path="$file"; return 1; }
+      ;;
+  esac
+  return 0
+}
+
+# ---------- Dump das detecções ----------
+env::dump_detected(){
+  local i
+  for i in "${!__env_det_names[@]}"; do
+    printf '%-10s  bin=%s  from=%s  ver="%s"\n' \
+      "${__env_det_names[$i]}" "${__env_det_bins[$i]}" "${__env_det_from[$i]}" "$(printf '%s' "${__env_det_vers[$i]}" | env::__sanitize)"
+  done
+}
+
+# ---------- Snapshot ----------
+env::snapshot(){
+  # [--run-id <id>]
+  local run_id="${ADM_RUN_ID:-}" arg
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) shift; run_id="${1:-}";;
+      *) env::__log_err "snapshot: argumento desconhecido" arg="$1"; return 2;;
+    esac; shift || true
+  done
+  [ -n "$run_id" ] || run_id="$(date +%Y%m%d-%H%M%S)-$$"
+  local d="$__env_root/state/env"
+  mkdir -p "$d" 2>/dev/null || true
+  env::export_build_env --file "$d/$run_id.env" || return 1
+  env::__log_evt "env_snapshot" file="$d/$run_id.env"
+  printf '%s\n' "$d/$run_id.env"
+}
+
+# ---------- Leitura de metafile (env.*) ----------
+env::from_metafile(){
+  # env::from_metafile <cat> <pkg>
+  local cat="$1" pkg="$2"
+  [ -n "$cat" ] && [ -n "$pkg" ] || { env::__log_err "from_metafile: cat/pkg vazios"; return 2; }
+  local mf="${__env_root}/metafile/$cat/$pkg/metafile"
+  [ -r "$mf" ] || return 0
+  local line k v
+  while IFS= read -r line; do
+    case "$line" in \#*|"") continue;; esac
+    case "$line" in env.*=*)
+      k="${line%%=*}"; v="${line#*=}"
+      k="${k#env.}"
+      # operadores += e unset
+      case "$k" in
+        unset)
+          IFS=, read -r -a arr <<<"$v"
+          for key in "${arr[@]}"; do unset "$key"; env::__log_warn "env unset by metafile" key="$key"; done
+          ;;
+        *+)
+          key="${k%+}"
+          eval "cur=\${$key:-}"
+          eval "export $key=\"\$cur $v\""
+          ;;
+        *)
+          # allowlist básica
+          case "$k" in
+            CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|RUSTFLAGS|GOFLAGS|MAKEFLAGS|PKG_CONFIG_PATH|PKG_CONFIG_LIBDIR)
+              eval "export $k=\"$v\""
+              ;;
+            *) env::__log_warn "env key não permitida no metafile (ignorada)" key="$k";;
+          esac
+          ;;
+      esac
+    ;; esac
+  done < "$mf"
+  return 0
+}
+
+# ---------- Ativar stage ----------
+env::activate_stage(){
+  # env::activate_stage <0|1|2> [profile]
+  local st="${1:-$__env_stage}" prof="${2:-$__env_profile}"
+  case "$st" in 0|1|2) ;; *) env::__log_err "stage inválido" stage="$st"; return 2;; esac
+  case "$prof" in minimal|normal|aggressive) ;; *) env::__log_err "profile inválido" profile="$prof"; return 2;; esac
+  __env_stage="$st"; __env_profile="$prof"
+
+  __env_tool_bin="$(env::__tool_bin_for_stage "$st")"
+  __env_stage_sysroot="$(env::__sysroot_for_stage "$st")"
+  __env_stage_pc_paths="$(env::__pc_paths_for_stage "$st")"
+  __env_stage_pc_libdir="$(env::__pc_libdir_for_stage "$st")"
+
+  env::prepend_path "$__env_tool_bin"
+  env::prepend_path "$__env_stage_sysroot/usr/bin"
+  env::prepend_path "$__env_stage_sysroot/bin"
+
+  export PKG_CONFIG_PATH="$__env_stage_pc_paths"
+  export PKG_CONFIG_LIBDIR="$__env_stage_pc_libdir"
+
+  env::__log_evt "env_stage_activated" stage="$st" profile="$prof" tool_bin="$__env_tool_bin"
+  return 0
+}
+
+# ---------- Inicialização geral ----------
+env::init(){
+  env::__load_config
+  env::__base_locale_repro
+  env::__base_tmp_umask
+  env::sanitize
+
+  env::activate_stage "$__env_stage" "$__env_profile" || { [ "$__env_has_rc" -eq 1 ] && rc::exit 22 "Falha ao ativar stage"; return 22; }
+
+  env::detect_compilers
+  env::__select_tools
+
+  # Validação mínima: CC e LD
+  if [ -z "$__env_cc" ] || [ -z "$__env_ld" ]; then
+    env::__log_err "compilador/linker ausentes" cc="$__env_cc" ld="$__env_ld"
+    [ "$__env_has_rc" -eq 1 ] && rc::exit 101 "Ferramentas de build ausentes (CC/LD)"
+    return 101
+  fi
+
+  env::apply_profile_tuning
+  env::set_jobs
+
+  __env_initialized=1
+  env::__log_evt "env_initialized" stage="$__env_stage" profile="$__env_profile" libc="$__env_libc"
+  env::__log_info "env init ok" stage="$__env_stage" profile="$__env_profile"
+  return 0
+}
+# ---------- Enable ccache / sccache / distcc ----------
+env::enable_ccache(){
+  if command -v ccache >/dev/null 2>&1; then
+    export CC="ccache ${__env_cc}"
+    export CXX="ccache ${__env_cxx}"
+    export RUSTC_WRAPPER=""  # prefer ccache for C/C++
+    env::__log_info "ccache habilitado"
+  else
+    env::__log_warn "ccache não encontrado; ignorando"
+  fi
+}
+env::enable_sccache(){
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER="sccache"
+    export CC="sccache ${__env_cc}"
+    export CXX="sccache ${__env_cxx}"
+    env::__log_info "sccache habilitado"
+  else
+    env::__log_warn "sccache não encontrado; ignorando"
+  fi
+}
+env::enable_distcc(){
+  if command -v distcc >/dev/null 2>&1; then
+    export CC="distcc ${__env_cc}"
+    export CXX="distcc ${__env_cxx}"
+    env::__log_info "distcc habilitado"
+  else
+    env::__log_warn "distcc não encontrado; ignorando"
+  fi
+}
+
+# ---------- Validação forte ----------
+env::validate(){
+  # noexec/tmpl: se lib/fs-layout estiver carregada, já avisa; aqui checamos TMPDIR executável mínimo
+  if [ -n "$TMPDIR" ] && [ -d "$TMPDIR" ] && command -v mount >/dev/null 2>&1; then
+    mount | grep " on " | grep -F "$TMPDIR" | grep -q noexec && {
+      env::__log_err "TMPDIR montado com noexec; builds podem falhar" tmpdir="$TMPDIR"
+      return 22
+    }
+  fi
+
+  # Ferramentas mínimas
+  [ -x "$__env_cc" ] || { env::__log_err "CC inválido" cc="$__env_cc"; return 101; }
+  [ -x "$__env_ld" ] || { env::__log_err "LD inválido" ld="$__env_ld"; return 101; }
+  # pkg-config desejável
+  [ -n "$__env_pkgconf" ] || env::__log_warn "pkg-config não encontrado (alguns builds podem falhar)"
+  return 0
+}
+
+# ---------- Impressão do ambiente whitelisted ----------
+env::print(){
+  cat <<EOF
+# stage=${__env_stage} profile=${__env_profile} libc=${__env_libc}
+CC=${__env_cc}
+CXX=${__env_cxx}
+CPP=${__env_cpp}
+LD=${__env_ld}
+AR=${__env_ar}
+RANLIB=${__env_ranlib}
+STRIP=${__env_strip}
+PKG_CONFIG=${__env_pkgconf}
+PKG_CONFIG_PATH=${__env_stage_pc_paths}
+PKG_CONFIG_LIBDIR=${__env_stage_pc_libdir}
+CFLAGS=${__env_CFLAGS}
+CXXFLAGS=${__env_CXXFLAGS}
+CPPFLAGS=${__env_CPPFLAGS}
+LDFLAGS=${__env_LDFLAGS}
+RUSTC=${__env_rustc}
+CARGO=${__env_cargo}
+RUSTFLAGS=${__env_RUSTFLAGS}
+GO=${__env_go}
+GOFLAGS=${__env_GOFLAGS}
+MAKEFLAGS=${__env_MAKEFLAGS}
+PATH=${PATH}
+TMPDIR=${TMPDIR}
+LC_ALL=${LC_ALL} LANG=${LANG} TZ=${TZ}
+EOF
+}
+
+# ---------- Subshell de depuração ----------
+env::shell(){
+  # Abre um subshell com o ambiente ativo
+  env::__log_info "abrindo subshell do ambiente (exit para retornar)"
+  ${SHELL:-/bin/sh} -i
+}
+
+# ---------- Função de alto nível: preparar para build de um pacote ----------
+# Uso típico no pipeline:
+#   source lib/env
+#   env::init || exit $?
+#   env::from_metafile libs zlib
+#   env::export_build_env --print
+env::export_and_validate(){
+  env::export_build_env --print >/dev/null || return 1
+  env::validate || return $?
+  return 0
+}
+
+# ---------- Fim seguro ----------
+return 0 2>/dev/null || true
