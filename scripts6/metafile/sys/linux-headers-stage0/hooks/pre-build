@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# linux-headers-stage0: pre-build
+# Objetivo: preparar build "headers only" do kernel.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+# Limpa sujeira e garante árvore previsível
+make mrproper
+# Prepara headers (sem compilar kernel)
+make headers
+# Alguns kernels usam headers_install diretamente:
+# mantemos ambos os caminhos; a instalação real será no pre-install.
