@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# adm-install — gerenciador de pacotes binários (instala/atualiza/remove/verifica)
+# Consome pacotes produzidos por adm-build: tar.(zst|gz), manifest.txt, pkgmeta.json
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.3.0"
+
+# ====================== Cores / Log ======================
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ # level msg...
+  local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then
+    printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-install.log"; exit 2' ERR
+
+# ====================== Paths / Defaults ======================
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_STATES="${ADM_STATES:-${ROOT_BASE}/states}"
+ADM_CACHE_PKG="${ADM_CACHE_PKG:-${ROOT_BASE}/cache/pkg}"
+
+DB_DIR="${ADM_STATES}/db"
+DB_INSTALLED="${DB_DIR}/installed"
+DB_FILES="${DB_DIR}/files"
+DB_OWNERS="${DB_DIR}/owners.map"
+DB_HISTORY="${DB_DIR}/history.log"
+DB_TXN="${DB_DIR}/txn"
+DB_LOCK="${DB_DIR}/lock"
+DB_BACKUP="${DB_DIR}/backup"
+
+mkdir -p "$ADM_LOGS" "$ADM_CACHE_PKG" "$DB_DIR" "$DB_INSTALLED" "$DB_FILES" "$DB_TXN" "$DB_BACKUP"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-install.log" 2>&1
+
+# ====================== CLI ======================
+CMD="${1:-}"; shift || true
+ROOT="/"                 # root de destino
+TARGET=""                # host|chroot (opcional)
+STRICT_DEPS=0
+FORCE=0
+PURGE=0
+REPLACE_CONFFILES=0
+DRY_RUN=0
+WAIT_LOCK=0
+KEEP_BACKUPS=5          # para clean
+KEEP_VERSIONS=2         # por pacote no cache
+VERBOSE=0
+PRINT=1
+
+usage(){
+  cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} <comando> [args] [opções]
+
+Comandos:
+  install <pkgfile|name> [--version=X]   Instala (de arquivo ou do cache)
+  upgrade <name> [--version=X]           Atualiza pacote instalado
+  remove <name>                          Remove pacote
+  reinstall <name>                       Reinstala mesma versão
+  verify [name|all]                      Verifica integridade dos arquivos
+  list                                   Lista instalados
+  info <name>                            Mostra metadata instalada
+  files <name>                           Lista arquivos de <name>
+  owns <path>                            Mostra quem é dono de <path>
+  rollback <TXID>                        Reverte uma transação
+  clean                                  Limpa backups antigos e cache
+
+Opções comuns:
+  --root=DIR              Instala em root alternativo (default: /)
+  --target=host|chroot    Valida alvo compatível com pacote (se existir)
+  --strict-deps           Erro se dependências faltarem
+  --force                 Sobrescreve conflitos de arquivo (com backup)
+  --purge                 remove configs sem preservar ao remover
+  --replace-conffiles     substitui conffiles do usuário ao instalar/atualizar
+  --dry-run               Simula sem aplicar
+  --wait-lock             Aguarda liberação do lock
+  --keep-backups=N        Preserva N transações antigas (clean)
+  --keep-versions=M       Preserva M versões por pacote no cache (clean)
+  --verbose               Log detalhado
+  --print=0|1             Resumo no stdout (default: 1)
+EOF
+}
+
+# parse flags globais (após comando)
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root=*) ROOT="${1#*=}";;
+    --target=*) TARGET="${1#*=}";;
+    --strict-deps) STRICT_DEPS=1;;
+    --force) FORCE=1;;
+    --purge) PURGE=1;;
+    --replace-conffiles) REPLACE_CONFFILES=1;;
+    --dry-run) DRY_RUN=1;;
+    --wait-lock) WAIT_LOCK=1;;
+    --keep-backups=*) KEEP_BACKUPS="${1#*=}";;
+    --keep-versions=*) KEEP_VERSIONS="${1#*=}";;
+    --verbose) VERBOSE=1;;
+    --print=0) PRINT=0;;
+    --print=1) PRINT=1;;
+    -h|--help) usage; exit 0;;
+    *) break;;
+  esac
+  shift
+done
+
+[ -n "$CMD" ] || { usage; exit 2; }
+[[ -z "$TARGET" || "$TARGET" =~ ^(host|chroot)$ ]] || fatal "TARGET inválido"
+
+# ====================== Helpers ======================
+has(){ command -v "$1" >/dev/null 2>&1; }
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+ensure_dir(){ mkdir -p "$1"; }
+json_get(){ # chave simples de json minimalista (usa jq se houver)
+  local key="$1" file="$2"
+  if has jq; then jq -r ".${key} // empty" "$file" 2>/dev/null
+  else awk -v k="\"$key\"" -F: 'tolower($0) ~ k {sub(/^[[:space:]]*/,"",$2); gsub(/[",]/,"",$2); print $2; exit}' "$file" 2>/dev/null
+  fi
+}
+join_csv(){ local IFS=','; echo "$*"; }
+normalize_path(){ python3 -c "import os,sys;print(os.path.normpath(sys.argv[1]))" "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
+
+# ====================== Locking ======================
+lock_acquire(){
+  ensure_dir "$DB_DIR"
+  if [ -e "$DB_LOCK" ]; then
+    if [ $WAIT_LOCK -eq 1 ]; then
+      log INFO "Aguardando lock..."
+      while [ -e "$DB_LOCK" ]; do sleep 1; done
+    else
+      fatal "Outro processo está usando o gerenciador (lock presente). Use --wait-lock."
+    fi
+  fi
+  echo "$$ $(date -u +%s)" > "$DB_LOCK"
+}
+lock_release(){ rm -f "$DB_LOCK" || true; }
+
+# ====================== Transações ======================
+new_txid(){ date -u +%Y%m%dT%H%M%SZ_$RANDOM; }
+journal_append(){ # txid, msg
+  local tx="$1" msg="$2"
+  echo "$(ts) $msg" >> "${DB_TXN}/${tx}.log"
+}
+backup_path(){ echo "${DB_BACKUP}/$1"; }
+
+# ====================== DB APIs ======================
+installed_meta(){ # name -> file json
+  echo "${DB_INSTALLED}/${1}.json"
+}
+installed_files(){ # name -> file list
+  echo "${DB_FILES}/${1}.list"
+}
+is_installed(){ [ -f "$(installed_meta "$1")" ]; }
+owner_of(){ # path -> name (via owners.map)
+  [ -f "$DB_OWNERS" ] || return 1
+  awk -v p="$1" '$1==p{print $2;exit}' "$DB_OWNERS"
+}
+map_add_owner(){ # txid path name (append; journal remove reverte)
+  echo "$2 $3" >> "$DB_OWNERS"
+  echo "OWNADD $2 $3" >> "${DB_TXN}/${1}.log"
+}
+map_del_owner(){ # txid path (remove a linha)
+  if [ -f "$DB_OWNERS" ]; then
+    cp -f "$DB_OWNERS" "${DB_OWNERS}.bak"
+    awk -v p="$2" '$1!=p{print}' "${DB_OWNERS}.bak" > "$DB_OWNERS"
+    rm -f "${DB_OWNERS}.bak"
+    echo "OWNDEL $2" >> "${DB_TXN}/${1}.log"
+  fi
+}
+
+# ====================== Pacote (arquivo) & Cache ======================
+find_cached_pkg(){ # name [version] -> path
+  local name="$1" ver="${2:-}"
+  local dir="${ADM_CACHE_PKG}/${name}"
+  [ -d "$dir" ] || return 1
+  local file
+  if [ -n "$ver" ]; then
+    file="$(ls -1t "$dir"/${name}-${ver}-*.tar.* 2>/dev/null | head -n1 || true)"
+  else
+    file="$(ls -1t "$dir"/${name}-*.tar.* 2>/dev/null | head -n1 || true)"
+  fi
+  [ -n "$file" ] && echo "$file"
+}
+
+tar_extract(){ # tar.(zst|gz) to dir
+  local pkg="$1" dst="$2"
+  ensure_dir "$dst"
+  case "$pkg" in
+    *.tar.zst) zstd -d -c "$pkg" | tar -C "$dst" -xf - ;;
+    *.tar.gz|*.tgz) tar -C "$dst" -xzf "$pkg" ;;
+    *.tar) tar -C "$dst" -xf "$pkg" ;;
+    *) fatal "Formato de pacote desconhecido: $pkg" ;;
+  esac
+}
+# ====================== Scriptlets / Hooks / Triggers ======================
+run_scriptlet(){ # stage pkgroot name version root TXID
+  local stage="$1" pkgroot="$2" name="$3" ver="$4" root="$5" tx="$6"
+  local sdir="${pkgroot}/scriptlets"
+  local s="${sdir}/${stage}"
+  [ -x "$s" ] || return 0
+  log INFO "[$name] scriptlet ${stage}"
+  ADM_NAME="$name" ADM_VERSION="$ver" ADM_ROOT="$root" ADM_TARGET="${TARGET:-}" TXID="$tx" PATH="$PATH" SHELL="${SHELL:-/bin/sh}" \
+  bash -lc "$s"
+}
+
+# Disparos de sistema (avaliam impacto de paths)
+trigger_ldconfig(){ local root="$1"
+  [ -d "${root}/usr/lib" ] || [ -d "${root}/usr/lib64" ] || return 0
+  has ldconfig || return 0
+  chroot "${root}" ldconfig || true
+}
+trigger_depmod(){ local root="$1"
+  command -v depmod >/dev/null 2>&1 || return 0
+  [ -d "${root}/lib/modules" ] || return 0
+  chroot "${root}" depmod -a || true
+}
+trigger_systemd(){ local root="$1"
+  [ -d "${root}/etc/systemd/system" ] || [ -d "${root}/usr/lib/systemd/system" ] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl daemon-reload || true
+}
+trigger_desktop_caches(){ local root="$1"
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && find "${root}/usr/share/icons" -maxdepth 1 -type d -print -quit >/dev/null 2>&1 && \
+    chroot "$root" gtk-update-icon-cache -q /usr/share/icons/* 2>/dev/null || true
+  command -v update-desktop-database >/dev/null 2>&1 && [ -d "${root}/usr/share/applications" ] && \
+    chroot "$root" update-desktop-database -q || true
+  command -v fc-cache >/dev/null 2>&1 && [ -d "${root}/usr/share/fonts" ] && \
+    chroot "$root" fc-cache -f || true
+  command -v glib-compile-schemas >/dev/null 2>&1 && [ -d "${root}/usr/share/glib-2.0/schemas" ] && \
+    chroot "$root" glib-compile-schemas /usr/share/glib-2.0/schemas || true
+}
+trigger_cert_caches(){ local root="$1"
+  if command -v update-ca-trust >/dev/null 2>&1; then chroot "$root" update-ca-trust || true
+  elif command -v c_rehash >/dev/null 2>&1; then chroot "$root" c_rehash /etc/ssl/certs || true
+  fi
+}
+
+run_triggers(){ # root changed_flag_paths...
+  local root="$1"; shift || true
+  trigger_ldconfig "$root"
+  trigger_depmod "$root"
+  trigger_systemd "$root"
+  trigger_desktop_caches "$root"
+  trigger_cert_caches "$root"
+}
+
+# ====================== Verificações / Conffiles ======================
+is_conffile(){ # path_rel -> 0/1
+  case "$1" in
+    etc/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+file_checksum(){ sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+
+# ====================== Instalação (core) ======================
+resolve_pkg_input(){ # arg -> pkgpath name version
+  local arg="$1"
+  if [ -f "$arg" ]; then
+    local base; base="$(basename "$arg")"
+    local name ver
+    name="$(echo "$base" | sed -E 's/^([^ -]+)-([0-9][^ -]*)-.*/\1/')" || true
+    ver="$(echo "$base" | sed -E 's/^([^ -]+)-([0-9][^ -]*)-.*/\2/')" || true
+    echo "$arg" "$name" "$ver"
+    return 0
+  else
+    local name="$arg" ver=""
+    if [[ "${2:-}" == --version=* ]]; then ver="${2#*=}"; fi
+    local path; path="$(find_cached_pkg "$name" "$ver" || true)"
+    [ -n "$path" ] || fatal "Pacote não encontrado no cache: $name ${ver:+(versão $ver)}"
+    local base; base="$(basename "$path")"
+    ver="$(echo "$base" | sed -E 's/^([^ -]+)-([0-9][^ -]*)-.*/\2/')" || ver=""
+    echo "$path" "$name" "$ver"
+  fi
+}
+
+unpack_to_staging(){ # pkgpath txid -> staging_dir pkgroot
+  local pkg="$1" tx="$2"
+  local tmp="${DB_DIR}/staging_${tx}"
+  ensure_dir "$tmp"
+  tar_extract "$pkg" "$tmp"
+  # espera-se que o pacote contenha a árvore / (usr/, etc/, lib/, ...) na raiz
+  echo "$tmp" "$tmp"
+}
+
+# Checa integridade do pacote (sha256 do .tar.zst se houver *.sha256 ao lado)
+check_pkg_integrity(){ # pkgpath
+  local pkg="$1" sha="${pkg}.sha256"
+  [ -f "$sha" ] || return 0
+  local want got
+  want="$(awk '{print $1}' "$sha" 2>/dev/null || true)"
+  [ -n "$want" ] || return 0
+  got="$(sha256_file "$pkg")"
+  [ "$want" = "$got" ] || fatal "sha256 do pacote não confere (got=$got want=$want)"
+}
+
+# Carrega manifest e metadata embutidos no pacote (se existirem dentro do staging)
+find_embedded_manifest(){ # staging -> path or empty
+  local st="$1"
+  # procura por markers comuns
+  local mf
+  mf="$(find "$st" -maxdepth 3 -name manifest.txt -print -quit 2>/dev/null || true)"
+  echo "$mf"
+}
+find_embedded_pkgmeta(){ # staging -> path or empty
+  local st="$1"
+  local js
+  js="$(find "$st" -maxdepth 3 -name pkgmeta.json -print -quit 2>/dev/null || true)"
+  echo "$js"
+}
+
+# Conflitos de arquivos (com owners)
+detect_file_conflicts(){ # name root manifest -> emits list of conflicts
+  local name="$1" root="$2" mfile="$3"
+  [ -f "$mfile" ] || return 0
+  local rel conflicts=()
+  while read -r rel; do
+    rel="${rel#./}"
+    [ -z "$rel" ] && continue
+    local tgt="${root%/}/$rel"
+    if [ -e "$tgt" ]; then
+      local ow; ow="$(owner_of "$rel" || true)"
+      if [ -n "$ow" ] && [ "$ow" != "$name" ]; then
+        conflicts+=("$rel (dono: $ow)")
+      elif [ -z "$ow" ] && [ $FORCE -eq 0 ]; then
+        conflicts+=("$rel (arquivo órfão)")
+      fi
+    fi
+  done < "$mfile"
+  printf "%s\n" "${conflicts[@]:-}"
+}
+
+# Move atômico com backup
+atomic_install(){ # txid name root staging manifest conffiles_policy
+  local tx="$1" name="$2" root="$3" st="$4" mf="$5" replace_conf="$6"
+  local rel
+  while read -r rel; do
+    rel="${rel#./}"; [ -z "$rel" ] && continue
+    local src="${st%/}/$rel"
+    local dst="${root%/}/$rel"
+    ensure_dir "$(dirname "$dst")"
+    if [ -e "$dst" ]; then
+      if is_conffile "$rel" && [ $replace_conf -eq 0 ]; then
+        # preserva arquivo existente; instala como .pkgnew
+        cp -a "$src" "${dst}.pkgnew" 2>/dev/null || true
+        echo "PKGNEW $rel" >> "${DB_TXN}/${tx}.log"
+        continue
+      fi
+      # backup do existente
+      ensure_dir "$(backup_path "$tx")/orig"
+      cp -a "$dst" "$(backup_path "$tx")/orig/$(echo "$rel" | tr '/' '_')" 2>/dev/null || true
+      echo "BACKUP $rel" >> "${DB_TXN}/${tx}.log"
+    fi
+    # instala
+    install -Dm644 /dev/null "$dst" 2>/dev/null || true
+    if [ -d "$src" ]; then
+      # copiar diretórios recursivamente com atributos
+      cp -a "$src"/. "$dst"/ 2>/dev/null || cp -a "$src" "$dst"
+    else
+      cp -a "$src" "$dst"
+    fi
+    map_add_owner "$tx" "$rel" "$name"
+  done < "$mf"
+}
+
+# Calcula checksums de arquivos instalados
+write_installed_checksums(){ # name root manifest -> DB_FILES/name.list
+  local name="$1" root="$2" mf="$3" out; out="$(installed_files "$name")"
+  ensure_dir "$(dirname "$out")"
+  : > "$out"
+  local rel
+  while read -r rel; do
+    rel="${rel#./}"; [ -z "$rel" ] && continue
+    local p="${root%/}/$rel"
+    if [ -f "$p" ]; then
+      echo "$(sha256_file "$p") $rel" >> "$out"
+    else
+      echo "- $rel" >> "$out"
+    fi
+  done < "$mf"
+}
+# ====================== Atualização do DB instalado ======================
+write_installed_meta(){ # name version pkgmeta_json target root txid
+  local name="$1" ver="$2" js="$3" target="$4" root="$5" tx="$6"
+  local out; out="$(installed_meta "$name")"
+  ensure_dir "$(dirname "$out")"
+  local sha_pkg="" arch=""
+  if [ -n "${PKGFILE:-}" ] && [ -f "$PKGFILE" ]; then sha_pkg="$(sha256_file "$PKGFILE")"; fi
+  arch="$(uname -m)"
+  {
+    echo "{"
+    echo "  \"name\": \"$name\","
+    echo "  \"version\": \"$ver\","
+    echo "  \"arch\": \"$arch\","
+    echo "  \"root\": \"$(echo "$root" | sed 's/"/\\"/g')\","
+    echo "  \"target\": \"${target:-}\","
+    echo "  \"package_sha256\": \"${sha_pkg}\","
+    if [ -f "$js" ]; then
+      # inclui campos úteis do pkgmeta.json
+      for k in description maintainer homepage run_deps build_deps opt_deps timestamp; do
+        local v; v="$(json_get "$k" "$js" || true)"
+        [ -n "$v" ] && echo "  \"$k\": \"$(echo "$v" | sed 's/"/\\"/g')\","
+      done
+    fi
+    echo "  \"installed_at\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
+    echo "  \"txid\": \"$tx\""
+    echo "}"
+  } > "$out"
+}
+
+# ====================== Dependências ======================
+deps_from_pkgmeta(){ # pkgmeta_json -> csv
+  local js="$1"
+  [ -f "$js" ] || { echo ""; return 0; }
+  local r b o
+  r="$(json_get run_deps "$js" || true)"
+  b="$(json_get build_deps "$js" || true)"
+  o="$(json_get opt_deps "$js" || true)"
+  echo "${r}${r:+,}${b}${o:+,}${o}" | sed 's/,,*/,/g; s/^,//; s/,$//'
+}
+deps_check_installed(){ # csv -> missing list (one per line)
+  local csv="$1"
+  IFS=',' read -r -a arr <<<"$csv"
+  local d
+  for d in "${arr[@]:-}"; do
+    d="$(echo "$d" | sed 's/[[:space:]]//g')"
+    [ -z "$d" ] && continue
+    is_installed "$d" || echo "$d"
+  done
+}
+
+# ====================== Operações ======================
+cmd_install(){ # install <pkgfile|name> [--version=X]
+  [ $# -ge 1 ] || fatal "Uso: install <pkgfile|name> [--version=X]"
+  lock_acquire
+  local tx; tx="$(new_txid)"; journal_append "$tx" "BEGIN install"
+
+  local pkg name ver
+  read -r pkg name ver <<<"$(resolve_pkg_input "$1" "${2:-}")"
+  export PKGFILE="$pkg"
+
+  log STEP "[$name] Instalação (pkg=$pkg, ver=$ver, root=$ROOT)"
+
+  check_pkg_integrity "$pkg"
+
+  local staging pkgroot; read -r staging pkgroot <<<"$(unpack_to_staging "$pkg" "$tx")"
+
+  local mf js
+  mf="$(find_embedded_manifest "$staging" || true)"
+  js="$(find_embedded_pkgmeta "$staging" || true)"
+  [ -n "$mf" ] || fatal "Manifest ausente no pacote"
+  [ -n "$js" ] || log WARN "pkgmeta.json ausente no pacote"
+
+  # deps
+  local deps; deps="$(deps_from_pkgmeta "$js")"
+  if [ -n "$deps" ]; then
+    local missing; missing="$(deps_check_installed "$deps" || true)"
+    if [ -n "$missing" ]; then
+      if [ $STRICT_DEPS -eq 1 ]; then
+        fatal "Dependências não instaladas: $(echo "$missing" | tr '\n' ' ')"
+      else
+        log WARN "Dependências ausentes: $(echo "$missing" | tr '\n' ' ')"
+      fi
+    fi
+  fi
+
+  # conflitos
+  local conf; conf="$(detect_file_conflicts "$name" "$ROOT" "$mf" || true)"
+  if [ -n "$conf" ] && [ $FORCE -eq 0 ]; then
+    fatal "Conflitos de arquivo:\n$conf"
+  fi
+
+  # scriptlet pre-install
+  run_scriptlet pre-install "$staging" "$name" "$ver" "$ROOT" "$tx"
+
+  if [ $DRY_RUN -eq 1 ]; then
+    log OK "Dry-run: instalação simulada. Nada foi aplicado."
+  else
+    atomic_install "$tx" "$name" "$ROOT" "$staging" "$mf" "$REPLACE_CONFFILES"
+    write_installed_checksums "$name" "$ROOT" "$mf"
+    write_installed_meta "$name" "$ver" "$js" "${TARGET:-}" "$ROOT" "$tx"
+    # triggers
+    run_triggers "$ROOT"
+  fi
+
+  run_scriptlet post-install "$staging" "$name" "$ver" "$ROOT" "$tx"
+
+  echo "$(ts) install $name $ver TX=$tx" >> "$DB_HISTORY"
+  journal_append "$tx" "END install"
+  lock_release
+  [ $PRINT -eq 1 ] && { echo "INSTALLED: $name $ver (TX=$tx)"; } >&3
+}
+
+cmd_upgrade(){ # upgrade <name> [--version=X]
+  [ $# -ge 1 ] || fatal "Uso: upgrade <name> [--version=X]"
+  local name="$1" verflag="${2:-}"
+  # precisa do pacote novo (cache)
+  local pkg name2 ver2; read -r pkg name2 ver2 <<<"$(resolve_pkg_input "$name" "$verflag")"
+  [ "$name" = "$name2" ] || fatal "Nome do pacote difere do arquivo fornecido"
+  is_installed "$name" || fatal "Pacote não instalado: $name"
+
+  lock_acquire
+  local tx; tx="$(new_txid)"; journal_append "$tx" "BEGIN upgrade"
+
+  export PKGFILE="$pkg"
+  log STEP "[$name] Upgrade para ver=$ver2 (pkg=$pkg)"
+
+  local staging pkgroot; read -r staging pkgroot <<<"$(unpack_to_staging "$pkg" "$tx")"
+  local mf js; mf="$(find_embedded_manifest "$staging" || true)"; js="$(find_embedded_pkgmeta "$staging" || true)"
+  [ -n "$mf" ] || fatal "Manifest ausente no pacote"
+  [ -n "$js" ] || log WARN "pkgmeta.json ausente no pacote"
+
+  # scriptlet pre-upgrade
+  run_scriptlet pre-upgrade "$staging" "$name" "$ver2" "$ROOT" "$tx"
+
+  if [ $DRY_RUN -eq 1 ]; then
+    log OK "Dry-run: upgrade simulado."
+  else
+    atomic_install "$tx" "$name" "$ROOT" "$staging" "$mf" "$REPLACE_CONFFILES"
+    write_installed_checksums "$name" "$ROOT" "$mf"
+    write_installed_meta "$name" "$ver2" "$js" "${TARGET:-}" "$ROOT" "$tx"
+    run_triggers "$ROOT"
+  fi
+
+  run_scriptlet post-upgrade "$staging" "$name" "$ver2" "$ROOT" "$tx"
+  echo "$(ts) upgrade $name $ver2 TX=$tx" >> "$DB_HISTORY"
+  journal_append "$tx" "END upgrade"
+  lock_release
+  [ $PRINT -eq 1 ] && { echo "UPGRADED: $name $ver2 (TX=$tx)"; } >&3
+}
+
+cmd_reinstall(){ # reinstall <name>
+  [ $# -ge 1 ] || fatal "Uso: reinstall <name>"
+  local name="$1"
+  is_installed "$name" || fatal "Pacote não instalado: $name"
+  local curmeta; curmeta="$(installed_meta "$name")"
+  local ver; ver="$(json_get version "$curmeta")"
+  cmd_upgrade "$name" "--version=$ver"
+}
+
+# Remoção de arquivos conforme manifest e conffiles
+remove_files(){ # tx name root manifest purge
+  local tx="$1" name="$2" root="$3" mf="$4" purge="$5"
+  local rel
+  while read -r rel; do
+    rel="${rel#./}"; [ -z "$rel" ] && continue
+    local dst="${root%/}/$rel"
+    if [ -e "$dst" ]; then
+      if is_conffile "$rel" && [ $purge -eq 0 ]; then
+        # mantém config; renomeia para .save antes de remover se for remover diretório pai
+        cp -a "$dst" "${dst}.save" 2>/dev/null || true
+        echo "CONFSAVE $rel" >> "${DB_TXN}/${tx}.log"
+        continue
+      fi
+      ensure_dir "$(backup_path "$tx")/removed"
+      cp -a "$dst" "$(backup_path "$tx")/removed/$(echo "$rel" | tr '/' '_')" 2>/dev/null || true
+      echo "REMKEEP $rel" >> "${DB_TXN}/${tx}.log"
+      rm -rf "$dst"
+      map_del_owner "$tx" "$rel"
+    fi
+  done < "$mf"
+}
+
+cmd_remove(){ # remove <name>
+  [ $# -ge 1 ] || fatal "Uso: remove <name>"
+  local name="$1"
+  is_installed "$name" || fatal "Pacote não instalado: $name"
+
+  lock_acquire
+  local tx; tx="$(new_txid)"; journal_append "$tx" "BEGIN remove"
+
+  local mf; mf="$(installed_files "$name")"
+  [ -f "$mf" ] || fatal "Manifest instalado ausente: $mf"
+  log STEP "[$name] Remoção (root=$ROOT, purge=$PURGE)"
+
+  run_scriptlet pre-remove "${DB_DIR}/.no-pkgroot" "$name" "$(json_get version "$(installed_meta "$name")")" "$ROOT" "$tx"
+
+  if [ $DRY_RUN -eq 1 ]; then
+    log OK "Dry-run: remoção simulada."
+  else
+    remove_files "$tx" "$name" "$ROOT" "$mf" "$PURGE"
+    rm -f "$(installed_meta "$name")" "$(installed_files "$name")"
+    run_triggers "$ROOT"
+  fi
+
+  run_scriptlet post-remove "${DB_DIR}/.no-pkgroot" "$name" "" "$ROOT" "$tx"
+  echo "$(ts) remove $name TX=$tx" >> "$DB_HISTORY"
+  journal_append "$tx" "END remove"
+  lock_release
+  [ $PRINT -eq 1 ] && { echo "REMOVED: $name (TX=$tx)"; } >&3
+}
+# ====================== Verify / Query / Rollback / Clean ======================
+cmd_verify(){ # verify [name|all]
+  local what="${1:-all}"
+  local list=()
+  if [ "$what" = "all" ]; then
+    mapfile -t list < <(ls -1 "${DB_INSTALLED}"/*.json 2>/dev/null | xargs -I{} basename {} .json)
+  else
+    list=("$what")
+  fi
+  local nbad=0
+  for name in "${list[@]:-}"; do
+    local mf; mf="$(installed_files "$name")"
+    [ -f "$mf" ] || { log WARN "[$name] sem arquivo de lista"; nbad=$((nbad+1)); continue; }
+    local ok=1
+    while read -r line; do
+      [ -z "$line" ] && continue
+      local sum path; sum="$(echo "$line" | awk '{print $1}')"; path="$(echo "$line" | cut -d' ' -f2-)"
+      local real="${ROOT%/}/$path"
+      if [ "$sum" = "-" ]; then
+        [ -e "$real" ] || continue
+      else
+        if [ -f "$real" ]; then
+          local got; got="$(sha256_file "$real")"
+          [ "$got" = "$sum" ] || { log WARN "[$name] checksum difere: $path"; ok=0; }
+        else
+          log WARN "[$name] arquivo ausente: $path"; ok=0
+        fi
+      fi
+    done < "$mf"
+    [ $ok -eq 1 ] && log OK "[$name] verificado" || nbad=$((nbad+1))
+  done
+  [ $nbad -eq 0 ] || exit 1
+}
+
+cmd_list(){
+  ls -1 "${DB_INSTALLED}"/*.json 2>/dev/null | while read -r f; do
+    local n v; n="$(basename "$f" .json)"; v="$(json_get version "$f")"
+    echo "$n $v"
+  done | sort
+}
+
+cmd_info(){ # info <name>
+  [ $# -ge 1 ] || fatal "Uso: info <name>"
+  local f; f="$(installed_meta "$1")"
+  [ -f "$f" ] || fatal "Pacote não instalado: $1"
+  cat "$f" | sed 's/^/  /'
+}
+
+cmd_files(){ # files <name>
+  [ $# -ge 1 ] || fatal "Uso: files <name>"
+  local f; f="$(installed_files "$1")"
+  [ -f "$f" ] || fatal "Manifest ausente para: $1"
+  cut -d' ' -f2- "$f"
+}
+
+cmd_owns(){ # owns <path>
+  [ $# -ge 1 ] || fatal "Uso: owns <path>"
+  local p; p="$(echo "$1" | sed 's|^/||')"
+  local o; o="$(owner_of "$p" || true)"
+  [ -n "$o" ] && echo "$o" || { log WARN "Nenhum dono para: $p"; exit 1; }
+}
+
+# Rollback executa usando o journal inverso
+cmd_rollback(){ # rollback <TXID>
+  [ $# -ge 1 ] || fatal "Uso: rollback <TXID>"
+  local tx="$1" j="${DB_TXN}/${tx}.log"
+  [ -f "$j" ] || fatal "TXID inválido"
+  lock_acquire
+  log STEP "Rollback TX=$tx"
+  tac "$j" | while read -r op rest; do
+    case "$op" in
+      OWNADD) # desfaz: remove owner
+        local path="$(echo "$rest" | awk '{print $1}')"
+        map_del_owner "$tx" "$path"
+        ;;
+      OWNDEL) # desfaz: impossível recuperar dono antigo sem state — ignorar
+        ;;
+      BACKUP) # restaurar arquivo sobrescrito
+        local rel="$(echo "$rest")"
+        local b="${DB_BACKUP}/${tx}/orig/$(echo "$rel" | tr '/' '_')"
+        local dst="${ROOT%/}/$rel"
+        [ -f "$b" ] && { ensure_dir "$(dirname "$dst")"; cp -a "$b" "$dst"; }
+        ;;
+      REMKEEP) # recoloca arquivo removido
+        local rel="$(echo "$rest")"
+        local b="${DB_BACKUP}/${tx}/removed/$(echo "$rel" | tr '/' '_')"
+        local dst="${ROOT%/}/$rel"
+        [ -e "$b" ] && { ensure_dir "$(dirname "$dst")"; cp -a "$b" "$dst"; }
+        ;;
+      PKGNEW) # remove .pkgnew criado
+        local rel="$(echo "$rest")"
+        rm -f "${ROOT%/}/${rel}.pkgnew" 2>/dev/null || true
+        ;;
+      CONFSAVE) # remove .save criado
+        local rel="$(echo "$rest")"
+        rm -f "${ROOT%/}/${rel}.save" 2>/dev/null || true
+        ;;
+      *) : ;;
+    esac
+  done
+  echo "$(ts) rollback TX=$tx" >> "$DB_HISTORY"
+  lock_release
+  [ $PRINT -eq 1 ] && { echo "ROLLBACK: TX=$tx concluído"; } >&3
+}
+
+cmd_clean(){
+  # limpa backups antigos
+  local to_del; to_del="$(ls -1t "$DB_BACKUP" 2>/dev/null | tail -n +$((KEEP_BACKUPS+1)) || true)"
+  if [ -n "$to_del" ]; then
+    echo "$to_del" | while read -r d; do rm -rf "${DB_BACKUP}/${d}"; done
+  fi
+  # limpa versões antigas no cache
+  for d in "$ADM_CACHE_PKG"/*; do
+    [ -d "$d" ] || continue
+    ls -1t "$d"/*.tar.* 2>/dev/null | tail -n +$((KEEP_VERSIONS+1)) | xargs -r rm -f --
+  done
+  [ $PRINT -eq 1 ] && { echo "CLEAN: backups>=$KEEP_BACKUPS, versões por pacote>=$KEEP_VERSIONS"; } >&3
+}
+
+# ====================== Main ======================
+main(){
+  case "$CMD" in
+    install)   cmd_install "$@" ;;
+    upgrade)   cmd_upgrade "$@" ;;
+    remove)    cmd_remove "$@" ;;
+    reinstall) cmd_reinstall "$@" ;;
+    verify)    cmd_verify "${1:-all}" ;;
+    list)      cmd_list ;;
+    info)      cmd_info "$@" ;;
+    files)     cmd_files "$@" ;;
+    owns)      cmd_owns "$@" ;;
+    rollback)  cmd_rollback "$@" ;;
+    clean)     cmd_clean ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"
+
+# restaurar stdout
+exec 1>&3 3>&-
