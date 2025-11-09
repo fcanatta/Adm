@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# gcc-stage1: pre-configure — configura GCC para usar headers/crt da libc do Stage1.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")}"
+HOST_TRIPLET="${HOST_TRIPLET:-${TARGET_TRIPLET:-$BUILD_TRIPLET}}"
+
+# Detectar libc (heurística simples: presença de algum header típico)
+LIBC_KIND="glibc"
+if grep -q 'musl' <<<"$("${HOST_TRIPLET}-gcc" --version 2>/dev/null || true)"; then
+  LIBC_KIND="musl"
+else
+  if [ -f "/usr/include/unistd.h" ] && (ldd --version 2>&1 | grep -qi musl); then
+    LIBC_KIND="musl"
+  fi
+fi
+export LIBC_KIND
+
+mkdir -p "${ADM_BUILD_DIR}"
+cd "${ADM_BUILD_DIR}"
+
+COMMON_OPTS=(
+  "--prefix=/usr"
+  "--target=${HOST_TRIPLET}"
+  "--host=${BUILD_TRIPLET}"
+  "--build=${BUILD_TRIPLET}"
+  "--with-sysroot=/"
+  "--with-native-system-header-dir=/usr/include"
+  "--enable-languages=c"
+  "--disable-nls"
+  "--disable-multilib"
+  "--disable-libstdcxx"
+  "--disable-libstdc++-v3"
+  "--disable-libssp"
+  "--disable-libgomp"
+  "--disable-libquadmath"
+  "--disable-libvtv"
+  "--disable-lto"
+  "--disable-werror"
+)
+
+if [ "$LIBC_KIND" = "musl" ]; then
+  COMMON_OPTS+=("--with-libiconv-prefix=" "--with-gnu-ld" "--enable-default-pie")
+else
+  # glibc
+  COMMON_OPTS+=("--with-gnu-ld")
+fi
+
+# Preferir binutils do target no PATH
+export PATH="/usr/bin:${PATH}"
+export CC="${BUILD_TRIPLET}-gcc"
+
+"${ADM_WORK_DIR}/configure" "${COMMON_OPTS[@]}"
