@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# musl-stage1: pre-build — instala headers e compila apenas crt.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+# 1) Instalar headers no DESTDIR
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" DESTDIR="${ADM_DESTDIR}" install-headers
+
+# 2) Construir startfiles (crt). O alvo 'crt' compila crt1.o, crti.o, crtn.o, Scrt1.o (PIE).
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" crt
+
+# 3) Instalar startfiles no DESTDIR
+install -Dm0644 "crt/crt1.o"  "${ADM_DESTDIR}/usr/lib/crt1.o"
+install -Dm0644 "crt/crti.o"  "${ADM_DESTDIR}/usr/lib/crti.o"
+install -Dm0644 "crt/crtn.o"  "${ADM_DESTDIR}/usr/lib/crtn.o"
+# Opcional: PIE
+test -f "crt/Scrt1.o" && install -Dm0644 "crt/Scrt1.o" "${ADM_DESTDIR}/usr/lib/Scrt1.o" || true
