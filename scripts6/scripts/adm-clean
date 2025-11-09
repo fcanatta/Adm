@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+# adm-clean — zelador do workspace /usr/src/adm/*
+# Limpa caches, workdirs, sources, logs, updates e estados com políticas de retenção.
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.0.0"
+
+# ===== Cores / Log =====
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-clean.log"; exit 2' ERR
+
+# ===== Paths =====
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_STATES="${ADM_STATES:-${ROOT_BASE}/states}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_META="${ADM_META:-${ROOT_BASE}/metafiles}"
+ADM_UPDATE="${ADM_UPDATE:-${ROOT_BASE}/update}"
+ADM_SOURCES="${ADM_SOURCES:-${ROOT_BASE}/sources}"
+ADM_WORK="${ADM_WORK:-${ROOT_BASE}/work}"
+ADM_CACHE_PKG="${ADM_CACHE_PKG:-${ROOT_BASE}/cache/pkg}"
+
+mkdir -p "$ADM_LOGS"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-clean.log" 2>&1
+
+# ===== CLI =====
+SCOPES=()            # cache-pkg cache-src work logs updates states meta-orphans plans all
+DRY_RUN=0
+EXPLAIN=0
+INTERACTIVE=0
+ESTIMATE=0
+VERBOSE=0
+PRINT=1
+
+KEEP_VERSIONS=2
+MAX_AGE=""          # ex: 30d 12h
+MAX_SIZE=""         # ex: 50G 800M
+
+KEEP_SOURCE_VERS=2
+SOURCE_MAX_AGE=""
+SOURCE_MAX_SIZE=""
+
+PURGE_WORK=0
+PRESERVE_DETECT_LOGS=0
+
+LOGS_MAX_AGE=""
+LOGS_KEEP=10
+
+KEEP_UPDATES=5
+UPDATES_MAX_AGE=""
+PRUNE_PROMOTED=0
+
+KEEP_BACKUPS=5
+TXN_MAX_AGE=""
+REBUILD_OWNERS=0
+
+PLANS_MAX_AGE=""
+
+PROTECT_PATTERNS=() # --protect=glob (repetível)
+
+usage(){
+  cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} [escopos...] [opções]
+
+Escopos:
+  cache-pkg | cache-src | work | logs | updates | states | meta-orphans | plans | all
+
+Opções gerais:
+  --dry-run                  Não remove; apenas reporta
+  --explain                  Explica porque cada item é elegível
+  --interactive              Confirma por lote antes de remover
+  --estimate                 Apenas calcula espaço potencial
+  --protect=GLOB             Protege caminhos que casem com o GLOB (repetível)
+  --verbose                  Log detalhado
+  --print=0|1                Resumo no stdout (default: 1)
+
+Cache de pacotes:
+  --keep-versions=N          Manter N versões por pacote (default: 2)
+  --max-age=SPAN             Idade máx. (ex: 30d, 12h)
+  --max-size=SIZE            Tamanho total máx. (ex: 50G)
+
+Cache de sources:
+  --keep-source-versions=N   Manter N versões por pacote (default: 2)
+  --source-max-age=SPAN      Idade máx. (ex: 90d)
+  --source-max-size=SIZE     Tamanho total máx.
+
+Workdirs:
+  --purge-work               Força apagar tudo (exceto builds ativos)
+  --preserve-detect-logs     Mantém detect/ e logs/
+
+Logs:
+  --logs-max-age=SPAN        Idade máx. (ex: 30d)
+  --logs-keep=N              Manter N por componente
+
+Updates:
+  --keep-updates=N           Manter N updates por pacote
+  --updates-max-age=SPAN     Idade máx.
+  --prune-promoted           Limpar updates já promovidos
+
+States:
+  --keep-backups=N           Preservar N backups (default: 5)
+  --txn-max-age=SPAN         Idade máx. de transações
+  --rebuild-owners           Reconstruir owners.map pelos manifests
+
+Plans:
+  --plans-max-age=SPAN       Idade máx. dos estados do adm-plan
+EOF
+}
+
+# parse argv
+parse_args(){
+  local a
+  while [ $# -gt 0 ]; do
+    a="$1"; shift || true
+    case "$a" in
+      cache-pkg|cache-src|work|logs|updates|states|meta-orphans|plans|all) SCOPES+=("$a");;
+      --dry-run) DRY_RUN=1;;
+      --explain) EXPLAIN=1;;
+      --interactive) INTERACTIVE=1;;
+      --estimate) ESTIMATE=1;;
+      --protect=*) PROTECT_PATTERNS+=("${a#*=}");;
+      --verbose) VERBOSE=1;;
+      --print=0) PRINT=0;;
+      --print=1) PRINT=1;;
+
+      --keep-versions=*) KEEP_VERSIONS="${a#*=}";;
+      --max-age=*) MAX_AGE="${a#*=}";;
+      --max-size=*) MAX_SIZE="${a#*=}";;
+
+      --keep-source-versions=*) KEEP_SOURCE_VERS="${a#*=}";;
+      --source-max-age=*) SOURCE_MAX_AGE="${a#*=}";;
+      --source-max-size=*) SOURCE_MAX_SIZE="${a#*=}";;
+
+      --purge-work) PURGE_WORK=1;;
+      --preserve-detect-logs) PRESERVE_DETECT_LOGS=1;;
+
+      --logs-max-age=*) LOGS_MAX_AGE="${a#*=}";;
+      --logs-keep=*) LOGS_KEEP="${a#*=}";;
+
+      --keep-updates=*) KEEP_UPDATES="${a#*=}";;
+      --updates-max-age=*) UPDATES_MAX_AGE="${a#*=}";;
+      --prune-promoted) PRUNE_PROMOTED=1;;
+
+      --keep-backups=*) KEEP_BACKUPS="${a#*=}";;
+      --txn-max-age=*) TXN_MAX_AGE="${a#*=}";;
+      --rebuild-owners) REBUILD_OWNERS=1;;
+
+      --plans-max-age=*) PLANS_MAX_AGE="${a#*=}";;
+
+      -h|--help) usage; exit 0;;
+      *) log WARN "Opção desconhecida: $a";;
+    esac
+  done
+  [ "${#SCOPES[@]}" -gt 0 ] || SCOPES=("all")
+}
+
+# ===== Helpers gerais =====
+has(){ command -v "$1" >/dev/null 2>&1; }
+ensure_dir(){ mkdir -p "$1"; }
+is_under_rootbase(){ local p="$1"; case "$p" in ${ROOT_BASE}/*) return 0;; *) return 1;; esac }
+now_epoch(){ date +%s; }
+# tamanho em bytes
+du_bytes(){ du -sb -- "$1" 2>/dev/null | awk '{print $1}'; }
+# parse SPAN ex: 30d 12h 15m
+span_to_seconds(){ local s="$1"; [ -z "$s" ] && { echo 0; return; }
+  local total=0 num unit
+  for part in $s; do
+    num="$(echo "$part" | sed -E 's/[^0-9]//g')"
+    unit="$(echo "$part" | sed -E 's/[0-9]//g')"
+    case "$unit" in s|"") total=$((total+num));;
+      m) total=$((total+num*60));;
+      h) total=$((total+num*3600));;
+      d) total=$((total+num*86400));;
+      w) total=$((total+num*604800));;
+      *) total=$((total+num));;
+    esac
+  done
+  echo "$total"
+}
+# parse SIZE ex: 50G 800M 120K
+size_to_bytes(){ local s="$1"; [ -z "$s" ] && { echo 0; return; }
+  local num unit; num="$(echo "$s" | sed -E 's/[^0-9.]//g')"; unit="$(echo "$s" | sed -E 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')"
+  case "$unit" in B|"") awk -v n="$num" 'BEGIN{printf "%.0f",n}' ;;
+    K) awk -v n="$num" 'BEGIN{printf "%.0f",n*1024}' ;;
+    M) awk -v n="$num" 'BEGIN{printf "%.0f",n*1024*1024}' ;;
+    G) awk -v n="$num" 'BEGIN{printf "%.0f",n*1024*1024*1024}' ;;
+    T) awk -v n="$num" 'BEGIN{printf "%.0f",n*1024*1024*1024*1024}' ;;
+    *) echo "$num" ;;
+  esac
+}
+# confirma lote
+confirm_batch(){ [ $INTERACTIVE -eq 1 ] || return 0; local n="$1" msg="$2"; read -r -p "Remover ${n} itens ${msg}? [y/N] " ans || true; [[ "$ans" =~ ^[Yy]$ ]]; }
+# aplica proteção
+is_protected(){ local p="$1"; for g in "${PROTECT_PATTERNS[@]:-}"; do [[ "$p" == $g ]] && return 0; done; return 1; }
+# remove (ou simula)
+maybe_rm(){ local path="$1"
+  is_under_rootbase "$path" || { log WARN "Ignorando (fora de ${ROOT_BASE}): $path"; return 0; }
+  is_protected "$path" && { log WARN "Protegido: $path"; return 0; }
+  if [ $DRY_RUN -eq 1 ] || [ $ESTIMATE -eq 1 ]; then
+    local sz; sz="$(du_bytes "$path" 2>/dev/null || echo 0)"
+    printf "%s\t%s\n" "$sz" "$path"
+  else
+    rm -rf -- "$path"
+  fi
+}
+# ===== Coleta de referências =====
+# Lê todos metafiles ativos e updates para saber quais sources/versões não podem ser limpos.
+mf_field(){ awk -F'=' -v K="$1" '$0!~/^#/ && $0~"=" {k=$1; gsub(/[[:space:]]/,"",k); if(k==K){$1="";sub(/^=/,"");print;exit}}' 2>/dev/null; }
+
+collect_active_sources(){
+  # Emite linhas: name|version|url1,url2,...
+  local f name ver srcs
+  while IFS= read -r -d '' f; do
+    name="$(mf_field name < "$f")"
+    ver="$(mf_field version < "$f")"
+    srcs="$(mf_field sources < "$f")"
+    [ -n "$name" ] && [ -n "$ver" ] && [ -n "$srcs" ] && echo "${name}|${ver}|${srcs}"
+  done < <(find "$ADM_META" "$ADM_UPDATE" -type f -name metafile -print0 2>/dev/null)
+}
+
+collect_built_fingerprints(){
+  # fingerprints que indicam builds concluídos que podem depender de sources
+  find "${ADM_STATES}" -type f -name '*.fingerprint' 2>/dev/null || true
+}
+
+# ===== utilitários de listagem =====
+list_cache_pkg(){
+  # Emite: pkgname|filepath|mtime|size
+  local d f n mt sz
+  for d in "$ADM_CACHE_PKG"/*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    for f in "$d"/*.tar.* 2>/dev/null; do
+      [ -f "$f" ] || continue
+      mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+      sz="$(du_bytes "$f")"
+      echo "$n|$f|$mt|$sz"
+    done
+  done
+}
+
+list_cache_src(){
+  # Emite: name|version|dir|mtime|size
+  local d n v mt sz
+  for n in "$ADM_SOURCES"/*; do
+    [ -d "$n" ] || continue
+    n="$(basename "$n")"
+    for d in "$ADM_SOURCES/$n"/*; do
+      [ -d "$d" ] || continue
+      v="$(basename "$d")"
+      mt="$(stat -c %Y "$d" 2>/dev/null || echo 0)"
+      sz="$(du_bytes "$d")"
+      echo "$n|$v|$d|$mt|$sz"
+    done
+  done
+}
+
+list_workdirs(){
+  # Emite: path|mtime|size
+  local d mt sz
+  for d in "$ADM_WORK"/*/* 2>/dev/null; do
+    [ -d "$d" ] || continue
+    mt="$(stat -c %Y "$d" 2>/dev/null || echo 0)"
+    sz="$(du_bytes "$d")"
+    echo "$d|$mt|$sz"
+  done
+}
+
+list_logs(){
+  # Emite: filepath|mtime|size
+  local f mt sz
+  for f in "$ADM_LOGS"/*.log "$ADM_LOGS"/*/*.log 2>/dev/null; do
+    [ -f "$f" ] || continue
+    mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    sz="$(du_bytes "$f")"
+    echo "$f|$mt|$sz"
+  done
+}
+
+list_updates(){
+  # Emite: name|metafile|mtime|size
+  local d mf n mt sz
+  for d in "$ADM_UPDATE"/*; do
+    [ -d "$d" ] || continue
+    n="$(basename "$d")"
+    mf="$d/metafile"
+    [ -f "$mf" ] || continue
+    mt="$(stat -c %Y "$mf" 2>/dev/null || echo 0)"
+    sz="$(du_bytes "$mf")"
+    echo "$n|$mf|$mt|$sz"
+  done
+}
+
+list_plans(){
+  # Emite: filepath|mtime|size
+  local f mt sz
+  for f in "$ADM_STATES/plan"/* 2>/dev/null; do
+    [ -e "$f" ] || continue
+    mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    sz="$(du_bytes "$f")"
+    echo "$f|$mt|$sz"
+  done
+}
+
+# ===== Seletores por política =====
+older_than(){
+  local mtime="$1" max_age="$2"
+  [ -z "$max_age" ] && return 1
+  local now; now="$(now_epoch)"
+  local thr; thr=$(( now - $(span_to_seconds "$max_age") ))
+  [ "$mtime" -lt "$thr" ]
+}
+
+choose_lru_to_fit_size(){
+  # lê linhas "size<TAB>path", acumula até exceder limite; imprime o excedente (LRU = menor atime/mtime)
+  local limit_bytes="$1"
+  [ "$limit_bytes" -le 0 ] && return 1
+  # Ordena por mtime ascendente via stat na hora (mais velho primeiro)
+  awk -v lim="$limit_bytes" -F'\t' '
+  function mtime(p,  t,cmd){ cmd="stat -c %Y \"" p "\" 2>/dev/null"; cmd|getline t; close(cmd); return t+0 }
+  { arr[NR]=$0; paths[NR]=$2; sizes[NR]=$1; ord[NR]=mtime($2) }
+  END{
+    # soma total
+    total=0; for(i=1;i<=NR;i++){ total+=sizes[i] }
+    if(total<=lim){ exit }
+    # ordena por ord asc
+    for(i=1;i<=NR;i++) for(j=i+1;j<=NR;j++) if(ord[i]>ord[j]){ tmp=ord[i]; ord[i]=ord[j]; ord[j]=tmp; ts=sizes[i]; sizes[i]=sizes[j]; sizes[j]=ts; tp=paths[i]; paths[i]=paths[j]; paths[j]=tp }
+    cur=total
+    for(i=1;i<=NR;i++){ if(cur<=lim) break; print sizes[i] "\t" paths[i]; cur-=sizes[i] }
+  }'
+}
+
+# ===== Apresentação =====
+print_candidates(){
+  # entrada: "size<TAB>path" ...
+  local total=0 n=0 line
+  while IFS=$'\t' read -r sz p; do
+    [ -z "$p" ] && continue
+    n=$((n+1)); total=$((total+sz))
+    if [ $EXPLAIN -eq 1 ]; then printf "%10d  %s\n" "$sz" "$p"; else printf "%s\n" "$p"; fi
+  done
+  echo "$n $total"
+}
+# ===== Escopo: cache-pkg =====
+clean_cache_pkg(){
+  log STEP "[cache-pkg] Iniciando"
+  local max_age="$MAX_AGE" keep="$KEEP_VERSIONS" max_size_bytes; max_size_bytes="$(size_to_bytes "$MAX_SIZE")"
+  local lines=() to_remove=()
+  while IFS='|' read -r pkg file mt sz; do
+    [ -f "$file" ] || continue
+    # aplicar keep versions por pacote
+    lines+=("$pkg|$file|$mt|$sz")
+  done < <(list_cache_pkg)
+
+  # por pacote, mantém N versões mais recentes por mtime
+  declare -A per_pkg=()
+  for it in "${lines[@]:-}"; do
+    per_pkg["${it%%|*}"]+="${it}"$'\n'
+  done
+
+  tmp_candidates="$(mktemp)"
+  for p in "${!per_pkg[@]}"; do
+    printf "%s" "${per_pkg[$p]}" | sort -t'|' -k3,3nr | awk -F'|' -v keep="$keep" 'NR>keep{print}' >> "$tmp_candidates"
+  done
+
+  # aplicar max-age
+  tmp_age="$(mktemp)"
+  while IFS='|' read -r pkg file mt sz; do
+    if older_than "$mt" "$max_age"; then echo -e "$sz\t$file" >> "$tmp_age"; fi
+  done < "$tmp_candidates"
+
+  # unir candidatos por keep e por age (evitar duplicata)
+  tmp_all="$(mktemp)"
+  cat "$tmp_candidates" | awk -F'|' '{print $4"\t"$2}' > "$tmp_all"
+  cat "$tmp_age" >> "$tmp_all"
+  sort -u -k2,2 "$tmp_all" > "${tmp_all}.u"
+
+  # se max-size definido, calcular excedente LRU
+  tmp_final="$(mktemp)"
+  if [ "$max_size_bytes" -gt 0 ]; then
+    # soma total atual
+    cur_total=0
+    while IFS='|' read -r pkg file mt sz; do cur_total=$((cur_total+sz)); done < <(list_cache_pkg)
+    if [ "$cur_total" -gt "$max_size_bytes" ]; then
+      # escolher os mais velhos para reduzir ao limite
+      list_cache_pkg | awk -F'|' '{print $4"\t"$2}' | choose_lru_to_fit_size "$max_size_bytes" >> "$tmp_final"
+    fi
+  fi
+  cat "${tmp_all}.u" >> "$tmp_final"
+  sort -u -k2,2 "$tmp_final" > "${tmp_final}.u"
+
+  # aplicar proteção e apresentar/remover
+  local removed=0 bytes=0
+  if [ -s "${tmp_final}.u" ]; then
+    [ $ESTIMATE -eq 1 ] && log INFO "[cache-pkg] (estimate) candidatos:"
+    read -r n tot <<<"$(print_candidates < "${tmp_final}.u")"
+    if [ "$n" -gt 0 ]; then
+      confirm_batch "$n" "[cache-pkg]" || { log INFO "Cancelado pelo usuário"; rm -f "$tmp_candidates" "$tmp_age" "$tmp_all" "${tmp_all}.u" "$tmp_final" "${tmp_final}.u"; return 0; }
+      while IFS=$'\t' read -r sz path; do
+        [ -z "$path" ] && continue
+        out="$(maybe_rm "$path")" || true
+        if [ $DRY_RUN -eq 1 ] || [ $ESTIMATE -eq 1 ]; then
+          bytes=$((bytes+sz)); removed=$((removed+1))
+        else
+          bytes=$((bytes+sz)); removed=$((removed+1))
+          # remover hash/assinatura órfã
+          rm -f "${path}.sha256" "${path}.sig" 2>/dev/null || true
+        fi
+      done < "${tmp_final}.u"
+    fi
+  fi
+  log OK "[cache-pkg] removidos=$removed bytes=$bytes"
+  rm -f "$tmp_candidates" "$tmp_age" "$tmp_all" "${tmp_all}.u" "$tmp_final" "${tmp_final}.u" || true
+}
+
+# ===== Escopo: cache-src =====
+clean_cache_src(){
+  log STEP "[cache-src] Iniciando"
+  local keep="$KEEP_SOURCE_VERS" max_age="$SOURCE_MAX_AGE" max_size_b; max_size_b="$(size_to_bytes "$SOURCE_MAX_SIZE")"
+  # refs ativas
+  declare -A keep_map=()
+  while IFS='|' read -r nm vr urls; do
+    [ -n "$nm" ] && [ -n "$vr" ] && keep_map["$nm|$vr"]=1
+  done < <(collect_active_sources || true)
+
+  tmp_candidates="$(mktemp)"
+  while IFS='|' read -r name ver dir mt sz; do
+    [ -d "$dir" ] || continue
+    # elegível se não referenciado por metafile/update E não há fingerprint óbvio
+    if [ -z "${keep_map["$name|$ver"]+x}" ]; then
+      # idade
+      if [ -n "$max_age" ] && older_than "$mt" "$max_age"; then
+        echo -e "$sz\t$dir" >> "$tmp_candidates"
+        continue
+      fi
+      # seleção por quantidade: mantém N versões mais novas por pacote
+      : # coletaremos por pacote abaixo
+    fi
+  done < <(list_cache_src || true)
+
+  # manter N versões por name
+  declare -A per_name=()
+  while IFS='|' read -r name ver dir mt sz; do
+    [ -d "$dir" ] || continue
+    per_name["$name"]+="$name|$ver|$dir|$mt|$sz"$'\n'
+  done < <(list_cache_src || true)
+
+  for n in "${!per_name[@]}"; do
+    # ordena por mtime desc e descarta além do keep, mas só os não referenciados
+    printf "%s" "${per_name[$n]}" | sort -t'|' -k4,4nr | awk -F'|' -v k="$keep" -v KMAP="$(declare -p keep_map 2>/dev/null)" '
+      BEGIN{ eval(KMAP) }
+      {
+        key=$1 "|" $2
+        if(!keep_map[key]) arr[++i]=$0
+      }
+      END{
+        for(j=k+1;j<=i;j++){
+          split(arr[j],a,"|")
+          print a[5] "\t" a[3]
+        }
+      }' >> "$tmp_candidates"
+  done
+
+  # max size LRU
+  tmp_final="$(mktemp)"
+  if [ "$max_size_b" -gt 0 ]; then
+    total=0
+    while IFS='|' read -r _ _ dir _ sz; do total=$((total+sz)); done < <(list_cache_src || true)
+    if [ "$total" -gt "$max_size_b" ]; then
+      list_cache_src | awk -F'|' '{print $5"\t"$3}' | choose_lru_to_fit_size "$max_size_b" >> "$tmp_final"
+    fi
+  fi
+  cat "$tmp_candidates" >> "$tmp_final" || true
+  sort -u -k2,2 "$tmp_final" > "${tmp_final}.u"
+
+  local removed=0 bytes=0
+  if [ -s "${tmp_final}.u" ]; then
+    [ $ESTIMATE -eq 1 ] && log INFO "[cache-src] (estimate) candidatos:"
+    read -r n tot <<<"$(print_candidates < "${tmp_final}.u")"
+    if [ "$n" -gt 0 ]; then
+      confirm_batch "$n" "[cache-src]" || { log INFO "Cancelado pelo usuário"; rm -f "$tmp_candidates" "$tmp_final" "${tmp_final}.u"; return 0; }
+      while IFS=$'\t' read -r sz path; do
+        [ -z "$path" ] && continue
+        out="$(maybe_rm "$path")" || true
+        bytes=$((bytes+sz)); removed=$((removed+1))
+      done < "${tmp_final}.u"
+    fi
+  fi
+  log OK "[cache-src] removidos=$removed bytes=$bytes"
+  rm -f "$tmp_candidates" "$tmp_final" "${tmp_final}.u" || true
+}
+
+# ===== Escopo: work =====
+clean_work(){
+  log STEP "[work] Iniciando"
+  local removed=0 bytes=0
+  # se PURGE_WORK: remove tudo exceto possíveis locks
+  if [ $PURGE_WORK -eq 1 ]; then
+    find "$ADM_WORK" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while read -r d; do
+      [ -d "$d" ] || continue
+      if [ $PRESERVE_DETECT_LOGS -eq 1 ]; then
+        # remove tudo menos detect e logs
+        while IFS= read -r -d '' it; do
+          base="$(basename "$it")"
+          [[ "$base" =~ ^(detect|logs)$ ]] && continue
+          out="$(maybe_rm "$it")" || true
+          if [ $DRY_RUN -eq 1 ] || [ $ESTIMATE -eq 1 ]; then sz="$(du_bytes "$it" 2>/dev/null || echo 0)"; bytes=$((bytes+sz)); removed=$((removed+1)); fi
+        done < <(find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+      else
+        sz="$(du_bytes "$d" 2>/dev/null || echo 0)"
+        out="$(maybe_rm "$d")" || true
+        bytes=$((bytes+sz)); removed=$((removed+1))
+      fi
+    done
+    log OK "[work] removidos=$removed bytes=$bytes (purge)"
+    return 0
+  fi
+  # Caso normal: remove workdirs com fingerprints concluídos
+  case "${ADM_STATES:+set}" in set) true;; *) log WARN "[work] states ausente; pulando"; return 0;; esac
+  find "$ADM_WORK" -mindepth 2 -maxdepth 2 -type d 2>/dev/null | while read -r d; do
+    pkg="$(basename "$d")"; name="${pkg%-*}"; ver="${pkg##*-}"
+    fp1="${ADM_STATES}/built/${name}-${ver}.fingerprint"
+    fp2="${ADM_STATES}/built-chroot/${name}-${ver}.fingerprint"
+    [ -f "$fp1" ] || [ -f "$fp2" ] || continue
+    if [ $PRESERVE_DETECT_LOGS -eq 1 ]; then
+      while IFS= read -r -d '' it; do
+        base="$(basename "$it")"
+        [[ "$base" =~ ^(detect|logs)$ ]] && continue
+        sz="$(du_bytes "$it" 2>/dev/null || echo 0)"
+        out="$(maybe_rm "$it")" || true
+        bytes=$((bytes+sz)); removed=$((removed+1))
+      done < <(find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    else
+      sz="$(du_bytes "$d" 2>/dev/null || echo 0)"
+      out="$(maybe_rm "$d")" || true
+      bytes=$((bytes+sz)); removed=$((removed+1))
+    fi
+  done
+  log OK "[work] removidos=$removed bytes=$bytes"
+}
+# ===== Escopo: logs =====
+clean_logs(){
+  log STEP "[logs] Iniciando"
+  local removed=0 bytes=0 max_age="$LOGS_MAX_AGE" keep="$LOGS_KEEP"
+  # rotaciona/compacta logs antigos
+  for f in "$ADM_LOGS"/*.log "$ADM_LOGS"/*/*.log 2>/dev/null; do
+    [ -f "$f" ] || continue
+    if [ -n "$max_age" ] && older_than "$(stat -c %Y "$f" 2>/dev/null || echo 0)" "$max_age"; then
+      if [ $DRY_RUN -eq 1 ] || [ $ESTIMATE -eq 1 ]; then
+        sz="$(du_bytes "$f")"; printf "%s\t%s\n" "$sz" "$f"
+      else
+        gzip -f9 "$f" || true
+      fi
+    fi
+  done
+  # manter N por componente
+  for d in "$ADM_LOGS" "$ADM_LOGS"/*; do
+    [ -d "$d" ] || continue
+    ls -1t "$d"/*.log.gz 2>/dev/null | tail -n +"$((keep+1))" | while read -r f; do
+      sz="$(du_bytes "$f" 2>/dev/null || echo 0)"
+      out="$(maybe_rm "$f")" || true
+      bytes=$((bytes+sz)); removed=$((removed+1))
+    done
+  done
+  log OK "[logs] removidos=$removed bytes=$bytes"
+}
+
+# ===== Escopo: updates =====
+clean_updates(){
+  log STEP "[updates] Iniciando"
+  local removed=0 bytes=0 keep="$KEEP_UPDATES" max_age="$UPDATES_MAX_AGE"
+  declare -A per_name=()
+  while IFS='|' read -r name mf mt sz; do
+    per_name["$name"]+="$name|$mf|$mt|$sz"$'\n'
+  done < <(list_updates || true)
+
+  tmp="$(mktemp)"
+  for n in "${!per_name[@]}"; do
+    printf "%s" "${per_name[$n]}" | sort -t'|' -k3,3nr | awk -F'|' -v k="$keep" 'NR>k{print $0}' >> "$tmp"
+    if [ -n "$max_age" ]; then
+      printf "%s" "${per_name[$n]}" | while IFS='|' read -r name mf mt sz; do
+        older_than "$mt" "$max_age" && echo "$name|$mf|$mt|$sz"
+      done >> "$tmp"
+    fi
+  done
+
+  sort -u "$tmp" | while IFS='|' read -r name mf mt sz; do
+    [ -f "$mf" ] || continue
+    # se PRUNE_PROMOTED: compara com metafile oficial (se idêntico, pode remover)
+    if [ $PRUNE_PROMOTED -eq 1 ]; then
+      official="$(find "$ADM_META" -type f -path "*/${name}/metafile" -print -quit 2>/dev/null || true)"
+      if [ -n "$official" ] && cmp -s "$official" "$mf"; then
+        sz2="$(du_bytes "$mf" 2>/dev/null || echo 0)"
+        out="$(maybe_rm "$mf")" || true
+        bytes=$((bytes+sz2)); removed=$((removed+1))
+        rdir="$(dirname "$mf")"; rtry="$(rmdir "$rdir" 2>/dev/null || true)"
+        continue
+      fi
+    fi
+    # candidato genérico
+    sz2="$(du_bytes "$mf" 2>/dev/null || echo 0)"
+    out="$(maybe_rm "$mf")" || true
+    bytes=$((bytes+sz2)); removed=$((removed+1))
+    rdir="$(dirname "$mf")"; rmdir "$rdir" 2>/dev/null || true
+  done
+  rm -f "$tmp" || true
+  log OK "[updates] removidos=$removed bytes=$bytes"
+}
+
+# ===== Escopo: states =====
+clean_states(){
+  log STEP "[states] Iniciando"
+  local removed=0 bytes=0
+  # backups antigos
+  if [ -d "${ADM_STATES}/db/backup" ]; then
+    ls -1t "${ADM_STATES}/db/backup" 2>/dev/null | tail -n +"$((KEEP_BACKUPS+1))" | while read -r d; do
+      p="${ADM_STATES}/db/backup/$d"; sz="$(du_bytes "$p" 2>/dev/null || echo 0)"
+      out="$(maybe_rm "$p")" || true; bytes=$((bytes+sz)); removed=$((removed+1))
+    done
+  fi
+  # txn antigos
+  if [ -n "$TXN_MAX_AGE" ] && [ -d "${ADM_STATES}/db/txn" ]; then
+    find "${ADM_STATES}/db/txn" -type f -name '*.log' 2>/dev/null | while read -r f; do
+      mt="$(stat -c %Y "$f" 2>/dev/null || echo 0)"; if older_than "$mt" "$TXN_MAX_AGE"; then
+        sz="$(du_bytes "$f" 2>/dev/null || echo 0)"; out="$(maybe_rm "$f")" || true
+        bytes=$((bytes+sz)); removed=$((removed+1))
+      fi
+    done
+  fi
+  # rebuild owners
+  if [ $REBUILD_OWNERS -eq 1 ]; then
+    omap="${ADM_STATES}/db/owners.map"
+    : > "${omap}.new"
+    for fl in "${ADM_STATES}/db/files"/*.list 2>/dev/null; do
+      [ -f "$fl" ] || continue
+      name="$(basename "$fl" .list)"
+      cut -d' ' -f2- "$fl" | while read -r rel; do
+        [ -z "$rel" ] && continue
+        echo "$rel $name" >> "${omap}.new"
+      done
+    done
+    if [ $DRY_RUN -eq 1 ] || [ $ESTIMATE -eq 1 ]; then
+      log INFO "[states] (dry-run) owners.map reconstruído virtualmente"
+    else
+      mv -f "${omap}.new" "$omap"
+      log OK "[states] owners.map reconstruído"
+    fi
+  fi
+  log OK "[states] removidos=$removed bytes=$bytes"
+}
+
+# ===== Escopo: meta-orphans =====
+clean_meta_orphans(){
+  log STEP "[meta-orphans] Iniciando"
+  local removed=0 bytes=0
+  # patches/hooks que não pertencem a nenhum pacote com metafile
+  find "$ADM_META" -mindepth 2 -maxdepth 3 -type d \( -name patches -o -name hooks \) 2>/dev/null | while read -r d; do
+    pkgdir="$(dirname "$d")"
+    [ -f "${pkgdir}/metafile" ] && continue
+    sz="$(du_bytes "$d" 2>/dev/null || echo 0)"
+    out="$(maybe_rm "$d")" || true
+    bytes=$((bytes+sz)); removed=$((removed+1))
+  done
+  log OK "[meta-orphans] removidos=$removed bytes=$bytes"
+}
+
+# ===== Escopo: plans =====
+clean_plans(){
+  log STEP "[plans] Iniciando"
+  local removed=0 bytes=0 max_age="$PLANS_MAX_AGE"
+  list_plans | while IFS='|' read -r f mt sz; do
+    [ -e "$f" ] || continue
+    if [ -n "$max_age" ] && older_than "$mt" "$max_age"; then
+      out="$(maybe_rm "$f")" || true
+      bytes=$((bytes+sz)); removed=$((removed+1))
+    fi
+  done
+  log OK "[plans] removidos=$removed bytes=$bytes"
+}
+
+# ===== Orquestração =====
+run_scopes(){
+  local any=0
+  for s in "${SCOPES[@]}"; do
+    case "$s" in
+      all) clean_cache_pkg; clean_cache_src; clean_work; clean_logs; clean_updates; clean_states; clean_meta_orphans; clean_plans; any=1;;
+      cache-pkg) clean_cache_pkg; any=1;;
+      cache-src) clean_cache_src; any=1;;
+      work) clean_work; any=1;;
+      logs) clean_logs; any=1;;
+      updates) clean_updates; any=1;;
+      states) clean_states; any=1;;
+      meta-orphans) clean_meta_orphans; any=1;;
+      plans) clean_plans; any=1;;
+    esac
+  done
+  [ $any -eq 1 ] || log WARN "Nenhum escopo executado"
+}
+
+# ===== Main =====
+main(){
+  parse_args "$@"
+  log INFO "Iniciando ${SELF} v${VER} (rootbase=$ROOT_BASE)"
+  run_scopes
+  log OK "adm-clean concluído."
+  [ $PRINT -eq 1 ] && echo "OK" >&3
+}
+main "$@"
+
+# restaurar stdout
+exec 1>&3 3>&-
