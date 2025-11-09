@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# gcc-stage0: pre-configure
+# Configura GCC pass1 (C only, without headers, sem libs extras)
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+# Baixa/instala prerequisites opcionais (mpfr/gmp/mpc/isl) se o tarball não tiver:
+# Para stage0, preferimos usar "in-tree" se disponíveis, senão confiar nos do host.
+# (Sem erro se ausentes; o configure vai guiar.)
+for lib in gmp mpfr mpc isl; do
+  [ -d "$lib" ] || true
+done
+
+export CFLAGS="${CFLAGS_STAGE0:--O2 -g0 -fno-plt -U_FORTIFY_SOURCE}"
+export CXXFLAGS="${CXXFLAGS_STAGE0:--O2 -g0 -fno-plt -U_FORTIFY_SOURCE}"
+export LDFLAGS="${LDFLAGS_STAGE0:--Wl,--as-needed}"
+
+conf_args=(
+  --prefix=/usr
+  --target="${TARGET_TRIPLET:-$(uname -m)-pc-linux-gnu}"
+  --host="${HOST_TRIPLET:-$(uname -m)-pc-linux-gnu}"
+  --build="${BUILD_TRIPLET:-$(uname -m)-pc-linux-gnu}"
+  --with-sysroot="${SYSROOT:-/}"
+  --disable-nls
+  --disable-multilib
+  --disable-libssp
+  --disable-libgomp
+  --disable-libquadmath
+  --disable-libatomic
+  --disable-libvtv
+  --disable-libstdcxx
+  --disable-libstdc++-v3
+  --disable-shared
+  --without-headers
+  --enable-languages=c
+)
+
+mkdir -p "${ADM_BUILD_DIR}"
+cd "${ADM_BUILD_DIR}"
+"${ADM_WORK_DIR}/configure" "${conf_args[@]}"
