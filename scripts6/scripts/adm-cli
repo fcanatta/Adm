@@ -1,0 +1,721 @@
+#!/usr/bin/env bash
+# adm-cli — orquestrador com TUI (gum/whiptail/dialog) + CLI
+# - init/bootstrap/plan/detect/build/install/update/mkinitrsmfs/clean/info/search/list/help
+# - install por nome (metafile) resolvendo deps → binário do cache OU build
+# - install --bin --bin-dir: instala binários do cache/dir; se faltar dep, pode construir (fallback)
+# - TUI para navegar comandos rapidamente
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.2.0"
+
+# ===================== Cores / Log =====================
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"; C_MAG="\033[35m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ # level msg...
+  local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-cli.log"; exit 2' ERR
+
+# ===================== Paths / Defaults =====================
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_META="${ADM_META:-${ROOT_BASE}/metafiles}"
+ADM_UPDATE="${ADM_UPDATE:-${ROOT_BASE}/update}"
+ADM_SOURCES="${ADM_SOURCES:-${ROOT_BASE}/sources}"
+ADM_WORK="${ADM_WORK:-${ROOT_BASE}/work}"
+ADM_CACHE_PKG="${ADM_CACHE_PKG:-${ROOT_BASE}/cache/pkg}"
+ADM_STATES="${ADM_STATES:-${ROOT_BASE}/states}"
+
+mkdir -p "$ADM_LOGS"
+exec 3>> "${ADM_LOGS}/adm-cli.log"  # FD 3 para log adicional
+# não redirecionamos stdout/stderr para manter interatividade do TUI
+
+# ===================== Descoberta de TUI =====================
+has(){ command -v "$1" >/dev/null 2>&1; }
+TUI_MODE="none" # gum|whiptail|dialog|none
+if has gum; then TUI_MODE="gum"
+elif has whiptail; then TUI_MODE="whiptail"
+elif has dialog; then TUI_MODE="dialog"
+else TUI_MODE="none"
+fi
+
+# ===================== Helpers genéricos =====================
+ensure_dir(){ mkdir -p "$1"; }
+trim(){ sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//' ; }
+join_csv(){ local IFS=','; echo "$*"; }
+mf_field(){ awk -F'=' -v K="$1" '$0!~/^#/ && $0~"=" {k=$1; gsub(/[[:space:]]/,"",k); if(k==K){$1="";sub(/^=/,"");print;exit}}' 2>/dev/null; }
+die_usage(){ echo; usage >&2; exit 2; }
+
+# ===================== TUI Wrappers =====================
+tui_title(){ case "$TUI_MODE" in
+  gum) gum style --foreground 212 --border double --margin "1 2" --padding "1 2" --bold "$1" ;;
+  whiptail) whiptail --title "$1" --msgbox "" 8 40 ;;
+  dialog) dialog --title "$1" --msgbox "" 8 40 ;;
+  none) printf "\n%s%s%s\n" "$B" "$1" "$R" ;;
+esac; }
+
+tui_menu(){ # title; items as "key:label" per line; echo chosen key
+  local title="$1"; shift || true
+  local items=("$@")
+  case "$TUI_MODE" in
+    gum)
+      gum style --foreground 212 --bold "$title" >/dev/null
+      printf "%s\n" "${items[@]}" | awk -F':' '{printf "%s\t%s\n",$1,$2}' | gum choose --header "$title" --no-limit=false --height 20 --cursor.foreground="#00ffff" --selected.foreground="#00ff00" | cut -f1
+      ;;
+    whiptail)
+      local opts=(); local k v
+      for i in "${items[@]}"; do k="${i%%:*}"; v="${i#*:}"; opts+=("$k" "$v"); done
+      whiptail --title "$title" --menu "" 20 78 12 "${opts[@]}" 3>&1 1>&2 2>&3
+      ;;
+    dialog)
+      local opts=(); local k v
+      for i in "${items[@]}"; do k="${i%%:*}"; v="${i#*:}"; opts+=("$k" "$v"); done
+      dialog --title "$title" --menu "" 20 78 12 "${opts[@]}" 3>&1 1>&2 2>&3
+      ;;
+    none)
+      echo "$title"
+      local idx=1; for i in "${items[@]}"; do echo " [$idx] ${i#*:}"; idx=$((idx+1)); done
+      read -r -p "Escolha [1-${#items[@]}]: " n || true
+      if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "${#items[@]}" ]; then
+        echo "${items[$((n-1))]%%:*}"
+      fi
+      ;;
+  esac
+}
+
+tui_input(){ # title default
+  local title="$1" def="${2:-}"
+  case "$TUI_MODE" in
+    gum) gum input --placeholder "$def" --header "$title" ;;
+    whiptail) whiptail --title "$title" --inputbox "" 10 70 "$def" 3>&1 1>&2 2>&3 ;;
+    dialog) dialog --title "$title" --inputbox "" 10 70 "$def" 3>&1 1>&2 2>&3 ;;
+    none) read -r -p "$title: " val || true; echo "${val:-$def}" ;;
+  esac
+}
+
+tui_confirm(){ # title
+  local title="$1"
+  case "$TUI_MODE" in
+    gum) gum confirm "$title" && echo yes || echo no ;;
+    whiptail) whiptail --yesno "$title" 8 60 && echo yes || echo no ;;
+    dialog) dialog --yesno "$title" 8 60 && echo yes || echo no ;;
+    none) read -r -p "$title [y/N]: " a || true; [[ "$a" =~ ^[Yy]$ ]] && echo yes || echo no ;;
+  esac
+}
+
+tui_info(){ # message
+  local msg="$1"
+  case "$TUI_MODE" in
+    gum) gum style --border normal --margin "1 2" --padding "1 2" --foreground 250 "$msg" ;;
+    whiptail) whiptail --msgbox "$msg" 12 80 ;;
+    dialog) dialog --msgbox "$msg" 12 80 ;;
+    none) echo -e "$msg" ;;
+  esac
+}
+
+# ===================== Uso =====================
+usage(){
+cat <<EOF
+${SELF} v${VER}
+
+Uso: ${SELF} <comando> [args] [opções globais]
+
+Comandos:
+  menu                   Abre menu TUI
+  init                   Encaminha para adm-init
+  bootstrap:host         Encaminha para adm-bootstrap-host
+  bootstrap:chroot       Encaminha para adm-bootstrap-chroot
+  plan                   Encaminha para adm-plan
+  detect                 Encaminha para adm-detect
+  build                  Encaminha para adm-build
+  install                Instala por nome (metafile) com deps (binário ou build)
+  install-bin            Atalho: instala usando binários do cache/dir
+  update                 Encaminha para adm-update
+  mkinitrsmfs            Encaminha para adm-mkinitrsmfs
+  clean                  Encaminha para adm-clean
+  info                   Mostra informações de programa/metafile/instalado
+  search                 Busca por nome/descrição/categoria
+  list                   Lista programas disponíveis (metafiles)
+  graph                  Mostra último plano (graphviz / explain)
+  help [cmd|--all]       Ajuda geral ou de um subcomando
+
+Opções globais (repassadas quando aplicável):
+  --root=DIR             Root alvo (default: /)
+  --target=host|chroot   Alvo lóg. para bootstrap/install
+  --jobs=N               Paralelismo de build
+  --profile=minimum|normal|aggressive|glibc|musl
+  --libc=glibc|musl
+  --strict               Modo estrito
+  --dry-run              Simulação
+  --verbose              Verbosidade
+  --color=auto|always|never
+
+Instalação (atalhos principais):
+  ${SELF} install <name> [--version=X] [--prefer-bin|--prefer-build] [--fallback=build|skip] [--strict-deps]
+  ${SELF} install --bin-dir=/path [--fallback=build|skip] [--strict-deps]
+  ${SELF} install-bin <name> [--version=X] [--fallback=build|skip] [--strict-deps]
+
+TUI:
+  ${SELF} menu
+
+EOF
+}
+
+# ===================== Globais de contexto =====================
+ROOT="/"
+TARGET=""
+JOBS="${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+PROFILE=""
+LIBC=""
+STRICT=0
+DRY_RUN=0
+VERBOSE=0
+COLOR_OPT="$COLOR_MODE"
+PREFER_MODE=""     # prefer-bin | prefer-build
+FALLBACK_MODE="build"  # build | skip
+
+# ===================== Parse Inicial (globais + comando) =====================
+CMD="${1:-}"
+shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root=*) ROOT="${1#*=}";;
+    --target=*) TARGET="${1#*=}";;
+    --jobs=*) JOBS="${1#*=}";;
+    --profile=*) PROFILE="${1#*=}";;
+    --libc=*) LIBC="${1#*=}";;
+    --strict) STRICT=1;;
+    --dry-run) DRY_RUN=1;;
+    --verbose) VERBOSE=1;;
+    --color=*) COLOR_OPT="${1#*=}";;
+    --prefer-bin) PREFER_MODE="prefer-bin";;
+    --prefer-build) PREFER_MODE="prefer-build";;
+    --fallback=*) FALLBACK_MODE="${1#*=}";;
+    --) shift; break;;
+    -*)
+      log WARN "Opção global desconhecida: $1"
+      ;;
+    *) break;;
+  esac
+  shift || true
+done
+[[ "$COLOR_OPT" =~ ^(auto|always|never)$ ]] || COLOR_OPT="auto"
+COLOR_MODE="$COLOR_OPT"
+
+# ===================== Checagens de ferramentas núcleo =====================
+need(){ has "$1" || fatal "Ferramenta obrigatória ausente: $1"; }
+need awk; need sed; need find; need grep
+# scripts satélites opcionalmente faltam; checaremos ao usar
+# ===================== Descoberta de scripts satélites =====================
+find_script(){ # nome -> path
+  # tenta PATH, depois /usr/src/adm/scripts (ou variações)
+  local n="$1" p
+  if command -v "$n" >/dev/null 2>&1; then command -v "$n"; return 0; fi
+  for d in "$ROOT_BASE/scripts" "$ROOT_BASE/scripts6/scripts" "$ROOT_BASE/bin" ; do
+    p="$d/$n"; [ -x "$p" ] && { echo "$p"; return 0; }
+  done
+  echo ""
+}
+S_INIT="$(find_script adm-init)"
+S_BOOT_HOST="$(find_script adm-bootstrap-host)"
+S_BOOT_CHROOT="$(find_script adm-bootstrap-chroot)"
+S_PLAN="$(find_script adm-plan)"
+S_DETECT="$(find_script adm-detect)"
+S_BUILD="$(find_script adm-build)"
+S_INSTALL="$(find_script adm-install)"
+S_UPDATE="$(find_script adm-update)"
+S_MKINIT="$(find_script adm-mkinitrsmfs)"
+S_CLEAN="$(find_script adm-clean)"
+
+# ===================== Exec wrappers =====================
+run(){ # executa e propaga flags globais onde fizer sentido
+  local bin="$1"; shift || true
+  [ -x "$bin" ] || fatal "Script não encontrado/exec: $bin"
+  log STEP "Exec: $bin $*"
+  "$bin" "$@"
+}
+pass_common(){ # converte flags globais para lista
+  local a=()
+  [ -n "$ROOT" ] && a+=("--root=$ROOT")
+  [ -n "$TARGET" ] && a+=("--target=$TARGET")
+  [ -n "$PROFILE" ] && a+=("--profile=$PROFILE")
+  [ -n "$LIBC" ] && a+=("--libc=$LIBC")
+  [ "$STRICT" -eq 1 ] && a+=("--strict")
+  [ "$DRY_RUN" -eq 1 ] && a+=("--dry-run")
+  [ "$VERBOSE" -eq 1 ] && a+=("--verbose")
+  echo "${a[@]}"
+}
+
+# ===================== Metafiles / Catálogo =====================
+find_metafile_by_name(){ # name [category] -> path or empty
+  local name="$1" cat="${2:-}" p
+  if [ -n "$cat" ]; then
+    p="${ADM_META}/${cat}/${name}/metafile"
+    [ -f "$p" ] && { echo "$p"; return 0; }
+    echo ""; return 1
+  fi
+  # qualquer categoria
+  find "$ADM_META" -mindepth 2 -maxdepth 2 -type f -path "*/${name}/metafile" -print -quit 2>/dev/null || true
+}
+list_all_metafiles(){ find "$ADM_META" -mindepth 2 -maxdepth 2 -type f -name metafile 2>/dev/null || true; }
+get_field(){ local f="$1" k="$2"; mf_field "$k" < "$f" | trim; }
+
+# ===================== Busca / Info / List =====================
+cmd_search(){
+  local query="$1"; shift || true
+  local category=""; local regex=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category=*) category="${1#*=}";;
+      --regex) regex=1;;
+      *) log WARN "Flag desconhecida: $1";;
+    esac; shift || true
+  done
+  local mf
+  list_all_metafiles | while read -r mf; do
+    local n v c d h
+    n="$(get_field "$mf" name)"; v="$(get_field "$mf" version)"
+    c="$(basename "$(dirname "$mf")")"
+    d="$(get_field "$mf" description)"
+    h="$(get_field "$mf" homepage)"
+    [ -n "$category" ] && [ "$c" != "$category" ] && continue
+    local hay="$n $c $d $h"
+    if [ $regex -eq 1 ]; then
+      echo "$hay" | grep -Eiq "$query" || continue
+    else
+      echo "$hay" | grep -iq "$query" || continue
+    fi
+    echo "$c/$n - $d - v$v"
+  done
+}
+cmd_list(){
+  local category=""; local installed=0; local not_inst=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category=*) category="${1#*=}";;
+      --installed) installed=1;;
+      --not-installed) not_inst=1;;
+      *) log WARN "Flag desconhecida: $1";;
+    esac; shift || true
+  done
+  local mf
+  list_all_metafiles | while read -r mf; do
+    local c n v; c="$(basename "$(dirname "$mf")")"; [ -n "$category" ] && [ "$c" != "$category" ] && continue
+    n="$(get_field "$mf" name)"; v="$(get_field "$mf" version)"
+    if [ $installed -eq 1 ] || [ $not_inst -eq 1 ]; then
+      if [ -f "${ADM_STATES}/db/installed/${n}.json" ]; then
+        [ $installed -eq 1 ] && echo "$c/$n $v (INSTALADO)"
+      else
+        [ $not_inst -eq 1 ] && echo "$c/$n $v"
+      fi
+    else
+      echo "$c/$n $v"
+    fi
+  done | sort
+}
+cmd_info(){
+  local name="" cat="" show_inst=0 show_files=0 show_deps=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --category=*) cat="${1#*=}";;
+      --installed) show_inst=1;;
+      --files) show_files=1;;
+      --deps) show_deps=1;;
+      *) [ -z "$name" ] && name="$1" || log WARN "Arg extra ignorado: $1";;
+    esac; shift || true
+  done
+  [ -n "$name" ] || die_usage
+  local mf; mf="$(find_metafile_by_name "$name" "$cat" || true)"
+  [ -n "$mf" ] || fatal "Metafile de '$name' não encontrado"
+  local v c d h m r b o s
+  c="$(basename "$(dirname "$mf")")"
+  v="$(get_field "$mf" version)"; d="$(get_field "$mf" description)"
+  h="$(get_field "$mf" homepage)"; m="$(get_field "$mf" maintainer)"
+  r="$(get_field "$mf" run_deps)"; b="$(get_field "$mf" build_deps)"; o="$(get_field "$mf" opt_deps)"
+  s="$(get_field "$mf" sources)"
+  echo "Metafile: $mf"
+  echo "name=$name"; echo "version=$v"; echo "category=$c"
+  echo "description=$d"; echo "homepage=$h"; echo "maintainer=$m"
+  echo "run_deps=${r}"; echo "build_deps=${b}"; echo "opt_deps=${o}"
+  echo "sources=$s"
+  if [ $show_inst -eq 1 ]; then
+    local im="${ADM_STATES}/db/installed/${name}.json"
+    if [ -f "$im" ]; then
+      echo; echo "== INSTALADO =="; cat "$im"
+    else
+      echo; echo "Não instalado."
+    fi
+  fi
+  if [ $show_files -eq 1 ]; then
+    local fl="${ADM_STATES}/db/files/${name}.list"
+    if [ -f "$fl" ]; then
+      echo; echo "== FILES =="; cut -d' ' -f2- "$fl"
+    else
+      echo; echo "Sem lista de arquivos instalada."
+    fi
+  fi
+  if [ $show_deps -eq 1 ]; then
+    echo; echo "== DEPS (run/build/opt) =="; echo "$r"; echo "$b"; echo "$o"
+  fi
+}
+
+# ===================== Plan/Graph Helpers =====================
+last_plan_dir(){ ls -1dt "${ADM_STATES}/plan"/* 2>/dev/null | head -n1 || true; }
+show_graph(){
+  local d; d="$(last_plan_dir)"
+  [ -n "$d" ] || fatal "Nenhum plano encontrado"
+  if [ -f "${d}/graph.dot" ]; then
+    echo "Graphviz: ${d}/graph.dot"
+  else
+    echo "Sem graph.dot; gere com adm-plan --graphviz"
+  fi
+}
+
+# ===================== mkinitrsmfs trigger =====================
+maybe_mkinit_after_install(){ # pkgname
+  local name="$1"
+  # heurística: se pacote parece kernel ou módulos foram tocados, dispara mkinit
+  if [[ "$name" =~ ^(linux|kernel|linux-kernel|linux-headers|linux-modules) ]]; then
+    [ -n "$S_MKINIT" ] && run "$S_MKINIT" "$(pass_common)" || true
+    return 0
+  fi
+  # se existe /lib/modules com mtime muito recente (últimos 2m), também dispara
+  local recent="$(find "${ROOT%/}/lib/modules" -type d -mmin -2 2>/dev/null | head -n1 || true)"
+  [ -n "$recent" ] && [ -n "$S_MKINIT" ] && run "$S_MKINIT" "$(pass_common)" || true
+}
+# ===================== Resolver estratégia: BIN vs BUILD =====================
+find_cached_pkg(){ # name [version] -> path or empty
+  local n="$1" v="${2:-}" dir="${ADM_CACHE_PKG}/${n}"
+  [ -d "$dir" ] || return 1
+  local pat
+  if [ -n "$v" ]; then pat="${dir}/${n}-${v}-*.tar.*"
+  else pat="${dir}/${n}-*.tar.*"
+  fi
+  ls -1t $pat 2>/dev/null | head -n1 || true
+}
+
+compat_ok_with_target(){ # pkgpath -> 0/1 (checagem best-effort por nome)
+  local f="$(basename "$1")"
+  # heurística: se nome contém musl/glibc; se LIBC definido, tenta casar
+  if [[ "$f" =~ musl ]] && [ "$LIBC" = "glibc" ]; then return 1; fi
+  if [[ "$f" =~ glibc ]] && [ "$LIBC" = "musl" ]; then return 1; fi
+  return 0
+}
+
+install_from_cache_or_build(){ # name version prefer fallback strict_deps
+  local n="$1" v="${2:-}" prefer="$3" fallback="$4" strict="$5"
+  local pkg=""
+  if [ "$prefer" = "prefer-bin" ] || [ "$prefer" = "bin" ]; then
+    pkg="$(find_cached_pkg "$n" "$v" || true)"
+    if [ -n "$pkg" ] && compat_ok_with_target "$pkg"; then
+      run "$S_INSTALL" install "$pkg" $(pass_common) || return $?
+      maybe_mkinit_after_install "$n"
+      return 0
+    else
+      if [ "$fallback" = "build" ]; then
+        run "$S_BUILD" --only="$n" $(pass_common) --jobs="$JOBS"
+        # após build, instalar do cache
+        pkg="$(find_cached_pkg "$n" "$v" || true)"
+        [ -n "$pkg" ] || fatal "Build OK mas pacote não apareceu no cache: $n"
+        run "$S_INSTALL" install "$pkg" $(pass_common)
+        maybe_mkinit_after_install "$n"
+        return 0
+      else
+        [ "$strict" -eq 1 ] && fatal "Binário não disponível/compatível para $n e fallback=skip" || return 0
+      fi
+    fi
+  else
+    # prefer-build
+    run "$S_BUILD" --only="$n" $(pass_common) --jobs="$JOBS"
+    pkg="$(find_cached_pkg "$n" "$v" || true)"
+    [ -n "$pkg" ] || fatal "Build OK mas pacote não apareceu no cache: $n"
+    run "$S_INSTALL" install "$pkg" $(pass_common)
+    maybe_mkinit_after_install "$n"
+  fi
+}
+
+# ===================== Plan/Install por nome (com deps) =====================
+plan_for_name(){ # name [version] -> plan_dir
+  local n="$1" v="${2:-}"
+  [ -n "$S_PLAN" ] || fatal "adm-plan não encontrado"
+  local extra=()
+  [ -n "$v" ] && extra+=("--pin-version=$v") # se seu adm-plan suportar pin, senão ignora
+  run "$S_PLAN" --only="$n" --explain-all --graphviz "${extra[@]}" $(pass_common) || fatal "Falha no planejamento"
+  last_plan_dir
+}
+
+# lê order.list do plano e devolve lista de pacotes (dependências antes do alvo)
+read_plan_order(){ # plan_dir
+  local d="$1"
+  [ -f "${d}/order.list" ] || fatal "Plano sem order.list: $d"
+  cat "${d}/order.list" | sed '/^#/d;/^$/d'
+}
+
+cmd_install(){
+  [ -n "$S_INSTALL" ] || fatal "adm-install não encontrado"
+  [ -n "$S_BUILD" ] || fatal "adm-build não encontrado"
+  [ -n "$S_PLAN" ] || fatal "adm-plan não encontrado"
+
+  local name="" version="" use_bin=0 bin_dir="" strict_deps=0 prefer="${PREFER_MODE:-prefer-build}" fallback="${FALLBACK_MODE}"
+  # Parse específico do install
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --bin) use_bin=1; prefer="prefer-bin";;
+      --bin-dir=*) bin_dir="${1#*=}";;
+      --version=*) version="${1#*=}";;
+      --strict-deps) strict_deps=1;;
+      --prefer-bin) prefer="prefer-bin";;
+      --prefer-build) prefer="prefer-build";;
+      --fallback=*) fallback="${1#*=}";;
+      --category=*) : ;; # aceitamos mas resolvemos pelo nome
+      --*) log WARN "Flag desconhecida em install: $1";;
+      *) [ -z "$name" ] && name="$1" || log WARN "Arg extra ignorado: $1";;
+    esac; shift || true
+  done
+
+  if [ -n "$bin_dir" ] && [ -z "$name" ]; then
+    # modo multi a partir de diretório: indexa, resolve deps, instala o máximo e constrói o que faltar
+    [ -d "$bin_dir" ] || fatal "--bin-dir não é diretório"
+    log STEP "Indexando binários em $bin_dir"
+    # preparar mapa: name → path mais recente
+    declare -A BINIDX=()
+    while read -r f; do
+      base="$(basename "$f")"
+      pkg="${base%%-*}"
+      BINIDX["$pkg"]="$f"
+    done < <(ls -1 "$bin_dir"/*.tar.* 2>/dev/null || true)
+    [ "${#BINIDX[@]}" -gt 0 ] || fatal "Nenhum pacote .tar.* em $bin_dir"
+    # instalar todos, respeitando dependências simplificadas via adm-install (confia que ele valida deps)
+    for pkg in "${!BINIDX[@]}"; do
+      p="${BINIDX[$pkg]}"
+      if compat_ok_with_target "$p"; then
+        run "$S_INSTALL" install "$p" $(pass_common) || {
+          if [ "$fallback" = "build" ]; then
+            log WARN "Instalação binária falhou para $pkg; tentando build"
+            run "$S_BUILD" --only="$pkg" $(pass_common) --jobs="$JOBS"
+            p2="$(find_cached_pkg "$pkg" || true)"
+            [ -n "$p2" ] && run "$S_INSTALL" install "$p2" $(pass_common)
+          else
+            [ $strict_deps -eq 1 ] && fatal "Falha installing $pkg e fallback=skip" || true
+          fi
+        }
+        maybe_mkinit_after_install "$pkg"
+      else
+        if [ "$fallback" = "build" ]; then
+          run "$S_BUILD" --only="$pkg" $(pass_common) --jobs="$JOBS"
+          p2="$(find_cached_pkg "$pkg" || true)"
+          [ -n "$p2" ] && run "$S_INSTALL" install "$p2" $(pass_common)
+          maybe_mkinit_after_install "$pkg"
+        else
+          [ $strict_deps -eq 1 ] && fatal "Binário incompatível $pkg e fallback=skip" || true
+        fi
+      fi
+    done
+    log OK "Instalação a partir de --bin-dir concluída."
+    return 0
+  fi
+
+  [ -n "$name" ] || die_usage
+
+  # plano do alvo
+  local pdir; pdir="$(plan_for_name "$name" "$version")"
+  log INFO "Plano: $pdir"
+  local order; mapfile -t order < <(read_plan_order "$pdir")
+
+  # percorre dependências (tudo, exceto o último alvo se order listar alvo por último)
+  for dep in "${order[@]}"; do
+    [ -z "$dep" ] && continue
+    if [ "$dep" = "$name" ]; then
+      # instala alvo por último
+      continue
+    fi
+    if [ $use_bin -eq 1 ]; then
+      install_from_cache_or_build "$dep" "" "prefer-bin" "$fallback" "$strict_deps"
+    else
+      install_from_cache_or_build "$dep" "" "${PREFER_MODE:-prefer-build}" "$fallback" "$strict_deps"
+    fi
+  done
+
+  # por fim, o alvo
+  if [ $use_bin -eq 1 ]; then
+    install_from_cache_or_build "$name" "$version" "prefer-bin" "$fallback" "$strict_deps"
+  else
+    install_from_cache_or_build "$name" "$version" "${PREFER_MODE:-prefer-build}" "$fallback" "$strict_deps"
+  fi
+
+  log OK "Instalação de $name concluída."
+}
+
+cmd_install_bin(){
+  # atalho
+  cmd_install --bin "$@"
+}
+
+# ===================== Encaminhadores simples =====================
+cmd_init(){ [ -n "$S_INIT" ] || fatal "adm-init não encontrado"; run "$S_INIT" $(pass_common); }
+cmd_boot_host(){ [ -n "$S_BOOT_HOST" ] || fatal "adm-bootstrap-host não encontrado"; run "$S_BOOT_HOST" $(pass_common); }
+cmd_boot_chroot(){ [ -n "$S_BOOT_CHROOT" ] || fatal "adm-bootstrap-chroot não encontrado"; run "$S_BOOT_CHROOT" $(pass_common); }
+cmd_plan(){ [ -n "$S_PLAN" ] || fatal "adm-plan não encontrado"; run "$S_PLAN" "$@" $(pass_common); }
+cmd_detect(){ [ -n "$S_DETECT" ] || fatal "adm-detect não encontrado"; run "$S_DETECT" "$@" $(pass_common); }
+cmd_build(){ [ -n "$S_BUILD" ] || fatal "adm-build não encontrado"; run "$S_BUILD" "$@" $(pass_common) --jobs="$JOBS"; }
+cmd_update(){ [ -n "$S_UPDATE" ] || fatal "adm-update não encontrado"; run "$S_UPDATE" "$@" $(pass_common); }
+cmd_mkinit(){ [ -n "$S_MKINIT" ] || fatal "adm-mkinitrsmfs não encontrado"; run "$S_MKINIT" "$@" $(pass_common); }
+cmd_clean(){ [ -n "$S_CLEAN" ] || fatal "adm-clean não encontrado"; run "$S_CLEAN" "$@" ; }
+cmd_graph(){ show_graph; }
+# ===================== Help agregador =====================
+cmd_help(){
+  local sub="${1:-}"
+  if [ "$sub" = "--all" ]; then
+    echo "#== adm-init =="; [ -n "$S_INIT" ] && "$S_INIT" -h || echo "(não encontrado)"
+    echo "#== adm-bootstrap-host =="; [ -n "$S_BOOT_HOST" ] && "$S_BOOT_HOST" -h || echo "(não encontrado)"
+    echo "#== adm-bootstrap-chroot =="; [ -n "$S_BOOT_CHROOT" ] && "$S_BOOT_CHROOT" -h || echo "(não encontrado)"
+    echo "#== adm-plan =="; [ -n "$S_PLAN" ] && "$S_PLAN" -h || echo "(não encontrado)"
+    echo "#== adm-detect =="; [ -n "$S_DETECT" ] && "$S_DETECT" -h || echo "(não encontrado)"
+    echo "#== adm-build =="; [ -n "$S_BUILD" ] && "$S_BUILD" -h || echo "(não encontrado)"
+    echo "#== adm-install =="; [ -n "$S_INSTALL" ] && "$S_INSTALL" -h || echo "(não encontrado)"
+    echo "#== adm-update =="; [ -n "$S_UPDATE" ] && "$S_UPDATE" -h || echo "(não encontrado)"
+    echo "#== adm-mkinitrsmfs =="; [ -n "$S_MKINIT" ] && "$S_MKINIT" -h || echo "(não encontrado)"
+    echo "#== adm-clean =="; [ -n "$S_CLEAN" ] && "$S_CLEAN" -h || echo "(não encontrado)"
+    return 0
+  fi
+  if [ -z "$sub" ]; then usage; return 0; fi
+  case "$sub" in
+    init) [ -n "$S_INIT" ] && "$S_INIT" -h || echo "adm-init não encontrado" ;;
+    bootstrap:host) [ -n "$S_BOOT_HOST" ] && "$S_BOOT_HOST" -h || echo "adm-bootstrap-host não encontrado" ;;
+    bootstrap:chroot) [ -n "$S_BOOT_CHROOT" ] && "$S_BOOT_CHROOT" -h || echo "adm-bootstrap-chroot não encontrado" ;;
+    plan) [ -n "$S_PLAN" ] && "$S_PLAN" -h || echo "adm-plan não encontrado" ;;
+    detect) [ -n "$S_DETECT" ] && "$S_DETECT" -h || echo "adm-detect não encontrado" ;;
+    build) [ -n "$S_BUILD" ] && "$S_BUILD" -h || echo "adm-build não encontrado" ;;
+    install) [ -n "$S_INSTALL" ] && "$S_INSTALL" -h || echo "adm-install não encontrado" ;;
+    update) [ -n "$S_UPDATE" ] && "$S_UPDATE" -h || echo "adm-update não encontrado" ;;
+    mkinitrsmfs) [ -n "$S_MKINIT" ] && "$S_MKINIT" -h || echo "adm-mkinitrsmfs não encontrado" ;;
+    clean) [ -n "$S_CLEAN" ] && "$S_CLEAN" -h || echo "adm-clean não encontrado" ;;
+    *) usage ;;
+  esac
+}
+
+# ===================== Menu TUI =====================
+menu_main(){
+  local choice
+  while true; do
+    choice="$(tui_menu "ADM - Menu principal" \
+      "init:Inicializar perfis de build (adm-init)" \
+      "bootstrap_host:Bootstrap no host (adm-bootstrap-host)" \
+      "bootstrap_chroot:Bootstrap no chroot (adm-bootstrap-chroot)" \
+      "plan:Planejar (adm-plan)" \
+      "detect:Detectar (adm-detect)" \
+      "build:Construir (adm-build)" \
+      "install:Instalar por nome (metafile)" \
+      "install_bin:Instalar binário do cache" \
+      "update:Atualizar upstream (adm-update)" \
+      "mkinit:Gerar initramfs (adm-mkinitrsmfs)" \
+      "search:Buscar programas" \
+      "info:Informações de programa" \
+      "list:Listar programas" \
+      "graph:Ver grafo do plano" \
+      "clean:Limpar (adm-clean)" \
+      "help:Ajuda" \
+      "quit:Sair")"
+    case "$choice" in
+      init) cmd_init;;
+      bootstrap_host) cmd_boot_host;;
+      bootstrap_chroot) cmd_boot_chroot;;
+      plan) local only; only="$(tui_input "Somente pacote (opcional)" "")"; cmd_plan ${only:+--only="$only"};;
+      detect) local sdir; sdir="$(tui_input "Diretório do source (opcional)" "")"; cmd_detect ${sdir:+--source-dir="$sdir"};;
+      build) local only; only="$(tui_input "Construir --only (opcional)" "")"; cmd_build ${only:+--only="$only"};;
+      install)
+        local name ver pref fallback strict
+        name="$(tui_input "Programa (name)" "")" || true
+        [ -z "$name" ] && continue
+        ver="$(tui_input "Versão (opcional)" "")" || true
+        pref="$(tui_menu "Preferência" "prefer-build:Compilar (default)" "prefer-bin:Binário do cache")"
+        fallback="$(tui_menu "Fallback" "build:Se faltar bin, compila" "skip:Se faltar, pula")"
+        strict="$(tui_confirm "Strict deps?")"
+        cmd_install "$name" ${ver:+--version="$ver"} ${pref:+--$pref} --fallback="${fallback:-build}" $( [ "$strict" = "yes" ] && echo --strict-deps )
+        ;;
+      install_bin)
+        local name ver fb strict
+        name="$(tui_input "Programa (name)" "")" || true
+        [ -z "$name" ] && continue
+        ver="$(tui_input "Versão (opcional)" "")" || true
+        fb="$(tui_menu "Fallback" "build:Se faltar bin, compila" "skip:Se faltar, pula")"
+        strict="$(tui_confirm "Strict deps?")"
+        cmd_install_bin "$name" ${ver:+--version="$ver"} --fallback="${fb:-build}" $( [ "$strict" = "yes" ] && echo --strict-deps )
+        ;;
+      update)
+        local prog; prog="$(tui_input "Programa para atualizar (name)" "")" || true
+        [ -z "$prog" ] && continue
+        cmd_update --program="$prog" --deps=1 --max-depth=2
+        ;;
+      mkinit)
+        local kver; kver="$(tui_input "Kernel (kver) - opcional" "")" || true
+        cmd_mkinit ${kver:+--kver="$kver"}
+        ;;
+      search)
+        local q; q="$(tui_input "Buscar por (regex OK)" "")" || true
+        [ -z "$q" ] && continue
+        tui_info "$(cmd_search "$q" --regex)"
+        ;;
+      info)
+        local name; name="$(tui_input "Programa (name)" "")" || true
+        [ -z "$name" ] && continue
+        tui_info "$(cmd_info "$name" --installed --files)"
+        ;;
+      list)
+        tui_info "$(cmd_list)"
+        ;;
+      graph)
+        tui_info "$(cmd_graph)"
+        ;;
+      clean)
+        local scope; scope="$(tui_menu "Escopos (um por vez)" \
+          "all:Todos" "cache-pkg:Cache de pacotes" "cache-src:Cache de sources" \
+          "work:Workdirs" "logs:Logs" "updates:Updates" "states:States" \
+          "meta-orphans:Órfãos de meta" "plans:Planos antigos")"
+        [ -z "$scope" ] && continue
+        cmd_clean "$scope" --dry-run
+        local apply; apply="$(tui_confirm "Aplicar limpeza de $scope agora?")"
+        [ "$apply" = "yes" ] && cmd_clean "$scope"
+        ;;
+      help) cmd_help --all | ${PAGER:-less} ;;
+      quit|"") break;;
+    esac
+  done
+}
+
+# ===================== Main dispatch =====================
+main(){
+  case "$CMD" in
+    ""|help) cmd_help "$@";;
+    menu) menu_main ;;
+    init) cmd_init "$@";;
+    bootstrap:host) cmd_boot_host "$@";;
+    bootstrap:chroot) cmd_boot_chroot "$@";;
+    plan) cmd_plan "$@";;
+    detect) cmd_detect "$@";;
+    build) cmd_build "$@";;
+    install) cmd_install "$@";;
+    install-bin) cmd_install_bin "$@";;
+    update) cmd_update "$@";;
+    mkinitrsmfs|mkinit) cmd_mkinit "$@";;
+    clean) cmd_clean "$@";;
+    info) cmd_info "$@";;
+    search) cmd_search "$@";;
+    list) cmd_list "$@";;
+    graph) cmd_graph "$@";;
+    *) usage; exit 2;;
+  endcase
+}
+
+main "$@"
