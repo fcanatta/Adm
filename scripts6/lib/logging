@@ -1,0 +1,535 @@
+#!/usr/bin/env bash
+# lib/logging
+# Registro humano e JSONL com rotação, locks, redatores e coloração opcional para eco em console.
+# Compatível com CI (sem ANSI nos arquivos). Sem set -e; funções retornam status.
+
+# --------- Guarda de múltiplos sources ----------
+if [ -n "${__ADM_LOG_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+__ADM_LOG_SOURCED=1
+
+# --------- Estado interno ----------
+__log_base="/usr/src/adm/logs"
+__log_level="INFO"          # DEBUG|INFO|WARN|ERROR|FATAL
+__log_keep_runs=10
+__log_days_to_keep=90
+__log_max_mb=50
+__log_keep_rot=5
+__log_tz="UTC"              # UTC|LOCAL
+__log_json_pretty=0
+__log_fsync_on="ERROR,FATAL,phase_end"
+__log_initialized=0
+
+# Contexto do run
+__log_run_id=""
+__log_cat=""
+__log_pkg=""
+__log_ver=""
+__log_stage=""
+__log_profile=""
+__log_phase="system"
+__log_phase_started_ms=0
+
+# Console colors (opcional) — só para eco; arquivos são sempre sem ANSI
+__log_use_color=0
+__c_reset=""; __c_ok=""; __c_warn=""; __c_err=""; __c_info=""; __c_bold=""
+__log_colorize_console="${ADM_LOG_COLOR:-auto}"  # auto|on|off
+
+# --------- Utilidades básicas ----------
+log::ts_rfc3339_ms() {
+  # Retorna timestamp RFC3339 com ms (UTC por padrão)
+  local fmt="%Y-%m-%dT%H:%M:%S"
+  local sec ns ms tz="Z"
+  sec=$(date +%s 2>/dev/null || echo 0)
+  ns=$(date +%N 2>/dev/null || echo 0)
+  ms=$(( ns / 1000000 ))
+  if [ "$__log_tz" = "LOCAL" ]; then
+    # offset local
+    tz=$(date +%z)
+    tz="${tz:0:3}:${tz:3:2}"
+    printf "%s.%03d%s" "$(date +"$fmt")" "$ms" "$tz"
+  else
+    printf "%s.%03dZ" "$(date -u +"$fmt")" "$ms"
+  fi
+}
+
+log::epoch_ms() {
+  if date +%s%3N >/dev/null 2>&1; then date +%s%3N; else printf '%s000' "$(date +%s)"; fi
+}
+
+log::duration_ms() {
+  # $1 start_ms $2 end_ms
+  local s="${1:-0}" e="${2:-$(log::epoch_ms)}"
+  if ! [ "$s" -ge 0 ] 2>/dev/null; then s=0; fi
+  if ! [ "$e" -ge "$s" ] 2>/dev/null; then e="$s"; fi
+  printf '%s' $(( e - s ))
+}
+
+log::strip_ansi() {
+  sed -E 's/\x1b\[[0-9;]*m//g'
+}
+
+# --------- Coloração para console ----------
+log::__detect_color_console() {
+  if [ "$__log_colorize_console" = "off" ]; then __log_use_color=0; return; fi
+  if [ "$__log_colorize_console" = "on" ]; then __log_use_color=1; return; fi
+  # auto
+  if [ -t 2 ]; then __log_use_color=1; else __log_use_color=0; fi
+}
+
+log::__apply_colors() {
+  if [ "$__log_use_color" -eq 1 ]; then
+    __c_reset=$'\033[0m'
+    __c_bold=$'\033[1m'
+    __c_ok=$'\033[32m'
+    __c_warn=$'\033[33m'
+    __c_err=$'\033[31m'
+    __c_info=$'\033[36m'
+  else
+    __c_reset=""; __c_bold=""; __c_ok=""; __c_warn=""; __c_err=""; __c_info=""
+  fi
+}
+
+log::__console() {
+  # $1 level $2 mensagem
+  local lvl="${1:-INFO}" msg="${2:-}"
+  case "$lvl" in
+    DEBUG) [ "${ADM_VERBOSE:-0}" = "1" ] || return 0;;
+    INFO)  ;;
+    WARN)  ;;
+    ERROR|FATAL) ;;
+    *) lvl="INFO";;
+  esac
+  local cstart="" cend="$__c_reset" tag="$lvl"
+  case "$lvl" in
+    DEBUG) cstart="$__c_bold";;
+    INFO)  cstart="$__c_info";;
+    WARN)  cstart="$__c_warn";;
+    ERROR) cstart="$__c_err";;
+    FATAL) cstart="$__c_err$__c_bold";;
+  esac
+  printf '%b[%s] %-5s%b %s\n' "$cstart" "$(date +%T)" "$tag" "$cend" "$msg" 1>&2
+}
+
+# --------- Nível de log ----------
+log::__level_to_num() {
+  case "$1" in
+    DEBUG) echo 10;;
+    INFO)  echo 20;;
+    WARN)  echo 30;;
+    ERROR) echo 40;;
+    FATAL) echo 50;;
+    EVENT) echo 25;; # intermediário
+    *)     echo 20;;
+  esac
+}
+
+log::__enabled() {
+  # retorna 0 se nível deve ser logado
+  local need; need=$(log::__level_to_num "$1")
+  local cur;  cur=$(log::__level_to_num "$__log_level")
+  [ "$need" -ge "$cur" ]
+}
+
+# --------- Sanitização e redatores ----------
+log::sanitize_text() {
+  # Redige tokens/senhas/segredos e remove ANSI
+  local t; t="$(cat)"
+  t="$(printf '%s' "$t" | log::strip_ansi)"
+  # Authorization
+  t="$(printf '%s' "$t" | sed -E 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1*** /Ig')"
+  # token= password= secret=
+  t="$(printf '%s' "$t" | sed -E 's/([Tt][Oo][Kk][Ee][Nn]|[Pp]assword|[Ss]ecret)[[:space:]]*=[[:space:]]*[^&[:space:]]+/*** /g')"
+  # URLs com credenciais
+  t="$(printf '%s' "$t" | sed -E 's#(https?://)[^/:@]+:[^/@]+@#\1***:***@#g')"
+  # chaves AWS-like
+  t="$(printf '%s' "$t" | sed -E 's/(AWS_[A-Z_]*KEY[[:space:]]*=[[:space:]]*)[^[:space:]]+/\1***/g')"
+  printf '%s' "$t"
+}
+
+log::__escape_json() {
+  # Escapa \ " e controle
+  local s; s="$(cat)"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  # Remove CR
+  s="${s//$'\r'/}"
+  # Substitui quebras por \n
+  s="${s//$'\n'/\\n}"
+  printf '%s' "$s"
+}
+
+# --------- Locks ----------
+log::__with_lock() {
+  # $1 path do arquivo de log
+  local path="${1:-}"
+  [ -z "$path" ] && { echo "log::__with_lock: path vazio" 1>&2; return 2; }
+  local lock="${path}.lock"
+  if command -v flock >/dev/null 2>&1; then
+    flock -w 5 "$lock" bash -c "${*:2}"
+    return $?
+  else
+    # Fallback pobre com diretório (não perfeito, mas melhor que nada)
+    local dirlock="${lock}.d"
+    local waited=0
+    while ! mkdir "$dirlock" 2>/dev/null; do
+      sleep 0.05
+      waited=$(( waited + 1 ))
+      [ "$waited" -gt 200 ] && break
+    done
+    bash -c "${*:2}"
+    local rc=$?
+    rmdir "$dirlock" 2>/dev/null || true
+    return $rc
+  fi
+}
+
+# --------- Rotação ----------
+log::rotate() {
+  # $1 path $2 max_mb $3 keep
+  local path="${1:-}" max_mb="${2:-$__log_max_mb}" keep="${3:-$__log_keep_rot}"
+  [ -z "$path" ] && return 0
+  [ -f "$path" ] || return 0
+  local bytes; bytes=$(wc -c < "$path" 2>/dev/null || echo 0)
+  local limit=$(( max_mb * 1024 * 1024 ))
+  [ "$bytes" -lt "$limit" ] && return 0
+
+  # Rotaciona: path.N → path.(N+1), até keep
+  local i
+  for i in $(seq "$keep" -1 1); do
+    if [ -f "${path}.${i}" ]; then
+      if [ "$i" -eq "$keep" ]; then rm -f "${path}.${i}" 2>/dev/null || true; else mv -f "${path}.${i}" "${path}.$((i+1))" 2>/dev/null || true; fi
+    fi
+  done
+  mv -f "$path" "${path}.1" 2>/dev/null || true
+}
+
+log::fsync() {
+  # $1 path
+  local p="${1:-}"
+  [ -n "$p" ] && [ -f "$p" ] && command -v sync >/dev/null 2>&1 && sync -f "$p" 2>/dev/null || true
+}
+
+# --------- Inicialização e contexto ----------
+log::init() {
+  # $1 base_dir (opcional)
+  __log_base="${1:-$__log_base}"
+  mkdir -p "$__log_base/system" 2>/dev/null || true
+
+  # Carrega config
+  local cfg="/usr/src/adm/config/logging.conf"
+  if [ -r "$cfg" ]; then
+    while IFS='=' read -r k v; do
+      case "$k" in
+        \#*|"") continue;;
+        level)            __log_level="$v" ;;
+        max_size_mb)      __log_max_mb="${v:-50}" ;;
+        keep_rotations)   __log_keep_rot="${v:-5}" ;;
+        keep_runs)        __log_keep_runs="${v:-10}" ;;
+        days_to_keep)     __log_days_to_keep="${v:-90}" ;;
+        timezone)         __log_tz="${v:-UTC}" ;;
+        fsync_on)         __log_fsync_on="$v" ;;
+        json_pretty)      __log_json_pretty="${v:-0}" ;;
+      esac
+    done < "$cfg"
+  fi
+
+  # Coloração console
+  log::__detect_color_console
+  log::__apply_colors
+
+  __log_initialized=1
+  return 0
+}
+
+log::set-run() {
+  # $1 run_id $2 cat $3 pkg $4 ver [$5 stage] [$6 profile]
+  __log_run_id="${1:-}"
+  __log_cat="${2:-}"
+  __log_pkg="${3:-}"
+  __log_ver="${4:-}"
+  __log_stage="${5:-}"
+  __log_profile="${6:-}"
+  [ -z "$__log_run_id" ] && __log_run_id="$(date +%Y%m%d-%H%M%S)-$$"
+
+  local pdir="$__log_base/$__log_cat/$__log_pkg/$__log_ver/run-$__log_run_id"
+  [ -n "$__log_cat" ] && [ -n "$__log_pkg" ] && [ -n "$__log_ver" ] && mkdir -p "$pdir" 2>/dev/null || true
+  # Symlink latest
+  if [ -d "$__log_base/$__log_cat/$__log_pkg/$__log_ver" ]; then
+    ln -sfn "run-$__log_run_id" "$__log_base/$__log_cat/$__log_pkg/$__log_ver/latest" 2>/dev/null || true
+  fi
+  return 0
+}
+
+log::context() {
+  # log::context phase <name> | set key value | get key
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    phase)
+      __log_phase="${1:-system}"
+      __log_phase_started_ms=0
+      ;;
+    set)
+      local k="${1:-}" v="${2:-}"
+      case "$k" in
+        run_id)   __log_run_id="$v";;
+        cat)      __log_cat="$v";;
+        pkg)      __log_pkg="$v";;
+        version)  __log_ver="$v";;
+        stage)    __log_stage="$v";;
+        profile)  __log_profile="$v";;
+        phase)    __log_phase="$v";;
+      esac;;
+    get)
+      local k="${1:-}"; eval "printf '%s' \"\$__log_${k}\"";;
+  esac
+}
+
+# --------- Caminhos de log por fase ----------
+log::__phase_dir() {
+  # Retorna diretório onde escrever (por fase e run)
+  if [ -n "$__log_cat" ] && [ -n "$__log_pkg" ] && [ -n "$__log_ver" ] && [ -n "$__log_run_id" ]; then
+    printf '%s/%s/%s/%s/run-%s' "$__log_base" "$__log_cat" "$__log_pkg" "$__log_ver" "$__log_run_id"
+  else
+    printf '%s/system' "$__log_base"
+  fi
+}
+
+log::__file_for() {
+  # $1 tipo: human|json
+  local dir; dir="$(log::__phase_dir)"
+  local base="$dir/${__log_phase}"
+  [ "$1" = "json" ] && printf '%s.jsonl' "$base" || printf '%s.log' "$base"
+}
+
+# --------- Escrita genérica ----------
+log::__should_fsync() {
+  # Retorna 0 se deve fsync para este marcador
+  local tag="${1:-}"
+  case ",$__log_fsync_on," in
+    *,"$tag",*) return 0;;
+    *) return 1;;
+  esac
+}
+
+log::__write_human() {
+  # $1 level $2 msg k=v ...
+  local lvl="${1:-INFO}"; shift || true
+  local msg="${1:-}"; shift || true
+
+  log::__enabled "$lvl" || return 0
+
+  local dir file
+  dir="$(log::__phase_dir)"; file="$(log::__file_for human)"
+  mkdir -p "$dir" 2>/dev/null || true
+
+  # monta linha humana
+  local line
+  line="[$(date +%T)] $(printf '%-5s' "$lvl") $msg"
+  # pares extras
+  local kv
+  for kv in "$@"; do
+    [ -z "$kv" ] && continue
+    line="$line $(printf '%s' "$kv")"
+  done
+  # sanitiza
+  line="$(printf '%s' "$line" | log::sanitize_text)"
+
+  # rotação + lock + append
+  log::__with_lock "$file" -- "
+    $(typeset -f log::rotate >/dev/null 2>&1 && echo :) >/dev/null 2>&1
+    $(declare -f log::rotate)
+    log::rotate \"$file\" \"$__log_max_mb\" \"$__log_keep_rot\"
+    printf '%s\n' \"$line\" >> \"$file\"
+  "
+  # fsync condicional
+  if log::__should_fsync "$lvl"; then log::fsync "$file"; fi
+
+  # agregador system (somente quando estamos em system)
+  if [ "$(log::__phase_dir)" = "$__log_base/system" ]; then
+    local sfile="$__log_base/system/adm.$(date +%F).log"
+    log::__with_lock "$sfile" -- "
+      $(declare -f log::rotate)
+      log::rotate \"$sfile\" \"$__log_max_mb\" \"$__log_keep_rot\"
+      printf '%s\n' \"$line\" >> \"$sfile\"
+    "
+    if log::__should_fsync "$lvl"; then log::fsync "$sfile"; fi
+  fi
+}
+
+log::__write_json() {
+  # $1 level $2 msg k=v ...
+  local lvl="${1:-INFO}"; shift || true
+  local msg="${1:-}"; shift || true
+
+  log::__enabled "$lvl" || return 0
+
+  local dir file
+  dir="$(log::__phase_dir)"; file="$(log::__file_for json)"
+  mkdir -p "$dir" 2>/dev/null || true
+
+  local ts run phase pkg ver stage profile
+  ts="$(log::ts_rfc3339_ms)"
+  run="$__log_run_id"; phase="$__log_phase"
+  [ -n "$__log_cat" ] && [ -n "$__log_pkg" ] && pkg="$__log_cat/$__log_pkg" || pkg=""
+  ver="$__log_ver"; stage="$__log_stage"; profile="$__log_profile"
+
+  # Sanitiza mensagem e meta
+  local smsg meta_kv k v
+  smsg="$(printf '%s' "$msg" | log::sanitize_text | log::__escape_json)"
+
+  # Monta objeto JSON básico
+  local json="{\"ts\":\"$ts\",\"level\":\"$lvl\",\"run_id\":\"$run\",\"phase\":\"$phase\""
+  [ -n "$pkg" ]    && json="$json,\"pkg\":\"$(printf '%s' "$pkg" | log::__escape_json)\""
+  [ -n "$ver" ]    && json="$json,\"version\":\"$(printf '%s' "$ver" | log::__escape_json)\""
+  [ -n "$stage" ]  && json="$json,\"stage\":\"$(printf '%s' "$stage" | log::__escape_json)\""
+  [ -n "$profile" ]&& json="$json,\"profile\":\"$(printf '%s' "$profile" | log::__escape_json)\""
+  json="$json,\"msg\":\"$smsg\""
+
+  # Converte pares k=v para campos simples ou meta={}
+  local meta_started=0
+  for meta_kv in "$@"; do
+    [ -z "$meta_kv" ] && continue
+    k="${meta_kv%%=*}"
+    v="${meta_kv#*=}"
+    [ "$k" = "$v" ] && v=""  # se não tiver '='
+    k="$(printf '%s' "$k" | log::sanitize_text | log::__escape_json)"
+    v="$(printf '%s' "$v" | log::sanitize_text | log::__escape_json)"
+    # alguns campos já padronizados
+    case "$k" in
+      cmd|file|url|sha256|bytes|rc|duration_ms|event|trace_id|parent_id)
+        json="$json,\"$k\":\"$v\"";;
+      *)
+        if [ $meta_started -eq 0 ]; then json="$json,\"meta\":{"; meta_started=1; else json="$json,"; fi
+        json="$json\"$k\":\"$v\""
+        ;;
+    esac
+  done
+  [ $meta_started -eq 1 ] && json="$json}"
+
+  json="$json}"
+
+  # Rotação + lock + append
+  log::__with_lock "$file" -- "
+    $(declare -f log::rotate)
+    log::rotate \"$file\" \"$__log_max_mb\" \"$__log_keep_rot\"
+    printf '%s\n' \"$json\" >> \"$file\"
+  "
+  if log::__should_fsync "$lvl"; then log::fsync "$file"; fi
+
+  # agregador system
+  if [ "$(log::__phase_dir)" = "$__log_base/system" ]; then
+    local sfile="$__log_base/system/adm.$(date +%F).jsonl"
+    log::__with_lock "$sfile" -- "
+      $(declare -f log::rotate)
+      log::rotate \"$sfile\" \"$__log_max_mb\" \"$__log_keep_rot\"
+      printf '%s\n' \"$json\" >> \"$sfile\"
+    "
+    if log::__should_fsync "$lvl"; then log::fsync "$sfile"; fi
+  fi
+}
+
+# --------- APIs públicas de escrita ----------
+log::human() { [ "$__log_initialized" -eq 1 ] || log::init; log::__write_human "$@"; }
+log::json()  { [ "$__log_initialized" -eq 1 ] || log::init; log::__write_json  "$@"; }
+
+log::debug() { log::human DEBUG "$@"; log::json DEBUG "$@"; }
+log::info()  { log::human INFO  "$@"; log::json INFO  "$@"; }
+log::warn()  { log::human WARN  "$@"; log::json WARN  "$@"; }
+log::error() { log::human ERROR "$@"; log::json ERROR "$@"; return 1; }
+log::fatal() { log::human FATAL "$@"; log::json FATAL "$@"; return 2; }
+
+# --------- Eventos semânticos ----------
+log::phase_start() {
+  # $1 name k=v...
+  local name="${1:-phase}"; shift || true
+  __log_phase="$name"
+  __log_phase_started_ms="$(log::epoch_ms)"
+  log::json EVENT "phase start" event="phase_start" started_ms="$__log_phase_started_ms" "$@"
+  log::human INFO  "phase_start $name" "$@"
+}
+
+log::phase_end() {
+  local end_ms; end_ms="$(log::epoch_ms)"
+  local dur; dur="$(log::duration_ms "$__log_phase_started_ms" "$end_ms")"
+  log::json EVENT "phase end" event="phase_end" duration_ms="$dur"
+  log::human INFO  "phase_end $__log_phase duration=${dur}ms"
+}
+
+log::exec() {
+  # $1 cmd ...
+  local cmd="${*:-}"
+  log::json INFO "exec" cmd="$cmd"
+}
+
+log::exec_result() {
+  # $1 cmd $2 rc $3 duration_ms [k=v...]
+  local cmd="${1:-}" rc="${2:-0}" dur="${3:-0}"; shift 3 || true
+  log::json INFO "exec_result" cmd="$cmd" rc="$rc" duration_ms="$dur" "$@"
+  [ "$rc" -eq 0 ] || log::error "exec failed rc=$rc cmd=$cmd"
+}
+
+log::download() {
+  # $1 url $2 dest $3 bytes $4 sha256 $5 status
+  log::json INFO "download" url="$1" file="$2" bytes="$3" sha256="$4" status="$5"
+  log::human INFO "download url=$1 -> $2 bytes=$3 status=$5"
+}
+
+log::hash_ok() {
+  log::json INFO "hash_ok" file="$1" sha256="$2"
+  log::human INFO "hash_ok file=$1"
+}
+
+log::hash_mismatch() {
+  log::json ERROR "hash_mismatch" file="$1" expected="$2" got="$3"
+  log::human ERROR "hash_mismatch file=$1 expected=$2 got=$3"
+  return 1
+}
+
+log::patch_applied() {
+  log::json INFO "patch_applied" file="$1"
+  log::human INFO "patch_applied $1"
+}
+
+log::package_created() {
+  # $1 artifact $2 bytes $3 profile
+  log::json EVENT "package_created" file="$1" bytes="$2" profile="$3" event="package_created"
+  log::human INFO "package_created $1 bytes=$2 profile=$3"
+}
+
+log::update_found() {
+  # $1 from_ver $2 to_ver $3 url
+  log::json EVENT "update_found" event="update_found" from="$1" to="$2" url="$3"
+  log::human INFO "update_found $1 -> $2 url=$3"
+}
+
+log::deps_resolved() {
+  # $1 resolver(optional) $2 counts(optional) ... (livre)
+  log::json EVENT "deps_resolved" event="deps_resolved" "$@"
+  log::human INFO "deps_resolved $*"
+}
+
+# --------- Manutenção (GC) ----------
+log::gc_runs() {
+  # Remove runs antigos mantendo __log_keep_runs por pacote (heurística simples)
+  find "$__log_base" -type d -name 'run-*' 2>/dev/null | while read -r d; do
+    local parent; parent="$(dirname "$d")"
+    # lista por mtime
+    local runs; IFS=$'\n' read -r -d '' -a runs < <(ls -1t "$parent"/run-* 2>/dev/null && printf '\0')
+    local i=0
+    for r in "${runs[@]}"; do
+      i=$(( i + 1 ))
+      [ "$i" -le "$__log_keep_runs" ] && continue
+      rm -rf "$r" 2>/dev/null || true
+    done
+  done
+}
+
+log::gc_days() {
+  # Apaga arquivos mais antigos que __log_days_to_keep
+  find "$__log_base" -type f -mtime +"$__log_days_to_keep" -print0 2>/dev/null | xargs -0 rm -f 2>/dev/null || true
+}
+
+# --------- Fim seguro ----------
+return 0 2>/dev/null || true
