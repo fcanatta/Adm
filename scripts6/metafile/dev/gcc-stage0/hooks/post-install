@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# gcc-stage0: post-install
+# Instala gcc (driver) e libgcc mínima; ajuste de symlinks e limpeza
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+cd "${ADM_BUILD_DIR}"
+make install-gcc DESTDIR="${ADM_DESTDIR}"
+make install-target-libgcc DESTDIR="${ADM_DESTDIR}"
+
+# Links convenientes
+if [ -x "${ADM_DESTDIR}/usr/bin/gcc" ] && [ ! -e "${ADM_DESTDIR}/usr/bin/cc" ]; then
+  ln -sf gcc "${ADM_DESTDIR}/usr/bin/cc"
+fi
+
+# Remover documentação pesada no stage0
+rm -rf "${ADM_DESTDIR}/usr/share/info" \
+       "${ADM_DESTDIR}/usr/share/man" \
+       "${ADM_DESTDIR}/usr/share/doc" 2>/dev/null || true
+
+# Normalizar timestamps
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  find "${ADM_DESTDIR}" -type f -exec touch -h -d @"${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || true
+fi
