@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+# adm-mkinitrsmfs — Gera initramfs reprodutível (host/chroot/bootstrap)
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.0.0"
+
+# =============== Cores / Log ===============
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then
+    printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-mkinitrsmfs.log"; exit 2' ERR
+
+# =============== Paths ===============
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_STATES="${ADM_STATES:-${ROOT_BASE}/states}"
+mkdir -p "$ADM_LOGS" "$ADM_STATES"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-mkinitrsmfs.log" 2>&1
+
+# =============== Defaults / CLI ===============
+ROOT="/"                  # root de destino (host/chroot)
+KVER=""                   # versão do kernel
+CPIO_FMT="newc"           # newc|crc
+COMPRESS="zstd"           # zstd|xz|gzip|lz4|lzop|none
+COMP_LEVEL=""             # nível do compressor
+SIGN=""                   # gpg|minisign|""
+WITH_SET="auto"           # auto implica lvm/md/crypt conforme detecção
+WITH_EXTRA=""             # --with=lvm,md,crypt,zfs,net,firmware,microcode
+WITHOUT_EXTRA=""          # --without=...
+FIRMWARE_POL="auto"       # auto|all|none
+UDEV_IMPL="auto"          # auto|mdev|none
+BOOTSTRAP=0               # modo mínimo
+STRICT=0
+DRY_RUN=0
+VERIFY=0
+VERBOSE=0
+PRINT=1
+
+usage(){
+  cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} [opções]
+  --kver=KVER                 Kernel alvo (ex.: 6.11.3); autodetect se omitido
+  --root=DIR                  Root alternativo (default: /)
+  --bootstrap                 Gera imagem mínima (busybox estático, mdev)
+  --cpio=newc|crc            Formato do cpio (default: newc)
+  --compress=zstd|xz|gzip|lz4|lzop|none
+  --compress-level=N         Nível de compressão
+  --with=CSV                 lvm,md,crypt,zfs,net,firmware,microcode
+  --without=CSV              Forçar exclusão de componentes
+  --firmware=auto|all|none
+  --udev=auto|mdev|none
+  --sign=gpg|minisign        Assinar imagem
+  --strict                   Falha se não detectar rootfs essencial
+  --dry-run                  Não gera, apenas imprime o plano
+  --verify                   Verifica conteúdo mínimo da imagem após gerar
+  --verbose                  Log detalhado
+  --print=0|1                Resumo no stdout (default: 1)
+EOF
+}
+
+for a in "$@"; do
+  case "$a" in
+    --kver=*) KVER="${a#*=}";;
+    --root=*) ROOT="${a#*=}";;
+    --bootstrap) BOOTSTRAP=1;;
+    --cpio=*) CPIO_FMT="${a#*=}";;
+    --compress=*) COMPRESS="${a#*=}";;
+    --compress-level=*) COMP_LEVEL="${a#*=}";;
+    --with=*) WITH_EXTRA="${a#*=}";;
+    --without=*) WITHOUT_EXTRA="${a#*=}";;
+    --firmware=*) FIRMWARE_POL="${a#*=}";;
+    --udev=*) UDEV_IMPL="${a#*=}";;
+    --sign=*) SIGN="${a#*=}";;
+    --strict) STRICT=1;;
+    --dry-run) DRY_RUN=1;;
+    --verify) VERIFY=1;;
+    --verbose) VERBOSE=1;;
+    --print=0) PRINT=0;;
+    --print=1) PRINT=1;;
+    -h|--help) usage; exit 0;;
+    *) log WARN "Opção desconhecida: $a";;
+  esac
+done
+
+# =============== Helpers ===============
+has(){ command -v "$1" >/dev/null 2>&1; }
+ensure_dir(){ mkdir -p "$1"; }
+join_csv(){ local IFS=','; echo "$*"; }
+contains_word(){ local list="$1" w="$2"; IFS=',' read -r -a A <<<"$list"; for x in "${A[@]}"; do [ "$x" = "$w" ] && return 0; done; return 1; }
+ts_id(){ date -u +%Y%m%dT%H%M%SZ_$RANDOM; }
+file_bytes(){ du -sb -- "$1" 2>/dev/null | awk '{print $1}'; }
+normpath(){ python3 -c "import os,sys;print(os.path.normpath(sys.argv[1]))" "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"; }
+
+# =============== Pré-checagens ===============
+need_cmd(){ has "$1" || fatal "Comando requerido não encontrado: $1"; }
+preflight(){
+  need_cmd cpio
+  case "$COMPRESS" in
+    zstd) need_cmd zstd;;
+    xz) need_cmd xz;;
+    gzip) need_cmd gzip;;
+    lz4) need_cmd lz4;;
+    lzop) need_cmd lzop;;
+    none) : ;;
+    *) fatal "Compressor inválido: $COMPRESS" ;;
+  esac
+  has depmod || log WARN "depmod ausente; fallback modules.dep existente"
+  has modinfo || log WARN "modinfo ausente; firmware auto pode ser parcial"
+}
+
+# =============== Descoberta do Kernel ===============
+find_kver(){
+  if [ -n "$KVER" ]; then echo "$KVER"; return 0; fi
+  # tenta listar /lib/modules
+  local d k
+  for d in "${ROOT%/}/lib/modules"/* 2>/dev/null; do
+    [ -d "$d" ] || continue
+    k="$(basename "$d")"
+    echo "$k"
+    return 0
+  done
+  fatal "Não foi possível detectar KVER em ${ROOT}/lib/modules"
+}
+
+# =============== Contexto de Build ===============
+setup_ctx(){
+  KVER="$(find_kver)"
+  OUT_BOOT="${ROOT%/}/boot"
+  MODDIR="${ROOT%/}/lib/modules/${KVER}"
+  [ -d "$MODDIR" ] || fatal "Diretório de módulos não encontrado: $MODDIR"
+  TXID="$(ts_id)"
+  BUILD_DIR="${ADM_STATES}/initramfs-build/${KVER}/${TXID}"
+  CACHE_DIR="${ADM_STATES}/initramfs-cache/${KVER}"
+  MAN_DIR="${ADM_STATES}/initramfs-manifests"
+  STAGE="${BUILD_DIR}/stage"
+  INIT="${STAGE}/init"
+  ensure_dir "$OUT_BOOT" "$BUILD_DIR" "$CACHE_DIR" "$MAN_DIR" "$STAGE"
+  log INFO "KVER=$KVER root=$ROOT build=$BUILD_DIR"
+}
+
+# =============== Detecção do ambiente (rootfs/cripto/raid/lvm/net) ===============
+read_cmdline(){
+  local f="${ROOT%/}/proc/cmdline"
+  [ -r "$f" ] && cat "$f" || true
+}
+read_fstab(){
+  local f="${ROOT%/}/etc/fstab"
+  [ -r "$f" ] && grep -E '^[^#]' "$f" || true
+}
+
+detect_rootfs(){
+  # Determina root= e fstype por cmdline e/ou fstab
+  local cmd fstab rootdev fstype
+  cmd="$(read_cmdline || true)"
+  fstab="$(read_fstab || true)"
+  rootdev="$(echo "$cmd" | sed -nE 's/.*\broot=([^ ]+).*/\1/p' || true)"
+  fstype="$(echo "$cmd" | sed -nE 's/.*\brootfstype=([^ ]+).*/\1/p' || true)"
+  if [ -z "$rootdev" ] && [ -n "$fstab" ]; then
+    # pega a primeira entrada montada em /
+    rootdev="$(echo "$fstab" | awk '$2=="/"{print $1;exit}')"
+    fstype="${fstype:-$(echo "$fstab" | awk '$2=="/"{print $3;exit}')}"
+  fi
+  echo "${rootdev:-auto}|${fstype:-auto}"
+}
+
+detect_features(){
+  # Retorna CSV com recursos necessários detectados
+  local need=()
+  local cmd fstab; cmd="$(read_cmdline || true)"; fstab="$(read_fstab || true)"
+  # LUKS/crypt
+  echo "$cmd" | grep -Eq '\b(cryptdevice=|rd\.luks=1)\b' && need+=("crypt")
+  # LVM
+  echo "$cmd" | grep -Eq '\brd\.lvm=1\b' && need+=("lvm")
+  # RAID (md)
+  echo "$cmd" | grep -Eq '\brd\.md=1\b' && need+=("md")
+  # NET boot
+  echo "$cmd" | grep -Eq '\b(ip=|nfsroot=|iscsi)\b' && need+=("net")
+  # Fallback por fstab para LVM/MD
+  echo "$fstab" | grep -qE '^/dev/mapper/' && need+=("crypt")
+  echo "$fstab" | grep -qE '^/dev/(dm-|mapper/)' && need+=("lvm")
+  echo "$fstab" | grep -qE '^/dev/md' && need+=("md")
+  # Firmware/microcode: se houver diretório e pacotes presentes, sugerir
+  [ -d "${ROOT%/}/lib/firmware" ] && need+=("firmware")
+  [ -f "${ROOT%/}/boot/intel-ucode.img" ] || [ -f "${ROOT%/}/boot/amd-ucode.img" ] && need+=("microcode")
+  # ZFS (se módulos presentes)
+  [ -d "${MODDIR}/kernel/zfs" ] && need+=("zfs")
+  # Unificar/ordenar
+  printf "%s\n" "${need[@]}" | awk '!x[$0]++' | paste -sd, -
+}
+
+# =============== Mapeamento fstype→módulo base ===============
+fs_module_for(){
+  case "$1" in
+    ext4|ext2|ext3) echo "ext4";;
+    xfs) echo "xfs";;
+    btrfs) echo "btrfs";;
+    f2fs) echo "f2fs";;
+    reiserfs) echo "reiserfs";;
+    jfs) echo "jfs";;
+    nilfs2) echo "nilfs2";;
+    auto|"") echo "ext4";; # fallback
+    *) echo "$1";;
+  esac
+}
+
+# =============== Escolha de módulos base (storage) ===============
+base_storage_modules(){
+  # drivers genéricos para atingir disco em VMs/hosts comuns
+  cat <<'EOF'
+virtio_pci
+virtio_blk
+virtio_scsi
+virtio_net
+ahci
+libahci
+nvme
+sd_mod
+sr_mod
+usb_storage
+xhci_pci
+xhci_hcd
+uhci_hcd
+ohci_hcd
+ata_piix
+pcieport
+EOF
+}
+# =============== Fecho de dependências de módulos (.ko) ===============
+# Preferimos ler modules.dep do root, evitando modprobe externo.
+modules_dep_file(){ echo "${MODDIR}/modules.dep"; }
+closure_modules(){
+  # Entrada: lista de módulos (nome sem .ko). Saída: caminhos relativos dos .ko + deps
+  local req=("$@")
+  local depf; depf="$(modules_dep_file)"
+  [ -r "$depf" ] || { log WARN "modules.dep não encontrado; inclusão pode ser incompleta"; }
+  declare -A need=()
+  for m in "${req[@]}"; do
+    # localizar .ko relativo via modules.dep
+    if [ -r "$depf" ]; then
+      # linha exemplo: kernel/fs/ext4/ext4.ko: kernel/lib/crc16.ko
+      grep -E "/${m}\.ko:" "$depf" | while IFS=: read -r ko deps; do
+        ko="$(echo "$ko" | xargs)"
+        [ -n "$ko" ] && need["$ko"]=1
+        # deps listadas separadas por espaço
+        for d in $deps; do need["$d"]=1; done
+      done
+    fi
+    # fallback: procurar por nome
+    if [ "${#need[@]}" -eq 0 ]; then
+      local path; path="$(find "$MODDIR" -type f -name "${m}.ko*" -printf '%P\n' -quit 2>/dev/null || true)"
+      [ -n "$path" ] && need["$path"]=1
+    fi
+  done
+  # acrescenta dependências recursivas
+  if [ -r "$depf" ]; then
+    local changed=1
+    while [ $changed -eq 1 ]; do
+      changed=0
+      while IFS=: read -r ko deps; do
+        ko="$(echo "$ko" | xargs)"
+        [ -n "$ko" ] || continue
+        if [ -n "${need[$ko]:-}" ]; then
+          for d in $deps; do
+            if [ -z "${need[$d]:-}" ]; then need["$d"]=1; changed=1; fi
+          done
+        fi
+      done < "$depf"
+    done
+  fi
+  printf "%s\n" "${!need[@]}" | sort -u
+}
+
+# =============== Firmware por modinfo ===============
+firmware_for_module(){
+  local rel="$1" abs="${MODDIR%/}/$rel"
+  has modinfo || return 0
+  modinfo -k "$KVER" "$abs" 2>/dev/null | awk -F': *' 'tolower($1)=="firmware"{print $2}'
+}
+
+collect_firmware_for(){
+  # Entrada: caminhos relativos de .ko
+  local rel fw
+  declare -A uniq=()
+  [ "$FIRMWARE_POL" = "none" ] && return 0
+  for rel in "$@"; do
+    while read -r fw; do
+      [ -z "$fw" ] && continue
+      uniq["$fw"]=1
+    done < <(firmware_for_module "$rel" || true)
+  done
+  printf "%s\n" "${!uniq[@]}" | sort -u
+}
+
+# =============== Seleção de componentes (WITH/WITHOUT/auto) ===============
+compute_components(){
+  local detected; detected="$(detect_features || true)"
+  local with="${WITH_EXTRA}"
+  local without="${WITHOUT_EXTRA}"
+
+  # auto inclui detectados, a menos que WITHOUT diga para excluir
+  IFS=',' read -r -a D <<<"${detected}"
+  for x in "${D[@]:-}"; do
+    [ -z "$x" ] && continue
+    contains_word "$without" "$x" && continue
+    if [ -z "$with" ]; then with="$x"; else contains_word "$with" "$x" || with="${with},${x}"; fi
+  done
+
+  # firmware policy influencia inclusão de firmware
+  case "$FIRMWARE_POL" in
+    auto) : ;;  # segue detected→firmware se estava presente
+    all) contains_word "$with" "firmware" || with="${with},firmware";;
+    none) # remove firmware
+      local tmp=; IFS=',' read -r -a A <<<"$with"
+      for x in "${A[@]:-}"; do [ "$x" = "firmware" ] && continue; tmp="${tmp:+$tmp,}$x"; done
+      with="$tmp"
+      ;;
+  esac
+  echo "$with" | sed 's/^,//; s/,$//'
+}
+
+# =============== Coleta de módulos necessários ===============
+plan_modules(){
+  local root_pair fsmod storage
+  root_pair="$(detect_rootfs)"
+  local rootdev="${root_pair%%|*}" fstype="${root_pair#*|}"
+  fsmod="$(fs_module_for "$fstype")"
+  # base + fs
+  storage="$(base_storage_modules; echo "$fsmod")" # múltiplas linhas
+  # extras por componentes
+  local comps; comps="$(compute_components)"
+  contains_word "$comps" "lvm" && storage="${storage}"$'\n'"dm_mod device-mapper"
+  contains_word "$comps" "crypt" && storage="${storage}"$'\n'"dm_crypt"
+  contains_word "$comps" "md" && storage="${storage}"$'\n'"md_mod raid0 raid1 raid10 raid456"
+  contains_word "$comps" "zfs" && storage="${storage}"$'\n'"zfs zunicode zavl zcommon znvpair spl"
+  # normalizar e transformar em array de nomes
+  echo "$storage" | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+# =============== Copy helpers (binários e libs) ===============
+copy_one(){
+  # $1 src (absoluto em ROOT), $2 dst-root (STAGE)
+  local src="$1" dstroot="$2"
+  [ -e "$src" ] || { log WARN "Arquivo ausente: $src"; return 0; }
+  local rel; rel="$(echo "$src" | sed -E "s#^${ROOT%/}##")"
+  install -D -m 0755 "$src" "${dstroot%/}/${rel}"
+}
+copy_file_mode(){
+  local src="$1" dst="$2" mode="${3:-0644}"
+  ensure_dir "$(dirname "$dst")"
+  install -m "$mode" "$src" "$dst"
+}
+
+copy_binary_with_libs(){
+  # copia binário e bibliotecas dinâmicas (ldd), detecta musl/glibc
+  local bin="$1" dst="$2"
+  [ -x "$bin" ] || { log WARN "Binário não executável: $bin"; return 0; }
+  copy_one "$bin" "$dst"
+  if has ldd; then
+    local line so
+    while read -r line; do
+      so="$(echo "$line" | awk '{print $3}')" || so=""
+      [[ "$line" =~ "=>" ]] || so="$(echo "$line" | awk '{print $1}')" || true
+      [[ "$so" = "not" || -z "$so" ]] && continue
+      [[ "$so" = /* ]] || continue
+      copy_one "$so" "$dst"
+    done < <(ldd "$bin" 2>/dev/null || true)
+  fi
+}
+
+# =============== Montagem do STAGE: /bin /sbin /lib... ===============
+select_udev_impl(){
+  if [ "$BOOTSTRAP" -eq 1 ]; then echo "mdev"; return 0; fi
+  case "$UDEV_IMPL" in
+    auto)
+      if has udevadm || [ -x "${ROOT%/}/usr/bin/udevadm" ]; then echo "udev"; else echo "mdev"; fi
+      ;;
+    mdev) echo "mdev";;
+    none) echo "none";;
+    *) echo "udev";;
+  esac
+}
+
+ensure_busybox(){
+  # tenta achar busybox estático (preferível em bootstrap), senão dinâmico
+  local cand
+  for cand in "${ROOT%/}/bin/busybox" "${ROOT%/}/usr/bin/busybox" /bin/busybox /usr/bin/busybox; do
+    [ -x "$cand" ] && echo "$cand" && return 0
+  done
+  fatal "busybox não encontrado no host/chroot"
+}
+
+install_udev_mini(){
+  local impl="$1"
+  case "$impl" in
+    udev)
+      # udevadm + systemd-udevd (ou eudev) conforme o root
+      local udevadm="${ROOT%/}/usr/bin/udevadm"
+      local udevd="${ROOT%/}/usr/lib/systemd/systemd-udevd"
+      [ -x "$udevadm" ] || udevadm="${ROOT%/}/bin/udevadm"
+      [ -x "$udevd" ] || udevd="${ROOT%/}/lib/udev/udevd"
+      [ -x "$udevd" ] || udevd="${ROOT%/}/sbin/udevd"
+      copy_binary_with_libs "$udevadm" "$STAGE"
+      copy_binary_with_libs "$udevd" "$STAGE"
+      # regras básicas
+      local rulesd="${ROOT%/}/lib/udev/rules.d"
+      if [ -d "$rulesd" ]; then
+        (cd "$ROOT" && find "${rulesd#/}" -maxdepth 1 -type f -name "*.rules" -print0) | \
+          xargs -0 -I{} sh -c 'install -D -m 0644 "'"$ROOT"'/{}" "'"$STAGE"'/{}"'
+      fi
+      ;;
+    mdev)
+      # usaremos busybox mdev; cria mdev.conf mínimo
+      ensure_dir "${STAGE}/etc"
+      cat > "${STAGE}/etc/mdev.conf" <<'EOF'
+# mdev minimal rules
+$sysfs/mdev               root:root 0660 */sbin/mdev
+EOF
+      ;;
+    none) : ;;
+  esac
+}
+
+# =============== Cópia de módulos e firmware ===============
+install_modules_and_firmware(){
+  local -a names=("$@")
+  local -a rels
+  mapfile -t rels < <(closure_modules "${names[@]}" || true)
+  # copia .ko*
+  local r
+  for r in "${rels[@]:-}"; do
+    local src="${MODDIR%/}/$r"
+    [ -f "$src" ] || continue
+    local dst="${STAGE}/lib/modules/${KVER}/$r"
+    ensure_dir "$(dirname "$dst")"
+    install -m 0644 "$src" "$dst"
+  done
+  # modules.dep e config
+  if [ -f "${MODDIR}/modules.dep" ]; then
+    ensure_dir "${STAGE}/lib/modules/${KVER}"
+    install -m 0644 "${MODDIR}/modules.dep" "${STAGE}/lib/modules/${KVER}/modules.dep"
+  fi
+  # firmware
+  if [ "$FIRMWARE_POL" != "none" ] && [ -d "${ROOT%/}/lib/firmware" ]; then
+    if [ "$FIRMWARE_POL" = "all" ]; then
+      (cd "$ROOT" && tar -C lib -cf - firmware 2>/dev/null) | tar -C "$STAGE" -xf - 2>/dev/null || true
+    else
+      mapfile -t FW < <(collect_firmware_for "${rels[@]}" || true)
+      for f in "${FW[@]:-}"; do
+        [ -f "${ROOT%/}/lib/firmware/$f" ] || continue
+        ensure_dir "${STAGE}/lib/firmware/$(dirname "$f")"
+        install -m 0644 "${ROOT%/}/lib/firmware/$f" "${STAGE}/lib/firmware/$f"
+      done
+    fi
+  fi
+}
+# =============== Geração do /init ===============
+write_init_script(){
+  local impl_udev="$1" comps_csv="$2"
+  ensure_dir "$(dirname "$INIT")"
+  cat > "$INIT" <<'SH'
+#!/bin/sh
+set -eu
+
+echo "[init] early userspace"
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs devtmpfs /dev || mount -t tmpfs dev /dev && mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+
+cmdline="$(cat /proc/cmdline || true)"
+
+# parse helper
+getarg(){ echo " $cmdline " | sed -nE "s/.*[[:space:]]$1=([^[:space:]]*).*/\1/p"; }
+
+ROOTDEV="$(getarg root || true)"
+ROOTFST="$(getarg rootfstype || true)"
+RESUME="$(getarg resume || true)"
+CRYPTSPEC="$(getarg cryptdevice || true)"
+
+quiet="$(echo " $cmdline " | grep -c " quiet ")"
+say(){ [ "$quiet" -ge 1 ] && return 0; echo "$@"; }
+
+# udev/mdev
+UDEV_IMPL="@UDEV_IMPL@"
+case "$UDEV_IMPL" in
+  udev)
+    if [ -x /usr/lib/systemd/systemd-udevd ]; then /usr/lib/systemd/systemd-udevd --daemon; fi
+    if [ -x /lib/udev/udevd ]; then /lib/udev/udevd --daemon; fi
+    if command -v udevadm >/dev/null 2>&1; then udevadm trigger --action=add || true; udevadm settle || true; fi
+    ;;
+  mdev)
+    echo /sbin/mdev > /proc/sys/kernel/hotplug || true
+    mdev -s || true
+    ;;
+  none) : ;;
+esac
+
+# LVM / MD / CRYPT
+have(){ command -v "$1" >/dev/null 2>&1; }
+if echo "@COMPS@" | grep -qw md; then
+  say "[init] assembling mdraid"
+  have mdadm && mdadm --assemble --scan || true
+fi
+if echo "@COMPS@" | grep -qw lvm; then
+  say "[init] activating LVM"
+  have vgchange && vgchange -ay || true
+fi
+if echo "@COMPS@" | grep -qw crypt; then
+  say "[init] unlocking LUKS"
+  if [ -n "$CRYPTSPEC" ] && have cryptsetup; then
+    dev="${CRYPTSPEC%%:*}"
+    map="${CRYPTSPEC##*:}"
+    cryptsetup luksOpen "$dev" "$map" --allow-discards || cryptsetup open "$dev" "$map" || true
+    [ -z "$ROOTDEV" ] && ROOTDEV="/dev/mapper/$map"
+  fi
+fi
+
+# root device fallback
+[ -n "$ROOTDEV" ] || ROOTDEV="/dev/root"
+
+# resume (hibernation)
+if [ -n "$RESUME" ] && [ -e "$RESUME" ]; then
+  say "[init] resume from $RESUME"
+  echo "$RESUME" > /sys/power/resume || true
+fi
+
+# mount root
+FST="${ROOTFST:-auto}"
+[ "$FST" = "auto" ] && FST="@FS_MODULE@"
+say "[init] mounting root=$ROOTDEV fstype=$FST"
+mkdir -p /newroot
+mount -o rw -t "$FST" "$ROOTDEV" /newroot || {
+  say "[init] mount failed, falling back to shell"
+  exec sh
+}
+
+# switch_root
+for d in sys proc dev run; do mount --move "/$d" "/newroot/$d" 2>/dev/null || true; done
+exec switch_root /newroot /sbin/init || exec switch_root /newroot /bin/init || exec chroot /newroot /sbin/init
+SH
+  # substituições
+  local fsmod comps="$comps_csv"
+  local root_pair; root_pair="$(detect_rootfs)"
+  fsmod="$(fs_module_for "${root_pair#*|}")"
+  sed -i "s|@FS_MODULE@|${fsmod}|g" "$INIT"
+  sed -i "s|@UDEV_IMPL@|$(select_udev_impl)|g" "$INIT"
+  sed -i "s|@COMPS@|${comps}|g" "$INIT"
+  chmod +x "$INIT"
+}
+
+# =============== Inclusão de binários essenciais ===============
+install_essentials(){
+  local impl; impl="$(select_udev_impl)"
+  local bb; bb="$(ensure_busybox)"
+  copy_binary_with_libs "$bb" "$STAGE"
+  # symlinks essenciais do busybox no stage (/bin/sh, /sbin/*)
+  ensure_dir "${STAGE}/bin" "${STAGE}/sbin" "${STAGE}/usr/bin" "${STAGE}/usr/sbin"
+  ln -sf /bin/busybox "${STAGE}/bin/sh"
+  for s in mount switch_root modprobe insmod rmmod mdev ls blkid dmesg; do ln -sf /bin/busybox "${STAGE}/sbin/$s"; done
+  install_udev_mini "$impl"
+
+  # componentes extras
+  local comps; comps="$(compute_components)"
+  # mdadm, lvm, cryptsetup, net utils
+  if echo "$comps" | grep -qw md; then
+    for b in "${ROOT%/}/sbin/mdadm" "${ROOT%/}/usr/sbin/mdadm"; do [ -x "$b" ] && copy_binary_with_libs "$b" "$STAGE"; done
+  fi
+  if echo "$comps" | grep -qw lvm; then
+    for b in "${ROOT%/}/sbin/lvm" "${ROOT%/}/usr/sbin/lvm" "${ROOT%/}/sbin/vgchange"; do [ -x "$b" ] && copy_binary_with_libs "$b" "$STAGE"; done
+  fi
+  if echo "$comps" | grep -qw crypt; then
+    for b in "${ROOT%/}/sbin/cryptsetup" "${ROOT%/}/usr/sbin/cryptsetup"; do [ -x "$b" ] && copy_binary_with_libs "$b" "$STAGE"; done
+  fi
+  if echo "$comps" | grep -qw net; then
+    for b in "${ROOT%/}/sbin/ip" "${ROOT%/}/usr/bin/ip" "${ROOT%/}/sbin/udhcpc" "${ROOT%/}/usr/sbin/udhcpc"; do
+      [ -x "$b" ] && copy_binary_with_libs "$b" "$STAGE"
+    done
+  fi
+  if echo "$comps" | grep -qw zfs; then
+    for b in "${ROOT%/}/sbin/zpool" "${ROOT%/}/sbin/zfs" "${ROOT%/}/usr/sbin/zpool" "${ROOT%/}/usr/sbin/zfs"; do
+      [ -x "$b" ] && copy_binary_with_libs "$b" "$STAGE"
+    done
+  fi
+}
+
+# =============== Empacotamento (cpio + compressão) ===============
+compress_cmd(){
+  case "$COMPRESS" in
+    zstd) echo "zstd -q ${COMP_LEVEL:+-${COMP_LEVEL}} -T0";;
+    xz)   echo "xz -c ${COMP_LEVEL:+-T0 -${COMP_LEVEL}}";;
+    gzip) echo "gzip -c ${COMP_LEVEL:+-${COMP_LEVEL}}";;
+    lz4)  echo "lz4 -c ${COMP_LEVEL:+-${COMP_LEVEL}}";;
+    lzop) echo "lzop ${COMP_LEVEL:+-${COMP_LEVEL}}";;
+    none) echo "cat";;
+    *) fatal "Compressor inválido: $COMPRESS";;
+  esac
+}
+
+make_cpio(){
+  local img="$1"
+  ( cd "$STAGE" && find . -xdev -print0 | LC_ALL=C LANG=C cpio --null -ov --format="$CPIO_FMT" ) | $(compress_cmd) > "$img"
+}
+
+# =============== Assinatura opcional ===============
+sign_image(){
+  local img="$1"
+  case "$SIGN" in
+    gpg)
+      has gpg || fatal "gpg não encontrado para assinatura"
+      gpg --batch --yes --detach-sign --armor "$img"
+      ;;
+    minisign)
+      has minisign || fatal "minisign não encontrado"
+      minisign -S -m "$img"
+      ;;
+    "" ) : ;;
+    * ) fatal "assinador inválido: $SIGN" ;;
+  esac
+}
+
+# =============== Manifest e verificação ===============
+write_manifest(){
+  local img="$1"
+  local man="${MAN_DIR}/initramfs-${KVER}-${TXID}.manifest"
+  (cd "$STAGE" && find . -type f -print | LC_ALL=C sort | while read -r f; do
+    sha256sum "$f"
+  done ) > "$man" 2>/dev/null || true
+  echo "$man"
+}
+
+verify_image_minimal(){
+  local img="$1"
+  has cpio || return 0
+  local need=( "./init" "./bin/busybox" )
+  local tmp; tmp="$(mktemp -d)"
+  # Verificação superficial: lista do cpio
+  if [ "$COMPRESS" = "zstd" ]; then
+    zstd -d -c "$img" | cpio -it >/dev/null 2>&1 || fatal "imagem inválida"
+  else
+    case "$COMPRESS" in
+      xz) xz -dc "$img" | cpio -it >/dev/null 2>&1 || fatal "imagem inválida";;
+      gzip) gzip -dc "$img" | cpio -it >/dev/null 2>&1 || fatal "imagem inválida";;
+      lz4) lz4 -dc "$img" | cpio -it >/dev/null 2>&1 || fatal "imagem inválida";;
+      lzop) lzop -dc "$img" | cpio -it >/dev/null 2>&1 || fatal "imagem inválida";;
+      none) cpio -it < "$img" >/dev/null 2>&1 || fatal "imagem inválida";;
+      *) : ;;
+    esac
+  fi
+  # Teste de presença (rápido): extrai apenas a lista e procura
+  local list; list="$(mktemp)"
+  case "$COMPRESS" in
+    zstd) zstd -d -c "$img" | cpio -it > "$list" 2>/dev/null ;;
+    xz)   xz -dc "$img" | cpio -it > "$list" 2>/dev/null ;;
+    gzip) gzip -dc "$img" | cpio -it > "$list" 2>/dev/null ;;
+    lz4)  lz4 -dc "$img" | cpio -it > "$list" 2>/dev/null ;;
+    lzop) lzop -dc "$img" | cpio -it > "$list" 2>/dev/null ;;
+    none) cpio -it < "$img" > "$list" 2>/dev/null ;;
+  esac
+  for n in "${need[@]}"; do
+    grep -qxF "${n#./}" "$list" || fatal "componente obrigatório ausente no initramfs: $n"
+  done
+  rm -f "$list" || true
+}
+# =============== Pipeline principal ===============
+do_build(){
+  preflight
+  setup_ctx
+
+  local comps; comps="$(compute_components)"
+  log INFO "Componentes: ${comps:-none}"
+
+  # 1) planejar módulos
+  mapfile -t MODS < <(plan_modules)
+  [ "${#MODS[@]}" -gt 0 ] || { [ $STRICT -eq 1 ] && fatal "Não foi possível determinar módulos mínimos"; }
+
+  log STEP "Copiando módulos (${#MODS[@]}) e firmware (política=$FIRMWARE_POL)"
+  install_modules_and_firmware "${MODS[@]}"
+
+  # 2) essenciais e extras
+  log STEP "Instalando binários essenciais"
+  install_essentials
+
+  # 3) /init
+  log STEP "Gerando /init"
+  write_init_script "$(select_udev_impl)" "$comps"
+
+  # 4) normalizar timestamps para reprodutibilidade
+  find "$STAGE" -exec touch -h -d "@0" {} + 2>/dev/null || true
+
+  # 5) dry-run?
+  local img="${OUT_BOOT}/initramfs-${KVER}.img"
+  if [ $DRY_RUN -eq 1 ]; then
+    log OK "Dry-run: plano pronto (imagem seria: $img)"
+    (cd "$STAGE" && find . -type f | sort) | sed 's/^/  + /'
+    return 0
+  fi
+
+  # 6) criar cpio + comprimir
+  log STEP "Empacotando: $img (cpio=$CPIO_FMT, compress=$COMPRESS${COMP_LEVEL:+/$COMP_LEVEL})"
+  make_cpio "$img"
+
+  # 7) assinar (opcional)
+  [ -n "$SIGN" ] && { log STEP "Assinando ($SIGN)"; sign_image "$img"; }
+
+  # 8) manifest e verificação
+  local man; man="$(write_manifest "$img" || true)"
+  [ $VERIFY -eq 1 ] && { log STEP "Verificando imagem"; verify_image_minimal "$img"; }
+
+  log OK "Initramfs gerado: $img"
+  [ -n "$man" ] && log OK "Manifest: $man"
+  [ $PRINT -eq 1 ] && echo "$img" >&3
+}
+
+main(){
+  log INFO "Iniciando ${SELF} v${VER}"
+  do_build
+  log OK "Concluído."
+}
+
+main "$@"
+
+# restaurar stdout
+exec 1>&3 3>&-
