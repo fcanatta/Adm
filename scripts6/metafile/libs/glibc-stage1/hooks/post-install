@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# glibc-stage1: post-install — limpeza leve e determinismo.
+set -Eeuo pipefail
+: "${ADM_DESTDIR:?}"
+
+# Remover doc pesada (não necessária no Stage1)
+rm -rf "${ADM_DESTDIR}/usr/share/info" \
+       "${ADM_DESTDIR}/usr/share/man" \
+       "${ADM_DESTDIR}/usr/share/doc" 2>/dev/null || true
+
+# Normalizar timestamps para reprodutibilidade
+if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
+  find "${ADM_DESTDIR}" -type f -exec touch -h -d @"${SOURCE_DATE_EPOCH}" {} + 2>/dev/null || true
+fi
