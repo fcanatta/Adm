@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# lib/fetch
+# Obtém sources a partir de metafile: múltiplas URLs, cache, paralelismo, checksum, unpack, patches, hooks.
+# Sem set -e; todas as funções retornam status e logam claramente.
+
+# ---------- Guarda de múltiplos sources ----------
+if [ -n "${__ADM_FETCH_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+__ADM_FETCH_SOURCED=1
+
+# ---------- Integrações opcionais ----------
+__f_has_log=0
+if declare -F log::json >/dev/null 2>&1 && declare -F log::info >/dev/null 2>&1; then __f_has_log=1; fi
+f::evt(){  [ "$__f_has_log" -eq 1 ] && log::json EVENT "$@" || true; }
+f::info(){ [ "$__f_has_log" -eq 1 ] && log::info "$@" || printf '[INFO] %s\n' "$*" 1>&2; }
+f::warn(){ [ "$__f_has_log" -eq 1 ] && log::warn "$@" || printf '[WARN] %s\n' "$*" 1>&2; }
+f::err(){  [ "$__f_has_log" -eq 1 ] && log::error "$@" || printf '[ERROR] %s\n' "$*" 1>&2; }
+
+__f_has_cfg=0
+if declare -F config::get >/dev/null 2>&1; then __f_has_cfg=1; fi
+
+__f_has_state=0
+if declare -F state::pkg_set_phase >/dev/null 2>&1; then __f_has_state=1; fi
+
+__f_has_env=0
+if declare -F env::init >/dev/null 2>&1; then __f_has_env=1; fi
+
+# ---------- Estado ----------
+__f_root="/usr/src/adm"
+__f_dir_cache=""
+__f_dir_work=""
+__f_initialized=0
+__f_jobs="auto"        # número de downloads paralelos
+__f_net_allowed="on"   # se a política permitir rede
+__f_resume="on"        # retomar downloads quando possível
+
+# ---------- Utilidades ----------
+f::load_root(){
+  if [ "$__f_has_cfg" -eq 1 ]; then
+    __f_root="$(config::get adm.root 2>/dev/null || echo /usr/src/adm)"
+    __f_jobs="$(config::get fetch.jobs 2>/dev/null || config::get adm.jobs 2>/dev/null || echo auto)"
+    __f_net_allowed="$(config::get network.allow_during_build 2>/dev/null || echo on)"
+    __f_resume="$(config::get fetch.resume 2>/dev/null || echo on)"
+  fi
+  [ -n "$__f_root" ] || __f_root="/usr/src/adm"
+  __f_dir_cache="$__f_root/fetch/cache"
+  __f_dir_work="$__f_root/fetch/work"
+}
+
+f::mkdirp(){ local d="$1"; [ -n "$d" ] || { f::err "mkdirp: dir vazio"; return 2; }; mkdir -p "$d" 2>/dev/null || { f::err "falha mkdir" path="$d"; return 1; }; }
+f::now(){ date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u; }
+f::jobs(){
+  local n
+  if [ "$__f_jobs" = "auto" ]; then
+    if command -v nproc >/dev/null 2>&1; then n="$(nproc)"; else n=2; fi
+  else n="$__f_jobs"; fi
+  [ "$n" -lt 1 ] 2>/dev/null && n=1
+  printf '%s' "$n"
+}
+f::sha256_file(){
+  local fpath="$1"
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$fpath" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$fpath" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 "$fpath" | awk '{print $2}'
+  else f::err "nenhuma ferramenta de sha256 disponível"; return 127; fi
+}
+f::basename_from_url(){
+  local u="$1"
+  case "$u" in
+    file://*) basename "${u#file://}" ;;
+    */*) basename "$u" ;;
+    *) echo "source" ;;
+  esac
+}
+
+# ---------- Inicialização ----------
+fetch::init(){
+  f::load_root
+  f::mkdirp "$__f_dir_cache" || return 21
+  f::mkdirp "$__f_dir_work"  || return 21
+  # ferramentas opcionais
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || f::warn "curl/wget ausentes — apenas git/rsync/file funcionarão"
+  command -v git >/dev/null 2>&1  || f::warn "git ausente"
+  command -v rsync >/dev/null 2>&1 || f::warn "rsync ausente"
+  __f_initialized=1
+  f::info "fetch init ok" root="$__f_root"
+  f::evt "fetch_initialized" root="$__f_root"
+  return 0
+}
+
+# ---------- Parsing do metafile ----------
+# Suporta campos:
+#   sources=url1,url2
+#   sha256sums=sha1,sha2
+#   name=, version=, category= ...
+fetch::parse_meta(){
+  local mf="$1"
+  [ -r "$mf" ] || { f::err "metafile não legível" path="$mf"; return 4; }
+  local sources sums
+  sources="$(awk -F= '/^[[:space:]]*sources[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/[[:space:]]/,""); print; exit}' "$mf")"
+  sums="$(awk -F= '/^[[:space:]]*sha256sums[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/[[:space:]]/,""); print; exit}' "$mf")"
+  local name ver cat
+  name="$(awk -F= '/^[[:space:]]*name[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$mf")"
+  ver="$(awk -F= '/^[[:space:]]*version[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$mf")"
+  cat="$(awk -F= '/^[[:space:]]*category[[:space:]]*=/{sub(/^[^=]*=/,""); gsub(/^[[:space:]]+|[[:space:]]+$/,""); print; exit}' "$mf")"
+  [ -n "$name" ] && [ -n "$ver" ] && [ -n "$cat" ] || { f::err "metafile faltando name/version/category"; return 2; }
+
+  IFS=, read -r -a url_arr <<< "${sources:-}"
+  IFS=, read -r -a sum_arr <<< "${sums:-}"
+  local ucount="${#url_arr[@]}" scount="${#sum_arr[@]}"
+  [ "$ucount" -gt 0 ] || { f::err "metafile sem sources"; return 2; }
+  # se sha256sums presente, deve bater em contagem
+  if [ -n "$sums" ] && [ "$ucount" -ne "$scount" ]; then
+    f::err "número de sha256sums difere de sources" urls="$ucount" sums="$scount"; return 2
+  fi
+
+  # imprime linhas TSV: index \t url \t sha256 \t filename
+  local i
+  for ((i=0; i<ucount; i++)); do
+    local url="${url_arr[$i]}"
+    local sum="${sum_arr[$i]:-}"
+    local fname; fname="$(f::basename_from_url "$url")"
+    printf '%s\t%s\t%s\t%s\n' "$i" "$url" "$sum" "$fname"
+  done
+  return 0
+}
+
+# ---------- Shorthands → URLs reais ----------
+fetch::resolve_url(){
+  local raw="$1" name="$2" ver="$3"
+  case "$raw" in
+    github:*)
+      # github:user/repo@v1.2.3[#path]
+      local spec="${raw#github:}"
+      local pathpart=""
+      if [[ "$spec" == *"#"* ]]; then pathpart="${spec#*#}"; spec="${spec%%#*}"; fi
+      local userrepo="${spec%@*}"; local tag="${spec#*@}"
+      echo "https://github.com/${userrepo}/archive/refs/tags/${tag}.tar.gz${pathpart:+#$pathpart}"
+      ;;
+    gitlab:*)
+      # gitlab:group/repo@v1.2.3
+      local spec="${raw#gitlab:}"; local proj="${spec%@*}"; local tag="${spec#*@}"
+      echo "https://gitlab.com/${proj}/-/archive/${tag}/${proj##*/}-${tag}.tar.gz"
+      ;;
+    sf:*)
+      # sourceforge shorthand: sf:project/file
+      local spec="${raw#sf:}"
+      echo "https://downloads.sourceforge.net/project/${spec}"
+      ;;
+    file://*|ftp://*|http://*|https://*|git://*|ssh://*|rsync://*|*/.git)
+      echo "$raw" ;;
+    /*|~/*|./*|../* )
+      # caminho local
+      echo "file://$raw" ;;
+    *)
+      # fallback: tenta como http direta
+      echo "$raw" ;;
+  esac
+}
+
+# ---------- Download/Clone por protocolo ----------
+fetch::__curl(){
+  local url="$1" out="$2"
+  local resume=()
+  [ "$__f_resume" = "on" ] && resume=( -C - )
+  curl -L --fail --silent --show-error "${resume[@]}" -o "$out" "$url"
+}
+fetch::__wget(){
+  local url="$1" out="$2"
+  local resume=()
+  [ "$__f_resume" = "on" ] && resume=( -c )
+  wget -q "${resume[@]}" -O "$out" "$url"
+}
+
+fetch::download_url(){
+  # download/clonar em arquivo/diretório alvo
+  local url="$1" out="$2"
+  [ -n "$url" ] && [ -n "$out" ] || { f::err "download_url: parâmetros vazios"; return 2; }
+  [ "$__f_net_allowed" = "on" ] || { f::err "rede desabilitada pelo profile/config"; return 9; }
+
+  case "$url" in
+    http://*|https://*|ftp://*)
+      f::info "baixando" url="$url" out="$out"
+      if command -v curl >/dev/null 2>&1; then fetch::__curl "$url" "$out"
+      elif command -v wget >/dev/null 2>&1; then fetch::__wget "$url" "$out"
+      else f::err "curl/wget não encontrados"; return 127; fi
+      ;;
+    git://*|ssh://*|*.git)
+      f::info "clonando git" url="$url" out="$out"
+      command -v git >/dev/null 2>&1 || { f::err "git não encontrado"; return 127; }
+      rm -rf "$out" 2>/dev/null || true
+      git clone --depth=1 "$url" "$out" >/dev/null 2>&1 || return 1
+      ;;
+    rsync://*|*::*)
+      f::info "sincronizando rsync" url="$url" out="$out"
+      command -v rsync >/dev/null 2>&1 || { f::err "rsync não encontrado"; return 127; }
+      rsync -a --delete "$url" "$out" >/dev/null 2>&1 || return 1
+      ;;
+    file://*)
+      local p="${url#file://}"
+      if [ -d "$p" ]; then
+        f::info "copiando diretório local" src="$p" out="$out"
+        rm -rf "$out" 2>/dev/null || true
+        cp -a "$p" "$out" >/dev/null 2>&1 || return 1
+      else
+        f::info "copiando arquivo local" src="$p" out="$out"
+        cp -f "$p" "$out" >/dev/null 2>&1 || return 1
+      fi
+      ;;
+    *)
+      f::warn "protocolo desconhecido, tentando http(s)" url="$url"
+      if command -v curl >/dev/null 2>&1; then fetch::__curl "$url" "$out"
+      elif command -v wget >/dev/null 2>&1; then fetch::__wget "$url" "$out"
+      else return 127; fi
+      ;;
+  esac
+}
+
+# ---------- Cache por sha256 ----------
+# Política: se sha256 informado, chave do cache é sha256; senão, chave é basename+size+mtime (pior).
+fetch::cache_path_for(){
+  local sha="$1" fname="$2"
+  if [ -n "$sha" ]; then
+    echo "$__f_dir_cache/$sha"
+  else
+    echo "$__f_dir_cache/byname-$(echo "$fname" | tr -cs '[:alnum:]._-+' '-')"
+  fi
+}
+
+# ---------- Unpack ----------
+fetch::unpack(){
+  # fetch::unpack <archive_or_dir> <dst_dir>
+  local src="$1" dst="$2"
+  [ -n "$src" ] && [ -n "$dst" ] || { f::err "unpack: parâmetros vazios"; return 2; }
+  rm -rf "$dst" 2>/dev/null || true
+  mkdir -p "$dst" || return 1
+
+  if [ -d "$src" ]; then
+    # projeto já clonado/copiedir
+    (cd "$src" && find . -mindepth 1 -maxdepth 1 -print0 | xargs -0 -I{} cp -a "{}" "$dst"/) || return 1
+    return 0
+  fi
+
+  case "$src" in
+    *.tar.gz|*.tgz)      tar -xzf "$src" -C "$dst" --strip-components=1 >/dev/null 2>&1 || return 1;;
+    *.tar.xz)            tar -xJf "$src" -C "$dst" --strip-components=1 >/dev/null 2>&1 || return 1;;
+    *.tar.bz2|*.tbz2)    tar -xjf "$src" -C "$dst" --strip-components=1 >/dev/null 2>&1 || return 1;;
+    *.tar.zst|*.tzst)    tar --use-compress-program zstd -xf "$src" -C "$dst" --strip-components=1 >/dev/null 2>&1 || return 1;;
+    *.zip)               unzip -oq "$src" -d "$dst" >/dev/null 2>&1 && _f_subdir="$(find "$dst" -mindepth 1 -maxdepth 1 -type d | head -n1)" && [ -n "$_f_subdir" ] && (mv "$_f_subdir"/* "$dst"/ 2>/dev/null || true) ;;
+    *.tar)               tar -xf "$src" -C "$dst" --strip-components=1 >/dev/null 2>&1 || return 1;;
+    *)                   # arquivo "solto": apenas coloca
+                         cp -f "$src" "$dst/" || return 1;;
+  esac
+  return 0
+}
+
+# ---------- Patches & Hooks ----------
+fetch::apply_patches(){
+  # fetch::apply_patches <meta_dir> <src_dir>
+  local meta_dir="$1" src_dir="$2"
+  local pdir="$meta_dir/patches"
+  [ -d "$pdir" ] || return 0
+  local p
+  for p in "$pdir"/*.patch; do
+    [ -e "$p" ] || continue
+    ( cd "$src_dir" && patch -p1 --forward < "$p" >/dev/null 2>&1 ) || { f::err "patch falhou" patch="$p"; return 1; }
+    f::evt "patch_applied" patch="$p"
+  done
+  return 0
+}
+fetch::apply_hooks(){
+  # fetch::apply_hooks <meta_dir> <src_dir>
+  local meta_dir="$1" src_dir="$2"
+  local hdir="$meta_dir/hooks"
+  [ -d "$hdir" ] || return 0
+  local h
+  for h in "$hdir"/*; do
+    [ -x "$h" ] || continue
+    ( cd "$src_dir" && "$h" ) || { f::err "hook falhou" hook="$h"; return 1; }
+    f::evt "hook_run" hook="$h"
+  done
+  return 0
+}
+
+# ---------- Manifest / Fingerprint ----------
+fetch::manifest_write(){
+  # fetch::manifest_write <src_dir> <outfile>
+  local src="$1" out="$2"
+  [ -d "$src" ] || { f::err "manifest: src não é diretório"; return 2; }
+  ( cd "$src" && find . -type f -print | sed 's#^\./#/#' | sort -u ) > "$out" || { f::err "falha manifest_write"; return 1; }
+  return 0
+}
+fetch::fingerprint_write(){
+  # fingerprint = sha256( lista de arquivos + tamanhos + mtimes )
+  local src="$1" out="$2"
+  [ -d "$src" ] || { f::err "fingerprint: src não é diretório"; return 2; }
+  local tmp="$out.tmp.$$"
+  ( cd "$src" && find . -type f -printf '%P\t%s\t%T@\n' | sort ) > "$tmp" 2>/dev/null || return 1
+  local h; h="$(f::sha256_file "$tmp")" || { rm -f "$tmp"; return 1; }
+  echo "$h" > "$out" || { rm -f "$tmp"; return 1; }
+  rm -f "$tmp" || true
+  return 0
+}
+
+# ---------- Paralelismo: baixar múltiplos sources ----------
+fetch::__dl_worker(){
+  # args: index url sha256 dldir cache_dir
+  local idx="$1" url="$2" sha="$3" dldir="$4" cdir="$5"
+  local resolved; resolved="$(fetch::resolve_url "$url")"
+  local fname; fname="$(f::basename_from_url "$resolved")"
+  local dlpath="$dldir/$idx-$fname"
+  local cache_key; cache_key="$(fetch::cache_path_for "$sha" "$fname")"
+
+  # cache hit
+  if [ -n "$sha" ] && [ -f "$cache_key" ]; then
+    cp -f "$cache_key" "$dlpath" 2>/dev/null || true
+    echo "$idx|HIT|$dlpath|$sha"
+    return 0
+  fi
+
+  # protocolos que resultam em diretório (git/rsync/file dir)
+  case "$resolved" in
+    git://*|ssh://*|*.git|rsync://*|*::*|file://*/)
+      local outdir="$dldir/$idx-src"
+      fetch::download_url "$resolved" "$outdir" || { echo "$idx|ERR||$sha"; return 1; }
+      # Empacota para cache (tar) apenas se sha conhecido; caso contrário, deixa como diretório
+      if [ -n "$sha" ]; then
+        local tarball="$dldir/$idx-$fname.tar"
+        ( cd "$outdir" && tar -cf "$tarball" . ) >/dev/null 2>&1 || { echo "$idx|ERR||$sha"; return 1; }
+        mv -f "$tarball" "$dlpath"
+        [ -f "$dlpath" ] && cp -f "$dlpath" "$cache_key" 2>/dev/null || true
+        echo "$idx|OK|$dlpath|$sha"
+      else
+        echo "$idx|OKDIR|$outdir|"
+      fi
+      return 0
+      ;;
+    *)
+      # arquivo
+      fetch::download_url "$resolved" "$dlpath" || { echo "$idx|ERR||$sha"; return 1; }
+      # checksum se fornecido
+      if [ -n "$sha" ]; then
+        local got; got="$(f::sha256_file "$dlpath")" || { echo "$idx|ERR||$sha"; return 1; }
+        if [ "$got" != "$sha" ]; then
+          echo "$idx|BADSUM|$dlpath|$sha"
+          return 2
+        fi
+        cp -f "$dlpath" "$cache_key" 2>/dev/null || true
+      fi
+      echo "$idx|OK|$dlpath|$sha"
+      return 0
+      ;;
+  esac
+}
+
+fetch::download_all(){
+  # fetch::download_all <mf_dir> <work_dir> <tsv_lines>
+  # tsv_lines: "i \t url \t sha \t fname" (uma por linha)
+  local mf_dir="$1" work="$2"; shift 2 || true
+  local dldir="$work/.downloads"
+  f::mkdirp "$dldir" || return 21
+  local jobs; jobs="$(f::jobs)"
+
+  # Executa em paralelo usando subshell + bg jobs controlados
+  local pids=() idx=0
+  # coletor de resultados
+  : > "$dldir/results.txt"
+
+  # pipe as lines into loop
+  while IFS=$'\t' read -r i url sha fname; do
+    (
+      fetch::__dl_worker "$i" "$url" "$sha" "$dldir" "$__f_dir_cache" >> "$dldir/results.txt"
+    ) &
+    pids+=($!)
+    idx=$((idx+1))
+    # controle de simultaneidade
+    if [ "${#pids[@]}" -ge "$jobs" ]; then
+      wait -n 2>/dev/null || true
+      # remove finalizados
+      local np=()
+      for pid in "${pids[@]}"; do kill -0 "$pid" 2>/dev/null || continue; np+=("$pid"); done
+      pids=("${np[@]}")
+    fi
+  done <<< "$*"
+
+  # aguarda todos
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+  # Analisa resultados
+  local bad=0
+  while IFS='|' read -r rid status path sha; do
+    case "$status" in
+      OK|HIT|OKDIR) : ;;
+      BADSUM) f::err "checksum inválido" file="$path" expect="$sha"; bad=1 ;;
+      ERR)    f::err "download falhou" idx="$rid"; bad=1 ;;
+      *)      f::warn "status desconhecido" status="$status";;
+    esac
+  done < "$dldir/results.txt"
+
+  [ "$bad" -eq 0 ] || return 1
+  echo "$dldir"
+  return 0
+}
+# ---------- Pipeline completo a partir do metafile ----------
+# Uso: fetch::from_meta "<cat> <name> <ver> <profile> <stage>"
+fetch::from_meta(){
+  local tup="$1"
+  local cat name ver profile stage
+  read -r cat name ver profile stage <<<"$tup"
+  [ -n "$cat" ] && [ -n "$name" ] && [ -n "$ver" ] && [ -n "$profile" ] && [[ "$stage" =~ ^[0-2]$ ]] || { f::err "from_meta: parâmetros inválidos"; return 2; }
+  fetch::init || return $?
+
+  # caminhos
+  local meta_dir="$__f_root/metafile/$cat/$name"
+  local metafile="$meta_dir/metafile"
+  local work="$__f_dir_work/$cat/$name/$ver"
+  f::mkdirp "$work" || return 21
+
+  # state: garantir status.json (idle) se disponível
+  if [ "$__f_has_state" -eq 1 ]; then
+    state::ensure_pkg_status "$cat" "$name" "$ver" "$profile" "$stage" >/dev/null 2>&1 || true
+    state::pkg_set_phase "$cat $name $ver $profile $stage" fetched --rc 0 --note "fetch_begin $(f::now)" >/dev/null 2>&1 || true
+  fi
+  f::evt "fetch_begin" cat="$cat" pkg="$name" ver="$ver" profile="$profile" stage="$stage"
+
+  # parsing
+  local tsv; tsv="$(fetch::parse_meta "$metafile")" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "parse_meta"; return 2; }
+
+  # downloads paralelos
+  local dldir; dldir="$(fetch::download_all "$meta_dir" "$work" "$tsv")" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "download"; return 1; }
+
+  # coletar artefatos baixados
+  local expanded="$work/src"
+  f::mkdirp "$expanded" || return 21
+
+  # para cada item baixado, unpack
+  local resfile="$dldir/results.txt"
+  local any_err=0
+  while IFS='|' read -r rid status path sha; do
+    case "$status" in
+      OK|HIT)
+        # arquivo → unpack
+        local dst="$expanded/$rid"
+        f::mkdirp "$dst" || { any_err=1; continue; }
+        fetch::unpack "$path" "$dst" || { f::err "falha ao extrair" file="$path"; any_err=1; }
+        ;;
+      OKDIR)
+        # diretório copiado/clone → mover
+        local dst="$expanded/$rid"
+        rm -rf "$dst" 2>/dev/null || true
+        mv "$path" "$dst" || { f::err "falha ao mover dir" src="$path"; any_err=1; }
+        ;;
+      *) : ;; # já tratado
+    esac
+  done < "$resfile"
+
+  [ "$any_err" -eq 0 ] || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "unpack"; return 1; }
+
+  # aplicar patches/hooks no conjunto
+  local top="$expanded/combined"
+  f::mkdirp "$top" || return 21
+  # Se apenas 1 source, torna-o raiz; se múltiplos, mescla em combined (mantém subdirs 0/,1/,…)
+  local nsrc; nsrc="$(wc -l < "$resfile" | awk '{print $1}')"
+  if [ "$nsrc" -eq 1 ]; then
+    # move conteúdo de 0/ para combined/
+    ( cd "$expanded/0" && find . -mindepth 1 -maxdepth 1 -print0 | xargs -0 -I{} cp -a "{}" "$top"/ ) || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "merge"; return 1; }
+  else
+    ( cd "$expanded" && find . -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0 -I{} cp -a "{}" "$top/{}" ) || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "merge"; return 1; }
+  fi
+
+  fetch::apply_patches "$meta_dir" "$top" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "patch"; return 1; }
+  fetch::apply_hooks   "$meta_dir" "$top" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "hook"; return 1; }
+
+  # manifest + fingerprint
+  local manifest="$work/manifest.pre"
+  local fingerprint="$work/fingerprint.src"
+  fetch::manifest_write "$top" "$manifest" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "manifest"; return 1; }
+  fetch::fingerprint_write "$top" "$fingerprint" || { fetch::__fail "$cat" "$name" "$ver" "$profile" "$stage" "fingerprint"; return 1; }
+
+  # registrar no state
+  if [ "$__f_has_state" -eq 1 ]; then
+    state::artefact_set "$cat $name $ver $profile $stage" "fetch.work_dir" "$work" >/dev/null 2>&1 || true
+    state::artefact_set "$cat $name $ver $profile $stage" "fetch.src_dir" "$top"   >/dev/null 2>&1 || true
+    state::artefact_set "$cat $name $ver $profile $stage" "fetch.manifest" "$manifest" >/dev/null 2>&1 || true
+    state::fingerprint_write "$cat" "$name" "$ver" "$profile" "$stage" "$(cat "$fingerprint")" >/dev/null 2>&1 || true
+    state::pkg_set_phase "$cat $name $ver $profile $stage" fetched --rc 0 --note "fetch_done $(f::now)" >/dev/null 2>&1 || true
+  fi
+
+  f::evt "fetch_done" cat="$cat" pkg="$name" ver="$ver"
+  echo "$top"
+  return 0
+}
+
+fetch::__fail(){
+  local c="$1" n="$2" v="$3" p="$4" s="$5" step="$6"
+  f::err "fetch falhou" cat="$c" pkg="$n" ver="$v" step="$step"
+  if [ "$__f_has_state" -eq 1 ]; then
+    state::pkg_set_phase "$c $n $v $p $s" failed --rc 1 --note "fetch_failed($step) $(f::now)" >/dev/null 2>&1 || true
+  fi
+}
+
+# ---------- Limpeza ----------
+fetch::clean(){
+  # fetch::clean <cat> <name> <ver>
+  local c="$1" n="$2" v="$3"
+  [ -n "$c" ] && [ -n "$n" ] && [ -n "$v" ] || { f::err "clean: parâmetros inválidos"; return 2; }
+  local d="$__f_dir_work/$c/$n/$v"
+  [ -d "$d" ] || return 0
+  rm -rf --one-file-system "$d" 2>/dev/null || { f::err "falha ao remover workdir"; return 1; }
+  f::info "workdir removido" path="$d"
+  return 0
+}
+
+fetch::purge(){
+  # remove TODO o cache
+  rm -rf --one-file-system "$__f_dir_cache" 2>/dev/null || { f::err "falha ao remover cache"; return 1; }
+  f::mkdirp "$__f_dir_cache" || return 21
+  f::info "cache purgado" path="$__f_dir_cache"
+  return 0
+}
+
+# ---------- Verificação rápida ----------
+fetch::check(){
+  # fetch::check <cat> <name> <ver>
+  local c="$1" n="$2" v="$3"
+  local mf="$__f_root/metafile/$c/$n/metafile"
+  fetch::parse_meta "$mf" >/dev/null
+}
+
+# ---------- CLI ----------
+fetch::usage(){
+  cat <<'USAGE'
+adm fetch <cmd> ...
+
+Comandos:
+  do <cat> <name> <ver> <profile> <stage>   # baixa, verifica, extrai, patches, hooks, state
+  check <cat> <name> <ver>                  # valida metafile
+  clean <cat> <name> <ver>                  # remove workdir
+  purge                                     # limpa o cache de sources
+USAGE
+}
+
+# Execução direta opcional
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  sub="$1"; shift || true
+  case "$sub" in
+    do)     fetch::from_meta "$1 $2 $3 $4 $5" ;;
+    check)  fetch::init || exit $?; fetch::check "$@" ;;
+    clean)  fetch::init || exit $?; fetch::clean "$@" ;;
+    purge)  fetch::init || exit $?; fetch::purge ;;
+    ""|-h|--help) fetch::usage ;;
+    *) f::err "comando desconhecido: $sub"; fetch::usage; exit 1 ;;
+  esac
+fi
+
+# ---------- Fim seguro ----------
+return 0 2>/dev/null || true
