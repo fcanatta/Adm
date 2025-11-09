@@ -1,0 +1,598 @@
+#!/usr/bin/env bash
+# adm-build — executor de builds com fetch paralelo e múltiplos protocolos
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF="${0##*/}"
+VER="1.4.0"
+
+# ---------------- Cores / Log ----------------
+COLOR_MODE="${ADM_COLOR:-auto}"
+R="\033[0m"; B="\033[1m"
+C_CYAN="\033[36m"; C_RED="\033[31m"; C_GRN="\033[32m"; C_YEL="\033[33m"; C_BLU="\033[34m"
+ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+log(){ # level msg...
+  local L="$1"; shift; local M="$*"; local SYM COL
+  case "$L" in INFO)SYM="▶";COL="$C_CYAN";; OK)SYM="✓";COL="$C_GRN";; WARN)SYM="!";COL="$C_YEL";; ERR)SYM="✗";COL="$C_RED";; STEP)SYM="➜";COL="$C_BLU";; *)SYM="-";COL="$R";; esac
+  if [[ "$COLOR_MODE" == "never" || $(is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then
+    printf "%s %s %s\n" "$(ts)" "$SYM" "$M"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$B" "$(ts)" "$R" "$COL" "$SYM" "$R" "$B" "$M" "$R"
+  fi
+}
+fatal(){ log ERR "$*"; exit 2; }
+trap 'log ERR "Falha em ${SELF} (linha $LINENO). Veja ${ADM_LOGS}/adm-build.log"; exit 2' ERR
+
+# ---------------- CLI ----------------
+TARGET=""               # host|chroot (se vazio, lê de states/plan/target.txt)
+ONLY=""                 # lista, separada por vírgulas
+FROM_PKG=""             # começa a partir deste
+CONTINUE=0
+ALL=0                   # ignora changed.list
+STRICT_CHECKSUM=1
+STRICT_DETECT=0
+NO_TESTS=0
+KEEP_WORK=0
+KEEP_SRC=0
+MAX_PARALLEL=0          # por camada; 0 = auto
+FETCH_RETRIES=3
+FETCH_TIMEOUT=900       # seg por arquivo
+FETCH_PARALLEL=4        # quantos downloads simultâneos
+PREFER_DL=""            # aria2|curl|wget
+PRINT=0
+LOG_TAIL=0
+
+usage(){
+  cat <<EOF
+${SELF} v${VER}
+Uso: ${SELF} [opções]
+
+Seleção:
+  --continue                 Retoma a partir do último falho
+  --from=pkg                 Começa em 'pkg' na ordem planejada
+  --only=p1,p2               Restringe a estes pacotes
+  --all                      Ignora changed.list (constrói todos)
+
+Políticas:
+  --target=host|chroot       Força alvo (senão lê states/plan/target.txt)
+  --strict-checksum=0|1      Exigir sha256 por link (default: 1)
+  --strict-detect            Falha se adm-detect retornar unknown
+  --no-tests                 Pula testes
+  --keep-work                Não limpa src/ ao final
+  --keep-src                 Mantém árvore src extraída
+  --max-parallel=N           Paralelismo por camada (default: auto)
+  --fetch-retries=N          Retries por link (default: 3)
+  --fetch-timeout=SECS       Timeout por link (default: 900)
+  --fetch-parallel=N         Downloads simultâneos (default: 4)
+  --prefer=aria2|curl|wget   Preferência de downloader
+Output:
+  --print                    Resumo por pacote
+  --log-tail                 Tail do log ao falhar
+  -h|--help                  Ajuda
+EOF
+}
+
+for a in "$@"; do
+  case "$a" in
+    --continue) CONTINUE=1;;
+    --from=*) FROM_PKG="${a#*=}";;
+    --only=*) ONLY="${a#*=}";;
+    --all) ALL=1;;
+    --target=*) TARGET="${a#*=}";;
+    --strict-checksum=0) STRICT_CHECKSUM=0;;
+    --strict-checksum=1) STRICT_CHECKSUM=1;;
+    --strict-detect) STRICT_DETECT=1;;
+    --no-tests) NO_TESTS=1;;
+    --keep-work) KEEP_WORK=1;;
+    --keep-src) KEEP_SRC=1;;
+    --max-parallel=*) MAX_PARALLEL="${a#*=}";;
+    --fetch-retries=*) FETCH_RETRIES="${a#*=}";;
+    --fetch-timeout=*) FETCH_TIMEOUT="${a#*=}";;
+    --fetch-parallel=*) FETCH_PARALLEL="${a#*=}";;
+    --prefer=*) PREFER_DL="${a#*=}";;
+    --print) PRINT=1;;
+    --log-tail) LOG_TAIL=1;;
+    -h|--help) usage; exit 0;;
+    *) log WARN "Opção desconhecida: $a";;
+  esac
+done
+[[ -z "$TARGET" || "$TARGET" =~ ^(host|chroot)$ ]] || fatal "TARGET inválido"
+
+# ---------------- Ambiente (adm-init) ----------------
+ROOT_BASE="${ADM_ROOT_DIR:-/usr/src/adm}"
+ADM_STATES="${ADM_STATES:-${ROOT_BASE}/states}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_BASE}/logs}"
+ADM_META="${ADM_META:-${ROOT_BASE}/metafiles}"
+ADM_SOURCES="${ADM_SOURCES:-${ROOT_BASE}/sources}"
+ADM_WORK="${ADM_WORK:-${ROOT_BASE}/work}"
+ADM_CACHE_PKG="${ADM_CACHE_PKG:-${ROOT_BASE}/cache/pkg}"
+
+mkdir -p "$ADM_LOGS" "$ADM_SOURCES" "$ADM_WORK" "$ADM_CACHE_PKG"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-build.log" 2>&1
+
+[ -f "${ADM_STATES}/paths.env" ] || fatal "paths.env ausente (rode adm-init)"
+[ -f "${ADM_STATES}/global.env" ] || fatal "global.env ausente (rode adm-init)"
+# shellcheck disable=SC1090
+. "${ADM_STATES}/paths.env"
+# shellcheck disable=SC1090
+. "${ADM_STATES}/global.env"
+[ -n "${ADM_PROFILE_FILE:-}" ] && . "${ADM_PROFILE_FILE}" || true
+
+PLAN_DIR="${ADM_STATES}/plan"
+[ -f "${PLAN_DIR}/order.list" ] || fatal "states/plan/order.list ausente (rode adm-plan)"
+[ -f "${PLAN_DIR}/layers.json" ] || fatal "states/plan/layers.json ausente"
+[ -f "${PLAN_DIR}/target.txt" ] && TARGET="${TARGET:-$(cat "${PLAN_DIR}/target.txt")}" || TARGET="${TARGET:-host}"
+[[ "$TARGET" =~ ^(host|chroot)$ ]] || fatal "TARGET inválido: $TARGET"
+
+log INFO "Iniciando ${SELF} v${VER} (target=${TARGET})"
+
+# ---------------- Utils ----------------
+has(){ command -v "$1" >/dev/null 2>&1; }
+trim(){ sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//' ; }
+split_csv(){ IFS=',' read -r -a _a <<<"$1"; printf "%s\n" "${_a[@]}"; }
+mdirs(){ mkdir -p "$1"; }
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+calc_fp(){ # name version sources sums patches-hash
+  printf "%s" "$1|$2|$3|$4|$5" | sha256sum | awk '{print $1}'
+}
+patches_hash(){ local pd="$1"; if [ -d "$pd" ]; then find "$pd" -maxdepth 1 -type f -print0 | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'; else echo "none"; fi; }
+
+# Leitor de metafile com chaves mínimas
+mf_field(){ awk -F'=' -v K="$2" '$0!~/^#/ && $0~"=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); if(key==K){$1="";sub(/^=/,"");print;exit}}' "$1" 2>/dev/null | trim; }
+
+# Estado de pacote construído
+is_built_state(){
+  local name="$1" ver="$2" fp="$3" dir
+  case "$TARGET" in host) dir="${ADM_STATES}/built";; chroot) dir="${ADM_STATES}/built-chroot";; esac
+  local f="${dir}/${name}-${ver}.fingerprint"
+  [ -f "$f" ] && grep -q "$fp" "$f"
+}
+write_built_state(){
+  local name="$1" ver="$2" fp="$3" dir
+  case "$TARGET" in host) dir="${ADM_STATES}/built";; chroot) dir="${ADM_STATES}/built-chroot";; esac
+  mdirs "$dir"; printf "%s\n" "$fp" > "${dir}/${name}-${ver}.fingerprint"
+}
+
+# Progresso / retomada
+LAST_SUCCESS="${ADM_STATES}/last-success.txt"
+LAST_FAILED="${ADM_STATES}/last-failed.txt"
+PROGRESS_LOG="${ADM_STATES}/progress.log"
+
+mark_success(){ echo "$1" > "$LAST_SUCCESS"; sed -i "\$a$(ts) OK $1" "$PROGRESS_LOG" || true; }
+mark_failed(){ echo "$1" > "$LAST_FAILED"; sed -i "\$a$(ts) FAIL $1" "$PROGRESS_LOG" || true; }
+
+# ---------------- Plano / seleção ----------------
+read_order(){
+  mapfile -t ORDER < "${PLAN_DIR}/order.list"
+  if [ $ALL -eq 0 ] && [ -f "${PLAN_DIR}/changed.list" ]; then
+    mapfile -t CHANGED < "${PLAN_DIR}/changed.list"
+    declare -A set=()
+    for x in "${CHANGED[@]}"; do set["$x"]=1; done
+    local o filtered=()
+    for o in "${ORDER[@]}"; do [ -n "${set[$o]+x}" ] && filtered+=("$o"); done
+    ORDER=("${filtered[@]}")
+  fi
+  if [ -n "$ONLY" ]; then
+    declare -A want=(); for x in $(echo "$ONLY" | tr ',' ' '); do want["$x"]=1; done
+    local o f2=(); for o in "${ORDER[@]}"; do [ -n "${want[$o]+x}" ] && f2+=("$o"); done
+    ORDER=("${f2[@]}")
+  fi
+  if [ -n "$FROM_PKG" ]; then
+    local idx=-1 i=0
+    for i in "${!ORDER[@]}"; do [ "${ORDER[$i]}" = "$FROM_PKG" ] && { idx=$i; break; }; done
+    [ $idx -ge 0 ] && ORDER=("${ORDER[@]:$idx}")
+  elif [ $CONTINUE -eq 1 ] && [ -s "$LAST_FAILED" ]; then
+    FROM_PKG="$(cat "$LAST_FAILED")"
+    local idx=-1 i
+    for i in "${!ORDER[@]}"; do [ "${ORDER[$i]}" = "$FROM_PKG" ] && { idx=$i; break; }; done
+    [ $idx -ge 0 ] && ORDER=("${ORDER[@]:$idx}")
+  fi
+  [ "${#ORDER[@]}" -gt 0 ] || fatal "Nenhum pacote para construir após filtros"
+}
+
+read_layers(){
+  LAYERS_JSON="$(cat "${PLAN_DIR}/layers.json")"
+  # Vamos usar ordem linear; paralelismo por camada será simples: executa subconjuntos por camada com semáforo.
+}
+
+read_order
+read_layers
+log OK "Selecionados ${#ORDER[@]} pacotes para build"
+# ---------------- Fetch: escolha de downloader ----------------
+pick_downloader(){
+  if [ -n "$PREFER_DL" ]; then echo "$PREFER_DL"; return 0; fi
+  if has aria2c; then echo "aria2"; return 0; fi
+  if has curl; then echo "curl"; return 0; fi
+  if has wget; then echo "wget"; return 0; fi
+  echo "curl"
+}
+
+# ---------------- Fetch helpers ----------------
+dl_http(){
+  # $1=url $2=dest
+  local url="$1" out="$2" dl="$(pick_downloader)"
+  case "$dl" in
+    aria2) aria2c -c -x16 -s16 --timeout="$FETCH_TIMEOUT" --dir="$(dirname "$out")" --out="$(basename "$out")" "$url" ;;
+    curl)  curl -L --fail --retry "$FETCH_RETRIES" --retry-delay 3 --connect-timeout 20 -m "$FETCH_TIMEOUT" -C - -o "$out" "$url" ;;
+    wget)  wget -c --tries="$FETCH_RETRIES" --timeout="$FETCH_TIMEOUT" -O "$out" "$url" ;;
+    *)     curl -L --fail -C - -o "$out" "$url" ;;
+  esac
+}
+dl_ftp(){ dl_http "$@"; }
+dl_rsync(){
+  # $1=rsync://... or host:path $2=dest
+  local src="$1" out="$2"
+  rsync -av --partial --timeout="$FETCH_TIMEOUT" "$src" "$out"
+}
+dl_git_archive(){
+  # Clona raso e arquiva tar.(zst|gz) em $2
+  # Suporta fragmentos: #commit=<sha> | #tag=<tag> | @tag (em https)
+  local url="$1" out="$2" tmp dirc comp
+  tmp="$(mktemp -d)"; dirc="$tmp/repo"
+  git clone --depth=1 "$url" "$dirc" >/dev/null 2>&1 || git clone "$url" "$dirc"
+  # fragmentos
+  local frag=""
+  case "$url" in *\#commit=*) frag="${url##*#commit=}"; git -C "$dirc" checkout --quiet "$frag" || true;; esac
+  case "$url" in *\#tag=*) frag="${url##*#tag=}"; git -C "$dirc" checkout --quiet "tags/$frag" || git -C "$dirc" checkout --quiet "$frag" || true;; esac
+  # compressão
+  if has zstd; then comp="zstd"; git -C "$dirc" archive --format=tar HEAD | zstd -T0 -o "$out"
+  else comp="gzip"; git -C "$dirc" archive --format=tar HEAD | gzip -9 > "$out"
+  fi
+  rm -rf "$tmp"
+}
+dl_dir_archive(){
+  # $1=path_dir $2=dest
+  local p="$1" out="$2"
+  [ -d "$p" ] || fatal "Diretório local não existe: $p"
+  ( cd "$p" && { if has zstd; then tar -cf - . | zstd -T0 -o "$out"; else tar -czf "$out" .; fi; } )
+}
+dl_sourceforge(){
+  # Aceita URL direta; SourceForge redireciona. Usa dl_http.
+  dl_http "$1" "$2"
+}
+dl_github_gitlab(){
+  # URL de release/archive http(s) normal → usa dl_http
+  dl_http "$1" "$2"
+}
+
+# Verifica sha256
+verify_sha(){
+  local file="$1" want="$2"
+  [ -f "$file" ] || return 1
+  local got; got="$(sha256_file "$file")"
+  if [ "$got" = "$want" ]; then return 0; fi
+  return 1
+}
+
+# Limita concorrência de jobs
+sem_init(){ SEM_MAX="$1"; SEM_CUR=0; }
+sem_acquire(){
+  while [ "$SEM_CUR" -ge "$SEM_MAX" ]; do wait -n || true; SEM_CUR=$((SEM_CUR-1)); done
+  SEM_CUR=$((SEM_CUR+1))
+}
+sem_release(){ wait -n || true; SEM_CUR=$((SEM_CUR-1)); }
+
+# Baixa um item com retries e verificação
+fetch_item(){
+  # args: name ver idx url sha outdir
+  local name="$1" ver="$2" idx="$3" url="$4" want="$5" outdir="$6"
+  local base="${name}-${ver}-src${idx}"
+  local ext="${url##*/}"
+  local dest="${outdir}/${base}-${ext}"
+  local ok=0 tries=0
+  while [ $tries -lt "$FETCH_RETRIES" ]; do
+    tries=$((tries+1))
+    log INFO "[$name] fetch (${idx}) tentativa ${tries}: ${url}"
+    case "$url" in
+      http://*|https://*) dl_http "$url" "$dest" ;;
+      ftp://*)            dl_ftp "$url" "$dest" ;;
+      rsync://*|*:*/*)    dl_rsync "$url" "$dest" ;;
+      git://*|*.git|ssh://*git*) dl_git_archive "$url" "$dest" ;;
+      file://*)           cp -f "${url#file://}" "$dest" ;;
+      /*|./*|../*|~/*)    [ -d "$url" ] && dl_dir_archive "$url" "$dest" || cp -f "$url" "$dest" ;;
+      *sourceforge.net/*) dl_sourceforge "$url" "$dest" ;;
+      *github.com/*|*gitlab.com/*) dl_github_gitlab "$url" "$dest" ;;
+      *)                  dl_http "$url" "$dest" ;;
+    esac
+    if [ "$STRICT_CHECKSUM" -eq 1 ]; then
+      if verify_sha "$dest" "$want"; then ok=1; break; else log WARN "[$name] sha256 mismatch (got=$(sha256_file "$dest"), want=$want)."; fi
+    else
+      if [ -n "$want" ] && ! verify_sha "$dest" "$want"; then log WARN "[$name] sha256 mismatch (não estrito)"; fi
+      ok=1; break
+    fi
+  done
+  [ $ok -eq 1 ] || fatal "[$name] Falha ao baixar ${url} após ${FETCH_RETRIES} tentativas"
+  echo "$dest"
+}
+
+# Fetch em paralelo de todos os sources declarados
+fetch_all(){
+  # args: meta_dir name ver outdir
+  local mdir="$1" name="$2" ver="$3" outdir="$4"
+  mdirs "$outdir"
+  local sources sums
+  sources="$(mf_field "${mdir}/metafile" sources)"
+  sums="$(mf_field "${mdir}/metafile" sha256sums)"
+  [ -n "$sources" ] || fatal "[$name] metafile sem 'sources'"
+  local -a srcs sums_a
+  mapfile -t srcs < <(split_csv "$sources")
+  mapfile -t sums_a < <(split_csv "$sums")
+  if [ "$STRICT_CHECKSUM" -eq 1 ] && [ "${#srcs[@]}" -ne "${#sums_a[@]}" ]; then
+    fatal "[$name] número de sources != sha256sums (strict)"
+  fi
+  sem_init "$FETCH_PARALLEL"
+  local -a results
+  local i=0 pid
+  for i in "${!srcs[@]}"; do
+    local url="$(echo "${srcs[$i]}" | trim)"
+    local want="${sums_a[$i]:-}"
+    sem_acquire
+    ( set -Eeuo pipefail
+      fpath="$(fetch_item "$name" "$ver" "$i" "$url" "$want" "$outdir")"
+      printf "%s\n" "$fpath"
+    ) & pid=$!
+    PIDS+=("$pid")
+  done
+  # consumir saídas dos jobs
+  results=()
+  for _ in "${PIDS[@]:-}"; do
+    read -r fp || true
+    [ -n "$fp" ] && results+=("$fp")
+  done
+  # aguarda todos
+  wait || true
+  echo "${results[@]}"
+}
+# ---------------- Extract / Patches ----------------
+extract_one(){
+  # $1=archive $2=destdir
+  local arc="$1" dst="$2"
+  mdirs "$dst"
+  case "$arc" in
+    *.tar.zst)    zstd -d -c "$arc" | tar -C "$dst" -xf - ;;
+    *.tar.xz)     xz -dc "$arc" | tar -C "$dst" -xf - ;;
+    *.tar.gz|*.tgz)  tar -C "$dst" -xzf "$arc" ;;
+    *.zip)        unzip -q -d "$dst" "$arc" ;;
+    *.zst)        zstd -d -c "$arc" > "$dst/$(basename "${arc%.zst}")";;
+    *.xz)         xz -dk "$arc" -c > "$dst/$(basename "${arc%.xz}")";;
+    *)            tar -C "$dst" -xf "$arc" 2>/dev/null || cp -f "$arc" "$dst/";;
+  esac
+}
+apply_patches(){
+  # $1=patchdir $2=srcdir $3=name
+  local pd="$1" sd="$2" name="$3"
+  [ -d "$pd" ] || return 0
+  local p
+  for p in $(find "$pd" -maxdepth 1 -type f -name '*.patch' | sort); do
+    log INFO "[$name] patch $(basename "$p")"
+    ( cd "$sd" && patch -p1 -s < "$p" )
+  done
+}
+
+# ---------------- Detect / Configure ----------------
+run_detect(){
+  # $1=meta_dir $2=workdir (base) $3=name $4=ver
+  local mdir="$1" wdir="$2" name="$3" ver="$4"
+  local src="$wdir/src" bld="$wdir/build" stg="$wdir/staging" det="$wdir/detect"
+  mdirs "$bld" "$stg" "$det"
+  adm-detect --src="$src" --builddir="$bld" --staging="$stg" --meta="$mdir" --out="$det" --print || {
+    [ $STRICT_DETECT -eq 1 ] && fatal "[$name] adm-detect falhou"
+    log WARN "[$name] adm-detect falhou; tentando fallback"
+  }
+  [ -f "$det/detect.env" ] && . "$det/detect.env" || true
+}
+
+configure_pkg(){
+  local name="$1" wdir="$2"
+  local src="$wdir/src" bld="$wdir/build" det="$wdir/detect"
+  local bs="${ADM_DETECT_BUILD_SYSTEM:-unknown}"
+  case "$bs" in
+    meson)
+      has meson || fatal "[$name] meson não encontrado"
+      meson setup "$bld" "$src" ${ADM_DETECT_CONFIGURE_ARGS:+$ADM_DETECT_CONFIGURE_ARGS} || fatal "[$name] meson setup falhou"
+      ;;
+    cmake)
+      has cmake || fatal "[$name] cmake não encontrado"
+      cmake -S "$src" -B "$bld" ${ADM_DETECT_CONFIGURE_ARGS:+$ADM_DETECT_CONFIGURE_ARGS} || fatal "[$name] cmake configure falhou"
+      ;;
+    autotools)
+      ( cd "$bld" && "$src/configure" ${ADM_DETECT_CONFIGURE_ARGS:+$ADM_DETECT_CONFIGURE_ARGS} ) || fatal "[$name] configure falhou"
+      ;;
+    make)
+      : # nada a fazer
+      ;;
+    python|cargo|go|node|ruby|unknown)
+      : # tratados na build
+      ;;
+    *) : ;;
+  esac
+}
+
+# ---------------- Build / Test / Install ----------------
+build_pkg(){
+  local name="$1" wdir="$2"
+  local bld="$wdir/build"
+  case "${ADM_DETECT_BUILD_SYSTEM:-unknown}" in
+    meson)  has ninja || fatal "[$name] ninja não encontrado"; ninja -C "$bld" -j"${ADM_JOBS:-$(nproc)}" ;;
+    cmake)  cmake --build "$bld" -j"${ADM_JOBS:-$(nproc)}" ;;
+    autotools|make) make -C "$bld" -j"${ADM_JOBS:-$(nproc)}" ;;
+    cargo)  ( cd "$wdir/src" && cargo build --release ) ;;
+    go)     ( cd "$wdir/src" && go build ./... ) ;;
+    python) ( cd "$wdir/src" && (python -m build || python setup.py bdist_wheel) ) ;;
+    node)   ( cd "$wdir/src" && { if has pnpm; then pnpm i --frozen-lockfile; pnpm run build || true; elif has npm; then npm ci; npm run build || true; elif has yarn; then yarn install --frozen-lockfile; yarn build || true; fi; } ) ;;
+    ruby)   : ;;
+    unknown)
+      if [ -f "$wdir/src/Makefile" ]; then make -C "$wdir/src" -j"${ADM_JOBS:-$(nproc)}"; else fatal "[$name] build system unknown"; fi
+      ;;
+  esac
+}
+
+test_pkg(){
+  local name="$1" wdir="$2"
+  [ $NO_TESTS -eq 1 ] && { log INFO "[$name] testes desativados"; return 0; }
+  case "${ADM_DETECT_BUILD_SYSTEM:-unknown}" in
+    meson) meson test -C "$wdir/build" ;;
+    cmake) ctest --output-on-failure -C Release -j"${ADM_JOBS:-$(nproc)}" --test-dir "$wdir/build" ;;
+    autotools|make) make -C "$wdir/build" check || true ;;
+    cargo) ( cd "$wdir/src" && cargo test --all || true ) ;;
+    go)    ( cd "$wdir/src" && go test ./... || true ) ;;
+    python) ( cd "$wdir/src" && (pytest || true) ) ;;
+    node)   ( cd "$wdir/src" && { npm test || true; } ) ;;
+    *) : ;;
+  esac
+}
+
+install_pkg(){
+  local name="$1" wdir="$2"
+  local stg="$wdir/staging"
+  case "${ADM_DETECT_BUILD_SYSTEM:-unknown}" in
+    meson) DESTDIR="$stg" ninja -C "$wdir/build" install ;;
+    cmake) DESTDIR="$stg" cmake --install "$wdir/build" ;;
+    autotools|make)
+      if [ -d "$wdir/build" ] && [ -f "$wdir/build/Makefile" ]; then
+        make -C "$wdir/build" DESTDIR="$stg" install
+      else
+        make -C "$wdir/src" DESTDIR="$stg" install
+      fi
+      ;;
+    cargo)
+      ( cd "$wdir/src" && cargo install --path . --root "$stg/usr" || true )
+      ;;
+    go)
+      ( cd "$wdir/src" && GOFLAGS="-trimpath" GOBIN="$stg/usr/bin" go install ./... || true )
+      ;;
+    python)
+      ( cd "$wdir/src" && python -m pip install --root "$stg" --prefix /usr --no-deps --no-warn-script-location dist/*.whl 2>/dev/null || true )
+      ;;
+    node|ruby|unknown) : ;;
+  esac
+}
+# ---------------- Package / Cleanup ----------------
+package_pkg(){
+  local name="$1" ver="$2" wdir="$3"
+  local stg="$wdir/staging"
+  [ -d "$stg" ] || fatal "[$name] staging inexistente"
+  ( cd "$stg" && find . -type f | sed 's|^\./||' | sort ) > "$wdir/manifest.txt"
+  local meta="$wdir/pkgmeta.json"
+  cat > "$meta" <<EOF
+{
+  "name": "$name",
+  "version": "$ver",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "target": "$TARGET"
+}
+EOF
+  local arch; arch="$(uname -m)"
+  local pkgf="${name}-${ver}-${arch}.tar"
+  ( cd "$stg" && tar -cf "$wdir/$pkgf" . )
+  if has zstd; then zstd -19 -T0 -f "$wdir/$pkgf" -o "$wdir/${pkgf}.zst" && rm -f "$wdir/$pkgf" && pkgf="${pkgf}.zst"
+  else tar -czf "$wdir/${pkgf}.gz" -C "$stg" . && rm -f "$wdir/$pkgf" && pkgf="${pkgf}.gz"
+  fi
+  mdirs "$ADM_CACHE_PKG/$name"; cp -f "$wdir/$pkgf" "$ADM_CACHE_PKG/$name/"
+  echo "$ADM_CACHE_PKG/$name/$pkgf"
+}
+
+cleanup_pkg(){
+  local wdir="$1"
+  if [ $KEEP_WORK -eq 0 ] && [ $KEEP_SRC -eq 0 ]; then rm -rf "$wdir/src" || true; fi
+}
+
+# ---------------- Pipeline por pacote ----------------
+build_one(){
+  local name="$1" ver="$2" cat="$3" mdir="${ADM_META}/${cat}/${name}"
+  log STEP "[$name] === Início ==="
+  local wdir="${ADM_WORK}/${cat}/${name}-${ver}"; mdirs "$wdir/src" "$wdir/build" "$wdir/staging" "$wdir/detect" "$wdir/logs"
+  local src_cache="${ADM_SOURCES}/${name}/${ver}"; mdirs "$src_cache"
+
+  # sources & sums
+  local sources sums patches_dir="${mdir}/patches"
+  sources="$(mf_field "${mdir}/metafile" sources)"
+  sums="$(mf_field "${mdir}/metafile" sha256sums)"
+  local fp patches_h; patches_h="$(patches_hash "$patches_dir")"
+  fp="$(calc_fp "$name" "$ver" "$sources" "$sums" "$patches_h")"
+
+  if is_built_state "$name" "$ver" "$fp"; then
+    log OK "[$name] já construído com fingerprint atual — pulando"
+    return 0
+  fi
+
+  # FETCH paralelo
+  PIDS=()
+  local fetched; fetched="$(fetch_all "$mdir" "$name" "$ver" "$src_cache")"
+  # EXTRACT para src/
+  for arc in $fetched; do extract_one "$arc" "$wdir/src"; done
+
+  # PATCHES
+  apply_patches "$patches_dir" "$wdir/src" "$name"
+
+  # DETECT
+  run_detect "$mdir" "$wdir" "$name" "$ver"
+
+  # CONFIGURE/BUILD/TEST/INSTALL
+  configure_pkg "$name" "$wdir"
+  build_pkg "$name" "$wdir"
+  test_pkg "$name" "$wdir"
+  install_pkg "$name" "$wdir"
+
+  # PACKAGE
+  local pkgfile; pkgfile="$(package_pkg "$name" "$ver" "$wdir")"
+  log OK "[$name] pacote gerado: $pkgfile"
+
+  # STATE
+  write_built_state "$name" "$ver" "$fp"
+  mark_success "$name"
+  cleanup_pkg "$wdir"
+  log OK "[$name] === Fim ==="
+}
+
+# ---------------- Orquestração por camada ----------------
+run_all(){
+  # Vamos usar a lista linear ORDER, mas respeitar MAX_PARALLEL para múltiplos pacotes em paralelo.
+  local n="${#ORDER[@]}"
+  local k="${MAX_PARALLEL:-0}"
+  [ "$k" -le 0 ] && k="$(min "${ADM_JOBS_BUILD:-0}" "$n")"
+  [ "$k" -le 0 ] && k="$(min "${ADM_JOBS:-0}" "$n")"
+  [ "$k" -le 0 ] && k=1
+
+  log INFO "Paralelismo de pacotes: $k"
+  local sem=$k running=0
+  for pkg in "${ORDER[@]}"; do
+    # descobrir meta
+    local mdir; mdir="$(find "${ADM_META}" -type d -path "*/${pkg}" -print -quit)"
+    [ -n "$mdir" ] || fatal "Metafile para $pkg não encontrado"
+    local mf="${mdir}/metafile"
+    local name ver cat
+    name="$(mf_field "$mf" name)"; ver="$(mf_field "$mf" version)"; cat="$(mf_field "$mf" category)"
+    [ -n "$name" ] && [ -n "$ver" ] && [ -n "$cat" ] || fatal "metafile inválido para $pkg"
+
+    # semáforo simples
+    while [ "$running" -ge "$sem" ]; do wait -n || true; running=$((running-1)); done
+    (
+      set -Eeuo pipefail
+      build_one "$name" "$ver" "$cat"
+    ) || {
+      mark_failed "$name"
+      log ERR "Falha no pacote: $name"
+      [ $LOG_TAIL -eq 1 ] && tail -n 200 "${ADM_LOGS}/adm-build.log" >&3 || true
+      exit 6
+    } &
+    running=$((running+1))
+  done
+  wait || true
+}
+
+min(){ [ "$1" -le "$2" ] && echo "$1" || echo "$2"; }
+
+# ---------------- Main ----------------
+main(){
+  run_all
+  log OK "Build concluído."
+  [ $PRINT -eq 1 ] && { echo "Pacotes processados: ${#ORDER[@]}"; } >&3
+}
+main "$@"
+
+# restaurar stdout
+exec 1>&3 3>&-
