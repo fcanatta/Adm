@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# adm-detect — detector de build/compiladores/linkers/linguagens/deps
+# adm-detect — detector evoluído de build/toolchain/frameworks/deps/docs/GPU/Xorg/kernel
 # Saídas: detect.json + detect.env (consumidos pelo adm-build)
 # Licença: MIT
 
 set -Eeuo pipefail
 
 SELF_NAME="${0##*/}"
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 # ---------------------- Cores / Logging ----------------------
 COLOR_MODE="${ADM_COLOR:-auto}"
@@ -27,12 +27,12 @@ usage(){ cat <<EOF
 ${SELF_NAME} v${VERSION}
 Uso: ${SELF_NAME} --src=DIR --builddir=DIR --staging=DIR --meta=DIR --out=DIR [opções]
   --src=DIR        Diretório do source (já extraído e patchado)
-  --builddir=DIR   Diretório de build (vazio ou existente)
-  --staging=DIR    Diretório de staging (DESTDIR do pacote)
+  --builddir=DIR   Diretório de build
+  --staging=DIR    Diretório de staging (DESTDIR)
   --meta=DIR       Pasta do pacote (metafile/hooks/patches)
   --out=DIR        Saída (detect.json, detect.env, detect.log)
   --strict         Erros ambíguos viram fatais
-  --no-probe       Não executar sondagens opcionais (apenas inspeção de arquivos)
+  --no-probe       Não executar sondagens opcionais
   --print          Mostrar resumo ao final
 EOF
 }
@@ -53,10 +53,10 @@ done
 [ -n "$SRC_DIR" ] && [ -d "$SRC_DIR" ] || fatal "--src inválido"
 [ -n "$BUILD_DIR" ] || fatal "--builddir obrigatório"
 [ -n "$STAGING_DIR" ] || fatal "--staging obrigatório"
-[ -n "$META_DIR" ] && [ -d "$META_DIR" ] || cecho WARN "--meta não encontrado (prossigo sem hooks)"
 [ -n "$OUT_DIR" ] || fatal "--out obrigatório"
+[ -z "$META_DIR" ] || [ -d "$META_DIR" ] || cecho WARN "--meta não encontrado (prosseguindo)"
 
-mkdir -p "$OUT_DIR"
+mkdir -p "$OUT_DIR" "$BUILD_DIR" "$STAGING_DIR"
 DETECT_LOG="${OUT_DIR%/}/detect.log"
 exec 3>&1; exec >>"$DETECT_LOG" 2>&1
 cecho INFO "Iniciando ${SELF_NAME} v${VERSION}"
@@ -72,23 +72,20 @@ print(json.dumps(s)[1:-1])
 PY
 PL
 }
-read_meta_field(){ local k="$1"; awk -F'=' -v K="$k" '$0!~/^#/ && $0~"=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); if(key==K){$1="";sub(/^=/,"");print;exit}}' "$META_DIR/metafile" 2>/dev/null | trim; }
+read_meta_field(){ local k="$1"; [ -f "$META_DIR/metafile" ] || return 0
+  awk -F'=' -v K="$k" '$0!~/^#/ && $0~"=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); if(key==K){$1="";sub(/^=/,"");print;exit}}' "$META_DIR/metafile" 2>/dev/null | trim; }
 first_existing(){ for f in "$@"; do [ -f "$f" ] && { echo "$f"; return 0; }; done; return 1; }
+add_unique(){ local -n A="$1"; local v="$2"; [ -z "$v" ] && return 0; for x in "${A[@]:-}"; do [ "$x" = "$v" ] && return 0; done; A+=("$v"); }
+add_many(){ local -n A="$1"; shift; local v; for v in "$@"; do add_unique A "$v"; done; }
 
 # ---------------------- Hooks ----------------------
-run_hook(){ local ph="$1"
-  local h="$META_DIR/hooks/$ph"
-  [ -x "$h" ] || return 0
+run_hook(){ local ph="$1"; local h="${META_DIR}/hooks/$ph"; [ -x "$h" ] || return 0
   cecho INFO "Hook $ph"
-  ADM_NAME="$(read_meta_field name)" \
-  ADM_VERSION="$(read_meta_field version)" \
-  ADM_CATEGORY="$(read_meta_field category)" \
-  SRC_DIR="$SRC_DIR" BUILD_DIR="$BUILD_DIR" STAGING_DIR="$STAGING_DIR" OUT_DIR="$OUT_DIR" \
-  "$h"
+  ADM_NAME="$(read_meta_field name)" ADM_VERSION="$(read_meta_field version)" ADM_CATEGORY="$(read_meta_field category)" \
+  SRC_DIR="$SRC_DIR" BUILD_DIR="$BUILD_DIR" STAGING_DIR="$STAGING_DIR" OUT_DIR="$OUT_DIR" "$h"
 }
 
 # ---------------------- Estado / Defaults ----------------------
-mkdir -p "$BUILD_DIR" "$STAGING_DIR"
 BUILD_SYSTEM="unknown"
 LANGS=() ; TESTS=()
 CC_DET="" ; CXX_DET="" ; FC_DET="" ; RUSTC_DET="" ; GO_DET="" ; JAVAC_DET=""
@@ -97,18 +94,23 @@ DESTDIR_SUPPORTED="unknown" ; CCACHE_SUPPORTED="unknown"
 CFLAGS_OUT="${CFLAGS:-}" ; CXXFLAGS_OUT="${CXXFLAGS:-}" ; LDFLAGS_OUT="${LDFLAGS:-}"
 PKGCONFIG_PATH_OUT="${PKG_CONFIG_PATH:-}"
 DEPS_BUILD=() ; DEPS_RUN=() ; DEPS_UNKNOWN=()
+
 FEATURES_ENABLE=() ; FEATURES_DISABLE=()
 CROSS_SUPPORTED="unknown" ; CROSS_STYLE=""
 CONFIG_ARGS=()
 
+DOC_TOOLS=()           # doc tools detectados
+FRAMEWORKS=()         # frameworks/libs relevantes
+ACCEL_STACK=()        # cuda/opencl/rocm
+GFX_STACK=()          # x11/xcb/opengl/egl/glx/vulkan/wayland/xorg
+KERNEL_INFO=()        # tipo de árvore, drivers, firmware
+
 # ---------------------- Sondagem segura ----------------------
-do_probe(){ # executa comando com timeout, se disponível
-  local tcmd cmd; tcmd="$1"; cmd="$2"
-  if [ "$NO_PROBE" -eq 1 ]; then return 0; fi
+do_probe(){ local tcmd="$1" cmd="$2"; [ "$NO_PROBE" -eq 1 ] && return 0
   if has timeout; then timeout "$tcmd" bash -lc "$cmd"; else bash -lc "$cmd"; fi
 }
 
-# ---------------------- Detecção de Build System ----------------------
+# ---------------------- Build system ----------------------
 detect_build_system(){
   local s="$SRC_DIR"
   if   [ -f "$s/meson.build" ]; then BUILD_SYSTEM="meson"
@@ -125,10 +127,10 @@ detect_build_system(){
   cecho OK "build_system=$BUILD_SYSTEM"
 }
 
-# ---------------------- Detecção de linguagens ----------------------
+# ---------------------- Linguagens ----------------------
 detect_languages(){
   local s="$SRC_DIR"
-  find "$s" -type f \( -name '*.c' -o -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hh' -o -name '*.hpp' -o -name '*.S' -o -name '*.s' -o -name '*.f' -o -name '*.f90' -o -name '*.rs' -o -name '*.go' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.m' -o -name '*.mm' -o -name '*.java' -o -name '*.lua' \) -printf '%f\n' \
+  find "$s" -type f \( -name '*.c' -o -name '*.h' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hh' -o -name '*.hpp' -o -name '*.S' -o -name '*.s' -o -name '*.f' -o -name '*.f90' -o -name '*.rs' -o -name '*.go' -o -name '*.py' -o -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.m' -o -name '*.mm' -o -name '*.java' -o -name '*.lua' -o -name '*.cu' -o -name '*.hip' \) -printf '%f\n' \
   | awk '{
      if($0~/\.c$/) langs["c"]=1;
      if($0~/\.(cc|cpp|cxx)$/) langs["cxx"]=1;
@@ -143,14 +145,15 @@ detect_languages(){
      if($0~/\.mm$/) langs["objcpp"]=1;
      if($0~/\.java$/) langs["java"]=1;
      if($0~/\.lua$/) langs["lua"]=1;
+     if($0~/\.cu$/) langs["cuda"]=1;
+     if($0~/\.hip$/) langs["hip"]=1;
    } END{for(k in langs) print k}' | sort > "$OUT_DIR/langs.list" || true
   mapfile -t LANGS < "$OUT_DIR/langs.list" || LANGS=()
-  cecho OK "linguagens: ${LANGS[*]:-(nenhuma detectada)}"
+  cecho OK "linguagens: ${LANGS[*]:-(nenhuma)}"
 }
 
-# ---------------------- Detecção de Compiladores/Linkers ----------------------
+# ---------------------- Toolchain / Linker ----------------------
 detect_toolchain(){
-  # CC/CXX preferindo ambiente; senão procura
   CC_DET="${CC:-}"; CXX_DET="${CXX:-}"
   [ -z "$CC_DET" ]  && { has clang && CC_DET="clang" || { has gcc && CC_DET="gcc" || CC_DET="cc"; }; }
   [ -z "$CXX_DET" ] && { has clang++ && CXX_DET="clang++" || { has g++ && CXX_DET="g++" || CXX_DET="c++"; }; }
@@ -158,7 +161,6 @@ detect_toolchain(){
   has go && GO_DET="go" || GO_DET=""
   has javac && JAVAC_DET="javac" || JAVAC_DET=""
   has gfortran && FC_DET="gfortran" || FC_DET=""
-  # Linker preferido
   if has mold; then LINKER_DET="mold"
   elif has ld.lld || has lld; then LINKER_DET="lld"
   elif has ld.gold; then LINKER_DET="gold"
@@ -167,27 +169,20 @@ detect_toolchain(){
   cecho OK "toolchain: CC=$CC_DET CXX=$CXX_DET LD=$LINKER_DET"
 }
 
-# ---------------------- Suporte DESTDIR/LTO/ccache/testes ----------------------
+# ---------------------- Capacidades base ----------------------
 detect_capabilities(){
   case "$BUILD_SYSTEM" in
     meson|cmake|autotools|make|python|cargo|go|node|ruby) DESTDIR_SUPPORTED="true" ;;
     *) DESTDIR_SUPPORTED="unknown" ;;
   esac
-  # LTO: perfis aggressives geralmente aceitam; confirmamos por hints
-  if grep -REqs 'INTERPROCEDURAL_OPTIMIZATION|b_lto|flto' "$SRC_DIR" 2>/dev/null; then
-    LTO_SUPPORTED="true"
-  else
-    LTO_SUPPORTED="maybe"
-  fi
+  grep -REqs 'INTERPROCEDURAL_OPTIMIZATION|b_lto|flto' "$SRC_DIR" 2>/dev/null && LTO_SUPPORTED="true" || LTO_SUPPORTED="maybe"
   CCACHE_SUPPORTED=$(has ccache && echo "true" || echo "false")
-
-  # testes suportados
-  if [ -f "$SRC_DIR/CMakeLists.txt" ]; then TESTS+=("ctest"); fi
-  [ -f "$SRC_DIR/meson.build" ] && TESTS+=("meson")
-  [ -f "$SRC_DIR/Makefile" ] && grep -qE '(^|[[:space:]])check([[:space:]]|:)' "$SRC_DIR/Makefile" && TESTS+=("make")
-  [ -f "$SRC_DIR/Cargo.toml" ] && TESTS+=("cargo")
-  [ -f "$SRC_DIR/go.mod" ] && TESTS+=("go")
-  [ -f "$SRC_DIR/pyproject.toml" ] || [ -f "$SRC_DIR/setup.py" ] && TESTS+=("pytest")
+  [ -f "$SRC_DIR/CMakeLists.txt" ] && add_unique TESTS "ctest"
+  [ -f "$SRC_DIR/meson.build" ] && add_unique TESTS "meson"
+  [ -f "$SRC_DIR/Makefile" ] && grep -qE '(^|[[:space:]])check([[:space:]]|:)' "$SRC_DIR/Makefile" && add_unique TESTS "make"
+  [ -f "$SRC_DIR/Cargo.toml" ] && add_unique TESTS "cargo"
+  [ -f "$SRC_DIR/go.mod" ] && add_unique TESTS "go"
+  ([ -f "$SRC_DIR/pyproject.toml" ] || [ -f "$SRC_DIR/setup.py" ]) && add_unique TESTS "pytest"
 }
 
 run_hook pre-detect
@@ -195,38 +190,20 @@ detect_build_system
 detect_languages
 detect_toolchain
 detect_capabilities
-# ---------------------- Extração de Dependências ----------------------
-add_unique(){ # dest-array-name value
-  local -n A="$1"; local v="$2"; [ -z "$v" ] && return 0
-  for x in "${A[@]:-}"; do [ "$x" = "$v" ] && return 0; done
-  A+=("$v")
-}
+# ---------------------- Dependências base ----------------------
 collect_pkgconfig(){
-  # Busca nomes que aparecem em pkg-config (foo >= x.y) → "foo"
-  grep -REoh 'pkg-config[[:space:]]+[^;]*' "$SRC_DIR" 2>/dev/null | sed 's/\\//g' | tr ' ' '\n' \
-    | awk '/^[A-Za-z0-9._+-]+$/{print}' | sort -u
   grep -REoh 'PKG_CHECK_MODULES\(\s*[A-Za-z0-9_]+\s*,\s*[^)]*\)' "$SRC_DIR" 2>/dev/null \
     | sed -E 's/.*PKG_CHECK_MODULES\(\s*[A-Za-z0-9_]+\s*,\s*([^)]*)\).*/\1/' \
-    | tr ' ' '\n' | tr ',' '\n' | tr -d '>' | tr -d '=' | tr -d '<' \
-    | awk '/^[A-Za-z0-9._+-]+$/{print}' | sort -u
+    | tr ' ,><=\t' '\n' | awk '/^[A-Za-z0-9._+-]+$/{print}' | sort -u
+  grep -REoh 'pkg-config[[:space:]]+[^;]*' "$SRC_DIR" 2>/dev/null \
+    | tr ' ' '\n' | awk '/^[A-Za-z0-9._+-]+$/{print}' | sort -u
 }
-collect_cmake(){
-  grep -REoh 'find_package\([[:space:]]*[A-Za-z0-9_+-]+' "$SRC_DIR" 2>/dev/null \
-    | sed -E 's/.*find_package\(\s*([A-Za-z0-9_+-]+).*/\1/' | sort -u
-}
-collect_meson(){
-  grep -REoh "dependency\(['\"][A-Za-z0-9_+-]+['\"]" "$SRC_DIR" 2>/dev/null \
-    | sed -E "s/.*dependency\(['\"]([A-Za-z0-9_+-]+)['\"].*/\1/" | sort -u
-}
-collect_autoconf_libs(){
-  grep -REoh 'AC_CHECK_LIB\(\s*[A-Za-z0-9_+-]+' "$SRC_DIR" 2>/dev/null \
-    | sed -E 's/.*AC_CHECK_LIB\(\s*([A-Za-z0-9_+-]+).*/\1/' | sort -u
-}
+collect_cmake(){ grep -REoh 'find_package\([[:space:]]*[A-Za-z0-9_+-]+' "$SRC_DIR" 2>/dev/null | sed -E 's/.*find_package\(\s*([A-Za-z0-9_+-]+).*/\1/' | sort -u; }
+collect_meson(){ grep -REoh "dependency\(['\"][A-Za-z0-9_+-]+['\"]" "$SRC_DIR" 2>/dev/null | sed -E "s/.*dependency\(['\"]([A-Za-z0-9_+-]+)['\"].*/\1/" | sort -u; }
+collect_autoconf_libs(){ grep -REoh 'AC_CHECK_LIB\(\s*[A-Za-z0-9_+-]+' "$SRC_DIR" 2>/dev/null | sed -E 's/.*AC_CHECK_LIB\(\s*([A-Za-z0-9_+-]+).*/\1/' | sort -u; }
 collect_python(){
-  if [ -f "$SRC_DIR/pyproject.toml" ]; then
-    awk -v RS= -F'\n' '/\[project\]/,/^\[/{print}' "$SRC_DIR/pyproject.toml" 2>/dev/null \
-      | grep -Eo "['\"][A-Za-z0-9_.+-]+['\"]" | tr -d "\"'" | sort -u
-  fi
+  [ -f "$SRC_DIR/pyproject.toml" ] && awk -v RS= -F'\n' '/\[project\]/,/^\[/{print}' "$SRC_DIR/pyproject.toml" 2>/dev/null \
+     | grep -Eo "['\"][A-Za-z0-9_.+-]+['\"]" | tr -d "\"'" | sort -u
   [ -f "$SRC_DIR/requirements.txt" ] && awk -F'[<>= ]' '{print $1}' "$SRC_DIR/requirements.txt" | awk '/^[A-Za-z0-9_.+-]+$/{print}' | sort -u
 }
 collect_node(){
@@ -246,14 +223,9 @@ collect_cargo(){
   awk '/^\[build-dependencies\]/, /^\[/{if($0 !~ /^\[/) print}' "$SRC_DIR/Cargo.toml" 2>/dev/null \
    | awk -F'=' '{gsub(/[[:space:]]/,"",$1); if($1!="") print $1}' | sort -u
 }
-collect_go(){
-  [ -f "$SRC_DIR/go.mod" ] || return 0
-  awk '/^require /{print $2}' "$SRC_DIR/go.mod" 2>/dev/null | awk -F'/' '{print $NF}' | sort -u
-}
+collect_go(){ [ -f "$SRC_DIR/go.mod" ] && awk '/^require /{print $2}' "$SRC_DIR/go.mod" 2>/dev/null | awk -F'/' '{print $NF}' | sort -u; }
+
 classify_dependencies(){
-  # Heurística de classificação:
-  # - pkg-config/CMake/Meson/Autoconf → build_deps
-  # - runtimes (python/node) → run_deps (libs podem ser build também; mantemos unknown extras)
   local x
   while read -r x; do [ -n "$x" ] && add_unique DEPS_BUILD "$x"; done < <(collect_pkgconfig)
   while read -r x; do [ -n "$x" ] && add_unique DEPS_BUILD "$x"; done < <(collect_cmake)
@@ -269,11 +241,9 @@ classify_dependencies(){
     | sed -E 's/.*<([^>]+)>.*/\1/' | awk -F'/' '{print $1}' | awk '/^[A-Za-z0-9_.+-]+$/{print}' | sort -u \
     | while read -r h; do add_unique DEPS_UNKNOWN "$h"; done
 }
-
 classify_dependencies
 
-# ---------------------- Flags / Linker / Perfil ----------------------
-# Respeita CFLAGS/CXXFLAGS/LDFLAGS do ambiente (perfil); adiciona fuse-ld se suportado
+# ---------------------- Flags / Linker / Libc / LTO ----------------------
 apply_linker_flags(){
   case "$LINKER_DET" in
     mold) LDFLAGS_OUT="${LDFLAGS_OUT:+$LDFLAGS_OUT }-Wl,-O2 -Wl,--as-needed -fuse-ld=mold" ;;
@@ -291,12 +261,9 @@ apply_libc_macros(){
   CXXFLAGS_OUT="${CXXFLAGS_OUT:+$CXXFLAGS_OUT }${CFLAGS_OUT:+ }${CFLAGS_OUT## }"
 }
 apply_perf_safety_flags(){
-  # Já vem do perfil em geral; garantimos -fPIC e proteções mínimas quando plausível
   case "$BUILD_SYSTEM" in
-    cargo|go|python|node|ruby) : ;; # flags C/C++ pouco úteis aqui
-    *) CFLAGS_OUT="${CFLAGS_OUT:+$CFLAGS_OUT }-fPIC"
-       CXXFLAGS_OUT="${CXXFLAGS_OUT:+$CXXFLAGS_OUT }-fPIC"
-       ;;
+    cargo|go|python|node|ruby) : ;;
+    *) CFLAGS_OUT="${CFLAGS_OUT:+$CFLAGS_OUT }-fPIC"; CXXFLAGS_OUT="${CXXFLAGS_OUT:+$CXXFLAGS_OUT }-fPIC" ;;
   esac
 }
 apply_lto_feature(){
@@ -304,14 +271,10 @@ apply_lto_feature(){
     CFLAGS_OUT="${CFLAGS_OUT:+$CFLAGS_OUT }-flto -fuse-linker-plugin"
     CXXFLAGS_OUT="${CXXFLAGS_OUT:+$CXXFLAGS_OUT }-flto -fuse-linker-plugin"
     LDFLAGS_OUT="${LDFLAGS_OUT:+$LDFLAGS_OUT }-flto"
-    FEATURES_ENABLE+=("lto" "linker=$LINKER_DET")
+    add_many FEATURES_ENABLE "lto" "linker=$LINKER_DET"
   fi
 }
-
-apply_linker_flags
-apply_libc_macros
-apply_perf_safety_flags
-apply_lto_feature
+apply_linker_flags; apply_libc_macros; apply_perf_safety_flags; apply_lto_feature
 
 # ---------------------- Cross (hints) ----------------------
 detect_cross(){
@@ -326,55 +289,147 @@ detect_cross(){
 }
 detect_cross
 
-# ---------------------- Config args (hints) ----------------------
 compose_config_args(){
   case "$BUILD_SYSTEM" in
     cmake)
-      CONFIG_ARGS+=( "-DCMAKE_INSTALL_PREFIX=/usr" "-DCMAKE_BUILD_TYPE=Release" )
-      [ -n "$CFLAGS_OUT" ]   && CONFIG_ARGS+=( "-DCMAKE_C_FLAGS=${CFLAGS_OUT}" )
-      [ -n "$CXXFLAGS_OUT" ] && CONFIG_ARGS+=( "-DCMAKE_CXX_FLAGS=${CXXFLAGS_OUT}" )
-      [ -n "$LDFLAGS_OUT" ]  && CONFIG_ARGS+=( "-DCMAKE_EXE_LINKER_FLAGS=${LDFLAGS_OUT}" )
+      add_many CONFIG_ARGS "-DCMAKE_INSTALL_PREFIX=/usr" "-DCMAKE_BUILD_TYPE=Release"
+      [ -n "$CFLAGS_OUT" ]   && add_unique CONFIG_ARGS "-DCMAKE_C_FLAGS=${CFLAGS_OUT}"
+      [ -n "$CXXFLAGS_OUT" ] && add_unique CONFIG_ARGS "-DCMAKE_CXX_FLAGS=${CXXFLAGS_OUT}"
+      [ -n "$LDFLAGS_OUT" ]  && add_unique CONFIG_ARGS "-DCMAKE_EXE_LINKER_FLAGS=${LDFLAGS_OUT}"
       ;;
     meson)
-      CONFIG_ARGS+=( "--prefix=/usr" )
-      [[ "$LTO_SUPPORTED" =~ (true|maybe) ]] && CONFIG_ARGS+=( "-Db_lto=true" )
+      add_unique CONFIG_ARGS "--prefix=/usr"
+      [[ "$LTO_SUPPORTED" =~ (true|maybe) ]] && add_unique CONFIG_ARGS "-Db_lto=true"
       ;;
-    autotools)
-      CONFIG_ARGS+=( "--prefix=/usr" )
-      ;;
-    make)
-      : # nada especial aqui
-      ;;
-    python|cargo|go|node|ruby)
-      : # controlado pelo executor
-      ;;
-    *)
-      :
-      ;;
+    autotools) add_unique CONFIG_ARGS "--prefix=/usr" ;;
+    make) : ;;
+    python|cargo|go|node|ruby) : ;;
+    *) : ;;
   esac
 }
 compose_config_args
 
-# ---------------------- PKG_CONFIG_PATH seguro ----------------------
 compute_pkgconfig_path(){
   local base="/usr/lib/pkgconfig:/usr/share/pkgconfig:/usr/local/lib/pkgconfig"
-  if [ -n "$PKGCONFIG_PATH_OUT" ]; then
-    PKGCONFIG_PATH_OUT="$base:$PKGCONFIG_PATH_OUT"
-  else
-    PKGCONFIG_PATH_OUT="$base"
-  fi
+  PKGCONFIG_PATH_OUT="${PKGCONFIG_PATH_OUT:+$base:$PKGCONFIG_PATH_OUT}"
+  [ -z "$PKGCONFIG_PATH_OUT" ] && PKGCONFIG_PATH_OUT="$base"
 }
 compute_pkgconfig_path
-# ---------------------- Serialização JSON/ENV ----------------------
-join_json_array(){ # prints ["a","b"] safely
-  local arr=("$@"); local out="["; local i=0
-  for x in "${arr[@]:-}"; do
-    local e; e="$(printf "%s" "$x" | json_escape)"
-    [ $i -gt 0 ] && out+=", "
-    out+="\"$e\""; i=$((i+1))
-  done
+
+# ---------------------- Doc tools ----------------------
+detect_doc_tools(){
+  local s="$SRC_DIR"
+  [ -f "$s/Doxyfile" ] && add_unique DOC_TOOLS "doxygen"
+  [ -f "$s/conf.py" ] && grep -q "sphinx" "$s/conf.py" 2>/dev/null && add_unique DOC_TOOLS "sphinx"
+  [ -f "$s/mkdocs.yml" ] && add_unique DOC_TOOLS "mkdocs"
+  [ -f "$s/book.toml" ] || [ -d "$s/src" -a -f "$s/src/SUMMARY.md" ] && add_unique DOC_TOOLS "mdbook"
+  [ -f "$s/pandoc.yaml" ] || grep -REqs 'pandoc' "$s" 2>/dev/null && add_unique DOC_TOOLS "pandoc"
+  find "$s" -maxdepth 2 -type f -name 'CMakeLists.txt' -exec grep -H "doxygen" {} \; 2>/dev/null | grep -q . && add_unique DOC_TOOLS "doxygen-cmake"
+  find "$s" -type f -name '*.adoc' -o -name '*.asciidoc' | grep -q . && add_unique DOC_TOOLS "asciidoc"
+  find "$s" -type f -name 'Makefile' -exec grep -H "man[1-9]" {} \; 2>/dev/null | grep -q . && add_unique DOC_TOOLS "man-groff"
+  find "$s" -type f -name '*.tex' | grep -q . && add_unique DOC_TOOLS "latex"
+  find "$s" -type f -name 'CMakeLists.txt' -exec grep -H "Graphviz" {} \; 2>/dev/null | grep -q . && add_unique DOC_TOOLS "graphviz"
+  find "$s" -type f -name '*.java' | grep -q . && add_unique DOC_TOOLS "javadoc"
+}
+detect_doc_tools
+
+# ---------------------- Frameworks ----------------------
+detect_frameworks(){
+  local s="$SRC_DIR"
+  # Qt
+  grep -REqs 'find_package\(\s*Qt[0-9]+' "$s" 2>/dev/null && add_unique FRAMEWORKS "qt"
+  find "$s" -maxdepth 2 -name '*.pro' | grep -q . && add_unique FRAMEWORKS "qt-qmake"
+  # GTK/GLib/GStreamer
+  grep -REqs "dependency\('gtk|glib|gstreamer" "$s" 2>/dev/null && add_many FRAMEWORKS "gtk" "glib" "gstreamer"
+  grep -REqs 'find_package\(\s*(GTK|GLIB|GStreamer)' "$s" 2>/dev/null && add_many FRAMEWORKS "gtk" "glib" "gstreamer"
+  # SDL2 / wx / Boost / OpenSSL / Cairo / FFMpeg
+  grep -REqs "SDL2|find_package\(SDL2|dependency\('sdl2" "$s" 2>/dev/null && add_unique FRAMEWORKS "sdl2"
+  grep -REqs "wxWidgets|find_package\(wxWidgets" "$s" 2>/dev/null && add_unique FRAMEWORKS "wxwidgets"
+  grep -REqs "find_package\(Boost|<boost/" "$s" 2>/dev/null && add_unique FRAMEWORKS "boost"
+  grep -REqs "find_package\(OpenSSL|<openssl/" "$s" 2>/dev/null && add_unique FRAMEWORKS "openssl"
+  grep -REqs "find_package\(Cairo|cairo/" "$s" 2>/dev/null && add_unique FRAMEWORKS "cairo"
+  grep -REqs "avcodec|libavformat|find_package\(FFMPEG|find_package\(LibAV" "$s" 2>/dev/null && add_unique FRAMEWORKS "ffmpeg"
+  # Outros
+  grep -REqs "libuv/|find_package\(libuv" "$s" 2>/dev/null && add_unique FRAMEWORKS "libuv"
+  grep -REqs "event.h|find_package\(Libevent" "$s" 2>/dev/null && add_unique FRAMEWORKS "libevent"
+  grep -REqs "find_package\(Protobuf|protobuf/" "$s" 2>/dev/null && add_unique FRAMEWORKS "protobuf"
+  grep -REqs "find_package\(gRPC|grpc/" "$s" 2>/dev/null && add_unique FRAMEWORKS "grpc"
+  grep -REqs "find_package\(OpenCV|opencv2/" "$s" 2>/dev/null && add_unique FRAMEWORKS "opencv"
+  grep -REqs "QtWebEngine" "$s" 2>/dev/null && add_unique FRAMEWORKS "qtwebengine"
+  grep -REqs "unicode/|find_package\(ICU" "$s" 2>/dev/null && add_unique FRAMEWORKS "icu"
+  grep -REqs "curl/|find_package\(CURL" "$s" 2>/dev/null && add_unique FRAMEWORKS "curl"
+  grep -REqs "zlib.h|find_package\(ZLIB" "$s" 2>/dev/null && add_unique FRAMEWORKS "zlib"
+  grep -REqs "bzlib.h|find_package\(BZip2" "$s" 2>/dev/null && add_unique FRAMEWORKS "bzip2"
+  grep -REqs "zstd.h|find_package\(Zstd" "$s" 2>/dev/null && add_unique FRAMEWORKS "zstd"
+}
+detect_frameworks
+# ---------------------- Aceleradores (CUDA/OpenCL/ROCm) ----------------------
+detect_accelerators(){
+  local s="$SRC_DIR" found=0
+  # CUDA
+  find "$s" -type f -name '*.cu' | grep -q . && { add_unique ACCEL_STACK "cuda"; found=1; }
+  grep -REqs 'find_package\(\s*CUDAToolkit|CUDA_ADD_LIBRARY|CUDA_ADD_EXECUTABLE' "$s" 2>/dev/null && { add_unique ACCEL_STACK "cuda"; found=1; }
+  has nvcc && { add_unique ACCEL_STACK "cuda"; found=1; }
+  # OpenCL
+  grep -REqs '<CL/cl.h>|find_package\(OpenCL|OpenCL/CL.h|cl.hpp' "$s" 2>/dev/null && { add_unique ACCEL_STACK "opencl"; found=1; }
+  pkg-config --exists OpenCL 2>/dev/null && { add_unique ACCEL_STACK "opencl"; found=1; } || true
+  # ROCm / HIP
+  find "$s" -type f -name '*.hip' | grep -q . && { add_unique ACCEL_STACK "rocm-hip"; found=1; }
+  grep -REqs 'find_package\(\s*HIP|hip/hip_runtime.h' "$s" 2>/dev/null && { add_unique ACCEL_STACK "rocm-hip"; found=1; }
+  has hipcc && { add_unique ACCEL_STACK "rocm-hip"; found=1; }
+  # Ajuste de flags indicadores
+  [ $found -eq 1 ] && add_unique FEATURES_ENABLE "accelerators"
+}
+detect_accelerators
+
+# ---------------------- Stack gráfico (Xorg/Wayland/OpenGL/Vulkan) ----------------------
+detect_graphics_stack(){
+  local s="$SRC_DIR"
+  # X11 / XCB / Xorg
+  grep -REqs '<X11/|find_package\(X11|xorg-server|xorgproto' "$s" 2>/dev/null && add_unique GFX_STACK "x11"
+  grep -REqs '<xcb/|find_package\(XCB' "$s" 2>/dev/null && add_unique GFX_STACK "xcb"
+  grep -REqs 'xorg-.*\.pc|Xorg' "$s" 2>/dev/null && add_unique GFX_STACK "xorg"
+  # Wayland
+  grep -REqs 'wayland-client.h|wayland-server.h|find_package\(Wayland' "$s" 2>/dev/null && add_unique GFX_STACK "wayland"
+  # OpenGL / EGL / GLX
+  grep -REqs 'gl\.h|glew\.h|find_package\(OpenGL' "$s" 2>/dev/null && add_unique GFX_STACK "opengl"
+  grep -REqs 'egl\.h|find_package\(EGL' "$s" 2>/dev/null && add_unique GFX_STACK "egl"
+  grep -REqs 'glx\.h|find_package\(GLX' "$s" 2>/dev/null && add_unique GFX_STACK "glx"
+  # Vulkan
+  grep -REqs 'vulkan/vulkan\.h|find_package\(Vulkan' "$s" 2>/dev/null && add_unique GFX_STACK "vulkan"
+  # Mesa
+  grep -REqs 'mesa|gbm\.h|find_package\(gbm' "$s" 2>/dev/null && add_unique GFX_STACK "mesa"
+}
+detect_graphics_stack
+
+# ---------------------- Kernel/Drivers/Firmware ----------------------
+detect_kernel_drivers_firmware(){
+  local s="$SRC_DIR"
+  # Kernel tree?
+  if [ -f "$s/Makefile" ] && grep -qE '^VERSION[[:space:]]*=' "$s/Makefile" 2>/dev/null && [ -f "$s/Kconfig" ]; then
+    add_unique KERNEL_INFO "linux-kernel-tree"
+  fi
+  # Out-of-tree module?
+  if find "$s" -maxdepth 2 -type f -name 'Makefile' -exec grep -HE '(^|[[:space:]])obj-m[[:space:]]*\+=' {} \; 2>/dev/null | grep -q .; then
+    add_unique KERNEL_INFO "kmod-out-of-tree"
+  fi
+  # Drivers dir?
+  [ -d "$s/drivers" ] && add_unique KERNEL_INFO "drivers-dir"
+  # Firmware
+  [ -d "$s/firmware" ] && add_unique KERNEL_INFO "firmware-dir"
+  find "$s" -type f -name '*.fw' | grep -q . && add_unique KERNEL_INFO "firmware-blobs"
+  # Kconfig fragments
+  find "$s" -type f -name 'Kconfig*' | grep -q . && add_unique KERNEL_INFO "kconfig"
+}
+detect_kernel_drivers_firmware
+
+# ---------------------- Serialização JSON/ENV helpers ----------------------
+join_json_array(){ local arr=("$@"); local out="["; local i=0
+  for x in "${arr[@]:-}"; do local e; e="$(printf "%s" "$x" | json_escape)"; [ $i -gt 0 ] && out+=", "; out+="\"$e\""; i=$((i+1)); done
   out+="]"; printf "%s" "$out"
 }
+to_space_list(){ local arr=("$@"); printf "%s" "${arr[*]:-}"; }
+
 write_detect_json(){
   local f="$OUT_DIR/detect.json"
   local langs_json; IFS=$'\n' langs_json="$(join_json_array "${LANGS[@]}")"
@@ -385,6 +440,11 @@ write_detect_json(){
   local feat_en; feat_en="$(join_json_array "${FEATURES_ENABLE[@]}")"
   local feat_dis; feat_dis="$(join_json_array "${FEATURES_DISABLE[@]}")"
   local cfg_args; cfg_args="$(join_json_array "${CONFIG_ARGS[@]}")"
+  local doc_json; doc_json="$(join_json_array "${DOC_TOOLS[@]}")"
+  local fw_json; fw_json="$(join_json_array "${FRAMEWORKS[@]}")"
+  local acc_json; acc_json="$(join_json_array "${ACCEL_STACK[@]}")"
+  local gfx_json; gfx_json="$(join_json_array "${GFX_STACK[@]}")"
+  local kjson;   kjson="$(join_json_array "${KERNEL_INFO[@]}")"
 
   cat >"$f" <<EOF
 {
@@ -423,6 +483,11 @@ write_detect_json(){
     "enable": $feat_en,
     "disable": $feat_dis
   },
+  "docs": $doc_json,
+  "frameworks": $fw_json,
+  "accelerators": $acc_json,
+  "graphics_stack": $gfx_json,
+  "kernel": $kjson,
   "cross": {
     "supported": $( [[ "$CROSS_SUPPORTED" =~ (true|maybe) ]] && echo true || echo false ),
     "triplet_style": "$(printf "%s" "$CROSS_STYLE" | json_escape)",
@@ -453,42 +518,49 @@ ADM_DETECT_LINKER="$LINKER_DET"
 ADM_DETECT_SUPPORTS_DESTDIR="$( [ "$DESTDIR_SUPPORTED" = "true" ] && echo 1 || echo 0 )"
 ADM_DETECT_SUPPORTS_LTO="$( [[ "$LTO_SUPPORTED" =~ (true|maybe) ]] && echo 1 || echo 0 )"
 ADM_DETECT_SUPPORTS_CCACHE="$( [ "$CCACHE_SUPPORTED" = "true" ] && echo 1 || echo 0 )"
-ADM_DETECT_TESTS="$(printf "%s" "${TESTS[*]:-}")"
-ADM_DETECT_LANGS="$(printf "%s" "${LANGS[*]:-}")"
+ADM_DETECT_TESTS="$(to_space_list "${TESTS[@]}")"
+ADM_DETECT_LANGS="$(to_space_list "${LANGS[@]}")"
 ADM_DETECT_CFLAGS="$(printf "%s" "$CFLAGS_OUT")"
 ADM_DETECT_CXXFLAGS="$(printf "%s" "$CXXFLAGS_OUT")"
 ADM_DETECT_LDFLAGS="$(printf "%s" "$LDFLAGS_OUT")"
-ADM_DETECT_CONFIGURE_ARGS="$(printf "%s" "${CONFIG_ARGS[*]:-}")"
+ADM_DETECT_CONFIGURE_ARGS="$(to_space_list "${CONFIG_ARGS[@]}")"
 ADM_DETECT_ENV_EXPORTS="PKG_CONFIG_PATH=${PKGCONFIG_PATH_OUT}"
-ADM_DETECT_DEPS_BUILD="$(printf "%s" "${DEPS_BUILD[*]:-}")"
-ADM_DETECT_DEPS_RUN="$(printf "%s" "${DEPS_RUN[*]:-}")"
-ADM_DETECT_DEPS_UNKNOWN="$(printf "%s" "${DEPS_UNKNOWN[*]:-}")"
-ADM_DETECT_FEATURES_ENABLE="$(printf "%s" "${FEATURES_ENABLE[*]:-}")"
-ADM_DETECT_FEATURES_DISABLE="$(printf "%s" "${FEATURES_DISABLE[*]:-}")"
+ADM_DETECT_DEPS_BUILD="$(to_space_list "${DEPS_BUILD[@]}")"
+ADM_DETECT_DEPS_RUN="$(to_space_list "${DEPS_RUN[@]}")"
+ADM_DETECT_DEPS_UNKNOWN="$(to_space_list "${DEPS_UNKNOWN[@]}")"
+ADM_DETECT_FEATURES_ENABLE="$(to_space_list "${FEATURES_ENABLE[@]}")"
+ADM_DETECT_FEATURES_DISABLE="$(to_space_list "${FEATURES_DISABLE[@]}")"
+ADM_DETECT_DOC_TOOLS="$(to_space_list "${DOC_TOOLS[@]}")"
+ADM_DETECT_FRAMEWORKS="$(to_space_list "${FRAMEWORKS[@]}")"
+ADM_DETECT_ACCELERATORS="$(to_space_list "${ACCEL_STACK[@]}")"
+ADM_DETECT_GRAPHICS_STACK="$(to_space_list "${GFX_STACK[@]}")"
+ADM_DETECT_KERNEL_INFO="$(to_space_list "${KERNEL_INFO[@]}")"
 ADM_DETECT_CROSS_SUPPORTED="$( [[ "$CROSS_SUPPORTED" =~ (true|maybe) ]] && echo 1 || echo 0 )"
 ADM_DETECT_CROSS_STYLE="$CROSS_STYLE"
 EOF
   cecho OK "Escrito $f"
 }
 
-# ---------------------- Sanidade / Strict ----------------------
 sanity_checks(){
   [ -s "$OUT_DIR/detect.env" ] && [ -s "$OUT_DIR/detect.json" ] || fatal "artefatos de detecção não gerados"
   if [ "$STRICT" -eq 1 ]; then
     [ "$BUILD_SYSTEM" != "unknown" ] || fatal "STRICT: sistema de build não detectado"
-    # se C/C++ presentes, exigir CC/CXX
-    printf "%s\n" "${LANGS[@]:-}" | grep -qE '^(c|cxx)$' && { [ -n "$CC_DET" ] || fatal "STRICT: CC ausente"; [ -n "$CXX_DET" ] || cecho WARN "STRICT: C++ ausente (ok se não necessário)"; }
+    printf "%s\n" "${LANGS[@]:-}" | grep -qE '^(c|cxx)$' && { [ -n "$CC_DET" ] || fatal "STRICT: CC ausente"; }
   fi
 }
 
-# ---------------------- Impressão ----------------------
 print_summary(){
   [ "$DO_PRINT" -eq 1 ] || return 0
   echo "----- DETECT SUMMARY -----" >&3
   echo "build_system : $BUILD_SYSTEM" >&3
-  echo "compilers    : CC=$CC_DET CXX=$CXX_DET FC=$FC_DET RUSTC=$RUSTC_DET GO=$GO_DET JAVAC=$JAVAC_DET" >&3
+  echo "toolchain    : CC=$CC_DET CXX=$CXX_DET FC=$FC_DET RUSTC=$RUSTC_DET GO=$GO_DET JAVAC=$JAVAC_DET" >&3
   echo "linker       : $LINKER_DET" >&3
   echo "langs        : ${LANGS[*]:-(none)}" >&3
+  echo "docs         : ${DOC_TOOLS[*]:-(none)}" >&3
+  echo "frameworks   : ${FRAMEWORKS[*]:-(none)}" >&3
+  echo "accelerators : ${ACCEL_STACK[*]:-(none)}" >&3
+  echo "gfx stack    : ${GFX_STACK[*]:-(none)}" >&3
+  echo "kernel       : ${KERNEL_INFO[*]:-(none)}" >&3
   echo "tests        : ${TESTS[*]:-(none)}" >&3
   echo "cflags       : $CFLAGS_OUT" >&3
   echo "cxxflags     : $CXXFLAGS_OUT" >&3
@@ -502,7 +574,6 @@ print_summary(){
   echo "out files    : $OUT_DIR/detect.json ; $OUT_DIR/detect.env ; log: $DETECT_LOG" >&3
 }
 
-# ---------------------- Main ----------------------
 main(){
   write_detect_json
   write_detect_env
