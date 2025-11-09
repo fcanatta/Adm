@@ -1,0 +1,12 @@
+name=musl-stage1
+version=1.2.5
+category=libs
+run_deps=
+build_deps=linux-headers-stage0
+opt_deps=
+num_builds=0
+description=musl Stage1 (headers + crt) para bootstrap do toolchain
+homepage=https://musl.libc.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz,https://mirror.leaseweb.com/musl/musl-1.2.5.tar.gz
