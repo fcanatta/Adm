@@ -1,0 +1,12 @@
+name=linux-headers-stage0
+version=6.11.0
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Headers do kernel para bootstrap (stage0), somente headers
+homepage=https://www.kernel.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz,https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
