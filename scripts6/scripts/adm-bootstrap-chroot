@@ -6,7 +6,8 @@
 # - Retomada: salva último sucesso e continua do ponto de falha (--resume)
 # - DESTDIR sempre; empacota a partir do DESTDIR; hooks e patches automáticos
 # - Perfis do adm-init; fingerprint evita rebuild
-#
+# adm-bootstrap-chroot --resume # continuar de onde parou
+# adm-bootstrap-chroot --resume --only=pkgQueFalhou # para insistir somente em alguns 
 # Licença: MIT
 
 set -Eeuo pipefail
