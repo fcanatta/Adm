@@ -1,0 +1,3 @@
+adm-cli install linux-headers-stage0 --prefer-build
+  adm-cli install binutils-stage0 --prefer-build
+  adm-cli install gcc-stage0 --prefer-build
