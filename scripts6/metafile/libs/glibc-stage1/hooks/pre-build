@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# glibc-stage1: pre-build — instala headers e compila csu (crt1/crti/crtn).
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+cd "${ADM_BUILD_DIR}"
+
+# 1) Instalar headers no DESTDIR (sem construir tudo)
+#   A forma suportada: "make install-headers" + "install-bootstrap-headers=yes"
+#   Alguns fluxos também criam stubs.h para permitir compilações intermediárias.
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" install-headers DESTDIR="${ADM_DESTDIR}" install-bootstrap-headers=yes
+
+# Garantir stubs.h (antigos fluxos exigiam; hoje costuma não ser necessário, mas é seguro):
+touch "${ADM_DESTDIR}/usr/include/gnu/stubs.h" 2>/dev/null || true
+
+# 2) Compilar csu (contém crt1.o/crti.o/crtn.o)
+#    Em versões recentes, 'csu' ainda é alvo válido.
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}" csu/subdir_lib
+
+# 3) Instalar startfiles no DESTDIR
+install -Dm0644 csu/crt1.o  "${ADM_DESTDIR}/usr/lib/crt1.o"
+install -Dm0644 csu/crti.o  "${ADM_DESTDIR}/usr/lib/crti.o"
+install -Dm0644 csu/crtn.o  "${ADM_DESTDIR}/usr/lib/crtn.o"
+
+# Nota: libc completa NÃO é construída aqui; isso é Stage2/Final.
