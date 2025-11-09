@@ -1,0 +1,12 @@
+name=isl
+version=0.26
+category=libs
+run_deps=
+build_deps=gmp
+opt_deps=
+num_builds=0
+description=Integer Set Library (dep opcional de GCC)
+homepage=https://libisl.sourceforge.io/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://libisl.sourceforge.io/isl-0.26.tar.xz,https://mirrors.kernel.org/sourceware/isl/isl-0.26.tar.xz
