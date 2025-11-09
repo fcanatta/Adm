@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# adm-plan — gera plano de construção a partir dos metafiles mínimos
+# - Grafo de dependências locais, ordem topológica e camadas (batches)
+# - Fingerprints para decidir changed/unchanged
+# - Relatórios em states/plan/
+# - Opções: --only, --since, --stage, --changed-only, --rebuild
+#           --strict-checksum, --print, --dry-run, --fail-on-missing-meta
+#           --target=host|chroot, --explain-all, --graphviz
+#
+# Licença: MIT
+
+set -Eeuo pipefail
+
+SELF_NAME="${0##*/}"
+VERSION="1.2.0"
+
+# ---------- Cores e logs concisos ----------
+COLOR_MODE="${ADM_COLOR:-auto}"
+CLR_RESET="\033[0m"; CLR_BOLD="\033[1m"
+CLR_BLUE="\033[34m"; CLR_GREEN="\033[32m"; CLR_RED="\033[31m"; CLR_YELLOW="\033[33m"; CLR_CYAN="\033[36m"
+log_ts(){ date +'%Y-%m-%d %H:%M:%S'; }
+_is_tty(){ [ -t 1 ] && printf 1 || printf 0; }
+cecho(){
+  local lvl="$1"; shift; local msg="$*"; local sym col
+  case "$lvl" in INFO) sym="▶"; col="$CLR_CYAN";; OK) sym="✓"; col="$CLR_GREEN";; WARN) sym="!"; col="$CLR_YELLOW";; ERR) sym="✗"; col="$CLR_RED";; STEP) sym="➜"; col="$CLR_BLUE";; *) sym="-"; col="$CLR_RESET";; esac
+  if [[ "$COLOR_MODE" == "never" || $(_is_tty) -eq 0 && "$COLOR_MODE" != "always" ]]; then
+    printf "%s %s %s\n" "$(log_ts)" "$sym" "$msg"
+  else
+    printf "%b%s%b %b%s%b %b%s%b\n" "$CLR_BOLD" "$(log_ts)" "$CLR_RESET" "$col" "$sym" "$CLR_RESET" "$CLR_BOLD" "$msg" "$CLR_RESET"
+  fi
+}
+fatal(){ cecho ERR "$*"; exit 2; }
+trap 'cecho ERR "Falha em ${SELF_NAME} (linha $LINENO). Veja ${ADM_LOGS}/adm-plan.log"; exit 2' ERR
+
+# ---------- CLI ----------
+TARGET="host"                 # host|chroot
+ONLY_LIST=""
+SINCE_PKG=""
+STAGE="all"                   # toolchain|base|world|all (heurístico opcional)
+CHANGED_ONLY=0
+REBUILD=0
+STRICT_CHECKSUM=0
+DRY_RUN=0
+DO_PRINT=0
+FAIL_ON_MISSING_META=0
+EXPLAIN_ALL=0
+GRAPHVIZ=0
+
+usage(){
+  cat <<EOF
+${SELF_NAME} v${VERSION}
+Uso: ${SELF_NAME} [opções]
+
+Planeja a ordem de build a partir dos metafiles.
+
+Opções:
+  --target=host|chroot          Seleciona qual estado usar para fingerprints (default: host)
+  --only=pkg1,pkg2              Limita o plano a esses pacotes + suas deps locais
+  --since=pkg                   Mantém pkg e todos que DEPENDEM dele (rebuild downstream)
+  --stage=toolchain|base|world|all   Heurístico opcional de conjuntos padrão (default: all)
+  --changed-only                Emite plano somente com pacotes que precisam rebuild
+  --rebuild                     Força tratar todos como changed
+  --strict-checksum             Exige sha256sums preenchido; sem isso, erro
+  --fail-on-missing-meta        Erra se dep referenciada não tiver metafile local
+  --dry-run                     Gera relatório, mas não altera estados prévios
+  --print                       Mostra resumo (ordem e marcas) no stdout
+  --explain-all                 Gera um explain/<pkg>.txt para todos os pacotes
+  --graphviz                    Exporta graph.dot (Graphviz) com nós/arestas e status
+  -h|--help                     Ajuda
+EOF
+}
+
+for a in "$@"; do
+  case "$a" in
+    --target=*) TARGET="${a#*=}";;
+    --only=*) ONLY_LIST="${a#*=}";;
+    --since=*) SINCE_PKG="${a#*=}";;
+    --stage=*) STAGE="${a#*=}";;
+    --changed-only) CHANGED_ONLY=1;;
+    --rebuild) REBUILD=1;;
+    --strict-checksum) STRICT_CHECKSUM=1;;
+    --fail-on-missing-meta) FAIL_ON_MISSING_META=1;;
+    --dry-run) DRY_RUN=1;;
+    --print) DO_PRINT=1;;
+    --explain-all) EXPLAIN_ALL=1;;
+    --graphviz) GRAPHVIZ=1;;
+    -h|--help) usage; exit 0;;
+    *) cecho WARN "Opção desconhecida: $a";;
+  esac
+done
+[[ "$TARGET" =~ ^(host|chroot)$ ]] || fatal "TARGET inválido: $TARGET"
+
+# ---------- Carregar ambiente do adm-init ----------
+ROOT_DEFAULT="/usr/src/adm"
+ADM_STATES="${ADM_STATES:-${ROOT_DEFAULT}/states}"
+ADM_LOGS="${ADM_LOGS:-${ROOT_DEFAULT}/logs}"
+[ -f "${ADM_STATES}/paths.env" ] || fatal "paths.env não encontrado (rode adm-init)"
+[ -f "${ADM_STATES}/global.env" ] || fatal "global.env não encontrado (rode adm-init)"
+
+mkdir -p "$ADM_LOGS"
+exec 3>&1
+exec >> "${ADM_LOGS}/adm-plan.log" 2>&1
+cecho INFO "Iniciando ${SELF_NAME} v${VERSION}"
+
+# shellcheck disable=SC1090
+. "${ADM_STATES}/paths.env"
+# shellcheck disable=SC1090
+. "${ADM_STATES}/global.env"
+[ -n "${ADM_PROFILE_FILE:-}" ] && . "${ADM_PROFILE_FILE}" || true
+
+PLAN_DIR="${ADM_STATES}/plan"
+mkdir -p "$PLAN_DIR" "${ADM_STATES}/explain"
+
+# ---------- Helpers ----------
+has_cmd(){ command -v "$1" >/dev/null 2>&1; }
+trim(){ sed 's/^[[:space:]]\+//; s/[[:space:]]\+$//' ; }
+split_csv(){ local csv="$1"; local arr=(); IFS=',' read -r -a arr <<< "$csv"; printf "%s\n" "${arr[@]}"; }
+read_field(){ awk -F'=' -v k="$2" '$0 !~ /^#/ && $0 ~ "=" {key=$1; sub(/[[:space:]]+$/,"",key); gsub(/^[[:space:]]+/,"",key); val=$0; sub(/^[^=]+=/,"",val); if (key==k){print val; exit}}' "$1" | trim; }
+sha256sum_str(){ printf "%s" "$1" | sha256sum | awk '{print $1}'; }
+array_unique(){ awk '!seen[$0]++'; }
+
+# ---------- Indexação de metafiles ----------
+declare -A PKG_META_PATH PKG_CATEGORY PKG_VERSION PKG_RUN_DEPS PKG_BUILD_DEPS PKG_OPT_DEPS PKG_SOURCES PKG_SHA256S
+
+scan_metafiles(){
+  find "${ADM_META}" -type f -name "metafile" -print0 2>/dev/null \
+  | while IFS= read -r -d '' f; do
+      local dir="$(dirname "$f")"; local prog="$(basename "$dir")"; local cat="$(basename "$(dirname "$dir")")"
+      printf "%s|%s|%s\n" "$cat" "$prog" "$f"
+    done | sort
+}
+
+load_meta(){
+  local mf="$1"
+  for k in name version category run_deps build_deps opt_deps num_builds description homepage maintainer sha256sums sources; do
+    local v; v="$(read_field "$mf" "$k" || true)"
+    printf "%s=%s\n" "$k" "$v"
+  done
+}
+
+index_metafiles(){
+  cecho STEP "Indexando metafiles em ${ADM_META}"
+  local line
+  while IFS= read -r line; do
+    local cat name mf; IFS='|' read -r cat name mf <<< "$line"
+    local tmp; tmp="$(load_meta "$mf")"
+    local v catl rd bd od ss src
+    v="$(printf "%s\n" "$tmp" | awk -F= '$1=="version"{print substr($0,index($0,$2))}')"
+    catl="$(printf "%s\n" "$tmp" | awk -F= '$1=="category"{print substr($0,index($0,$2))}')"
+    rd="$(printf "%s\n" "$tmp" | awk -F= '$1=="run_deps"{print substr($0,index($0,$2))}')"
+    bd="$(printf "%s\n" "$tmp" | awk -F= '$1=="build_deps"{print substr($0,index($0,$2))}')"
+    od="$(printf "%s\n" "$tmp" | awk -F= '$1=="opt_deps"{print substr($0,index($0,$2))}')"
+    ss="$(printf "%s\n" "$tmp" | awk -F= '$1=="sha256sums"{print substr($0,index($0,$2))}')"
+    src="$(printf "%s\n" "$tmp" | awk -F= '$1=="sources"{print substr($0,index($0,$2))}')"
+
+    # Metafiles inválidos básicos
+    [ -z "$name" ] && fatal "Metafile sem 'name': $mf"
+    [ -z "$v" ] && fatal "Metafile sem 'version': $mf"
+    [ -z "$src" ] && fatal "Metafile sem 'sources': $mf"
+    if [ $STRICT_CHECKSUM -eq 1 ] && [ -z "$ss" ]; then
+      fatal "Metafile sem 'sha256sums' (strict): $mf"
+    fi
+
+    PKG_META_PATH["$name"]="$mf"
+    PKG_CATEGORY["$name"]="$cat"
+    PKG_VERSION["$name"]="${v:-0}"
+    PKG_RUN_DEPS["$name"]="${rd:-}"
+    PKG_BUILD_DEPS["$name"]="${bd:-}"
+    PKG_OPT_DEPS["$name"]="${od:-}"
+    PKG_SOURCES["$name"]="${src:-}"
+    PKG_SHA256S["$name"]="${ss:-}"
+  done < <(scan_metafiles)
+  cecho OK "Indexação concluída"
+}
+
+# ---------- Conjuntos heurísticos ----------
+choose_stage_default(){
+  local wish_tool=(linux-headers binutils glibc musl gcc clang)
+  local wish_base=(busybox coreutils bash sed grep gawk findutils diffutils file tar xz gzip bzip2 zstd pkg-config make ninja util-linux ca-certificates tzdata)
+  case "$STAGE" in
+    toolchain) printf "%s\n" "${wish_tool[@]}" ;;
+    base)      printf "%s\n" "${wish_base[@]}" ;;
+    world)     printf "%s\n" "${!PKG_META_PATH[@]}" | sort ;;
+    all|*)     { printf "%s\n" "${wish_tool[@]}"; printf "%s\n" "${wish_base[@]}"; printf "%s\n" "${!PKG_META_PATH[@]}"; } | array_unique ;;
+  esac
+}
+
+apply_only_filter_lines(){
+  local -a in=("$@")
+  [ -z "$ONLY_LIST" ] && { printf "%s\n" "${in[@]}"; return; }
+  declare -A only=(); local x
+  while IFS= read -r x; do [ -n "$x" ] && only["$x"]=1; done < <(printf "%s\n" $(echo "$ONLY_LIST" | tr ',' ' '))
+  local out=(); local n
+  for n in "${in[@]}"; do [ -n "${only[$n]+x}" ] && out+=("$n"); done
+  printf "%s\n" "${out[@]}"
+}
+
+# ---------- Fechamento por dependências locais ----------
+collect_with_local_deps(){
+  # fecha conjunto T com deps locais recursivamente
+  local -a seeds=("$@")
+  declare -A need=()
+  local q=("${seeds[@]}"); local cur
+  for cur in "${seeds[@]}"; do need["$cur"]=1; done
+  while [ "${#q[@]}" -gt 0 ]; do
+    cur="${q[0]}"; q=("${q[@]:1}")
+    local depcsv; for depcsv in "${PKG_BUILD_DEPS[$cur]:-}" "${PKG_RUN_DEPS[$cur]:-}"; do
+      [ -z "$depcsv" ] && continue
+      local d; for d in $(split_csv "$depcsv"); do
+        d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+        if [ -n "${PKG_META_PATH[$d]+x}" ] && [ -z "${need[$d]+x}" ]; then
+          need["$d"]=1; q+=("$d")
+        fi
+      done
+    done
+  done
+  printf "%s\n" "${!need[@]}" | sort
+}
+
+# ---------- Dependentes (downstream) para --since ----------
+collect_downstream_of(){
+  local pivot="$1"
+  # construir grafo inverso dep->users em todos locais
+  declare -A rev
+  local a d depcsv
+  for a in "${!PKG_META_PATH[@]}"; do
+    for depcsv in "${PKG_BUILD_DEPS[$a]}" "${PKG_RUN_DEPS[$a]}"; do
+      [ -z "$depcsv" ] && continue
+      for d in $(split_csv "$depcsv"); do
+        d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+        [ -n "${PKG_META_PATH[$d]+x}" ] || continue
+        rev["$d"]+="${rev[$d]:+ }$a"
+      done
+    done
+  done
+  declare -A seen=(); local q=("$pivot")
+  seen["$pivot"]=1
+  while [ "${#q[@]}" -gt 0 ]; do
+    local u="${q[0]}"; q=("${q[@]:1}")
+    local v; for v in ${rev[$u]:-}; do
+      if [ -z "${seen[$v]+x}" ]; then seen["$v"]=1; q+=("$v"); fi
+    done
+  done
+  printf "%s\n" "${!seen[@]}" | sort
+}
+# ---------- Grafo e topologia ----------
+build_graph_and_topo(){
+  # entrada: nomes a considerar (linhas em stdin)
+  # saída: imprime ordem topológica em stdout
+  # e popula arquivos temporários com adj/indegree para camadas
+  local nodes=(); while IFS= read -r n; do [ -n "$n" ] && nodes+=("$n"); done
+  [ "${#nodes[@]}" -gt 0 ] || { cecho ERR "Nenhum nó para topologia"; exit 9; }
+
+  # mapear para teste rápido
+  declare -A in_set=(); local X
+  for X in "${nodes[@]}"; do in_set["$X"]=1; done
+
+  # indegree e adj
+  declare -A indeg adj missing_meta externals
+  local a depcsv d
+  for a in "${nodes[@]}"; do indeg["$a"]=0; done
+
+  for a in "${nodes[@]}"; do
+    for depcsv in "${PKG_BUILD_DEPS[$a]:-}" "${PKG_RUN_DEPS[$a]:-}"; do
+      [ -z "$depcsv" ] && continue
+      for d in $(split_csv "$depcsv"); do
+        d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+        if [ -n "${PKG_META_PATH[$d]+x}" ]; then
+          if [ -n "${in_set[$d]+x}" ]; then
+            adj["$d"]+="${adj[$d]:+ }$a"
+            indeg["$a"]=$(( ${indeg[$a]} + 1 ))
+          fi
+        else
+          externals["$d"]=1
+          [ $FAIL_ON_MISSING_META -eq 1 ] && missing_meta["$d"]=1
+        fi
+      done
+    done
+  done
+
+  # salvar externals/missing
+  : > "${PLAN_DIR}/externals.list"
+  for X in "${!externals[@]}"; do echo "$X"; done | sort >> "${PLAN_DIR}/externals.list"
+  : > "${PLAN_DIR}/missing-meta.list"
+  for X in "${!missing_meta[@]}"; do echo "$X"; done | sort >> "${PLAN_DIR}/missing-meta.list"
+  if [ $FAIL_ON_MISSING_META -eq 1 ] && [ -s "${PLAN_DIR}/missing-meta.list" ]; then
+    cecho ERR "Dependências sem metafile local detectadas (STRICT): $(wc -l < "${PLAN_DIR}/missing-meta.list")"
+    exit 13
+  fi
+
+  # Kahn
+  local order=() q=()
+  for X in "${nodes[@]}"; do [ "${indeg[$X]}" -eq 0 ] && q+=("$X"); done
+
+  while [ "${#q[@]}" -gt 0 ]; do
+    local u="${q[0]}"; q=("${q[@]:1}"); order+=("$u")
+    local v; for v in ${adj[$u]:-}; do
+      indeg["$v"]=$(( ${indeg[$v]} - 1 )); [ "${indeg[$v]}" -eq 0 ] && q+=("$v")
+    done
+  done
+
+  if [ "${#order[@]}" -ne "${#nodes[@]}" ]; then
+    cecho ERR "Ciclo detectado no grafo de dependências locais"
+    # tentativa de diagnóstico: listar nós ainda com indegree>0
+    local cyc=()
+    for X in "${nodes[@]}"; do [ "${indeg[$X]}" -gt 0 ] && cyc+=("$X"); done
+    printf "%s\n" "${cyc[@]}" > "${PLAN_DIR}/cycle.nodes"
+    cecho ERR "Nós envolvidos (cycle.nodes): ${cyc[*]}"
+    exit 4
+  fi
+
+  printf "%s\n" "${order[@]}"
+}
+
+# ---------- Camadas (batches) ----------
+layers_from_topo(){
+  # Reexecuta cálculo de camadas (não apenas a ordem) para paralelizar
+  local nodes=(); while IFS= read -r n; do [ -n "$n" ] && nodes+=("$n"); done
+  declare -A in_set=(); local X
+  for X in "${nodes[@]}"; do in_set["$X"]=1; done
+
+  declare -A indeg adj
+  for a in "${nodes[@]}"; do indeg["$a"]=0; done
+  for a in "${nodes[@]}"; do
+    local depcsv d
+    for depcsv in "${PKG_BUILD_DEPS[$a]:-}" "${PKG_RUN_DEPS[$a]:-}"; do
+      [ -z "$depcsv" ] && continue
+      for d in $(split_csv "$depcsv"); do
+        d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+        if [ -n "${PKG_META_PATH[$d]+x}" ] && [ -n "${in_set[$d]+x}" ]; then
+          adj["$d"]+="${adj[$d]:+ }$a"; indeg["$a"]=$(( ${indeg[$a]} + 1 ))
+        fi
+      done
+    done
+  done
+
+  local layers_json="["; local first_layer=1
+  local cur_layer=()
+  # Inicial
+  local q=(); for X in "${nodes[@]}"; do [ "${indeg[$X]}" -eq 0 ] && q+=("$X"); done
+
+  declare -A doneN=()
+  while :; do
+    cur_layer=()
+    # nós com indegree 0 que ainda não foram emitidos
+    for X in "${q[@]}"; do
+      [ -z "${doneN[$X]+x}" ] && cur_layer+=("$X")
+    done
+    [ "${#cur_layer[@]}" -eq 0 ] && break
+
+    # emitir camada
+    if [ $first_layer -eq 0 ]; then layers_json+=", "; fi
+    first_layer=0
+    layers_json+="["
+    local i=0
+    for X in "${cur_layer[@]}"; do
+      [ $i -gt 0 ] && layers_json+=", "
+      layers_json+="\"$X\""; i=$((i+1))
+      doneN["$X"]=1
+    done
+    layers_json+="]"
+
+    # reduzir indegree dos vizinhos e recomputar q
+    local Y
+    for X in "${cur_layer[@]}"; do
+      for Y in ${adj[$X]:-}; do
+        indeg["$Y"]=$(( ${indeg[$Y]} - 1 ))
+      done
+    done
+    q=()
+    for X in "${nodes[@]}"; do
+      [ -z "${doneN[$X]+x}" ] && [ "${indeg[$X]}" -eq 0 ] && q+=("$X")
+    done
+  done
+
+  layers_json+="]"
+  printf "%s\n" "$layers_json"
+}
+
+# ---------- Fingerprint ----------
+pkg_patch_hash(){
+  local name="$1"; local pd="${ADM_META}/${PKG_CATEGORY[$name]}/${name}/patches"
+  if [ -d "$pd" ]; then
+    find "$pd" -maxdepth 1 -type f -print0 2>/dev/null | xargs -0 -r sha256sum | sha256sum | awk '{print $1}'
+  else
+    echo "none"
+  fi
+}
+pkg_fp(){
+  local name="$1"; local v="${PKG_VERSION[$name]}"; local src="${PKG_SOURCES[$name]}"; local sums="${PKG_SHA256S[$name]}"
+  local ph; ph="$(pkg_patch_hash "$name")"
+  sha256sum_str "${name}|${v}|${src}|${sums}|${ph}"
+}
+
+# ---------- Estado: built host/chroot ----------
+is_built_state(){
+  local name="$1"; local v="${PKG_VERSION[$name]}"; local fp; fp="$(pkg_fp "$name")"
+  local dir
+  case "$TARGET" in
+    host)   dir="${ADM_STATES}/built" ;;
+    chroot) dir="${ADM_STATES}/built-chroot" ;;
+  esac
+  local f="${dir}/${name}-${v}.fingerprint"
+  [ -f "$f" ] && grep -q "$fp" "$f"
+}
+
+# ---------- Explain por pacote ----------
+write_explain(){
+  local name="$1"
+  local out="${ADM_STATES}/explain/${name}.txt"
+  local v="${PKG_VERSION[$name]}"
+  local src="${PKG_SOURCES[$name]}"
+  local sums="${PKG_SHA256S[$name]}"
+  local ph; ph="$(pkg_patch_hash "$name")"
+  local now; now="$(pkg_fp "$name")"
+  local dir statef old=""
+  case "$TARGET" in
+    host)   dir="${ADM_STATES}/built" ;;
+    chroot) dir="${ADM_STATES}/built-chroot" ;;
+  esac
+  statef="${dir}/${name}-${v}.fingerprint"
+  [ -f "$statef" ] && old="$(cat "$statef")" || old="<none>"
+
+  {
+    echo "name=$name"
+    echo "version=$v"
+    echo "sources=$src"
+    echo "sha256sums=$sums"
+    echo "patches_hash=$ph"
+    echo "fingerprint_now=$now"
+    echo "fingerprint_prev=$old"
+    if [ "$old" = "$now" ]; then
+      echo "status=UNCHANGED"
+    else
+      echo "status=CHANGED"
+    fi
+  } > "$out"
+}
+
+# ---------- Graphviz DOT ----------
+emit_graphviz(){
+  local nodes=(); while IFS= read -r n; do [ -n "$n" ] && nodes+=("$n"); done
+  local f="${PLAN_DIR}/graph.dot"
+  {
+    echo "digraph ADM {"
+    echo "  rankdir=LR;"
+    echo "  node [shape=box, fontname=\"Helvetica\"];"
+    local n
+    for n in "${nodes[@]}"; do
+      local color="lightgray"
+      if [ $REBUILD -eq 1 ]; then
+        color="tomato"
+      elif is_built_state "$n"; then
+        color="palegreen"
+      else
+        color="gold"
+      fi
+      echo "  \"$n\" [style=filled, fillcolor=\"$color\", label=\"$n\\n${PKG_VERSION[$n]}\"];"
+    done
+    local a depcsv d
+    for a in "${nodes[@]}"; do
+      for depcsv in "${PKG_BUILD_DEPS[$a]:-}" "${PKG_RUN_DEPS[$a]:-}"; do
+        [ -z "$depcsv" ] && continue
+        for d in $(split_csv "$depcsv"); do
+          d="$(echo "$d" | trim)"; [ -z "$d" ] && continue
+          [ -n "${PKG_META_PATH[$d]+x}" ] || continue
+          # aresta local d->a
+          echo "  \"$d\" -> \"$a\";"
+        done
+      done
+    done
+    echo "}"
+  } > "$f"
+  cecho OK "Graphviz emitido: $f"
+}
+
+# ---------- Seleção e filtros principais ----------
+select_nodes(){
+  # 1) base por stage (heurístico)
+  mapfile -t base < <(choose_stage_default)
+
+  # 2) aplicar --only se houver
+  mapfile -t filtered < <(apply_only_filter_lines "${base[@]}")
+
+  # 3) fechar com dependências locais
+  mapfile -t closed < <(collect_with_local_deps "${filtered[@]}")
+
+  # 4) se --since, manter pivot e todos downstream dele
+  if [ -n "$SINCE_PKG" ]; then
+    mapfile -t since_set < <(collect_downstream_of "$SINCE_PKG")
+    # interseção closed ∩ since_set
+    declare -A mark=(); local x
+    for x in "${since_set[@]}"; do mark["$x"]=1; done
+    local out=(); for x in "${closed[@]}"; do [ -n "${mark[$x]+x}" ] && out+=("$x"); done
+    printf "%s\n" "${out[@]}"
+  else
+    printf "%s\n" "${closed[@]}"
+  fi
+}
+
+# ---------- Classificação changed/unchanged ----------
+classify_changed(){
+  local nodes=(); while IFS= read -r n; do [ -n "$n" ] && nodes+=("$n"); done
+  : > "${PLAN_DIR}/changed.list"
+  : > "${PLAN_DIR}/unchanged.list"
+  local n
+  for n in "${nodes[@]}"; do
+    if [ $REBUILD -eq 1 ]; then
+      echo "$n" >> "${PLAN_DIR}/changed.list"
+    else
+      if is_built_state "$n"; then
+        echo "$n" >> "${PLAN_DIR}/unchanged.list"
+      else
+        echo "$n" >> "${PLAN_DIR}/changed.list"
+      fi
+    fi
+    [ $EXPLAIN_ALL -eq 1 ] && write_explain "$n"
+  done
+}
+
+# ---------- Impressão resumida ----------
+print_summary(){
+  local order_file="${PLAN_DIR}/order.list"
+  local changed_file="${PLAN_DIR}/changed.list"
+  local unchanged_file="${PLAN_DIR}/unchanged.list"
+  local changed_n=$( [ -f "$changed_file" ] && wc -l < "$changed_file" || echo 0 )
+  local unchanged_n=$( [ -f "$unchanged_file" ] && wc -l < "$unchanged_file" || echo 0 )
+  cecho INFO "Pacotes: total=$(wc -l < "$order_file") changed=$changed_n unchanged=$unchanged_n"
+  if [ $DO_PRINT -eq 1 ]; then
+    echo "---- ORDEM ----"
+    nl -ba "$order_file" | sed 's/^[[:space:]]\+//'
+    echo "---------------"
+  fi
+}
+# ---------- Main ----------
+main(){
+  cecho STEP "Carregando e indexando metafiles"
+  index_metafiles
+
+  cecho STEP "Selecionando nós-alvo (stage/only/deps/since)"
+  mapfile -t sel < <(select_nodes)
+  if [ "${#sel[@]}" -eq 0 ]; then
+    cecho ERR "Nenhum alvo após seleção (verifique --only/--stage/--since)"
+    exit 9
+  fi
+
+  cecho STEP "Calculando ordem topológica"
+  mapfile -t order < <(printf "%s\n" "${sel[@]}" | build_graph_and_topo)
+  : > "${PLAN_DIR}/order.list"; printf "%s\n" "${order[@]}" > "${PLAN_DIR}/order.list"
+
+  cecho STEP "Derivando camadas de paralelismo"
+  layers_from_topo < "${PLAN_DIR}/order.list" > "${PLAN_DIR}/layers.json"
+
+  cecho STEP "Classificando changed/unchanged (target=${TARGET}, rebuild=$REBUILD)"
+  classify_changed < "${PLAN_DIR}/order.list"
+
+  if [ $GRAPHVIZ -eq 1 ]; then
+    emit_graphviz < "${PLAN_DIR}/order.list"
+  fi
+
+  # Diag
+  {
+    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "target=${TARGET}"
+    echo "total=$(wc -l < "${PLAN_DIR}/order.list")"
+    echo "changed=$(wc -l < "${PLAN_DIR}/changed.list" 2>/dev/null || echo 0)"
+    echo "unchanged=$(wc -l < "${PLAN_DIR}/unchanged.list" 2>/dev/null || echo 0)"
+    echo "externals=$(wc -l < "${PLAN_DIR}/externals.list" 2>/dev/null || echo 0)"
+  } > "${PLAN_DIR}/diag.txt"
+
+  cecho OK "Plano gerado em ${PLAN_DIR}"
+  print_summary
+
+  [ $DRY_RUN -eq 1 ] && cecho OK "Dry-run: estados anteriores não foram tocados."
+
+  exit 0
+}
+
+main "$@"
+# Restaurar stdout
+exec 1>&3 3>&-
