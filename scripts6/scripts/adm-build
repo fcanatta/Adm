@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # adm-build — executor de builds com fetch paralelo e múltiplos protocolos
 # Licença: MIT
-
+# adm-build --only=seu_pacote --from=seu_pacote --strict-checksum=1 --no-tests --print
 set -Eeuo pipefail
 
 SELF="${0##*/}"
