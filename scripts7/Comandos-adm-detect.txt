@@ -1,0 +1,10 @@
+# Execução direta após extract (SRC_DIR padrão work/<name>-<version>/src):
+/usr/src/adm/scripts/adm-detect /usr/src/adm/metafiles/apps/busybox/metafile
+
+# Passando SRC_DIR explicitamente:
+ /usr/src/adm/scripts/adm-detect /usr/src/adm/metafiles/apps/busybox/metafile \
+   --src-dir=/usr/src/adm/work/busybox-1.36.0/src
+
+# Consumindo a saída no pipeline:
+eval "$(/usr/src/adm/scripts/adm-detect /usr/src/adm/metafiles/apps/busybox/metafile)"
+echo "Build system: $BUILD_SYSTEM / Langs: $LANGS / Cross: $CROSS"
