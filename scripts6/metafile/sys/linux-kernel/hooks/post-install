@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# linux-kernel: post-install
+# - Descobre release (kernelrelease)
+# - Instala kernel, System.map, config em /boot do DESTDIR
+# - Instala módulos em DESTDIR (/lib/modules/<release>)
+# - Roda depmod no DESTDIR
+# - Cria gatilho de initramfs para o adm-mkinitrsmfs
+set -Eeuo pipefail
+
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"; : "${ADM_DESTDIR:?}"
+
+# Descobre o release como o kernel reporta
+KREL="$(make -s -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" kernelrelease)"
+[ -n "$KREL" ] || { echo "Falha ao obter kernelrelease"; exit 2; }
+
+# Diretórios destino
+BOOT_DIR="${ADM_DESTDIR}/boot"
+MOD_DIR="${ADM_DESTDIR}/lib/modules/${KREL}"
+mkdir -p "${BOOT_DIR}" "${MOD_DIR}"
+
+# Detecta nome da imagem conforme a ARCH
+# (o make install padrão copia, mas fazemos manual p/ DESTDIR limpo)
+IMG_CAND=( "arch/${ARCH}/boot/bzImage" "arch/${ARCH}/boot/Image.gz" "arch/${ARCH}/boot/Image" "vmlinux" )
+KIMG=""
+for c in "${IMG_CAND[@]}"; do
+  if [ -f "${ADM_BUILD_DIR}/${c}" ]; then KIMG="${ADM_BUILD_DIR}/${c}"; break; fi
+done
+[ -n "$KIMG" ] || { echo "Imagem do kernel não encontrada em ${ADM_BUILD_DIR}/arch/${ARCH}/boot"; exit 2; }
+
+# Instala kernel e auxiliares em /boot
+install -Dm0644 "${KIMG}"                   "${BOOT_DIR}/vmlinuz-${KREL}"
+[ -f "${ADM_BUILD_DIR}/System.map" ] && install -Dm0644 "${ADM_BUILD_DIR}/System.map" "${BOOT_DIR}/System.map-${KREL}" || true
+[ -f "${ADM_BUILD_DIR}/.config" ]     && install -Dm0644 "${ADM_BUILD_DIR}/.config"     "${BOOT_DIR}/config-${KREL}"   || true
+
+# Instala módulos no DESTDIR
+JOBS="${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" -j"${JOBS}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" \
+  modules_install INSTALL_MOD_PATH="${ADM_DESTDIR}"
+
+# depmod dentro do DESTDIR (se disponível)
+if command -v depmod >/dev/null 2>&1; then
+  depmod -b "${ADM_DESTDIR}" "${KREL}" || true
+fi
+
+# Gatilho para geração de initramfs pelo seu sistema (adm-cli/adm-install cuidam disso):
+# Ex.: /usr/src/adm/state/triggers/mkinit/kernel-<release>
+TRIG_DIR="${ADM_STATES:-/usr/src/adm/state}/triggers/mkinit"
+mkdir -p "${TRIG_DIR}"
+echo "${KREL}" > "${TRIG_DIR}/kernel-${KREL}"
+
+# Dica simbólica padrão (opcional): vmlinuz -> vmlinuz-<release>
+ln -sfn "vmlinuz-${KREL}" "${BOOT_DIR}/vmlinuz"
+[ -f "${BOOT_DIR}/System.map-${KREL}" ] && ln -sfn "System.map-${KREL}" "${BOOT_DIR}/System.map" || true
+[ -f "${BOOT_DIR}/config-${KREL}" ]     && ln -sfn "config-${KREL}"     "${BOOT_DIR}/config"     || true
