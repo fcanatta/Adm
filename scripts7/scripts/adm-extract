@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-extract
+# Extrai fontes baixadas (múltiplos artefatos) para work/<name>-<version>/src,
+# executa hooks pre/post-extract, faz limpeza segura, e emite SRC_DIR=...
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20 ambiente inválido (ferramentas faltantes, adm-meta ausente)
+# 40 erro de extração (algum item)
+# 41 formato não suportado
+# 42 entradas ausentes (não encontrou arquivos para extrair)
+# 43 erro de IO (perm, mover, criar dirs)
+
+set -Eeuo pipefail
+umask 022
+
+# --------------------------------------------------------------------
+# AMBIENTE/PATHS
+# --------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_DESTDIR="${ADM_DESTDIR:-$ADM_ROOT/destdir}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+
+mkdir -p "$ADM_SOURCES" "$ADM_WORK" "$ADM_LOGS" "$ADM_STATE" >/dev/null 2>&1 || true
+
+# Integração opcional com adm-io e adm-meta
+ADM_IO="${ADM_IO:-$ADM_ROOT/scripts/adm-io}"
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+ADM_META="${ADM_META:-$ADM_ROOT/scripts/adm-meta}"
+[[ -x "$ADM_META" ]] || { log_e "adm-meta não encontrado/executável: $ADM_META"; exit 20; }
+
+# --------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------
+trim() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_to_array() { local s="${1:-}"; s="${s//[[:space:]]/}"; s="${s#,}"; s="${s%,}"; IFS=, read -r -a _ARR <<< "$s"; }
+parent_dir() { dirname -- "$1"; }
+
+basename_sane() {
+  local u="$1"
+  local b="${u##*/}"
+  b="${b%%\?*}"; b="${b%%#*}"
+  [[ -z "$b" || "$b" == */ ]] && b="source"
+  echo "$b"
+}
+
+find_cached_for_source() {
+  # tenta localizar no cache o artefato correspondente à URL (pelo basename e prefixo <name>_<version>-NN-)
+  local idx="$1" url="$2" name="$3" ver="$4"
+  local base; base="$(basename_sane "$url")"
+  local pat="${name}_${ver}-$(printf '%02d' "$idx")-${base}"
+  local cand
+  cand="$(ls -1 "$ADM_SOURCES"/"$pat" 2>/dev/null | head -n1 || true)"
+  [[ -n "$cand" ]] && { printf '%s' "$cand"; return 0; }
+  # fallback: qualquer arquivo no cache que termine com o basename (último ganho)
+  cand="$(ls -1 "$ADM_SOURCES"/*"${base}" 2>/dev/null | tail -n1 || true)"
+  printf '%s' "$cand"
+}
+
+ensure_tools() {
+  command -v tar >/dev/null 2>&1 || { log_e "tar não encontrado"; exit 20; }
+  command -v xz  >/dev/null 2>&1 || true
+  command -v zstd >/dev/null 2>&1 || true
+  command -v unzip >/dev/null 2>&1 || true
+}
+
+# --------------------------------------------------------------------
+# PARSE DO METAFILE
+# --------------------------------------------------------------------
+load_meta() {
+  local metaf="$1"
+  [[ -f "$metaf" ]] || { log_e "Metafile inexistente: $metaf"; exit 1; }
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")"
+  # Espera: ADM_NAME, ADM_VERSION, ADM_SOURCES, ADM_META_DIR, ADM_HOOKS_DIR
+  if [[ -z "${ADM_NAME:-}" || -z "${ADM_VERSION:-}" ]]; then
+    log_e "Metafile sem name/version"; exit 20
+  fi
+  : "${ADM_SOURCES:?parse não retornou ADM_SOURCES}"
+  : "${ADM_META_DIR:?}"
+  : "${ADM_HOOKS_DIR:?}"
+}
+
+# --------------------------------------------------------------------
+# HOOKS
+# --------------------------------------------------------------------
+run_hook_if_exists() {
+  local hookname="$1"
+  local hook="$ADM_HOOKS_DIR/$hookname"
+  if [[ -x "$hook" ]]; then
+    log_i "Executando hook: $hookname" hook="$hook"
+    # Exporta contexto mínimo
+    export ADM_NAME ADM_VERSION ADM_WORKDIR ADM_DESTDIR ADM_PROFILE LIBC_TARGET
+    # shellcheck disable=SC1090
+    "$hook" || { log_e "Hook falhou: $hookname"; exit 40; }
+  fi
+}
+
+# --------------------------------------------------------------------
+# EXTRAÇÃO
+# --------------------------------------------------------------------
+is_tarball_ext() {
+  case "$1" in
+    *.tar|*.tar.gz|*.tgz|*.tar.xz|*.tar.zst|*.tar.bz2|*.tbz2) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+extract_one() {
+  local file="$1" dest="$2"
+  [[ -f "$file" ]] || { log_e "Arquivo não existe: $file"; return 43; }
+
+  local f="$file"
+  case "$f" in
+    *.tar.zst)
+      if command -v zstd >/dev/null 2>&1; then
+        tar --zstd -xf "$f" -C "$dest" || return 40
+      else
+        # tar moderno costuma suportar --zstd sem binário externo; se falhar, tenta zstdcat
+        if command -v zstdcat >/dev/null 2>&1; then
+          zstdcat -- "$f" | tar -x -C "$dest" || return 40
+        else
+          log_e "zstd não disponível para *.tar.zst"; return 41
+        fi
+      fi
+      ;;
+    *.tar.xz)
+      tar -I xz -xf "$f" -C "$dest" || return 40
+      ;;
+    *.tar.gz|*.tgz)
+      tar -z -xf "$f" -C "$dest" || return 40
+      ;;
+    *.tar.bz2|*.tbz2)
+      tar -j -xf "$f" -C "$dest" || return 40
+      ;;
+    *.tar)
+      tar -xf "$f" -C "$dest" || return 40
+      ;;
+    *.zip)
+      if command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$f" -d "$dest" || return 40
+      else
+        log_e "unzip não disponível para *.zip"; return 41
+      fi
+      ;;
+    *)
+      # arquivo "solto" — copiar para SRC_DIR
+      cp -f "$f" "$dest/" || return 43
+      ;;
+  esac
+  return 0
+}
+
+flatten_if_single_toplevel() {
+  # Se a extração criou exatamente 1 diretório no dest e nenhum arquivo na raiz,
+  # move o conteúdo desse diretório para dest (flatten)
+  local dest="$1"
+  local items
+  items=$(find "$dest" -mindepth 1 -maxdepth 1 -printf '%f\n' | wc -l | awk '{print $1}')
+  if [[ "$items" -eq 1 ]]; then
+    local only; only=$(find "$dest" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -n1 || true)
+    if [[ -n "$only" ]]; then
+      # há um único diretório; mover conteúdo
+      shopt -s dotglob
+      mv -f "$dest/$only"/* "$dest/" 2>/dev/null || true
+      rmdir "$dest/$only" 2>/dev/null || true
+      shopt -u dotglob
+    fi
+  fi
+}
+
+safe_clean_and_prepare_srcdir() {
+  local pkg="$1" ver="$2"
+  local wdir="$ADM_WORK/${pkg}-${ver}"
+  local src="$wdir/src"
+  mkdir -p "$ADM_WORK" || { log_e "Falha criar $ADM_WORK"; exit 43; }
+  if [[ -d "$src" ]]; then
+    local bak="${wdir}/src.old.$$"
+    mv -f "$src" "$bak" || { log_e "Falha ao mover src antigo"; exit 43; }
+    rm -rf "$bak" || true
+  fi
+  mkdir -p "$src" || { log_e "Falha criar $src"; exit 43; }
+  echo "$src"
+}
+
+# --------------------------------------------------------------------
+# PRINCIPAL
+# --------------------------------------------------------------------
+cmd_extract() {
+  local metaf="${1:-}"
+  local inputs=""
+  while (( $# )); do
+    case "$1" in
+      --inputs=*) inputs="${1#*=}" ;;
+      *) metaf="$1" ;;
+    esac
+    shift || true
+  done
+
+  [[ -n "$metaf" ]] || { printf 'Uso: adm-extract <metafile> [--inputs=/p1,/p2]\n' >&2; exit 1; }
+
+  ensure_tools
+  load_meta "$metaf"
+
+  section "Extraindo fontes" pkg="$ADM_NAME" ver="$ADM_VERSION"
+  # Resolve SRC_DIR
+  local SRC_DIR; SRC_DIR="$(safe_clean_and_prepare_srcdir "$ADM_NAME" "$ADM_VERSION")"
+  export ADM_WORKDIR="$SRC_DIR"  # para hooks
+
+  # Hooks pre-extract
+  run_hook_if_exists "pre-extract"
+
+  # Determinar inputs (arquivos a extrair)
+  local FILES=()
+  if [[ -n "$inputs" ]]; then
+    inputs="${inputs//[[:space:]]/}"
+    IFS=, read -r -a FILES <<< "$inputs"
+  else
+    # Monta a partir do cache, por índice e basename
+    csv_to_array "$ADM_SOURCES"; local SOURCES=( "${_ARR[@]}" )
+    if (( ${#SOURCES[@]} == 0 )); then log_e "Nenhuma source em ADM_SOURCES"; exit 42; fi
+    local i
+    for ((i=0;i<${#SOURCES[@]};i++)); do
+      local idx=$((i+1)) ; local url="${SOURCES[$i]}"
+      local found; found="$(find_cached_for_source "$idx" "$url" "$ADM_NAME" "$ADM_VERSION")"
+      if [[ -n "$found" && -f "$found" ]]; then
+        FILES+=("$found")
+      else
+        log_w "Não encontrei no cache: $url (idx=$idx)"
+      fi
+    done
+  fi
+
+  (( ${#FILES[@]} > 0 )) || { log_e "Sem entradas para extrair (use --inputs=... se necessário)"; exit 42; }
+
+  # Extrair um por um (na ordem)
+  local any_err=0 total=0
+  for f in "${FILES[@]}"; do
+    f="$(trim "$f")"
+    [[ -n "$f" ]] || continue
+    ((total++))
+    local tok=""
+    if ((have_io)); then tok="$("$ADM_IO" spinner start "Extraindo: $(basename "$f")")" || true; fi
+    if ! extract_one "$f" "$SRC_DIR"; then
+      any_err=1
+      ((have_io)) && "$ADM_IO" spinner stop "$tok" --error "Falha ao extrair" file="$f" || true
+      log_e "Falha ao extrair: $f"
+      continue
+    fi
+    ((have_io)) && "$ADM_IO" spinner stop "$tok" --ok "OK" file="$f" || true
+  done
+
+  (( any_err == 0 )) || { log_e "Uma ou mais extrações falharam"; exit 40; }
+
+  # Flatten opcional se houver só um diretório
+  flatten_if_single_toplevel "$SRC_DIR"
+
+  # Contagem de arquivos
+  local nfiles; nfiles=$(find "$SRC_DIR" -type f | wc -l | awk '{print $1}')
+  log_o "Extração concluída" files="$nfiles" dir="$SRC_DIR"
+
+  # Hooks post-extract
+  run_hook_if_exists "post-extract"
+
+  # Marca estado
+  local stampdir="$ADM_STATE/${ADM_NAME}-${ADM_VERSION}"
+  mkdir -p "$stampdir" || true
+  : >"$stampdir/EXTRACT_OK"
+
+  # Saída machine-readable
+  printf 'SRC_DIR=%s\n' "$SRC_DIR"
+  printf 'EXTRACTED_FILES=%s\n' "$nfiles"
+}
+# --------------------------------------------------------------------
+# USO / DISPATCHER
+# --------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+adm-extract — extrai artefatos (múltiplos) do cache para o diretório de trabalho.
+
+Uso:
+  adm-extract <metafile> [--inputs=/path1,/path2]
+
+Comportamento:
+  - Sem --inputs, resolve automaticamente os caminhos em /usr/src/adm/sources
+    com base em <name>_<version>-NN-<basename> de cada source do metafile.
+  - Extrai na ordem, no mesmo SRC_DIR, e depois faz "flatten" se houver
+    apenas um diretório toplevel criado.
+  - Executa hooks: pre-extract e post-extract (se existirem).
+
+Formatos suportados:
+  *.tar.zst, *.tar.xz, *.tar.gz, *.tgz, *.tar.bz2, *.tbz2, *.tar, *.zip, arquivo solto (copiado para SRC_DIR)
+
+Saída machine-readable:
+  SRC_DIR=/usr/src/adm/work/<name>-<version>/src
+  EXTRACTED_FILES=N
+
+Exit codes:
+  0 ok; 1 uso; 20 ambiente; 40 extração; 41 formato; 42 entradas; 43 IO
+USAGE
+}
+
+main() {
+  case "${1:-}" in
+    -h|--help|help|"") usage; exit 0 ;;
+    *) cmd_extract "$@" ;;
+  esac
+}
+
+main "$@"
