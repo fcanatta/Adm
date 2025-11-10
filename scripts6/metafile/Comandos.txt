@@ -75,5 +75,27 @@ make install PREFIX="$ADM_DESTDIR/usr" 2>/dev/null || \
 { echo "Instalação MAKEFILE precisou de alvo específico; ajuste este hook para o pacote."; exit 2; }
 rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
 
+# Meson/pre-configure 
+#!/usr/bin/env bash
+# Hook genérico MESON - pre-configure
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"
+mkdir -p "$ADM_BUILD_DIR"
+meson setup "$ADM_BUILD_DIR" --prefix=/usr --buildtype=release
 
+# Meson/pre-build
+#!/usr/bin/env bash
+# Hook genérico MESON - pre-build
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+meson compile -C "$ADM_BUILD_DIR" -j "${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+
+# Meson/post-install
+#!/usr/bin/env bash
+# Hook genérico MESON - post-install
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+meson install -C "$ADM_BUILD_DIR" --destdir "$ADM_DESTDIR"
+rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
 
