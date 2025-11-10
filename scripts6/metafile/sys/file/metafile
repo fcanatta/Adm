@@ -1,0 +1,12 @@
+name=file
+version=5.46
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Detector de tipo de arquivo (magic)
+homepage=https://astro.github.io/filebench/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://astron.com/pub/file/file-5.46.tar.gz
