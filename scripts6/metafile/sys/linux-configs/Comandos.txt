@@ -1,0 +1,13 @@
+# Ver perfil
+ls -1 /usr/src/adm/kernel-configs/*.config
+readlink -f /usr/src/adm/kernel-configs/current.config
+
+# Trocar perfil
+ln -sfn /usr/src/adm/kernel-configs/server.config \
+        /usr/src/adm/kernel-configs/current.config
+echo "/usr/src/adm/kernel-configs/current.config" > /usr/src/adm/state/kernel-config.current
+
+# Usar um perfil pra instalar
+ADM_KERNEL_CONFIG=/usr/src/adm/kernel-configs/server.config \
+  adm-cli install linux-kernel --prefer-build
+
