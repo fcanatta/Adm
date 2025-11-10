@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Configura LLVM com Clang + LLD; LLDB opcional (requer extra de Python/termios).
+# Compatível com glibc e musl. Usa Ninja.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_DIR"
+cd "$ADM_BUILD_DIR"
+
+# Seleção de projetos: Clang e LLD (padrão). Habilite LLDB se quiser.
+LLVM_ENABLE_PROJECTS="${LLVM_ENABLE_PROJECTS:-clang;lld}"
+
+# Otimizações e compat geral
+CMAKE_OPTS=(
+  -G Ninja
+  -DCMAKE_INSTALL_PREFIX=/usr
+  -DCMAKE_BUILD_TYPE=Release
+  -DLLVM_ENABLE_PROJECTS="${LLVM_ENABLE_PROJECTS}"
+  -DLLVM_ENABLE_RUNTIMES=""            # pode habilitar compiler-rt/libcxx depois
+  -DLLVM_BUILD_EXAMPLES=OFF
+  -DLLVM_BUILD_TESTS=OFF
+  -DLLVM_ENABLE_OCAMLDOC=OFF
+  -DLLVM_ENABLE_BINDINGS=OFF
+  -DLLVM_INCLUDE_DOCS=OFF
+  -DLLVM_INCLUDE_EXAMPLES=OFF
+  -DLLVM_INCLUDE_TESTS=OFF
+  -DLLVM_ENABLE_ZLIB=ON
+  -DLLVM_ENABLE_TERMINFO=OFF
+  -DCLANG_DEFAULT_CXX_STDLIB=libstdc++
+  -DCLANG_DEFAULT_LINKER=ld
+)
+
+# musl: preferências sensatas
+if ldd --version 2>&1 | grep -qi musl; then
+  CMAKE_OPTS+=( -DLLVM_ENABLE_LIBXML2=OFF )
+fi
+
+cmake -S "$ADM_WORK_DIR/llvm" -B "$ADM_BUILD_DIR" "${CMAKE_OPTS[@]}"
