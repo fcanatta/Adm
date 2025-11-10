@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"; mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+conf=( --prefix=/usr --disable-static )
+# Suporte a zstd/lz4 (e lzo se você empacotar depois)
+PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/usr/lib/pkgconfig:/usr/share/pkgconfig}"
+export PKG_CONFIG_PATH
+"$ADM_WORK_DIR/configure" "${conf[@]}"
