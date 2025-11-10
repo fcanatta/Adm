@@ -1,0 +1,12 @@
+name=musl-stage1
+version=1.2.5
+category=libs
+run_deps=
+build_deps=binutils-stage0,gcc-stage0,musl-headers-stage0
+opt_deps=
+num_builds=0
+description=musl libc (stage1) completa para o target; instala no SYSROOT
+homepage=https://musl.libc.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz
