@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"
+cd "$ADM_WORK_DIR"
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
