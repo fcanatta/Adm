@@ -16,3 +16,13 @@ ADM_KERNEL_CONFIG=/usr/src/adm/configs/full.config    adm-cli install linux-kern
 /usr/src/adm/env/kernel.conf
 # Com
 ADM_KERNEL_CONFIG=/usr/src/linux/custom.config
+
+# Criar diretório para configs
+/usr/src/adm/kernel-configs/
+    ├── minimal.config
+    ├── desktop.config
+    └── server.config
+
+# E usar assim
+ADM_KERNEL_CONFIG=/usr/src/adm/kernel-configs/server.config \
+adm-cli install linux-kernel
