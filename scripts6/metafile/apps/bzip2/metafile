@@ -1,0 +1,12 @@
+name=bzip2
+version=1.0.8
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Compactador bzip2
+homepage=https://sourceware.org/bzip2/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
