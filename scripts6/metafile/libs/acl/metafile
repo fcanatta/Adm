@@ -1,0 +1,12 @@
+name=acl
+version=2.3.2
+category=libs
+run_deps=attr
+build_deps=attr
+opt_deps=
+num_builds=0
+description=Listas de controle de acesso (libacl + utilitários)
+homepage=https://savannah.nongnu.org/projects/acl/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/acl/acl-2.3.2.tar.xz
