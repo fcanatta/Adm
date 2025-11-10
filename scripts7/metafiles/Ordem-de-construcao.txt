@@ -9,3 +9,9 @@ adm install linux-headers-stage0      --profile=minimum --jobs=8
 adm install binutils-stage0           --profile=minimum --jobs=8
 adm install gcc-stage0                --profile=minimum --jobs=8
 adm install glibc-headers-stage0      --profile=minimum --jobs=8
+
+# Ordem musl stage1
+adm install musl-stage1        --profile=minimum --jobs=8
+adm install gcc-stage1-musl    --profile=minimum --jobs=8
+
+
