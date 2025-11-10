@@ -1,0 +1,12 @@
+name=llvm-project
+version=18.1.8
+category=dev
+run_deps=
+build_deps=cmake,ninja,python3
+opt_deps=
+num_builds=0
+description=LLVM toolchain (LLVM core, Clang e LLD)
+homepage=https://llvm.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.tar.gz
