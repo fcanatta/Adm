@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+CONFIGURE_EXTRAS+=" --prefix=/usr --with-sysroot=${SYSROOT} --target=${TARGET}"
+CONFIGURE_EXTRAS+=" --enable-languages=c --without-headers --with-newlib"
+CONFIGURE_EXTRAS+=" --disable-nls --disable-multilib --disable-werror"
+# Se o host tiver clang, evite surpresas:
+# : "${CC:=gcc}"; export CC
+export CONFIGURE_EXTRAS
