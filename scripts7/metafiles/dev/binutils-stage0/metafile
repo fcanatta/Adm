@@ -1,0 +1,12 @@
+name=binutils-stage0
+version=2.42
+category=dev
+run_deps=
+build_deps=bash,coreutils,make,gcc
+opt_deps=zlib,zstd
+num_builds=0
+description=Binutils (stage0) para bootstrap real do toolchain; build mínimo, sem NLS e sem Werror
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz,https://ftpmirror.gnu.org/binutils/binutils-2.42.tar.xz
