@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${WORKDIR:?WORKDIR não definido}"  # fornecido pelo constructor
+: "${CONFIGURE_EXTRAS:=}"
+
+# glibc precisa de builddir dedicado
+BUILD_DIR="${WORKDIR}/build-glibc-stage1"
+mkdir -p "$BUILD_DIR"
+export ADM_OUT_OF_TREE_BUILD="$BUILD_DIR"
+
+# flags clássicas da glibc para cross
+CONFIGURE_EXTRAS+=" --host=${TARGET} --build=$(./scripts/config.guess 2>/dev/null || echo $(uname -m))-unknown-linux-gnu"
+CONFIGURE_EXTRAS+=" --prefix=/usr --with-headers=${SYSROOT}/usr/include --with-sysroot=${SYSROOT}"
+CONFIGURE_EXTRAS+=" --disable-multilib --disable-werror"
+export CONFIGURE_EXTRAS
