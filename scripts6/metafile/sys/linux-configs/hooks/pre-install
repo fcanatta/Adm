@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# linux-configs: pre-install
+# - Cria perfis de config do kernel (fragmentos .frag e .kcfg)
+# - Prepara diretórios e estado
+
+set -Eeuo pipefail
+: "${ADM_DESTDIR:?}"
+
+CFGDIR="${ADM_DESTDIR}/usr/src/adm/kernel-configs"
+STATED="${ADM_DESTDIR}/usr/src/adm/state"
+mkdir -p "${CFGDIR}" "${STATED}"
+
+# Fragmentos de Kconfig (enxutos e seguros para bootstrap)
+# minimal: foco em boot rápido, sem debug pesado, sem BTF obrigatório
+cat > "${CFGDIR}/minimal.frag" <<'EOF'
+# Base minimal
+CONFIG_EXPERT=y
+CONFIG_MODULES=y
+# Debug desativado
+# CONFIG_DEBUG_KERNEL is not set
+# CONFIG_DEBUG_INFO is not set
+# BTF opcional
+# CONFIG_DEBUG_INFO_BTF is not set
+# Geral
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+# FS essenciais
+CONFIG_EXT4_FS=y
+CONFIG_EXT4_FS_POSIX_ACL=y
+CONFIG_EXT4_FS_SECURITY=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+# Rede básica
+CONFIG_INET=y
+CONFIG_NETFILTER=y
+EOF
+
+# server: adiciona storage e redes comuns de servidor
+cat > "${CFGDIR}/server.frag" <<'EOF'
+# Server add-ons
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_MD=y
+CONFIG_BLK_DEV_MD=y
+CONFIG_MD_AUTODETECT=y
+CONFIG_MD_RAID456=y
+CONFIG_DM_CRYPT=m
+CONFIG_DM_SNAPSHOT=m
+CONFIG_DM_THIN_PROVISIONING=m
+CONFIG_DM_MIRROR=m
+CONFIG_DM_MULTIPATH=m
+CONFIG_BTRFS_FS=m
+CONFIG_XFS_FS=m
+CONFIG_FUSE_FS=m
+CONFIG_ZRAM=m
+CONFIG_VETH=m
+CONFIG_VLAN_8021Q=m
+CONFIG_BRIDGE=m
+CONFIG_BONDING=m
+EOF
+
+# desktop: drivers gráficos comuns, input, áudio, BT/Wi-Fi típicos (modular)
+cat > "${CFGDIR}/desktop.frag" <<'EOF'
+# Desktop add-ons
+CONFIG_DRM=y
+CONFIG_DRM_KMS_HELPER=y
+CONFIG_DRM_I915=m
+CONFIG_DRM_AMDGPU=m
+CONFIG_DRM_RADEON=m
+CONFIG_DRM_NOUVEAU=m
+CONFIG_DRM_VIRTIO_GPU=m
+
+CONFIG_INPUT_EVDEV=y
+CONFIG_HID_GENERIC=y
+CONFIG_HID_MULTITOUCH=m
+
+CONFIG_SND=y
+CONFIG_SND_HDA_INTEL=m
+CONFIG_SND_HDA_CODEC_REALTEK=m
+CONFIG_SND_HDA_CODEC_HDMI=m
+CONFIG_SND_USB_AUDIO=m
+
+CONFIG_CFG80211=m
+CONFIG_MAC80211=m
+CONFIG_IWLWIFI=m
+CONFIG_ATH9K=m
+CONFIG_RT2800USB=m
+CONFIG_BT=m
+CONFIG_BT_HIDP=m
+EOF
+
+# Perfis de alto nível (lista de fragmentos a mesclar)
+cat > "${CFGDIR}/minimal.kcfg" <<'EOF'
+minimal.frag
+EOF
+
+cat > "${CFGDIR}/server.kcfg" <<'EOF'
+minimal.frag
+server.frag
+EOF
+
+cat > "${CFGDIR}/desktop.kcfg" <<'EOF'
+minimal.frag
+desktop.frag
+EOF
+
+# Escreve estado inicial só se não existir: minimal por padrão
+if [ ! -f "${STATED}/kernel-config.current" ]; then
+  echo "/usr/src/adm/kernel-configs/current.config" > "${STATED}/kernel-config.current"
+fi
