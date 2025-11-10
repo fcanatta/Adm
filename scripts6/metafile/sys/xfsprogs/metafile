@@ -1,0 +1,12 @@
+name=xfsprogs
+version=6.9.0
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas para XFS (mkfs.xfs, xfs_repair)
+homepage=https://xfs.wiki.kernel.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-6.9.0.tar.xz
