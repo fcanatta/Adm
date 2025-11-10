@@ -3,3 +3,8 @@ Para habilitar LLDB: defina LLVM_ENABLE_PROJECTS="clang;lld;lldb" antes do adm-c
 LLVM_ENABLE_PROJECTS="clang;lld;lldb" adm-cli install llvm-project --prefer-build
 
 (LLDB exige Python + curses/terminfo; mantive TERMINFO=OFF por padrão.)
+
+adm-cli install cmake --prefer-build
+adm-cli install ninja --prefer-build
+adm-cli install python3 --prefer-build
+adm-cli install llvm-project --prefer-build
