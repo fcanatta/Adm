@@ -1,0 +1,12 @@
+name=glibc-final
+version=2.40
+category=libs
+run_deps=
+build_deps=linux-headers-stage0,binutils-pass2
+opt_deps=
+num_builds=0
+description=glibc completa (ld.so, libc, locales opcionais)
+homepage=https://www.gnu.org/software/libc/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz,https://mirrors.kernel.org/gnu/libc/glibc-2.40.tar.xz
