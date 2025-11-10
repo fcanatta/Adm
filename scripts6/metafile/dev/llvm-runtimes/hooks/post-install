@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+ninja -C "$ADM_BUILD_DIR" install DESTDIR="${ADM_DESTDIR}"
+
+# Conveniências (alternativas de stdlib C++):
+# - Se quiser priorizar libc++ como default para clang, você pode criar um site config posterior.
+rm -rf "${ADM_DESTDIR}/usr/share/doc" "${ADM_DESTDIR}/usr/share/info" 2>/dev/null || true
