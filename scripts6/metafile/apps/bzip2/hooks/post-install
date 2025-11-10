@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Hook genérico MAKEFILE-PURO - post-install (tenta variáveis padrão)
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
+cd "$ADM_WORK_DIR"
+# Tenta DESTDIR, PREFIX=/usr
+make DESTDIR="$ADM_DESTDIR" PREFIX=/usr install 2>/dev/null || \
+make install PREFIX="$ADM_DESTDIR/usr" 2>/dev/null || \
+{ echo "Instalação MAKEFILE precisou de alvo específico; ajuste este hook para o pacote."; exit 2; }
+rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
