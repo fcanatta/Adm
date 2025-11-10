@@ -14,4 +14,6 @@ adm install glibc-headers-stage0      --profile=minimum --jobs=8
 adm install musl-stage1        --profile=minimum --jobs=8
 adm install gcc-stage1-musl    --profile=minimum --jobs=8
 
-
+# Ordem glibc
+adm install glibc-stage1        --profile=minimum --jobs=8
+adm install gcc-stage1-glibc    --profile=minimum --jobs=8
