@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
+# musl-final: post-install — instala em DESTDIR e ajusta symlinks úteis
 set -Eeuo pipefail
 : "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
-cd "$ADM_WORK_DIR"
-make DESTDIR="$ADM_DESTDIR" install
-rm -rf "$ADM_DESTDIR/usr/share/man" "$ADM_DESTDIR/usr/share/doc" "$ADM_DESTDIR/usr/share/info" 2>/dev/null || true
+
+cd "${ADM_WORK_DIR}"
+make DESTDIR="${ADM_DESTDIR}" install
+
+# Criar symlink /lib/ld-musl.so.1 → ld-musl-<arch>.so.1 para conveniência
+# Detecta o ldso específico instalado
+shopt -s nullglob
+ld_candidates=( "${ADM_DESTDIR}/lib/ld-musl-"*.so.1 )
+if [ ${#ld_candidates[@]} -gt 0 ]; then
+  ld_arch_path="${ld_candidates[0]}"
+  ln -sfn "$(basename "$ld_arch_path")" "${ADM_DESTDIR}/lib/ld-musl.so.1"
+fi
+
+# Conveniência: garantir que ldd exista (musl instala um script ldd)
+if [ -x "${ADM_DESTDIR}/usr/bin/ldd" ] && [ ! -e "${ADM_DESTDIR}/bin/ldd" ]; then
+  mkdir -p "${ADM_DESTDIR}/bin"
+  ln -sfn ../usr/bin/ldd "${ADM_DESTDIR}/bin/ldd"
+fi
+
+# Limpeza leve (docs pesados não são necessários no bootstrap)
+rm -rf "${ADM_DESTDIR}/usr/share/doc" "${ADM_DESTDIR}/usr/share/info" 2>/dev/null || true
