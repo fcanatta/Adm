@@ -1,0 +1,19 @@
+# Criar um pacote
+/usr/src/adm/scripts/adm-meta new apps busybox --version=1.36.0 \
+  --description="Multi-call binary" --homepage=https://busybox.net \
+  --maintainer="Você <voce@email>"
+
+# Verificar e normalizar
+/usr/src/adm/scripts/adm-meta lint /usr/src/adm/metafiles/apps/busybox/metafile --strict
+/usr/src/adm/scripts/adm-meta verify /usr/src/adm/metafiles/apps/busybox/metafile
+
+# Parse para pipeline
+eval "$(/usr/src/adm/scripts/adm-meta parse /usr/src/adm/metafiles/apps/busybox/metafile)"
+echo "$ADM_NAME $ADM_VERSION | $ADM_SOURCES"
+
+# Ajustar deps
+/usr/src/adm/scripts/adm-meta deps add /usr/src/adm/metafiles/apps/busybox/metafile build depA,depB
+/usr/src/adm/scripts/adm-meta deps rm  /usr/src/adm/metafiles/apps/busybox/metafile run dep2
+
+# Sincronizar sums ↔ sources
+/usr/src/adm/scripts/adm-meta sync-sums /usr/src/adm/metafiles/apps/busybox/metafile
