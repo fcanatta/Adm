@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# linux-firmware: pre-build
+# (não há build; só checagens rápidas)
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"
+
+# Heurística: o tarball geralmente contém tudo já pronto.
+# Apenas verificamos se há a pasta 'intel', 'amdgpu', etc., para sinalizar árvore válida.
+shopt -s nullglob
+have_any=0
+for d in amdgpu i915 iwlwifi ath10k ath11k radeon rtw88 mediatek qcom; do
+  [ -d "${ADM_WORK_DIR}/${d}" ] && have_any=1 && break
+done
+[ $have_any -eq 1 ] || echo "Aviso: diretórios típicos de firmware não detectados — isso pode ser normal em certos snapshots."
