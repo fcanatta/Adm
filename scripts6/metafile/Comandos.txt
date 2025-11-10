@@ -1,0 +1,15 @@
+adm-cli install gmp --prefer-build
+adm-cli install mpfr --prefer-build
+adm-cli install mpc --prefer-build
+adm-cli install isl --prefer-build
+
+adm-cli install binutils-pass2 --prefer-build
+
+# escolha UMA libc final:
+adm-cli install glibc-final --prefer-build
+# ou:
+# adm-cli install musl-final --prefer-build
+
+adm-cli install gcc-final --prefer-build
+
+adm-verify --stage=final
