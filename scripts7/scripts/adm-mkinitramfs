@@ -24,6 +24,7 @@ section(){ ((have_io)) && "$ADM_IO" section "$@" || printf '\n== %s ==\n' "$*"; 
 die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
 exists(){ command -v "$1" >/dev/null 2>&1; }
 abspath(){ readlink -f -- "$1" 2>/dev/null || echo "$1"; }
+
 # Defaults
 ROOT="/"                # --root
 CHROOT=0                # --chroot
@@ -49,3 +50,445 @@ UMASK_FILES=0644
 trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
 csv_to_arr(){ local s="${1:-}"; s="${s//[[:space:]]/}"; IFS=, read -r -a _ARR <<< "$s"; }
 join(){ local IFS=:; echo "$*"; }
+
+usage(){
+  cat <<'USAGE'
+adm-mkinitramfs — gera initramfs com autodetecção de módulos, firmware e init.
+
+Uso:
+  adm-mkinitramfs [opções]
+
+Opções:
+  --root=/path           Raiz do sistema alvo (default=/)
+  --chroot               Executa operações sensíveis via chroot (quando seguro)
+  --kver=K               Versão do kernel (ex.: 6.10.5); auto se ausente
+  --output=/path.img     Caminho do initramfs (auto: /boot/initramfs-KVER.img)
+  --compress=zstd|xz|lz4|gzip|none
+  --hostonly[=0|1]       Incluir só o necessário (default=1)
+  --firmware=auto|all|none
+  --with-network         Inclui drivers e ferramentas de rede
+  --add-mods=a,b,c       Força incluir módulos
+  --add-bins=a,b         Binários extras (copiados com libs)
+  --add-libs=a.so,b.so   Bibliotecas extras
+  --kmod-conf=/path      Adiciona modprobe.d custom (pode repetir)
+  --init=systemd|openrc|runit|s6|sysv  Força init
+  --hook-pre=/path       Executa antes do build (pode repetir)
+  --hook-post=/path      Executa após build (pode repetir)
+  --keep-work            Não apaga diretório temporário
+  -h|--help              Ajuda
+USAGE
+}
+
+parse_args(){
+  while (( $# )); do
+    case "$1" in
+      --root=*) ROOT="${1#*=}" ;;
+      --chroot) CHROOT=1 ;;
+      --kver=*) KVER="${1#*=}" ;;
+      --output=*) OUT="${1#*=}" ;;
+      --compress=*) COMPRESS="${1#*=}" ;;
+      --hostonly) HOSTONLY=1 ;;
+      --hostonly=*) HOSTONLY="${1#*=}" ;;
+      --firmware=*) FIRMWARE_MODE="${1#*=}" ;;
+      --with-network) WITH_NETWORK=1 ;;
+      --add-mods=*) ADD_MODS="${1#*=}" ;;
+      --add-bins=*) ADD_BINS="${1#*=}" ;;
+      --add-libs=*) ADD_LIBS="${1#*=}" ;;
+      --kmod-conf=*) KMODCONF+=("${1#*=}") ;;
+      --init=*) INIT_OVERRIDE="${1#*=}" ;;
+      --hook-pre=*) HOOKS_PRE+=("${1#*=}") ;;
+      --hook-post=*) HOOKS_POST+=("${1#*=}") ;;
+      --keep-work) KEEP_WORK=1 ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) usage; exit 1 ;;
+    esac; shift || true
+  done
+}
+
+validate_env(){
+  [[ -d "$ROOT" ]] || die "ROOT inválido: $ROOT" 72
+  ROOT="$(abspath "$ROOT")"
+  exists cpio || die "cpio ausente" 20
+  exists find || die "find ausente" 20
+  exists depmod || die "depmod ausente" 20
+  # compressor
+  case "$COMPRESS" in
+    zstd) exists zstd || die "zstd ausente" 20 ;;
+    xz)   exists xz   || die "xz ausente" 20 ;;
+    lz4)  exists lz4  || die "lz4 ausente" 20 ;;
+    gzip) exists gzip || die "gzip ausente" 20 ;;
+    none) : ;;
+    *) die "compressor inválido: $COMPRESS" 70 ;;
+  esac
+  # busybox ou conjunto básico
+  if ! exists busybox; then
+    for b in sh mount umount modprobe mkdir mknod; do
+      exists "$b" || die "ferramenta ausente: $b (ou instale busybox)" 71
+    done
+  fi
+}
+
+detect_kver(){
+  if [[ -n "$KVER" ]]; then echo "$KVER"; return; fi
+  local d="$ROOT/lib/modules"
+  [[ -d "$d" ]] || die "Sem /lib/modules em ROOT" 50
+  KVER="$(ls -1 "$d" 2>/dev/null | sort -V | tail -n1 || true)"
+  [[ -n "$KVER" ]] || die "Não foi possível detectar KVER" 50
+  echo "$KVER"
+}
+
+compress_cmd(){
+  case "$COMPRESS" in
+    zstd) echo "zstd -T0 -19 --quiet" ;;
+    xz)   echo "xz -T0 -9e --quiet" ;;
+    lz4)  echo "lz4 -12 -q" ;;
+    gzip) echo "gzip -9 -c" ;;
+    none) echo "cat" ;;
+  esac
+}
+
+detect_init_in_root(){
+  local r="$ROOT"
+  [[ -n "$INIT_OVERRIDE" ]] && { echo "$INIT_OVERRIDE"; return; }
+  if [[ -x "$r/usr/lib/systemd/systemd" || -x "$r/lib/systemd/systemd" ]]; then
+    echo "systemd"; return
+  fi
+  [[ -x "$r/sbin/openrc" || -x "$r/bin/openrc" ]] && { echo "openrc"; return; }
+  [[ -x "$r/sbin/runit" || -x "$r/bin/runit" ]] && { echo "runit"; return; }
+  [[ -x "$r/bin/s6-svscan" || -x "$r/usr/bin/s6-svscan" ]] && { echo "s6"; return; }
+  [[ -x "$r/sbin/init" || -x "$r/bin/init" ]] && { echo "sysv"; return; }
+  echo "sysv"
+}
+
+udev_mode(){
+  local r="$ROOT"
+  [[ -x "$r/usr/lib/systemd/systemd-udevd" || -x "$r/lib/systemd/systemd-udevd" ]] && { echo systemd-udev; return; }
+  [[ -x "$r/sbin/udevd" || -x "$r/bin/udevd" ]] && { echo eudev; return; }
+  [[ -x "$r/sbin/mdev" || -x "$r/bin/mdev" ]] && { echo mdev; return; }
+  echo mdev
+}
+
+mkwork(){
+  WORKDIR="$(mktemp -d -p "$TMPBASE" adm-initramfs.XXXXXXXX)"
+  mkdir -p "$WORKDIR/root" "$WORKDIR/build" "$WORKDIR/build/{bin,sbin,usr/bin,usr/sbin,lib,lib64,usr/lib}" >/dev/null 2>&1 || true
+}
+
+copy_one(){
+  local src="$1" dst="$2"
+  [[ -e "$src" ]] || return 1
+  install -Dm "$UMASK_FILES" "$src" "$dst" 2>/dev/null || cp -a "$src" "$dst"
+}
+
+copy_with_libs(){
+  local bin dst_base="$WORKDIR/build"
+  for bin in "$@"; do
+    [[ -x "$ROOT/$bin" ]] || continue
+    install -Dm 0755 "$ROOT/$bin" "$dst_base/$bin"
+    local deps; deps="$(chroot "$ROOT" ldd "$bin" 2>/dev/null || ldd "$ROOT/$bin" 2>/dev/null || true)"
+    while read -r a b c; do
+      [[ "$b" == "=>" && -f "$c" ]] && install -Dm 0644 "$c" "$dst_base${c#$ROOT}"
+      [[ "$b" == "=>" && ! -f "$c" && -f "$ROOT/$c" ]] && install -Dm 0644 "$ROOT/$c" "$dst_base/$c"
+    done <<< "$deps"
+  done
+}
+
+detect_root_device(){
+  # tenta por /etc/fstab do ROOT; fallback: cmdline host
+  local fstab="$ROOT/etc/fstab"
+  if [[ -f "$fstab" ]]; then
+    local rt; rt="$(awk '$3 ~ /ext[234]|xfs|btrfs|f2fs/ && $2=="/"{print $1}' "$fstab" | head -n1)"
+    [[ -n "$rt" ]] && { echo "$rt"; return; }
+  fi
+  local kcmd; kcmd="$(cat /proc/cmdline 2>/dev/null || true)"
+  [[ "$kcmd" =~ root=([^[:space:]]+) ]] && { echo "${BASH_REMATCH[1]}"; return; }
+  echo ""
+}
+
+fs_modules_for(){
+  case "$1" in
+    ext4|ext3|ext2) echo "ext4" ;;
+    xfs) echo "xfs" ;;
+    btrfs) echo "btrfs" ;;
+    f2fs) echo "f2fs" ;;
+    *) echo "" ;;
+  esac
+}
+
+collect_modules(){
+  local k="$KVER"; local rootdev="$1"; local need=()
+  # módulos essenciais
+  need+=( "loop" "unix" "crc32c" )
+  # storage basico
+  need+=( "ahci" "xhci_pci" "ehci_pci" "nvme" "sd_mod" "sr_mod" "usb_storage" )
+  # criptografia / dm
+  [[ -f "$ROOT/etc/crypttab" ]] && need+=( "dm_crypt" "dm_mod" "dm_integrity" "dm_snapshot" "dm_thin_pool" )
+  # mdadm
+  [[ -f "$ROOT/etc/mdadm.conf" ]] && need+=( "md_mod" "raid0" "raid1" "raid10" "raid456" )
+  # lvm
+  [[ -d "$ROOT/etc/lvm" ]] && need+=( "dm_mod" )
+  # FS do root
+  local rtfs=""
+  if [[ -n "$rootdev" ]]; then
+    rtfs="$(blkid -o value -s TYPE "$rootdev" 2>/dev/null || true)"
+  fi
+  [[ -z "$rtfs" && -f "$ROOT/etc/fstab" ]] && rtfs="$(awk '$2=="/"{print $3}' "$ROOT/etc/fstab" | head -n1)"
+  [[ -n "$rtfs" ]] && need+=( $(fs_modules_for "$rtfs") )
+  # hostonly: adiciona módulos carregados
+  if (( HOSTONLY )); then
+    while read -r m _; do need+=( "${m%%-*}" ); done < /proc/modules 2>/dev/null || true
+  fi
+  # add extras
+  if [[ -n "$ADD_MODS" ]]; then csv_to_arr "$ADD_MODS"; need+=("${_ARR[@]}"); fi
+  # unique
+  printf '%s\n' "${need[@]}" | sed '/^$/d' | LC_ALL=C sort -u
+}
+
+install_modules(){
+  local k="$KVER"; local list=("$@")
+  local modbase="$ROOT/lib/modules/$k"
+  [[ -d "$modbase" ]] || die "Módulos do kernel não encontrados: $modbase" 50
+  mkdir -p "$WORKDIR/build/lib/modules/$k" "$WORKDIR/build/etc/modprobe.d"
+  # depmod com -b no ROOT (não requer chroot)
+  depmod -b "$ROOT" "$k" >/dev/null 2>&1 || log_w "depmod retornou não-zero (prosseguindo)"
+
+  local m
+  for m in "${list[@]}"; do
+    local f; f="$(modprobe -S "$k" -D -n "$m" 2>/dev/null | awk '/insmod/ {print $NF}')" || true
+    [[ -z "$f" ]] && f="$(find "$modbase" -type f -name "${m}.ko*" 2>/dev/null | head -n1 || true)"
+    [[ -n "$f" ]] || continue
+    install -Dm 0644 "$f" "$WORKDIR/build/lib/modules/$k/${f#$modbase/}"
+  done
+  # módulos dependências via copy dep dirs
+  ( cd "$ROOT" && tar -cf - "lib/modules/$k/modules.dep" "lib/modules/$k/modules.order" 2>/dev/null ) \
+    | ( cd "$WORKDIR/build" && tar -xf - ) || true
+  # modprobe.d custom
+  local c; for c in "${KMODCONF[@]}"; do
+    [[ -f "$c" ]] && install -Dm 0644 "$c" "$WORKDIR/build/etc/modprobe.d/$(basename "$c")"
+  done
+}
+
+install_firmware(){
+  case "$FIRMWARE_MODE" in
+    none) return 0 ;;
+    all)
+      [[ -d "$ROOT/lib/firmware" || -d "$ROOT/usr/lib/firmware" ]] || return 0
+      ( cd "$ROOT" && tar -cf - lib/firmware usr/lib/firmware 2>/dev/null ) \
+        | ( cd "$WORKDIR/build" && tar -xf - ) || true
+      ;;
+    auto|*)
+      # heurística: copia só diretórios básicos; se inexistente, ignora
+      local fwbase="$ROOT/lib/firmware"
+      [[ -d "$fwbase" ]] || fwbase="$ROOT/usr/lib/firmware"
+      [[ -d "$fwbase" ]] || return 0
+      mkdir -p "$WORKDIR/build/$(realpath --relative-to="$ROOT" "$fwbase" 2>/dev/null || echo lib/firmware)"
+      # copia apenas pequenas árvores comuns
+      local sel=( "amd" "amdgpu" "radeon" "i915" "intel" "qcom" "rtl_bt" "rtl_nic" "ath" "brcm" "bnx2" )
+      local d; for d in "${sel[@]}"; do
+        [[ -d "$fwbase/$d" ]] && ( cd "$fwbase" && tar -cf - "$d" ) | ( cd "$WORKDIR/build/$fwbase" && tar -xf - ) || true
+      done
+      ;;
+  esac
+}
+
+install_userspace(){
+  local init_kind; init_kind="$(detect_init_in_root)"
+  local udev; udev="$(udev_mode)"
+  # busybox preferencial
+  if [[ -x "$ROOT/bin/busybox" || -x "$ROOT/usr/bin/busybox" ]]; then
+    local bb="$ROOT$(command -v busybox | sed "s|^$ROOT||")"
+    install -Dm 0755 "$bb" "$WORKDIR/build/bin/busybox"
+    for app in sh ash mount umount mknod mkdir ln ls cat dmesg modprobe insmod rmmod switch_root \
+               sleep grep awk sed cp mv rm ln readlink blkid uname echo pwd; do
+      ln -sf "/bin/busybox" "$WORKDIR/build/bin/$app"
+    done
+  else
+    copy_with_libs /bin/sh /bin/mount /bin/umount /bin/cat /bin/echo /usr/bin/blkid
+  fi
+  # udev/mdev
+  case "$udev" in
+    systemd-udev) copy_with_libs /usr/lib/systemd/systemd-udevd /usr/bin/udevadm ;;
+    eudev)        copy_with_libs /sbin/udevd /sbin/udevadm /bin/udevadm /usr/bin/udevadm ;;
+    mdev)         copy_with_libs /sbin/mdev /bin/mount ;;
+  esac
+  # extras
+  [[ -n "$ADD_BINS" ]] && { csv_to_arr "$ADD_BINS"; copy_with_libs "${_ARR[@]}"; }
+  [[ -n "$ADD_LIBS" ]] && { csv_to_arr "$ADD_LIBS"; for L in "${_ARR[@]}"; do install -Dm 0644 "$ROOT/$L" "$WORKDIR/build/$L" || true; done; }
+}
+
+write_init_script(){
+  local init_kind; init_kind="$(detect_init_in_root)"
+  install -Dm 0755 /dev/null "$WORKDIR/build/init"
+  cat > "$WORKDIR/build/init" <<'INIT'
+#!/bin/sh
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+echo "[initramfs] booting..."
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev || { mknod -m 622 /dev/console c 5 1; mknod -m 666 /dev/null c 1 3; }
+
+read_kcmd(){ for x in $(cat /proc/cmdline); do case "$x" in $1=*) echo "${x#*=}";; esac; done; }
+ROOTDEV="$(read_kcmd root || true)"
+ROOTFS="$(read_kcmd rootfstype || true)"
+ROOTFLAGS="$(read_kcmd rootflags || true)"
+ROOTWAIT="$(read_kcmd rootwait || true)"
+ROOTDELAY="$(read_kcmd rootdelay || true)"
+CRYPTROOT="$(read_kcmd cryptroot || true)"
+RESUME="$(read_kcmd resume || true)"
+
+modload(){ modprobe -q "$1" 2>/dev/null || true; }
+# Carregar alguns essenciais cedo
+for m in loop dm_mod dm_crypt crc32c ahci nvme sd_mod xhci_pci ehci_pci; do modload "$m"; done
+
+if [ -n "${ROOTDELAY:-}" ]; then sleep "$ROOTDELAY"; fi
+[ -n "${ROOTWAIT:-}" ] && sleep 3
+
+# Udev/mdev
+if command -v systemd-udevd >/dev/null 2>&1; then
+  systemd-udevd --daemon || true
+  udevadm trigger --action=add || true
+  udevadm settle --timeout=10 || true
+elif command -v udevd >/dev/null 2>&1; then
+  udevd --daemon || true
+  udevadm trigger --action=add || true
+  udevadm settle --timeout=10 || true
+elif command -v mdev >/dev/null 2>&1; then
+  echo /sbin/mdev > /proc/sys/kernel/hotplug || true
+  mdev -s || true
+fi
+INIT
+}
+
+append_init_storage(){
+  cat >> "$WORKDIR/build/init" <<'INIT'
+# mdadm (raid)
+if [ -f /etc/mdadm.conf ] && command -v mdadm >/dev/null 2>&1; then
+  mdadm --assemble --scan || true
+fi
+
+# lvm
+if command -v vgchange >/dev/null 2>&1; then
+  vgchange -ay || true
+fi
+
+# luks
+if [ -n "${CRYPTROOT:-}" ] && command -v cryptsetup >/dev/null 2>&1; then
+  cryptsetup luksOpen "${CRYPTROOT}" cryptroot || true
+  [ -b /dev/mapper/cryptroot ] && ROOTDEV="/dev/mapper/cryptroot"
+fi
+
+# resume
+if [ -n "${RESUME:-}" ] && command -v resume >/dev/null 2>&1; then
+  resume "${RESUME}" || true
+fi
+
+[ -z "${ROOTDEV:-}" ] && ROOTDEV="/dev/sda1"
+
+[ -n "${ROOTFS:-}" ] && OPTS="-t ${ROOTFS}" || OPTS=""
+[ -n "${ROOTFLAGS:-}" ] && OPTS="$OPTS -o ${ROOTFLAGS}"
+
+mkdir -p /newroot
+mount $OPTS "${ROOTDEV}" /newroot || { echo "mount root falhou"; /bin/sh; }
+INIT
+}
+
+append_init_switch(){
+  local init_kind; init_kind="$(detect_init_in_root)"
+  cat >> "$WORKDIR/build/init" <<'INIT'
+# Fazer bind dos pseudo-fs
+mount -o move /proc /newroot/proc || true
+mount -o move /sys  /newroot/sys  || true
+mount -o move /dev  /newroot/dev  || true
+
+# se não houver switch_root, usa pivot
+if command -v switch_root >/dev/null 2>&1; then
+  exec switch_root /newroot /sbin/init
+else
+  cd /newroot
+  exec chroot . /sbin/init <dev/console >dev/console 2>&1
+fi
+INIT
+  # opcionalmente personaliza init alvo (systemd, etc.)
+  case "$init_kind" in
+    systemd)
+      sed -i 's#/sbin/init#/usr/lib/systemd/systemd#g' "$WORKDIR/build/init" || true ;;
+    openrc|runit|s6|sysv) : ;;
+  esac
+  chmod 0755 "$WORKDIR/build/init"
+}
+
+install_tools_storage(){
+  # ferramentas que o /init pode usar
+  local req=( /sbin/modprobe /usr/bin/udevadm /sbin/udevd /usr/lib/systemd/systemd-udevd
+              /sbin/mdadm /sbin/vgchange /sbin/cryptsetup /sbin/resume /bin/mount /sbin/switch_root )
+  local have=()
+  for x in "${req[@]}"; do [[ -x "$ROOT/$x" ]] && have+=("$x"); done
+  [[ ${#have[@]} -gt 0 ]] && copy_with_libs "${have[@]}"
+}
+
+run_hooks(){
+  local when="$1"; shift || true
+  local arr=("$@")
+  for h in "${arr[@]}"; do
+    [[ -x "$h" ]] || { log_w "hook não executável" path="$h"; continue; }
+    "$h" "$WORKDIR/build" "$KVER" "$ROOT" || log_w "hook falhou" hook="$h"
+  done
+}
+
+pack_initramfs(){
+  local out="$1"; local cc; cc="$(compress_cmd)"
+  ( cd "$WORKDIR/build" && find . -print0 \
+      | LC_ALL=C sort -z \
+      | cpio --null -ov --format=newc 2>/dev/null ) \
+      | eval "$cc" > "$out" || die "Falha ao empacotar initramfs" 60
+  chmod 0644 "$out"
+}
+
+default_output(){
+  [[ -n "$OUT" ]] && { echo "$OUT"; return; }
+  echo "$ROOT/boot/initramfs-$KVER.img"
+}
+
+build_pipeline(){
+  section "Preparando"
+  mkwork
+  KVER="$(detect_kver)"
+  local rootdev; rootdev="$(detect_root_device || true)"
+  log_i "KVER=$KVER ROOT=$ROOT DEV=${rootdev:-?} INIT=$(detect_init_in_root)"
+
+  section "Coletando módulos"
+  mapfile -t MODS < <(collect_modules "$rootdev")
+  install_modules "${MODS[@]}"
+
+  section "Firmware"
+  install_firmware || true
+
+  section "Userspace"
+  install_userspace
+  install_tools_storage
+
+  section "Gerando /init"
+  write_init_script
+  append_init_storage
+  append_init_switch
+}
+
+build_and_pack(){
+  run_hooks pre "${HOOKS_PRE[@]}"
+  local out; out="$(default_output)"
+  [[ -d "$(dirname "$out")" ]] || install -d "$(dirname "$out")"
+  section "Empacotando → $out (compressor: $COMPRESS)"
+  pack_initramfs "$out"
+  run_hooks post "${HOOKS_POST[@]}"
+  log_o "Initramfs criado" path="$out"
+  if (( KEEP_WORK==0 )); then rm -rf "$WORKDIR" || true; else log_w "WORK mantido" path="$WORKDIR"; fi
+}
+
+main(){
+  parse_args "$@"
+  validate_env
+  build_pipeline
+  build_and_pack
+}
+
+main "$@"
