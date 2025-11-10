@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-install
+# Instala pacotes binários (ADM) no sistema final (/), resolvendo dependências,
+# executando em camadas com paralelismo e registrando a instalação.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20 ambiente inválido (ferramentas ausentes)
+# 43 IO/perm (caminhos, root ausente, etc.)
+# 60 dependências ausentes
+# 61 ciclo no DAG (modo --dir)
+# 70 pacote inválido/ilegível
+# 71 checksum inválido
+
+set -Eeuo pipefail
+umask 022
+
+# -----------------------------------------------------------------------------
+# Caminhos / Integrações
+# -----------------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+
+mkdir -p "$ADM_PACKAGES" "$ADM_LOGS" "$ADM_STATE" "$ADM_DB"/{installed,reverse} >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+ADM_RESOLVER="${ADM_RESOLVER:-$ADM_SCRIPTS/adm-resolver}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+csv_join(){ local IFS=,; printf '%s' "$*"; }
+csv_unique_sorted(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a A <<< "$s"; IFS=$'\n' read -r -d '' out < <(printf '%s\n' "${A[@]}" | sed '/^$/d' | LC_ALL=C sort -u && printf '\0') || true; printf '%s' "$(paste -sd, <<< "$out")"; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+
+need_root(){
+  if [[ "${ADM_ALLOW_UNPRIVILEGED_INSTALL:-0}" != "1" && "$EUID" -ne 0 ]]; then
+    die "É necessário root para instalar em / (defina ADM_ALLOW_UNPRIVILEGED_INSTALL=1 para testes em prefixo)" 43
+  fi
+}
+
+arch_guess(){ uname -m 2>/dev/null || echo unknown; }
+libc_guess(){
+  if command -v ldd >/dev/null 2>&1; then
+    ldd --version 2>&1 | grep -qi musl && { echo musl; return; }
+    ldd --version 2>&1 | grep -qi 'gnu libc\|glibc' && { echo glibc; return; }
+  fi
+  echo unknown
+}
+
+sha256_cmd(){
+  if command -v sha256sum >/dev/null 2>&1; then echo "sha256sum"; return; fi
+  if command -v shasum >/dev/null 2>&1; then echo "shasum -a 256"; return; fi
+  echo ""
+}
+
+# -----------------------------------------------------------------------------
+# Validação de ambiente
+# -----------------------------------------------------------------------------
+validate_env(){
+  command -v tar >/dev/null 2>&1 || die "tar não encontrado" 20
+  if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
+    die "nem zstd nem xz disponíveis" 20
+  fi
+  [[ -x "$ADM_META" ]] || die "adm-meta não encontrado: $ADM_META" 20
+  [[ -d "$ADM_PACKAGES" ]] || die "Diretório de pacotes não encontrado: $ADM_PACKAGES" 43
+}
+
+# -----------------------------------------------------------------------------
+# Banco de dados / Registro
+# -----------------------------------------------------------------------------
+DB_INSTALLED_DIR="$ADM_DB/installed"
+DB_REVERSE_DIR="$ADM_DB/reverse"
+DB_BY_FILE="$ADM_DB/by-file.map"    # formato: /path -> pkg
+
+installed_meta(){ printf '%s/%s.meta' "$DB_INSTALLED_DIR" "$1"; }
+installed_files(){ printf '%s/%s.files' "$DB_INSTALLED_DIR" "$1"; }
+reverse_file(){ printf '%s/%s.rdeps' "$DB_REVERSE_DIR" "$1"; }
+
+is_installed(){ [[ -f "$(installed_meta "$1")" ]]; }
+mark_installed(){
+  local name="$1" version="$2" release="$3" arch="$4" libc="$5" deps_csv="$6" manifest_file="$7"
+  local meta; meta="$(installed_meta "$name")"
+  {
+    echo "name=$name"
+    echo "version=$version"
+    echo "release=$release"
+    echo "arch=$arch"
+    echo "libc=$libc"
+    echo "run_deps=$(csv_norm "$deps_csv")"
+    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$meta"
+  cp -f "$manifest_file" "$(installed_files "$name")" 2>/dev/null || true
+
+  # atualiza índices: by-file e reverse deps
+  while IFS= read -r f; do
+    f="/${f#./}"
+    printf '%s %s\n' "$f" "$name"
+  done < "$manifest_file" >> "$DB_BY_FILE.tmp.$$"
+  sort -u "$DB_BY_FILE.tmp.$$" -o "$DB_BY_FILE" 2>/dev/null || cp -f "$DB_BY_FILE.tmp.$$" "$DB_BY_FILE" || true
+  rm -f "$DB_BY_FILE.tmp.$$" || true
+
+  # reverse deps
+  csv_to_arr "$deps_csv"
+  for d in "${_ARR[@]}"; do
+    [[ -z "$d" ]] && continue
+    echo "$name" >> "$(reverse_file "$d")"
+    sort -u -o "$(reverse_file "$d")" "$(reverse_file "$d")" 2>/dev/null || true
+  done
+}
+
+# -----------------------------------------------------------------------------
+# Pacotes ADM (.tar.zst/.tar.xz)
+# -----------------------------------------------------------------------------
+is_adm_pkg(){ [[ "$1" =~ \.tar\.(zst|xz)$ ]]; }
+pkg_basename(){ basename -- "$1"; }
+pkg_sha_ok(){
+  local pkg="$1" shbin; shbin="$(sha256_cmd)"
+  [[ -n "$shbin" && -f "${pkg}.sha256" ]] || return 0
+  ( cd "$(dirname "$pkg")" && $shbin -c "$(basename "$pkg").sha256" ) >/dev/null 2>&1
+}
+pkg_read_meta_from_file(){
+  # Lê .ADM_META embutido (sem extrair ao disco) fazendo stream do tar
+  local pkg="$1"
+  local tmpd; tmpd="$(mktemp -d)"
+  # extrai apenas .ADM_META e .ADM_MANIFEST
+  if [[ "$pkg" =~ \.tar\.zst$ ]]; then
+    ( tar --use-compress-program=zstd -xf "$pkg" -C "$tmpd" .ADM_META .ADM_MANIFEST ) >/dev/null 2>&1 || true
+  else
+    ( tar -I xz -xf "$pkg" -C "$tmpd" .ADM_META .ADM_MANIFEST ) >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$tmpd/.ADM_META" ]]; then
+    cat "$tmpd/.ADM_META"
+  fi
+  if [[ -f "$tmpd/.ADM_MANIFEST" ]]; then
+    cat "$tmpd/.ADM_MANIFEST" | sed 's|^\./||' > "$tmpd/.ADM_MANIFEST.norm"
+    echo "___MANIFEST_FILE=$tmpd/.ADM_MANIFEST.norm"
+  fi
+}
+
+# Resolve compatibilidade arch/libc do pacote (pelo nome e/ou .ADM_META)
+pkg_matches_target(){
+  local pkg="$1" want_arch="$2" want_libc="$3"
+  # tenta inferir pelo nome <name>-<ver>-<rel>-<arch>-<libc>.tar.*
+  local base; base="$(pkg_basename "$pkg")"
+  local arch="" libc=""
+  if [[ "$base" =~ ^([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)-([0-9]+)-([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)\.tar\.(zst|xz)$ ]]; then
+    arch="${BASH_REMATCH[4]}"; libc="${BASH_REMATCH[5]}"
+  else
+    # tenta .ADM_META
+    local meta; meta="$(pkg_read_meta_from_file "$pkg" | grep -E '^(arch|libc)=' || true)"
+    arch="${meta#*arch=}"; arch="${arch%%$'\n'*}"
+    libc="${meta#*libc=}"; libc="${libc%%$'\n'*}"
+  fi
+  [[ -z "$want_arch" ]] && want_arch="$(arch_guess)"
+  [[ -z "$want_libc" ]] && want_libc="$(libc_guess)"
+  [[ "$arch" == "$want_arch" && "$libc" == "$want_libc" ]]
+}
+
+# Escolhe o "melhor" pacote para um nome, respeitando [versão], arch/libc
+find_best_pkg_for_name(){
+  local name="$1" want_ver="${2:-}" want_arch="${3:-}" want_libc="${4:-}"
+  local candidates
+  candidates="$(ls -1 "$ADM_PACKAGES"/"$name"-*.tar.* 2>/dev/null || true)"
+  [[ -n "$candidates" ]] || { echo ""; return 0; }
+  local best="" best_rel=-1 best_ver=""
+  while IFS= read -r p; do
+    pkg_matches_target "$p" "$want_arch" "$want_libc" || continue
+    local base ver rel
+    base="$(pkg_basename "$p")"
+    # <name>-<ver>-<rel>-<arch>-<libc>.tar.*
+    if [[ "$base" =~ ^${name}-([A-Za-z0-9._+-]+)-([0-9]+)-([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)\.tar\.(zst|xz)$ ]]; then
+      ver="${BASH_REMATCH[1]}"; rel="${BASH_REMATCH[2]}"
+    else
+      # fallback: tenta ler .ADM_META
+      local meta; meta="$(pkg_read_meta_from_file "$p" || true)"
+      ver="$(printf '%s\n' "$meta" | awk -F= '/^version=/{print $2}' | head -n1)"
+      rel="$(printf '%s\n' "$meta" | awk -F= '/^release=/{print $2}' | head -n1)"
+      [[ -z "$rel" ]] && rel=0
+    fi
+    [[ -n "$want_ver" && "$ver" != "$want_ver" ]] && continue
+    # heurística: maior release vence; se empate, escolhe o mais novo por mtime
+    if (( rel > best_rel )); then
+      best="$p"; best_rel="$rel"; best_ver="$ver"
+    elif (( rel == best_rel )); then
+      [[ "$p" -nt "$best" ]] && { best="$p"; best_ver="$ver"; }
+    fi
+  done <<< "$candidates"
+  echo "$best"
+}
+
+# -----------------------------------------------------------------------------
+# Instalação de um pacote (arquivo .tar.* → /)
+# -----------------------------------------------------------------------------
+DO_DRYRUN=0
+extract_pkg_to_root(){
+  local pkg="$1"
+  if (( DO_DRYRUN )); then
+    log_i "[dry-run] Simulando extração de $(pkg_basename "$pkg") para /"
+    return 0
+  fi
+  if [[ "$pkg" =~ \.tar\.zst$ ]]; then
+    tar --zstd -C / -xf "$pkg" || return 1
+  else
+    tar -I xz -C / -xf "$pkg" || return 1
+  fi
+  return 0
+}
+
+# Checa conflitos simples antes de extrair (se mapa existir)
+check_conflicts(){
+  local manifest="$1" name="$2"
+  [[ -f "$DB_BY_FILE" ]] || return 0
+  local conflicts=()
+  while IFS= read -r f; do
+    f="/${f#./}"
+    local owner
+    owner="$(grep -F -- "$f " "$DB_BY_FILE" | awk '{print $2}' | head -n1 || true)"
+    [[ -n "$owner" && "$owner" != "$name" ]] && conflicts+=("$f:$owner")
+  done < "$manifest"
+  if ((${#conflicts[@]})); then
+    if (( FORCE )); then
+      log_w "Conflitos serão sobrescritos (force)" count="${#conflicts[@]}"
+      return 0
+    fi
+    log_e "Conflitos detectados: ${#conflicts[@]} (use --force para sobrescrever)"
+    return 1
+  fi
+  return 0
+}
+# -----------------------------------------------------------------------------
+# Instalar UM pacote: verifica checksum, lê meta/manifesto, checa conflitos, extrai e registra
+# -----------------------------------------------------------------------------
+install_one_pkg(){
+  local pkg="$1" name_override="${2:-}"
+  is_adm_pkg "$pkg" || { log_e "Arquivo não é pacote ADM: $pkg"; return 70; }
+  pkg_sha_ok "$pkg" || { log_e "Checksum inválido: $pkg"; return 71; }
+
+  # lê metadados e manifesto
+  local meta; meta="$(pkg_read_meta_from_file "$pkg" || true)"
+  local name version release arch libc deps manifest_path
+  name="$(printf '%s\n' "$meta" | awk -F= '/^name=/{print $2}' | head -n1)"
+  version="$(printf '%s\n' "$meta" | awk -F= '/^version=/{print $2}' | head -n1)"
+  release="$(printf '%s\n' "$meta" | awk -F= '/^release=/{print $2}' | head -n1)"
+  arch="$(printf '%s\n' "$meta" | awk -F= '/^arch=/{print $2}' | head -n1)"
+  libc="$(printf '%s\n' "$meta" | awk -F= '/^libc=/{print $2}' | head -n1)"
+  deps="$(printf '%s\n' "$meta" | awk -F= '/^run_deps=/{print $2}' | head -n1)"
+  manifest_path="$(printf '%s\n' "$meta" | awk -F= '/^___MANIFEST_FILE=/{print $2}' | head -n1)"
+
+  [[ -n "$name_override" ]] && name="$name_override"
+  [[ -n "$name" && -n "$version" ]] || { log_e "Metadados ausentes no pacote $pkg"; return 70; }
+  [[ -f "$manifest_path" ]] || { log_e "Manifesto ausente no pacote $pkg"; return 70; }
+
+  # skip se já instalado (mesma versão) e sem --reinstall
+  if is_installed "$name" && (( REINSTALL == 0 && FORCE == 0 )); then
+    local curv; curv="$(awk -F= '/^version=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    if [[ "$curv" == "$version" ]]; then
+      log_i "Já instalado: $name-$version (pulei)"
+      SKIPPED+=("$name")
+      return 0
+    fi
+  fi
+
+  # checa conflitos
+  check_conflicts "$manifest_path" "$name" || return 43
+
+  # hooks (se houver no repositório)
+  run_repo_hook_if_exists "$name" "pre-install"
+
+  # extrai
+  local tok=""; ((have_io)) && tok="$("$ADM_IO" spinner start "Instalando $(pkg_basename "$pkg")")"
+  if ! extract_pkg_to_root "$pkg"; then
+    ((have_io)) && "$ADM_IO" spinner stop "$tok" --error "Falha" || true
+    log_e "Falha ao extrair $pkg"
+    return 43
+  fi
+  ((have_io)) && "$ADM_IO" spinner stop "$tok" --ok "OK" || true
+
+  # registra
+  mark_installed "$name" "$version" "${release:-0}" "${arch:-$(arch_guess)}" "${libc:-$(libc_guess)}" "${deps:-}" "$manifest_path"
+
+  # hook pós
+  run_repo_hook_if_exists "$name" "post-install"
+
+  INSTALLED+=("$name")
+  log_o "Instalado" name="$name" version="$version"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Hooks do repositório (aproveita hooks do projeto fonte)
+# -----------------------------------------------------------------------------
+run_repo_hook_if_exists(){
+  local name="$1" hook="$2"
+  # encontra metafile desse pacote pelo nome
+  local mf
+  mf="$(find "$ADM_METAFILES" -type f -name metafile -exec awk -F= '/^name=/{print FILENAME ":" $2}' {} + 2>/dev/null | awk -F: -v n="$name" '$2==n{print $1;exit}' || true)"
+  [[ -n "$mf" ]] || return 0
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$mf")" || return 0
+  local h="$ADM_HOOKS_DIR/$hook"
+  [[ -x "$h" ]] || return 0
+  log_i "Hook (repo) $hook" package="$name"
+  # Exporta contexto mínimo
+  export ADM_NAME="$name" ADM_VERSION="$ADM_VERSION" ADM_WORKDIR="/" ADM_DESTDIR="/" ADM_PROFILE="" LIBC_TARGET=""
+  "$h" || log_w "Hook $hook retornou erro (continuando)"
+}
+
+# -----------------------------------------------------------------------------
+# Modo --name: usar adm-resolver para ordenar e localizar pacotes
+# -----------------------------------------------------------------------------
+resolve_order_from_repo(){
+  local metafile="$1" arch="$2" libc="$3" include_opt="$4"
+  [[ -x "$ADM_RESOLVER" ]] || die "adm-resolver ausente" 20
+  local out; out="$("$ADM_RESOLVER" "$metafile" $([[ "$include_opt" == "1" ]] && echo --include-opt) --prefer-binary --arch="${arch}" --libc="${libc}" || true)"
+  local run_layers; run_layers="$(printf '%s\n' "$out" | awk -F= '/^RUN_LAYERS=/{print $2}' | head -n1)"
+  local miss; miss="$(printf '%s\n' "$out" | awk -F= '/^BIN_MISS_RUN=/{print $2}' | head -n1)"
+  echo "${run_layers:-}|${miss:-}"
+}
+
+install_by_name(){
+  local name="$1" version="${2:-}" arch="${3:-}" libc="${4:-}" include_opt="${5:-0}"
+  # encontra o metafile do root
+  local mf; mf="$(find "$ADM_METAFILES" -type f -name metafile -exec awk -F= '/^name=/{print FILENAME ":" $2}' {} + 2>/dev/null | awk -F: -v n="$name" '$2==n{print $1;exit}' || true)"
+  [[ -n "$mf" ]] || die "Metafile para '$name' não encontrado no repositório" 60
+  section "Resolvendo dependências (repo)" root="$name"
+  IFS='|' read -r layers miss <<<"$(resolve_order_from_repo "$mf" "$arch" "$libc" "$include_opt")"
+  if [[ -n "$miss" ]]; then
+    log_w "Binários ausentes para (continuará compilando se houver pipeline de build): $miss"
+  fi
+  # layers: CSVs separados por ';'
+  local IFS=';' ; read -r -a LAY <<< "$layers"
+  local layer_idx=0
+  for layer_csv in "${LAY[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    csv_to_arr "$layer_csv"
+    log_i "Camada $layer_idx" count="${#_ARR[@]}"
+    # instala em paralelo
+    run_install_layer "${_ARR[@]}" "$version" "$arch" "$libc"
+    ((layer_idx++))
+  done
+}
+
+run_install_layer(){
+  local version="$#"; version="${!version}"; shift
+  local arch="$#"; arch="${!arch}"; shift
+  local libc="$#"; libc="${!libc}"; shift
+  local pkgs=( "$@" )
+  local -a PIDS=() ; local -A NAMES=() ; local -A RC=()
+  local name
+  for name in "${pkgs[@]}"; do
+    (
+      local pkgfile
+      pkgfile="$(find_best_pkg_for_name "$name" "$version" "$arch" "$libc")"
+      if [[ -z "$pkgfile" ]]; then
+        log_e "Pacote não encontrado no cache: $name"
+        echo 60 > "$ADM_STATE/install.$$.rc.$name"
+        exit 60
+      fi
+      install_one_pkg "$pkgfile" "$name" || echo $? > "$ADM_STATE/install.$$.rc.$name"
+    ) &
+    PIDS+=("$!")
+    NAMES["$!"]="$name"
+  done
+  local any_fail=0
+  local pid
+  for pid in "${PIDS[@]}"; do
+    wait "$pid" || true
+    local rcfile="$ADM_STATE/install.$$.rc.${NAMES[$pid]}"
+    if [[ -f "$rcfile" ]]; then
+      any_fail=1
+      local code; code="$(cat "$rcfile")"
+      rm -f "$rcfile"
+      log_e "Falha ao instalar ${NAMES[$pid]}" rc="$code"
+      MISSING+=("${NAMES[$pid]}")
+    fi
+  done
+  (( any_fail == 0 ))
+}
+# -----------------------------------------------------------------------------
+# Modo --dir: monta DAG a partir dos pacotes presentes no diretório
+# -----------------------------------------------------------------------------
+# Lê .ADM_META de todos os pacotes, constrói grafo name -> deps, toposort e instala por camadas.
+declare -A DIR_NAME2PKG=()
+declare -A DIR_DEPS=()
+csv_merge_unique(){ local a; a="$(csv_norm "$1")"; shift; local out="$a"; while (($#)); do local b; b="$(csv_norm "$1")"; shift; out="$(csv_unique_sorted "${out}${out:+,}${b}")"; done; printf '%s' "$out"; }
+
+index_dir_packages(){
+  local dir="$1" arch="$2" libc="$3"
+  local count=0
+  shopt -s nullglob
+  for p in "$dir"/*.tar.zst "$dir"/*.tar.xz; do
+    [[ -f "$p" ]] || continue
+    pkg_matches_target "$p" "$arch" "$libc" || continue
+    local meta; meta="$(pkg_read_meta_from_file "$p" || true)"
+    local name; name="$(printf '%s\n' "$meta" | awk -F= '/^name=/{print $2}' | head -n1)"
+    local deps; deps="$(printf '%s\n' "$meta" | awk -F= '/^run_deps=/{print $2}' | head -n1)"
+    [[ -z "$name" ]] && { log_w "Pacote sem name: $p"; continue; }
+    DIR_NAME2PKG["$name"]="$p"
+    DIR_DEPS["$name"]="$(csv_norm "$deps")"
+    ((count++))
+  done
+  shopt -u nullglob
+  ((count>0)) || die "Nenhum pacote compatível encontrado em $dir" 60
+  log_i "Indexados $count pacotes em $dir"
+}
+
+toposort_dir_graph(){
+  declare -A indeg=()
+  declare -A edges=()
+  local nodes=()
+  for n in "${!DIR_NAME2PKG[@]}"; do nodes+=("$n"); done
+  for n in "${nodes[@]}"; do
+    edges["$n"]="${DIR_DEPS[$n]:-}"
+  done
+  for n in "${nodes[@]}"; do indeg["$n"]=0; done
+  for n in "${nodes[@]}"; do
+    csv_to_arr "${edges[$n]}"
+    for d in "${_ARR[@]}"; do
+      [[ -z "$d" ]] && continue
+      # só conta se o dep também está no conjunto (senão, espera já instalado)
+      [[ -n "${DIR_NAME2PKG[$d]+x}" ]] || continue
+      indeg["$d"]=$(( indeg["$d"] + 1 ))
+    done
+  done
+  local layers=()
+  while :; do
+    local L=()
+    for n in "${nodes[@]}"; do
+      [[ "${indeg[$n]+x}" ]] || continue
+      (( indeg["$n"] == 0 )) && L+=("$n")
+    done
+    ((${#L[@]}==0)) && break
+    layers+=("$(csv_join "${L[@]}")")
+    for n in "${L[@]}"; do
+      unset 'indeg[$n]'
+      csv_to_arr "${edges[$n]}"
+      for d in "${_ARR[@]}"; do
+        [[ -z "$d" ]] && continue
+        [[ -n "${DIR_NAME2PKG[$d]+x}" ]] || continue
+        (( indeg["$d"] > 0 )) && indeg["$d"]=$(( indeg["$d"] - 1 ))
+      done
+    done
+  done
+  # se sobrou indegree, ciclo
+  for k in "${!indeg[@]}"; do
+    log_e "Ciclo detectado envolvendo '$k'"
+    return 61
+  done
+  # retorna layers separados por ';'
+  local s="" ; local i
+  for ((i=0;i<${#layers[@]};i++)); do
+    s+="${i>0?';':''}${layers[$i]}"
+  done
+  echo "$s"
+  return 0
+}
+
+install_from_dir(){
+  local dir="$1" arch="$2" libc="$3"
+  section "Indexando diretório" path="$dir"
+  index_dir_packages "$dir" "$arch" "$libc"
+  local layers; layers="$(toposort_dir_graph)" || return 61
+  local IFS=';' ; read -r -a LAY <<< "$layers"
+  local layer_idx=0
+  for layer_csv in "${LAY[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    csv_to_arr "$layer_csv"
+    log_i "Camada $layer_idx (dir)" count="${#_ARR[@]}"
+    # instala em paralelo
+    local -a PIDS=() ; local -A NAM=() ; local -A RC=()
+    local n
+    for n in "${_ARR[@]}"; do
+      (
+        install_one_pkg "${DIR_NAME2PKG[$n]}" "$n" || echo $? > "$ADM_STATE/install.$$.rc.$n"
+      ) &
+      PIDS+=("$!"); NAM["$!"]="$n"
+    done
+    for pid in "${PIDS[@]}"; do
+      wait "$pid" || true
+      local rcfile="$ADM_STATE/install.$$.rc.${NAM[$pid]}"
+      if [[ -f "$rcfile" ]]; then
+        local code; code="$(cat "$rcfile")"; rm -f "$rcfile"
+        log_e "Falha ao instalar ${NAM[$pid]}" rc="$code"
+        MISSING+=("${NAM[$pid]}")
+      fi
+    done
+    ((layer_idx++))
+  done
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# CLI / Dispatcher
+# -----------------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-install — instala pacotes ADM (.tar.zst/.tar.xz) com resolução de dependências.
+
+Modos:
+  1) Por nome (repositório de metafiles + cache de pacotes):
+     adm-install --name=<pkg> [--version=V] [--arch=...] [--libc=...] [--include-opt]
+  2) Por diretório (constrói DAG com .ADM_META de cada pacote):
+     adm-install --dir=/path/to/pkgs [--arch=...] [--libc=...]
+
+Opções gerais:
+  --jobs=N         Paralelismo por camada (default = nproc)
+  --force          Sobrescreve conflitos de arquivo
+  --reinstall      Reinstala mesmo se a mesma versão já estiver instalada
+  --dry-run        Não extrai, apenas simula
+  --include-opt    (modo --name) inclui opt_deps na resolução
+  --arch=...       Filtra/seleciona pacotes para uma arquitetura
+  --libc=...       Filtra/seleciona pacotes para glibc|musl
+
+Saída (KEY=VAL):
+  INSTALLED_SET=pkg1,pkg2,...
+  SKIPPED_SET=pkgX,...
+  MISSING_SET=pkgY,...
+
+Exit codes:
+  0 ok; 1 uso; 20 ambiente; 43 IO; 60 missing; 61 ciclo; 70 inválido; 71 checksum
+USAGE
+}
+
+# Estado global para coletar resultados
+declare -a INSTALLED=()
+declare -a SKIPPED=()
+declare -a MISSING=()
+
+main(){
+  validate_env
+  need_root
+
+  local mode="" NAME="" VERSION="" DIR="" INCLUDE_OPT=0
+  local ARCH="" LIBC="" FORCE=0 REINSTALL=0
+  local JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+  DO_DRYRUN=0
+
+  while (( $# )); do
+    case "$1" in
+      --name=*) NAME="${1#*=}"; mode="name" ;;
+      --version=*) VERSION="${1#*=}" ;;
+      --dir=*) DIR="${1#*=}"; mode="dir" ;;
+      --include-opt) INCLUDE_OPT=1 ;;
+      --arch=*) ARCH="${1#*=}" ;;
+      --libc=*) LIBC="${1#*=}" ;;
+      --jobs=*) JOBS="${1#*=}" ;;
+      --force) FORCE=1 ;;
+      --reinstall) REINSTALL=1 ;;
+      --dry-run) DO_DRYRUN=1 ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) usage; exit 1 ;;
+    esac; shift || true
+  done
+
+  [[ -n "$mode" ]] || { usage; exit 1; }
+
+  section "adm-install" mode="$mode"
+  if [[ "$mode" == "name" ]]; then
+    [[ -n "$NAME" ]] || { log_e "Requer --name=<pkg>"; exit 1; }
+    install_by_name "$NAME" "$VERSION" "$ARCH" "$LIBC" "$INCLUDE_OPT" || { rc=$?; [[ $rc -eq 0 ]] || exit "$rc"; }
+  else
+    [[ -d "$DIR" ]] || die "Diretório inválido: $DIR" 43
+    install_from_dir "$DIR" "$ARCH" "$LIBC" || { rc=$?; [[ $rc -eq 0 ]] || exit "$rc"; }
+  fi
+
+  # Saída machine-readable
+  printf 'INSTALLED_SET=%s\n' "$(csv_unique_sorted "$(csv_join "${INSTALLED[@]}")")"
+  printf 'SKIPPED_SET=%s\n'   "$(csv_unique_sorted "$(csv_join "${SKIPPED[@]}")")"
+  printf 'MISSING_SET=%s\n'   "$(csv_unique_sorted "$(csv_join "${MISSING[@]}")")"
+
+  # Se faltou algo, retorna 60
+  if ((${#MISSING[@]})); then
+    exit 60
+  fi
+  exit 0
+}
+
+main "$@"
