@@ -1,0 +1,589 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-meta
+# Metadados de pacotes: parse, lint, new, show, get/set, deps add/rm, sync-sums,
+# bump-builds, find, verify e utilidades.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/argumentos
+# 20 esquema inválido
+# 21 cardinal sources != sha256sums
+# 22 chave obrigatória ausente / get de chave inexistente
+# 23 valor malformado (URL, etc.)
+# 24 já existe (new sem --force)
+# 25 tipo inválido (ex.: num_builds)
+# 26 listas dessincronizadas (após sync-sums)
+# 27 divergência caminho <cat>/<prog> vs category/name
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+
+# Integração opcional com adm-io
+ADM_IO="${ADM_IO:-$ADM_ROOT/scripts/adm-io}"
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+
+log_info() { if (( have_io )); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_ok()   { if (( have_io )); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_warn() { if (( have_io )); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_err()  { if (( have_io )); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section()  { if (( have_io )); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+die() { local c="${2:-1}"; log_err "$1"; exit "$c"; }
+
+# Locks (mkdir fallback)
+LOCK_DIR="$ADM_ROOT/locks"
+mkdir -p "$LOCK_DIR" "$ADM_LOGS" "$ADM_STATE" >/dev/null 2>&1 || true
+have_flock=0; command -v flock >/dev/null 2>&1 && have_flock=1
+
+with_lock() {
+  local name="$1"; shift
+  local lf="$LOCK_DIR/${name}.lock"
+  if (( have_flock )); then
+    flock -w 60 "$lf" -- bash -c "$*"
+  else
+    local waited=0
+    while ! mkdir "$lf" 2>/dev/null; do
+      (( waited++ )); (( waited > 60 )) && die "Timeout lock: $name" 24
+      sleep 1
+    done
+    trap 'rmdir "'"$lf"'" 2>/dev/null || true' EXIT
+    bash -c "$*"; local rc=$?
+    rmdir "$lf" 2>/dev/null || true
+    trap - EXIT
+    return "$rc"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Utilidades
+# -----------------------------------------------------------------------------
+trim() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+slug_ok() { [[ "${1:-}" =~ ^[a-z0-9._+-]+$ ]]; }        # simples e permissivo
+has_spaces_around_equal() { [[ "$1" =~ ^[[:space:]]*[^#[:space:]]+[[:space:]]+=[[:space:]]+.+$ ]]; }
+bad_equal_spacing() { [[ "$1" =~ ^[^#=[:space:]]+[[:space:]]*=|=[[:space:]]*[^#=] ]]; }
+is_keyval_line() { [[ "$1" =~ ^[A-Za-z0-9_]+=[^=].*$ ]]; }
+is_comment_or_empty() { [[ -z "${1:-}" || "$1" =~ ^[[:space:]]*# ]]; }
+normalize_list() { local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; IFS=, read -r -a A <<< "$v"; declare -A seen=(); local out=(); for e in "${A[@]}"; do [[ -z "$e" ]] && continue; if [[ -z "${seen[$e]+x}" ]]; then out+=("$e"); seen[$e]=1; fi; done; local IFS=,; printf '%s' "${out[*]}"; }
+csv_count() { local s="${1:-}"; [[ -z "$s" ]] && { echo 0; return; } awk -F',' '{print NF}' <<< "$s"; }
+url_basic_ok() { [[ "${1:-}" =~ ^(https?|ftp|rsync|git(\+https?)?|file)://.+$ || "${1:-}" =~ ^git@.+:.+$ ]]; }
+
+canon_keys=( name version category run_deps build_deps opt_deps num_builds description homepage maintainer sha256sums sources )
+
+required_keys=( name version category num_builds sha256sums sources )
+
+# Parser básico em memória
+declare -A META=()
+declare -A DUPCHECK=()
+
+read_metafile() {
+  local f="$1"
+  [[ -f "$f" ]] || die "Metafile não encontrado: $f" 22
+  META=(); DUPCHECK=()
+  local ln=0
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    ((ln++))
+    line="$(trim "$line")"
+    is_comment_or_empty "$line" && continue
+    if ! is_keyval_line "$line"; then
+      die "Linha inválida $ln em $f: '$line' (esperado KEY=VAL sem espaços)" 20
+    fi
+    if has_spaces_around_equal "$line"; then
+      die "Espaços ao redor de '=' na linha $ln: '$line'" 20
+    fi
+    local k="${line%%=*}" v="${line#*=}"
+    [[ -n "$k" ]] || die "Chave vazia na linha $ln" 20
+    if [[ -n "${DUPCHECK[$k]+x}" ]]; then
+      die "Chave duplicada '$k' na linha $ln" 20
+    fi
+    DUPCHECK[$k]=1
+    META[$k]="$v"
+  done < "$f"
+}
+
+ensure_required() {
+  local missing=()
+  for k in "${required_keys[@]}"; do
+    [[ -n "${META[$k]+x}" ]] || missing+=("$k")
+  done
+  (( ${#missing[@]} == 0 )) || die "Chaves obrigatórias ausentes: ${missing[*]}" 22
+}
+
+validate_values() {
+  # tipos e formatos
+  is_int "${META[num_builds]:-}" || die "num_builds não é inteiro" 25
+
+  # listas normalizadas
+  local run build opt sums srcs
+  run="$(normalize_list "${META[run_deps]:-}")"; META[run_deps]="$run"
+  build="$(normalize_list "${META[build_deps]:-}")"; META[build_deps]="$build"
+  opt="$(normalize_list "${META[opt_deps]:-}")"; META[opt_deps]="$opt"
+  sums="$(normalize_list "${META[sha256sums]:-}")"; META[sha256sums]="$sums"
+  srcs="$(normalize_list "${META[sources]:-}")"; META[sources]="$srcs"
+
+  # cardinalidade
+  local nsums nsrcs; nsums="$(csv_count "$sums")"; nsrcs="$(csv_count "$srcs")"
+  (( nsums == nsrcs )) || die "Cardinalidade difere: sha256sums($nsums) vs sources($nsrcs)" 21
+
+  # URL básica
+  IFS=, read -r -a S <<< "$srcs"
+  for u in "${S[@]}"; do
+    url_basic_ok "$u" || die "URL inválida: $u" 23
+  done
+
+  # category slug
+  if [[ -n "${META[category]:-}" ]]; then
+    local cat="${META[category]}"
+    # categorias aceitas: apps|libs|sys|dev|... (não validaremos enum, só slug)
+    slug_ok "$cat" || die "Categoria com caracteres inválidos: $cat" 23
+  fi
+
+  # name slug básico
+  slug_ok "${META[name]}" || die "Nome inválido: ${META[name]}" 23
+
+  # description -> sem quebras
+  if [[ -n "${META[description]:-}" ]]; then
+    META[description]="$(tr -s '[:space:]' ' ' <<< "${META[description]}" | tr -d '\r' | tr -d '\n')"
+  fi
+
+  # maintainer básico
+  if [[ -n "${META[maintainer]:-}" ]]; then
+    [[ "${META[maintainer]}" =~ <.+@.+> ]] || log_warn "Maintainer sem e-mail esperado: ${META[maintainer]}"
+  fi
+}
+
+# Localização e caminhos a partir do metafile
+meta_dir_of() { local f="$1"; cd "$(dirname "$f")" && pwd -P; }
+meta_cat_of() { local d; d="$(meta_dir_of "$1")"; basename "$(dirname "$d")"; }
+meta_prog_of(){ local d; d="$(meta_dir_of "$1")"; basename "$d"; }
+hooks_dir_of(){ local f="$1"; echo "$(meta_dir_of "$f")/hooks"; }
+patches_dir_of(){ local f="$1"; echo "$(meta_dir_of "$f")/patches"; }
+
+# Emitir pares KEY=VAL para parse
+emit_parse_env() {
+  local f="$1"
+  local cat prog dir hooks patches
+  dir="$(meta_dir_of "$f")"; cat="$(basename "$(dirname "$dir")")"; prog="$(basename "$dir")"
+  hooks="$(hooks_dir_of "$f")"; patches="$(patches_dir_of "$f")"
+
+  printf 'ADM_NAME=%s\n'       "${META[name]}"
+  printf 'ADM_VERSION=%s\n'    "${META[version]}"
+  printf 'ADM_CATEGORY=%s\n'   "${META[category]}"
+  printf 'ADM_RUN_DEPS=%s\n'   "${META[run_deps]:-}"
+  printf 'ADM_BUILD_DEPS=%s\n' "${META[build_deps]:-}"
+  printf 'ADM_OPT_DEPS=%s\n'   "${META[opt_deps]:-}"
+  printf 'ADM_NUM_BUILDS=%s\n' "${META[num_builds]}"
+  printf 'ADM_DESCRIPTION=%s\n'"${META[description]:-}"
+  printf 'ADM_HOMEPAGE=%s\n'   "${META[homepage]:-}"
+  printf 'ADM_MAINTAINER=%s\n' "${META[maintainer]:-}"
+  printf 'ADM_SOURCES=%s\n'    "${META[sources]}"
+  printf 'ADM_SHA256S=%s\n'    "${META[sha256sums]}"
+  printf 'ADM_META_DIR=%s\n'   "$dir"
+  printf 'ADM_HOOKS_DIR=%s\n'  "$hooks"
+  printf 'ADM_PATCHES_DIR=%s\n'"$patches"
+}
+
+# Canonicalização de arquivo (show)
+canon_write_metafile() {
+  local f="$1"
+  # Reescreve em ordem canônica (comentários não preservados)
+  local tmp="${f}.tmp.$$"
+  : >"$tmp"
+  for k in "${canon_keys[@]}"; do
+    if [[ -n "${META[$k]+x}" ]]; then
+      printf '%s=%s\n' "$k" "${META[$k]}" >>"$tmp"
+    fi
+  done
+  mv -f "$tmp" "$f"
+}
+
+# -----------------------------------------------------------------------------
+# Subcomandos principais (parse, lint, new, show, get, set)
+# -----------------------------------------------------------------------------
+cmd_parse() {
+  local f="${1:-}"; [[ -n "$f" ]] || die "Uso: adm-meta parse <metafile>" 1
+  read_metafile "$f"; ensure_required; validate_values
+  emit_parse_env "$f"
+}
+
+cmd_lint() {
+  local f="${1:-}"; shift || true
+  local strict=0; [[ "${1:-}" == "--strict" ]] && { strict=1; shift; }
+  [[ -n "$f" ]] || die "Uso: adm-meta lint <metafile> [--strict]" 1
+
+  local ln=0 had_err=0 had_warn=0
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    ((ln++))
+    local raw="$line"
+    line="$(trim "$line")"
+    is_comment_or_empty "$line" && continue
+    if ! is_keyval_line "$line"; then
+      log_err "Linha $ln inválida: '$raw'"; had_err=1; continue
+    fi
+    if has_spaces_around_equal "$line"; then
+      log_err "Espaços ao redor de '=' na linha $ln: '$raw'"; had_err=1; continue
+    fi
+    local k="${line%%=*}" v="${line#*=}"
+    case "$k" in
+      name|version|category|run_deps|build_deps|opt_deps|num_builds|description|homepage|maintainer|sha256sums|sources) : ;;
+      *) log_warn "Chave desconhecida '$k' (linha $ln)"; had_warn=1 ;;
+    esac
+    # listas: avisar se há espaços
+    case "$k" in
+      run_deps|build_deps|opt_deps|sha256sums|sources)
+        if [[ "$v" =~ [[:space:]] ]]; then
+          log_warn "Lista com espaços em '$k' (linha $ln)"
+          had_warn=1
+        fi
+      ;;
+    esac
+  done < "$f"
+
+  # valida formalmente
+  if ! ( read_metafile "$f"; ensure_required; validate_values ); then
+    had_err=1
+  fi
+
+  if (( had_err )); then
+    exit 20
+  fi
+  if (( strict && had_warn )); then
+    exit 20
+  fi
+  log_ok "Lint ok"
+}
+
+create_hooks_scaffold() {
+  local d="$1"
+  mkdir -p "$d" || die "Falha criar hooks: $d" 24
+  local hooks=(pre-fetch post-fetch pre-extract post-extract pre-patch post-patch pre-configure post-configure pre-build post-build pre-install post-install pre-package post-package pre-remove post-remove verify rollback)
+  for h in "${hooks[@]}"; do
+    local f="$d/$h"
+    if [[ ! -f "$f" ]]; then
+      cat >"$f" <<'H'
+#!/usr/bin/env sh
+# Hook gerado automaticamente — idempotente
+# Variáveis comuns esperadas:
+#  ADM_NAME ADM_VERSION ADM_WORKDIR ADM_DESTDIR ADM_PROFILE LIBC_TARGET
+# Saia com 0 para sucesso; qualquer !=0 aborta a etapa.
+exit 0
+H
+      chmod +x "$f"
+    fi
+  done
+}
+
+cmd_new() {
+  local cat="${1:-}"; local prog="${2:-}"; shift 2 || true
+  local version="" description="" homepage="" maintainer="" force=0
+  while (( $# )); do
+    case "$1" in
+      --version=*) version="${1#*=}" ;;
+      --description=*) description="${1#*=}" ;;
+      --homepage=*) homepage="${1#*=}" ;;
+      --maintainer=*) maintainer="${1#*=}" ;;
+      --force) force=1 ;;
+      *) die "Flag desconhecida: $1" 1 ;;
+    esac
+    shift
+  done
+  [[ -n "$cat" && -n "$prog" ]] || die "Uso: adm-meta new <categoria> <programa> [--version=V] [--description=...] [--homepage=URL] [--maintainer=\"Nome <email>\"] [--force]" 1
+  slug_ok "$cat" || die "Categoria inválida: $cat" 23
+  slug_ok "$prog" || die "Programa inválido: $prog" 23
+
+  local dir="$ADM_METAFILES/$cat/$prog"
+  local metaf="$dir/metafile"
+  if [[ -e "$metaf" && $force -ne 1 ]]; then
+    die "Metafile já existe: $metaf (use --force para sobrescrever)" 24
+  fi
+  mkdir -p "$dir" || die "Falha criar diretório: $dir" 24
+  mkdir -p "$dir/patches" || die "Falha criar patches/" 24
+  create_hooks_scaffold "$dir/hooks"
+
+  # criar metafile inicial
+  : >"$metaf"
+  {
+    printf 'name=%s\n' "$prog"
+    printf 'version=%s\n' "${version:-0.0.0}"
+    printf 'category=%s\n' "$cat"
+    printf 'run_deps=\n'
+    printf 'build_deps=\n'
+    printf 'opt_deps=\n'
+    printf 'num_builds=0\n'
+    printf 'description=%s\n' "${description:-}"
+    printf 'homepage=%s\n' "${homepage:-}"
+    printf 'maintainer=%s\n' "${maintainer:-}"
+    printf 'sha256sums=\n'
+    printf 'sources=\n'
+  } >"$metaf"
+  log_ok "Criado: $metaf"
+  log_ok "Hooks: $dir/hooks (stubs)  Patches: $dir/patches"
+}
+
+cmd_show() {
+  local cat="${1:-}" prog="${2:-}"
+  [[ -n "$cat" && -n "$prog" ]] || die "Uso: adm-meta show <categoria> <programa>" 1
+  local metaf="$ADM_METAFILES/$cat/$prog/metafile"
+  read_metafile "$metaf"; ensure_required; validate_values
+  # imprimir normalizado (sem comentários)
+  for k in "${canon_keys[@]}"; do
+    [[ -n "${META[$k]+x}" ]] && printf '%s=%s\n' "$k" "${META[$k]}"
+  done
+}
+
+cmd_get() {
+  local f="${1:-}" k="${2:-}"
+  [[ -n "$f" && -n "$k" ]] || die "Uso: adm-meta get <metafile> <chave>" 1
+  read_metafile "$f"
+  if [[ -n "${META[$k]+x}" ]]; then
+    printf '%s\n' "${META[$k]}"
+  else
+    die "Chave inexistente: $k" 22
+  fi
+}
+
+cmd_set() {
+  local f="${1:-}" k="${2:-}" v="${3:-}"
+  [[ -n "$f" && -n "$k" && "${3+x}" ]] || die "Uso: adm-meta set <metafile> <chave> <valor>" 1
+  read_metafile "$f"
+  # validações específicas
+  case "$k" in
+    num_builds) is_int "$v" || die "num_builds precisa ser inteiro" 25 ;;
+    run_deps|build_deps|opt_deps|sha256sums|sources) v="$(normalize_list "$v")" ;;
+  esac
+  META["$k"]="$v"
+  # revalidar essenciais se afetado
+  if [[ "$k" == "sha256sums" || "$k" == "sources" ]]; then
+    local nsum nsrc; nsum="$(csv_count "${META[sha256sums]}")"; nsrc="$(csv_count "${META[sources]}")"
+    (( nsum == nsrc )) || die "Após set, cardinalidade difere: sha256sums($nsum) vs sources($nsrc)" 21
+  fi
+  canon_write_metafile "$f"
+  log_ok "Atualizado $k"
+}
+# -----------------------------------------------------------------------------
+# deps add|rm, sync-sums, bump-builds
+# -----------------------------------------------------------------------------
+merge_csv_unique_sorted() {
+  local a="$(normalize_list "${1:-}")"
+  local b="$(normalize_list "${2:-}")"
+  local IFS=,; read -r -a A <<< "$a"; read -r -a B <<< "$b"
+  declare -A seen=(); local out=()
+  for x in "${A[@]}" "${B[@]}"; do
+    [[ -z "$x" ]] && continue
+    if [[ -z "${seen[$x]+x}" ]]; then out+=("$x"); seen[$x]=1; fi
+  done
+  IFS=$'\n' read -r -d '' combined < <(printf '%s\n' "${out[@]}" | LC_ALL=C sort && printf '\0') || true
+  local IFS=,
+  printf '%s' "$(paste -sd, <<< "$combined")"
+}
+
+remove_from_csv() {
+  local base="$(normalize_list "${1:-}")"
+  local rmv="$(normalize_list "${2:-}")"
+  IFS=, read -r -a B <<< "$base"
+  IFS=, read -r -a R <<< "$rmv"
+  declare -A drop=(); for x in "${R[@]}"; do drop[$x]=1; done
+  local out=()
+  for x in "${B[@]}"; do [[ -n "${drop[$x]+x}" ]] && continue; out+=("$x"); done
+  IFS=$'\n' read -r -d '' combined < <(printf '%s\n' "${out[@]}" | LC_ALL=C sort && printf '\0') || true
+  local IFS=,; printf '%s' "$(paste -sd, <<< "$combined")"
+}
+
+cmd_deps() {
+  local action="${1:-}"; local f="${2:-}"; local which="${3:-}"; local list="${4:-}"
+  [[ -n "$action" && -n "$f" && -n "$which" && -n "$list" ]] || die "Uso: adm-meta deps <add|rm> <metafile> <run|build|opt> <dep1,dep2,...>" 1
+  read_metafile "$f"
+  local key=""
+  case "$which" in
+    run) key="run_deps" ;;
+    build) key="build_deps" ;;
+    opt) key="opt_deps" ;;
+    *) die "Tipo de deps inválido: $which" 1 ;;
+  esac
+  case "$action" in
+    add)
+      META["$key"]="$(merge_csv_unique_sorted "${META[$key]:-}" "$list")"
+      ;;
+    rm)
+      META["$key"]="$(remove_from_csv "${META[$key]:-}" "$list")"
+      ;;
+    *) die "Ação inválida: $action" 1 ;;
+  esac
+  canon_write_metafile "$f"
+  printf 'ADM_%s_DEPS=%s\n' "$(tr '[:lower:]' '[:upper:]' <<< "$which")" "${META[$key]}"
+  log_ok "Deps $which atualizadas"
+}
+
+cmd_sync_sums() {
+  local f="${1:-}"; [[ -n "$f" ]] || die "Uso: adm-meta sync-sums <metafile>" 1
+  read_metafile "$f"; ensure_required
+
+  local sums="$(normalize_list "${META[sha256sums]}")"
+  local srcs="$(normalize_list "${META[sources]}")"
+  local ns="$(csv_count "$sums")"; local nr="$(csv_count "$srcs")"
+
+  if (( ns == nr )); then
+    log_ok "Listas já sincronizadas ($ns entradas)"
+    exit 0
+  fi
+
+  IFS=, read -r -a S <<< "$srcs"
+  IFS=, read -r -a H <<< "$sums"
+
+  if (( nr > ns )); then
+    # adicionar marcadores MISSING
+    local diff=$(( nr - ns ))
+    log_warn "Faltam $diff sha256 para sources"
+    while (( diff > 0 )); do H+=("MISSING"); ((diff--)); done
+  else
+    # sha256s a mais → marcar sobras com EXTRA
+    local diff=$(( ns - nr ))
+    log_warn "Sobram $diff sha256 sem source correspondente (marcando EXTRA)"
+    # mantemos o comprimento de sums; apenas renomeamos os excedentes no final
+    # Para manter ordem, nada a fazer além de alertar.
+  fi
+
+  local IFS=,; META[sha256sums]="${H[*]}"
+  canon_write_metafile "$f"
+  printf 'ADM_SHA256S=%s\n' "${META[sha256sums]}"
+  log_warn "Listas sincronizadas com marcadores; revise os MISSING/EXTRA"
+  exit 26
+}
+
+cmd_bump_builds() {
+  local f="${1:-}"; shift || true
+  local inc=1
+  if [[ "${1:-}" =~ ^--inc=([0-9]+)$ ]]; then
+    inc="${BASH_REMATCH[1]}"; shift
+  fi
+  is_int "$inc" || die "Incremento inválido: $inc" 25
+  read_metafile "$f"
+  local cur="${META[num_builds]:-0}"
+  is_int "$cur" || die "num_builds inválido no arquivo: $cur" 25
+  local next=$(( cur + inc ))
+  (( next >= 0 )) || die "num_builds negativo resultante" 25
+  META[num_builds]="$next"
+  canon_write_metafile "$f"
+  printf 'ADM_NUM_BUILDS=%s\n' "$next"
+  log_ok "num_builds -> $next"
+}
+
+# -----------------------------------------------------------------------------
+# find e verify
+# -----------------------------------------------------------------------------
+cmd_find() {
+  local filter_cat="" filter_name="" filter_re=""
+  while (( $# )); do
+    case "$1" in
+      --category=*) filter_cat="${1#*=}" ;;
+      --name=*) filter_name="${1#*=}" ;;
+      --regex=*) filter_re="${1#*=}" ;;
+      *) die "Flag desconhecida: $1" 1 ;;
+    esac; shift
+  done
+  local base="$ADM_METAFILES"
+  [[ -d "$base" ]] || die "Diretório de metafiles inexistente: $base" 20
+  local count=0
+  while IFS= read -r -d '' path; do
+    local rel="${path#$base/}"
+    local cat="${rel%%/*}"; local rest="${rel#*/}"
+    local prog="${rest%%/*}"
+    local ok=1
+    if [[ -n "$filter_cat" && "$cat" != "$filter_cat" ]]; then ok=0; fi
+    if [[ -n "$filter_name" && ! "$prog" =~ $filter_name ]]; then ok=0; fi
+    if [[ -n "$filter_re" && ! "$rel" =~ $filter_re ]]; then ok=0; fi
+    if (( ok )); then
+      printf 'PATH=%s\n' "$path"
+      ((count++))
+    fi
+  done < <(find "$base" -type f -name metafile -print0)
+  log_ok "Encontrados $count metafiles"
+}
+
+cmd_verify() {
+  local f="${1:-}"; shift || true
+  local nowarn=0; [[ "${1:-}" == "--no-warn-extras" ]] && { nowarn=1; shift; }
+  [[ -n "$f" ]] || die "Uso: adm-meta verify <metafile> [--no-warn-extras]" 1
+
+  read_metafile "$f"; ensure_required; validate_values
+
+  # caminho x conteúdo
+  local cat_path prog_path
+  cat_path="$(meta_cat_of "$f")"
+  prog_path="$(meta_prog_of "$f")"
+  if [[ "${META[category]}" != "$cat_path" || "${META[name]}" != "$prog_path" ]]; then
+    die "Divergência: caminho <$cat_path/$prog_path> vs meta <${META[category]}/${META[name]}>" 27
+  fi
+
+  # homepage validação leve
+  if [[ -n "${META[homepage]:-}" ]]; then
+    url_basic_ok "${META[homepage]}" || die "Homepage inválida: ${META[homepage]}" 23
+  fi
+
+  # maintainer regex simples
+  if [[ -n "${META[maintainer]:-}" && ! "${META[maintainer]}" =~ <.+@.+> ]]; then
+    log_warn "Maintainer sem <email>: ${META[maintainer]}"
+  fi
+
+  # chaves extras: avisar (opcional)
+  local known="^(name|version|category|run_deps|build_deps|opt_deps|num_builds|description|homepage|maintainer|sha256sums|sources)$"
+  for k in "${!META[@]}"; do
+    if ! [[ "$k" =~ $known ]]; then
+      if (( nowarn == 0 )); then
+        log_warn "Chave extra no metafile: $k"
+      fi
+    fi
+  done
+  log_ok "Verificação OK: $f"
+}
+
+# -----------------------------------------------------------------------------
+# Uso e dispatcher
+# -----------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+adm-meta — gerenciamento de metafiles
+
+Comandos:
+  parse <metafile>
+  lint <metafile> [--strict]
+  new <categoria> <programa> [--version=V] [--description=...] [--homepage=URL] [--maintainer="Nome <email>"] [--force]
+  show <categoria> <programa>
+  get <metafile> <chave>
+  set <metafile> <chave> <valor>
+  deps <add|rm> <metafile> <run|build|opt> <dep1,dep2,...>
+  sync-sums <metafile>
+  bump-builds <metafile> [--inc=N]
+  find [--category=<cat>] [--name=<glob>] [--regex=<re>]
+  verify <metafile> [--no-warn-extras]
+
+Códigos de retorno:
+  0 ok; 1 uso; 20 esquema; 21 cardinal; 22 chave; 23 valor; 24 existe; 25 tipo; 26 sincronização; 27 divergência caminho/meta.
+USAGE
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    parse)        cmd_parse "$@" ;;
+    lint)         cmd_lint "$@" ;;
+    new)          cmd_new "$@" ;;
+    show)         cmd_show "$@" ;;
+    get)          cmd_get "$@" ;;
+    set)          cmd_set "$@" ;;
+    deps)         cmd_deps "$@" ;;
+    sync-sums)    cmd_sync_sums "$@" ;;
+    bump-builds)  cmd_bump_builds "$@" ;;
+    find)         cmd_find "$@" ;;
+    verify)       cmd_verify "$@" ;;
+    -h|--help|help|"") usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
