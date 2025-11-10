@@ -1,0 +1,10 @@
+# Construção completa padrão (tudo automático):
+/usr/src/adm/scripts/adm-constructor /usr/src/adm/metafiles/apps/busybox/metafile
+
+# Com profile agressivo e pulando empacotamento:
+JOBS=8 /usr/src/adm/scripts/adm-constructor /usr/src/adm/metafiles/apps/busybox/metafile \
+  --profile=aggressive --no-package
+
+# Se você já rodou fetch + extract e só quer compilar/instalar:
+ /usr/src/adm/scripts/adm-constructor /usr/src/adm/metafiles/apps/busybox/metafile \
+  --skip-fetch --skip-extract
