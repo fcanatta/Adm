@@ -1,0 +1,12 @@
+name=procps-ng
+version=4.0.4
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas para processos (ps, top, free, sysctl)
+homepage=https://gitlab.com/procps-ng/procps
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://sourceforge.net/projects/procps-ng/files/Production/procps-ng-4.0.4.tar.xz/download
