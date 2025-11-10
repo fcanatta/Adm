@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+cd "$ADM_BUILD_DIR"
+make DESTDIR="$ADM_DESTDIR" install
+# Conveniências
+[ -x "$ADM_DESTDIR/usr/bin/python3" ] && [ ! -e "$ADM_DESTDIR/usr/bin/python" ] && ln -sf python3 "$ADM_DESTDIR/usr/bin/python"
+rm -rf "$ADM_DESTDIR/usr/share/doc" "$ADM_DESTDIR/usr/share/info" 2>/dev/null || true
