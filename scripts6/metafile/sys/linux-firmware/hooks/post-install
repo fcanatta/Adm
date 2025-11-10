@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# linux-firmware: post-install
+# - Copia firmwares para ${DESTDIR}/lib/firmware
+# - Aplica filtros de inclusão/remoção opcional
+# - Mantém LICENSES (por padrão)
+# - Gera manifest em /usr/src/adm/state
+# - Gatilho mkinitrsmfs
+set -Eeuo pipefail
+
+: "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
+
+dst="${ADM_DESTDIR}/lib/firmware"
+mkdir -p "${dst}"
+
+# Função: copiar preservando perms/symlinks
+copy_all() {
+  # rsync é preferível; fallback para cp -a
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -aH --exclude='.git' --exclude='.github' "$@" "${dst}/"
+  else
+    # shellcheck disable=SC2086
+    cp -a $@ "${dst}/"
+  fi
+}
+
+# Monta lista de fontes a copiar
+# Se ADM_FIRMWARE_FILTER for vazio → copia tudo (com exceções)
+# Caso contrário, incluímos apenas os diretórios/padrões especificados.
+collect_sources() {
+  local arr=()
+  if [ -n "${ADM_FIRMWARE_FILTER:-}" ]; then
+    # Inclusão seletiva
+    for pat in ${ADM_FIRMWARE_FILTER}; do
+      # Expande dirs/padrões
+      mapfile -t hits < <(cd "${ADM_WORK_DIR}" && printf "%s\n" ${pat} 2>/dev/null || true)
+      if [ "${#hits[@]}" -gt 0 ]; then
+        for h in "${hits[@]}"; do
+          [ -e "${ADM_WORK_DIR}/${h}" ] && arr+=("${ADM_WORK_DIR}/${h}")
+        done
+      else
+        # fallback: se não expandiu, tenta caminho direto
+        [ -e "${ADM_WORK_DIR}/${pat}" ] && arr+=("${ADM_WORK_DIR}/${pat}")
+      fi
+    done
+  else
+    # Tudo
+    arr+=("${ADM_WORK_DIR}/"* )
+  fi
+  printf "%s\n" "${arr[@]}"
+}
+
+# Aplica exclusões sobre a árvore já instalada
+apply_excludes() {
+  [ -z "${ADM_FIRMWARE_EXCLUDE:-}" ] && return 0
+  shopt -s nullglob dotglob
+  for pat in ${ADM_FIRMWARE_EXCLUDE}; do
+    mapfile -t rmv < <(cd "${dst}" && printf "%s\n" ${pat} 2>/dev/null || true)
+    for r in "${rmv[@]}"; do
+      [ -e "${dst}/${r}" ] && rm -rf "${dst}/${r}"
+    done
+  done
+}
+
+# 1) Copiar (com ou sem filtro)
+mapfile -t SRC_LIST < <(collect_sources)
+
+# Filtra itens espúrios (apenas entradas existentes)
+to_copy=()
+for s in "${SRC_LIST[@]}"; do
+  [ -e "$s" ] || continue
+  base="$(basename "$s")"
+  # Evita copiar metadados de VCS e arquivos de topo não-firmware
+  case "$base" in
+    .git|.github|.gitignore|README*|readme*|COPYING*|Changelog*|Makefile|WHENCE|LICENSE|LICENCE|LICENSES|LICENCES) continue;;
+  esac
+  to_copy+=("$s")
+done
+
+# Se nada específico foi coletado, assume conteúdo “núcleo” conhecido
+if [ "${#to_copy[@]}" -eq 0 ]; then
+  for d in amdgpu i915 iwlwifi ath10k ath11k radeon rtw88 mediatek qcom rtl_bt rtlwifi brcm firmware.*; do
+    [ -e "${ADM_WORK_DIR}/${d}" ] && to_copy+=("${ADM_WORK_DIR}/${d}")
+  done
+fi
+
+# Copia
+if [ "${#to_copy[@]}" -gt 0 ]; then
+  copy_all "${to_copy[@]}"
+fi
+
+# 2) Mantém LICENSES por padrão (próximo da raiz do repo)
+if [ "${ADM_FIRMWARE_KEEP_LICENSES}" = "1" ]; then
+  for f in WHENCE WHENCE.md LICENSE LICENCE LICENSES LICENCES COPYING*; do
+    [ -e "${ADM_WORK_DIR}/${f}" ] && install -Dm0644 "${ADM_WORK_DIR}/${f}" "${dst}/${f}"
+  done
+fi
+
+# 3) Exclusões (se definidas)
+apply_excludes
+
+# 4) Manifest
+STATE_DIR="${ADM_STATES:-/usr/src/adm/state}"
+mkdir -p "${STATE_DIR}"
+MAN="${STATE_DIR}/firmware-manifest.txt"
+(
+  echo "# Manifest de firmware instalado"
+  echo "# Gerado: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  echo "# Filtro include: ${ADM_FIRMWARE_FILTER:-<todos>}"
+  echo "# Filtro exclude: ${ADM_FIRMWARE_EXCLUDE:-<nenhum>}"
+  echo
+  cd "${dst}"
+  # Lista arquivos relevantes (bin/blobs)
+  find . -type f ! -name 'README*' ! -name 'WHENCE*' ! -name 'COPYING*' ! -name 'LICENSE*' -printf "%P\n" | sort
+) > "${MAN}"
+
+# 5) Gatilho de initramfs
+TRIG_DIR="${STATE_DIR}/triggers/mkinit"
+mkdir -p "${TRIG_DIR}"
+echo "firmware-updated" > "${TRIG_DIR}/firmware-$(date +%s)"
+
+# 6) Limpeza leve (opcional)
+if [ "${ADM_FIRMWARE_PRUNE_DOCS}" = "1" ]; then
+  rm -rf "${ADM_DESTDIR}/usr/share/doc" "${ADM_DESTDIR}/usr/share/info" 2>/dev/null || true
+fi
