@@ -1,0 +1,12 @@
+name=musl-headers-stage0
+version=1.2.5
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Headers da musl para bootstrap; instala no SYSROOT
+homepage=https://musl.libc.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz
