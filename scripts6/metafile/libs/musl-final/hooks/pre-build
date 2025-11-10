@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# musl-final: pre-build — build completo
 set -Eeuo pipefail
-: "${ADM_WORK_DIR:?}"; cd "$ADM_WORK_DIR"
-make -j"${ADM_JOBS:-$(nproc || echo 4)}"
+: "${ADM_WORK_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
