@@ -1,0 +1,12 @@
+name=cmake
+version=3.30.5
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Sistema de build CMake
+homepage=https://cmake.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5.tar.gz
