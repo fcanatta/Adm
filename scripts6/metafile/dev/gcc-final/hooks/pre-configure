@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Detecta libc (glibc/musl) e configura gcc para C e C++.
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"; mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+
+BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine || echo "$(uname -m)-pc-linux-gnu")}"
+HOST_TRIPLET="${HOST_TRIPLET:-$BUILD_TRIPLET}"
+
+# Heurística: musl ou glibc
+LIBC_KIND="glibc"
+if ldd --version 2>&1 | grep -qi musl; then LIBC_KIND="musl"; fi
+export LIBC_KIND
+
+PATH="/usr/bin:${PATH}"
+export CC="${BUILD_TRIPLET}-gcc"
+
+conf=(
+  --prefix=/usr
+  --target="${HOST_TRIPLET}"
+  --host="${BUILD_TRIPLET}"
+  --build="${BUILD_TRIPLET}"
+  --with-sysroot=/
+  --with-native-system-header-dir=/usr/include
+  --with-gmp=/usr --with-mpfr=/usr --with-mpc=/usr --with-isl=/usr
+  --enable-languages=c,c++
+  --disable-multilib
+  --disable-nls
+  --disable-werror
+  --enable-shared
+  --enable-threads=posix
+)
+[ "$LIBC_KIND" = "musl" ] && conf+=( --enable-default-pie )
+
+"$ADM_WORK_DIR/configure" "${conf[@]}"
