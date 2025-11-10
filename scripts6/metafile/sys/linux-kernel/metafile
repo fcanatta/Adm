@@ -1,0 +1,12 @@
+name=linux-kernel
+version=6.11.0
+category=sys
+run_deps=kmod
+build_deps=
+opt_deps=linux-firmware
+num_builds=0
+description=Kernel Linux (núcleo + módulos) com instalação em DESTDIR e gatilho de initramfs
+homepage=https://www.kernel.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz,https://mirrors.edge.kernel.org/pub/linux/kernel/v6.x/linux-6.11.tar.xz
