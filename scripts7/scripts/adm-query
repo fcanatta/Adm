@@ -1,0 +1,510 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-query
+# Consultas unificadas sobre pacotes/metafiles/DB/cache: info, list, search, provides/owns, deps/rdeps, files, versions, status.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20  ambiente inválido
+# 43  IO/perm
+# 50  não encontrado
+# 70  dados inválidos
+
+set -Eeuo pipefail
+umask 022
+
+# --------------------------------------------------------------------
+# Caminhos base
+# --------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+
+mkdir -p "$ADM_METAFILES" "$ADM_PACKAGES" "$ADM_DB"/{installed,reverse} "$ADM_LOGS" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+csv_join(){ local IFS=,; printf '%s' "$*"; }
+lower(){ tr '[:upper:]' '[:lower:]'; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+
+json_escape(){
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"
+  printf '%s' "$s"
+}
+
+# --------------------------------------------------------------------
+# DB paths / utilitários
+# --------------------------------------------------------------------
+DB_INSTALLED_DIR="$ADM_DB/installed"
+DB_REVERSE_DIR="$ADM_DB/reverse"
+DB_BY_FILE="$ADM_DB/by-file.map"
+
+installed_meta(){ printf '%s/%s.meta' "$DB_INSTALLED_DIR" "$1"; }
+installed_files(){ printf '%s/%s.files' "$DB_INSTALLED_DIR" "$1"; }
+reverse_file(){ printf '%s/%s.rdeps' "$DB_REVERSE_DIR" "$1"; }
+is_installed(){ [[ -f "$(installed_meta "$1")" ]]; }
+
+# --------------------------------------------------------------------
+# Leitura de metafile via adm-meta (ou heurística)
+# --------------------------------------------------------------------
+load_meta_vars(){ # $1 = metafile path
+  local metaf="$1"
+  [[ -x "$ADM_META" ]] || die "adm-meta não encontrado: $ADM_META" 20
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")"
+  ADM_NAME="${ADM_NAME:-}"; ADM_VERSION="${ADM_VERSION:-}"; ADM_CATEGORY="${ADM_CATEGORY:-}"
+  ADM_RUN_DEPS="${ADM_RUN_DEPS:-}"; ADM_BUILD_DEPS="${ADM_BUILD_DEPS:-}"; ADM_OPT_DEPS="${ADM_OPT_DEPS:-}"
+  ADM_HOMEPAGE="${ADM_HOMEPAGE:-}"; ADM_MAINTAINER="${ADM_MAINTAINER:-}"; ADM_DESCRIPTION="${ADM_DESCRIPTION:-}"
+  ADM_SOURCES="${ADM_SOURCES:-}"; ADM_SHA256SUMS="${ADM_SHA256SUMS:-}"
+}
+
+# Encontra metafile por nome de pacote
+find_metafile_by_name(){
+  local name="$1"
+  # Faz uma varredura rápida: awk sobre name= em todos os metafiles
+  find "$ADM_METAFILES" -type f -name metafile -print0 2>/dev/null \
+  | xargs -0 -r awk -v RS= -F= -v N="$name" '
+      $1=="name" && $2==N { print FILENAME; exit }' \
+  | head -n1 || true
+}
+
+# --------------------------------------------------------------------
+# INFO / STATUS
+# --------------------------------------------------------------------
+print_info(){
+  local name="$1"
+  local metaf; metaf="$(find_metafile_by_name "$name" || true)"
+  local inst="no" iv="" rel="" arch="" libc=""
+  local run="" build="" opt="" cat="" desc="" home="" maint="" vers="" sources="" sums=""
+  if [[ -n "$metaf" ]]; then
+    load_meta_vars "$metaf"
+    vers="$ADM_VERSION"; cat="$ADM_CATEGORY"; run="$ADM_RUN_DEPS"; build="$ADM_BUILD_DEPS"; opt="$ADM_OPT_DEPS"
+    desc="$ADM_DESCRIPTION"; home="$ADM_HOMEPAGE"; maint="$ADM_MAINTAINER"; sources="$ADM_SOURCES"; sums="$ADM_SHA256SUMS"
+  fi
+  if is_installed "$name"; then
+    inst="yes"
+    iv="$(awk -F= '/^version=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    rel="$(awk -F= '/^release=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    arch="$(awk -F= '/^arch=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+    libc="$(awk -F= '/^libc=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+  fi
+
+  section "Informações — $name"
+  printf 'name=%s\n' "$name"
+  [[ -n "$vers" ]] && printf 'version_meta=%s\n' "$vers"
+  printf 'installed=%s\n' "$inst"
+  [[ -n "$iv" ]]   && printf 'version_installed=%s\n' "$iv"
+  [[ -n "$rel" ]]  && printf 'release=%s\n' "$rel"
+  [[ -n "$arch" ]] && printf 'arch=%s\n' "$arch"
+  [[ -n "$libc" ]] && printf 'libc=%s\n' "$libc"
+  [[ -n "$cat" ]]  && printf 'category=%s\n' "$cat"
+  [[ -n "$desc" ]] && printf 'description=%s\n' "$desc"
+  [[ -n "$home" ]] && printf 'homepage=%s\n' "$home"
+  [[ -n "$maint" ]]&& printf 'maintainer=%s\n' "$maint"
+  [[ -n "$run"  ]] && printf 'run_deps=%s\n' "$(csv_norm "$run")"
+  [[ -n "$build"]] && printf 'build_deps=%s\n' "$(csv_norm "$build")"
+  [[ -n "$opt"  ]] && printf 'opt_deps=%s\n' "$(csv_norm "$opt")"
+  [[ -n "$sources" ]] && printf 'sources=%s\n' "$(csv_norm "$sources")"
+  [[ -n "$sums"    ]] && printf 'sha256sums=%s\n' "$(csv_norm "$sums")"
+
+  # versões no cache
+  local avail; avail="$(list_cache_versions "$name")"
+  [[ -n "$avail" ]] && printf 'cache_versions=%s\n' "$avail"
+
+  if ((have_io)); then
+    "$ADM_IO" log ok "OK" name="$name"
+  fi
+}
+
+print_status(){
+  local name="$1"
+  local inst="no" iv="" rel="" arch="" libc=""
+  if is_installed "$name"; then
+    inst="yes"
+    iv="$(awk -F= '/^version=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    rel="$(awk -F= '/^release=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    arch="$(awk -F= '/^arch=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+    libc="$(awk -F= '/^libc=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+  fi
+  printf 'name=%s\ninstalled=%s\n' "$name" "$inst"
+  [[ -n "$iv"   ]] && printf 'version=%s\n' "$iv"
+  [[ -n "$rel"  ]] && printf 'release=%s\n' "$rel"
+  [[ -n "$arch" ]] && printf 'arch=%s\n' "$arch"
+  [[ -n "$libc" ]] && printf 'libc=%s\n' "$libc"
+}
+
+# --------------------------------------------------------------------
+# LIST / SEARCH (metafiles)
+# --------------------------------------------------------------------
+iter_metafiles(){ find "$ADM_METAFILES" -type f -name metafile 2>/dev/null; }
+
+list_all(){
+  local category="${1:-}" installed_filter="${2:-any}" pattern="${3:-}" regex="${4:-0}" limit="${5:-0}"
+  section "Lista de pacotes"
+  local count=0
+  while IFS= read -r mf; do
+    load_meta_vars "$mf"
+    local ok=1
+    [[ -n "$category" && "$ADM_CATEGORY" != "$category" ]] && ok=0
+    if [[ "$installed_filter" == "installed" && ! -f "$(installed_meta "$ADM_NAME")" ]]; then ok=0; fi
+    if [[ "$installed_filter" == "not" && -f "$(installed_meta "$ADM_NAME")" ]]; then ok=0; fi
+    if (( ok )); then
+      if [[ -n "$pattern" ]]; then
+        if (( regex )); then
+          printf '%s %s %s %s\n' "$ADM_NAME" "$ADM_VERSION" "$ADM_CATEGORY" "$ADM_DESCRIPTION" | grep -Eq "$pattern" || ok=0
+        else
+          printf '%s %s %s %s\n' "$ADM_NAME" "$ADM_VERSION" "$ADM_CATEGORY" "$ADM_DESCRIPTION" | grep -qi -- "$pattern" || ok=0
+        fi
+      fi
+    fi
+    (( ok )) || continue
+    printf '%-30s %-15s %-8s %s\n' "$ADM_NAME" "$ADM_VERSION" "$ADM_CATEGORY" "${ADM_DESCRIPTION:0:80}"
+    count=$((count+1))
+    if (( limit>0 && count>=limit )); then break; fi
+  done < <(iter_metafiles | LC_ALL=C sort)
+  log_o "Total" count="$count"
+}
+
+search_pkgs(){
+  local term="$1" field="${2:-any}" regex="${3:-0}" limit="${4:-0}"
+  section "Busca: $term"
+  local count=0
+  while IFS= read -r mf; do
+    load_meta_vars "$mf"
+    local hay=""
+    case "$field" in
+      name)       hay="$ADM_NAME" ;;
+      desc|description) hay="$ADM_DESCRIPTION" ;;
+      homepage)   hay="$ADM_HOMEPAGE" ;;
+      maint|maintainer) hay="$ADM_MAINTAINER" ;;
+      any|*)      hay="$ADM_NAME $ADM_DESCRIPTION $ADM_HOMEPAGE $ADM_MAINTAINER" ;;
+    esac
+    local hit=0
+    if (( regex )); then
+      printf '%s\n' "$hay" | grep -Eq "$term" && hit=1
+    else
+      printf '%s\n' "$hay" | grep -qi -- "$term" && hit=1
+    fi
+    (( hit==1 )) || continue
+    printf '%-30s %-15s %-8s %s\n' "$ADM_NAME" "$ADM_VERSION" "$ADM_CATEGORY" "${ADM_DESCRIPTION:0:80}"
+    count=$((count+1))
+    if (( limit>0 && count>=limit )); then break; fi
+  done < <(iter_metafiles | LC_ALL=C sort)
+  log_o "Resultados" count="$count"
+}
+
+# --------------------------------------------------------------------
+# FILES / OWNS / PROVIDES
+# --------------------------------------------------------------------
+print_files(){
+  local name="$1"
+  local f; f="$(installed_files "$name")"
+  [[ -f "$f" ]] || die "Pacote não instalado ou sem manifesto: $name" 50
+  section "Arquivos — $name"
+  sed 's|^\./||' "$f"
+}
+
+who_owns(){
+  local path="$1"
+  [[ -f "$DB_BY_FILE" ]] || die "Índice by-file.map ausente (instale algo antes)" 50
+  local p="$path"
+  [[ "$p" != /* ]] && p="/$p"
+  # normaliza possíveis // e ./:
+  p="$(readlink -f -- "$p" 2>/dev/null || echo "$p")"
+  local owner
+  owner="$(grep -F -- "$p " "$DB_BY_FILE" | awk '{print $2}' | sort -u | paste -sd, - || true)"
+  [[ -n "$owner" ]] || { log_w "Nenhum dono encontrado"; return 50; }
+  printf 'owners=%s\n' "$owner"
+}
+
+provides_glob_in_dir(){
+  local dir="$1" glob="$2"
+  section "Provides (glob) em diretório" dir="$dir" glob="$glob"
+  shopt -s nullglob
+  local hits=0
+  for pkg in "$dir"/*.tar.zst "$dir"/*.tar.xz; do
+    [[ -f "$pkg" ]] || continue
+    local lst
+    if [[ "$pkg" =~ \.tar\.zst$ ]]; then
+      lst="$(tar --zstd -tf "$pkg" 2>/dev/null || true)"
+    else
+      lst="$(tar -I xz -tf "$pkg" 2>/dev/null || true)"
+    fi
+    local match; match="$(printf '%s\n' "$lst" | grep -E '^(\.\/)?'"$glob"'$' || true)"
+    if [[ -n "$match" ]]; then
+      printf '%s: %s\n' "$(basename "$pkg")" "$match"
+      hits=$((hits+1))
+    fi
+  done
+  shopt -u nullglob
+  (( hits>0 )) || { log_w "Nenhuma correspondência"; return 50; }
+  return 0
+}
+
+# --------------------------------------------------------------------
+# VERSIONS (cache)
+# --------------------------------------------------------------------
+list_cache_versions(){
+  local name="$1"
+  local out
+  out="$(ls -1 "$ADM_PACKAGES"/"$name"-*.tar.* 2>/dev/null | awk -F/ '{print $NF}' \
+        | sed -nE 's/^'"$name"'-([A-Za-z0-9._+-]+)-([0-9]+)-([^-]+)-([^.]+)\.tar\.(zst|xz)$/\1-\2-\3-\4.\5/p' \
+        | LC_ALL=C sort -u || true)"
+  printf '%s' "$out"
+}
+# --------------------------------------------------------------------
+# DEPS / RDEPS
+# --------------------------------------------------------------------
+print_deps(){
+  local name="$1"
+  local metasrc; metasrc="$(find_metafile_by_name "$name" || true)"
+  [[ -n "$metasrc" ]] || die "Metafile não encontrado para $name" 50
+  load_meta_vars "$metasrc"
+  printf 'run_deps=%s\n' "$(csv_norm "$ADM_RUN_DEPS")"
+  printf 'build_deps=%s\n' "$(csv_norm "$ADM_BUILD_DEPS")"
+  printf 'opt_deps=%s\n' "$(csv_norm "$ADM_OPT_DEPS")"
+}
+
+print_rdeps(){
+  local name="$1"
+  local f; f="$(reverse_file "$name")"
+  if [[ -f "$f" ]]; then
+    local csv; csv="$(awk '{print $1}' "$f" | sed '/^$/d' | paste -sd, - || true)"
+    printf 'rdeps=%s\n' "$(csv_norm "$csv")"
+  else
+    printf 'rdeps=\n'
+  fi
+}
+
+# --------------------------------------------------------------------
+# JSON (resumo para info/status)
+# --------------------------------------------------------------------
+json_info(){
+  local name="$1"
+  local metaf; metaf="$(find_metafile_by_name "$name" || true)"
+  local inst=false iv="" rel="" arch="" libc=""
+  local run="" build="" opt="" cat="" desc="" home="" maint="" vers="" sources="" sums=""
+  if [[ -n "$metaf" ]]; then
+    load_meta_vars "$metaf"
+    vers="$ADM_VERSION"; cat="$ADM_CATEGORY"; run="$ADM_RUN_DEPS"; build="$ADM_BUILD_DEPS"; opt="$ADM_OPT_DEPS"
+    desc="$ADM_DESCRIPTION"; home="$ADM_HOMEPAGE"; maint="$ADM_MAINTAINER"; sources="$ADM_SOURCES"; sums="$ADM_SHA256SUMS"
+  fi
+  if is_installed "$name"; then
+    inst=true
+    iv="$(awk -F= '/^version=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    rel="$(awk -F= '/^release=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true)"
+    arch="$(awk -F= '/^arch=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+    libc="$(awk -F= '/^libc=/{print $2}'    "$(installed_meta "$name")" 2>/dev/null || true)"
+  fi
+  local cache; cache="$(json_escape "$(list_cache_versions "$name")")"
+  printf '{'
+  printf '"name":"%s",' "$(json_escape "$name")"
+  printf '"installed":%s,' "$inst"
+  [[ -n "$vers" ]] && printf '"version_meta":"%s",' "$(json_escape "$vers")" || printf '"version_meta":null,'
+  [[ -n "$iv"   ]] && printf '"version_installed":"%s",' "$(json_escape "$iv")" || printf '"version_installed":null,'
+  [[ -n "$rel"  ]] && printf '"release":"%s",' "$(json_escape "$rel")" || printf '"release":null,"
+  [[ -n "$arch" ]] && printf '"arch":"%s",' "$(json_escape "$arch")" || printf '"arch":null,'
+  [[ -n "$libc" ]] && printf '"libc":"%s",' "$(json_escape "$libc")" || printf '"libc":null,'
+  [[ -n "$cat"  ]] && printf '"category":"%s",' "$(json_escape "$cat")" || printf '"category":null,'
+  [[ -n "$desc" ]] && printf '"description":"%s",' "$(json_escape "$desc")" || printf '"description":null,'
+  [[ -n "$home" ]] && printf '"homepage":"%s",' "$(json_escape "$home")" || printf '"homepage":null,'
+  [[ -n "$maint"]] && printf '"maintainer":"%s",' "$(json_escape "$maint")" || printf '"maintainer":null,'
+  printf '"run_deps":"%s",' "$(json_escape "$(csv_norm "$run")")"
+  printf '"build_deps":"%s",' "$(json_escape "$(csv_norm "$build")")"
+  printf '"opt_deps":"%s",'   "$(json_escape "$(csv_norm "$opt")")"
+  printf '"sources":"%s",'    "$(json_escape "$(csv_norm "$sources")")"
+  printf '"sha256sums":"%s",' "$(json_escape "$(csv_norm "$sums")")"
+  printf '"cache_versions":"%s"' "$cache"
+  printf '}\n'
+}
+
+# --------------------------------------------------------------------
+# CLI / Dispatcher
+# --------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-query — consultas sobre pacotes/metafiles/DB/cache.
+
+Uso geral:
+  adm-query info <nome> [--json]
+  adm-query status <nome> [--json]
+  adm-query list [--category=apps|libs|dev|sys|...] [--installed|--not-installed] [--like=padrao] [--regex] [--limit=N]
+  adm-query search <termo> [--field=name|desc|homepage|maint|any] [--regex] [--limit=N]
+  adm-query files <nome>
+  adm-query owns <arquivo-absoluto|relativo>
+  adm-query provides <glob> [--dir=/path/de/pacotes]      # procura globs dentro de pacotes ADM
+  adm-query deps <nome>
+  adm-query rdeps <nome>
+  adm-query versions <nome>
+
+Opções comuns:
+  --json            (info/status) imprime JSON simples
+  --limit=N         limita a listagem
+  --regex           ativa busca por expressão regular
+  --category=...    filtra por categoria no list
+  --installed       lista apenas instalados (no list)
+  --not-installed   lista apenas não-instalados (no list)
+  --like=PADRAO     filtro de texto (case-insensitive) em list
+  --field=...       campo alvo da busca (em search)
+  --dir=/path       diretório com pacotes (em provides)
+
+Exit codes:
+  0 ok; 1 uso; 20 env; 43 IO; 50 não encontrado; 70 dados inválidos
+USAGE
+}
+
+validate_env(){
+  [[ -d "$ADM_METAFILES" ]] || log_w "Diretório de metafiles não existe: $ADM_METAFILES"
+  [[ -d "$ADM_PACKAGES"  ]] || log_w "Diretório de pacotes não existe: $ADM_PACKAGES"
+  [[ -d "$ADM_DB"        ]] || log_w "Diretório de DB não existe: $ADM_DB"
+  [[ -x "$ADM_META"      ]] || log_w "adm-meta ausente; parse de metafile pode falhar"
+}
+
+main(){
+  validate_env
+  local cmd="${1:-}"; shift || true
+  [[ -n "$cmd" ]] || { usage; exit 1; }
+
+  # flags gerais interpretadas por subcomandos
+  local JSON=0 REGEX=0 LIMIT=0 CATEGORY="" LIKE="" ONLY_INST=0 ONLY_NOT=0 FIELD="any" DIR_OVERRIDE=""
+
+  # Pre-parse de flags comuns quando aplicável
+  case "$cmd" in
+    info|status|files|deps|rdeps|versions|owns|provides|list|search) : ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+
+  # Sub-dispatch com parse específico
+  case "$cmd" in
+    info)
+      local name=""
+      while (( $# )); do
+        case "$1" in
+          --json) JSON=1 ;;
+          -h|--help|help) usage; exit 0 ;;
+          *) name="${1}";;
+        esac; shift || true
+      done
+      [[ -n "$name" ]] || { usage; exit 1; }
+      if (( JSON )); then json_info "$name"; else print_info "$name"; fi
+      ;;
+
+    status)
+      local name=""
+      while (( $# )); do
+        case "$1" in
+          --json) JSON=1 ;;
+          -h|--help|help) usage; exit 0 ;;
+          *) name="${1}";;
+        esac; shift || true
+      done
+      [[ -n "$name" ]] || { usage; exit 1; }
+      if (( JSON )); then
+        # JSON simples com status
+        local buf; buf="$(print_status "$name")"
+        printf '{'; printf '"name":"%s",' "$(json_escape "$name")"
+        printf '"installed":%s,' "$(echo "$buf" | awk -F= '/^installed=/{print $2}')"
+        printf '"version":%s' "$(echo "$buf" | awk -F= '/^version=/{print "\""$2"\"" }' | head -n1 || echo null)"
+        printf '}\n'
+      else
+        print_status "$name"
+      fi
+      ;;
+
+    list)
+      while (( $# )); do
+        case "$1" in
+          --category=*) CATEGORY="${1#*=}" ;;
+          --installed) ONLY_INST=1 ;;
+          --not-installed) ONLY_NOT=1 ;;
+          --like=*) LIKE="${1#*=}" ;;
+          --regex) REGEX=1 ;;
+          --limit=*) LIMIT="${1#*=}" ;;
+          -h|--help|help) usage; exit 0 ;;
+          *) usage; exit 1 ;;
+        esac; shift || true
+      done
+      local filt="any"; (( ONLY_INST )) && filt="installed"; (( ONLY_NOT )) && filt="not"
+      list_all "$CATEGORY" "$filt" "$LIKE" "$REGEX" "$LIMIT"
+      ;;
+
+    search)
+      local term=""
+      while (( $# )); do
+        case "$1" in
+          --field=*) FIELD="${1#*=}" ;;
+          --regex) REGEX=1 ;;
+          --limit=*) LIMIT="${1#*=}" ;;
+          -h|--help|help) usage; exit 0 ;;
+          *) [[ -z "$term" ]] && term="$1" || usage ;;
+        esac; shift || true
+      done
+      [[ -n "$term" ]] || { usage; exit 1; }
+      search_pkgs "$term" "$FIELD" "$REGEX" "$LIMIT"
+      ;;
+
+    files)
+      local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+      print_files "$name"
+      ;;
+
+    owns)
+      local fpath="${1:-}"; [[ -n "$fpath" ]] || { usage; exit 1; }
+      who_owns "$fpath" || exit 50
+      ;;
+
+    provides)
+      local glob="${1:-}"; shift || true
+      while (( $# )); do
+        case "$1" in
+          --dir=*) DIR_OVERRIDE="${1#*=}" ;;
+          -h|--help|help) usage; exit 0 ;;
+          *) usage; exit 1 ;;
+        esac; shift || true
+      done
+      [[ -n "$glob" ]] || { usage; exit 1; }
+      local dir="${DIR_OVERRIDE:-$ADM_PACKAGES}"
+      [[ -d "$dir" ]] || die "Diretório de pacotes inválido: $dir" 43
+      provides_glob_in_dir "$dir" "$glob"
+      ;;
+
+    deps)
+      local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+      print_deps "$name"
+      ;;
+
+    rdeps)
+      local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+      print_rdeps "$name"
+      ;;
+
+    versions)
+      local name="${1:-}"; [[ -n "$name" ]] || { usage; exit 1; }
+      local out; out="$(list_cache_versions "$name")"
+      [[ -n "$out" ]] && printf '%s\n' "$out" || { log_w "Sem versões no cache para $name"; exit 50; }
+      ;;
+  esac
+}
+
+main "$@"
