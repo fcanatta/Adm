@@ -1,0 +1,12 @@
+name=lvm2
+version=2.03.24
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Gerenciamento de volumes lógicos (LVM2) + device-mapper
+homepage=https://sourceware.org/lvm2/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://sourceware.org/ftp/lvm2/releases/LVM2.2.03.24.tgz
