@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"; mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+
+# LVM2 tem configure com muitas opções; aqui um mínimo funcional.
+conf=(
+  --prefix=/usr
+  --sbindir=/usr/bin
+  --with-confdir=/etc
+  --disable-static
+  --enable-applib
+  --enable-cmdlib
+  --enable-dmeventd
+  --with-udevdir=/lib/udev
+)
+"$ADM_WORK_DIR/configure" "${conf[@]}"
