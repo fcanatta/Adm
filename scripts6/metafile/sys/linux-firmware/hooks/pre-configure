@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# linux-firmware: pre-configure
+# (não há configure; apenas validamos diretórios e variáveis de filtro)
+set -Eeuo pipefail
+
+: "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
+
+# Opções de filtro (opcionais):
+#  - ADM_FIRMWARE_FILTER="amdgpu iwlwifi ath10k" (lista de dirs/padrões a incluir)
+#  - ADM_FIRMWARE_EXCLUDE="nvidia/* qcom/*"    (padrões a excluir)
+#  - ADM_FIRMWARE_KEEP_LICENSES=1 (default)    (mantém arquivos LICENSE*)
+#  - ADM_FIRMWARE_PRUNE_DOCS=1 (default)       (remove docs avulsos fora do /lib/firmware)
+: "${ADM_FIRMWARE_KEEP_LICENSES:=1}"
+: "${ADM_FIRMWARE_PRUNE_DOCS:=1}"
+
+# Salva parâmetros para próximos hooks
+export ADM_FIRMWARE_FILTER ADM_FIRMWARE_EXCLUDE ADM_FIRMWARE_KEEP_LICENSES ADM_FIRMWARE_PRUNE_DOCS
