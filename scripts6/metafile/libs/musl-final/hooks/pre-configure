@@ -1,9 +1,27 @@
 #!/usr/bin/env bash
+# musl-final: pre-configure — prepara build completo (headers + libc + ldso + crt)
 set -Eeuo pipefail
 : "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
-cd "$ADM_WORK_DIR"
-BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine || echo "$(uname -m)-pc-linux-gnu")}"
-HOST_TRIPLET="${HOST_TRIPLET:-$BUILD_TRIPLET}"
-export CC="${HOST_TRIPLET}-gcc"
-./configure --prefix=/usr
-mkdir -p "$ADM_BUILD_DIR"
+
+cd "${ADM_WORK_DIR}"
+
+# Detecta triplet/arch p/ cross quando TARGET_TRIPLET estiver definido
+BUILD_TRIPLET="${BUILD_TRIPLET:-$(gcc -dumpmachine 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")}"
+HOST_TRIPLET="${HOST_TRIPLET:-${TARGET_TRIPLET:-$BUILD_TRIPLET}}"
+
+# musl recomenda in-tree; mas cria BUILD_DIR para artefatos (logs etc.)
+mkdir -p "${ADM_BUILD_DIR}"
+
+# O musl instala o ldso em /lib por padrão. Garantimos isso com --syslibdir=/lib.
+# Para cross, usamos CC="<triplet>-gcc" automaticamente se disponível.
+if command -v "${HOST_TRIPLET}-gcc" >/dev/null 2>&1; then
+  export CC="${HOST_TRIPLET}-gcc"
+fi
+
+./configure \
+  --prefix=/usr \
+  --syslibdir=/lib \
+  --target="${HOST_TRIPLET}" || {
+    # Fallback sem --target (versões antigas aceitam só CC=triplet-gcc)
+    ./configure --prefix=/usr --syslibdir=/lib
+}
