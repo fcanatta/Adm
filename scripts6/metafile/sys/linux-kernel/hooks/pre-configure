@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# linux-kernel: pre-configure
-# - Seleciona ARCH/CROSS_COMPILE se TARGET_TRIPLET estiver definido
-# - Usa .config fornecido (ADM_KERNEL_CONFIG ou arquivo "config" no source) OU gera defconfig
-# - Força olddefconfig para completar opções
+# linux-kernel: pre-configure (atualizado)
+# - Seleciona ARCH/CROSS_COMPILE a partir do TARGET_TRIPLET (se houver)
+# - Prioridade do .config:
+#   1) ADM_KERNEL_CONFIG (variável de ambiente)
+#   2) /usr/src/adm/state/kernel-config.current (se apontar p/ arquivo válido)
+#   3) arquivo "config" no diretório do source
+#   4) defconfig
+# - Sempre roda olddefconfig no final para preencher opções novas
+
 set -Eeuo pipefail
 
 : "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
 
 cd "${ADM_WORK_DIR}"
 
-# Detecta ARCH/CROSS_COMPILE a partir do TARGET_TRIPLET (heurística simples)
+# ---------------- ARCH / CROSS_COMPILE ----------------
 ARCH="${ARCH:-}"
 if [ -z "$ARCH" ] && [ -n "${TARGET_TRIPLET:-}" ]; then
   case "$TARGET_TRIPLET" in
@@ -32,23 +37,30 @@ fi
 
 export ARCH CROSS_COMPILE
 
-# Cria dir de build out-of-tree (suportado por kernel com O=)
+# ---------------- Diretório de build (O=) ----------------
 mkdir -p "${ADM_BUILD_DIR}"
 
-# Escolha de .config:
-# 1) Caminho externo via ADM_KERNEL_CONFIG
-# 2) Arquivo "config" dentro da árvore de sources
-# 3) Caso contrário, defconfig padrão da ARCH
-if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "${ADM_KERNEL_CONFIG}" ]; then
-  cp -f "${ADM_KERNEL_CONFIG}" "${ADM_BUILD_DIR}/.config"
-elif [ -f "${ADM_WORK_DIR}/config" ]; then
-  cp -f "${ADM_WORK_DIR}/config" "${ADM_BUILD_DIR}/.config"
+# ---------------- Seleção do .config ----------------
+# Preferência a partir do estado, se ADM_KERNEL_CONFIG não vier do ambiente
+if [ -z "${ADM_KERNEL_CONFIG:-}" ]; then
+  if [ -f "/usr/src/adm/state/kernel-config.current" ]; then
+    CAND="$(cat /usr/src/adm/state/kernel-config.current || true)"
+    if [ -n "$CAND" ] && [ -f "$CAND" ]; then
+      ADM_KERNEL_CONFIG="$CAND"
+    fi
+  fi
 fi
 
-# Se ainda não temos .config, roda defconfig
-if [ ! -f "${ADM_BUILD_DIR}/.config" ]; then
+# 1) ADM_KERNEL_CONFIG definido e existente → usar
+if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "${ADM_KERNEL_CONFIG}" ]; then
+  cp -f "${ADM_KERNEL_CONFIG}" "${ADM_BUILD_DIR}/.config"
+# 2) Arquivo "config" dentro do source → usar
+elif [ -f "${ADM_WORK_DIR}/config" ]; then
+  cp -f "${ADM_WORK_DIR}/config" "${ADM_BUILD_DIR}/.config"
+# 3) Senão, gerar defconfig
+else
   make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
 fi
 
-# Completa opções novas sem interação
+# Completar opções novas sem interação
 make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
