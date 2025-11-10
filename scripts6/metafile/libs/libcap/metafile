@@ -1,0 +1,12 @@
+name=libcap
+version=2.70
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Suporte a capabilities no Linux (biblioteca + tools)
+homepage=https://sites.google.com/site/fullycapable/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.70.tar.xz
