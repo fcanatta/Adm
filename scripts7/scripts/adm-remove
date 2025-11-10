@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-remove
+# Remove pacotes ADM previamente instalados (registrados no DB), com:
+# - validação de dependentes (reverse-deps);
+# - ordem correta (dependentes → dependências) com camadas paralelas;
+# - hooks de repo (pre/post-remove);
+# - purge (dirs vazios), dry-run, cascade, force;
+# - atualização do DB (by-file.map / installed / reverse).
+#
+# Exit codes:
+#  0  ok (todas remoções realizadas)
+#  1  uso/args
+# 20  ambiente inválido (ferramentas/paths)
+# 43  IO/perm (não conseguiu apagar/atualizar índices)
+# 60  bloqueado por dependentes (sem --cascade/--force)
+# 61  ciclo detectado no grafo de dependentes
+# 70  pacote não instalado / inexistente
+# 71  falha de hook (pre/post), não fatal por padrão (warning)
+
+set -Eeuo pipefail
+umask 022
+
+# -----------------------------------------------------------------------------
+# Caminhos / Integrações
+# -----------------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+
+mkdir -p "$ADM_DB"/{installed,reverse} "$ADM_LOGS" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# -----------------------------------------------------------------------------
+# Helpers / DB paths
+# -----------------------------------------------------------------------------
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+csv_join(){ local IFS=,; printf '%s' "$*"; }
+csv_unique_sorted(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a A <<< "$s"; IFS=$'\n' read -r -d '' out < <(printf '%s\n' "${A[@]}" | sed '/^$/d' | LC_ALL=C sort -u && printf '\0') || true; printf '%s' "$(paste -sd, <<< "$out")"; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+
+DB_INSTALLED_DIR="$ADM_DB/installed"
+DB_REVERSE_DIR="$ADM_DB/reverse"
+DB_BY_FILE="$ADM_DB/by-file.map"    # formato: "/path fileowner"
+
+installed_meta(){ printf '%s/%s.meta' "$DB_INSTALLED_DIR" "$1"; }
+installed_files(){ printf '%s/%s.files' "$DB_INSTALLED_DIR" "$1"; }
+reverse_file(){ printf '%s/%s.rdeps' "$DB_REVERSE_DIR" "$1"; }
+
+is_installed(){ [[ -f "$(installed_meta "$1")" ]]; }
+
+# -----------------------------------------------------------------------------
+# Opções / Default flags
+# -----------------------------------------------------------------------------
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+DO_DRYRUN=0
+DO_CASCADE=0
+DO_FORCE=0
+DO_PURGE=0
+NO_PRUNE=0
+
+# Pacotes protegidos por padrão (precisam de --force para remover)
+PROTECTED_DEFAULT="musl,glibc,busybox,coreutils,bash,sh,adm,adm-io,adm-install,adm-remove,adm-package,adm-constructor,adm-detect,adm-resolver,adm-extract,adm-fetch,adm-meta,adm-paths"
+
+is_protected(){
+  local name="$1"; local list="${PROTECTED:-$PROTECTED_DEFAULT}"; list="$(csv_norm "$list")"
+  csv_to_arr "$list"
+  for p in "${_ARR[@]}"; do [[ "$name" == "$p" ]] && return 0; done
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Hooks do repositório (aproveita a estrutura dos fontes)
+# -----------------------------------------------------------------------------
+run_repo_hook_if_exists(){
+  local name="$1" hook="$2"
+  [[ -x "$ADM_META" ]] || return 0
+  # encontra metafile pelo nome
+  local mf
+  mf="$(find "$ADM_METAFILES" -type f -name metafile -exec awk -F= '/^name=/{print FILENAME ":" $2}' {} + 2>/dev/null | awk -F: -v n="$name" '$2==n{print $1;exit}' || true)"
+  [[ -n "$mf" ]] || return 0
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$mf")" || return 0
+  local h="$ADM_HOOKS_DIR/$hook"
+  [[ -x "$h" ]] || return 0
+  log_i "Hook (repo) $hook" package="$name"
+  # Exporta contexto mínimo
+  export ADM_NAME="$name" ADM_VERSION="$ADM_VERSION" ADM_WORKDIR="/" ADM_DESTDIR="/" ADM_PROFILE="" LIBC_TARGET=""
+  "$h" || { log_w "Hook $hook retornou erro"; return 71; }
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Carregar dependências (run_deps) e dependentes (reverse) do BD
+# -----------------------------------------------------------------------------
+get_run_deps(){
+  local name="$1"
+  awk -F= '/^run_deps=/{print $2}' "$(installed_meta "$name")" 2>/dev/null || true
+}
+get_rdeps_list(){
+  local name="$1"
+  if [[ -f "$(reverse_file "$name")" ]]; then
+    awk '{print $1}' "$(reverse_file "$name")" 2>/dev/null | sed '/^$/d' | sort -u
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Coletar alvo(s) e validar estado
+# -----------------------------------------------------------------------------
+collect_targets(){
+  local list_csv="$1"
+  csv_to_arr "$list_csv"
+  local missing=()
+  local t
+  for t in "${_ARR[@]}"; do
+    [[ -z "$t" ]] && continue
+    if ! is_installed "$t"; then
+      missing+=("$t")
+    fi
+  done
+  if ((${#missing[@]})); then
+    log_e "Pacote(s) não instalado(s)" names="$(csv_join "${missing[@]}")"
+    return 70
+  fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Fecho (cascade) ou verificação de bloqueio por dependentes
+# -----------------------------------------------------------------------------
+# Dirigimos pelo grafo de "dependentes": A → (quem depende de A)
+declare -A RDEPS=()   # name -> csv de dependentes
+load_reverse_graph(){
+  # inicializa RDEPS com base em reverse/*.rdeps
+  while IFS= read -r -d '' f; do
+    local n; n="$(basename "$f" .rdeps)"
+    local deps; deps="$(awk '{print $1}' "$f" 2>/dev/null | sed '/^$/d' | paste -sd, - || true)"
+    RDEPS["$n"]="$(csv_norm "$deps")"
+  done < <(find "$DB_REVERSE_DIR" -type f -name '*.rdeps' -print0 2>/dev/null || true)
+}
+
+# retorna fecho de dependentes (todos que precisam de qualquer item do conjunto)
+closure_dependents(){
+  local seeds_csv="$1"
+  csv_to_arr "$seeds_csv"; local queue=( "${_ARR[@]}" )
+  declare -A seen=(); local out=()
+  local i=0
+  while (( i < ${#queue[@]} )); do
+    local n="${queue[$i]}"; ((i++))
+    [[ -z "$n" ]] && continue
+    if [[ -z "${seen[$n]+x}" ]]; then
+      seen["$n"]=1
+      out+=("$n")
+      csv_to_arr "${RDEPS[$n]:-}"
+      local d
+      for d in "${_ARR[@]}"; do
+        [[ -z "$d" ]] && continue
+        queue+=("$d")
+      done
+    fi
+  done
+  csv_join "${out[@]}"
+}
+
+# Se não for cascade/force, checa dependentes e bloqueia se houver
+block_if_has_dependents(){
+  local seeds_csv="$1"
+  local clos; clos="$(closure_dependents "$seeds_csv")"
+  csv_to_arr "$clos"
+  # remove as próprias seeds; se sobrar alguém → bloqueia
+  local seeds_norm; seeds_norm="$(csv_norm "$seeds_csv")"
+  local others=()
+  local x
+  for x in "${_ARR[@]}"; do
+    [[ -z "$x" ]] && continue
+    [[ ",$seeds_norm," == *",$x,"* ]] && continue
+    others+=("$x")
+  done
+  if ((${#others[@]})); then
+    log_e "Há pacotes que dependem do(s) alvo(s)" rdeps="$(csv_join "${others[@]}")"
+    return 60
+  fi
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Ordenação de remoção (dependentes primeiro) em camadas
+# -----------------------------------------------------------------------------
+# Monta subgrafo apenas com os nós que serão removidos (closure de dependentes)
+toposort_dependents_layers(){
+  local remove_set_csv="$1"
+  # Construir indegree em relação a RDEPS, mas restrito ao conjunto
+  csv_to_arr "$remove_set_csv"; local NODES=( "${_ARR[@]}" )
+  declare -A mark=()
+  local n; for n in "${NODES[@]}"; do mark["$n"]=1; done
+
+  declare -A indeg=(); declare -A edges=()
+  for n in "${NODES[@]}"; do
+    # edges: n -> dependentes de n (no subgrafo)
+    local e=""
+    csv_to_arr "${RDEPS[$n]:-}"
+    local d
+    for d in "${_ARR[@]}"; do
+      [[ -n "${mark[$d]+x}" ]] && e="${e}${e:+,}$d"
+    done
+    edges["$n"]="$(csv_norm "$e")"
+  done
+  for n in "${NODES[@]}"; do indeg["$n"]=0; done
+  for n in "${NODES[@]}"; do
+    csv_to_arr "${edges[$n]}"
+    local d
+    for d in "${_ARR[@]}"; do
+      [[ -z "$d" ]] && continue
+      indeg["$d"]=$(( indeg["$d"] + 1 ))
+    done
+  done
+
+  local layers=()
+  while :; do
+    local L=()
+    for n in "${NODES[@]}"; do
+      [[ "${indeg[$n]+x}" ]] || continue
+      (( indeg["$n"] == 0 )) && L+=("$n")
+    done
+    ((${#L[@]}==0)) && break
+    layers+=("$(csv_join "${L[@]}")")
+    for n in "${L[@]}"; do
+      unset 'indeg[$n]'
+      csv_to_arr "${edges[$n]}"
+      local d
+      for d in "${_ARR[@]}"; do
+        [[ -z "$d" ]] && continue
+        (( indeg["$d"] > 0 )) && indeg["$d"]=$(( indeg["$d"] - 1 ))
+      done
+    done
+  done
+
+  # Se sobrou indegree → ciclo
+  for k in "${!indeg[@]}"; do
+    log_e "Ciclo detectado envolvendo '$k'"
+    return 61
+  done
+
+  # Camadas separadas por ';' (cada camada = CSV)
+  local out=""; local i
+  for ((i=0;i<${#layers[@]};i++)); do
+    out+="${i>0?';':''}${layers[$i]}"
+  done
+  echo "$out"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Remoção de arquivos / diretórios
+# -----------------------------------------------------------------------------
+safe_remove_file(){
+  local f="$1"
+  if (( DO_DRYRUN )); then
+    log_i "[dry-run] remove file: $f"
+    return 0
+  fi
+  rm -f -- "$f" 2>/dev/null || return 1
+  return 0
+}
+
+prune_empty_dirs(){
+  local path="$1"
+  (( NO_PRUNE )) && return 0
+  # sobe até / removendo diretórios vazios não essenciais
+  local d; d="$(dirname -- "$path")"
+  while [[ "$d" != "/" && "$d" != "." ]]; do
+    rmdir "$d" 2>/dev/null || break
+    d="$(dirname -- "$d")"
+  done
+  return 0
+}
+
+remove_manifest_files(){
+  local name="$1" manifest="$2" failed=0
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local abs="/${rel#./}"
+    if [[ -e "$abs" || -L "$abs" ]]; then
+      if ! safe_remove_file "$abs"; then
+        log_w "Falha ao remover" file="$abs"
+        failed=1
+      else
+        (( DO_PURGE )) && prune_empty_dirs "$abs" || true
+      fi
+    fi
+  done < "$manifest"
+  (( failed == 0 ))
+}
+
+# -----------------------------------------------------------------------------
+# Atualização dos índices do DB após remoção
+# -----------------------------------------------------------------------------
+db_remove_package_indices(){
+  local name="$1"
+  local meta="$(installed_meta "$name")"
+  local files="$(installed_files "$name")"
+
+  # 1) remove entradas de by-file.map pertencentes ao pacote
+  if [[ -f "$DB_BY_FILE" && -f "$files" ]]; then
+    if (( DO_DRYRUN )); then
+      log_i "[dry-run] atualizar índice: $DB_BY_FILE (- $name)"
+    else
+      # cria mapa filtrado
+      grep -vE "^[[:space:]]*/.*[[:space:]]+$name$" "$DB_BY_FILE" > "$DB_BY_FILE.tmp.$$" 2>/dev/null || true
+      mv -f "$DB_BY_FILE.tmp.$$" "$DB_BY_FILE" 2>/dev/null || true
+    fi
+  fi
+
+  # 2) remove referências reverse dos deps (para cada dep, tirar 'name' do arquivo reverse/dep.rdeps)
+  local deps; deps="$(awk -F= '/^run_deps=/{print $2}' "$meta" 2>/dev/null || true)"
+  csv_to_arr "$deps"
+  local d
+  for d in "${_ARR[@]}"; do
+    [[ -z "$d" ]] && continue
+    local rf; rf="$(reverse_file "$d")"
+    if [[ -f "$rf" ]]; then
+      if (( DO_DRYRUN )); then
+        log_i "[dry-run] atualizar reverse: $rf (- $name)"
+      else
+        grep -v -Fx "$name" "$rf" > "$rf.tmp.$$" 2>/dev/null || true
+        mv -f "$rf.tmp.$$" "$rf" 2>/dev/null || true
+      fi
+    fi
+  done
+
+  # 3) apaga reverse/<name>.rdeps
+  if (( DO_DRYRUN )); then
+    log_i "[dry-run] remover reverse: $(reverse_file "$name")"
+  else
+    rm -f -- "$(reverse_file "$name")" 2>/dev/null || true
+  fi
+
+  # 4) apaga installed/*.meta|*.files
+  if (( DO_DRYRUN )); then
+    log_i "[dry-run] remover meta/files de $name"
+  else
+    rm -f -- "$meta" "$files" 2>/dev/null || true
+  fi
+}
+# -----------------------------------------------------------------------------
+# Remoção de um pacote (com hooks e atualização do DB)
+# -----------------------------------------------------------------------------
+remove_one_package(){
+  local name="$1"
+  [[ -f "$(installed_meta "$name")" && -f "$(installed_files "$name")" ]] || { log_e "Pacote não instalado: $name"; return 70; }
+
+  # proteção
+  if (( DO_FORCE == 0 )); then
+    if is_protected "$name"; then
+      log_e "Pacote protegido: $name (use --force)"
+      return 60
+    fi
+  fi
+
+  # hooks
+  run_repo_hook_if_exists "$name" "pre-remove" || true
+
+  # remover arquivos
+  local man; man="$(installed_files "$name")"
+  if ! remove_manifest_files "$name" "$man"; then
+    log_w "Alguns arquivos não puderam ser removidos" package="$name"
+  fi
+
+  # atualizar DB
+  db_remove_package_indices "$name"
+
+  # hook pós
+  run_repo_hook_if_exists "$name" "post-remove" || true
+
+  log_o "Removido" name="$name"
+  REMOVED+=("$name")
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Orfãos: pacotes sem dependentes após a operação
+# -----------------------------------------------------------------------------
+find_orphans(){
+  # Um órfão: instalado, e reverse/<name>.rdeps vazio/inexistente
+  local orf=()
+  while IFS= read -r -d '' meta; do
+    local n; n="$(basename "$meta" .meta)"
+    local rf; rf="$(reverse_file "$n")"
+    local has=0
+    [[ -s "$rf" ]] && has=1
+    (( has == 0 )) && orf+=("$n")
+  done < <(find "$DB_INSTALLED_DIR" -type f -name '*.meta' -print0 2>/dev/null || true)
+  printf '%s' "$(csv_join "${orf[@]}")"
+}
+
+# -----------------------------------------------------------------------------
+# Execução paralela por camadas
+# -----------------------------------------------------------------------------
+run_remove_layer(){
+  local names_csv="$1"
+  csv_to_arr "$names_csv"
+  local -a PIDS=() ; local -A NAM=()
+  local n
+  for n in "${_ARR[@]}"; do
+    (
+      remove_one_package "$n" || echo $? > "$ADM_LOGS/remove.$$.rc.$n"
+    ) &
+    PIDS+=("$!"); NAM["$!"]="$n"
+  done
+  local any_fail=0
+  local pid
+  for pid in "${PIDS[@]}"; do
+    wait "$pid" || true
+    local rcfile="$ADM_LOGS/remove.$$.rc.${NAM[$pid]}"
+    if [[ -f "$rcfile" ]]; then
+      any_fail=1
+      local code; code="$(cat "$rcfile")"
+      rm -f "$rcfile"
+      log_e "Falha ao remover ${NAM[$pid]}" rc="$code"
+      FAILED+=("${NAM[$pid]}")
+    fi
+  done
+  (( any_fail == 0 ))
+}
+
+# -----------------------------------------------------------------------------
+# Pipeline principal de remoção
+# -----------------------------------------------------------------------------
+do_remove_pipeline(){
+  local targets_csv="$1"
+
+  section "Carregando reverse-deps"
+  load_reverse_graph
+
+  # bloqueia se houver dependentes (não removidos) e não for cascade/force
+  if (( DO_CASCADE == 0 && DO_FORCE == 0 )); then
+    block_if_has_dependents "$targets_csv" || return 60
+  fi
+
+  # conjunto a remover:
+  # - se cascade/force: closure de dependentes + as próprias targets
+  # - se seguro: apenas as targets
+  local remove_set_csv
+  if (( DO_CASCADE || DO_FORCE )); then
+    remove_set_csv="$(closure_dependents "$targets_csv")"
+  else
+    remove_set_csv="$(csv_norm "$targets_csv")"
+  fi
+
+  # ordena por camadas: dependentes → deps
+  local layers; layers="$(toposort_dependents_layers "$remove_set_csv")" || return 61
+
+  # executa camadas
+  local IFS=';'; read -r -a LAY <<< "$layers"
+  local idx=0
+  for layer_csv in "${LAY[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    section "Removendo camada $idx" pkgs="$layer_csv"
+    run_remove_layer "$layer_csv" || true
+    ((idx++))
+  done
+
+  # pós: orfãos (apenas relatório)
+  local orf; orf="$(find_orphans)"
+  ORPHANS_SET="$(csv_unique_sorted "$orf")"
+}
+
+# -----------------------------------------------------------------------------
+# Ambiente / Validação
+# -----------------------------------------------------------------------------
+validate_env(){
+  [[ -d "$DB_INSTALLED_DIR" ]] || { log_w "DB instalado vazio: $DB_INSTALLED_DIR"; }
+  [[ -d "$DB_REVERSE_DIR"   ]] || mkdir -p "$DB_REVERSE_DIR" || { log_e "Falha criar $DB_REVERSE_DIR"; exit 43; }
+  [[ -x "$ADM_META" ]] || log_w "adm-meta ausente (hooks podem ser ignorados)"
+}
+
+# -----------------------------------------------------------------------------
+# CLI / Dispatcher
+# -----------------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-remove — remove pacotes instalados, com verificação de dependentes, hooks e atualização de índices.
+
+Uso:
+  adm-remove <pkg1>[,<pkg2>...] [opções]
+  adm-remove --file=/caminho/lista.txt           # um nome por linha
+
+Opções:
+  --cascade     Remove também dependentes (fecho por reverse-deps)
+  --force       Ignora dependentes e proteção (cuidado!)
+  --purge       Após remover arquivos, tenta limpar diretórios vazios
+  --no-prune    Não remove diretórios vazios (desativa o purge de diretórios)
+  --dry-run     Apenas simula (não apaga nada)
+  --jobs=N      Paralelismo por camada (default = nproc)
+  --protect=a,b Lista adicional de protegidos (além do padrão)
+  --unprotect   Não usa a lista padrão de protegidos (apenas os de --protect)
+
+Saída (KEY=VAL):
+  REMOVED_SET=pkg1,pkg2,...
+  SKIPPED_SET=pkgX,...
+  FAILED_SET=pkgY,...
+  ORPHANS_SET=pkgZ,...
+
+Exit codes:
+  0 ok; 1 uso; 20 env; 43 IO; 60 bloqueado; 61 ciclo; 70 inexistente; 71 hook
+USAGE
+}
+
+declare -a REMOVED=()
+declare -a SKIPPED=()
+declare -a FAILED=()
+ORPHANS_SET=""
+
+main(){
+  validate_env
+
+  local NAMES_CSV="" LIST_FILE=""
+  PROTECTED="$PROTECTED_DEFAULT"
+
+  # parse args
+  while (( $# )); do
+    case "$1" in
+      --file=*) LIST_FILE="${1#*=}" ;;
+      --cascade) DO_CASCADE=1 ;;
+      --force) DO_FORCE=1 ;;
+      --purge) DO_PURGE=1 ;;
+      --no-prune) NO_PRUNE=1 ;;
+      --dry-run) DO_DRYRUN=1 ;;
+      --jobs=*) JOBS="${1#*=}" ;;
+      --protect=*) PROTECTED="$(csv_unique_sorted "${PROTECTED},${1#*=}")" ;;
+      --unprotect) PROTECTED="" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *,*) NAMES_CSV="$(csv_unique_sorted "${NAMES_CSV},${1}")" ;;
+      *) NAMES_CSV="$(csv_unique_sorted "${NAMES_CSV},${1}")" ;;
+    esac
+    shift || true
+  done
+
+  if [[ -n "$LIST_FILE" ]]; then
+    [[ -f "$LIST_FILE" ]] || { log_e "Arquivo de lista não existe: $LIST_FILE"; exit 1; }
+    local names; names="$(sed 's/#.*//' "$LIST_FILE" | sed '/^[[:space:]]*$/d' | tr '\n' ',' | sed 's/,$//' )"
+    NAMES_CSV="$(csv_unique_sorted "${NAMES_CSV},${names}")"
+  fi
+
+  [[ -n "$NAMES_CSV" ]] || { usage; exit 1; }
+
+  section "Preparando remoção" targets="$NAMES_CSV"
+  collect_targets "$NAMES_CSV" || { rc=$?; ((rc==70)) && exit 70 || exit 1; }
+
+  do_remove_pipeline "$NAMES_CSV" || { rc=$?; exit "$rc"; }
+
+  # saída machine-readable
+  printf 'REMOVED_SET=%s\n'  "$(csv_unique_sorted "$(csv_join "${REMOVED[@]}")")"
+  printf 'SKIPPED_SET=%s\n'  "$(csv_unique_sorted "$(csv_join "${SKIPPED[@]}")")"
+  printf 'FAILED_SET=%s\n'   "$(csv_unique_sorted "$(csv_join "${FAILED[@]}")")"
+  printf 'ORPHANS_SET=%s\n'  "$ORPHANS_SET"
+
+  # resumo
+  log_o "Resumo" removed="$(csv_unique_sorted "$(csv_join "${REMOVED[@]}")")"
+  [[ -n "${FAILED[*]:-}" ]] && log_w "Falharam" failed="$(csv_unique_sorted "$(csv_join "${FAILED[@]}")")"
+  [[ -n "$ORPHANS_SET" ]] && log_i "Órfãos" orphans="$ORPHANS_SET"
+
+  exit 0
+}
+
+main "$@"
