@@ -1,0 +1,18 @@
+# 1) Empacotar do DESTDIR (padrão usado pelo adm-constructor):
+/usr/src/adm/scripts/adm-package /usr/src/adm/metafiles/apps/busybox/metafile \
+  --destdir=/usr/src/adm/destdir/busybox-1.36.0 --format=zst
+
+# 2) Reempacotar de um diretório já pronto (sem recompilar):
+/usr/src/adm/scripts/adm-package --repack-dir=/tmp/mydest \
+  --metafile=/usr/src/adm/metafiles/apps/busybox/metafile --format=xz
+
+# 3) Converter .deb → ADM:
+ /usr/src/adm/scripts/adm-package --from-deb=./htop_3.3.0-1_amd64.deb --format=zst \
+  --name=htop --version=3.3.0 --release=1 --arch=x86_64 --libc=glibc
+
+# 4) Converter .rpm → ADM:
+ /usr/src/adm/scripts/adm-package --from-rpm=./ripgrep-14.0.3-1.x86_64.rpm --format=xz \
+  --name=ripgrep --version=14.0.3 --release=1 --arch=x86_64 --libc=musl
+
+# 5) Reempacotar um ADM para outro formato:
+ /usr/src/adm/scripts/adm-package --repack-adm=/usr/src/adm/packages/foo-1.0-1-x86_64-musl.tar.zst --format=xz
