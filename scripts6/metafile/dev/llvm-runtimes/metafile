@@ -1,0 +1,12 @@
+name=llvm-runtimes
+version=18.1.8
+category=dev
+run_deps=
+build_deps=llvm-project,cmake,ninja
+opt_deps=
+num_builds=0
+description=LLVM runtimes: compiler-rt, libc++, libc++abi, libunwind
+homepage=https://llvm.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.tar.gz
