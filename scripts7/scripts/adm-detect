@@ -1,0 +1,453 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-detect
+# Detecção de build system, linguagens, compiladores, linkers, libc, toolchain,
+# arquitetura, cross, docs e deps heurísticas a partir do SRC_DIR (work/src).
+#
+# Exit codes:
+#  0  ok (detecção sólida)
+# 20  ambiente inválido (adm-meta ausente, etc.)
+# 43  erro de IO/caminhos
+# 50  nada detectado
+# 51  detecção parcial (achou algo, mas com lacunas)
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+
+ADM_IO="${ADM_IO:-$ADM_ROOT/scripts/adm-io}"
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+ADM_META="${ADM_META:-$ADM_ROOT/scripts/adm-meta}"
+[[ -x "$ADM_META" ]] || { log_e "adm-meta não encontrado/executável: $ADM_META"; exit 20; }
+
+# Pode herdar perfil para obter LIBC_TARGET/TOOLCHAIN_TARGET
+PROFILE_ENV="$ADM_STATE/profile.env"
+if [[ -f "$PROFILE_ENV" ]]; then
+  # shellcheck disable=SC1090
+  source "$PROFILE_ENV" || true
+fi
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+lower(){ tr '[:upper:]' '[:lower:]'; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+csv_add_unique(){
+  # csv_add_unique "a,b" "c a b" -> "a,b,c"
+  local base="${1//[[:space:]]/}"; shift
+  local add="$*"
+  local IFS=,; read -r -a A <<< "${base#,}"
+  declare -A seen=(); local out=()
+  for x in "${A[@]}"; do [[ -z "$x" ]] && continue; seen[$x]=1; out+=("$x"); done
+  for x in $add; do [[ -z "$x" ]] && continue; [[ -n "${seen[$x]+x}" ]] && continue; seen[$x]=1; out+=("$x"); done
+  (IFS=,; printf '%s' "${out[*]}")
+}
+csv_sort(){
+  local s="${1//[[:space:]]/}"; s="${s#,}"; s="${s%,}"
+  IFS=, read -r -a A <<< "$s"
+  IFS=$'\n' read -r -d '' sorted < <(printf '%s\n' "${A[@]}" | LC_ALL=C sort -u && printf '\0') || true
+  printf '%s' "$(paste -sd, <<< "$sorted")"
+}
+emit(){ printf '%s=%s\n' "$1" "$2"; }
+
+safe_cd(){ cd "$1" 2>/dev/null || { log_e "Não foi possível acessar: $1"; exit 43; }; }
+
+# -----------------------------------------------------------------------------
+# Host/toolchain/libc/arch/cross
+# -----------------------------------------------------------------------------
+detect_arch(){
+  uname -m 2>/dev/null || echo unknown
+}
+detect_libc(){
+  if exists ldd; then
+    if ldd --version 2>&1 | grep -qi musl; then echo musl; return; fi
+    if ldd --version 2>&1 | grep -qi 'gnu libc\|glibc'; then echo glibc; return; fi
+  fi
+  echo "${LIBC_TARGET:-unknown}"
+}
+detect_toolchain_host(){
+  local has_gcc=0 has_clang=0
+  exists gcc && has_gcc=1
+  exists clang && has_clang=1
+  if ((has_gcc && has_clang)); then echo both; return; fi
+  ((has_gcc)) && { echo gcc; return; }
+  ((has_clang)) && { echo clang; return; }
+  echo none
+}
+guess_host_triple(){
+  # tenta via gcc/clang -dumpmachine; fallback por uname/libc
+  local t
+  if exists "${TOOLCHAIN_TARGET:-gcc}"; then
+    t="$(${TOOLCHAIN_TARGET:-gcc} -dumpmachine 2>/dev/null || true)"
+  elif exists gcc; then
+    t="$(gcc -dumpmachine 2>/dev/null || true)"
+  elif exists clang; then
+    t="$(clang -dumpmachine 2>/dev/null || true)"
+  fi
+  [[ -n "$t" ]] && { echo "$t"; return; }
+  local arch; arch="$(detect_arch)"
+  local libc; libc="$(detect_libc)"
+  case "$libc" in
+    musl) echo "${arch}-linux-musl" ;;
+    glibc) echo "${arch}-linux-gnu" ;;
+    *) echo "${arch}-unknown-linux" ;;
+  esac
+}
+detect_target_from_env(){
+  # olha variáveis comuns de cross
+  local t="${TARGET:-${CHOST:-${CTARGET:-}}}"
+  [[ -n "$t" ]] && { echo "$t"; return; }
+  # tenta CC/CXX com prefixo
+  if [[ -n "${CC:-}" ]]; then
+    # p.ex. aarch64-linux-musl-gcc
+    if [[ "$CC" =~ ([a-z0-9_.+-]+)-(gcc|clang)$ ]]; then
+      echo "${BASH_REMATCH[1]}"
+      return
+    fi
+  fi
+  echo ""
+}
+is_cross(){
+  local host="$1" tgt="$2"
+  [[ -n "$tgt" && "$host" != "$tgt" ]] && echo 1 || echo 0
+}
+
+# -----------------------------------------------------------------------------
+# Fonte/Contexto (metafile e SRC_DIR)
+# -----------------------------------------------------------------------------
+NAME=""; VERSION=""; META_DIR=""; HOOKS_DIR=""
+SRC_DIR=""   # alvo principal para análise
+
+load_meta(){
+  local metaf="$1"
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")"
+  NAME="$ADM_NAME"; VERSION="$ADM_VERSION"; META_DIR="$ADM_META_DIR"; HOOKS_DIR="$ADM_HOOKS_DIR"
+}
+
+resolve_srcdir(){
+  local d="$ADM_WORK/${NAME}-${VERSION}/src"
+  [[ -d "$d" ]] && { SRC_DIR="$d"; return; }
+  # fallback: SRC_DIR passado por env
+  if [[ -n "${ADM_WORKDIR:-}" && -d "$ADM_WORKDIR" ]]; then SRC_DIR="$ADM_WORKDIR"; return; fi
+  # tentativa genérica: work/*/src mais recente
+  local g; g="$(ls -1dt "$ADM_WORK"/*/src 2>/dev/null | head -n1 || true)"
+  [[ -d "$g" ]] && { SRC_DIR="$g"; return; }
+  log_e "SRC_DIR não encontrado: $d"; exit 43
+}
+
+# -----------------------------------------------------------------------------
+# Scanners de build system / linguagens / deps
+# -----------------------------------------------------------------------------
+have_file(){ [[ -f "$1" ]]; }
+any_file(){ local p="$1"; compgen -G "$p" >/dev/null 2>&1; }
+
+detect_build_systems(){
+  local sys=""
+  # sinais fortes
+  any_file "$SRC_DIR/configure.ac"    && sys="$(csv_add_unique "$sys" autotools)"
+  any_file "$SRC_DIR/configure.in"    && sys="$(csv_add_unique "$sys" autotools)"
+  any_file "$SRC_DIR/Makefile.am"     && sys="$(csv_add_unique "$sys" autotools)"
+  any_file "$SRC_DIR/CMakeLists.txt"  && sys="$(csv_add_unique "$sys" cmake)"
+  any_file "$SRC_DIR/meson.build"     && sys="$(csv_add_unique "$sys" meson)"
+  any_file "$SRC_DIR/meson_options.txt" && sys="$(csv_add_unique "$sys" meson)"
+  any_file "$SRC_DIR/Makefile"        && sys="$(csv_add_unique "$sys" make)"
+  any_file "$SRC_DIR/GNUmakefile"     && sys="$(csv_add_unique "$sys" make)"
+  any_file "$SRC_DIR/build.ninja"     && sys="$(csv_add_unique "$sys" ninja)"
+  any_file "$SRC_DIR/Kbuild"          && sys="$(csv_add_unique "$sys" kbuild)"
+  any_file "$SRC_DIR/Makefile" && grep -qE '^\s*obj-(y|m)\s*[:+]?=' "$SRC_DIR/Makefile" 2>/dev/null && sys="$(csv_add_unique "$sys" kbuild)"
+  # linguagens que implicam sistema
+  any_file "$SRC_DIR/Cargo.toml"      && sys="$(csv_add_unique "$sys" cargo)"
+  any_file "$SRC_DIR/go.mod"          && sys="$(csv_add_unique "$sys" go)"
+  any_file "$SRC_DIR/package.json"    && sys="$(csv_add_unique "$sys" node)"
+  any_file "$SRC_DIR/pyproject.toml"  && sys="$(csv_add_unique "$sys" pep517)"
+  any_file "$SRC_DIR/setup.py"        && sys="$(csv_add_unique "$sys" distutils)"
+  any_file "$SRC_DIR/build.gradle"    && sys="$(csv_add_unique "$sys" gradle)"
+  any_file "$SRC_DIR/pom.xml"         && sys="$(csv_add_unique "$sys" maven)"
+  echo "$(csv_sort "$sys")"
+}
+
+detect_langs(){
+  local langs=""
+  any_file "$SRC_DIR/*.[cC]"      && langs="$(csv_add_unique "$langs" c)"
+  any_file "$SRC_DIR/*.[cC][cCxX+]*" && langs="$(csv_add_unique "$langs" cpp)"
+  any_file "$SRC_DIR/*.[sS]"      && langs="$(csv_add_unique "$langs" asm)"
+  any_file "$SRC_DIR/*.rs"        && langs="$(csv_add_unique "$langs" rust)"
+  any_file "$SRC_DIR/*.go"        && langs="$(csv_add_unique "$langs" go)"
+  any_file "$SRC_DIR/*.py"        && langs="$(csv_add_unique "$langs" python)"
+  any_file "$SRC_DIR/package.json"&& langs="$(csv_add_unique "$langs" node)"
+  any_file "$SRC_DIR/*.pl"        && langs="$(csv_add_unique "$langs" perl)"
+  any_file "$SRC_DIR/*.lua"       && langs="$(csv_add_unique "$langs" lua)"
+  any_file "$SRC_DIR/src/main/java/**/*.java" && langs="$(csv_add_unique "$langs" java)"
+  any_file "$SRC_DIR/Makefile" && grep -qE '(^|\s)(obj-(y|m)|KBUILD_)' "$SRC_DIR/Makefile" 2>/dev/null && langs="$(csv_add_unique "$langs" kernel)"
+  echo "$(csv_sort "$langs")"
+}
+
+detect_docs(){
+  local docs=""
+  any_file "$SRC_DIR/Doxyfile"        && docs="$(csv_add_unique "$docs" doxygen)"
+  any_file "$SRC_DIR/docs/conf.py"    && docs="$(csv_add_unique "$docs" sphinx)"
+  any_file "$SRC_DIR/mkdocs.yml"      && docs="$(csv_add_unique "$docs" mkdocs)"
+  any_file "$SRC_DIR/*.1"             && docs="$(csv_add_unique "$docs" man)"
+  any_file "$SRC_DIR/*.md"            && docs="$(csv_add_unique "$docs" markdown)"
+  echo "$(csv_sort "$docs")"
+}
+
+detect_compilers(){
+  local comp=""
+  exists gcc   && comp="$(csv_add_unique "$comp" gcc)"
+  exists clang && comp="$(csv_add_unique "$comp" clang)"
+  exists zig   && comp="$(csv_add_unique "$comp" zig-cc)"
+  exists rustc && comp="$(csv_add_unique "$comp" rustc)"
+  exists go    && comp="$(csv_add_unique "$comp" go)"
+  exists javac && comp="$(csv_add_unique "$comp" javac)"
+  echo "$(csv_sort "$comp")"
+}
+
+detect_linkers(){
+  local l=""
+  # ld default
+  exists ld.bfd && l="$(csv_add_unique "$l" ld.bfd)"
+  exists ld.lld && l="$(csv_add_unique "$l" ld.lld)"
+  exists ld.gold && l="$(csv_add_unique "$l" gold)"
+  exists mold && l="$(csv_add_unique "$l" mold)"
+  exists ld && l="$(csv_add_unique "$l" ld)"
+  echo "$(csv_sort "$l")"
+}
+
+# Dependências (heurísticas leves)
+# - pkg-config: procura .pc de uso nos arquivos (PKG_CHECK_MODULES / find_package / meson dependency(...))
+# - package.json: deps de node
+# - pyproject/setup.py: nomes de deps
+# - Cargo.toml: dependencies
+# - CMakeLists: find_package(XYZ REQUIRED)
+# - meson.build: dependency('foo') / pkgs
+collect_deps(){
+  local build="" run=""
+  # autotools: PKG_CHECK_MODULES([X], [x11 >= 1.2 gtk+-3.0])
+  if any_file "$SRC_DIR/configure.ac"; then
+    local deps; deps="$(grep -Eo 'PKG_CHECK_MODULES\(\[[^]]+\],\s*\[([^]]+)\]\)' "$SRC_DIR/configure.ac" 2>/dev/null | sed -E 's/.*\[(.*)\].*/\1/' | tr ' ' '\n' | sed 's/>=.*//; s/[[:space:]]//g' | grep -E '^[A-Za-z0-9_.+-]+$' || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # meson
+  if any_file "$SRC_DIR/meson.build"; then
+    local deps; deps="$(grep -Eo "dependency\('([^']+)'" "$SRC_DIR/meson.build" 2>/dev/null | sed -E "s/.*'([^']+)'.*/\1/" | sort -u || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # CMake
+  if any_file "$SRC_DIR/CMakeLists.txt"; then
+    local deps; deps="$(grep -Eo 'find_package\(([A-Za-z0-9_.+-]+)' "$SRC_DIR/CMakeLists.txt" 2>/dev/null | sed -E 's/find_package\(([^ ]+).*/\1/' | sort -u || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # Cargo
+  if any_file "$SRC_DIR/Cargo.toml"; then
+    local deps; deps="$(awk -F'=' '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && $1 !~ /^#/ {print $1}' "$SRC_DIR/Cargo.toml" 2>/dev/null | tr -d ' ' | tr -d '"' | tr -d "'" | sed 's/#.*//' | sed '/^$/d' | sort -u || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # go.mod
+  if any_file "$SRC_DIR/go.mod"; then
+    local deps; deps="$(grep -E '^require\s' -A999 "$SRC_DIR/go.mod" 2>/dev/null | grep -E '^[[:space:]]*[a-zA-Z0-9._/-]+' | awk '{print $1}' | sed 's/\/\/.*//' | sed '/^require$/d' | sed '/^)/q' | sed '/^$/d' | sort -u || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # Python
+  if any_file "$SRC_DIR/pyproject.toml"; then
+    local deps; deps="$(awk '/^\[project.dependencies\]/{f=1;next} /^\[/{f=0} f {print}' "$SRC_DIR/pyproject.toml" 2>/dev/null | sed -E 's/["'\'']//g' | sed -E 's/[>=<].*//g' | sed 's/^[[:space:]-]*//' | sed '/^$/d' | sort -u || true)"
+    [[ -n "$deps" ]] && run="$(csv_add_unique "$run" $deps)"
+  fi
+  if any_file "$SRC_DIR/setup.py"; then
+    local deps; deps="$(grep -E "install_requires\s*=\s*\[" -A5 "$SRC_DIR/setup.py" 2>/dev/null | grep -Eo "'[^']+'|\"[^\"]+\"" | tr -d "'\"" | sed -E 's/[>=<].*//g' | sort -u || true)"
+    [[ -n "$deps" ]] && run="$(csv_add_unique "$run" $deps)"
+  fi
+  # Node
+  if any_file "$SRC_DIR/package.json"; then
+    local deps; deps="$(jq -r '.dependencies|keys[]?' "$SRC_DIR/package.json" 2>/dev/null || true)"
+    [[ -n "$deps" ]] && run="$(csv_add_unique "$run" $deps)"
+    deps="$(jq -r '.devDependencies|keys[]?' "$SRC_DIR/package.json" 2>/dev/null || true)"
+    [[ -n "$deps" ]] && build="$(csv_add_unique "$build" $deps)"
+  fi
+  # Perl
+  if any_file "$SRC_DIR/Makefile.PL"; then
+    local deps; deps="$(grep -Eo "PREREQ_PM\s*=>\s*\{.*\}" "$SRC_DIR/Makefile.PL" 2>/dev/null | tr ',' '\n' | awk -F'=>' '{gsub(/[ '"'"']/, "", $1); print $1}' | sed '/^$/d' | sort -u || true)"
+    [[ -n "$deps" ]] && run="$(csv_add_unique "$run" $deps)"
+  fi
+  # Lua (rockspec)
+  if any_file "$SRC_DIR/*.rockspec"; then
+    local deps; deps="$(grep -E 'dependencies\s*=' -A5 "$SRC_DIR"/*.rockspec 2>/dev/null | grep -Eo "'[^']+'|\"[^\"]+\"" | tr -d "'\"" | sed -E 's/[>=<].*//g' | sort -u || true)"
+    [[ -n "$deps" ]] && run="$(csv_add_unique "$run" $deps)"
+  fi
+
+  # pkg-config hints brutos nos fontes
+  local pc; pc="$(grep -RhoE '[a-zA-Z0-9_.+-]+\.pc' "$SRC_DIR" 2>/dev/null | sed 's/\.pc$//' | sort -u || true)"
+  [[ -n "$pc" ]] && build="$(csv_add_unique "$build" $pc)"
+
+  echo "$(csv_sort "$build")":::$(csv_sort "$run")
+}
+
+# Kernel/Kbuild
+detect_kernel(){
+  local has=0 ver=""
+  if any_file "$SRC_DIR/Makefile" && grep -qE '^VERSION\s*=' "$SRC_DIR/Makefile" 2>/dev/null; then
+    has=1
+    local V R P
+    V="$(grep -E '^VERSION\s*=' "$SRC_DIR/Makefile" | head -n1 | awk -F= '{print $2}' | tr -d '[:space:]' || true)"
+    R="$(grep -E '^PATCHLEVEL\s*=' "$SRC_DIR/Makefile" | head -n1 | awk -F= '{print $2}' | tr -d '[:space:]' || true)"
+    P="$(grep -E '^SUBLEVEL\s*=' "$SRC_DIR/Makefile" | head -n1 | awk -F= '{print $2}' | tr -d '[:space:]' || true)"
+    ver="$V.${R:-0}.${P:-0}"
+  elif any_file "$SRC_DIR/Kbuild"; then
+    has=1
+  fi
+  if ((has)); then
+    echo "linux:::${ver:-unknown}"
+  else
+    echo "none:::"
+  fi
+}
+# -----------------------------------------------------------------------------
+# Execução principal
+# -----------------------------------------------------------------------------
+cmd_detect(){
+  local metaf="${1:-}" ; local src_override=""
+  while (( $# )); do
+    case "$1" in
+      --src-dir=*) src_override="${1#*=}" ;;
+      *) metaf="$1" ;;
+    esac
+    shift || true
+  done
+  [[ -n "$metaf" ]] || { printf 'Uso: adm-detect <metafile> [--src-dir=/caminho]\n' >&2; exit 1; }
+  load_meta "$metaf"
+
+  section "Detecção de build/toolchain" pkg="$NAME" ver="$VERSION"
+
+  if [[ -n "$src_override" ]]; then
+    [[ -d "$src_override" ]] || { log_e "SRC_DIR inválido: $src_override"; exit 43; }
+    SRC_DIR="$src_override"
+  else
+    resolve_srcdir
+  fi
+  safe_cd "$SRC_DIR"
+
+  # Host/toolchain/libc/arch
+  local ARCH LIBC TOOL HOST_TRIPLE TARGET_TRIPLE CROSS
+  ARCH="$(detect_arch)"
+  LIBC="$(detect_libc)"
+  TOOL="$(detect_toolchain_host)"
+  HOST_TRIPLE="$(guess_host_triple)"
+  TARGET_TRIPLE="$(detect_target_from_env)"
+  CROSS="$(is_cross "$HOST_TRIPLE" "$TARGET_TRIPLE")"
+
+  # Build systems e linguagens
+  local BSYS LANGS DOCS
+  BSYS="$(detect_build_systems)"
+  LANGS="$(detect_langs)"
+  DOCS="$(detect_docs)"
+
+  # Compiladores/Linkers instalados (host)
+  local COMP LINKERS
+  COMP="$(detect_compilers)"
+  LINKERS="$(detect_linkers)"
+
+  # Deps (heurísticas)
+  local DEPB DEPR
+  IFS=::: read -r DEPB DEPR <<<"$(collect_deps)"
+
+  # Kernel
+  local KERN KVER
+  IFS=::: read -r KERN KVER <<<"$(detect_kernel)"
+
+  # Ajustes com perfil (se existir)
+  [[ -n "${LIBC_TARGET:-}" ]] && LIBC="$LIBC_TARGET"
+  if [[ -n "${TOOLCHAIN_TARGET:-}" && "$TOOL" != "$TOOLCHAIN_TARGET" && "$TOOL" != "both" ]]; then
+    # Informe que ferramenta desejada difere da disponível
+    log_w "Toolchain alvo ($TOOLCHAIN_TARGET) difere da detectada ($TOOL)"
+  fi
+
+  # Saídas machine-readable
+  emit BUILD_SYSTEMS    "${BSYS}"
+  # Heurística principal (preferência)
+  emit BUILD_SYSTEM     "$(echo "$BSYS" | awk -F, '{print $1}')"
+  emit LANGS            "${LANGS}"
+  emit COMPILERS        "${COMP}"
+  emit LINKERS          "${LINKERS}"
+  emit DOCS             "${DOCS}"
+  emit NEEDS_DOCS       "$([[ -n "$DOCS" ]] && echo true || echo false)"
+  emit LIBC             "${LIBC}"
+  emit TOOLCHAIN        "${TOOL}"
+  emit ARCH             "${ARCH}"
+  emit HOST_TRIPLE      "${HOST_TRIPLE}"
+  emit TARGET_TRIPLE    "${TARGET_TRIPLE}"
+  emit CROSS            "${CROSS}"
+  emit KERNEL           "${KERN}"
+  emit KERNEL_VERSION_GUESS "${KVER}"
+  emit DETECTED_BUILD_DEPS "${DEPB}"
+  emit DETECTED_RUN_DEPS   "${DEPR}"
+
+  # Classificação do resultado
+  local partial=0 none=0
+  [[ -z "$BSYS" && -z "$LANGS" ]] && none=1
+  # Consideramos parcial se faltou BUILD_SYSTEM mas temos linguagens, ou vice-versa
+  if (( none == 0 )); then
+    if [[ -z "$BSYS" || -z "$LANGS" ]]; then partial=1; fi
+  fi
+
+  if (( none )); then
+    log_w "Nada conclusivo detectado em $SRC_DIR"
+    exit 50
+  fi
+  if (( partial )); then
+    log_w "Detecção parcial concluída"
+    exit 51
+  fi
+  log_o "Detecção concluída com sucesso"
+  exit 0
+}
+
+usage(){
+  cat <<'USAGE'
+adm-detect — detecta build system, linguagens, toolchain, libc, linkers, deps, kernel.
+
+Uso:
+  adm-detect <metafile> [--src-dir=/caminho]
+
+Saída (KEY=VAL):
+  BUILD_SYSTEMS=autotools,cmake,meson,...
+  BUILD_SYSTEM=cmake
+  LANGS=c,cpp,rust,go,python,node,perl,lua,java,kernel
+  COMPILERS=gcc,clang,zig-cc,rustc,go,javac
+  LINKERS=ld.lld,ld.bfd,gold,mold,ld
+  DOCS=doxygen,sphinx,mkdocs,man,markdown
+  NEEDS_DOCS=true|false
+  LIBC=glibc|musl|unknown
+  TOOLCHAIN=gcc|clang|both|none
+  ARCH=x86_64|aarch64|...
+  HOST_TRIPLE=x86_64-pc-linux-gnu
+  TARGET_TRIPLE=aarch64-linux-musl (ou vazio)
+  CROSS=0|1
+  KERNEL=linux|none
+  KERNEL_VERSION_GUESS=5.15.0|unknown
+  DETECTED_BUILD_DEPS=pkg1,pkg2
+  DETECTED_RUN_DEPS=pkg3,pkg4
+
+Exit codes:
+  0 ok; 50 nada detectado; 51 parcial; 20 ambiente; 43 IO
+USAGE
+}
+
+main(){
+  case "${1:-}" in
+    -h|--help|help|"") usage; exit 0 ;;
+    *) cmd_detect "$@" ;;
+  esac
+}
+
+main "$@"
