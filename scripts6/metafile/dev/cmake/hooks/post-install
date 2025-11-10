@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+cmake --install "$ADM_BUILD_DIR" --prefix /usr --config Release --component default --destdir "$ADM_DESTDIR"
+rm -rf "$ADM_DESTDIR/usr/share/doc" "$ADM_DESTDIR/usr/share/info" 2>/dev/null || true
