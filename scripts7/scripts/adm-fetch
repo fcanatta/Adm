@@ -1,0 +1,413 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-fetch
+# Baixa fontes declaradas no metafile (múltiplos links), em paralelo, valida sha256
+# e popula o cache em /usr/src/adm/sources. Integra com adm-io quando disponível.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20 ambiente inválido
+# 30 download falhou (algum item)
+# 31 checksum inválido (algum item)
+# 32 protocolo/URL não suportado
+# 33 erro de IO/cache/perm
+
+set -Eeuo pipefail
+umask 022
+
+# -----------------------------------------------------------------------------
+# AMBIENTE/PATHS
+# -----------------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+
+mkdir -p "$ADM_SOURCES" "$ADM_WORK" "$ADM_LOGS" "$ADM_STATE" "$ADM_METAFILES" >/dev/null 2>&1 || true
+
+# Integração opcional com adm-io
+ADM_IO="${ADM_IO:-$ADM_ROOT/scripts/adm-io}"
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# Concurrency
+: "${ADM_FETCH_JOBS:=0}"  # 0 = auto (nproc ou número de fontes)
+if [[ "$ADM_FETCH_JOBS" == "0" ]]; then
+  ADM_FETCH_JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)"
+  [[ "$ADM_FETCH_JOBS" -gt 0 ]] || ADM_FETCH_JOBS=2
+fi
+
+# sha256 util
+sha256_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then echo "sha256sum"; return; fi
+  if command -v shasum >/dev/null 2>&1; then echo "shasum -a 256"; return; fi
+  echo ""
+}
+
+SHA256_BIN="$(sha256_cmd)"
+[[ -n "$SHA256_BIN" ]] || { log_e "Não encontrei sha256sum/shasum"; exit 20; }
+
+# curl/wget
+DL_CURL=0; DL_WGET=0
+command -v curl >/dev/null 2>&1 && DL_CURL=1
+command -v wget >/dev/null 2>&1 && DL_WGET=1
+(( DL_CURL==0 && DL_WGET==0 )) && { log_e "Necessário curl ou wget"; exit 20; }
+
+# rsync
+have_rsync=0; command -v rsync >/dev/null 2>&1 && have_rsync=1
+# git
+have_git=0; command -v git >/dev/null 2>&1 && have_git=1
+
+# -----------------------------------------------------------------------------
+# PARSE DO METAFILE (via adm-meta)
+# -----------------------------------------------------------------------------
+ADM_META="${ADM_META:-$ADM_ROOT/scripts/adm-meta}"
+[[ -x "$ADM_META" ]] || { log_e "adm-meta não encontrado/executável: $ADM_META"; exit 20; }
+
+# Lê ADM_SOURCES/ADM_SHA256S/ADM_NAME/ADM_VERSION etc.
+load_meta() {
+  local metaf="$1"
+  [[ -f "$metaf" ]] || { log_e "Metafile inexistente: $metaf"; exit 1; }
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")"
+  # Agora temos: ADM_NAME, ADM_VERSION, ADM_SOURCES, ADM_SHA256S, ...
+  if [[ -z "${ADM_SOURCES:-}" ]]; then log_e "sources vazio no metafile"; exit 20; fi
+  if [[ -z "${ADM_SHA256S:-}" ]]; then log_e "sha256sums vazio no metafile"; exit 20; fi
+}
+
+# -----------------------------------------------------------------------------
+# HELPERS
+# -----------------------------------------------------------------------------
+trim() { local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_to_array() {
+  local s="${1:-}"; s="${s//[[:space:]]/}"; s="${s#,}"; s="${s%,}"
+  IFS=, read -r -a _ARR <<< "$s"
+}
+
+basename_sane() {
+  local u="$1"
+  # tenta extrair um nome amigável do URL/caminho
+  if [[ "$u" =~ ^git(\+https?)?://|^https?://|^ftp://|^rsync://|^file:// ]]; then
+    local b="${u##*/}"
+    b="${b%%\?*}"; b="${b%%#*}"
+    [[ -z "$b" || "$b" == */ ]] && b="source"
+    echo "$b"
+  else
+    # local path
+    local b="${u##*/}"
+    echo "$b"
+  fi
+}
+
+# normaliza nome final no cache para evitar colisões
+cache_target_for() {
+  local idx="$1" url="$2"
+  local base; base="$(basename_sane "$url")"
+  # Prefixa índice para manter ordem e evitar colisões entre nomes iguais
+  printf '%s/%s-%02d-%s' "$ADM_SOURCES" "${ADM_NAME:-pkg}_${ADM_VERSION:-0}" "$idx" "$base"
+}
+
+# Verifica sha256 (retorna 0 ok, 1 mismatch)
+check_sha256() {
+  local file="$1" want="$2"
+  [[ "$want" == "SKIP" || "$want" == "MISSING" || -z "$want" ]] && return 0
+  local got
+  got="$($SHA256_BIN "$file" | awk '{print $1}')"
+  if [[ "$got" == "$want" ]]; then return 0; fi
+  return 1
+}
+
+# -----------------------------------------------------------------------------
+# DOWNLOADERs
+# -----------------------------------------------------------------------------
+dl_http_https_ftp() {
+  local url="$1" tmp="$2"
+  if (( DL_CURL )); then
+    # shellcheck disable=SC2086
+    curl -L --fail --retry 3 --connect-timeout 20 --max-time 0 -o "$tmp" "$url"
+  else
+    wget -O "$tmp" --tries=3 --timeout=20 "$url"
+  fi
+}
+
+dl_rsync() {
+  local url="$1" tmp="$2"
+  (( have_rsync )) || { log_e "rsync não disponível"; return 32; }
+  rsync -av --progress "$url" "$tmp" >/dev/null 2>&1 || return 30
+  return 0
+}
+
+archive_dir_to() {
+  local dir="$1" out="$2"
+  # detecta extensão alvo
+  case "$out" in
+    *.tar.zst) tar --zstd -C "$dir" -cf "$out" . ;;
+    *.tar.xz)  tar -I xz -C "$dir" -cf "$out" . ;;
+    *.tar.gz|*.tgz) tar -z -C "$dir" -cf "$out" . ;;
+    *) tar -C "$dir" -cf "$out" . ;;
+  esac
+}
+
+dl_file_or_dir() {
+  local url="$1" tmp="$2"
+  local path="${url#file://}"
+  if [[ -z "$path" ]]; then path="$url"; fi
+  if [[ -f "$path" ]]; then
+    cp -f "$path" "$tmp"
+    return 0
+  elif [[ -d "$path" ]]; then
+    # empacota diretório em tar.zst temporário
+    archive_dir_to "$path" "$tmp"
+    return 0
+  else
+    return 30
+  fi
+}
+
+dl_git_snapshot() {
+  local url="$1" tmp="$2"
+  (( have_git )) || { log_e "git não disponível"; return 32; }
+  # Suporta: git://, https://...*.git, git@...
+  # Caso não haja ref estável, faremos snapshot de HEAD (checksum deve ser SKIP)
+  local workdir; workdir="$(mktemp -d)"
+  trap 'rm -rf "$workdir"' RETURN
+  git clone --depth=1 "$url" "$workdir/repo" >/dev/null 2>&1 || return 30
+  # Tenta obter HEAD hash curto
+  (cd "$workdir/repo" && git rev-parse --short HEAD) >/dev/null 2>&1 || true
+  # Arquiva como tar.zst por padrão se extensão do tmp indicar; senão tar.gz
+  case "$tmp" in
+    *.tar.zst|*.tar.xz|*.tar.gz|*.tgz) archive_dir_to "$workdir/repo" "$tmp" ;;
+    *) tar -C "$workdir/repo" -czf "$tmp" . ;;
+  esac
+  return 0
+}
+
+proto_of() {
+  local u="$1"
+  if [[ "$u" =~ ^https?:// ]]; then echo "http"; return; fi
+  if [[ "$u" =~ ^ftp:// ]]; then echo "ftp"; return; fi
+  if [[ "$u" =~ ^rsync:// ]]; then echo "rsync"; return; fi
+  if [[ "$u" =~ ^git(\+https?)?:// || "$u" =~ ^git@ || "$u" =~ \.git(#|$) ]]; then echo "git"; return; fi
+  if [[ "$u" =~ ^file:// ]]; then echo "file"; return; fi
+  # caminho local (arquivo ou diretório)
+  if [[ -e "$u" || -d "$u" ]]; then echo "local"; return; fi
+  echo "unknown"
+}
+
+# -----------------------------------------------------------------------------
+# WORKER DE DOWNLOAD (1 item)
+# -----------------------------------------------------------------------------
+# Retorna via echo: PATH=<arquivo no cache> ; Exit: 0 ok, 31 checksum, 30 download, 32 protocolo.
+download_item() {
+  local idx="$1" url="$2" want_sha="$3"
+  url="$(trim "$url")"; want_sha="$(trim "$want_sha")"
+  local target; target="$(cache_target_for "$idx" "$url")"
+
+  # Se já existe e checksum confere → reuse
+  if [[ -f "$target" ]] && check_sha256 "$target" "$want_sha"; then
+    echo "PATH=$target"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$target")" || { log_e "Falha ao criar cache"; return 33; }
+
+  local tmp="${target}.part.$$"
+  rm -f "$tmp" 2>/dev/null || true
+
+  local ptoken=""
+  if (( have_io )); then
+    ptoken="$("$ADM_IO" spinner start "Baixando: $url")" || true
+  else
+    printf '[INFO] Baixando: %s\n' "$url"
+  fi
+
+  local rc=0
+  case "$(proto_of "$url")" in
+    http|ftp)
+      if ! dl_http_https_ftp "$url" "$tmp"; then rc=30; fi
+      ;;
+    rsync)
+      if ! dl_rsync "$url" "$tmp"; then rc=30; fi
+      ;;
+    git)
+      if ! dl_git_snapshot "$url" "$tmp"; then rc=30; fi
+      ;;
+    file|local)
+      if ! dl_file_or_dir "$url" "$tmp"; then rc=30; fi
+      ;;
+    *)
+      rc=32
+      ;;
+  esac
+
+  # Finaliza spinner
+  if (( have_io )); then
+    if (( rc == 0 )); then
+      "$ADM_IO" spinner stop "$ptoken" --ok "Download concluído" url="$url" || true
+    else
+      "$ADM_IO" spinner stop "$ptoken" --error "Download falhou" url="$url" || true
+    fi
+  fi
+
+  (( rc == 0 )) || { rm -f "$tmp" 2>/dev/null || true; return "$rc"; }
+
+  # Verifica checksum (se houver)
+  if ! check_sha256 "$tmp" "$want_sha"; then
+    log_e "Checksum inválido para $url"
+    rm -f "$tmp" 2>/dev/null || true
+    return 31
+  fi
+
+  mv -f "$tmp" "$target" || { log_e "Falha ao mover para cache: $target"; return 33; }
+  echo "PATH=$target"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# PIPELINE PRINCIPAL
+# -----------------------------------------------------------------------------
+cmd_fetch() {
+  local metaf="$1"
+  [[ -n "$metaf" ]] || { printf 'Uso: adm-fetch <metafile>\n' >&2; exit 1; }
+  load_meta "$metaf"
+
+  section "Fetch de fontes" pkg="$ADM_NAME" ver="$ADM_VERSION"
+
+  # Separa arrays
+  csv_to_array "$ADM_SOURCES"; local SOURCES=( "${_ARR[@]}" )
+  csv_to_array "$ADM_SHA256S"; local SHAS=( "${_ARR[@]}" )
+
+  local n="${#SOURCES[@]}"
+  (( n > 0 )) || { log_e "Nenhuma source encontrada"; exit 20; }
+
+  log_i "Iniciando downloads" total="$n" jobs="$ADM_FETCH_JOBS"
+
+  # Execução paralela simples com controle de jobs
+  declare -a PIDS=() ; declare -A TMPRES=() ; declare -A TMPRC=()
+  local i=0 active=0
+  for ((i=0; i<n; i++)); do
+    local url="${SOURCES[$i]}" sha="${SHAS[$i]:-}"
+    (
+      download_item "$((i+1))" "$url" "$sha"
+      rc=$?; echo "$rc" >"$ADM_STATE/fetch.$$.rc.$i"
+      # shellcheck disable=SC2181
+      if [[ $rc -eq 0 ]]; then
+        # captura PATH=...
+        : >"$ADM_STATE/fetch.$$.path.$i"
+        download_item_out="$(download_item "$((i+1))" "$url" "$sha" 2>/dev/null || true)"
+        # Não reexecutar download; em vez disso, se rc==0 acima já moveu; para extrair PATH, recomputamos
+        echo "PATH=$(cache_target_for "$((i+1))" "$url")" >"$ADM_STATE/fetch.$$.path.$i"
+      fi
+    ) &
+    PIDS+=("$!")
+    ((active++))
+    # Limita concorrência
+    if (( active >= ADM_FETCH_JOBS )); then
+      wait -n
+      ((active--))
+    fi
+  done
+  # espera restantes
+  wait
+
+  # Agrega resultados
+  local any_dl_fail=0 any_sha_fail=0 any_proto_fail=0 any_io_fail=0
+  local paths=()
+  for ((i=0; i<n; i++)); do
+    local rcfile="$ADM_STATE/fetch.$$.rc.$i"
+    if [[ ! -f "$rcfile" ]]; then
+      log_e "Falha interna: rc de item $i ausente"
+      any_io_fail=1
+      continue
+    fi
+    local rc; rc="$(cat "$rcfile")"
+    rm -f "$rcfile"
+    case "$rc" in
+      0)
+        local pfile="$ADM_STATE/fetch.$$.path.$i"
+        if [[ -f "$pfile" ]]; then
+          local p; p="$(cut -d= -f2- "$pfile")"
+          paths+=("$p")
+          rm -f "$pfile"
+          log_o "OK: $(basename "${SOURCES[$i]}")" path="$p"
+        else
+          # reconstrói destino previsto
+          local p; p="$(cache_target_for "$((i+1))" "${SOURCES[$i]}")"
+          paths+=("$p")
+          log_o "OK: $(basename "${SOURCES[$i]}")" path="$p"
+        fi
+        ;;
+      30) any_dl_fail=1; log_e "Download falhou" url="${SOURCES[$i]}" ;;
+      31) any_sha_fail=1; log_e "Checksum inválido" url="${SOURCES[$i]}" ;;
+      32) any_proto_fail=1; log_e "Protocolo/URL não suportado" url="${SOURCES[$i]}" ;;
+      33) any_io_fail=1; log_e "Erro de IO/cache" url="${SOURCES[$i]}" ;;
+      *)  any_io_fail=1; log_e "Erro desconhecido rc=$rc" url="${SOURCES[$i]}" ;;
+    esac
+  done
+
+  # Emite saída machine-readable
+  local IFS=,
+  printf 'ADM_DOWNLOADED=%s\n' "${paths[*]}"
+
+  # Marca estado do pacote
+  local stampdir="$ADM_STATE/${ADM_NAME}-${ADM_VERSION}"
+  mkdir -p "$stampdir" || true
+  : >"$stampdir/DOWNLOAD_OK"
+
+  # Decide exit code agregado
+  if (( any_dl_fail || any_sha_fail || any_proto_fail || any_io_fail )); then
+    if   (( any_sha_fail )); then exit 31
+    elif (( any_proto_fail )); then exit 32
+    elif (( any_io_fail )); then exit 33
+    else exit 30
+    fi
+  fi
+  log_o "Todos os downloads concluídos" total="$n"
+}
+# -----------------------------------------------------------------------------
+# USO / DISPATCHER
+# -----------------------------------------------------------------------------
+usage() {
+  cat <<'USAGE'
+adm-fetch — baixa em paralelo os sources do metafile para o cache.
+
+Uso:
+  adm-fetch <metafile>
+
+Ambiente:
+  ADM_ROOT=/usr/src/adm (padrão)
+  ADM_SOURCES, ADM_WORK, ADM_LOGS, ADM_STATE, ADM_METAFILES
+  ADM_FETCH_JOBS=N  (concorrência; 0=auto)
+  ADM_IO=/usr/src/adm/scripts/adm-io (opcional; logs bonitos)
+  ADM_META=/usr/src/adm/scripts/adm-meta (parse do metafile)
+
+Protocolos suportados:
+  http(s), ftp (curl/wget)
+  rsync (se rsync instalado)
+  git (clone --depth=1 → snapshot tar.*) — exige sha256=SKIP/MISSING se ref não for estável
+  file:// e caminhos locais (arquivo/diretório; diretório vira tar.*)
+  Padrões GitHub/GitLab/SourceForge via HTTP funcionam out of the box.
+
+Saída machine-readable:
+  ADM_DOWNLOADED=/usr/src/adm/sources/<pkg_ver>-01-foo.tar.xz,/usr/src/adm/sources/<pkg_ver>-02-bar.tar.zst
+
+Exit codes:
+  0 ok; 1 uso; 20 ambiente; 30 download; 31 checksum; 32 protocolo; 33 IO
+USAGE
+}
+
+main() {
+  local metaf="${1:-}"
+  case "$metaf" in
+    -h|--help|help|"") usage; exit 0 ;;
+    *) cmd_fetch "$metaf" ;;
+  esac
+}
+
+main "$@"
