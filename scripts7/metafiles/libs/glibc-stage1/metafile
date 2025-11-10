@@ -1,0 +1,12 @@
+name=glibc-stage1
+version=2.40
+category=libs
+run_deps=
+build_deps=binutils-stage0,gcc-stage0,linux-headers-stage0,glibc-headers-stage0
+opt_deps=
+num_builds=0
+description=glibc (stage1) para o target; instala no SYSROOT (build-dir separado)
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
