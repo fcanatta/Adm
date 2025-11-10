@@ -1,0 +1,12 @@
+name=gawk
+version=5.3.0
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Interpretador awk do GNU
+homepage=https://www.gnu.org/software/gawk/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gawk/gawk-5.3.0.tar.xz
