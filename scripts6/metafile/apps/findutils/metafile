@@ -1,0 +1,12 @@
+name=findutils
+version=4.10.0
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Localiza arquivos e executa ações (find/xargs)
+homepage=https://www.gnu.org/software/findutils/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz
