@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm
+# CLI principal do ADM: orquestra instalação (build/bin), remove, update, clean,
+# query, mkinitramfs e utilitários. Inclui menu TUI, dry-run global e passthrough
+# de help/flags para subcomandos específicos.
+#
+# Exit codes (gerais):
+#  0 ok | 1 uso | 2 subcomando inválido | 20 env | 43 IO | 50 não encontrado
+#  60 pipeline falhou | 70 args inválidos
+
+set -Eeuo pipefail
+umask 022
+
+# ------------------------------------------------------------------------------
+# Caminhos e integrações
+# ------------------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_DESTDIR_BASE="${ADM_DESTDIR_BASE:-$ADM_ROOT/destdir}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+
+mkdir -p "$ADM_LOGS" "$ADM_STATE" >/dev/null 2>&1 || true
+
+# scripts aliados
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+ADM_FETCH="${ADM_FETCH:-$ADM_SCRIPTS/adm-fetch}"
+ADM_DETECT="${ADM_DETECT:-$ADM_SCRIPTS/adm-detect}"
+ADM_CONSTRUCTOR="${ADM_CONSTRUCTOR:-$ADM_SCRIPTS/adm-constructor}"
+ADM_PACKAGE="${ADM_PACKAGE:-$ADM_SCRIPTS/adm-package}"
+ADM_INSTALL_BIN="${ADM_INSTALL_BIN:-$ADM_SCRIPTS/adm-install}"
+ADM_REMOVE="${ADM_REMOVE:-$ADM_SCRIPTS/adm-remove}"
+ADM_UPDATE="${ADM_UPDATE:-$ADM_SCRIPTS/adm-update}"
+ADM_CLEAN="${ADM_CLEAN:-$ADM_SCRIPTS/adm-clean}"
+ADM_QUERY="${ADM_QUERY:-$ADM_SCRIPTS/adm-query}"
+ADM_MKINITRAMFS="${ADM_MKINITRAMFS:-$ADM_SCRIPTS/adm-mkinitramfs}"
+ADM_PATHS="${ADM_PATHS:-$ADM_SCRIPTS/adm-paths}"
+ADM_RESOLVER="${ADM_RESOLVER:-$ADM_SCRIPTS/adm-resolver}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ ((have_io)) && "$ADM_IO" log info "$@" || printf '[INFO] %s\n' "$*"; }
+log_o(){ ((have_io)) && "$ADM_IO" log ok   "$@" || printf  '[OK] %s\n' "$*"; }
+log_w(){ ((have_io)) && "$ADM_IO" log warn "$@" || printf '[WARN] %s\n' "$*"; }
+log_e(){ ((have_io)) && "$ADM_IO" log error "$@" || printf '[ERR] %s\n' "$*"; }
+section(){ ((have_io)) && "$ADM_IO" section "$@" || printf '\n== %s ==\n' "$*"; }
+
+# ------------------------------------------------------------------------------
+# Utilidades gerais
+# ------------------------------------------------------------------------------
+DRY_RUN=0
+ASSUME_YES=0
+GLOBAL_JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+DEFAULT_ARCH="$(uname -m 2>/dev/null || echo unknown)"
+DEFAULT_LIBC="$( (ldd --version 2>&1 | grep -qi musl && echo musl) || echo glibc )"
+PROFILE="normal"  # aggressive|normal|minimum
+
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_to_arr(){ local s="${1:-}"; s="${s//[[:space:]]/}"; IFS=, read -r -a _ARR <<< "$s"; }
+join_csv(){ local IFS=,; printf '%s' "$*"; }
+
+run_cmd(){
+  # Wrapper que respeita --dry-run e registra comandos
+  if (( DRY_RUN )); then
+    printf '[DRY] %s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
+
+# ------------------------------------------------------------------------------
+# Detecção de metafile pelo nome
+# ------------------------------------------------------------------------------
+find_metafile_by_name(){
+  local name="$1"
+  find "$ADM_METAFILES" -type f -name metafile -print0 2>/dev/null \
+    | xargs -0 -r awk -F= -v RS= -v N="$name" '$1=="name"&&$2==N {print FILENAME; exit}' \
+    | head -n1 || true
+}
+
+# ------------------------------------------------------------------------------
+# TUI helpers (dialog/whiptail → fallback texto)
+# ------------------------------------------------------------------------------
+have_dialog(){ exists dialog || exists whiptail; }
+tui_menu(){
+  local title="$1"; shift
+  local opts=("$@")
+  if exists dialog; then
+    dialog --clear --stdout --title "$title" --menu "Escolha:" 20 78 12 "${opts[@]}"
+  elif exists whiptail; then
+    whiptail --title "$title" --menu "Escolha:" 20 78 12 "${opts[@]}" 3>&1 1>&2 2>&3
+  else
+    echo "TUI indisponível. Use 'adm help'." >&2; return 1
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Uso / ajuda
+# ------------------------------------------------------------------------------
+usage_short(){
+  cat <<'USAGE'
+adm — CLI principal do ADM
+
+Uso:
+  adm <comando> [opções]
+
+Comandos principais:
+  install        Construir e/ou instalar pacote (ou binários: --bin)
+  remove         Remover pacote(s)
+  update         Detectar upstream e gerar update/metafile
+  clean          Limpar caches e artefatos
+  query          Consultas (info/list/search/files/owns/provides/deps/versions)
+  mkinitramfs    Criar initramfs
+  paths          Perfis e paths de build (aggressive/normal/minimum)
+  fetch          Baixar fontes (metafile)
+  detect         Detectar toolchain/drivers/linguagens (adm-detect)
+  constructor    Orquestrar build (adm-constructor)
+  package        Empacotar destdir → .tar.zst/.tar.xz
+  meta           Utilitários de metafile
+  resolver       Resolver dependências (ordens/layers)
+  io             Ferramentas de I/O (saída/log)
+
+Ajuda detalhada:
+  adm help [comando]        # repassa --help ao script respectivo
+
+Flags globais:
+  --dry-run   # não executa, apenas simula
+  --yes       # não perguntar confirmações
+  --jobs=N    # paralelismo padrão
+  --profile=aggressive|normal|minimum  # perfil de build
+USAGE
+}
+
+help_passthrough(){
+  local sub="$1"
+  case "$sub" in
+    install)     "$ADM_INSTALL_BIN" --help || true ;;
+    remove)      "$ADM_REMOVE" --help || true ;;
+    update)      "$ADM_UPDATE" --help || true ;;
+    clean)       "$ADM_CLEAN" --help || true ;;
+    query)       "$ADM_QUERY" --help || true ;;
+    mkinitramfs) "$ADM_MKINITRAMFS" --help || true ;;
+    paths)       "$ADM_PATHS" --help || true ;;
+    fetch)       "$ADM_FETCH" --help || true ;;
+    detect)      "$ADM_DETECT" --help || true ;;
+    constructor) "$ADM_CONSTRUCTOR" --help || true ;;
+    package)     "$ADM_PACKAGE" --help || true ;;
+    meta)        "$ADM_META" --help || true ;;
+    resolver)    "$ADM_RESOLVER" --help || true ;;
+    io)          "$ADM_IO" --help || true ;;
+    *) usage_short ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Aplicação de perfil de compilação
+# ------------------------------------------------------------------------------
+apply_profile(){
+  local p="$1"
+  case "$p" in
+    aggressive|normal|minimum) PROFILE="$p" ;;
+    *) log_w "Perfil inválido, usando 'normal'"; PROFILE="normal" ;;
+  esac
+  if [[ -x "$ADM_PATHS" ]]; then
+    run_cmd "$ADM_PATHS" profile apply --name="$PROFILE" || log_w "Falha ao aplicar profile"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Pipelines de instalação
+# ------------------------------------------------------------------------------
+install_usage(){
+  cat <<'USAGE'
+adm install — construir/instalar pacote
+
+Uso:
+  adm install <programa> [opções]           # build + instalar
+  adm install --bin <programa> [opções]     # instalar do cache de binários
+  adm install --dir=/path/to/pkgs           # instalar a partir de diretório de pacotes
+
+Opções comuns:
+  --arch=ARCH          (default: auto)
+  --libc=glibc|musl    (default: auto)
+  --include-opt        incluir opt_deps
+  --jobs=N             paralelismo por camada
+  --force              sobrescreve conflitos (instalação binária)
+  --reinstall          reinstala mesma versão (binário)
+  --profile=aggressive|normal|minimum
+  --version=V          (preferência; binário)
+  --dir=/path          (instalação por diretório de pacotes)
+  --dry-run            simulação
+USAGE
+}
+# Resolve layers (build e run) usando adm-resolver
+resolver_layers(){
+  local metaf="$1" arch="$2" libc="$3" include_opt="$4"
+  [[ -x "$ADM_RESOLVER" ]] || die "adm-resolver ausente" 20
+  "$ADM_RESOLVER" "$metaf" $([[ "$include_opt" == "1" ]] && echo --include-opt) \
+    --arch="${arch}" --libc="${libc}" || return 60
+}
+
+# Executa em paralelo por camada
+run_parallel_layer(){
+  local jobs="${1:-$GLOBAL_JOBS}"; shift
+  local -a cmds=("$@")
+  local -a PIDS=() ; local any_fail=0
+  local i
+  for ((i=0;i<${#cmds[@]};i++)); do
+    # controle simples de concorrência
+    while (( $(jobs -rp | wc -l) >= jobs )); do sleep 0.1; done
+    if (( DRY_RUN )); then
+      printf '[DRY] %s\n' "${cmds[$i]}"
+    else
+      bash -c "${cmds[$i]}" || any_fail=1 &
+      PIDS+=("$!")
+    fi
+  done
+  for p in "${PIDS[@]}"; do wait "$p" || any_fail=1; done
+  (( any_fail == 0 ))
+}
+
+# Monta comandos para uma camada de build (fetch → detect → constructor → package)
+build_layer_cmds(){
+  local layer_csv="$1" arch="$2" libc="$3"
+  local -a out=()
+  IFS=, read -r -a pkgs <<<"${layer_csv//[[:space:]]/}"
+  local pkg
+  for pkg in "${pkgs[@]}"; do
+    # encontra metafile
+    local mf; mf="$(find_metafile_by_name "$pkg" || true)"
+    [[ -n "$mf" ]] || { log_e "metafile não encontrado" pkg="$pkg"; continue; }
+    # sequência por pacote
+    local cmd=""
+    cmd+="ADM_PROFILE=$PROFILE "
+    cmd+="&& \"$ADM_FETCH\" --metafile=\"$mf\" "
+    cmd+="&& \"$ADM_DETECT\" --metafile=\"$mf\" "
+    cmd+="&& \"$ADM_CONSTRUCTOR\" --metafile=\"$mf\" --arch=\"$arch\" --libc=\"$libc\" "
+    cmd+="&& \"$ADM_PACKAGE\" --metafile=\"$mf\""
+    out+=("$cmd")
+  done
+  printf '%s\0' "${out[@]}"
+}
+
+# Instala layer de binários (do cache)
+install_layer_bin_cmds(){
+  local layer_csv="$1" arch="$2" libc="$3" version_pref="$4"
+  local -a out=()
+  IFS=, read -r -a pkgs <<<"${layer_csv//[[:space:]]/}"
+  local pkg
+  for pkg in "${pkgs[@]}"; do
+    local cmd="\"$ADM_INSTALL_BIN\" --name=\"$pkg\""
+    [[ -n "$version_pref" ]] && cmd+=" --version=\"$version_pref\""
+    cmd+=" --arch=\"$arch\" --libc=\"$libc\""
+    out+=("$cmd")
+  done
+  printf '%s\0' "${out[@]}"
+}
+
+# Pipeline: build+install completo
+pipeline_build_install(){
+  local name="$1" arch="$2" libc="$3" include_opt="$4" jobs="$5"
+  section "Resolvendo dependências"
+  local mf; mf="$(find_metafile_by_name "$name" || true)"
+  [[ -n "$mf" ]] || die "metafile não encontrado para '$name'" 50
+
+  # aplicar profile
+  apply_profile "$PROFILE"
+
+  # Resolver ordem de compilação e execução
+  local out; out="$(resolver_layers "$mf" "$arch" "$libc" "$include_opt")" || return 60
+  local BLAYERS="$(printf '%s\n' "$out" | awk -F= '/^BUILD_LAYERS=/{print $2}')"     # opcional, se seu resolver fornece
+  local RLAYERS="$(printf '%s\n' "$out" | awk -F= '/^RUN_LAYERS=/{print $2}')"       # para instalação binária
+  local ALL_LAYERS="$BLAYERS"
+  # Se não houver BUILD_LAYERS específico, use RUN_LAYERS como base de build também
+  [[ -z "$ALL_LAYERS" ]] && ALL_LAYERS="$RLayers"
+  [[ -z "$ALL_LAYERS" ]] && ALL_LAYERS="$(printf '%s\n' "$out" | awk -F= '/^LAYERS=/{print $2}')"
+
+  [[ -n "$ALL_LAYERS" ]] || die "Resolver não retornou camadas" 60
+
+  section "Construindo camadas"
+  local IFS=';'; read -r -a LARR <<< "$ALL_LAYERS"
+  local idx=0
+  for layer_csv in "${LARR[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    log_i "Camada de build" index="$idx" pkgs="$layer_csv"
+    mapfile -d '' CMDS < <(build_layer_cmds "$layer_csv" "$arch" "$libc")
+    # Executa em paralelo
+    run_parallel_layer "$jobs" "${CMDS[@]}" || die "Falha ao construir camada $idx" 60
+    ((idx++))
+  done
+
+  section "Instalando (binários gerados)"
+  # após empacotar, instalamos por nome respeitando a ordem de execução (RUN_LAYERS)
+  local RL="${RLAYERS:-$ALL_LAYERS}"
+  IFS=';'; read -r -a RARR <<< "$RL"
+  idx=0
+  for layer_csv in "${RARR[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    log_i "Camada de instalação" index="$idx" pkgs="$layer_csv"
+    mapfile -d '' ICMD < <(install_layer_bin_cmds "$layer_csv" "$arch" "$libc" "")
+    run_parallel_layer "$jobs" "${ICMD[@]}" || die "Falha ao instalar camada $idx" 60
+    ((idx++))
+  done
+  log_o "Instalação concluída" root="/"
+}
+
+# Instalação: somente binários do cache
+pipeline_install_bin(){
+  local name="$1" arch="$2" libc="$3" include_opt="$4" jobs="$5" version_pref="$6" force="$7" reinstall="$8"
+  section "Resolvendo dependências (binário)"
+  local mf; mf="$(find_metafile_by_name "$name" || true)"
+  [[ -n "$mf" ]] || die "metafile não encontrado para '$name'" 50
+  local out; out="$(resolver_layers "$mf" "$arch" "$libc" "$include_opt")" || return 60
+  local RL; RL="$(printf '%s\n' "$out" | awk -F= '/^RUN_LAYERS=/{print $2}')" 
+  [[ -n "$RL" ]] || die "Resolver não retornou camadas" 60
+
+  IFS=';'; read -r -a RARR <<< "$RL"
+  local idx=0
+  for layer_csv in "${RARR[@]}"; do
+    [[ -z "$layer_csv" ]] && continue
+    log_i "Camada (bin)" index="$idx" pkgs="$layer_csv"
+    mapfile -d '' ICMD < <(install_layer_bin_cmds "$layer_csv" "$arch" "$libc" "$version_pref")
+    # injeta flags --force/--reinstall se necessário
+    local patched=()
+    local i
+    for ((i=0;i<${#ICMD[@]};i++)); do
+      local c="${ICMD[$i]}"
+      (( force )) && c+=" --force"
+      (( reinstall )) && c+=" --reinstall"
+      patched+=("$c")
+    done
+    run_parallel_layer "$jobs" "${patched[@]}" || die "Falha ao instalar camada $idx" 60
+    ((idx++))
+  done
+  log_o "Instalação (binário) concluída" root="/"
+}
+
+# ------------------------------------------------------------------------------
+# Subcomando: install
+# ------------------------------------------------------------------------------
+cmd_install(){
+  local BIN_ONLY=0 NAME="" DIR="" ARCH="$DEFAULT_ARCH" LIBC="$DEFAULT_LIBC"
+  local INCLUDE_OPT=0 JOBS="$GLOBAL_JOBS" FORCE=0 REINSTALL=0 VERSION=""
+  while (( $# )); do
+    case "$1" in
+      --bin) BIN_ONLY=1 ;;
+      --dir=*) DIR="${1#*=}" ;;
+      --arch=*) ARCH="${1#*=}" ;;
+      --libc=*) LIBC="${1#*=}" ;;
+      --include-opt) INCLUDE_OPT=1 ;;
+      --jobs=*) JOBS="${1#*=}" ;;
+      --force) FORCE=1 ;;
+      --reinstall) REINSTALL=1 ;;
+      --version=*) VERSION="${1#*=}" ;;
+      --profile=*) PROFILE="${1#*=}" ;;
+      --dry-run) DRY_RUN=1 ;;
+      -h|--help|help) install_usage; return 0 ;;
+      *) [[ -z "$NAME" && "$1" != --bin ]] && NAME="$1" || true ;;
+    esac; shift || true
+  done
+
+  if [[ -n "$DIR" ]]; then
+    # Instala de um diretório de pacotes
+    section "Instalação de diretório" dir="$DIR"
+    local cmd="\"$ADM_INSTALL_BIN\" --dir=\"$DIR\" --arch=\"$ARCH\" --libc=\"$LIBC\""
+    (( DRY_RUN )) && printf '[DRY] %s\n' "$cmd" || eval "$cmd"
+    return $?
+  fi
+
+  [[ -n "$NAME" ]] || { install_usage; return 1; }
+
+  if (( BIN_ONLY )); then
+    pipeline_install_bin "$NAME" "$ARCH" "$LIBC" "$INCLUDE_OPT" "$JOBS" "$VERSION" "$FORCE" "$REINSTALL"
+  else
+    pipeline_build_install "$NAME" "$ARCH" "$LIBC" "$INCLUDE_OPT" "$JOBS"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Subcomandos “finos”: apenas encaminham (com respeito a --dry-run global)
+# ------------------------------------------------------------------------------
+forward_or_run(){
+  local exe="$1"; shift
+  if (( DRY_RUN )); then
+    printf '[DRY] %s %s\n' "$exe" "$(printf '%q ' "$@")"
+  else
+    "$exe" "$@"
+  fi
+}
+
+cmd_remove(){ forward_or_run "$ADM_REMOVE" "$@"; }
+cmd_update(){ forward_or_run "$ADM_UPDATE" "$@"; }
+cmd_clean(){  forward_or_run "$ADM_CLEAN"  "$@"; }
+cmd_query(){  forward_or_run "$ADM_QUERY"  "$@"; }
+cmd_mkinit(){ forward_or_run "$ADM_MKINITRAMFS" "$@"; }
+cmd_paths(){  forward_or_run "$ADM_PATHS"  "$@"; }
+cmd_fetch(){  forward_or_run "$ADM_FETCH"  "$@"; }
+cmd_detect(){ forward_or_run "$ADM_DETECT" "$@"; }
+cmd_constructor(){ forward_or_run "$ADM_CONSTRUCTOR" "$@"; }
+cmd_package(){ forward_or_run "$ADM_PACKAGE" "$@"; }
+cmd_meta(){ forward_or_run "$ADM_META" "$@"; }
+cmd_resolver(){ forward_or_run "$ADM_RESOLVER" "$@"; }
+
+# ------------------------------------------------------------------------------
+# Menu TUI (opcional)
+# ------------------------------------------------------------------------------
+cmd_menu(){
+  local choice
+  choice="$(tui_menu "ADM — Menu" \
+    install "Construir/Instalar" \
+    install_bin "Instalar (binário)" \
+    remove "Remover pacote(s)" \
+    query "Consultar pacotes" \
+    update "Checar updates" \
+    clean "Limpeza" \
+    mkinitramfs "Gerar initramfs" \
+    paths "Perfis/Paths" \
+    exit "Sair")" || return 1
+
+  case "$choice" in
+    install)
+      local pkg; pkg="$(tui_menu "Instalar (build)" a "Digite o nome no prompt seguinte" )" || true
+      read -r -p "Nome do pacote: " pkg || true
+      [[ -n "$pkg" ]] && cmd_install "$pkg" ;;
+    install_bin)
+      read -r -p "Nome do pacote: " pkg || true
+      [[ -n "$pkg" ]] && cmd_install --bin "$pkg" ;;
+    remove)
+      read -r -p "Pacotes (CSV): " lst || true
+      [[ -n "$lst" ]] && cmd_remove "$lst" ;;
+    query)
+      read -r -p "Comando do query (ex: info curl): " sub || true
+      [[ -n "$sub" ]] && cmd_query $sub ;;
+    update)
+      read -r -p "Caminho do metafile: " mf || true
+      [[ -n "$mf" ]] && cmd_update "$mf" ;;
+    clean) cmd_clean --all --yes ;;
+    mkinitramfs) cmd_mkinit --hostonly ;;
+    paths) cmd_paths profile select ;;
+    exit|*) : ;;
+  esac
+}
+# ------------------------------------------------------------------------------
+# Ajuda principal e parsing global
+# ------------------------------------------------------------------------------
+usage_full(){
+  usage_short
+  cat <<'MORE'
+Atalhos úteis:
+  adm help <cmd>            # exibe ajuda do subcomando (passthrough)
+  adm menu                  # abre menu TUI (dialog/whiptail)
+
+Exemplos:
+  adm install zlib                          # build + install de zlib
+  adm install --bin zlib                    # instalar do cache binário
+  adm install --dir=/tmp/pkgs               # instalar diretório de pacotes
+  adm install curl --include-opt --jobs=8   # com opt_deps
+  adm query info curl                       # info unificada
+  adm remove "nginx,openssl" --cascade      # remover com rdeps
+  adm update /usr/src/adm/metafiles/apps/curl/metafile --with-checksums
+  adm mkinitramfs --hostonly --compress=zstd
+  adm clean --all --yes
+MORE
+}
+
+parse_global_flags(){
+  # interpreta flags globais e preserva resto para subcomando
+  local rem=()
+  while (( $# )); do
+    case "$1" in
+      --dry-run) DRY_RUN=1 ;;
+      --yes) ASSUME_YES=1 ;;
+      --jobs=*) GLOBAL_JOBS="${1#*=}" ;;
+      --profile=*) PROFILE="${1#*=}" ;;
+      -h|--help|help) usage_full; exit 0 ;;
+      *) rem+=("$1") ;;
+    esac; shift || true
+  done
+  # devolve remanescentes
+  printf '%s\0' "${rem[@]}"
+}
+
+validate_env(){
+  [[ -d "$ADM_SCRIPTS" ]] || die "scripts ausentes: $ADM_SCRIPTS" 20
+  [[ -x "$ADM_META" ]] || log_w "adm-meta ausente (algumas funções podem falhar)"
+  [[ -x "$ADM_INSTALL_BIN" ]] || log_w "adm-install ausente para modo binário"
+  [[ -x "$ADM_CONSTRUCTOR" ]] || log_w "adm-constructor ausente para builds"
+  [[ -x "$ADM_FETCH" ]] || log_w "adm-fetch ausente"
+  [[ -x "$ADM_DETECT" ]] || log_w "adm-detect ausente"
+  [[ -x "$ADM_PACKAGE" ]] || log_w "adm-package ausente"
+  [[ -x "$ADM_RESOLVER" ]] || log_w "adm-resolver ausente"
+}
+
+# ------------------------------------------------------------------------------
+# Dispatcher
+# ------------------------------------------------------------------------------
+main(){
+  validate_env
+
+  # flags globais
+  mapfile -d '' ARGS < <(parse_global_flags "$@")
+  set -- "${ARGS[@]}"
+
+  local cmd="${1:-}"; shift || true
+  if [[ -z "$cmd" ]]; then usage_short; exit 1; fi
+
+  case "$cmd" in
+    help) help_passthrough "${1:-}"; exit 0 ;;
+    menu) cmd_menu; exit $? ;;
+
+    install)      cmd_install "$@" ;;
+    remove)       cmd_remove "$@" ;;
+    update)       cmd_update "$@" ;;
+    clean)        cmd_clean "$@" ;;
+    query)        cmd_query "$@" ;;
+    mkinitramfs)  cmd_mkinit "$@" ;;
+    paths)        cmd_paths "$@" ;;
+    fetch)        cmd_fetch "$@" ;;
+    detect)       cmd_detect "$@" ;;
+    constructor)  cmd_constructor "$@" ;;
+    package)      cmd_package "$@" ;;
+    meta)         cmd_meta "$@" ;;
+    resolver)     cmd_resolver "$@" ;;
+    io)           forward_or_run "$ADM_IO" "$@" ;;
+    *) log_e "Comando inválido: $cmd"; usage_short; exit 2 ;;
+  esac
+}
+
+main "$@"
