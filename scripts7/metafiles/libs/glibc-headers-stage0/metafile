@@ -1,0 +1,12 @@
+name=glibc-headers-stage0
+version=2.40
+category=libs
+run_deps=
+build_deps=linux-headers-stage0
+opt_deps=
+num_builds=0
+description=Headers mínimos da glibc para bootstrap; instala headers no SYSROOT (stubs opcionais)
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
