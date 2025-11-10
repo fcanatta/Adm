@@ -1,0 +1,12 @@
+name=tar
+version=1.35
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Empacotador de arquivos (GNU tar)
+homepage=https://www.gnu.org/software/tar/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz
