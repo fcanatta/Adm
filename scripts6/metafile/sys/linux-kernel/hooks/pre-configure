@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# linux-kernel: pre-configure
+# - Seleciona ARCH/CROSS_COMPILE se TARGET_TRIPLET estiver definido
+# - Usa .config fornecido (ADM_KERNEL_CONFIG ou arquivo "config" no source) OU gera defconfig
+# - Força olddefconfig para completar opções
+set -Eeuo pipefail
+
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+cd "${ADM_WORK_DIR}"
+
+# Detecta ARCH/CROSS_COMPILE a partir do TARGET_TRIPLET (heurística simples)
+ARCH="${ARCH:-}"
+if [ -z "$ARCH" ] && [ -n "${TARGET_TRIPLET:-}" ]; then
+  case "$TARGET_TRIPLET" in
+    x86_64-* ) ARCH=x86_64 ;;
+    i?86-*   ) ARCH=i386 ;;
+    aarch64-*|arm64-* ) ARCH=arm64 ;;
+    arm-*    ) ARCH=arm ;;
+    riscv64-* ) ARCH=riscv ;;
+    ppc64le-* ) ARCH=powerpc ;;
+    s390x-*  ) ARCH=s390 ;;
+    *        ) ARCH="$(uname -m)";;
+  esac
+fi
+[ -n "$ARCH" ] || ARCH="$(uname -m)"
+
+CROSS_COMPILE="${CROSS_COMPILE:-}"
+if [ -z "$CROSS_COMPILE" ] && [ -n "${TARGET_TRIPLET:-}" ]; then
+  CROSS_COMPILE="${TARGET_TRIPLET}-"
+fi
+
+export ARCH CROSS_COMPILE
+
+# Cria dir de build out-of-tree (suportado por kernel com O=)
+mkdir -p "${ADM_BUILD_DIR}"
+
+# Escolha de .config:
+# 1) Caminho externo via ADM_KERNEL_CONFIG
+# 2) Arquivo "config" dentro da árvore de sources
+# 3) Caso contrário, defconfig padrão da ARCH
+if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "${ADM_KERNEL_CONFIG}" ]; then
+  cp -f "${ADM_KERNEL_CONFIG}" "${ADM_BUILD_DIR}/.config"
+elif [ -f "${ADM_WORK_DIR}/config" ]; then
+  cp -f "${ADM_WORK_DIR}/config" "${ADM_BUILD_DIR}/.config"
+fi
+
+# Se ainda não temos .config, roda defconfig
+if [ ! -f "${ADM_BUILD_DIR}/.config" ]; then
+  make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" defconfig
+fi
+
+# Completa opções novas sem interação
+make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" olddefconfig
