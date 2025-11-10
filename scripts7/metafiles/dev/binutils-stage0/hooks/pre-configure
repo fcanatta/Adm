@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+CONFIGURE_EXTRAS+=" --prefix=/usr --with-sysroot=${SYSROOT} --target=${TARGET}"
+CONFIGURE_EXTRAS+=" --disable-nls --disable-werror --disable-gold --disable-gprofng"
+CONFIGURE_EXTRAS+=" --enable-deterministic-archives --disable-multilib"
+export CONFIGURE_EXTRAS
