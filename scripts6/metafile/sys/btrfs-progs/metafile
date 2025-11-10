@@ -1,0 +1,12 @@
+name=btrfs-progs
+version=6.10.1
+category=sys
+run_deps=
+build_deps=zstd,lz4
+opt_deps=lzo
+num_builds=0
+description=Ferramentas para Btrfs (mkfs.btrfs, btrfs, btrfsck)
+homepage=https://btrfs.wiki.kernel.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v6.10.1.tar.xz
