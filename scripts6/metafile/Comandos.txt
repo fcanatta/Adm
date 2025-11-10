@@ -1,3 +1,8 @@
+# Ordem recomendada
+adm-cli install):
+kmod → eudev → coreutils → bash → grep → sed → gawk → findutils → diffutils → make → util-linux → shadow → procps-ng → psmisc → file → tar → gzip → bzip2 → xz → zstd → less → which → libcap → attr → acl
+
+
 adm-cli install gmp --prefer-build
 adm-cli install mpfr --prefer-build
 adm-cli install mpc --prefer-build
@@ -13,3 +18,62 @@ adm-cli install glibc-final --prefer-build
 adm-cli install gcc-final --prefer-build
 
 adm-verify --stage=final
+
+# Hooks genéricos 
+# autotools/pre-configure
+#!/usr/bin/env bash
+# Hook genérico AUTOTOOLS - pre-configure
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+
+cd "$ADM_WORK_DIR"
+mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+
+conf=( --prefix=/usr --disable-static )
+"$ADM_WORK_DIR/configure" "${conf[@]}"
+
+# Autotools/pre-build
+#!/usr/bin/env bash
+# Hook genérico AUTOTOOLS - pre-build
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+cd "$ADM_BUILD_DIR"
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+
+# Autotools/post-install
+#!/usr/bin/env bash
+# Hook genérico AUTOTOOLS - post-install
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+cd "$ADM_BUILD_DIR"
+make DESTDIR="$ADM_DESTDIR" install
+rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
+
+# Makefile/pre-configure
+#!/usr/bin/env bash
+# Hook genérico MAKEFILE-PURO - pre-configure (noop)
+set -Eeuo pipefail
+# Nada a fazer
+
+# Makefile/pre-build
+#!/usr/bin/env bash
+# Hook genérico MAKEFILE-PURO - pre-build
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}"
+cd "$ADM_WORK_DIR"
+make -j"${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+
+# Makefile/post-install 
+#!/usr/bin/env bash
+# Hook genérico MAKEFILE-PURO - post-install (tenta variáveis padrão)
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
+cd "$ADM_WORK_DIR"
+# Tenta DESTDIR, PREFIX=/usr
+make DESTDIR="$ADM_DESTDIR" PREFIX=/usr install 2>/dev/null || \
+make install PREFIX="$ADM_DESTDIR/usr" 2>/dev/null || \
+{ echo "Instalação MAKEFILE precisou de alvo específico; ajuste este hook para o pacote."; exit 2; }
+rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
+
+
+
