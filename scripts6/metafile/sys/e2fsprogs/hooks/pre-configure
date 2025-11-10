@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"; mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+conf=( --prefix=/usr --disable-static --enable-elf-shlibs )
+"$ADM_WORK_DIR/configure" "${conf[@]}"
