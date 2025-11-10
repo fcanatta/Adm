@@ -1,0 +1,4 @@
+adm-cli install musl-final --prefer-build
+
+# Depois valide
+adm-verify --stage=final --libc=musl
