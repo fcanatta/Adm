@@ -17,3 +17,13 @@ adm install gcc-stage1-musl    --profile=minimum --jobs=8
 # Ordem glibc
 adm install glibc-stage1        --profile=minimum --jobs=8
 adm install gcc-stage1-glibc    --profile=minimum --jobs=8
+
+# Musl
+# stage0 já pronto: linux-headers-stage0, binutils-stage0, gcc-stage0, musl-headers-stage0
+adm install musl-stage1        --profile=minimum --jobs=8
+adm install gcc-stage1-musl    --profile=minimum --jobs=8
+
+# Glibc
+# stage0 já pronto: linux-headers-stage0, binutils-stage0, gcc-stage0, glibc-headers-stage0
+adm install glibc-stage1       --profile=minimum --jobs=8
+adm install gcc-stage1-glibc   --profile=minimum --jobs=8
