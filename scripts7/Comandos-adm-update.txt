@@ -1,0 +1,15 @@
+# 1) Checar e gerar update com SHA256:
+ /usr/src/adm/scripts/adm-update /usr/src/adm/metafiles/apps/busybox/metafile --with-checksums
+
+# 2) Permitir pré-releases (rc/beta) e apenas imprimir resultados (sem gravar arquivo):
+ /usr/src/adm/scripts/adm-update /usr/src/adm/metafiles/apps/nginx/metafile --allow-pre --print-only
+
+# 3) Sobrepor fontes (CSV) ao gerar o metafile de update:
+ /usr/src/adm/scripts/adm-update /usr/src/adm/metafiles/apps/htop/metafile \
+   --sources="https://github.com/htop-dev/htop/archive/refs/tags/v{NEW}.tar.gz"
+
+# 4) Sem baixar (deixa sha256sums vazio):
+ /usr/src/adm/scripts/adm-update /usr/src/adm/metafiles/libs/zlib/metafile --no-download
+
+# 5) Forçar saída 0 mesmo se não houver novidades (útil em CI):
+ /usr/src/adm/scripts/adm-update /usr/src/adm/metafiles/apps/curl/metafile --force
