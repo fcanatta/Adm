@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Hook genérico MESON - post-install
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+meson install -C "$ADM_BUILD_DIR" --destdir "$ADM_DESTDIR"
+rm -rf "$ADM_DESTDIR/usr/share/info" "$ADM_DESTDIR/usr/share/doc" 2>/dev/null || true
