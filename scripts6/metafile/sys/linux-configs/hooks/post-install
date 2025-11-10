@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# linux-configs: post-install
+# - Gera .config para cada perfil (se o árvore do kernel estiver acessível)
+# - Cria symlink current.config para o perfil ativo
+# - Deixa tudo pronto para o hook do linux-kernel usar
+
+set -Eeuo pipefail
+: "${ADM_DESTDIR:?}"
+
+CFGDIR="${ADM_DESTDIR}/usr/src/adm/kernel-configs"
+STATED="${ADM_DESTDIR}/usr/src/adm/state"
+mkdir -p "${CFGDIR}" "${STATED}"
+
+# Caminhos possíveis onde o source do kernel costuma estar extraído durante build
+# (Se não existir, apenas deixa os fragmentos e kcfg prontos.)
+CANDS=( "${ADM_WORK_DIR:-}" "/usr/src/linux" "/usr/src/kernel" )
+
+gen_from_kcfg () {
+  local name="$1" kcfg="${CFGDIR}/${name}.kcfg"
+  local out="${CFGDIR}/${name}.config"
+  [ -s "$kcfg" ] || return 0
+  # Tenta encontrar merge_config.sh
+  local merge=""
+  for base in "${CANDS[@]}"; do
+    [ -d "$base/scripts/kconfig" ] && [ -x "$base/scripts/kconfig/merge_config.sh" ] && { merge="$base/scripts/kconfig/merge_config.sh"; break; }
+  done
+  if [ -x "$merge" ]; then
+    # Cria temp com lista de fragmentos absolutizados
+    tmp="$(mktemp)"
+    while read -r frag; do
+      [ -z "$frag" ] && continue
+      echo "${CFGDIR}/${frag}" >> "$tmp"
+    done < "$kcfg"
+    # Usa defconfig da ARCH local; como fallback, olddefconfig depois
+    # Precisamos de uma árvore de kernel para mesclar adequadamente.
+    # Aqui usamos o primeiro CAND existente.
+    srcbase=""
+    for base in "${CANDS[@]}"; do [ -d "$base" ] && { srcbase="$base"; break; }; done
+    if [ -n "$srcbase" ]; then
+      # Gera .config fundindo fragmentos sobre defconfig
+      pushd "$srcbase" >/dev/null
+      make mrproper >/dev/null 2>&1 || true
+      make defconfig >/dev/null
+      bash "$merge" -m .config $(cat "$tmp") >/dev/null
+      make olddefconfig >/dev/null
+      cp -f .config "$out"
+      popd >/dev/null
+    else
+      # Sem árvore de kernel: apenas concatena fragmentos como base para uso posterior
+      cat "$tmp" >/dev/null 2>&1 || true
+      # Cria um .config placeholder com header informativo
+      {
+        echo "# Placeholder: gere este perfil quando o source do kernel estiver disponível."
+        echo "# Execute: (no source do kernel) scripts/kconfig/merge_config.sh -m .config \\"
+        while read -r frag; do
+          [ -z "$frag" ] || echo "#   ${CFGDIR}/${frag} \\"
+        done < "$kcfg"
+      } > "$out"
+    fi
+    rm -f "$tmp"
+  else
+    # Sem merge_config.sh: deixa os fragmentos e instruções
+    {
+      echo "# merge_config.sh não encontrado. Para gerar:"
+      echo "# 1) Entre no source do kernel"
+      echo "# 2) make defconfig && scripts/kconfig/merge_config.sh -m .config \\"
+      while read -r frag; do
+        [ -z "$frag" ] || echo "#    ${CFGDIR}/${frag} \\"
+      done < "$kcfg"
+      echo "# 3) make olddefconfig"
+    } > "$out"
+  fi
+}
+
+# Gera/atualiza .config de cada perfil
+for p in minimal server desktop; do
+  gen_from_kcfg "$p" || true
+done
+
+# Cria symlink 'current.config' apontando para o perfil ativo (default: minimal)
+CUR_LINK="${CFGDIR}/current.config"
+CUR_STATE_FILE="${STATED}/kernel-config.current"
+
+# Se o state aponta para um caminho já existente, respeita.
+if [ -s "$CUR_STATE_FILE" ]; then
+  TARGET="$(cat "$CUR_STATE_FILE" || true)"
+else
+  TARGET="${CFGDIR}/minimal.config"
+  echo "$TARGET" > "$CUR_STATE_FILE"
+fi
+
+# Se o TARGET não existir, volta para minimal
+[ -f "$TARGET" ] || TARGET="${CFGDIR}/minimal.config"
+
+ln -sfn "$TARGET" "$CUR_LINK"
