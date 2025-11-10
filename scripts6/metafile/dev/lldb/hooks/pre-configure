@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# lldb: build da pasta lldb/ do monorepo
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_DIR"
+cd "$ADM_BUILD_DIR"
+
+# Localiza Python
+PY_BIN="${PY_BIN:-python3}"
+PY_EXEC="$("$PY_BIN" -c 'import sys;print(sys.executable)' 2>/dev/null || echo /usr/bin/python3)"
+PY_INC_DIR="$("$PY_BIN" -c 'import sysconfig;print(sysconfig.get_paths()["include"])' 2>/dev/null || echo /usr/include/python3)"
+PY_LIB_DIR="$("$PY_BIN" -c 'import sysconfig;print(sysconfig.get_config_var("LIBDIR") or "/usr/lib")' 2>/dev/null || echo /usr/lib)"
+
+CMAKE_OPTS=(
+  -G Ninja
+  -DCMAKE_INSTALL_PREFIX=/usr
+  -DCMAKE_BUILD_TYPE=Release
+  -DLLDB_ENABLE_PYTHON=ON
+  -DPYTHON_EXECUTABLE="${PY_EXEC}"
+  -DPYTHON_INCLUDE_DIR="${PY_INC_DIR}"
+  -DPYTHON_LIBRARY="${PY_LIB_DIR}"
+  -DLLVM_ENABLE_RUNTIMES=""
+  -DLLVM_ENABLE_PROJECTS="lldb"
+  -DLLVM_INCLUDE_TESTS=OFF
+  -DLLVM_INCLUDE_DOCS=OFF
+)
+
+# Terminfo opcional (em musl pode evitar ncurses)
+if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists ncurses; then
+  CMAKE_OPTS+=( -DLLDB_ENABLE_CURSES=ON )
+else
+  CMAKE_OPTS+=( -DLLDB_ENABLE_CURSES=OFF )
+fi
+
+cmake -S "$ADM_WORK_DIR/llvm" -B "$ADM_BUILD_DIR" "${CMAKE_OPTS[@]}"
