@@ -1,0 +1,12 @@
+name=ninja
+version=1.11.1
+category=dev
+run_deps=
+build_deps=cmake
+opt_deps=
+num_builds=0
+description=Executor de builds Ninja
+homepage=https://ninja-build.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/ninja-build/ninja/archive/refs/tags/v1.11.1.tar.gz
