@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"
+mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+
+# Flags mínimas; --enable-optimizations pode demorar (POC: deixa OFF)
+"$ADM_WORK_DIR/configure" --prefix=/usr --enable-shared --without-ensurepip || \
+"$ADM_WORK_DIR/configure" --prefix=/usr --without-ensurepip
