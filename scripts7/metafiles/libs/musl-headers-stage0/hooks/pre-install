@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+export ADM_SKIP_DEFAULT_INSTALL=1
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+$MAKE -j"$NPROC"
+# musl possui alvo próprio de headers com DESTDIR; instale no SYSROOT dentro do DESTDIR:
+$MAKE install-headers DESTDIR="${DESTDIR}${SYSROOT}"
