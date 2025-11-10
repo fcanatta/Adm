@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-mkinitramfs
+# Gera initramfs para kernel(s) com suporte a root custom, chroot, init detection,
+# firmware, autodetecção de drivers e hooks.
+#
+# Exit codes:
+#  0 ok; 1 uso; 20 env; 43 IO; 50 detecção; 60 build; 70 comp;
+#  71 falta busybox/util; 72 root inválido
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+
+have_io=0 ; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ ((have_io)) && "$ADM_IO" log info "$@" || printf '[INFO] %s\n' "$*"; }
+log_o(){ ((have_io)) && "$ADM_IO" log ok   "$@" || printf  '[OK] %s\n' "$*"; }
+log_w(){ ((have_io)) && "$ADM_IO" log warn "$@" || printf '[WARN] %s\n' "$*"; }
+log_e(){ ((have_io)) && "$ADM_IO" log error "$@" || printf '[ERR] %s\n' "$*"; }
+section(){ ((have_io)) && "$ADM_IO" section "$@" || printf '\n== %s ==\n' "$*"; }
+
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ readlink -f -- "$1" 2>/dev/null || echo "$1"; }
+# Defaults
+ROOT="/"                # --root
+CHROOT=0                # --chroot
+KVER=""                 # --kver
+OUT=""                  # --output
+COMPRESS="zstd"         # --compress=zstd|xz|lz4|gzip|none
+HOSTONLY=1              # --hostonly
+WITH_NETWORK=0          # --with-network
+FIRMWARE_MODE="auto"    # --firmware=auto|all|none
+ADD_MODS=""             # --add-mods=csv
+ADD_BINS=""             # --add-bins=csv
+ADD_LIBS=""             # --add-libs=csv
+INIT_OVERRIDE=""        # --init=systemd|openrc|runit|s6|sysv
+TMPBASE="${TMPDIR:-/tmp}"
+WORKDIR=""
+KEEP_WORK=0
+KMODCONF=()             # --kmod-conf=/path
+HOOKS_PRE=()            # --hook-pre=/path
+HOOKS_POST=()           # --hook-post=/path
+UMASK_DIRS=0755
+UMASK_FILES=0644
+
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_to_arr(){ local s="${1:-}"; s="${s//[[:space:]]/}"; IFS=, read -r -a _ARR <<< "$s"; }
+join(){ local IFS=:; echo "$*"; }
