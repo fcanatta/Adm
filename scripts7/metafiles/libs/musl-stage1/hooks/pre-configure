@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+# musl usa ./configure próprio; CROSS_COMPILE controla o toolchain
+export CROSS_COMPILE="${TARGET}-"
+CONFIGURE_EXTRAS+=" --prefix=/usr"
+export CONFIGURE_EXTRAS
