@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Hook genérico AUTOTOOLS - pre-configure
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+
+cd "$ADM_WORK_DIR"
+mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+
+conf=( --prefix=/usr --disable-static )
+"$ADM_WORK_DIR/configure" "${conf[@]}"
