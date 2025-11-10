@@ -1,0 +1,12 @@
+name=eudev
+version=3.2.14
+category=sys
+run_deps=kmod
+build_deps=kmod
+opt_deps=
+num_builds=0
+description=Gerenciador de dispositivos dinâmicos (udev) independente de systemd
+homepage=https://github.com/gentoo/eudev
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/gentoo/eudev/archive/refs/tags/v3.2.14.tar.gz
