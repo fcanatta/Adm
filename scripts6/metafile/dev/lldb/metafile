@@ -1,0 +1,12 @@
+name=lldb
+version=18.1.8
+category=dev
+run_deps=python3
+build_deps=llvm-project,cmake,ninja,python3
+opt_deps=ncurses
+num_builds=0
+description=LLDB (debugger do LLVM) com integração a Python
+homepage=https://llvm.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.tar.gz
