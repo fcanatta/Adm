@@ -1,0 +1,11 @@
+# Caminho musl
+adm install linux-headers-stage0      --profile=minimum --jobs=8
+adm install binutils-stage0           --profile=minimum --jobs=8
+adm install gcc-stage0                --profile=minimum --jobs=8
+adm install musl-headers-stage0       --profile=minimum --jobs=8
+
+# Caminho glibc
+adm install linux-headers-stage0      --profile=minimum --jobs=8
+adm install binutils-stage0           --profile=minimum --jobs=8
+adm install gcc-stage0                --profile=minimum --jobs=8
+adm install glibc-headers-stage0      --profile=minimum --jobs=8
