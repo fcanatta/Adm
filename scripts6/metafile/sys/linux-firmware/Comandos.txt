@@ -1,0 +1,14 @@
+# instala tudo
+adm-cli install linux-firmware --prefer-build
+
+# instala alguns conjuntos
+ADM_FIRMWARE_FILTER="amdgpu iwlwifi" \
+  adm-cli install linux-firmware --prefer-build
+
+# tudo mais excluir algo
+ADM_FIRMWARE_EXCLUDE="qcom/*" \
+  adm-cli install linux-firmware --prefer-build
+
+# harantir license
+ADM_FIRMWARE_KEEP_LICENSES=1 \
+  adm-cli install linux-firmware
