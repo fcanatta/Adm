@@ -1,0 +1,12 @@
+name=which
+version=2.21
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Localizador de executáveis no PATH
+homepage=https://www.gnu.org/software/which/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/which/which-2.21.tar.gz
