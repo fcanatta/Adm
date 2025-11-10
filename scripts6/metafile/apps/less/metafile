@@ -1,0 +1,12 @@
+name=less
+version=661
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Paginador de arquivos (less)
+homepage=https://www.greenwoodsoftware.com/less/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://www.greenwoodsoftware.com/less/less-661.tar.gz
