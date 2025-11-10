@@ -1,1 +1,18 @@
 adm-cli install linux-kernel --prefer-build
+
+# Adicionar config 
+ADM_KERNEL_CONFIG=/usr/src/linux/custom.config \
+adm-cli install linux-kernel --prefer-build
+
+# Ou exportar
+export ADM_KERNEL_CONFIG=/usr/src/linux/custom.config
+adm-cli install linux-kernel --prefer-build
+
+# Alternar entre 2
+ADM_KERNEL_CONFIG=/usr/src/adm/configs/minimal.config adm-cli install linux-kernel
+ADM_KERNEL_CONFIG=/usr/src/adm/configs/full.config    adm-cli install linux-kernel
+
+#Ou criar/editar
+/usr/src/adm/env/kernel.conf
+# Com
+ADM_KERNEL_CONFIG=/usr/src/linux/custom.config
