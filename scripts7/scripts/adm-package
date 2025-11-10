@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-package
+# Empacotamento a partir de DESTDIR, reempacote, e conversão de .deb/.rpm → pacote ADM.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20 ambiente inválido (ferramentas)
+# 43 IO/perm (destdir/caminhos)
+# 70 pacote vazio/inválido
+# 71 conversão DEB falhou
+# 72 conversão RPM falhou
+# 73 formato alvo inválido
+# 74 metafile inválido
+
+set -Eeuo pipefail
+umask 022
+
+# -------------------------------------------------------------------
+# Caminhos e integrações
+# -------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+
+mkdir -p "$ADM_PACKAGES" "$ADM_LOGS" "$ADM_STATE" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+exists(){ command -v "$1" >/dev/null 2>&1; }
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+size_bytes(){ stat -c %s "$1" 2>/dev/null || wc -c <"$1" 2>/dev/null || echo 0; }
+
+arch_guess(){ uname -m 2>/dev/null || echo unknown; }
+libc_guess(){
+  if command -v ldd >/dev/null 2>&1; then
+    ldd --version 2>&1 | grep -qi musl && { echo musl; return; }
+    ldd --version 2>&1 | grep -qi 'gnu libc\|glibc' && { echo glibc; return; }
+  fi
+  echo unknown
+}
+
+sha256_cmd(){
+  if command -v sha256sum >/dev/null 2>&1; then echo "sha256sum"; return; fi
+  if command -v shasum >/dev/null 2>&1; then echo "shasum -a 256"; return; fi
+  echo ""
+}
+
+# -------------------------------------------------------------------
+# Validações de ambiente
+# -------------------------------------------------------------------
+validate_env(){
+  [[ -x "$ADM_META" ]] || die "adm-meta não encontrado: $ADM_META" 20
+  command -v tar >/dev/null 2>&1 || die "tar não encontrado" 20
+  # compressores (pelo menos um)
+  if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
+    die "nem zstd nem xz disponíveis para compressão" 20
+  fi
+}
+
+# -------------------------------------------------------------------
+# Metafile → contexto
+# -------------------------------------------------------------------
+NAME=""; VERSION=""; CATEGORY=""; RUN_DEPS=""; BUILD_DEPS=""; OPT_DEPS=""; RELEASE=""
+load_meta(){
+  local metaf="$1"
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")" || die "Falha ao ler metafile: $metaf" 74
+  NAME="$ADM_NAME"; VERSION="$ADM_VERSION"; CATEGORY="$ADM_CATEGORY"
+  RUN_DEPS="${ADM_RUN_DEPS:-}"; BUILD_DEPS="${ADM_BUILD_DEPS:-}"; OPT_DEPS="${ADM_OPT_DEPS:-}"
+  RELEASE="${ADM_NUM_BUILDS:-0}"
+  [[ -n "$NAME" && -n "$VERSION" ]] || die "metafile sem name/version: $metaf" 74
+}
+
+# -------------------------------------------------------------------
+# Arquivar DESTDIR → pacote ADM
+# -------------------------------------------------------------------
+manifest_and_meta_files(){
+  local dest="$1"
+  # Manifesto: lista de arquivos
+  ( cd "$dest" && find . -type f | LC_ALL=C sort ) > "$dest/.ADM_MANIFEST" 2>/dev/null || true
+  # Metainfo: chave/valor úteis
+  {
+    echo "name=$NAME"
+    echo "version=$VERSION"
+    echo "release=${RELEASE:-0}"
+    echo "category=$CATEGORY"
+    echo "arch=${ARCH:-$(arch_guess)}"
+    echo "libc=${LIBC:-$(libc_guess)}"
+    echo "run_deps=$(csv_norm "$RUN_DEPS")"
+    echo "build_deps=$(csv_norm "$BUILD_DEPS")"
+    echo "opt_deps=$(csv_norm "$OPT_DEPS")"
+    echo "timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$dest/.ADM_META"
+}
+
+# Seleção de compressor
+detect_format(){
+  local fmt="$1"  # zst|xz|auto
+  if [[ "$fmt" == "auto" ]]; then
+    command -v zstd >/dev/null 2>&1 && echo zst && return
+    command -v xz >/dev/null 2>&1 && echo xz && return
+  elif [[ "$fmt" == "zst" || "$fmt" == "xz" ]]; then
+    echo "$fmt"; return
+  fi
+  echo "auto"
+}
+
+# Nome final do pacote
+compose_pkg_name(){
+  local arch="${ARCH:-$(arch_guess)}"
+  local libc="${LIBC:-$(libc_guess)}"
+  local rel="${RELEASE:-0}"
+  local fmt="$1" # zst/xz
+  printf '%s-%s-%s-%s-%s.tar.%s' "$NAME" "$VERSION" "$rel" "$arch" "$libc" "$fmt"
+}
+
+# Compactadores
+tar_write(){
+  local src="$1" out="$2"
+  case "$out" in
+    *.tar.zst) tar --zstd -C "$src" -cf "$out" . ;;
+    *.tar.xz)  tar -I xz  -C "$src" -cf "$out" . ;;
+    *) return 73 ;;
+  esac
+}
+
+# Checagens de DESTDIR
+validate_destdir(){
+  local dest="$1"
+  [[ -d "$dest" ]] || die "DESTDIR não existe: $dest" 43
+  # Pelo menos 1 arquivo regular
+  local n; n=$(find "$dest" -type f | head -n1 | wc -l | awk '{print $1}')
+  (( n > 0 )) || die "DESTDIR está vazio (nada para empacotar)" 70
+}
+
+# -------------------------------------------------------------------
+# Empacotar
+# -------------------------------------------------------------------
+package_from_destdir(){
+  local dest="$1" outdir="$2" fmt="$3"
+  validate_destdir "$dest"
+  manifest_and_meta_files "$dest"
+  fmt="$(detect_format "$fmt")"; [[ "$fmt" != "auto" ]] || fmt="zst"
+  local outname; outname="$(compose_pkg_name "$fmt")"
+  local outfile="$outdir/$outname"
+  mkdir -p "$outdir" || die "Falha criar diretório de saída: $outdir" 43
+
+  local tok=""
+  if ((have_io)); then tok="$("$ADM_IO" spinner start "Empacotando $outname")" || true; fi
+  tar_write "$dest" "$outfile" || { ((have_io)) && "$ADM_IO" spinner stop "$tok" --error "Falha ao empacotar" || true; die "Falha ao gerar pacote" 43; }
+  ((have_io)) && "$ADM_IO" spinner stop "$tok" --ok "Pacote pronto" || true
+
+  # checksum opcional
+  local SH="$(sha256_cmd)"
+  if [[ -n "$SH" ]]; then
+    "$SH" "$outfile" > "${outfile}.sha256" 2>/dev/null || true
+  fi
+
+  # Saídas
+  local sz; sz="$(size_bytes "$outfile")"
+  printf 'PACKAGE_PATH=%s\n' "$outfile"
+  printf 'PACKAGE_NAME=%s\n' "$(basename "$outfile")"
+  printf 'PACKAGE_FORMAT=%s\n' "$fmt"
+  printf 'PACKAGE_SIZE=%s\n' "$sz"
+  log_o "Pacote gerado" path="$outfile" size="$sz"
+}
+
+# -------------------------------------------------------------------
+# Reempacotar (de um diretório, ou converter formato de um ADM)
+# -------------------------------------------------------------------
+repack_dir(){
+  local dir="$1" metaf="$2" outdir="$3" fmt="$4"
+  [[ -n "$metaf" ]] || die "repack-dir requer --metafile=..." 1
+  load_meta "$metaf"
+  ARCH="${ARCH:-$(arch_guess)}"; LIBC="${LIBC:-$(libc_guess)}"
+  RELEASE="${RELEASE:-${ADM_NUM_BUILDS:-0}}"
+  package_from_destdir "$dir" "$outdir" "$fmt"
+}
+
+repack_adm(){
+  local pkg="$1" outdir="$2" fmt="$3"
+  [[ -f "$pkg" ]] || die "Pacote ADM inexistente: $pkg" 43
+  [[ "$pkg" =~ \.tar\.(zst|xz)$ ]] || die "Pacote ADM deve ser .tar.zst ou .tar.xz" 73
+  # extrai para tmp e reempacota com formato escolhido
+  local tmp; tmp="$(mktemp -d)"
+  tar -xf "$pkg" -C "$tmp" || die "Falha ao extrair pacote ADM" 43
+
+  # tenta ler .ADM_META para popular variáveis (se existir)
+  if [[ -f "$tmp/.ADM_META" ]]; then
+    NAME="$(grep -E '^name=' "$tmp/.ADM_META" | head -n1 | cut -d= -f2- || true)"
+    VERSION="$(grep -E '^version=' "$tmp/.ADM_META" | head -n1 | cut -d= -f2- || true)"
+    RELEASE="$(grep -E '^release=' "$tmp/.ADM_META" | head -n1 | cut -d= -f2- || true)"
+    ARCH="$(grep -E '^arch=' "$tmp/.ADM_META" | head -n1 | cut -d= -f2- || true)"
+    LIBC="$(grep -E '^libc=' "$tmp/.ADM_META" | head -n1 | cut -d= -f2- || true)"
+  fi
+  [[ -n "$NAME" && -n "$VERSION" ]] || { # tenta deduzir do nome do arquivo
+    local base; base="$(basename "$pkg")"
+    # <name>-<version>-<release>-<arch>-<libc>.tar.*
+    if [[ "$base" =~ ^([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)-([0-9]+)-([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)\.tar\.(zst|xz)$ ]]; then
+      NAME="${BASH_REMATCH[1]}"; VERSION="${BASH_REMATCH[2]}"; RELEASE="${BASH_REMATCH[3]}"; ARCH="${BASH_REMATCH[4]}"; LIBC="${BASH_REMATCH[5]}"
+    else
+      die "Não foi possível inferir metadados do pacote existente; forneça um metafile e use --repack-dir" 73
+    fi
+  }
+  package_from_destdir "$tmp" "$outdir" "$fmt"
+  rm -rf "$tmp" || true
+}
+# -------------------------------------------------------------------
+# Conversão de .deb → ADM
+# -------------------------------------------------------------------
+deb_to_adm(){
+  local deb="$1" outdir="$2" fmt="$3" name="${4:-}" version="${5:-}" release="${6:-0}" arch="${7:-}" libc="${8:-}"
+  [[ -f "$deb" ]] || die "Arquivo .deb não encontrado: $deb" 43
+
+  local tmp; tmp="$(mktemp -d)"
+  if command -v dpkg-deb >/dev/null 2>&1; then
+    dpkg-deb -x "$deb" "$tmp/root" || { rm -rf "$tmp"; die "dpkg-deb falhou" 71; }
+    dpkg-deb -e "$deb" "$tmp/DEBIAN" || true
+  else
+    # fallback manual: ar + tar
+    command -v ar >/dev/null 2>&1 || die "dpkg-deb não disponível e 'ar' ausente" 20
+    ( cd "$tmp" && ar x "$deb" ) || { rm -rf "$tmp"; die "Falha ar x" 71; }
+    local data; data="$(ls "$tmp"/data*.tar.* 2>/dev/null | head -n1 || true)"
+    [[ -n "$data" ]] || { rm -rf "$tmp"; die "data.tar.* ausente no .deb" 71; }
+    mkdir -p "$tmp/root"
+    tar -xf "$data" -C "$tmp/root" || { rm -rf "$tmp"; die "Falha extraindo data.tar.*" 71; }
+  fi
+
+  # nome/versão
+  if [[ -z "$name" || -z "$version" ]]; then
+    if command -v dpkg-deb >/dev/null 2>&1; then
+      name="${name:-$(dpkg-deb -f "$deb" Package 2>/dev/null || true)}"
+      version="${version:-$(dpkg-deb -f "$deb" Version 2>/dev/null || true)}"
+      arch="${arch:-$(dpkg-deb -f "$deb" Architecture 2>/dev/null || true)}"
+    fi
+    name="${name:-$(basename "$deb" .deb)}"
+    version="${version:-0}"
+  fi
+
+  NAME="$name"; VERSION="$version"; RELEASE="$release"
+  ARCH="${arch:-$(arch_guess)}"; LIBC="${libc:-$(libc_guess)}"
+  RUN_DEPS=""; BUILD_DEPS=""; OPT_DEPS=""
+
+  package_from_destdir "$tmp/root" "$outdir" "$fmt"
+  rm -rf "$tmp" || true
+}
+
+# -------------------------------------------------------------------
+# Conversão de .rpm → ADM
+# -------------------------------------------------------------------
+rpm_to_adm(){
+  local rpm="$1" outdir="$2" fmt="$3" name="${4:-}" version="${5:-}" release="${6:-0}" arch="${7:-}" libc="${8:-}"
+  [[ -f "$rpm" ]] || die "Arquivo .rpm não encontrado: $rpm" 43
+  command -v rpm2cpio >/dev/null 2>&1 || die "rpm2cpio ausente para converter RPM" 20
+  command -v cpio >/dev/null 2>&1 || die "cpio ausente para converter RPM" 20
+
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/root"
+  ( rpm2cpio "$rpm" | ( cd "$tmp/root" && cpio -idm --quiet ) ) || { rm -rf "$tmp"; die "Falha extraindo RPM" 72; }
+
+  # nome/versão heurística
+  if [[ -z "$name" || -z "$version" ]]; then
+    local base; base="$(basename "$rpm")"
+    # tentativa: nome-versao-release.arquitetura.rpm
+    if [[ "$base" =~ ^(.+)-([0-9][A-Za-z0-9._-]*)-([0-9][A-Za-z0-9._-]*)\.([A-Za-z0-9._+-]+)\.rpm$ ]]; then
+      name="${name:-${BASH_REMATCH[1]}}"
+      version="${version:-${BASH_REMATCH[2]}}"
+      release="${release:-${BASH_REMATCH[3]}}"
+      arch="${arch:-${BASH_REMATCH[4]}}"
+    else
+      name="${name:-$base}"
+      version="${version:-0}"
+    fi
+  fi
+
+  NAME="$name"; VERSION="$version"; RELEASE="$release"
+  ARCH="${arch:-$(arch_guess)}"; LIBC="${libc:-$(libc_guess)}"
+  RUN_DEPS=""; BUILD_DEPS=""; OPT_DEPS=""
+
+  package_from_destdir "$tmp/root" "$outdir" "$fmt"
+  rm -rf "$tmp" || true
+}
+
+# -------------------------------------------------------------------
+# CLI / Dispatcher
+# -------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-package — empacota um DESTDIR em pacote ADM (.tar.zst|.tar.xz), reempacota e converte .deb/.rpm.
+
+Uso principal (a partir do build):
+  adm-package <metafile> --destdir=/caminho/do/destdir [--format=zst|xz] [--output-dir=/usr/src/adm/packages] [--release=N] [--arch=...] [--libc=...]
+
+Reempacotar:
+  adm-package --repack-dir=/path/dir --metafile=/.../metafile [--format=zst|xz] [--output-dir=...]
+  adm-package --repack-adm=/path/pkg.tar.{zst|xz} [--format=zst|xz] [--output-dir=...]
+
+Converter:
+  adm-package --from-deb=/path/file.deb [--format=zst|xz] [--output-dir=...] [--name=...] [--version=...] [--release=N] [--arch=...] [--libc=...]
+  adm-package --from-rpm=/path/file.rpm [--format=zst|xz] [--output-dir=...] [--name=...] [--version=...] [--release=N] [--arch=...] [--libc=...]
+
+Saída (KEY=VAL):
+  PACKAGE_PATH=/usr/src/adm/packages/<name>-<version>-<release>-<arch>-<libc>.tar.<fmt>
+  PACKAGE_NAME=<arquivo>
+  PACKAGE_FORMAT=zst|xz
+  PACKAGE_SIZE=<bytes>
+
+Exit codes:
+  0 ok; 1 uso; 20 ambiente; 43 IO; 70 vazio; 71 deb; 72 rpm; 73 formato; 74 metafile
+USAGE
+}
+
+main(){
+  validate_env
+
+  local metafile="" destdir="" fmt="auto" outdir="$ADM_PACKAGES"
+  local repack_dir="" repack_pkg=""
+  local from_deb="" from_rpm=""
+  ARCH=""; LIBC=""
+  local name_override="" version_override="" release_override=""
+
+  while (( $# )); do
+    case "$1" in
+      --destdir=*) destdir="${1#*=}" ;;
+      --format=*) fmt="${1#*=}" ;;
+      --output-dir=*) outdir="${1#*=}" ;;
+      --repack-dir=*) repack_dir="${1#*=}" ;;
+      --repack-adm=*) repack_pkg="${1#*=}" ;;
+      --from-deb=*) from_deb="${1#*=}" ;;
+      --from-rpm=*) from_rpm="${1#*=}" ;;
+      --arch=*) ARCH="${1#*=}" ;;
+      --libc=*) LIBC="${1#*=}" ;;
+      --name=*) name_override="${1#*=}" ;;
+      --version=*) version_override="${1#*=}" ;;
+      --release=*) release_override="${1#*=}" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) metafile="$1" ;;
+    esac; shift || true
+  done
+
+  # Rotas exclusivas
+  if [[ -n "$from_deb" || -n "$from_rpm" || -n "$repack_dir" || -n "$repack_pkg" ]]; then
+    # conversões/reempacotes ignoram metafile (exceto --repack-dir exige --metafile)
+    :
+  else
+    [[ -n "$metafile" && -n "$destdir" ]] || { usage; exit 1; }
+    load_meta "$metafile"
+    [[ -n "$release_override" ]] && RELEASE="$release_override"
+    [[ -n "$ARCH" ]] || ARCH="$(arch_guess)"
+    [[ -n "$LIBC" ]] || LIBC="$(libc_guess)"
+    package_from_destdir "$destdir" "$outdir" "$fmt"
+    exit 0
+  fi
+
+  # Reempacotar diretório
+  if [[ -n "$repack_dir" ]]; then
+    [[ -n "$metafile" ]] || { log_e "Requer --metafile com --repack-dir"; exit 1; }
+    repack_dir="$repack_dir"; [[ -d "$repack_dir" ]] || die "Diretório inexistente: $repack_dir" 43
+    load_meta "$metafile"
+    [[ -n "$release_override" ]] && RELEASE="$release_override"
+    [[ -n "$ARCH" ]] || ARCH="$(arch_guess)"
+    [[ -n "$LIBC" ]] || LIBC="$(libc_guess)"
+    repack_dir "$repack_dir" "$metafile" "$outdir" "$fmt"
+    exit 0
+  fi
+
+  # Reempacotar ADM (mudar formato)
+  if [[ -n "$repack_pkg" ]]; then
+    [[ -f "$repack_pkg" ]] || die "Pacote inexistente: $repack_pkg" 43
+    repack_adm "$repack_pkg" "$outdir" "$fmt"
+    exit 0
+  fi
+
+  # Converter DEB
+  if [[ -n "$from_deb" ]]; then
+    NAME="$name_override"; VERSION="$version_override"; RELEASE="${release_override:-0}"
+    [[ -n "$ARCH" ]] || ARCH="$(arch_guess)"
+    [[ -n "$LIBC" ]] || LIBC="$(libc_guess)"
+    deb_to_adm "$from_deb" "$outdir" "$fmt" "$NAME" "$VERSION" "$RELEASE" "$ARCH" "$LIBC"
+    exit 0
+  fi
+
+  # Converter RPM
+  if [[ -n "$from_rpm" ]]; then
+    NAME="$name_override"; VERSION="$version_override"; RELEASE="${release_override:-0}"
+    [[ -n "$ARCH" ]] || ARCH="$(arch_guess)"
+    [[ -n "$LIBC" ]] || LIBC="$(libc_guess)"
+    rpm_to_adm "$from_rpm" "$outdir" "$fmt" "$NAME" "$VERSION" "$RELEASE" "$ARCH" "$LIBC"
+    exit 0
+  fi
+
+  usage; exit 1
+}
+
+main "$@"
