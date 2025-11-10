@@ -1,0 +1,559 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-paths
+# Purpose: canonical paths & profile manager for ADM build system
+# Shell: bash (requires arrays & [[ ]])
+# Exit codes:
+#  0  ok
+#  1  usage/args
+# 10  create dirs/perm
+# 11  profile not found/invalid
+# 12  sanity check failed
+# 13  toolchain incompatible
+# 14  libc target unsupported
+# 15  write state error
+# 16  invalid custom profile file
+
+set -Eeuo pipefail
+
+#-----------------------------
+# Utilities (minimal; no adm-io dep)
+#-----------------------------
+SCRIPT_NAME="${0##*/}"
+ADM_ROOT_DEFAULT="/usr/src/adm"
+umask 022
+
+err() { printf 'ERROR: %s\n' "$*" >&2; }
+inf() { printf '%s\n' "$*"; }
+die() { local c=${2:-1}; err "$1"; exit "$c"; }
+
+# join by delimiter
+join_by() { local IFS="$1"; shift; echo "$*"; }
+
+# Key=Val writer (only ascii)
+kv_echo() { printf '%s=%s\n' "$1" "$2"; }
+
+# Ensure a file write atomically
+atomic_write() {
+  local path="$1"; local tmp="${path}.tmp.$$"
+  cat >"$tmp"
+  mv -f "$tmp" "$path"
+}
+
+#-----------------------------
+# Paths & constants
+#-----------------------------
+ADM_ROOT="${ADM_ROOT:-$ADM_ROOT_DEFAULT}"
+ADM_SCRIPTS="$ADM_ROOT/scripts"
+ADM_SOURCES="$ADM_ROOT/sources"
+ADM_WORK="$ADM_ROOT/work"
+ADM_DESTDIR="$ADM_ROOT/destdir"
+ADM_PACKAGES="$ADM_ROOT/packages"
+ADM_LOGS="$ADM_ROOT/logs"
+ADM_STATE="$ADM_ROOT/state"
+ADM_CACHE="$ADM_ROOT/cache"
+ADM_UPDATE="$ADM_ROOT/update"
+ADM_METAFILES="$ADM_ROOT/metafiles"
+ADM_PROFILES_DIR="$ADM_CACHE/profiles"
+ADM_TMP="$ADM_ROOT/tmp"
+
+STATE_PROFILE_CURRENT="$ADM_STATE/profile.current"
+STATE_PROFILE_SELECTED="$ADM_STATE/profile.selected"
+STATE_PROFILE_ENV="$ADM_STATE/profile.env"
+STATE_LIBC_DETECTED="$ADM_STATE/libc.detected"
+STATE_TOOLCHAIN_DETECTED="$ADM_STATE/toolchain.detected"
+STATE_ARCH_DETECTED="$ADM_STATE/arch.detected"
+
+# Allowed keys in profile files
+read -r -d '' PROFILE_KEYS <<'EOF' || true
+ADM_CFLAGS
+ADM_CXXFLAGS
+ADM_ASFLAGS
+ADM_LDFLAGS
+ADM_CPPFLAGS
+ADM_FFLAGS
+ADM_RUSTFLAGS
+ADM_GOFLAGS
+ADM_MARCH
+ADM_MTUNE
+ADM_LTO
+ADM_THINLTO
+ADM_PGO
+ADM_HARDENING
+ADM_LINKER
+ADM_USE_LLD
+ADM_STRIP_BINARIES
+ADM_JOBS
+ADM_WARN_AS_ERR
+ADM_SAFE_MATH
+LIBC_TARGET
+TOOLCHAIN_TARGET
+EOF
+
+#-----------------------------
+# mkdirs (idempotent)
+#-----------------------------
+ensure_dirs() {
+  local d
+  for d in "$ADM_ROOT" "$ADM_SCRIPTS" "$ADM_SOURCES" "$ADM_WORK" "$ADM_DESTDIR" \
+           "$ADM_PACKAGES" "$ADM_LOGS" "$ADM_STATE" "$ADM_CACHE" "$ADM_UPDATE" \
+           "$ADM_METAFILES" "$ADM_TMP" "$ADM_PROFILES_DIR"
+  do
+    [[ -d "$d" ]] || mkdir -p "$d" || die "Falha ao criar diretório: $d" 10
+  done
+}
+
+#-----------------------------
+# Detections
+#-----------------------------
+detect_arch() {
+  local a; a="$(uname -m || true)"
+  [[ -n "${a:-}" ]] || a="unknown"
+  echo "$a"
+}
+
+detect_libc() {
+  # try ldd banner
+  if command -v ldd >/dev/null 2>&1; then
+    if ldd --version 2>&1 | grep -qi musl; then echo "musl"; return 0; fi
+    if ldd --version 2>&1 | grep -qi glibc; then echo "glibc"; return 0; fi
+    if ldd --version 2>&1 | grep -qi 'GNU libc'; then echo "glibc"; return 0; fi
+  fi
+  # heuristics: strings on libc
+  if command -v strings >/dev/null 2>&1; then
+    local libc_path
+    libc_path=$(ldd --version 2>/dev/null | sed -n '1p' || true)
+    if echo "$libc_path" | grep -qi musl; then echo "musl"; return 0; fi
+  fi
+  echo "unknown"
+}
+
+detect_toolchain() {
+  local has_gcc=0 has_clang=0
+  command -v gcc >/dev/null 2>&1 && has_gcc=1
+  command -v clang >/dev/null 2>&1 && has_clang=1
+  if (( has_gcc && has_clang )); then echo "both"; return 0; fi
+  (( has_gcc )) && { echo "gcc"; return 0; }
+  (( has_clang )) && { echo "clang"; return 0; }
+  echo "none"
+}
+
+#-----------------------------
+# Built-in profiles (templates)
+# Render to env given libc/toolchain
+#-----------------------------
+render_builtin_profile() {
+  # args: name minimal|normal|aggressive  libc glibc|musl  tool gcc|clang
+  local name="$1" libc="$2" tool="$3"
+  # Defaults for all
+  local ADM_CFLAGS="" ADM_CXXFLAGS="" ADM_ASFLAGS="" ADM_LDFLAGS="" ADM_CPPFLAGS=""
+  local ADM_FFLAGS="" ADM_RUSTFLAGS="" ADM_GOFLAGS=""
+  local ADM_MARCH="" ADM_MTUNE="" ADM_LTO="off" ADM_THINLTO="0" ADM_PGO="off"
+  local ADM_HARDENING="basic" ADM_LINKER="ld" ADM_USE_LLD="0"
+  local ADM_STRIP_BINARIES="1" ADM_JOBS="" ADM_WARN_AS_ERR="0" ADM_SAFE_MATH="0"
+
+  case "$name" in
+    minimal)
+      ADM_CFLAGS="-O1 -g0 -pipe"
+      ADM_CXXFLAGS="$ADM_CFLAGS"
+      ADM_HARDENING="basic"
+      ADM_LTO="off"
+      ADM_LINKER="ld"
+      ;;
+    normal)
+      ADM_CFLAGS="-O2 -pipe -fstack-protector-strong -D_FORTIFY_SOURCE=2"
+      ADM_CXXFLAGS="$ADM_CFLAGS"
+      ADM_HARDENING="strong"
+      ADM_LTO="off"
+      # prefer ld; allow lld if default tool is clang
+      [[ "$tool" == "clang" ]] && { ADM_LINKER="lld"; ADM_USE_LLD="1"; } || true
+      ;;
+    aggressive)
+      ADM_CFLAGS="-O3 -pipe -fno-semantic-interposition -fomit-frame-pointer"
+      ADM_CXXFLAGS="$ADM_CFLAGS"
+      ADM_MARCH="-march=native -mtune=native"
+      ADM_LTO="auto"
+      ADM_THINLTO="1"
+      ADM_HARDENING="basic"
+      ADM_LINKER="lld"; ADM_USE_LLD="1"
+      ADM_PGO="off"  # habilite por pacote/ambiente
+      ADM_SAFE_MATH="0"
+      # musl tighten: avoid Ofast by default; rely on O3
+      if [[ "$libc" == "musl" ]]; then
+        ADM_LTO="auto" # keep
+        # Keep conservative: some interposition flags may break; we maintain as-is
+      fi
+      ;;
+    *)
+      die "Perfil embutido desconhecido: $name" 11
+      ;;
+  esac
+
+  # Toolchain-specific nits
+  if [[ "$tool" == "gcc" ]]; then
+    : # gcc is fine; -fuse-ld= only if lld chosen and supported
+  elif [[ "$tool" == "clang" ]]; then
+    : # prefer lld if selected
+  else
+    die "Toolchain alvo inválido: $tool" 13
+  fi
+
+  # Jobs default
+  ADM_JOBS="${ADM_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+  # Emit env (only KEY=VAL)
+  kv_echo ADM_CFLAGS "$(echo "$ADM_CFLAGS $ADM_MARCH" | sed 's/  */ /g')"
+  kv_echo ADM_CXXFLAGS "$(echo "$ADM_CXXFLAGS $ADM_MARCH" | sed 's/  */ /g')"
+  kv_echo ADM_ASFLAGS "$ADM_ASFLAGS"
+  kv_echo ADM_LDFLAGS "$ADM_LDFLAGS"
+  kv_echo ADM_CPPFLAGS "$ADM_CPPFLAGS"
+  kv_echo ADM_FFLAGS "$ADM_FFLAGS"
+  kv_echo ADM_RUSTFLAGS "$ADM_RUSTFLAGS"
+  kv_echo ADM_GOFLAGS "$ADM_GOFLAGS"
+  kv_echo ADM_MARCH "$ADM_MARCH"
+  kv_echo ADM_MTUNE "$ADM_MTUNE"
+  kv_echo ADM_LTO "$ADM_LTO"
+  kv_echo ADM_THINLTO "$ADM_THINLTO"
+  kv_echo ADM_PGO "$ADM_PGO"
+  kv_echo ADM_HARDENING "$ADM_HARDENING"
+  kv_echo ADM_LINKER "$ADM_LINKER"
+  kv_echo ADM_USE_LLD "$ADM_USE_LLD"
+  kv_echo ADM_STRIP_BINARIES "$ADM_STRIP_BINARIES"
+  kv_echo ADM_JOBS "$ADM_JOBS"
+  kv_echo ADM_WARN_AS_ERR "$ADM_WARN_AS_ERR"
+  kv_echo ADM_SAFE_MATH "$ADM_SAFE_MATH"
+  kv_echo LIBC_TARGET "$libc"
+  kv_echo TOOLCHAIN_TARGET "$tool"
+}
+
+# Validate custom profile file (KEY=VAL lines, keys allowed)
+validate_custom_profile_file() {
+  local f="$1"
+  [[ -f "$f" ]] || die "Arquivo de perfil custom não existe: $f" 16
+  local line k v
+  while IFS= read -r line || [[ -n "${line:-}" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^# ]] && continue
+    [[ "$line" =~ ^[A-Za-z0-9_]+=.*$ ]] || die "Linha inválida no perfil: $line" 16
+    k="${line%%=*}"
+    v="${line#*=}"
+    # key must be in allowed list
+    if ! grep -qx "$k" <<<"$PROFILE_KEYS"; then
+      err "Aviso: chave '$k' não é suportada — será ignorada"
+    fi
+    # Prevent exports/commands
+    [[ "$k" =~ ^(export|source|\.)$ ]] && die "Chave proibida no perfil: $k" 16
+  done < "$f"
+}
+
+# Merge current env with an env lines stream.
+# We will keep only whitelisted keys; duplicates last-wins.
+consolidate_env_stream() {
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  {
+    while IFS= read -r k; do
+      [[ -z "$k" ]] && continue
+      local v
+      v=$(grep -E "^${k}=" "$tmp" | tail -n1 | cut -d= -f2-)
+      [[ -n "${v:-}" ]] && kv_echo "$k" "$v"
+    done <<<"$PROFILE_KEYS"
+  }
+  rm -f "$tmp"
+}
+
+#-----------------------------
+# Sanity check compilation
+#-----------------------------
+sanity_check_compile() {
+  # Requires: state/profile.env present
+  [[ -f "$STATE_PROFILE_ENV" ]] || die "profile.env ausente; rode: adm profile apply" 12
+
+  # Load env
+  # shellcheck disable=SC1090
+  set -a; source "$STATE_PROFILE_ENV"; set +a
+
+  local cc cxx ldflag="" ldopt=""
+  case "${TOOLCHAIN_TARGET:-}" in
+    gcc)  cc="gcc";  cxx="g++" ;;
+    clang) cc="clang"; cxx="clang++" ;;
+    *) die "Toolchain inválida para sanity check: ${TOOLCHAIN_TARGET:-}" 13 ;;
+  esac
+
+  # fuse-ld if lld chosen and compiler supports
+  if [[ "${ADM_USE_LLD:-0}" == "1" ]]; then
+    if [[ "$TOOLCHAIN_TARGET" == "gcc" ]]; then
+      ldopt="-fuse-ld=lld"
+    else
+      ldopt="-fuse-ld=lld"
+    fi
+  fi
+
+  mkdir -p "$ADM_TMP"
+  local cfile="$ADM_TMP/hello.c"
+  local bin="$ADM_TMP/hello.bin"
+
+  cat >"$cfile" <<'C'
+#include <stdio.h>
+int main(){ puts("ok"); return 0; }
+C
+
+  # Compile
+  set +e
+  "$cc" $ldopt ${ADM_CPPFLAGS:+$ADM_CPPFLAGS} ${ADM_CFLAGS:+$ADM_CFLAGS} -o "$bin" "$cfile" ${ADM_LDFLAGS:+$ADM_LDFLAGS} >/dev/null 2>&1
+  local rc=$?
+  set -e
+  (( rc == 0 )) || die "Sanity check: falha ao compilar com $cc (rc=$rc)" 12
+
+  # Run (best effort; may fail in cross env)
+  if [[ -x "$bin" ]]; then
+    set +e
+    "$bin" >/dev/null 2>&1
+    rc=$?
+    set -e
+    (( rc == 0 )) || err "Sanity check: execução falhou (rc=$rc) — ignorando execução"
+  fi
+  rm -f "$cfile" "$bin"
+}
+
+#-----------------------------
+# Commands
+#-----------------------------
+cmd_paths_init() {
+  ensure_dirs
+  # Detect and write states once
+  local libc tool arch
+  libc="$(detect_libc)"; tool="$(detect_toolchain)"; arch="$(detect_arch)"
+  printf '%s\n' "$libc" | atomic_write "$STATE_LIBC_DETECTED"
+  printf '%s\n' "$tool" | atomic_write "$STATE_TOOLCHAIN_DETECTED"
+  printf '%s\n' "$arch" | atomic_write "$STATE_ARCH_DETECTED"
+  kv_echo ADM_ROOT "$ADM_ROOT"
+}
+
+list_custom_profiles() {
+  ls -1 "$ADM_PROFILES_DIR"/*.env 2>/dev/null | sed 's#.*/##; s#\.env$##' || true
+}
+
+cmd_profile_list() {
+  ensure_dirs
+  local selected="(nenhum)"
+  [[ -f "$STATE_PROFILE_CURRENT" ]] && selected="$(cat "$STATE_PROFILE_CURRENT" 2>/dev/null || echo '(corrompido)')"
+  inf "Perfis embutidos: minimal, normal, aggressive"
+  local custom; custom="$(list_custom_profiles)"
+  if [[ -n "$custom" ]]; then
+    inf "Perfis custom: $(join_by ', ' $custom)"
+  else
+    inf "Perfis custom: (nenhum)"
+  fi
+  inf "Selecionado: $selected"
+}
+
+emit_env_for_profile() {
+  # args: profile libc tool
+  local name="$1" libc="$2" tool="$3"
+
+  case "$name" in
+    minimal|normal|aggressive)
+      render_builtin_profile "$name" "$libc" "$tool"
+      ;;
+    *)
+      # custom profile file should exist
+      local f="$ADM_PROFILES_DIR/${name}.env"
+      [[ -f "$f" ]] || die "Perfil custom não encontrado: $name" 11
+      validate_custom_profile_file "$f"
+      # emit file contents filtered to allowed keys (last key wins)
+      consolidate_env_stream <"$f"
+      ;;
+  esac
+}
+
+cmd_profile_show() {
+  ensure_dirs
+  local name="${1:-}"
+  local libc="${2:-}"
+  local tool="${3:-}"
+  if [[ -z "$name" ]]; then
+    # show current if exists
+    if [[ -f "$STATE_PROFILE_CURRENT" ]]; then
+      name="$(cut -d'|' -f1 "$STATE_PROFILE_CURRENT" 2>/dev/null || true)"
+      libc="$(cut -d'|' -f2 "$STATE_PROFILE_CURRENT" 2>/dev/null || true)"
+      tool="$(cut -d'|' -f3 "$STATE_PROFILE_CURRENT" 2>/dev/null || true)"
+    else
+      die "Informe <perfil> ou aplique um perfil primeiro" 1
+    fi
+  fi
+  [[ -n "$libc" ]] || libc="$(cat "$STATE_LIBC_DETECTED" 2>/dev/null || echo unknown)"
+  [[ -n "$tool" ]] || tool="$(cat "$STATE_TOOLCHAIN_DETECTED" 2>/dev/null || echo none)"
+  emit_env_for_profile "$name" "$libc" "$tool"
+}
+
+cmd_profile_select() {
+  ensure_dirs
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || die "Uso: adm profile select <perfil> [--libc=glibc|musl] [--toolchain=gcc|clang]" 1
+  local libc tool
+  libc="$(cat "$STATE_LIBC_DETECTED" 2>/dev/null || echo unknown)"
+  tool="$(cat "$STATE_TOOLCHAIN_DETECTED" 2>/dev/null || echo none)"
+  # parse flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --libc=*) libc="${1#*=}";;
+      --toolchain=*) tool="${1#*=}";;
+      *) die "Flag desconhecida: $1" 1;;
+    esac
+    shift
+  done
+  [[ "$libc" == "glibc" || "$libc" == "musl" ]] || die "LIBC inválida: $libc" 14
+  [[ "$tool" == "gcc" || "$tool" == "clang" ]] || die "Toolchain inválida: $tool" 13
+
+  # basic check: profile exists
+  if [[ "$name" != "minimal" && "$name" != "normal" && "$name" != "aggressive" ]]; then
+    [[ -f "$ADM_PROFILES_DIR/${name}.env" ]] || die "Perfil custom não encontrado: $name" 11
+  fi
+
+  printf '%s|%s|%s\n' "$name" "$libc" "$tool" | atomic_write "$STATE_PROFILE_SELECTED"
+  inf "Selecionado: $name (libc=$libc, toolchain=$tool)"
+}
+
+cmd_profile_apply() {
+  ensure_dirs
+  local force=0
+  [[ "${1:-}" == "--force" ]] && { force=1; shift; }
+
+  [[ -f "$STATE_PROFILE_SELECTED" ]] || die "Nenhum perfil selecionado. Use: adm profile select ..." 11
+  local name libc tool
+  name="$(cut -d'|' -f1 "$STATE_PROFILE_SELECTED")"
+  libc="$(cut -d'|' -f2 "$STATE_PROFILE_SELECTED")"
+  tool="$(cut -d'|' -f3 "$STATE_PROFILE_SELECTED")"
+
+  # Render env
+  local env_stream
+  env_stream="$(emit_env_for_profile "$name" "$libc" "$tool")"
+
+  # Consolidate to whitelist and write profile.env
+  consolidate_env_stream <<<"$env_stream" | atomic_write "$STATE_PROFILE_ENV" || die "Falha ao gravar profile.env" 15
+
+  # Write current marker
+  printf '%s|%s|%s\n' "$name" "$libc" "$tool" | atomic_write "$STATE_PROFILE_CURRENT" || die "Falha ao gravar profile.current" 15
+
+  # Sanity check
+  if ! sanity_check_compile; then
+    if (( force )); then
+      err "Sanity check reprovado — aplicando mesmo assim (--force)"
+    else
+      # revert current/env
+      rm -f "$STATE_PROFILE_CURRENT" "$STATE_PROFILE_ENV"
+      die "Sanity check reprovado; perfil não aplicado" 12
+    fi
+  fi
+
+  inf "Perfil aplicado: $name (libc=$libc, toolchain=$tool)"
+}
+
+cmd_profile_add() {
+  ensure_dirs
+  local name="" from=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from=*) from="${1#*=}";;
+      *) if [[ -z "$name" ]]; then name="$1"; else die "Uso: adm profile add <nome> --from=<arquivo.env>" 1; fi;;
+    esac
+    shift
+  done
+  [[ -n "$name" && -n "$from" ]] || die "Uso: adm profile add <nome> --from=<arquivo.env>" 1
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "Nome de perfil inválido" 16
+  validate_custom_profile_file "$from"
+  cp -f "$from" "$ADM_PROFILES_DIR/${name}.env" || die "Falha ao instalar perfil custom" 16
+  inf "Perfil custom adicionado: $name"
+}
+
+cmd_profile_remove() {
+  ensure_dirs
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Uso: adm profile remove <nome>" 1
+  [[ -f "$ADM_PROFILES_DIR/${name}.env" ]] || die "Perfil custom não existe: $name" 11
+  rm -f "$ADM_PROFILES_DIR/${name}.env" || die "Falha ao remover perfil: $name" 16
+  inf "Perfil custom removido: $name"
+}
+
+cmd_paths_echo() {
+  ensure_dirs
+  kv_echo ADM_ROOT "$ADM_ROOT"
+  kv_echo ADM_SOURCES "$ADM_SOURCES"
+  kv_echo ADM_WORK "$ADM_WORK"
+  kv_echo ADM_DESTDIR "$ADM_DESTDIR"
+  kv_echo ADM_PACKAGES "$ADM_PACKAGES"
+  kv_echo ADM_LOGS "$ADM_LOGS"
+  kv_echo ADM_STATE "$ADM_STATE"
+  kv_echo ADM_CACHE "$ADM_CACHE"
+  kv_echo ADM_UPDATE "$ADM_UPDATE"
+  kv_echo ADM_METAFILES "$ADM_METAFILES"
+  kv_echo ADM_SCRIPTS "$ADM_SCRIPTS"
+  if [[ -f "$STATE_PROFILE_CURRENT" && -f "$STATE_PROFILE_ENV" ]]; then
+    local name libc tool
+    name="$(cut -d'|' -f1 "$STATE_PROFILE_CURRENT")"
+    libc="$(cut -d'|' -f2 "$STATE_PROFILE_CURRENT")"
+    tool="$(cut -d'|' -f3 "$STATE_PROFILE_CURRENT")"
+    kv_echo ADM_PROFILE "$name"
+    kv_echo LIBC_TARGET "$libc"
+    kv_echo TOOLCHAIN_TARGET "$tool"
+    # emit env file contents
+    cat "$STATE_PROFILE_ENV"
+  fi
+  # detected states
+  [[ -f "$STATE_ARCH_DETECTED"    ]] && kv_echo ADM_ARCH "$(cat "$STATE_ARCH_DETECTED")"
+  [[ -f "$STATE_LIBC_DETECTED"    ]] && kv_echo LIBC_DETECTED "$(cat "$STATE_LIBC_DETECTED")"
+  [[ -f "$STATE_TOOLCHAIN_DETECTED" ]] && kv_echo TOOLCHAIN_DETECTED "$(cat "$STATE_TOOLCHAIN_DETECTED")"
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  adm paths init
+  adm paths echo
+  adm profile list
+  adm profile show [<perfil> [glibc|musl] [gcc|clang]]
+  adm profile select <perfil> [--libc=glibc|musl] [--toolchain=gcc|clang]
+  adm profile apply [--force]
+  adm profile add <nome> --from=<arquivo.env>
+  adm profile remove <nome>
+
+Notes:
+  - Perfis embutidos: minimal, normal, aggressive.
+  - Perfis custom ficam em: $ADM_PROFILES_DIR/<nome>.env
+  - Arquivos de estado em: $ADM_STATE
+USAGE
+}
+
+#-----------------------------
+# Dispatcher
+#-----------------------------
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    paths)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        init)  cmd_paths_init "$@";;
+        echo)  cmd_paths_echo "$@";;
+        *) usage; exit 1;;
+      esac
+      ;;
+    profile)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        list)   cmd_profile_list "$@";;
+        show)   cmd_profile_show "$@";;
+        select) cmd_profile_select "$@";;
+        apply)  cmd_profile_apply "$@";;
+        add)    cmd_profile_add "$@";;
+        remove) cmd_profile_remove "$@";;
+        *) usage; exit 1;;
+      esac
+      ;;
+    -h|--help|help|"") usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
