@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+cmake --build "$ADM_BUILD_DIR" -j "${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
