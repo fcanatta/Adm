@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# linux-kernel: pre-build
+# - Compila kernel (image) + módulos
+# - Tolera ausência de pahole/BTF (desliga se necessário)
+set -Eeuo pipefail
+
+: "${ADM_WORK_DIR:?}"; : "${ADM_BUILD_DIR:?}"
+
+# Se pahole não existe, tenta desabilitar BTF para evitar falhas
+if ! command -v pahole >/dev/null 2>&1; then
+  # Edita .config para desativar BTF silenciosamente (se habilitado)
+  if grep -q '^CONFIG_DEBUG_INFO_BTF=y' "${ADM_BUILD_DIR}/.config" 2>/dev/null; then
+    sed -i 's/^CONFIG_DEBUG_INFO_BTF=y/# CONFIG_DEBUG_INFO_BTF is not set/' "${ADM_BUILD_DIR}/.config"
+    make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" olddefconfig
+  fi
+fi
+
+# Compilação
+JOBS="${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
+make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" -j"${JOBS}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" all
+make -C "${ADM_WORK_DIR}" O="${ADM_BUILD_DIR}" -j"${JOBS}" ARCH="${ARCH}" CROSS_COMPILE="${CROSS_COMPILE}" modules
