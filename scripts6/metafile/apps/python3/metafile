@@ -1,0 +1,12 @@
+name=python3
+version=3.12.6
+category=apps
+run_deps=
+build_deps=openssl,zlib,xz,sqlite
+opt_deps=readline,libffi,bzip2
+num_builds=0
+description=Python 3 (runtime e ferramenta de build)
+homepage=https://www.python.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://www.python.org/ftp/python/3.12.6/Python-3.12.6.tgz
