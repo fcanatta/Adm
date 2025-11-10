@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_DESTDIR:?}"
+cd "$ADM_WORK_DIR"
+make PREFIX=/usr DESTDIR="$ADM_DESTDIR" install
+rm -rf "$ADM_DESTDIR/usr/share/doc" "$ADM_DESTDIR/usr/share/info" 2>/dev/null || true
