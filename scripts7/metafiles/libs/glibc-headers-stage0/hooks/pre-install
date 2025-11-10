@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+export ADM_SKIP_DEFAULT_INSTALL=1
+: "${MAKE:=make}"
+# Instalar apenas headers no SYSROOT
+$MAKE install-headers DESTDIR="${DESTDIR}${SYSROOT}"
+
+# (Opcional) Stubs mínimos para destravar um 'gcc pass2' com glibc.
+# Só tente criar se já existir um $TARGET-gcc do stage0 no PATH.
+if command -v "${TARGET:-}-gcc" >/dev/null 2>&1; then
+  mkdir -p "${DESTDIR}${SYSROOT}/usr/lib"
+  cat > crt0_min.S <<'EOF'
+  .globl _start
+_start:
+  ret
+EOF
+  "${TARGET}-gcc" -nostdlib -nostartfiles -c crt0_min.S -o crt1.o  || true
+  cp -f crt1.o "${DESTDIR}${SYSROOT}/usr/lib/" || true
+  # Placeholders leves para crti/crtn (variam por arch; deixar em branco é aceitável neste estágio)
+  : > "${DESTDIR}${SYSROOT}/usr/lib/crti.o" || true
+  : > "${DESTDIR}${SYSROOT}/usr/lib/crtn.o" || true
+  # Linker script vazio como marcador de libc (evita hard fails em alguns checks)
+  echo '/* stub for bootstrap */' > "${DESTDIR}${SYSROOT}/usr/lib/libc.so" || true
+fi
