@@ -1,0 +1,12 @@
+name=gcc-stage1-musl
+version=14.2.0
+category=dev
+run_deps=
+build_deps=binutils-stage0,musl-stage1
+opt_deps=
+num_builds=0
+description=GCC stage1 para o target, agora linkando contra a musl do SYSROOT
+homepage=https://gcc.gnu.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
