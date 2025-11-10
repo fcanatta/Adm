@@ -1,0 +1,464 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-update
+# Verifica upstream por versão mais nova e gera metafile em /usr/src/adm/update/<name>/metafile
+#
+# Exit codes:
+#  0  ok (metafile escrito ou nada a fazer)
+#  1  uso/args
+# 20  ambiente inválido (ferramentas)
+# 43  IO/perm
+# 50  upstream não detectado/indisponível
+# 51  nenhuma versão superior encontrada
+# 60  falha ao baixar fontes (quando --with-checksums)
+# 70  metafile inválido
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_UPDATES="${ADM_UPDATES:-$ADM_ROOT/update}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+
+mkdir -p "$ADM_UPDATES" "$ADM_SOURCES" "$ADM_LOGS" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+exists(){ command -v "$1" >/dev/null 2>&1; }
+
+# -----------------------------------------------------------------------------
+# Helpers básicos
+# -----------------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+csv_join(){ local IFS=,; printf '%s' "$*"; }
+lower(){ tr '[:upper:]' '[:lower:]'; }
+
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+
+sha256_cmd(){
+  if command -v sha256sum >/dev/null 2>&1; then echo "sha256sum"; return; fi
+  if command -v shasum >/dev/null 2>&1; then echo "shasum -a 256"; return; fi
+  echo ""
+}
+
+fetch_cmd(){
+  if command -v aria2c >/dev/null 2>&1; then echo "aria2c -x16 -s16 -k1M -q"; return; fi
+  if command -v curl >/dev/null 2>&1; then echo "curl -fsSL"; return; fi
+  if command -v wget >/dev/null 2>&1; then echo "wget -qO-"; return; fi
+  echo ""
+}
+
+# -----------------------------------------------------------------------------
+# Leitura do metafile
+# -----------------------------------------------------------------------------
+NAME=""; VERSION=""; CATEGORY=""; RUN_DEPS=""; BUILD_DEPS=""; OPT_DEPS=""; HOMEPAGE=""; MAINTAINER=""; DESCRIPTION=""; SOURCES=""; SHA256SUMS=""
+load_meta(){
+  local metaf="$1"
+  [[ -x "$ADM_META" ]] || die "adm-meta não encontrado: $ADM_META" 20
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")" || die "Falha ao ler metafile: $metaf" 70
+  NAME="$ADM_NAME"; VERSION="$ADM_VERSION"; CATEGORY="$ADM_CATEGORY"
+  RUN_DEPS="${ADM_RUN_DEPS:-}"; BUILD_DEPS="${ADM_BUILD_DEPS:-}"; OPT_DEPS="${ADM_OPT_DEPS:-}"
+  HOMEPAGE="${ADM_HOMEPAGE:-}"; MAINTAINER="${ADM_MAINTAINER:-}"; DESCRIPTION="${ADM_DESCRIPTION:-}"
+  SOURCES="${ADM_SOURCES:-}"; SHA256SUMS="${ADM_SHA256SUMS:-}"
+  [[ -n "$NAME" && -n "$VERSION" ]] || die "metafile sem name/version" 70
+}
+
+# -----------------------------------------------------------------------------
+# Comparação de versões (semver-ish, com pre-releases)
+# retorna: 0 se a==b, 1 se a>b, 2 se a<b
+# -----------------------------------------------------------------------------
+ver_norm(){
+  # normaliza: separa não numéricos, trata rc/beta/alpha como sufixo ordenável
+  local v="$(printf '%s' "$1" | sed 's/^v//' )"
+  v="$(printf '%s' "$v" | sed -E 's/[-_]?rc/-.rc/g; s/[-_]?beta/-.beta/g; s/[-_]?alpha/-.alpha/g')"
+  printf '%s' "$v"
+}
+cmp_seg(){
+  # compara dois segmentos (numérico tem prioridade)
+  local a="$1" b="$2"
+  if [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]]; then
+    ((10#$a > 10#$b)) && return 1
+    ((10#$a < 10#$b)) && return 2
+    return 0
+  fi
+  # pré-releases ordenam antes de vazio
+  [[ -z "$a" && -n "$b" ]] && return 2
+  [[ -n "$a" && -z "$b" ]] && return 1
+  # ordem lexicográfica estável
+  if [[ "$a" > "$b" ]]; then return 1; elif [[ "$a" < "$b" ]]; then return 2; else return 0; fi
+}
+ver_cmp(){
+  local A B
+  A="$(ver_norm "$1")"; B="$(ver_norm "$2")"
+  IFS='.-_' read -r -a SA <<< "$A"
+  IFS='.-_' read -r -a SB <<< "$B"
+  local n=$(( ${#SA[@]} > ${#SB[@]} ? ${#SA[@]} : ${#SB[@]} ))
+  local i
+  for ((i=0;i<n;i++)); do
+    cmp_seg "${SA[i]:-0}" "${SB[i]:-0}"; local r=$?
+    (( r==0 )) || return $r
+  done
+  return 0
+}
+
+is_prerelease(){
+  [[ "$1" =~ (alpha|beta|rc|pre) ]]
+}
+
+# -----------------------------------------------------------------------------
+# Detectores de upstream (fonte de versões)
+# -----------------------------------------------------------------------------
+UP_KIND=""; UP_URL=""; UP_OWNER=""; UP_REPO=""
+detect_from_sources(){
+  local srcs; srcs="$(printf '%s' "$SOURCES" | tr ',' '\n')"
+  while read -r u; do
+    u="$(trim "$u")"; [[ -z "$u" ]] && continue
+    if [[ "$u" =~ github\.com/([^/]+)/([^/]+) ]]; then
+      UP_KIND="github"; UP_OWNER="${BASH_REMATCH[1]}"; UP_REPO="${BASH_REMATCH[2]%%.git}"; UP_URL="https://github.com/${UP_OWNER}/${UP_REPO}"; return 0
+    fi
+    if [[ "$u" =~ gitlab\.com/([^/]+)/([^/]+) ]]; then
+      UP_KIND="gitlab"; UP_OWNER="${BASH_REMATCH[1]}"; UP_REPO="${BASH_REMATCH[2]%%.git}"; UP_URL="https://gitlab.com/${UP_OWNER}/${UP_REPO}"; return 0
+    fi
+    if [[ "$u" =~ sourceforge\.net/projects/([^/]+)/? ]]; then
+      UP_KIND="sourceforge"; UP_OWNER="${BASH_REMATCH[1]}"; UP_REPO=""; UP_URL="https://sourceforge.net/projects/${UP_OWNER}/files/"; return 0
+    fi
+    if [[ "$u" =~ \.git($|\?) ]]; then
+      UP_KIND="git"; UP_URL="$u"; return 0
+    fi
+    if [[ "$u" =~ ^https?:// ]]; then
+      UP_KIND="http"; UP_URL="$u"; return 0
+    fi
+  done <<< "$srcs"
+  return 1
+}
+detect_from_homepage(){
+  local h="$HOMEPAGE"
+  [[ -z "$h" ]] && return 1
+  if [[ "$h" =~ github\.com/([^/]+)/([^/]+) ]]; then
+    UP_KIND="github"; UP_OWNER="${BASH_REMATCH[1]}"; UP_REPO="${BASH_REMATCH[2]%%.git}"; UP_URL="$h"; return 0
+  fi
+  if [[ "$h" =~ gitlab\.com/([^/]+)/([^/]+) ]]; then
+    UP_KIND="gitlab"; UP_OWNER="${BASH_REMATCH[1]}"; UP_REPO="${BASH_REMATCH[2]%%.git}"; UP_URL="$h"; return 0
+  fi
+  if [[ "$h" =~ sourceforge\.net/projects/([^/]+)/? ]]; then
+    UP_KIND="sourceforge"; UP_OWNER="${BASH_REMATCH[1]}"; UP_URL="https://sourceforge.net/projects/${UP_OWNER}/files/"; return 0
+  fi
+  if [[ "$h" =~ ^https?:// ]]; then
+    UP_KIND="http"; UP_URL="$h"; return 0
+  fi
+  return 1
+}
+
+detect_upstream(){
+  detect_from_sources || detect_from_homepage || {
+    log_w "Upstream não detectado automaticamente"; return 1; }
+  log_o "Upstream" kind="$UP_KIND" url="$UP_URL"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Coleta de versões do upstream
+# -----------------------------------------------------------------------------
+list_versions_gittags(){
+  local repo_url="$1"
+  # Preferimos não clonar: usamos ls-remote
+  exists git || { echo ""; return 1; }
+  git ls-remote --tags "$repo_url" 2>/dev/null \
+    | awk '{print $2}' \
+    | sed -E 's#^refs/tags/##; s#\^\{\}$##' \
+    | sed 's/^v//' \
+    | sed 's/{}//g' \
+    | sort -u || true
+}
+list_versions_github(){
+  local owner="$1" repo="$2"
+  local base="https://github.com/${owner}/${repo}"
+  # Primeiro tenta por git (tags remotas)
+  local v; v="$(list_versions_gittags "${base}.git" || true)"
+  [[ -n "$v" ]] && { printf '%s\n' "$v"; return 0; }
+  # fallback: tenta página releases (raspagem simples)
+  local F; F="$(fetch_cmd)"; [[ -n "$F" ]] || { echo ""; return 1; }
+  $F "${base}/releases" 2>/dev/null \
+   | tr '"' '\n' | grep -E '/tag/v?[0-9][0-9A-Za-z._-]*$' \
+   | awk -F/ '{print $NF}' | sed 's/^v//' | sort -u || true
+}
+list_versions_gitlab(){
+  local owner="$1" repo="$2"
+  local base="https://gitlab.com/${owner}/${repo}.git"
+  list_versions_gittags "$base" || true
+}
+list_versions_sourceforge(){
+  local proj="$1"
+  local F; F="$(fetch_cmd)"; [[ -n "$F" ]] || { echo ""; return 1; }
+  $F "https://sourceforge.net/projects/${proj}/files/" 2>/dev/null \
+    | tr '"' '\n' \
+    | grep -E '/projects/'"${proj}"'/files/.+/' \
+    | awk -F/ '{print $NF}' \
+    | sed -E 's/[^0-9a-zA-Z._-].*$//' \
+    | grep -E '^[0-9]+(\.[0-9A-Za-z_-]+)*$' \
+    | sort -u || true
+}
+list_versions_http(){
+  local url="$1"
+  local F; F="$(fetch_cmd)"; [[ -n "$F" ]] || { echo ""; return 1; }
+  $F "$url" 2>/dev/null \
+    | tr '"' '\n' \
+    | grep -E '/[^"]*(tar\.(gz|bz2|xz|zst)|zip)' \
+    | sed -E 's#.*/([^/"]+)#\1#' \
+    | sed -E 's/.*-([0-9]+(\.[0-9A-Za-z_-]+)*)(\.tar\.(gz|bz2|xz|zst)|\.zip).*/\1/' \
+    | sort -u || true
+}
+
+collect_upstream_versions(){
+  case "$UP_KIND" in
+    github) list_versions_github "$UP_OWNER" "$UP_REPO" ;;
+    gitlab) list_versions_gitlab  "$UP_OWNER" "$UP_REPO" ;;
+    sourceforge) list_versions_sourceforge "$UP_OWNER" ;;
+    git)    list_versions_gittags "$UP_URL" ;;
+    http)   list_versions_http    "$UP_URL" ;;
+    *) echo ""; return 1 ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Seleção da melhor versão
+# -----------------------------------------------------------------------------
+select_newer_version(){
+  local allow_pre="$1"
+  local best=""; local cur="$VERSION"
+  local line
+  while read -r line; do
+    local v; v="$(trim "$line")"; [[ -z "$v" ]] && continue
+    if (( allow_pre == 0 )) && is_prerelease "$v"; then
+      continue
+    fi
+    ver_cmp "$v" "$cur"; local r=$?
+    (( r == 1 )) || continue   # v > cur?
+    if [[ -z "$best" ]]; then best="$v"; else
+      ver_cmp "$v" "$best"; (( $? == 1 )) && best="$v"
+    fi
+  done
+  printf '%s' "$best"
+}
+
+# -----------------------------------------------------------------------------
+# Reescrever URLs de fontes para a versão nova
+# -----------------------------------------------------------------------------
+rewrite_sources_for_version(){
+  local newv="$1"
+  local rebuilt=()
+  IFS=, read -r -a SRC_ARR <<< "$(csv_norm "$SOURCES")"
+  local s
+  for s in "${SRC_ARR[@]}"; do
+    s="$(trim "$s")"; [[ -z "$s" ]] && continue
+    local u="$s"
+    # heurística 1: troca aparições da versão atual pela nova
+    if [[ "$u" == *"$VERSION"* ]]; then
+      u="${u//$VERSION/$newv}"
+      rebuilt+=("$u"); continue
+    fi
+    # heurística 2: GitHub tarball se upstream é github
+    if [[ "$UP_KIND" == "github" ]]; then
+      u="https://github.com/${UP_OWNER}/${UP_REPO}/archive/refs/tags/v${newv}.tar.gz"
+      rebuilt+=("$u"); continue
+    fi
+    # heurística 3: GitLab tarball
+    if [[ "$UP_KIND" == "gitlab" ]]; then
+      u="https://gitlab.com/${UP_OWNER}/${UP_REPO}/-/archive/v${newv}/${UP_REPO}-v${newv}.tar.gz"
+      rebuilt+=("$u"); continue
+    fi
+    # heurística 4: tenta sufixo comum com v/newv
+    if [[ "$s" =~ v[0-9] ]]; then
+      u="${s/v$VERSION/v${newv}}"
+      rebuilt+=("$u"); continue
+    fi
+    rebuilt+=("$s")
+  done
+  (IFS=,; printf '%s' "${rebuilt[*]}")
+}
+# -----------------------------------------------------------------------------
+# Baixar e calcular sha256 (paralelo)
+# -----------------------------------------------------------------------------
+calc_sha256_for_sources(){
+  local sources_csv="$1" out_var="$2"
+  local F; F="$(fetch_cmd)"; [[ -n "$F" ]] || { printf -v "$out_var" ""; return 1; }
+  local SH; SH="$(sha256_cmd)"; [[ -n "$SH" ]] || { printf -v "$out_var" ""; return 1; }
+  IFS=, read -r -a SRC_ARR <<< "$(csv_norm "$sources_csv")"
+  local tmp; tmp="$(mktemp -d)"
+  local -a PIDS=(); local -A IDX2NAME=(); local i=0
+  for s in "${SRC_ARR[@]}"; do
+    [[ -z "$s" ]] && continue
+    local base; base="$(basename "$s")"; base="${base%%\?*}"
+    local out="$tmp/$base"
+    (
+      if [[ "$F" == aria2c* ]]; then
+        aria2c -x16 -s16 -k1M -o "$(basename "$out")" -d "$tmp" "$s" >/dev/null 2>&1
+      elif [[ "$F" == curl* ]]; then
+        curl -fsSL "$s" -o "$out"
+      else
+        wget -q "$s" -O "$out"
+      fi
+    ) || echo "ERR" > "$out.err" &
+    PIDS+=("$!"); IDX2NAME["$i"]="$out"; i=$((i+1))
+  done
+  local any_fail=0
+  local pid
+  for pid in "${PIDS[@]}"; do wait "$pid" || true; done
+  local sums=()
+  for k in "${!IDX2NAME[@]}"; do
+    local f="${IDX2NAME[$k]}"
+    if [[ -f "$f.err" ]]; then any_fail=1; continue; fi
+    if [[ -f "$f" ]]; then
+      local sum; sum="$($SH "$f" 2>/dev/null | awk '{print $1}' || true)"
+      [[ -n "$sum" ]] && sums+=("$sum")
+    fi
+  done
+  rm -rf "$tmp" || true
+  if (( any_fail )); then
+    printf -v "$out_var" ""
+    return 1
+  fi
+  local csv; (IFS=,; csv="${sums[*]}"); printf -v "$out_var" "%s" "$csv"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# Escrita do novo metafile
+# -----------------------------------------------------------------------------
+write_update_metafile(){
+  local newv="$1" new_sources="$2" new_sums="$3"
+  local dir="$ADM_UPDATES/$NAME"; local mf="$dir/metafile"
+  mkdir -p "$dir" || die "Falha criar diretório de update: $dir" 43
+  {
+    echo "name=$NAME"
+    echo "version=$newv"
+    echo "category=$CATEGORY"
+    echo "run_deps=$(csv_norm "$RUN_DEPS")"
+    echo "build_deps=$(csv_norm "$BUILD_DEPS")"
+    echo "opt_deps=$(csv_norm "$OPT_DEPS")"
+    echo "num_builds=0"
+    echo "description=${DESCRIPTION:-$NAME $newv}"
+    echo "homepage=$HOMEPAGE"
+    echo "maintainer=$MAINTAINER"
+    echo "sha256sums=$(csv_norm "$new_sums")"
+    echo "sources=$(csv_norm "$new_sources")"
+  } > "$mf"
+  printf '%s' "$mf"
+}
+
+# -----------------------------------------------------------------------------
+# CLI / Dispatcher
+# -----------------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-update — busca versão superior no upstream e gera metafile em /usr/src/adm/update/<name>/metafile
+
+Uso:
+  adm-update <metafile> [opções]
+
+Opções:
+  --allow-pre        Permitir pré-releases (alpha, beta, rc)
+  --with-checksums   Baixar fontes propostas e preencher sha256sums
+  --no-download      Não verificar URLs (apenas reescrever fontes pela heurística)
+  --sources=CSV      Sobrepor fontes (CSV) ao invés de reescrever as atuais
+  --print-only       Apenas imprime NEW_VERSION/SOURCES/DEST sem gravar arquivo
+  --force            Sempre sair 0 (mesmo se nada novo)
+
+Saída (KEY=VAL):
+  UPDATE_AVAILABLE=true|false
+  CURRENT_VERSION=x.y.z
+  NEW_VERSION=a.b.c
+  UPDATE_META_PATH=/usr/src/adm/update/<name>/metafile
+  NEW_SOURCES=url1,url2
+  NEW_SHA256S=sum1,sum2
+
+Exit codes:
+  0 ok; 1 uso; 20 env; 43 IO; 50 upstream; 51 sem-novidade; 60 falha download; 70 metafile
+USAGE
+}
+
+main(){
+  local metafile="" allow_pre=0 with_checksums=0 no_download=0 print_only=0 force_ok=0 override_sources=""
+  while (( $# )); do
+    case "$1" in
+      --allow-pre) allow_pre=1 ;;
+      --with-checksums) with_checksums=1 ;;
+      --no-download) no_download=1 ;;
+      --print-only) print_only=1 ;;
+      --force) force_ok=1 ;;
+      --sources=*) override_sources="${1#*=}" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) metafile="$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$metafile" ]] || { usage; exit 1; }
+
+  section "Lendo metafile" file="$metafile"
+  load_meta "$metafile"
+
+  section "Detectando upstream"
+  detect_upstream || { [[ $force_ok -eq 1 ]] && { printf 'UPDATE_AVAILABLE=false\nCURRENT_VERSION=%s\n' "$VERSION"; exit 0; } || exit 50; }
+
+  section "Coletando versões" name="$NAME" cur="$VERSION"
+  local versions; versions="$(collect_upstream_versions || true)"
+  if [[ -z "$versions" ]]; then
+    log_w "Nenhuma versão encontrada no upstream"
+    [[ $force_ok -eq 1 ]] && { printf 'UPDATE_AVAILABLE=false\nCURRENT_VERSION=%s\n' "$VERSION"; exit 0; } || exit 50
+  fi
+
+  local newv; newv="$(printf '%s\n' "$versions" | select_newer_version "$allow_pre")"
+  if [[ -z "$newv" ]]; then
+    log_o "Sem novidades: $NAME na versão $VERSION"
+    printf 'UPDATE_AVAILABLE=false\nCURRENT_VERSION=%s\n' "$VERSION"
+    [[ $force_ok -eq 1 ]] && exit 0 || exit 51
+  fi
+  log_o "Nova versão detectada" new="$newv"
+
+  section "Propondo fontes"
+  local new_sources
+  if [[ -n "$override_sources" ]]; then
+    new_sources="$(csv_norm "$override_sources")"
+  else
+    new_sources="$(rewrite_sources_for_version "$newv")"
+  fi
+  printf 'NEW_SOURCES=%s\n' "$new_sources"
+
+  local new_sums=""
+  if (( with_checksums )); then
+    section "Baixando para calcular SHA256"
+    calc_sha256_for_sources "$new_sources" new_sums || {
+      log_e "Falha ao baixar/hashear fontes"
+      [[ $force_ok -eq 1 ]] && { printf 'UPDATE_AVAILABLE=true\nCURRENT_VERSION=%s\nNEW_VERSION=%s\nNEW_SOURCES=%s\n' "$VERSION" "$newv" "$new_sources"; exit 0; } || exit 60
+    }
+  fi
+  printf 'NEW_SHA256S=%s\n' "$new_sums"
+
+  local dest=""
+  if (( print_only )); then
+    dest="$ADM_UPDATES/$NAME/metafile"
+  else
+    section "Escrevendo metafile de update"
+    dest="$(write_update_metafile "$newv" "$new_sources" "$new_sums")"
+    log_o "Update metafile escrito" path="$dest"
+  fi
+
+  printf 'UPDATE_AVAILABLE=true\n'
+  printf 'CURRENT_VERSION=%s\n' "$VERSION"
+  printf 'NEW_VERSION=%s\n' "$newv"
+  printf 'UPDATE_META_PATH=%s\n' "$dest"
+}
+
+main "$@"
