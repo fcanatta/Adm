@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+export ADM_SKIP_DEFAULT_INSTALL=1
+# Instala os headers no SYSROOT dentro do DESTDIR do pacote
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+$MAKE mrproper            >/dev/null 2>&1 || true
+$MAKE headers             -j"$NPROC"
+$MAKE headers_install     INSTALL_HDR_PATH="${DESTDIR}${SYSROOT}/usr"
