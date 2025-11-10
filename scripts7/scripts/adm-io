@@ -1,0 +1,668 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-io
+# UX/IO para o sistema ADM: logs coloridos, JSON lines, spinner, barras de progresso,
+# tee/rotação de logs, locks, prompts, separadores e utilitários.
+# Requer bash; não depende de outras libs além das tools POSIX usuais.
+#
+# Exit codes:
+#  0  ok
+#  1  uso/argumentos
+# 15  erro de IO / rotação
+# 20  ambiente inválido
+# 23  lock não obtido (timeout)
+# 24  erro de lock (permissão/corrupção)
+
+set -Eeuo pipefail
+umask 022
+
+# -----------------------------------------------------------------------------
+# CONFIG / AMBIENTE
+# -----------------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_CACHE="${ADM_CACHE:-$ADM_ROOT/cache}"
+
+: "${ADM_IO_QUIET:=0}"     # 1: suprime INFO/OK/SECTION/SUBSTEP
+: "${ADM_IO_VERBOSE:=0}"   # 1: imprime PID/script/tempo relativo
+: "${ADM_IO_JSON:=0}"      # 1: emite JSON lines além do humano
+: "${ADM_IO_NO_COLOR:=0}"  # 1: força sem cor (ou respeita NO_COLOR)
+: "${ADM_IO_TS:=iso}"      # iso|unix|off
+: "${ADM_IO_ROTATE_MAX:=1048576}" # 1MiB
+: "${ADM_IO_SPINNER_FRAMES:=⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏}"
+: "${ADM_IO_WIDTH:=0}"     # 0 = auto
+
+# Arquivos de estado para features que precisam persistir entre chamadas
+STATE_DIR="$ADM_STATE/io"
+STATE_LOG_CURRENT="$STATE_DIR/log.current"          # caminho do log ativo
+STATE_SPIN_DIR="$STATE_DIR/spinners"                # metadados de spinners
+STATE_PROG_DIR="$STATE_DIR/progress"                # metadados de progresso
+STATE_LOCK_DIR="$ADM_ROOT/locks"                    # arquivos de lock
+mkdir -p "$ADM_LOGS" "$STATE_DIR" "$STATE_SPIN_DIR" "$STATE_PROG_DIR" "$STATE_LOCK_DIR" >/dev/null 2>&1 || true
+
+# -----------------------------------------------------------------------------
+# TTY / CORES / SÍMBOLOS
+# -----------------------------------------------------------------------------
+is_tty() { [[ -t 1 ]] && [[ -t 2 ]]; }
+
+supports_color() {
+  [[ "${NO_COLOR:-}" != "" || "$ADM_IO_NO_COLOR" = "1" ]] && return 1
+  is_tty || return 1
+  command -v tput >/dev/null 2>&1 || return 1
+  local colors; colors=$(tput colors 2>/dev/null || echo 0)
+  [[ "${colors:-0}" -ge 8 ]]
+}
+
+USE_COLOR=0
+if supports_color; then USE_COLOR=1; fi
+
+# Cores
+if (( USE_COLOR )); then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+  C_OK=$'\033[32m'
+  C_INFO=$'\033[36m'
+  C_WARN=$'\033[33m'
+  C_ERR=$'\033[31m'
+  C_SEC=$'\033[35m'
+else
+  C_RESET= C_DIM= C_BOLD= C_OK= C_INFO= C_WARN= C_ERR= C_SEC=
+fi
+
+# Símbolos (fallback se não-TTY)
+if is_tty; then
+  SYM_OK="✔️ "
+  SYM_WARN="⚠️ "
+  SYM_ERR="✖️ "
+  BULLET="•"
+else
+  SYM_OK="[OK] "
+  SYM_WARN="[WARN] "
+  SYM_ERR="[ERROR] "
+  BULLET="*"
+fi
+
+# Largura terminal
+term_width() {
+  if (( ADM_IO_WIDTH > 0 )); then
+    echo "$ADM_IO_WIDTH"; return
+  fi
+  if is_tty && command -v tput >/dev/null 2>&1; then
+    local w; w=$(tput cols 2>/dev/null || echo 80)
+    [[ "$w" =~ ^[0-9]+$ ]] || w=80
+    echo "$w"
+  else
+    echo 80
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# UTILITÁRIOS
+# -----------------------------------------------------------------------------
+ts_now_iso()  { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+ts_now_unix() { date -u +%s; }
+timestamp() {
+  case "$ADM_IO_TS" in
+    iso)  ts_now_iso ;;
+    unix) ts_now_unix ;;
+    off)  echo "" ;;
+    *)    ts_now_iso ;;
+  esac
+}
+esc_json() {
+  # Escapa aspas/backslashes/newlines para JSON
+  local s="${1:-}"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+  printf '%s' "$s"
+}
+
+err() { printf '%s%s%s\n' "$C_ERR" "$*" "$C_RESET" >&2; }
+die() { local code="${2:-1}"; err "$1"; exit "$code"; }
+
+# -----------------------------------------------------------------------------
+# LOG FILE MANAGEMENT (TEE/ROTATE)
+# -----------------------------------------------------------------------------
+log_current_file() { [[ -f "$STATE_LOG_CURRENT" ]] && cat "$STATE_LOG_CURRENT" || echo ""; }
+set_log_current_file() { local f="$1"; printf '%s' "$f" >"$STATE_LOG_CURRENT"; }
+rotate_log_if_needed() {
+  local f; f="$(log_current_file)"; [[ -n "$f" ]] || return 0
+  [[ -f "$f" ]] || return 0
+  local sz; sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  if [[ "$sz" -ge "$ADM_IO_ROTATE_MAX" ]]; then
+    local ts; ts=$(date +"%Y%m%d-%H%M%S")
+    mv -f "$f" "${f}.${ts}.1" || return 1
+    : >"$f" || return 1
+  fi
+}
+
+tee_write() {
+  # Escreve também no arquivo de log atual, se existir
+  local line="$1"
+  local f; f="$(log_current_file)"
+  if [[ -n "$f" ]]; then
+    rotate_log_if_needed || die "Falha ao rotacionar log" 15
+    printf '%s\n' "$line" >>"$f" || die "Falha ao escrever log" 15
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# FORMATAÇÃO DE LOGS
+# -----------------------------------------------------------------------------
+fmt_level_human() {
+  local level="$1" msg="$2"
+  case "$level" in
+    OK)     printf '%s%s%s%s' "$C_OK" "$SYM_OK" "$msg" "$C_RESET" ;;
+    INFO)   printf '%s%s%s' "$C_INFO" "$msg" "$C_RESET" ;;
+    WARN)   printf '%s%s%s%s' "$C_WARN" "$SYM_WARN" "$msg" "$C_RESET" ;;
+    ERROR)  printf '%s%s%s%s' "$C_ERR" "$SYM_ERR" "$msg" "$C_RESET" ;;
+    DEBUG)  printf '%s%s%s' "$C_DIM" "$msg" "$C_RESET" ;;
+    *)      printf '%s' "$msg" ;;
+  esac
+}
+
+should_emit_human() {
+  local level="$1"
+  if [[ "$ADM_IO_QUIET" = "1" ]]; then
+    case "$level" in
+      WARN|ERROR) return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+emit_json_line() {
+  # args: level msg ctx(k=v ...)
+  local level="$1"; shift
+  local msg="$1"; shift || true
+  local ts; ts="$(timestamp)"
+  local ctx_json="{}"
+  if (( $# )); then
+    local first=1
+    ctx_json="{"
+    while (( $# )); do
+      local kv="$1"; shift
+      local k="${kv%%=*}" v="${kv#*=}"
+      [[ -z "$k" ]] && continue
+      v="$(esc_json "$v")"; k="$(esc_json "$k")"
+      if (( first )); then
+        ctx_json+="\"$k\":\"$v\""; first=0
+      else
+        ctx_json+=",\"$k\":\"$v\""
+      fi
+    done
+    ctx_json+="}"
+  fi
+  local j='{"ts":"'"$(esc_json "$ts")"'","level":"'"$(esc_json "$level")"'","msg":"'"$(esc_json "$msg")"'","ctx":'"$ctx_json"'}'
+  printf '%s\n' "$j"
+  tee_write "$j"
+}
+
+emit_human_line() {
+  # args: level msg ctx...
+  local level="$1"; shift
+  local msg="$1"; shift || true
+  local line=""
+  local ts=""; ts="$(timestamp)"
+  local prefix=""
+  if [[ "$ADM_IO_TS" != "off" && -n "$ts" ]]; then
+    prefix="[$ts] "
+  fi
+  # contexto textual leve
+  local ctx_tail=""
+  if (( $# )); then
+    ctx_tail=" ("
+    local first=1
+    while (( $# )); do
+      local kv="$1"; shift
+      if (( first )); then ctx_tail+="$kv"; first=0; else ctx_tail+=", $kv"; fi
+    done
+    ctx_tail+=")"
+  fi
+  local human_text; human_text="$(fmt_level_human "$level" "$msg")"
+  line="${prefix}${human_text}${ctx_tail}"
+  # Console
+  if should_emit_human "$level"; then
+    printf '%s\n' "$line"
+  fi
+  # Arquivo log
+  # Remover escapes ANSI ao persistir humano
+  local noansi="${line//$'\033'[\[0-9;]*[a-zA-Z]/}"
+  tee_write "$noansi"
+}
+
+log_event() {
+  # args: level msg ctx...
+  local level="$1"; shift
+  local msg="$1"; shift || true
+  # Verbose enriquece msg
+  if [[ "$ADM_IO_VERBOSE" = "1" ]]; then
+    local caller="${CALLER_SCRIPT:-${0##*/}}"
+    msg="[$caller pid=$$] $msg"
+  end_if=true
+  fi
+  (( ADM_IO_JSON == 1 )) && emit_json_line "$level" "$msg" "$@" || true
+  emit_human_line "$level" "$msg" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# SECTION / SUBSTEP / HR / NL
+# -----------------------------------------------------------------------------
+section() {
+  local title="$1"; shift || true
+  local w; w="$(term_width)"
+  local line; line=$(printf '─%.0s' $(seq 1 "$w"))
+  if should_emit_human "INFO"; then
+    printf '%s%s%s\n' "$C_SEC" "$line" "$C_RESET"
+    printf '%s%s%s\n' "$C_SEC" "$title" "$C_RESET"
+    printf '%s%s%s\n' "$C_SEC" "$line" "$C_RESET"
+  fi
+  (( ADM_IO_JSON == 1 )) && emit_json_line "SECTION" "$title" "$@" || true
+  # também persiste em log humano
+  tee_write "$title"
+}
+
+substep() {
+  local msg="$1"; shift || true
+  local prefix="$BULLET "
+  if should_emit_human "INFO"; then
+    printf '%s%s%s\n' "$C_INFO" "${prefix}${msg}" "$C_RESET"
+  fi
+  (( ADM_IO_JSON == 1 )) && emit_json_line "SUBSTEP" "$msg" "$@" || true
+  tee_write "${BULLET} ${msg}"
+}
+
+hr() {
+  local w; w="$(term_width)"
+  local line; line=$(printf '─%.0s' $(seq 1 "$w"))
+  if should_emit_human "INFO"; then
+    printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET"
+  fi
+  tee_write "$(printf '%*s' "$w" | tr ' ' '-')"
+}
+
+nl() {
+  local n="${1:-1}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=1
+  for _ in $(seq 1 "$n"); do
+    printf '\n'
+    tee_write ""
+  done
+}
+
+# -----------------------------------------------------------------------------
+# LOG SUBCOMMANDS
+# -----------------------------------------------------------------------------
+cmd_log() {
+  local lvl="${1:-}"; shift || true
+  [[ -n "$lvl" ]] || die "Uso: adm-io log <ok|info|warn|error|debug> MSG [ctx...]" 1
+  local msg="${1:-}"; shift || true
+  [[ -n "$msg" ]] || die "Mensagem vazia" 1
+  case "${lvl,,}" in
+    ok)    log_event "OK" "$msg" "$@" ;;
+    info)  log_event "INFO" "$msg" "$@" ;;
+    warn)  log_event "WARN" "$msg" "$@" ;;
+    error) log_event "ERROR" "$msg" "$@" ;;
+    debug) log_event "DEBUG" "$msg" "$@" ;;
+    *)     die "Nível inválido: $lvl" 1 ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# TEE: start/stop/rotate
+# -----------------------------------------------------------------------------
+cmd_tee_start() {
+  local to_file=""
+  while (( $# )); do
+    case "$1" in
+      --file=*) to_file="${1#*=}" ;;
+      *) die "Flag desconhecida: $1" 1 ;;
+    esac
+    shift
+  done
+  mkdir -p "$ADM_LOGS" "$STATE_DIR" || die "Falha ao criar diretórios de log" 15
+  if [[ -z "$to_file" ]]; then
+    local ts; ts=$(date +"%Y%m%d-%H%M%S")
+    to_file="$ADM_LOGS/${ts}-$$_adm.log"
+  fi
+  : >"$to_file" || die "Não foi possível abrir log: $to_file" 15
+  set_log_current_file "$to_file"
+  log_event "OK" "logging habilitado" "file=$to_file"
+}
+
+cmd_tee_stop() {
+  if [[ -f "$STATE_LOG_CURRENT" ]]; then
+    local f; f="$(cat "$STATE_LOG_CURRENT" 2>/dev/null || true)"
+    rm -f "$STATE_LOG_CURRENT" || true
+    log_event "OK" "logging desabilitado" "file=$f"
+  else
+    log_event "WARN" "nenhum log ativo para parar"
+  fi
+}
+
+cmd_tee_rotate() {
+  local f; f="$(log_current_file)"
+  [[ -n "$f" ]] || die "Não há log ativo para rotacionar" 15
+  rotate_log_if_needed || die "Falha ao rotacionar" 15
+  log_event "OK" "rotação verificada" "file=$f"
+}
+
+# -----------------------------------------------------------------------------
+# SPINNER
+# -----------------------------------------------------------------------------
+spinner_can_animate() { is_tty && (( USE_COLOR == 1 )); }
+
+spinner_bg() {
+  # Executa em background; atualiza a linha até que o arquivo meta seja removido
+  local token="$1"
+  local msg="$2"
+  local meta="$STATE_SPIN_DIR/$token.meta"
+  local frames="$ADM_IO_SPINNER_FRAMES"
+  local i=0
+  local width; width="$(term_width)"
+  trap 'exit 0' TERM INT
+  while [[ -f "$meta" ]]; do
+    if spinner_can_animate; then
+      local ch=${frames:i%${#frames}:1}
+      printf '\r%s%s %s%s' "$C_INFO" "$ch" "$msg" "$C_RESET"
+      ((i++))
+    else
+      # sem TTY: não anima; dorme e sai quando stop
+      sleep 0.2
+    fi
+    sleep 0.08
+  done
+  # clear line
+  if spinner_can_animate; then
+    printf '\r%*s\r' "$width" ""
+  fi
+}
+
+cmd_spinner_start() {
+  local msg="${1:-}"; shift || true
+  [[ -n "$msg" ]] || msg="Processando…"
+  local token="SPIN_$$_$RANDOM"
+  local meta="$STATE_SPIN_DIR/$token.meta"
+  printf '%s\n' "$msg" >"$meta"
+  spinner_bg "$token" "$msg" &
+  local pid=$!
+  echo "$pid" >>"$meta"
+  echo "$token"
+}
+
+cmd_spinner_stop() {
+  local token="${1:-}"; shift || true
+  [[ -n "$token" ]] || die "Uso: adm-io spinner stop <token> [--ok|--warn|--error] [mensagem] [ctx...]" 1
+  local mode="ok"
+  if (( $# )); then
+    case "$1" in
+      --ok|--warn|--error) mode="${1#--}"; shift ;;
+    esac
+  fi
+  local final="${1:-}"; shift || true
+  local meta="$STATE_SPIN_DIR/$token.meta"
+  if [[ -f "$meta" ]]; then
+    local pid; pid="$(tail -n1 "$meta" 2>/dev/null || echo "")"
+    rm -f "$meta"
+    if [[ -n "$pid" ]]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  fi
+  # exibe resultado final
+  case "$mode" in
+    ok)    log_event "OK"    "${final:-Concluído}" "$@" ;;
+    warn)  log_event "WARN"  "${final:-Concluído com avisos}" "$@" ;;
+    error) log_event "ERROR" "${final:-Falhou}" "$@" ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# PROGRESS BAR
+# -----------------------------------------------------------------------------
+progress_draw() {
+  local done="$1" total="$2" title="$3"
+  local width; width="$(term_width)"
+  local barw=$(( width - 20 ))
+  (( barw < 10 )) && barw=10
+  local pct=0
+  if (( total > 0 )); then
+    pct=$(( done * 100 / total ))
+  fi
+  local filled=$(( barw * pct / 100 ))
+  local empty=$(( barw - filled ))
+  local bar=""
+  bar+="$(printf '█%.0s' $(seq 1 "$filled"))"
+  bar+="$(printf '░%.0s' $(seq 1 "$empty"))"
+  printf '\r%s %3d%% %s' "$bar" "$pct" "$title"
+}
+
+cmd_progress_new() {
+  local total="${1:-}"; shift || true
+  local title="${1:-}"; shift || true
+  [[ "$total" =~ ^[0-9]+$ ]] || die "Uso: progress new <total> \"título\"" 1
+  local token="PROG_$$_$RANDOM"
+  local meta="$STATE_PROG_DIR/$token.meta"
+  printf 'TOTAL=%s\nDONE=0\nTITLE=%s\n' "$total" "${title//[$'\n']/ }" >"$meta"
+  echo "$token"
+}
+
+cmd_progress_update() {
+  local token="${1:-}"; shift || true
+  local done="${1:-}"; shift || true
+  [[ -n "$token" && "$done" =~ ^[0-9]+$ ]] || die "Uso: progress update <token> <done>" 1
+  local meta="$STATE_PROG_DIR/$token.meta"
+  [[ -f "$meta" ]] || die "Token de progresso inválido" 1
+  # shellcheck disable=SC1090
+  source "$meta"
+  DONE="$done"
+  printf 'TOTAL=%s\nDONE=%s\nTITLE=%s\n' "$TOTAL" "$DONE" "$TITLE" >"$meta"
+  if is_tty; then
+    progress_draw "$DONE" "$TOTAL" "$TITLE"
+  else
+    log_event "INFO" "progresso" "done=$DONE" "total=$TOTAL" "title=$TITLE"
+  fi
+}
+
+cmd_progress_done() {
+  local token="${1:-}"; shift || true
+  local final="${1:-Concluído}"; shift || true
+  local meta="$STATE_PROG_DIR/$token.meta"
+  if [[ -f "$meta" ]]; then
+    # shellcheck disable=SC1090
+    source "$meta"
+    if is_tty; then
+      progress_draw "$TOTAL" "$TOTAL" "$TITLE"
+      printf '\n'
+    fi
+    rm -f "$meta"
+  fi
+  log_event "OK" "$final"
+}
+# -----------------------------------------------------------------------------
+# LOCKS
+# -----------------------------------------------------------------------------
+use_flock=0
+command -v flock >/dev/null 2>&1 && use_flock=1
+
+cmd_with_lock() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" && "${1:-}" == "--" ]] || die "Uso: with-lock <nome> -- CMD ARGS..." 1
+  shift # remove --
+  local lockf="$STATE_LOCK_DIR/${name}.lock"
+  mkdir -p "$STATE_LOCK_DIR" || die "Falha criar diretório de locks" 24
+
+  if (( use_flock )); then
+    # shellcheck disable=SC2086
+    flock -w 120 "$lockf" -- "$@" || {
+      local rc=$?
+      (( rc == 142 )) && die "Timeout ao obter lock: $name" 23
+      die "Erro ao executar com lock ($name), rc=$rc" 24
+    }
+  else
+    # Fallback: lock por mkdir (atomic)
+    local waited=0
+    while ! mkdir "$lockf" 2>/dev/null; do
+      (( waited += 1 ))
+      (( waited > 120 )) && die "Timeout ao obter lock (sem flock): $name" 23
+      sleep 1
+    done
+    # obteve lock
+    trap 'rmdir "'"$lockf"'" 2>/dev/null || true' EXIT
+    # shellcheck disable=SC2086
+    "$@"
+    local rc=$?
+    rmdir "$lockf" 2>/dev/null || true
+    trap - EXIT
+    return "$rc"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# PROMPT (SIM/NÃO)
+# -----------------------------------------------------------------------------
+cmd_prompt() {
+  local q="${1:-}"; shift || true
+  [[ -n "$q" ]] || die "Uso: prompt \"Pergunta?\" [--default=yes|no]" 1
+  local def="no"
+  while (( $# )); do
+    case "$1" in
+      --default=yes) def="yes" ;;
+      --default=no)  def="no" ;;
+      *) die "Flag desconhecida: $1" 1 ;;
+    esac; shift
+  done
+
+  if ! is_tty; then
+    [[ "$def" == "yes" ]] && exit 0 || exit 1
+  fi
+
+  local prompt_str="[y/N]"
+  [[ "$def" == "yes" ]] && prompt_str="[Y/n]"
+
+  while true; do
+    printf '%s%s %s %s' "$C_INFO" "$q" "$prompt_str" "$C_RESET"
+    read -r ans || { [[ "$def" == "yes" ]] && exit 0 || exit 1; }
+    ans="${ans,,}"
+    case "$ans" in
+      y|yes) exit 0 ;;
+      n|no)  exit 1 ;;
+      "")    [[ "$def" == "yes" ]] && exit 0 || exit 1 ;;
+      *)     printf '%sResposta inválida. Digite y/yes ou n/no.%s\n' "$C_WARN" "$C_RESET" ;;
+    esac
+  done
+}
+
+# -----------------------------------------------------------------------------
+# SECTION/SUBSTEP EXPORTS
+# -----------------------------------------------------------------------------
+cmd_section() {
+  local title="${1:-}"; shift || true
+  [[ -n "$title" ]] || die "Uso: section \"Título\" [ctx...]" 1
+  section "$title" "$@"
+}
+cmd_substep() {
+  local msg="${1:-}"; shift || true
+  [[ -n "$msg" ]] || die "Uso: substep \"mensagem\" [ctx...]" 1
+  substep "$msg" "$@"
+}
+
+# -----------------------------------------------------------------------------
+# HR/NL EXPORTS
+# -----------------------------------------------------------------------------
+cmd_hr() { hr; }
+cmd_nl() {
+  local n="${1:-1}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=1
+  nl "$n"
+}
+
+# -----------------------------------------------------------------------------
+# HELP
+# -----------------------------------------------------------------------------
+usage() {
+cat <<'USAGE'
+adm-io — camada de IO/UX do ADM
+
+Uso:
+  adm-io log <ok|info|warn|error|debug> "MSG" [ctx...k=v]
+  adm-io section "TÍTULO" [ctx...]
+  adm-io substep "descrição" [ctx...]
+  adm-io hr
+  adm-io nl [N]
+
+  adm-io tee start [--file=/caminho.log]
+  adm-io tee stop
+  adm-io tee rotate
+
+  adm-io spinner start "MSG"            # -> imprime token (ex.: SPIN_123)
+  adm-io spinner stop <token> [--ok|--warn|--error] ["mensagem final"] [ctx...]
+
+  adm-io progress new <total> "título"  # -> imprime token (ex.: PROG_123)
+  adm-io progress update <token> <done>
+  adm-io progress done <token> ["mensagem final"]
+
+  adm-io with-lock <nome> -- CMD ARGS...
+  adm-io prompt "Pergunta?" [--default=yes|no]
+
+Variáveis:
+  ADM_ROOT, ADM_LOGS, ADM_STATE, ADM_CACHE
+  ADM_IO_QUIET=0|1, ADM_IO_VERBOSE=0|1, ADM_IO_JSON=0|1, ADM_IO_NO_COLOR=0|1
+  ADM_IO_TS=iso|unix|off, ADM_IO_ROTATE_MAX (bytes)
+  ADM_IO_SPINNER_FRAMES (ex.: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"), ADM_IO_WIDTH (0=auto)
+
+Saída:
+  - Humana colorida (TTY) com símbolos ✔️ ⚠️ ✖️, fallback sem cor/emoji.
+  - JSON lines (opcional) espelhado em arquivo de log quando tee ativo.
+
+Códigos de retorno: 0 ok; 1 uso; 15 IO/rotação; 20 ambiente; 23 lock timeout; 24 lock erro.
+USAGE
+}
+
+# -----------------------------------------------------------------------------
+# DISPATCHER
+# -----------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    log)       cmd_log "$@" ;;
+    section)   cmd_section "$@" ;;
+    substep)   cmd_substep "$@" ;;
+    hr)        cmd_hr "$@" ;;
+    nl)        cmd_nl "$@" ;;
+    tee)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        start)  cmd_tee_start "$@" ;;
+        stop)   cmd_tee_stop "$@" ;;
+        rotate) cmd_tee_rotate "$@" ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    spinner)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        start) cmd_spinner_start "$@" ;;
+        stop)  cmd_spinner_stop "$@" ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    progress)
+      local sub="${1:-}"; shift || true
+      case "$sub" in
+        new)    cmd_progress_new "$@" ;;
+        update) cmd_progress_update "$@" ;;
+        done)   cmd_progress_done "$@" ;;
+        *) usage; exit 1 ;;
+      esac
+      ;;
+    with-lock) cmd_with_lock "$@" ;;
+    prompt)    cmd_prompt "$@" ;;
+    -h|--help|help|"") usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
