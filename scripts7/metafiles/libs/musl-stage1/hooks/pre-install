@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+# Instalar musl no SYSROOT do target (não em /usr do pacote)
+: "${MAKE:=make}"
+$MAKE install DESTDIR="${DESTDIR}${SYSROOT}"
