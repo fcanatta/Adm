@@ -1,0 +1,5 @@
+# já instalado: cmake, ninja, python3, llvm-project
+
+adm-cli install llvm-runtimes --prefer-build
+adm-cli install lldb --prefer-build
+adm-cli install clang-tools-extra --prefer-build
