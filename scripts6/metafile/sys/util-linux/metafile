@@ -1,0 +1,12 @@
+name=util-linux
+version=2.39.4
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Conjunto de utilitários fundamentais (mount, fdisk, hwclock, etc.)
+homepage=https://www.kernel.org/pub/linux/utils/util-linux/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.39/util-linux-2.39.4.tar.xz
