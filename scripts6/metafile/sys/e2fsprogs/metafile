@@ -1,0 +1,12 @@
+name=e2fsprogs
+version=1.47.1
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas para ext2/3/4 (mkfs.ext4, e2fsck, tune2fs)
+homepage=https://e2fsprogs.sourceforge.net/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://downloads.sourceforge.net/e2fsprogs/e2fsprogs-1.47.1.tar.xz
