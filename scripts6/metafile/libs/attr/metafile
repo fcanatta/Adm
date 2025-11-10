@@ -1,0 +1,12 @@
+name=attr
+version=2.5.2
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Atributos estendidos (libattr + utilitários)
+homepage=https://savannah.nongnu.org/projects/attr/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/attr/attr-2.5.2.tar.gz
