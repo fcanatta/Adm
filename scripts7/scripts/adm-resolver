@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-resolver
+# Resolve dependências (build/run/opt), une com detecções (adm-detect),
+# constrói DAG, ordena topologicamente, calcula camadas de paralelismo e
+# verifica binários disponíveis.
+#
+# Exit codes:
+#  0  ok
+# 60  dependências ausentes
+# 61  ciclo detectado
+# 62  repositório/metafiles ausente
+# 63  erro de parsing/validação de metafile
+# 64  erro de IO/perm
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+
+ADM_META="${ADM_META:-$ADM_ROOT/scripts/adm-meta}"
+ADM_DETECT="${ADM_DETECT:-$ADM_ROOT/scripts/adm-detect}"
+ADM_IO="${ADM_IO:-$ADM_ROOT/scripts/adm-io}"
+
+[[ -x "$ADM_META" ]]   || { printf '[ERROR] adm-meta não encontrado: %s\n' "$ADM_META" >&2; exit 63; }
+[[ -d "$ADM_METAFILES" ]] || { printf '[ERROR] Diretório de metafiles não existe: %s\n' "$ADM_METAFILES" >&2; exit 62; }
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# -------------------------------------------------------------------
+# Helpers
+# -------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+lower(){ tr '[:upper:]' '[:lower:]'; }
+slug_ok(){ [[ "${1:-}" =~ ^[a-z0-9._+-]+$ ]]; }
+is_int(){ [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+csv_join(){ local IFS=,; printf '%s' "$*"; }
+csv_unique_sorted(){
+  local s; s="$(csv_norm "$1")"; IFS=, read -r -a A <<< "$s"
+  IFS=$'\n' read -r -d '' out < <(printf '%s\n' "${A[@]}" | sed '/^$/d' | LC_ALL=C sort -u && printf '\0') || true
+  printf '%s' "$(paste -sd, <<< "$out")"
+}
+csv_merge_unique(){
+  local a; a="$(csv_norm "$1")"; shift
+  local out="$a"
+  while (( "$#" )); do
+    local b; b="$(csv_norm "$1")"; shift
+    out="$(csv_unique_sorted "${out}${out:+,}${b}")"
+  done
+  printf '%s' "$out"
+}
+arr_contains(){ local x="$1"; shift; for y in "$@"; do [[ "$x" == "$y" ]] && return 0; done; return 1; }
+
+# -------------------------------------------------------------------
+# Índice de provedores (name -> metafile)
+# -------------------------------------------------------------------
+declare -A NAME2META=()
+declare -A META2NAME=()
+
+index_repository(){
+  local count=0
+  while IFS= read -r -d '' mf; do
+    # shellcheck disable=SC1090
+    eval "$("$ADM_META" parse "$mf")" || { log_e "Falha parse: $mf"; exit 63; }
+    local nm="$ADM_NAME"
+    if [[ -z "$nm" ]]; then
+      log_w "Metafile sem name: $mf"; continue
+    fi
+    NAME2META["$nm"]="$mf"
+    META2NAME["$mf"]="$nm"
+    ((count++))
+  done < <(find "$ADM_METAFILES" -type f -name metafile -print0)
+  ((count>0)) || { log_e "Nenhum metafile encontrado em $ADM_METAFILES"; exit 62; }
+  log_i "Indexados $count pacotes"
+}
+
+# -------------------------------------------------------------------
+# Leitura de um metafile
+# -------------------------------------------------------------------
+# Variáveis de trabalho para o ROOT
+ROOT_NAME=""; ROOT_VERSION=""; ROOT_CATEGORY=""
+ROOT_RUN_DEPS=""; ROOT_BUILD_DEPS=""; ROOT_OPT_DEPS=""
+
+load_root_meta(){
+  local metaf="$1"
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")" || { log_e "Falha parse root: $metaf"; exit 63; }
+  ROOT_NAME="$ADM_NAME"; ROOT_VERSION="$ADM_VERSION"; ROOT_CATEGORY="$ADM_CATEGORY"
+  ROOT_RUN_DEPS="$(csv_norm "${ADM_RUN_DEPS:-}")"
+  ROOT_BUILD_DEPS="$(csv_norm "${ADM_BUILD_DEPS:-}")"
+  ROOT_OPT_DEPS="$(csv_norm "${ADM_OPT_DEPS:-}")"
+  [[ -n "$ROOT_NAME" && -n "$ROOT_VERSION" ]] || { log_e "Root sem name/version: $metaf"; exit 63; }
+}
+
+# -------------------------------------------------------------------
+# Coletar deps detectados via adm-detect (opcional)
+# -------------------------------------------------------------------
+DETECT_B=""; DETECT_R=""
+
+collect_detected(){
+  local metaf="$1"; local src_override="${2:-}"
+  [[ -x "$ADM_DETECT" ]] || { log_w "adm-detect ausente; ignorando detecção"; return 0; }
+  local out
+  if [[ -n "$src_override" ]]; then
+    out="$("$ADM_DETECT" "$metaf" --src-dir="$src_override" || true)"
+  else
+    out="$("$ADM_DETECT" "$metaf" || true)"
+  fi
+  # Extrai KEY=VAL
+  DETECT_B="$(printf '%s\n' "$out" | awk -F= '/^DETECTED_BUILD_DEPS=/{print $2}' | head -n1 || true)"
+  DETECT_R="$(printf '%s\n' "$out" | awk -F= '/^DETECTED_RUN_DEPS=/{print $2}' | head -n1 || true)"
+  DETECT_B="$(csv_norm "$DETECT_B")"; DETECT_R="$(csv_norm "$DETECT_R")"
+}
+
+# -------------------------------------------------------------------
+# Montagem do universo alvo (closure)
+# -------------------------------------------------------------------
+# Grafo: EDGE from package -> its direct deps (tipo: build/run)
+declare -A G_BUILD=()   # key "pkg" -> "dep1,dep2"
+declare -A G_RUN=()
+
+add_edge(){
+  local kind="$1" pkg="$2" deps_csv="$3"
+  local cur
+  case "$kind" in
+    build) cur="${G_BUILD[$pkg]:-}" ;;
+    run)   cur="${G_RUN[$pkg]:-}" ;;
+    *) return ;;
+  esac
+  local next="$(csv_merge_unique "$cur" "$deps_csv")"
+  case "$kind" in
+    build) G_BUILD["$pkg"]="$next" ;;
+    run)   G_RUN["$pkg"]="$next" ;;
+  esac
+}
+
+ensure_provider_or_missing(){
+  # Recebe uma lista csv de nomes; retorna duas csv: FOUND e MISSING
+  local csv="$1"; csv_to_arr "$csv"; local FOUND=() MISSING=()
+  for d in "${_ARR[@]}"; do
+    [[ -z "$d" ]] && continue
+    if [[ -n "${NAME2META[$d]+x}" ]]; then
+      FOUND+=("$d")
+    else
+      MISSING+=("$d")
+    fi
+  done
+  printf '%s:::%s\n' "$(csv_join "${FOUND[@]}")" "$(csv_join "${MISSING[@]}")"
+}
+
+# fecha transitivamente o grafo (uma DFS/BFS simples sobre NAME2META)
+# retorna dois conjuntos csv: CL_BUILD e CL_RUN
+closure_from_root(){
+  local include_opt="$1"
+  local queue=()
+  declare -A seen=()
+
+  # ponto inicial: root
+  queue+=("$ROOT_NAME"); seen["$ROOT_NAME"]=1
+
+  # Seeds de dependências do root
+  local seeds_b="$ROOT_BUILD_DEPS"
+  local seeds_r="$(csv_merge_unique "$ROOT_RUN_DEPS" $([[ "$include_opt" == "1" ]] && echo "$ROOT_OPT_DEPS" || echo ""))"
+
+  add_edge build "$ROOT_NAME" "$seeds_b"
+  add_edge run   "$ROOT_NAME" "$seeds_r"
+
+  # BFS: para cada pacote descoberto, carrega seu metafile e adiciona arestas
+  local idx=0
+  while (( idx < ${#queue[@]} )); do
+    local pkg="${queue[$idx]}"; ((idx++))
+    local mf="${NAME2META[$pkg]:-}"
+    [[ -n "$mf" ]] || continue
+
+    # Parse do dependente para expandir recursivamente
+    # shellcheck disable=SC1090
+    eval "$("$ADM_META" parse "$mf")" || { log_e "Falha parse: $mf"; exit 63; }
+    local bd="$(csv_norm "${ADM_BUILD_DEPS:-}")"
+    local rd="$(csv_norm "${ADM_RUN_DEPS:-}")"
+    local od="$(csv_norm "${ADM_OPT_DEPS:-}")"
+    local rd2="$rd"
+    # opt somente se include_opt=1
+    [[ "$include_opt" == "1" ]] && rd2="$(csv_merge_unique "$rd2" "$od")"
+
+    add_edge build "$pkg" "$bd"
+    add_edge run   "$pkg" "$rd2"
+
+    # push filhos na fila
+    csv_to_arr "$(csv_merge_unique "$bd" "$rd2")"
+    for ch in "${_ARR[@]}"; do
+      [[ -z "$ch" ]] && continue
+      if [[ -z "${seen[$ch]+x}" ]]; then
+        seen["$ch"]=1
+        queue+=("$ch")
+      fi
+    done
+  done
+
+  # coletar fechos finais (sem root)
+  local CLB=() CLR=()
+  for k in "${!G_BUILD[@]}"; do
+    csv_to_arr "${G_BUILD[$k]}"
+    for n in "${_ARR[@]}"; do [[ -n "$n" && "$n" != "$ROOT_NAME" ]] && CLB+=("$n"); done
+  done
+  for k in "${!G_RUN[@]}"; do
+    csv_to_arr "${G_RUN[$k]}"
+    for n in "${_ARR[@]}"; do [[ -n "$n" && "$n" != "$ROOT_NAME" ]] && CLR+=("$n"); done
+  done
+  local CL_BUILD="$(csv_unique_sorted "$(csv_join "${CLB[@]}")")"
+  local CL_RUN="$(csv_unique_sorted "$(csv_join "${CLR[@]}")")"
+  printf '%s:::%s\n' "$CL_BUILD" "$CL_RUN"
+}
+
+# -------------------------------------------------------------------
+# Topological sort + grupos de paralelismo (por indegree)
+# -------------------------------------------------------------------
+toposort_layers(){
+  # args: kind=build|run rootname
+  local kind="$1" root="$2"
+  declare -A edges=() ; declare -A indeg=()
+  declare -a nodes=()
+
+  # Construir conjunto de nós
+  local keys_csv=""
+  for k in "${!G_BUILD[@]}"; do keys_csv="${keys_csv}${keys_csv:+,}$k"; done
+  for k in "${!G_RUN[@]}";   do keys_csv="${keys_csv}${keys_csv:+,}$k"; done
+  keys_csv="$(csv_unique_sorted "$keys_csv")"
+  csv_to_arr "$keys_csv"
+  for n in "${_ARR[@]}"; do [[ -n "$n" ]] && nodes+=("$n"); done
+
+  # Inicializar arestas conforme "kind"
+  for n in "${nodes[@]}"; do
+    local deps=""
+    case "$kind" in
+      build) deps="${G_BUILD[$n]:-}" ;;
+      run)   deps="${G_RUN[$n]:-}" ;;
+    esac
+    edges["$n"]="$(csv_norm "$deps")"
+  done
+
+  # indegree
+  for n in "${nodes[@]}"; do indeg["$n"]=0; done
+  for n in "${nodes[@]}"; do
+    csv_to_arr "${edges[$n]}"
+    for d in "${_ARR[@]}"; do
+      [[ -z "$d" ]] && continue
+      indeg["$d"]=$(( indeg["$d"] + 1 ))
+    done
+  done
+
+  # Kahn → layers
+  local layer=0
+  local layers_csv=()
+  local L=()
+  while :; do
+    L=()
+    for n in "${nodes[@]}"; do
+      [[ "${indeg[$n]+x}" ]] || continue
+      if (( indeg["$n"] == 0 )); then
+        L+=("$n")
+      fi
+    done
+    ((${#L[@]}==0)) && break
+    # registra camada
+    layers_csv+=("$(csv_join "${L[@]}")")
+    # remove nós da camada e diminui indegree dos vizinhos
+    for n in "${L[@]}"; do
+      unset 'indeg[$n]'
+      csv_to_arr "${edges[$n]}"
+      for d in "${_ARR[@]}"; do
+        [[ -z "$d" ]] && continue
+        (( indeg["$d"] > 0 )) && indeg["$d"]=$(( indeg["$d"] - 1 ))
+      done
+    done
+  done
+
+  # se sobrou indegree >0 → ciclo
+  local cyc_list=()
+  for n in "${!indeg[@]}"; do cyc_list+=("$n"); done
+  if ((${#cyc_list[@]})); then
+    printf 'CYCLE:::%s\n' "$(csv_join "${cyc_list[@]}")"
+    return 61
+  fi
+
+  # Concatena ordem total e devolve camadas
+  local order=""
+  for layer_csv in "${layers_csv[@]}"; do
+    order="${order}${order:+,}${layer_csv}"
+  done
+  # Camadas com separador ';'
+  local layers_join=""
+  local i
+  for ((i=0;i<${#layers_csv[@]};i++)); do
+    layers_join="${layers_join}${i>0?';':''}${layers_csv[$i]}"
+  done
+  printf 'ORDER:::%s:::%s\n' "$order" "$layers_join"
+  return 0
+}
+# -------------------------------------------------------------------
+# Binários disponíveis
+# -------------------------------------------------------------------
+arch_guess(){ uname -m 2>/dev/null || echo unknown; }
+libc_guess(){
+  if command -v ldd >/dev/null 2>&1; then
+    ldd --version 2>&1 | grep -qi musl && { echo musl; return; }
+    ldd --version 2>&1 | grep -qi 'gnu libc\|glibc' && { echo glibc; return; }
+  fi
+  echo unknown
+}
+
+binaries_available(){
+  local list_csv="$1" arch="${2:-}" libc="${3:-}"
+  [[ -d "$ADM_PACKAGES" ]] || { echo ":::"; return; }
+  [[ -z "$arch" ]] && arch="$(arch_guess)"
+  [[ -z "$libc" ]] && libc="$(libc_guess)"
+  csv_to_arr "$list_csv"
+  local ok=() miss=()
+  for p in "${_ARR[@]}"; do
+    [[ -z "$p" ]] && continue
+    # procura qualquer pacote do nome p que combine arch/libc no nome
+    # padrão sugestivo: <name>-<version>-<arch>[-<libc>].tar.*
+    local found=""
+    found="$(ls -1 "$ADM_PACKAGES"/"${p}"-*.tar.* 2>/dev/null | grep -E "${arch}|${libc}" || true | head -n1)"
+    if [[ -n "$found" ]]; then ok+=("$p"); else miss+=("$p"); fi
+  done
+  printf '%s:::%s\n' "$(csv_join "${ok[@]}")" "$(csv_join "${miss[@]}")"
+}
+
+# -------------------------------------------------------------------
+# DOT (visualização opcional)
+# -------------------------------------------------------------------
+emit_dot(){
+  local kind="$1" root="$2"
+  echo 'digraph deps {'
+  echo '  rankdir=LR; node [shape=box, style="rounded,filled", fillcolor="#f9f9f9"];'
+  for n in "${!G_BUILD[@]}"; do
+    csv_to_arr "${G_BUILD[$n]}"
+    for d in "${_ARR[@]}"; do [[ -n "$d" ]] && echo "  \"$n\" -> \"$d\" [color=blue,label=\"build\"];"; done
+  done
+  for n in "${!G_RUN[@]}"; do
+    csv_to_arr "${G_RUN[$n]}"
+    for d in "${_ARR[@]}"; do [[ -n "$d" ]] && echo "  \"$n\" -> \"$d\" [color=green,label=\"run\"];"; done
+  done
+  echo "  \"$root\" [fillcolor=\"#d0ebff\"];"
+  echo '}'
+}
+
+# -------------------------------------------------------------------
+# Comando principal
+# -------------------------------------------------------------------
+cmd_resolve(){
+  local metaf="${1:-}"
+  local include_opt=0 with_detect=1 prefer_binary=0 arch="" libc="" dot_out=""
+  while (( $# )); do
+    case "$1" in
+      --include-opt) include_opt=1 ;;
+      --no-detect)   with_detect=0 ;;
+      --prefer-binary) prefer_binary=1 ;;
+      --arch=*) arch="${1#*=}" ;;
+      --libc=*) libc="${1#*=}" ;;
+      --dot=*) dot_out="${1#*=}" ;;
+      *) metaf="$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$metaf" ]] || { printf 'Uso: adm-resolver <metafile> [--include-opt] [--no-detect] [--prefer-binary] [--arch=...] [--libc=...] [--dot=arquivo.dot]\n' >&2; exit 1; }
+
+  section "Resolvendo dependências" file="$metaf"
+  index_repository
+  load_root_meta "$metaf"
+
+  # Detecção (opcional) apenas para o root (dep’s sugeridas)
+  if (( with_detect )); then
+    collect_detected "$metaf"
+    log_i "Detecção: build='$DETECT_B' run='$DETECT_R'"
+    ROOT_BUILD_DEPS="$(csv_merge_unique "$ROOT_BUILD_DEPS" "$DETECT_B")"
+    ROOT_RUN_DEPS="$(csv_merge_unique "$ROOT_RUN_DEPS" "$DETECT_R")"
+  fi
+
+  # Checa provedores para as seeds do root
+  IFS=::: read -r FOUND_B MISS_B <<<"$(ensure_provider_or_missing "$ROOT_BUILD_DEPS")"
+  IFS=::: read -r FOUND_R MISS_R <<<"$(ensure_provider_or_missing "$ROOT_RUN_DEPS${include_opt:+,${ROOT_OPT_DEPS}}" )"
+
+  if [[ -n "$MISS_B$MISS_R" ]]; then
+    log_e "Dependências ausentes" missing="$(csv_merge_unique "$MISS_B" "$MISS_R")"
+    printf 'MISSING_DEPS=%s\n' "$(csv_merge_unique "$MISS_B" "$MISS_R")"
+    exit 60
+  fi
+
+  # Fecha transitivo do grafo (popula G_BUILD/G_RUN)
+  IFS=::: read -r CL_BUILD CL_RUN <<<"$(closure_from_root "$include_opt")"
+
+  # Topo sort (build e run)
+  local ORDER_B LAYERS_B ORDER_R LAYERS_R
+  local ts_out
+  ts_out="$(toposort_layers build "$ROOT_NAME" || true)"
+  if [[ "$ts_out" =~ ^CYCLE::: ]]; then
+    local cyc="${ts_out#CYCLE:::}"
+    log_e "Ciclo detectado (build)" cycle="$cyc"
+    printf 'CYCLE_BUILD=%s\n' "$cyc"
+    exit 61
+  else
+    ORDER_B="${ts_out#ORDER:::}"; ORDER_B="${ORDER_B%%:::*}"
+    LAYERS_B="${ts_out##*:::}"
+  fi
+  ts_out="$(toposort_layers run "$ROOT_NAME" || true)"
+  if [[ "$ts_out" =~ ^CYCLE::: ]]; then
+    local cyc="${ts_out#CYCLE:::}"
+    log_e "Ciclo detectado (run)" cycle="$cyc"
+    printf 'CYCLE_RUN=%s\n' "$cyc"
+    exit 61
+  else
+    ORDER_R="${ts_out#ORDER:::}"; ORDER_R="${ORDER_R%%:::*}"
+    LAYERS_R="${ts_out##*:::}"
+  fi
+
+  # Binários disponíveis (opcionalmente filtrando por arch/libc)
+  IFS=::: read -r BIN_OK_B BIN_MISS_B <<<"$(binaries_available "$CL_BUILD" "$arch" "$libc")"
+  IFS=::: read -r BIN_OK_R BIN_MISS_R <<<"$(binaries_available "$CL_RUN"   "$arch" "$libc")"
+
+  # Emite saída machine-readable principal
+  printf 'ROOT_NAME=%s\n' "$ROOT_NAME"
+  printf 'ROOT_VERSION=%s\n' "$ROOT_VERSION"
+  printf 'REQ_BUILD_DEPS=%s\n' "$ROOT_BUILD_DEPS"
+  printf 'REQ_RUN_DEPS=%s\n'   "$ROOT_RUN_DEPS"
+  printf 'REQ_OPT_DEPS=%s\n'   "$ROOT_OPT_DEPS"
+  printf 'DETECTED_BUILD_DEPS=%s\n' "$DETECT_B"
+  printf 'DETECTED_RUN_DEPS=%s\n'   "$DETECT_R"
+  printf 'RESOLVED_BUILD_SET=%s\n'  "$CL_BUILD"
+  printf 'RESOLVED_RUN_SET=%s\n'    "$CL_RUN"
+  printf 'BUILD_ORDER=%s\n'         "$ORDER_B"
+  printf 'RUN_ORDER=%s\n'           "$ORDER_R"
+  printf 'BUILD_LAYERS=%s\n'        "$LAYERS_B"
+  printf 'RUN_LAYERS=%s\n'          "$LAYERS_R"
+  printf 'BIN_OK_BUILD=%s\n'        "$BIN_OK_B"
+  printf 'BIN_MISS_BUILD=%s\n'      "$BIN_MISS_B"
+  printf 'BIN_OK_RUN=%s\n'          "$BIN_OK_R"
+  printf 'BIN_MISS_RUN=%s\n'        "$BIN_MISS_R"
+
+  # DOT opcional
+  if [[ -n "$dot_out" ]]; then
+    emit_dot build "$ROOT_NAME" >"$dot_out" || true
+    log_o "DOT salvo" path="$dot_out"
+  fi
+
+  # Logs amigáveis
+  log_o "Fecho build" set="$CL_BUILD"
+  log_o "Fecho run"   set="$CL_RUN"
+  log_i "Ordem build" order="$ORDER_B"
+  log_i "Ordem run"   order="$ORDER_R"
+
+  # Se --prefer-binary e existirem binários para todos, podemos sugerir instalação direta
+  if (( prefer_binary )); then
+    local miss="$(csv_merge_unique "$BIN_MISS_B" "$BIN_MISS_R")"
+    if [[ -z "$miss" ]]; then
+      log_o "Todos os binários presentes — instalar em paralelo por camadas"
+    else
+      log_w "Binários ausentes para" pkgs="$miss"
+    fi
+  fi
+}
+
+usage(){
+  cat <<'USAGE'
+adm-resolver — resolve dependências e produz plano (ordens/grupos/checagem binária).
+
+Uso:
+  adm-resolver <metafile> [--include-opt] [--no-detect] [--prefer-binary]
+               [--arch=<arch>] [--libc=<glibc|musl>] [--dot=grafo.dot]
+
+Saída (KEY=VAL):
+  ROOT_NAME, ROOT_VERSION
+  REQ_BUILD_DEPS, REQ_RUN_DEPS, REQ_OPT_DEPS
+  DETECTED_BUILD_DEPS, DETECTED_RUN_DEPS
+  RESOLVED_BUILD_SET, RESOLVED_RUN_SET
+  BUILD_ORDER, RUN_ORDER
+  BUILD_LAYERS, RUN_LAYERS       # camadas (separadas por ';'), cada camada é CSV
+  BIN_OK_BUILD, BIN_MISS_BUILD
+  BIN_OK_RUN,   BIN_MISS_RUN
+
+Exit codes:
+  0 ok; 60 missing; 61 cycle; 62 repo; 63 parse; 64 IO
+USAGE
+}
+
+main(){
+  case "${1:-}" in
+    -h|--help|help|"") usage; exit 0 ;;
+    *) cmd_resolve "$@" ;;
+  esac
+}
+main "$@"
