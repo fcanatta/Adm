@@ -1,0 +1,12 @@
+name=clang-tools-extra
+version=18.1.8
+category=dev
+run_deps=llvm-project
+build_deps=llvm-project,cmake,ninja
+opt_deps=
+num_builds=0
+description=Ferramentas extras do Clang (tidy, format, clangd, etc.)
+homepage=https://clang.llvm.org/extra/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.tar.gz
