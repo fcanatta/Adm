@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+DEST="$ADM_DESTDIR"
+ninja -C "$ADM_BUILD_DIR" install DESTDIR="$DEST"
+# Symlinks úteis
+if [ -x "$DEST/usr/bin/clang" ] && [ ! -e "$DEST/usr/bin/cc" ]; then ln -sf clang "$DEST/usr/bin/cc"; fi
+if [ -x "$DEST/usr/bin/clang++" ] && [ ! -e "$DEST/usr/bin/c++" ]; then ln -sf clang++ "$DEST/usr/bin/c++"; fi
+rm -rf "$DEST/usr/share/doc" "$DEST/usr/share/info" 2>/dev/null || true
