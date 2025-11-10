@@ -1,0 +1,11 @@
+# Instalar um pacote (e suas dependências) por nome usando o cache:
+sudo /usr/src/adm/scripts/adm-install --name=busybox --arch=$(uname -m) --libc=musl
+
+# Incluir opt_deps (se houver) e forçar reinstalação:
+sudo /usr/src/adm/scripts/adm-install --name=nginx --include-opt --reinstall
+
+# Instalar um conjunto de pacotes de um diretório (resolve DAG via .ADM_META):
+sudo /usr/src/adm/scripts/adm-install --dir=/tmp/pkgs --arch=$(uname -m) --libc=glibc
+
+# Simular (dry-run) sem extrair, só verificando ordem e conflitos:
+sudo /usr/src/adm/scripts/adm-install --name=git --dry-run
