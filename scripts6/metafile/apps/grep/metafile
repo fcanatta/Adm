@@ -1,0 +1,12 @@
+name=grep
+version=3.11
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Busca de padrões em arquivos (GNU grep)
+homepage=https://www.gnu.org/software/grep/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz
