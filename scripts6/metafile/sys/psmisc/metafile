@@ -1,0 +1,12 @@
+name=psmisc
+version=23.7
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas de processos (fuser, killall, pstree)
+homepage=https://gitlab.com/psmisc/psmisc
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://sourceforge.net/projects/psmisc/files/psmisc/psmisc-23.7.tar.xz/download
