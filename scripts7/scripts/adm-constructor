@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-constructor
+# Orquestra construção de pacotes: fetch → extract → detect → resolver → profiles → patches → configure → build → install → (package)
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20  ambiente inválido (ferramentas/scripts requeridos ausentes)
+# 40  falha em patch/configure/build/install
+# 41  build system não suportado ou não detectado
+# 42  nada a construir (sem fontes ou SRC_DIR ausente)
+# 43  IO/perm
+# 44  hooks falharam
+# 60+ erros específicos de resolver/fetch/extract propagados
+
+set -Eeuo pipefail
+umask 022
+
+# --------------------------------------------------------------------
+# Caminhos e integrações
+# --------------------------------------------------------------------
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_DESTDIR_BASE="${ADM_DESTDIR_BASE:-$ADM_ROOT/destdir}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+
+mkdir -p "$ADM_WORK" "$ADM_PACKAGES" "$ADM_STATE" "$ADM_LOGS" "$ADM_SOURCES" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+ADM_META="${ADM_META:-$ADM_SCRIPTS/adm-meta}"
+ADM_FETCH="${ADM_FETCH:-$ADM_SCRIPTS/adm-fetch}"
+ADM_EXTRACT="${ADM_EXTRACT:-$ADM_SCRIPTS/adm-extract}"
+ADM_DETECT="${ADM_DETECT:-$ADM_SCRIPTS/adm-detect}"
+ADM_RESOLVER="${ADM_RESOLVER:-$ADM_SCRIPTS/adm-resolver}"
+ADM_PATHS="${ADM_PATHS:-$ADM_SCRIPTS/adm-paths}"
+ADM_PACKAGE="${ADM_PACKAGE:-$ADM_SCRIPTS/adm-package}"
+ADM_INSTALL="${ADM_INSTALL:-$ADM_SCRIPTS/adm-install}"
+
+# --------------------------------------------------------------------
+# Logging (adm-io opcional)
+# --------------------------------------------------------------------
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+trim(){ local s="${1:-}"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+csv_norm(){ local v="${1:-}"; v="${v//[[:space:]]/}"; v="${v#,}"; v="${v%,}"; printf '%s' "$v"; }
+csv_to_arr(){ local s; s="$(csv_norm "$1")"; IFS=, read -r -a _ARR <<< "$s"; }
+emit(){ printf '%s=%s\n' "$1" "$2"; }
+
+exists(){ command -v "$1" >/dev/null 2>&1; }
+
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+
+# Locks
+LOCK_DIR="$ADM_ROOT/locks"; mkdir -p "$LOCK_DIR" || true
+with_lock(){
+  local name="$1"; shift
+  if command -v flock >/dev/null 2>&1; then
+    flock -w 300 "$LOCK_DIR/${name}.lock" -- bash -lc "$*"
+  else
+    local d="$LOCK_DIR/${name}.lock"
+    local waited=0
+    while ! mkdir "$d" 2>/dev/null; do
+      (( waited++ )); (( waited > 300 )) && die "Timeout lock: $name" 43
+      sleep 1
+    done
+    trap 'rmdir "'"$d"'" 2>/dev/null || true' EXIT
+    bash -lc "$*"; local rc=$?
+    rmdir "$d" 2>/dev/null || true
+    trap - EXIT
+    return "$rc"
+  fi
+}
+
+# --------------------------------------------------------------------
+# Parse do metafile e contexto
+# --------------------------------------------------------------------
+NAME=""; VERSION=""; CATEGORY=""
+META_DIR=""; HOOKS_DIR=""; PATCHES_DIR=""; RUN_DEPS=""; BUILD_DEPS=""; OPT_DEPS=""
+
+load_meta(){
+  local metaf="$1"
+  [[ -x "$ADM_META" ]] || die "adm-meta não encontrado: $ADM_META" 20
+  # shellcheck disable=SC1090
+  eval "$("$ADM_META" parse "$metaf")"
+  NAME="$ADM_NAME"; VERSION="$ADM_VERSION"; CATEGORY="$ADM_CATEGORY"
+  META_DIR="$ADM_META_DIR"; HOOKS_DIR="$ADM_HOOKS_DIR"; PATCHES_DIR="$ADM_PATCHES_DIR"
+  RUN_DEPS="${ADM_RUN_DEPS:-}"; BUILD_DEPS="${ADM_BUILD_DEPS:-}"; OPT_DEPS="${ADM_OPT_DEPS:-}"
+  [[ -n "$NAME" && -n "$VERSION" ]] || die "metafile sem name/version: $metaf" 20
+}
+
+# Diretórios de trabalho
+work_dir(){ printf '%s/%s-%s' "$ADM_WORK" "$NAME" "$VERSION"; }
+src_dir(){ printf '%s/src' "$(work_dir)"; }
+build_dir(){ printf '%s/build' "$(work_dir)"; }
+dest_dir(){ printf '%s/%s-%s' "$ADM_DESTDIR_BASE" "$NAME" "$VERSION"; }
+
+# --------------------------------------------------------------------
+# Hooks
+# --------------------------------------------------------------------
+run_hook(){
+  local hook="$1"
+  local f="$HOOKS_DIR/$hook"
+  if [[ -x "$f" ]]; then
+    log_i "Hook: $hook" script="$f"
+    # Exporta contexto comum
+    export ADM_NAME="$NAME" ADM_VERSION="$VERSION" ADM_WORKDIR="$(src_dir)" ADM_DESTDIR="$(dest_dir)" ADM_PROFILE="${ACTIVE_PROFILE:-}" LIBC_TARGET="${LIBC_TARGET:-}"
+    "$f" || die "Hook falhou: $hook" 44
+  fi
+}
+
+# --------------------------------------------------------------------
+# Profiles (adm-paths) e FLAGS
+# --------------------------------------------------------------------
+ACTIVE_PROFILE=""; CFLAGS=; CXXFLAGS=; LDFLAGS=; CPPFLAGS=; MAKEFLAGS=""; PKG_CONFIG_PATH=; LD=""; CC=""; CXX=""; AR=""; RANLIB=""; STRIP=""
+
+apply_profile(){
+  # Tenta adm-paths; fallback para defaults seguros (mínimo)
+  if [[ -x "$ADM_PATHS" ]]; then
+    # adm-paths deve aceitar:  paths profile --select=<aggressive|normal|minimal> --export
+    local want="${1:-auto}"
+    local out
+    if [[ "$want" == "auto" ]]; then
+      # heurística: se toolchain/kernel → mínimo, senão normal
+      out="$("$ADM_PATHS" profile auto --export 2>/dev/null || true)"
+    else
+      out="$("$ADM_PATHS" profile --select="$want" --export 2>/dev/null || true)"
+    fi
+    if [[ -n "$out" ]]; then
+      # shellcheck disable=SC1090
+      eval "$out"
+      ACTIVE_PROFILE="${ADM_PROFILE_NAME:-$want}"
+      log_o "Profile aplicado" profile="$ACTIVE_PROFILE"
+      return 0
+    fi
+  fi
+  # Fallback
+  case "${1:-auto}" in
+    aggressive) CFLAGS="-O3 -pipe"; CXXFLAGS="-O3 -pipe"; LDFLAGS="-Wl,-O1"; ACTIVE_PROFILE="aggressive" ;;
+    normal|auto) CFLAGS="-O2 -pipe"; CXXFLAGS="-O2 -pipe"; LDFLAGS="-Wl,-O1"; ACTIVE_PROFILE="normal" ;;
+    minimal) CFLAGS="-O0 -g"; CXXFLAGS="-O0 -g"; LDFLAGS=""; ACTIVE_PROFILE="minimal" ;;
+  esac
+  export CFLAGS CXXFLAGS LDFLAGS CPPFLAGS MAKEFLAGS PKG_CONFIG_PATH LD CC CXX AR RANLIB STRIP
+  log_w "adm-paths ausente/sem export; usando profile fallback" profile="$ACTIVE_PROFILE"
+}
+
+# --------------------------------------------------------------------
+# Fetch/Extract/Detect/Resolver
+# --------------------------------------------------------------------
+ensure_fetched_and_extracted(){
+  local metaf="$1"
+  # Fetch (se marcado como já feito, não refaz)
+  if [[ ! -f "$ADM_STATE/${NAME}-${VERSION}/DOWNLOAD_OK" ]]; then
+    [[ -x "$ADM_FETCH" ]] || die "adm-fetch ausente" 20
+    "$ADM_FETCH" "$metaf" || die "Fetch falhou" $?
+  else
+    log_i "Fetch já realizado"
+  fi
+  # Extract
+  if [[ ! -f "$ADM_STATE/${NAME}-${VERSION}/EXTRACT_OK" ]]; then
+    [[ -x "$ADM_EXTRACT" ]] || die "adm-extract ausente" 20
+    "$ADM_EXTRACT" "$metaf" || die "Extract falhou" $?
+  else
+    log_i "Extract já realizado"
+  fi
+}
+
+DETECTED_BUILD=""; BUILD_SYSTEM=""; LANGS=""; HOST_TRIPLE=""; TARGET_TRIPLE=""; CROSS="0"; LIBC=""; LINKERS=""; COMPILERS=""
+
+run_detect(){
+  local metaf="$1"
+  [[ -x "$ADM_DETECT" ]] || die "adm-detect ausente" 20
+  local out; out="$("$ADM_DETECT" "$metaf" --src-dir="$(src_dir)" || true)"
+  DETECTED_BUILD="$(printf '%s\n' "$out" | awk -F= '/^BUILD_SYSTEMS=/{print $2}' | head -n1)"
+  BUILD_SYSTEM="$(printf '%s\n' "$out" | awk -F= '/^BUILD_SYSTEM=/{print $2}' | head -n1)"
+  LANGS="$(printf '%s\n' "$out" | awk -F= '/^LANGS=/{print $2}' | head -n1)"
+  HOST_TRIPLE="$(printf '%s\n' "$out" | awk -F= '/^HOST_TRIPLE=/{print $2}' | head -n1)"
+  TARGET_TRIPLE="$(printf '%s\n' "$out" | awk -F= '/^TARGET_TRIPLE=/{print $2}' | head -n1)"
+  CROSS="$(printf '%s\n' "$out" | awk -F= '/^CROSS=/{print $2}' | head -n1)"
+  LIBC="$(printf '%s\n' "$out" | awk -F= '/^LIBC=/{print $2}' | head -n1)"
+  LINKERS="$(printf '%s\n' "$out" | awk -F= '/^LINKERS=/{print $2}' | head -n1)"
+  COMPILERS="$(printf '%s\n' "$out" | awk -F= '/^COMPILERS=/{print $2}' | head -n1)"
+
+  [[ -n "$BUILD_SYSTEM" ]] || die "Build system não detectado" 41
+  log_o "Build system" sys="$BUILD_SYSTEM" langs="$LANGS" cross="$CROSS" host="$HOST_TRIPLE" target="$TARGET_TRIPLE" libc="$LIBC"
+}
+
+# --------------------------------------------------------------------
+# Patches
+# --------------------------------------------------------------------
+apply_patches(){
+  local dir="$PATCHES_DIR"
+  [[ -d "$dir" ]] || { log_i "Sem patches"; return 0; }
+  local any=0
+  shopt -s nullglob
+  local list=("$dir"/*.patch "$dir"/*.diff)
+  for p in "${list[@]}"; do
+    [[ -f "$p" ]] || continue
+    any=1
+    log_i "Aplicando patch" file="$p"
+    ( cd "$(src_dir)" && patch -p1 --fuzz=2 -i "$p" ) || die "Falha ao aplicar patch: $(basename "$p")" 40
+  done
+  shopt -u nullglob
+  (( any )) && log_o "Patches aplicados" count="${#list[@]}"
+}
+
+# --------------------------------------------------------------------
+# Toolchain/env para cross e linker
+# --------------------------------------------------------------------
+prepare_toolchain_env(){
+  # Seleciona linker preferível, se disponível
+  if [[ "$LINKERS" == *"ld.lld"* ]] && exists ld.lld; then
+    export LD="ld.lld"; log_i "Linker: ld.lld"
+  elif [[ "$LINKERS" == *"gold"* ]] && exists ld.gold; then
+    export LD="ld.gold"; log_i "Linker: ld.gold"
+  elif [[ "$LINKERS" == *"mold"* ]] && exists mold; then
+    export LD="mold"; log_i "Linker: mold"
+  fi
+  # Cross
+  if [[ "$CROSS" == "1" && -n "$TARGET_TRIPLE" ]]; then
+    [[ -z "${CC:-}"  ]] && { exists "${TARGET_TRIPLE}-gcc"  && export CC="${TARGET_TRIPLE}-gcc"; }
+    [[ -z "${CXX:-}" ]] && { exists "${TARGET_TRIPLE}-g++"  && export CXX="${TARGET_TRIPLE}-g++"; }
+    [[ -z "${AR:-}"  ]] && { exists "${TARGET_TRIPLE}-ar"   && export AR="${TARGET_TRIPLE}-ar"; }
+    [[ -z "${RANLIB:-}" ]] && { exists "${TARGET_TRIPLE}-ranlib" && export RANLIB="${TARGET_TRIPLE}-ranlib"; }
+    log_i "Cross toolchain configurado" cc="${CC:-system}" cxx="${CXX:-system}"
+  fi
+}
+
+# --------------------------------------------------------------------
+# Configure / Build / Install (vários sistemas)
+# --------------------------------------------------------------------
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+CMAKE_GENERATOR="${CMAKE_GENERATOR:-Ninja}"
+
+configure_autotools(){
+  local d; d="$(src_dir)"
+  ( cd "$d" && [[ -x ./autogen.sh ]] && ./autogen.sh ) || true
+  local hostopt=""
+  [[ "$CROSS" == "1" && -n "$TARGET_TRIPLE" ]] && hostopt="--host=$TARGET_TRIPLE"
+  ( cd "$d" && ./configure --prefix=/usr $hostopt CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" ) || return 1
+}
+build_autotools(){
+  ( cd "$(src_dir)" && make -j"$JOBS" ) || return 1
+}
+install_autotools(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  ( cd "$(src_dir)" && make DESTDIR="$dest" install ) || return 1
+}
+
+configure_cmake(){
+  local b; b="$(build_dir)"; mkdir -p "$b"
+  local sysproc=""; [[ -n "$TARGET_TRIPLE" ]] && sysproc="-DCMAKE_SYSTEM_PROCESSOR=${TARGET_TRIPLE%%-*}"
+  local ccopt=""; [[ -n "${CC:-}"  ]] && ccopt="-DCMAKE_C_COMPILER=$CC"
+  local cxopt=""; [[ -n "${CXX:-}" ]] && cxopt="-DCMAKE_CXX_COMPILER=$CXX"
+  cmake -S "$(src_dir)" -B "$b" -G "$CMAKE_GENERATOR" \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr $sysproc $ccopt $cxopt \
+    -DCMAKE_C_FLAGS="$CFLAGS" -DCMAKE_CXX_FLAGS="$CXXFLAGS" -DCMAKE_EXE_LINKER_FLAGS="$LDFLAGS" || return 1
+}
+build_cmake(){
+  cmake --build "$(build_dir)" -j"$JOBS" || return 1
+}
+install_cmake(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  cmake --install "$(build_dir)" --prefix /usr --config Release --strip 2>/dev/null || true
+  DESTDIR="$dest" cmake --install "$(build_dir)" --config Release || return 1
+}
+
+configure_meson(){
+  local b; b="$(build_dir)"; mkdir -p "$b"
+  local crossopt=()
+  if [[ "$CROSS" == "1" && -n "$TARGET_TRIPLE" ]]; then
+    # tentativa simples: --cross-file com env CC/CXX já setados
+    crossopt+=(--cross-file /dev/null)
+  fi
+  meson setup "$b" "$(src_dir)" --prefix=/usr --libdir=lib -Dbuildtype=release "${crossopt[@]}" || return 1
+}
+build_meson(){ ninja -C "$(build_dir)" -j "$JOBS" || return 1; }
+install_meson(){ local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1; DESTDIR="$dest" meson install -C "$(build_dir)" || return 1; }
+
+build_make(){
+  ( cd "$(src_dir)" && make -j"$JOBS" CFLAGS="$CFLAGS" CXXFLAGS="$CXXFLAGS" LDFLAGS="$LDFLAGS" ) || return 1
+}
+install_make(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  ( cd "$(src_dir)" && if make -n install >/dev/null 2>&1; then make DESTDIR="$dest" install; else return 2; fi ) || return $?
+}
+
+build_ninja(){ ninja -C "$(src_dir)" -j "$JOBS" || return 1; }
+install_ninja(){ log_w "Projeto ninja puro sem target install — ignorando"; return 0; }
+
+build_cargo(){
+  ( cd "$(src_dir)" && cargo build --release --locked ) || return 1
+}
+install_cargo(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest/usr/bin" || return 1
+  local bin; bin="$(find "$(src_dir)"/target/release -maxdepth 1 -type f -perm -111 2>/dev/null | head -n1 || true)"
+  if [[ -n "$bin" ]]; then install -m755 "$bin" "$dest/usr/bin/$(basename "$bin")"; else return 2; fi
+}
+
+build_go(){
+  local gobin="$(build_dir)/.gobin"; mkdir -p "$gobin"
+  ( cd "$(src_dir)" && GOBIN="$gobin" go install ./... ) || return 1
+}
+install_go(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest/usr/bin" || return 1
+  local gobin="$(build_dir)/.gobin"
+  shopt -s nullglob; for f in "$gobin"/*; do install -m755 "$f" "$dest/usr/bin/"; done; shopt -u nullglob
+  return 0
+}
+
+build_python_pep517(){
+  ( cd "$(src_dir)" && python3 -m pip wheel --no-deps -w "$(build_dir)/wheel" . ) || return 1
+}
+install_python_pep517(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  ( cd "$(src_dir)" && python3 -m pip install --no-deps --prefix /usr --root "$dest" . ) || return 1
+}
+
+build_python_setup(){
+  ( cd "$(src_dir)" && python3 setup.py build ) || return 1
+}
+install_python_setup(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  ( cd "$(src_dir)" && python3 setup.py install --root="$dest" --prefix=/usr ) || return 1
+}
+
+build_node(){
+  ( cd "$(src_dir)" && if [[ -f package-lock.json || -f npm-shrinkwrap.json ]]; then npm ci --ignore-scripts; else npm install --ignore-scripts; fi ) || return 1
+  ( cd "$(src_dir)" && npm run -s build 2>/dev/null || true )
+}
+install_node(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest/usr/lib/node_modules/$NAME" || return 1
+  ( cd "$(src_dir)" && rsync -a --delete ./ "$dest/usr/lib/node_modules/$NAME"/ ) || return 1
+  # bin (se houver)
+  if command -v jq >/dev/null 2>&1 && [[ -f "$(src_dir)/package.json" ]]; then
+    local bins; bins="$(jq -r '.bin|objects|to_entries[]?|.value' "$(src_dir)/package.json" 2>/dev/null || true)"
+    if [[ -n "$bins" ]]; then
+      mkdir -p "$dest/usr/bin"
+      while read -r rel; do
+        [[ -z "$rel" ]] && continue
+        install -m755 "$(src_dir)/$rel" "$dest/usr/bin/$(basename "$rel")"
+      done <<< "$bins"
+    fi
+  fi
+  return 0
+}
+
+build_perl(){
+  ( cd "$(src_dir)" && perl Makefile.PL ) || return 1
+  ( cd "$(src_dir)" && make -j"$JOBS" ) || return 1
+}
+install_perl(){
+  local dest; dest="$(dest_dir)"; mkdir -p "$dest" || return 1
+  ( cd "$(src_dir)" && make DESTDIR="$dest" install ) || return 1
+}
+
+build_luarocks(){
+  if command -v luarocks >/dev/null 2>&1; then
+    ( cd "$(src_dir)" && luarocks make --lua-dir=/usr ) || return 1
+  else
+    return 2
+  fi
+}
+install_luarocks(){ :; return 0; }  # já instala via luarocks
+# --------------------------------------------------------------------
+# Execução de estágios por BUILD_SYSTEM
+# --------------------------------------------------------------------
+do_configure(){
+  run_hook pre-configure
+  case "$BUILD_SYSTEM" in
+    autotools) configure_autotools ;;
+    cmake)     configure_cmake ;;
+    meson)     configure_meson ;;
+    make)      : ;;  # make puro não tem configure
+    ninja)     : ;;
+    cargo)     : ;;
+    go)        : ;;
+    pep517|distutils|python) : ;;
+    node)      : ;;
+    maven|gradle) : ;;   # não implementado aqui; futuros
+    perl)      : ;;
+    luARocks|luarocks) : ;;
+    *)
+      # heurísticas: se existir configure, usa autotools
+      if [[ -x "$(src_dir)/configure" ]]; then configure_autotools || return 1
+      elif [[ -f "$(src_dir)/CMakeLists.txt" ]]; then BUILD_SYSTEM="cmake"; configure_cmake || return 1
+      elif [[ -f "$(src_dir)/meson.build" ]]; then BUILD_SYSTEM="meson"; configure_meson || return 1
+      else
+        log_w "Sem etapa configure para $BUILD_SYSTEM"
+      fi
+      ;;
+  esac
+  run_hook post-configure
+}
+
+do_build(){
+  run_hook pre-build
+  case "$BUILD_SYSTEM" in
+    autotools) build_autotools ;;
+    cmake)     build_cmake ;;
+    meson)     build_meson ;;
+    make)      build_make ;;
+    ninja)     build_ninja ;;
+    cargo)     build_cargo ;;
+    go)        build_go ;;
+    pep517)    build_python_pep517 ;;
+    distutils|python) build_python_setup ;;
+    node)      build_node ;;
+    perl)      build_perl ;;
+    luarocks|luARocks) build_luarocks ;;
+    *)
+      # heurísticas: tenta make; se falhar e houver build.ninja, tenta ninja
+      if make -C "$(src_dir)" -n >/dev/null 2>&1; then build_make || return 1
+      elif [[ -f "$(src_dir)/build.ninja" ]]; then build_ninja || return 1
+      else
+        return 1
+      fi
+      ;;
+  esac
+  run_hook post-build
+}
+
+do_install(){
+  run_hook pre-install
+  local dest; dest="$(dest_dir)"
+  mkdir -p "$dest" || return 1
+  case "$BUILD_SYSTEM" in
+    autotools) install_autotools ;;
+    cmake)     install_cmake ;;
+    meson)     install_meson ;;
+    make)      install_make || { [[ "$?" = "2" ]] && log_w "make install ausente" || return 1; } ;;
+    ninja)     install_ninja ;;  # best-effort
+    cargo)     install_cargo || { [[ "$?" = "2" ]] && log_w "binários cargo não encontrados" || return 1; } ;;
+    go)        install_go ;;
+    pep517)    install_python_pep517 ;;
+    distutils|python) install_python_setup ;;
+    node)      install_node ;;
+    perl)      install_perl ;;
+    luarocks|luARocks) install_luarocks ;;
+    *)
+      # heurística final: tenta 'make DESTDIR= install'
+      install_make || log_w "Sem install definido; nada instalado"
+      ;;
+  esac
+
+  # pós-ajustes comuns
+  # garantir hierarquias básicas
+  mkdir -p "$dest/usr/bin" "$dest/usr/lib" "$dest/usr/share" "$dest/etc" "$dest/var" 2>/dev/null || true
+
+  # strip opcional (se STRIP definido)
+  if [[ -n "${STRIP:-}" && -d "$dest" ]]; then
+    find "$dest" -type f -perm -111 -exec "$STRIP" --strip-unneeded {} + 2>/dev/null || true
+  fi
+
+  run_hook post-install
+}
+
+# --------------------------------------------------------------------
+# Aplicação total (pipeline interno)
+# --------------------------------------------------------------------
+execute_pipeline(){
+  local metaf="$1" profile_sel="${2:-auto}" skip_fetch="${3:-0}" skip_extract="${4:-0}" no_package="${5:-0}"
+
+  section "Construindo $NAME $VERSION" category="$CATEGORY"
+
+  # lock por pacote
+  with_lock "build-${NAME}" "true" || die 'Falha ao obter lock' 43
+
+  # logs centralizados
+  if ((have_io)); then "$ADM_IO" tee start --file="$ADM_LOGS/build-${NAME}-${VERSION}.log" || true; fi
+
+  # fetch/extract
+  if (( skip_fetch == 0 || skip_extract == 0 )); then
+    ensure_fetched_and_extracted "$metaf"
+  else
+    log_i "Fetch/Extract pulados por opção"
+  fi
+
+  # apply profile e preparar toolchain/linker
+  apply_profile "$profile_sel"
+  run_hook pre-patch
+  apply_patches
+  run_hook post-patch
+
+  # detectar
+  run_detect "$metaf"
+  prepare_toolchain_env
+
+  # configure/build/install
+  do_configure || die "Falha na configuração" 40
+  do_build     || die "Falha na compilação" 40
+  do_install   || die "Falha na instalação" 40
+
+  # gerar MANIFEST simples
+  local dest; dest="$(dest_dir)"
+  local manifest="$dest/.ADM_MANIFEST"
+  ( cd "$dest" && find . -type f | sed 's|^\./||' | LC_ALL=C sort ) >"$manifest" 2>/dev/null || true
+  log_o "DESTDIR pronto" path="$dest"
+
+  run_hook pre-package
+  if (( no_package == 0 )) && [[ -x "$ADM_PACKAGE" ]]; then
+    "$ADM_PACKAGE" "$metaf" --destdir="$dest" || log_w "Empacotamento falhou (prosseguindo)"
+  else
+    log_i "Empacotamento desabilitado ou adm-package ausente"
+  fi
+  run_hook post-package
+
+  # saída machine-readable
+  emit DESTDIR "$dest"
+  emit BUILD_SYSTEM "$BUILD_SYSTEM"
+  emit ACTIVE_PROFILE "$ACTIVE_PROFILE"
+  emit HOST_TRIPLE "$HOST_TRIPLE"
+  emit TARGET_TRIPLE "$TARGET_TRIPLE"
+  emit CROSS "$CROSS"
+  emit LIBC "$LIBC"
+  emit LANGS "$LANGS"
+
+  log_o "Build finalizado" pkg="$NAME" ver="$VERSION"
+  if ((have_io)); then "$ADM_IO" tee stop || true; fi
+}
+
+# --------------------------------------------------------------------
+# Validações de ambiente
+# --------------------------------------------------------------------
+validate_env(){
+  [[ -x "$ADM_META" ]]     || die "adm-meta ausente: $ADM_META" 20
+  [[ -x "$ADM_FETCH" ]]    || log_w "adm-fetch ausente; pular fetch se já tiver cache"
+  [[ -x "$ADM_EXTRACT" ]]  || log_w "adm-extract ausente; precisa de SRC_DIR pronto"
+  [[ -x "$ADM_DETECT" ]]   || die "adm-detect ausente: $ADM_DETECT" 20
+  [[ -x "$ADM_RESOLVER" ]] || log_w "adm-resolver ausente; dependências não serão verificadas"
+  command -v patch >/dev/null 2>&1 || die "patch não encontrado" 20
+  command -v make  >/dev/null 2>&1 || true
+  command -v cmake >/dev/null 2>&1 || true
+  command -v meson >/dev/null 2>&1 || true
+  command -v ninja >/dev/null 2>&1 || true
+  command -v cargo >/dev/null 2>&1 || true
+  command -v go    >/dev/null 2>&1 || true
+  command -v python3 >/dev/null 2>&1 || true
+  command -v npm   >/dev/null 2>&1 || true
+}
+
+# --------------------------------------------------------------------
+# Opcional: resolver deps antes de construir (informativo)
+# --------------------------------------------------------------------
+precheck_deps(){
+  local metaf="$1" include_opt="${2:-0}"
+  if [[ -x "$ADM_RESOLVER" ]]; then
+    local out; out="$("$ADM_RESOLVER" "$metaf" $([[ "$include_opt" == "1" ]] && echo --include-opt || true) --no-detect || true)"
+    local missing; missing="$(printf '%s\n' "$out" | awk -F= '/^MISSING_DEPS=/{print $2}' | head -n1 || true)"
+    if [[ -n "$missing" ]]; then
+      log_w "Dependências ausentes no repositório" missing="$missing"
+    else
+      log_i "Dependências parecem resolvíveis"
+    fi
+  fi
+}
+# --------------------------------------------------------------------
+# CLI / Dispatcher
+# --------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-constructor — orquestra a construção completa de um programa a partir do metafile.
+
+Uso:
+  adm-constructor <metafile> [opções]
+
+Opções:
+  --profile=<aggressive|normal|minimal|auto>    Seleciona perfil de compilação (default: auto)
+  --skip-fetch                                  Não roda adm-fetch
+  --skip-extract                                Não roda adm-extract
+  --no-package                                  Pula empacotamento ao final
+  --include-opt                                 Considera opt_deps para precheck
+  --jobs=N                                      Força número de jobs de build
+
+Saída machine-readable:
+  DESTDIR=...          diretório de instalação temporária
+  BUILD_SYSTEM=...     sistema de build detectado/usado
+  ACTIVE_PROFILE=...   profile aplicado
+  HOST_TRIPLE=...      triple host
+  TARGET_TRIPLE=...    triple target (cross)
+  CROSS=0|1            se cross-compiling
+  LIBC=glibc|musl|...
+  LANGS=c,cpp,...      linguagens detectadas
+
+Exit codes:
+  0 ok; 1 uso; 20 ambiente; 40 patch/configure/build/install; 41 build system; 42 sem fontes/SRC_DIR; 43 IO; 44 hooks
+USAGE
+}
+
+main(){
+  local metaf="" profile="auto" skip_fetch=0 skip_extract=0 no_package=0 include_opt=0
+  while (( $# )); do
+    case "$1" in
+      --profile=*) profile="${1#*=}" ;;
+      --skip-fetch) skip_fetch=1 ;;
+      --skip-extract) skip_extract=1 ;;
+      --no-package) no_package=1 ;;
+      --include-opt) include_opt=1 ;;
+      --jobs=*) JOBS="${1#*=}" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) metaf="$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$metaf" ]] || { usage; exit 1; }
+
+  validate_env
+  load_meta "$metaf"
+
+  # Precheck informativo de dependências
+  precheck_deps "$metaf" "$include_opt"
+
+  # Certificar SRC_DIR
+  local src; src="$(src_dir)"
+  if [[ ! -d "$src" ]] && (( skip_extract == 1 )); then
+    die "SRC_DIR ausente e --skip-extract foi usado" 42
+  fi
+
+  execute_pipeline "$metaf" "$profile" "$skip_fetch" "$skip_extract" "$no_package"
+}
+
+main "$@"
