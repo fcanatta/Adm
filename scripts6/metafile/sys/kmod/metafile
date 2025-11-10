@@ -1,0 +1,12 @@
+name=kmod
+version=33
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas e bibliotecas para módulos do kernel (modprobe, depmod)
+homepage=https://git.kernel.org/pub/scm/utils/kernel/kmod/kmod.git
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://mirrors.edge.kernel.org/pub/linux/utils/kernel/kmod/kmod-33.tar.xz
