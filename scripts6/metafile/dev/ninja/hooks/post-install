@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+cmake --install "$ADM_BUILD_DIR" --prefix /usr --config Release --destdir "$ADM_DESTDIR"
