@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/adm-clean
+# Limpeza segura de caches/diretórios do ADM:
+#  - sources, work, destdir, packages (antigos/órfãos), logs, state, locks, tmp
+#  - políticas: keep-days / keep-last / max-age-days
+#  - alvo de espaço livre: --min-free-gb
+#
+# Exit codes:
+#  0  ok
+#  1  uso/args
+# 20  ambiente inválido
+# 43  IO/perm
+# 70  nada a fazer / sem candidatos (não é erro)
+# 71  confirmação negada (sem --yes)
+# 72  alvo de espaço livre não atingível
+
+set -Eeuo pipefail
+umask 022
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+ADM_METAFILES="${ADM_METAFILES:-$ADM_ROOT/metafiles}"
+ADM_SOURCES="${ADM_SOURCES:-$ADM_ROOT/sources}"
+ADM_WORK="${ADM_WORK:-$ADM_ROOT/work}"
+ADM_DESTDIR_BASE="${ADM_DESTDIR_BASE:-$ADM_ROOT/destdir}"
+ADM_PACKAGES="${ADM_PACKAGES:-$ADM_ROOT/packages}"
+ADM_LOGS="${ADM_LOGS:-$ADM_ROOT/logs}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_LOCKS="${ADM_LOCKS:-$ADM_ROOT/locks}"
+ADM_TMP="${ADM_TMP:-$ADM_ROOT/tmp}"
+ADM_DB="${ADM_DB:-$ADM_ROOT/db}"
+
+mkdir -p "$ADM_SOURCES" "$ADM_WORK" "$ADM_DESTDIR_BASE" "$ADM_PACKAGES" "$ADM_LOGS" "$ADM_STATE" "$ADM_LOCKS" "$ADM_TMP" "$ADM_DB" >/dev/null 2>&1 || true
+
+ADM_IO="${ADM_IO:-$ADM_SCRIPTS/adm-io}"
+
+have_io=0; [[ -x "$ADM_IO" ]] && have_io=1
+log_i(){ if ((have_io)); then "$ADM_IO" log info "$@"; else printf '[INFO] %s\n' "$*"; fi; }
+log_o(){ if ((have_io)); then "$ADM_IO" log ok   "$@"; else printf '[OK] %s\n'   "$*"; fi; }
+log_w(){ if ((have_io)); then "$ADM_IO" log warn "$@"; else printf '[WARN] %s\n' "$*"; fi; }
+log_e(){ if ((have_io)); then "$ADM_IO" log error "$@"; else printf '[ERROR] %s\n' "$*"; fi; }
+section(){ if ((have_io)); then "$ADM_IO" section "$@"; else printf '\n==== %s ====\n' "$*"; fi; }
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+die(){ local c="${2:-1}"; log_e "$1"; exit "$c"; }
+now_epoch(){ date +%s; }
+days_to_secs(){ echo $(( ${1:-0} * 86400 )); }
+human(){ # bytes -> string
+  local b="${1:-0}"; local s=(B KB MB GB TB); local i=0
+  while (( b >= 1024 && i < ${#s[@]}-1 )); do b=$((b/1024)); ((i++)); done
+  printf "%s %s" "$b" "${s[$i]}"
+}
+is_subpath_of_root(){
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  local rp; rp="$(readlink -f -- "$p" 2>/dev/null || true)"
+  local rr; rr="$(readlink -f -- "$ADM_ROOT" 2>/dev/null || true)"
+  [[ -n "$rp" && -n "$rr" ]] || return 1
+  [[ "$rp" == "$rr"* ]]
+}
+safe_candidate(){
+  local p="$1"
+  [[ -e "$p" ]] || return 1
+  [[ "$p" != "/" && "$p" != "/*" && "$p" != "." ]] || return 1
+  is_subpath_of_root "$p"
+}
+
+du_bytes(){ du -sb --apparent-size "$1" 2>/dev/null | awk '{print $1}'; }
+
+confirm(){
+  local msg="$1"
+  if (( ASSUME_YES )); then return 0; fi
+  read -r -p "$msg [y/N] " ans || true
+  [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+# filtros
+match_protect(){
+  local p="$1"; local glob
+  IFS=, read -r -a PARR <<< "$PROTECT_GLOB"
+  for glob in "${PARR[@]}"; do
+    [[ -z "$glob" ]] && continue
+    [[ "$p" == $glob ]] && return 0
+  done
+  return 1
+}
+
+# Execução em "dry-run"
+DRY_RUN=0
+remove_path(){
+  local p="$1"
+  if (( DRY_RUN )); then
+    printf 'DRY:%s\n' "$p"
+    return 0
+  fi
+  if [[ -d "$p" && ! -L "$p" ]]; then
+    rm -rf --one-file-system -- "$p" 2>/dev/null || rm -rf -- "$p" 2>/dev/null || return 1
+  else
+    rm -f -- "$p" 2>/dev/null || return 1
+  fi
+}
+
+# Execução paralela por lote simples
+JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+par_delete(){
+  local -a items=("$@")
+  local -a PIDS=(); local i
+  local batch="${PAR_BATCH:-16}"
+  local idx=0
+  for p in "${items[@]}"; do
+    (( idx % batch == 0 )) && wait -n 2>/dev/null || true
+    ( remove_path "$p" ) &
+    PIDS+=("$!")
+    ((idx++))
+  done
+  for pid in "${PIDS[@]}"; do wait "$pid" 2>/dev/null || true; done
+}
+
+# Acumuladores
+FREED_BYTES=0
+REMOVED_COUNT=0
+add_freed(){
+  local b="${1:-0}"
+  FREED_BYTES=$((FREED_BYTES + b))
+}
+inc_removed(){ REMOVED_COUNT=$((REMOVED_COUNT + 1)); }
+
+# -----------------------------------------------------------------------------
+# Coletores de candidatos
+# -----------------------------------------------------------------------------
+KEEP_DAYS=14
+KEEP_LAST=2
+MAX_AGE_DAYS=0
+MIN_FREE_GB=0
+ASSUME_YES=0
+PROTECT_GLOB=""
+
+# fontes não referenciadas (por nome de arquivo), ou antigas por keep-days/max-age
+collect_sources_unused(){
+  local -a cand=()
+  local now; now="$(now_epoch)"
+  local max_age_secs=0
+  (( MAX_AGE_DAYS > 0 )) && max_age_secs="$(days_to_secs "$MAX_AGE_DAYS")"
+
+  # Mapeia nomes referenciados em metafiles/update
+  declare -A REF=()
+  while IFS= read -r -d '' mf; do
+    local srcs
+    srcs="$(awk -F= '/^sources=/{print $2}' "$mf" 2>/dev/null | tr ',' '\n' | sed 's/[[:space:]]//g' || true)"
+    while read -r u; do
+      [[ -z "$u" ]] && continue
+      REF["$(basename "${u%%\?*}")"]=1
+    done <<< "$srcs"
+  done < <(find "$ADM_METAFILES" "$ADM_ROOT/update" -type f -name metafile -print0 2>/dev/null || true)
+
+  # examina cache de sources
+  while IFS= read -r -d '' f; do
+    # protegido?
+    match_protect "$f" && continue
+    local base; base="$(basename "$f")"
+    local mtime; mtime="$(stat -c %Y "$f" 2>/dev/null || echo 0)"
+    local age=$(( now - mtime ))
+    local old_keep=$(( age > $(days_to_secs "$KEEP_DAYS") ))
+    local old_max=$(( MAX_AGE_DAYS > 0 && age > max_age_secs ))
+    local unref=$(( ${REF[$base]:-0} == 0 ))
+    if (( old_keep || old_max || unref )); then
+      cand+=("$f")
+    fi
+  done < <(find "$ADM_SOURCES" -type f -print0 2>/dev/null || true)
+
+  printf '%s\0' "${cand[@]}" 2>/dev/null || true
+}
+
+# work dirs antigos (sem locks recentes)
+collect_work_old(){
+  local -a cand=()
+  local now; now="$(now_epoch)"
+  local thresh=$(( now - $(days_to_secs "$KEEP_DAYS") ))
+  while IFS= read -r -d '' d; do
+    match_protect "$d" && continue
+    local mt; mt="$(stat -c %Y "$d" 2>/dev/null || echo 0)"
+    (( mt < thresh )) && cand+=("$d")
+  done < <(find "$ADM_WORK" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
+  printf '%s\0' "${cand[@]}" 2>/dev/null || true
+}
+
+# destdirs órfãos (sem pacote correspondente) ou antigos
+collect_destdirs_orphans(){
+  local -a cand=()
+  local now; now="$(now_epoch)"
+  local thresh=$(( now - $(days_to_secs "$KEEP_DAYS") ))
+
+  # indexa pacotes existentes por nome-versao
+  declare -A PKGKEYS=()
+  while IFS= read -r -d '' p; do
+    local b; b="$(basename "$p")"
+    # <name>-<version>-<rel>-<arch>-<libc>.tar.*
+    if [[ "$b" =~ ^([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)-([0-9]+)-([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)\.tar\.(zst|xz)$ ]]; then
+      PKGKEYS["${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"]=1
+    fi
+  done < <(find "$ADM_PACKAGES" -type f -name '*.tar.*' -print0 2>/dev/null || true)
+
+  while IFS= read -r -d '' d; do
+    match_protect "$d" && continue
+    local base; base="$(basename "$d")"  # name-version
+    local mt; mt="$(stat -c %Y "$d" 2>/dev/null || echo 0)"
+    local old=$(( mt < thresh ))
+    local orphan=$(( ${PKGKEYS[$base]:-0} == 0 ))
+    if (( orphan || old )); then
+      cand+=("$d")
+    fi
+  done < <(find "$ADM_DESTDIR_BASE" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null || true)
+
+  printf '%s\0' "${cand[@]}" 2>/dev/null || true
+}
+
+# packages antigos: manter últimos K por <name> (por release/mtime)
+collect_packages_old(){
+  local keep="${KEEP_LAST:-2}"
+  local -a cand=()
+  # index {[name] -> array(paths)} e ordena
+  declare -A GROUP=()
+  while IFS= read -r -d '' p; do
+    match_protect "$p" && continue
+    local b; b="$(basename "$p")"
+    local name=""
+    if [[ "$b" =~ ^([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)-([0-9]+)-([A-Za-z0-9._+-]+)-([A-Za-z0-9._+-]+)\.tar\.(zst|xz)$ ]]; then
+      name="${BASH_REMATCH[1]}"
+    else
+      name="misc"
+    fi
+    GROUP["$name"]+="${GROUP[$name]:+__SEP__}$p"
+  done < <(find "$ADM_PACKAGES" -type f -name '*.tar.*' -print0 2>/dev/null || true)
+  local k
+  for k in "${!GROUP[@]}"; do
+    IFS=__SEP__ read -r -a arr <<< "${GROUP[$k]}"
+    # ordena por mtime desc
+    IFS=$'\n' read -r -d '' sorted < <(printf '%s\n' "${arr[@]}" | xargs -r stat -c '%Y %n' 2>/dev/null | sort -rn | awk '{print $2}' && printf '\0') || true
+    local idx=0
+    while read -r path; do
+      [[ -z "$path" ]] && continue
+      (( idx >= keep )) && cand+=("$path")
+      ((idx++))
+    done <<< "$sorted"
+  done
+  printf '%s\0' "${cand[@]}" 2>/dev/null || true
+}
+
+# logs/state/tmp antigos
+collect_logs_old(){ find "$ADM_LOGS" -type f -mtime +"$KEEP_DAYS" -print0 2>/dev/null || true; }
+collect_state_old(){ find "$ADM_STATE" -type f -mtime +"$KEEP_DAYS" -name '*.rc.*' -print0 2>/dev/null || true; }
+collect_locks_stale(){ find "$ADM_LOCKS" -mindepth 1 -maxdepth 1 -mmin +120 -print0 2>/dev/null || true; }
+collect_tmp_old(){ find "$ADM_TMP" -mindepth 1 -mtime +"$KEEP_DAYS" -print0 2>/dev/null || true; }
+
+# pacotes órfãos (sem .ADM_META válido): suspeitos
+collect_packages_orphans(){
+  local -a cand=()
+  while IFS= read -r -d '' p; do
+    match_protect "$p" && continue
+    # tenta listar .ADM_META
+    local tmpd; tmpd="$(mktemp -d)"
+    if [[ "$p" =~ \.tar\.zst$ ]]; then
+      tar --zstd -tf "$p" '.ADM_META' >/dev/null 2>&1 || cand+=("$p")
+    else
+      tar -I xz -tf "$p" '.ADM_META' >/dev/null 2>&1 || cand+=("$p")
+    fi
+    rm -rf "$tmpd" 2>/dev/null || true
+  done < <(find "$ADM_PACKAGES" -type f -name '*.tar.*' -print0 2>/dev/null || true)
+  printf '%s\0' "${cand[@]}" 2>/dev/null || true
+}
+
+# -----------------------------------------------------------------------------
+# Pipeline de remoção com contabilidade
+# -----------------------------------------------------------------------------
+delete_candidates(){
+  local -a list=()
+  local total=0
+  while IFS= read -r -d '' p; do
+    safe_candidate "$p" || { log_w "Ignorando inseguros" path="$p"; continue; }
+    match_protect "$p" && { log_w "Protegido por glob" path="$p"; continue; }
+    local b; b="$(du_bytes "$p")"
+    total=$(( total + b ))
+    list+=("$p")
+  done
+  if ((${#list[@]}==0)); then
+    return 70
+  fi
+
+  if ! confirm "Remover ${#list[@]} itens (~$(human "$total"))?"; then
+    return 71
+  fi
+
+  if ((have_io)); then
+    local tok; tok="$("$ADM_IO" spinner start "Removendo ${#list[@]} itens")" || true
+    par_delete "${list[@]}"
+    "$ADM_IO" spinner stop "$tok" --ok "Concluído" || true
+  else
+    par_delete "${list[@]}"
+  fi
+
+  local p
+  for p in "${list[@]}"; do
+    local b; b="$(du_bytes "$p" 2>/dev/null || echo 0)"
+    # após remoção, b pode ser 0; usamos o estimado anterior já somado
+    inc_removed
+  done
+  add_freed "$total"
+  return 0
+}
+# -----------------------------------------------------------------------------
+# Limpezas específicas (compõem os coletores)
+# -----------------------------------------------------------------------------
+clean_sources(){ section "Limpando fontes (unused/antigas)"; collect_sources_unused | delete_candidates || true; }
+clean_work(){ section "Limpando work antigos"; collect_work_old | delete_candidates || true; }
+clean_destdir(){ section "Limpando destdirs órfãos/antigos"; collect_destdirs_orphans | delete_candidates || true; }
+clean_packages_old(){ section "Limpando pacotes antigos (mantendo últimos $KEEP_LAST)"; collect_packages_old | delete_candidates || true; }
+clean_packages_orphans(){ section "Limpando pacotes órfãos (sem .ADM_META)"; collect_packages_orphans | delete_candidates || true; }
+clean_logs(){ section "Limpando logs antigos"; collect_logs_old | delete_candidates || true; }
+clean_state(){ section "Limpando state residual (.rc.*)"; collect_state_old | delete_candidates || true; }
+clean_locks(){ section "Limpando locks obsoletos (>120min)"; collect_locks_stale | delete_candidates || true; }
+clean_tmp(){ section "Limpando tmp antigos"; collect_tmp_old | delete_candidates || true; }
+
+# -----------------------------------------------------------------------------
+# Alvo de espaço livre: apaga incrementalmente em ordem de risco baixo → alto
+# -----------------------------------------------------------------------------
+free_space_target(){
+  local goal_gb="$1"
+  local fs; fs="$(df -Pk "$ADM_ROOT" | awk 'NR==2{print $4}')" # KB livres
+  local free_gb=$(( fs / 1024 / 1024 ))
+  (( free_gb >= goal_gb )) && { log_o "Espaço suficiente" freeGB="$free_gb"; return 0; }
+  log_i "Espaço livre atual" freeGB="$free_gb" goalGB="$goal_gb"
+
+  # Ordem de limpeza: logs → state → tmp → work → sources → packages-old → destdir-orphans
+  local phase=1
+  while (( free_gb < goal_gb && phase <= 7 )); do
+    case "$phase" in
+      1) clean_logs ;;
+      2) clean_state ;;
+      3) clean_tmp ;;
+      4) clean_work ;;
+      5) clean_sources ;;
+      6) clean_packages_old ;;
+      7) clean_destdir ;;
+    esac
+    fs="$(df -Pk "$ADM_ROOT" | awk 'NR==2{print $4}')"
+    free_gb=$(( fs / 1024 / 1024 ))
+    (( phase++ ))
+  done
+
+  if (( free_gb < goal_gb )); then
+    log_w "Alvo de espaço não alcançado" freeGB="$free_gb" goalGB="$goal_gb"
+    return 72
+  fi
+  log_o "Alvo atingido" freeGB="$free_gb"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# CLI / Dispatcher
+# -----------------------------------------------------------------------------
+usage(){
+  cat <<'USAGE'
+adm-clean — limpeza segura dos diretórios do ADM.
+
+Uso:
+  adm-clean [opções] [alvos]
+
+Alvos (combine à vontade; --all executa tudo exceto --packages-orphans):
+  --sources            Remover fontes não referenciadas/antigas
+  --work               Remover diretórios de trabalho antigos
+  --destdir            Remover DESTDIRs órfãos/antigos
+  --packages-old       Remover pacotes antigos (mantém --keep-last por nome)
+  --packages-orphans   Remover pacotes órfãos (sem .ADM_META)
+  --logs               Remover logs antigos
+  --state              Remover artefatos temporários do state (*.rc.*)
+  --locks              Remover locks > 120min
+  --tmp                Remover temporários antigos
+  --orphans            Alias para --destdir + --packages-orphans
+  --all                Executa: sources, work, destdir, packages-old, logs, state, locks, tmp
+
+Políticas e opções:
+  --keep-days=N        Idade mínima (dias) para elegibilidade (padrão: 14)
+  --keep-last=K        Em pacotes, manter os K mais recentes por nome (padrão: 2)
+  --max-age-days=N     Força elegibilidade acima dessa idade (independente de referência)
+  --min-free-gb=G      Tenta liberar espaço até G GiB livres (executa fases incrementalmente)
+  --protect-glob=CSV   Lista de padrões (glob) a NÃO remover (ex.: "*.iso,/usr/src/adm/sources/foo*")
+  --dry-run            Apenas simula (não remove)
+  --yes                Não pedir confirmação
+  --jobs=N             Remoções em paralelo por lote (padrão: nproc)
+
+Saída (KEY=VAL):
+  FREED_BYTES=<n>
+  FREED_HUMAN=<str>
+  REMOVED_COUNT=<n>
+
+Exit codes:
+  0 ok; 1 uso; 20 env; 43 IO; 70 vazio; 71 cancelado; 72 alvo espaço não atingível
+USAGE
+}
+
+main(){
+  local do_any=0
+  local do_sources=0 do_work=0 do_destdir=0 do_pold=0 do_porph=0 do_logs=0 do_state=0 do_locks=0 do_tmp=0 do_all=0 do_orphans=0
+
+  # parse args
+  while (( $# )); do
+    case "$1" in
+      --sources) do_sources=1; do_any=1 ;;
+      --work) do_work=1; do_any=1 ;;
+      --destdir) do_destdir=1; do_any=1 ;;
+      --packages-old) do_pold=1; do_any=1 ;;
+      --packages-orphans) do_porph=1; do_any=1 ;;
+      --logs) do_logs=1; do_any=1 ;;
+      --state) do_state=1; do_any=1 ;;
+      --locks) do_locks=1; do_any=1 ;;
+      --tmp) do_tmp=1; do_any=1 ;;
+      --orphans) do_orphans=1; do_any=1 ;;
+      --all) do_all=1; do_any=1 ;;
+
+      --keep-days=*) KEEP_DAYS="${1#*=}" ;;
+      --keep-last=*) KEEP_LAST="${1#*=}" ;;
+      --max-age-days=*) MAX_AGE_DAYS="${1#*=}" ;;
+      --min-free-gb=*) MIN_FREE_GB="${1#*=}" ;;
+      --protect-glob=*) PROTECT_GLOB="${1#*=}" ;;
+      --dry-run) DRY_RUN=1 ;;
+      --yes) ASSUME_YES=1 ;;
+      --jobs=*) JOBS="${1#*=}" ;;
+      -h|--help|help) usage; exit 0 ;;
+      *) usage; exit 1 ;;
+    esac
+    shift || true
+  done
+
+  # default: --all
+  if (( do_any == 0 )); then do_all=1; fi
+  section "adm-clean" root="$ADM_ROOT"
+
+  # valida ambiente mínimo
+  [[ -d "$ADM_ROOT" ]] || die "ADM_ROOT não existe: $ADM_ROOT" 20
+
+  # composições
+  if (( do_orphans )); then do_destdir=1; do_porph=1; fi
+  if (( do_all )); then
+    do_sources=1; do_work=1; do_destdir=1; do_pold=1; do_logs=1; do_state=1; do_locks=1; do_tmp=1
+  fi
+
+  # Execução
+  (( do_sources )) && clean_sources
+  (( do_work )) && clean_work
+  (( do_destdir )) && clean_destdir
+  (( do_pold )) && clean_packages_old
+  (( do_porph )) && clean_packages_orphans
+  (( do_logs )) && clean_logs
+  (( do_state )) && clean_state
+  (( do_locks )) && clean_locks
+  (( do_tmp )) && clean_tmp
+
+  # alvo de espaço livre (opcional)
+  if (( MIN_FREE_GB > 0 )); then
+    section "Alvo de espaço livre"
+    free_space_target "$MIN_FREE_GB" || true
+  fi
+
+  # Saída final
+  printf 'FREED_BYTES=%s\n' "$FREED_BYTES"
+  printf 'FREED_HUMAN=%s\n' "$(human "$FREED_BYTES")"
+  printf 'REMOVED_COUNT=%s\n' "$REMOVED_COUNT"
+
+  log_o "Limpeza finalizada" removed="$REMOVED_COUNT" freed="$(human "$FREED_BYTES")"
+  exit 0
+}
+
+main "$@"
