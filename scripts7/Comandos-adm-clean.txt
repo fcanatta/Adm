@@ -1,0 +1,15 @@
+# Limpeza geral padrão (tudo, mantendo 2 últimos pacotes e 14 dias):
+/usr/src/adm/scripts/adm-clean --all --yes
+
+# Focar em espaço: tentar garantir 20 GiB livres (apaga em fases):
+/usr/src/adm/scripts/adm-clean --min-free-gb=20 --yes
+
+# Remover apenas fontes não referenciadas/antigas, sem executar:
+/usr/src/adm/scripts/adm-clean --sources --dry-run
+
+# Manter 5 pacotes por nome e agressivo nos destdirs:
+/usr/src/adm/scripts/adm-clean --packages-old --keep-last=5 --destdir --keep-days=7 --yes
+
+# Proteger alguns arquivos específicos do cache e ignorar:
+ADM_ROOT=/usr/src/adm /usr/src/adm/scripts/adm-clean --sources \
+  --protect-glob="*.iso,/usr/src/adm/sources/custom-*" --yes
