@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Hook genérico MESON - pre-build
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}"
+meson compile -C "$ADM_BUILD_DIR" -j "${ADM_JOBS:-$(nproc 2>/dev/null || echo 4)}"
