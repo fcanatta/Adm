@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_WORK_DIR:?}" "${ADM_BUILD_DIR:?}"
+cd "$ADM_WORK_DIR"; mkdir -p "$ADM_BUILD_DIR"; cd "$ADM_BUILD_DIR"
+# XFS usa build conf próprio porém baseado em autotools
+conf=( --prefix=/usr --disable-static )
+"$ADM_WORK_DIR/configure" "${conf[@]}"
