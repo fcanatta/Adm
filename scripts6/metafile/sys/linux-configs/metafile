@@ -1,0 +1,12 @@
+name=linux-configs
+version=1.0
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Perfis de configuração do kernel (minimal, server, desktop) e integração com ADM
+homepage=https://kernel.org/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=
