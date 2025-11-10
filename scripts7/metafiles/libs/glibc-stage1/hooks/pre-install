@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${ADM_OUT_OF_TREE_BUILD:?Builddir da glibc não definido}"
+
+# Instala a glibc no SYSROOT do target, via DESTDIR
+make -C "${ADM_OUT_OF_TREE_BUILD}" install DESTDIR="${DESTDIR}${SYSROOT}"
