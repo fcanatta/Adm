@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_BUILD_DIR:?}" "${ADM_DESTDIR:?}"
+ninja -C "$ADM_BUILD_DIR" install DESTDIR="${ADM_DESTDIR}"
+
+# Ajusta módulo Python do LLDB se necessário (caminhos padrão já cobrem a maioria dos casos)
+rm -rf "${ADM_DESTDIR}/usr/share/doc" "${ADM_DESTDIR}/usr/share/info" 2>/dev/null || true
