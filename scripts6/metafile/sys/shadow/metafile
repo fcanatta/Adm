@@ -1,0 +1,12 @@
+name=shadow
+version=4.14.2
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Ferramentas de contas de usuários e senhas
+homepage=https://shadow-maint.github.io/shadow/
+maintainer=Fernando Canatta <maintainer@example>
+sha256sums=
+sources=https://github.com/shadow-maint/shadow/releases/download/4.14.2/shadow-4.14.2.tar.xz
