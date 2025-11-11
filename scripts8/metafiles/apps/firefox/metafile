@@ -1,0 +1,12 @@
+name=firefox
+version=133.0
+category=apps
+run_deps=libs/openssl,sys/zstd,libs/libarchive,dev/python,dev/nodejs,libs/icu,libs/sqlite,libs/libevent
+build_deps=libs/openssl,sys/zstd,libs/libarchive,dev/python,dev/nodejs,libs/icu,libs/sqlite,libs/libevent,dev/llvm,dev/rust
+opt_deps=apps/ca-certificates
+num_builds=0
+description=Firefox browser
+homepage=https://firefox.com
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://archive.mozilla.org/pub/firefox/releases/133.0/source/firefox-133.0.source.tar.xz
