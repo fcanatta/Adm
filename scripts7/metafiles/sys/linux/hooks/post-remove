@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Espera receber KVER via env ou deduz por sobras em /boot e /lib/modules
+KVER="${KVER:-}"
+if [[ -z "$KVER" ]]; then
+  # tenta achar pelo System.map/config/vmlinuz mais recente com sufixo não-LTS
+  CAND=$(ls -1 /boot/vmlinuz-* 2>/dev/null | grep -v -- '-lts-' | sed 's#^/boot/vmlinuz-##' | sort -V | tail -n1 || true)
+  [[ -n "$CAND" ]] && KVER="$CAND"
+fi
+[[ -z "$KVER" ]] && exit 0
+
+RUNNING="$(uname -r 2>/dev/null || true)"
+[[ "$RUNNING" == "$KVER" ]] && exit 0
+
+rm -f "/boot/vmlinuz-${KVER}" "/boot/System.map-${KVER}" "/boot/config-${KVER}" 2>/dev/null || true
+rm -rf "/boot/dtbs-${KVER}" 2>/dev/null || true
+rm -rf "/lib/modules/${KVER}" 2>/dev/null || true
