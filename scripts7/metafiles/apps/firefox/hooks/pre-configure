@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${TARGET:?TARGET não definido (perfil do adm-paths)}"
+: "${SYSROOT:=}"     # Firefox não precisa explicitamente do --sysroot, mas mantemos se existir
+: "${MAKEFLAGS:=}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+# Garante Python do host para o 'mach' (build system)
+: "${PYTHON_FOR_BUILD:=python3}"
+command -v "$PYTHON_FOR_BUILD" >/dev/null 2>&1 || { echo "python3 (host) não encontrado"; exit 50; }
+
+# Garante Clang/Rust (target) acessíveis
+command -v clang >/dev/null 2>&1 || { echo "clang (target) não encontrado"; exit 50; }
+command -v rustc >/dev/null 2>&1 || { echo "rustc (target) não encontrado"; exit 50; }
+
+# Cria .mozconfig (idempotente) — Release, LTO, PGO off by default (pode habilitar depois)
+cat > .mozconfig <<EOF
+# Gerado pelo ADM (pre-configure)
+ac_add_options --prefix=/usr
+ac_add_options --enable-release
+ac_add_options --disable-debug
+ac_add_options --enable-hardening
+ac_add_options --enable-linker=lld
+# Use clang/clang++ e Rust do ambiente
+mk_add_options "export CC=clang"
+mk_add_options "export CXX=clang++"
+mk_add_options "export AR=llvm-ar"
+mk_add_options "export NM=llvm-nm"
+mk_add_options "export RANLIB=llvm-ranlib"
+# Cross target
+ac_add_options --target=${TARGET}
+# System libs (ajuste conforme disponibilidade; se faltarem, o build pode cair no bundled)
+ac_add_options --with-system-icu
+ac_add_options --with-system-zlib
+ac_add_options --with-system-bz2
+ac_add_options --with-system-libjpeg
+ac_add_options --with-system-png
+# NSS/NSPR: se tiver instalados como opt_deps, habilite; senão comente as linhas abaixo
+#ac_add_options --with-system-nspr
+#ac_add_options --with-system-nss
+# Feature toggles comuns (ajuste conforme o que você quer)
+ac_add_options --enable-rust-simd
+ac_add_options --disable-crashreporter
+ac_add_options --disable-tests
+# Build system
+mk_add_options MOZ_OBJDIR=./obj-adm
+mk_add_options MOZ_MAKE_FLAGS=-j${NPROC}
+# Telemetry/branding (ajuste se quiser official branding e chaves)
+ac_add_options --disable-updater
+EOF
+
+# NodeJS para parts do front-end
+if ! command -v node >/dev/null 2>&1; then
+  echo "Aviso: nodejs não encontrado; algumas partes da UI podem não compilar." >&2
+fi
+
+# Export para o 'mach'
+export MACH_BUILD_PYTHON="$PYTHON_FOR_BUILD"
+export LC_ALL=C.UTF-8
