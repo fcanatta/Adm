@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${TARGET:?TARGET não definido}"
+
+# Escolher arq. baixado conforme arch
+ARCH_DIR=""
+case "$TARGET" in
+  x86_64-*)  ARCH_DIR="linux-x86_64"  ;;
+  aarch64-*) ARCH_DIR="linux-aarch64" ;;
+  *) echo "Arquitetura não suportada para firefox-bin: $TARGET" >&2; exit 70 ;;
+esac
+
+# A fonte já foi extraída pelo constructor para um dir "firefox/"
+# Se não, tente extrair manualmente qualquer firefox-*.tar.* encontrado.
+if [[ ! -d firefox ]]; then
+  TARBALL="$(ls -1 firefox-*.tar.* 2>/dev/null | head -n1 || true)"
+  [[ -n "$TARBALL" ]] && tar -xf "$TARBALL"
+fi
+
+[[ -d firefox ]] || { echo "Diretório 'firefox' não encontrado após extração"; exit 60; }
+
+# Instalação sob /usr/lib/firefox
+install -d "${DESTDIR}/usr/lib/firefox"
+rsync -a firefox/ "${DESTDIR}/usr/lib/firefox/"
+
+# Symlink /usr/bin/firefox
+install -d "${DESTDIR}/usr/bin"
+ln -snf "../lib/firefox/firefox" "${DESTDIR}/usr/bin/firefox"
+
+# Desktop file
+install -d "${DESTDIR}/usr/share/applications"
+cat > "${DESTDIR}/usr/share/applications/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the Web
+Exec=firefox %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+EOF
+
+# Ícones (se presentes no pacote, copie; senão, ignore)
+for sz in 16 22 24 32 48 64 128 256; do
+  if [[ -f "browser/chrome/icons/default/default${sz}.png" ]]; then
+    install -d "${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps"
+    install -m 0644 "browser/chrome/icons/default/default${sz}.png" \
+      "${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps/firefox.png"
+  fi
+done
+
+# Mime (opcional, silencioso)
+install -d "${DESTDIR}/usr/share/mime/packages" || true
