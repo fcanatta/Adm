@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/80-cleanup
+# -----------------------------------------------------------------------------
+# ADM - Cleanup
+# - Limpa caches, states antigos, runs, backups, pacotes desatualizados,
+#   logs (rotação e compressão), tmp órfão e diretórios vazios.
+# - Políticas: keep-days, keep-runs, keep-versions por pacote.
+# - Dry-run, confirmação, agressivo, relatório de espaço liberado.
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+CLEAN_STATE="$ADM_STATE/cleanup"
+LOCKS="$CLEAN_STATE/locks"
+mkdir -p -- "$CLEAN_STATE" "$LOCKS" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _C_COLOR=${ADM_COLOR:-auto}
+  _C_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _C_COLOR=false; fi
+  if [[ "$_C_COLOR" == "auto" ]]; then
+    _C_COLOR=$([[ "$_C_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_C_COLOR" == "true" ]]; then
+    __c_red=$'\033[31m'; __c_grn=$'\033[32m'; __c_yel=$'\033[33m'
+    __c_blu=$'\033[34m'; __c_mag=$'\033[35m'; __c_cyn=$'\033[36m'; __c_dim=$'\033[2m'; __c_rst=$'\033[0m'
+    __c_chk=$'\xE2\x9C\x85'
+  else
+    __c_red=""; __c_grn=""; __c_yel=""; __c_blu=""; __c_mag=""; __c_cyn=""; __c_dim=""; __c_rst=""; __c_chk="[OK]"
+  fi
+  _ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_ts)" "$__c_dim" "$__c_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_ts)" "$__c_blu" "$__c_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_ts)" "$__c_yel" "$__c_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_ts)" "$__c_red" "$__c_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_ts)" "$__c_grn" "$__c_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_c_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"; }
+_c_now(){ date +%s; }
+_c_date(){ date -Iseconds; }
+_c_have(){ command -v "$1" >/dev/null 2>&1; }
+_c_hsize(){ numfmt --to=iec --suffix=B --padding=7 -- "$1" 2>/dev/null || echo "$1"; }
+_c_du(){ du -sb -- "$1" 2>/dev/null | awk '{print $1}'; }
+_c_age_days(){ local p="$1"; local mt; mt=$(stat -c %Y "$p" 2>/dev/null || echo 0); echo $(( ( $(_c_now) - mt ) / 86400 )); }
+_c_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_c_guard_path(){ # impede rm perigosos
+  local p="$(_c_abspath "$1")"
+  [[ "$p" == / || "$p" == "" ]] && return 1
+  [[ "$p" == "$ADM_ROOT"* || "$p" == "$ADM_STATE"* || "$p" == "$ADM_PACKAGES"* || "$p" == "$ADM_TMP"* ]] || return 1
+  printf "%s" "$p"
+}
+_lock(){
+  local key="$1"; mkdir -p -- "$LOCKS" || true
+  local d="$LOCKS/cleanup-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_unlock(){ local key="$1"; rm -rf -- "$LOCKS/cleanup-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+SAFE_DELETE=()  # relatório do que será apagado
+
+_queue_rm(){
+  local p="$1" dry="$2"
+  p="$(_c_guard_path "$p")" || { adm_log_warn "Caminho fora da zona segura: %s" "$1"; return 0; }
+  SAFE_DELETE+=("$p")
+  if (( dry==0 )); then
+    rm -rf -- "$p" 2>/dev/null || true
+  fi
+}
+
+# ============================== Alvos conhecidos =============================
+# (mantém nomes separados para granularidade)
+TARGETS_DEFAULT=( state caches packages logs tmp vacuum verify )
+
+# Subáreas:
+STATE_DIRS=(
+  "$ADM_STATE/build"
+  "$ADM_STATE/stage"
+  "$ADM_STATE/scheduler"
+  "$ADM_STATE/installer"
+  "$ADM_STATE/uninstaller"
+  "$ADM_STATE/update"
+  "$ADM_STATE/packer"
+  "$ADM_STATE/tmp"
+)
+
+CACHE_DIRS=(
+  "$ADM_STATE/fetcher"
+  "$ADM_STATE/cache"
+  "$ADM_STATE/update/cache"
+  "$ADM_ROOT/cache"
+)
+
+LOG_DIRS=(
+  "$ADM_STATE/logs"
+  "$ADM_STATE/scheduler"
+  "$ADM_STATE/installer"
+  "$ADM_STATE/uninstaller"
+  "$ADM_STATE/update"
+  "$ADM_STATE/packer"
+)
+
+TMP_DIRS=(
+  "$ADM_TMP"
+  "$ADM_STATE/tmp"
+)
+
+# ============================== Regras de retenção ===========================
+RET_KEEP_DAYS="${ADM_CLEAN_KEEP_DAYS:-14}"         # apaga itens mais velhos que isso (quando aplicável)
+RET_KEEP_RUNS="${ADM_CLEAN_KEEP_RUNS:-5}"          # mantém últimos N runs do scheduler/installer
+RET_KEEP_VERS="${ADM_CLEAN_KEEP_VERSIONS:-2}"      # mantém últimas N versões em $ADM_PACKAGES/<name-version>
+
+# ============================== Limpeza: helpers =============================
+_list_sorted_by_mtime(){
+  local d="$1"; [[ -d "$d" ]] || return 0
+  find "$d" -mindepth 1 -maxdepth 1 -printf "%T@ %P\n" 2>/dev/null | sort -nr
+}
+
+_keep_latest_n(){
+  local d="$1" n="$2"
+  _list_sorted_by_mtime "$d" | awk -v N="$n" 'NR>N {print $2}'
+}
+
+_compress_log_if_large(){
+  local f="$1" max_kb="${2:-1024}"
+  [[ -f "$f" ]] || return 0
+  local sz; sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+  (( sz/1024 < max_kb )) && return 0
+  if _c_have xz; then xz -T0 -z -f -- "$f" 2>/dev/null || true
+  elif _c_have gzip; then gzip -f -- "$f" 2>/dev/null || true
+  fi
+}
+
+_rotate_logs_in_dir(){
+  local d="$1" keep_days="$2" dry="$3"
+  [[ -d "$d" ]] || return 0
+  find "$d" -type f -name "*.log" -print 2>/dev/null | while read -r f; do
+    _compress_log_if_large "$f" 1024
+  done
+  # remove logs velhos
+  find "$d" -type f \( -name "*.log" -o -name "*.log.*" -o -name "*.xz" -o -name "*.gz" \) -mtime +"$keep_days" -print 2>/dev/null \
+    | while read -r f; do _queue_rm "$f" "$dry"; done
+}
+
+_vacuum_empty_dirs(){
+  local base="$1"
+  [[ -d "$base" ]] || return 0
+  find "$base" -depth -type d -empty -print -delete 2>/dev/null || true
+}
+
+# ============================== Limpeza: implementações ======================
+clean_state(){
+  local keep_days="$1" keep_runs="$2" dry="$3" aggressive="$4"
+  adm_log_info "Limpando STATE (keep_days=%s keep_runs=%s aggressive=%s)..." "$keep_days" "$keep_runs" "$aggressive"
+  local d
+  for d in "${STATE_DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    case "$d" in
+      */scheduler|*/installer|*/uninstaller)
+        # mantém últimos N runs
+        local to_remove; mapfile -t to_remove < <(_keep_latest_n "$d" "$keep_runs")
+        for x in "${to_remove[@]}"; do _queue_rm "$d/$x" "$dry"; done
+        # além disso, apaga run dirs com mtime > keep_days
+        find "$d" -mindepth 1 -maxdepth 1 -type d -mtime +"$keep_days" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+        ;;
+      *)
+        # apaga arquivos temporários e conteúdo com mtime > keep_days
+        find "$d" -mindepth 1 -mtime +"$keep_days" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+        # em agressivo, limpa tudo exceto locks ativos
+        if (( aggressive==1 )); then
+          find "$d" -mindepth 1 -not -path "*/locks/*" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+        fi
+        ;;
+    esac
+  done
+}
+
+clean_caches(){
+  local keep_days="$1" dry="$2" aggressive="$3"
+  adm_log_info "Limpando CACHES (keep_days=%s aggressive=%s)..." "$keep_days" "$aggressive"
+  local d
+  for d in "${CACHE_DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    # remove arquivos > keep_days
+    find "$d" -mindepth 1 -mtime +"$keep_days" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+    # agressivo: zera cache
+    if (( aggressive==1 )); then
+      find "$d" -mindepth 1 -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+    fi
+  done
+}
+
+clean_packages(){
+  local keep_versions="$1" dry="$2" aggressive="$3"
+  adm_log_info "Limpando PACKAGES (keep_versions=%s aggressive=%s)..." "$keep_versions" "$aggressive"
+  local root="$ADM_PACKAGES"; [[ -d "$root" ]] || return 0
+
+  # Estrutura: $ADM_PACKAGES/<name-version>/files
+  # Mantém apenas N versões mais recentes por <name>
+  # Indexa por base do nome (sem versão na cauda, heurística pelo último '-' seguido de número)
+  find "$root" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null | LC_ALL=C sort -V | while read -r nv; do
+    # separa name e version pela última ocorrência de -<digit>
+    if [[ "$nv" =~ ^(.+)-([0-9].*)$ ]]; then
+      local nm="${BASH_REMATCH[1]}" ver="${BASH_REMATCH[2]}"
+      printf "%s\t%s\t%s\n" "$nm" "$ver" "$nv"
+    else
+      printf "%s\t%s\t%s\n" "$nv" "0" "$nv"
+    fi
+  done | awk -F'\t' '{print $1"\t"$2"\t"$3}' | sort -k1,1 -k2,2V | \
+  awk -F'\t' -v root="$root" -v keep="$keep_versions" '
+    BEGIN{cur=""; count=0}
+    {
+      if ($1!=cur){cur=$1; count=0; arr[0]=$0; buf[0]=$3; idx=1;}
+      else {arr[idx]=$0; buf[idx]=$3; idx++;}
+      if ($1!=cur) next;
+    }
+    END{
+      # nada a fazer aqui; a lógica de corte é melhor em um segundo passo
+    }' >/dev/null
+
+  # Segundo passo (mais simples): para cada nome, ordenar diretórios por mtime e manter N
+  find "$root" -mindepth 1 -maxdepth 1 -type d -printf "%f\n" 2>/dev/null | while read -r nv; do
+    local nm
+    if [[ "$nv" =~ ^(.+)-([0-9].*)$ ]]; then nm="${BASH_REMATCH[1]}"; else nm="$nv"; fi
+    # Seleciona todos dirs que começam com nm-*
+    mapfile -t list < <(find "$root" -maxdepth 1 -type d -name "${nm}-*" -printf "%T@ %f\n" 2>/dev/null | sort -nr | awk '{print $2}')
+    (( ${#list[@]} <= keep_versions )) && continue
+    for ((i=keep_versions; i<${#list[@]}; i++)); do
+      _queue_rm "$root/${list[$i]}" "$dry"
+    done
+  done
+
+  # Agressivo: elimina qualquer conteúdo estranho dentro de cada <name-version>
+  if (( aggressive==1 )); then
+    find "$root" -mindepth 2 -type f -name ".*" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+  fi
+}
+
+clean_logs(){
+  local keep_days="$1" dry="$2"
+  adm_log_info "Limpando LOGS (keep_days=%s)..." "$keep_days"
+  local d; for d in "${LOG_DIRS[@]}"; do _rotate_logs_in_dir "$d" "$keep_days" "$dry"; done
+}
+
+clean_tmp(){
+  local keep_days="$1" dry="$2"
+  adm_log_info "Limpando TMP (keep_days=%s)..." "$keep_days"
+  local d; for d in "${TMP_DIRS[@]}"; do
+    [[ -d "$d" ]] || continue
+    find "$d" -mindepth 1 -mtime +"$keep_days" -print 2>/dev/null | while read -r x; do _queue_rm "$x" "$dry"; done
+  done
+}
+
+verify_consistency(){
+  local base="${1:-$ADM_ROOT}" fix="${2:-0}" dry="${3:-0}"
+  adm_log_info "Verificando consistência (symlinks quebrados, diretórios vazios)…"
+  # Symlinks quebrados
+  find "$base" -xtype l -print 2>/dev/null | while read -r l; do
+    adm_log_warn "Symlink quebrado: %s" "$l"
+    (( fix==1 )) && _queue_rm "$l" "$dry"
+  done
+  # Diretórios vazios profundos
+  _vacuum_empty_dirs "$base"
+}
+
+report_space_change(){
+  local before="$1" after="$2"
+  local freed=$(( before - after ))
+  (( freed < 0 )) && freed=0
+  adm_log_info "Espaço total antes: %s | depois: %s | liberado: %s" \
+    "$(_c_hsize "$before")" "$(_c_hsize "$after")" "$(_c_hsize "$freed")"
+}
+
+measure_total_space(){
+  local sum=0
+  local p
+  for p in "$ADM_STATE" "$ADM_PACKAGES" "$ADM_ROOT/cache" "$ADM_TMP"; do
+    [[ -d "$p" ]] || continue
+    local s="$(_c_du "$p")"; sum=$((sum + s))
+  done
+  echo "$sum"
+}
+# (continuação do arquivo /usr/src/adm/scripts/80-cleanup)
+
+# ============================== Doctor =======================================
+
+_cleanup_doctor(){
+  local fail=0
+  for b in find awk sed du stat xargs; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }
+  done
+  mkdir -p -- "$CLEAN_STATE" "$LOCKS" || { adm_log_error "Sem acesso a state/locks"; fail=$((fail+1)); }
+  [[ -d "$ADM_ROOT" && -d "$ADM_STATE" ]] || { adm_log_error "ADM_ROOT/ADM_STATE inválidos"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Cleanup OK."
+}
+
+# ============================== CLI / Execução ===============================
+
+_usage(){
+  cat <<'USAGE'
+Uso: 80-cleanup <comando> [opções]
+
+Comandos:
+  run          Executa limpeza (padrões seguros).
+  state        Limpa apenas diretórios de state (build, stage, runs, backups velhos).
+  caches       Limpa caches (fetcher/update/etc).
+  packages     Remove versões antigas de pacotes (mantém N últimas).
+  logs         Rotaciona/comprime e apaga logs antigos.
+  tmp          Limpa diretórios temporários.
+  vacuum       Remove diretórios vazios em ADM_ROOT/STATE/PACKAGES/TMP.
+  verify       Verifica consistência (symlinks quebrados) [--fix opcional].
+  doctor       Checa dependências do script.
+
+Opções gerais:
+  --keep-days=N         (default 14)   # idade mínima para remoção (dias)
+  --keep-runs=N         (default 5)    # manter últimos N runs (scheduler/installer/uninstaller)
+  --keep-versions=N     (default 2)    # manter últimas N versões por pacote
+  --aggressive          limpa além das regras padrão (usa com cuidado)
+  --dry-run             mostra o que será apagado sem apagar
+  --yes                 não pergunta confirmação
+  --targets=list        substitui o conjunto padrão: ex: --targets=state,caches,logs
+  --fix                 (em verify) remove symlinks quebrados
+USAGE
+}
+
+_parse_common(){
+  local keep_days keep_runs keep_vers aggressive dry yes targets fix
+  keep_days="$RET_KEEP_DAYS"; keep_runs="$RET_KEEP_RUNS"; keep_vers="$RET_KEEP_VERS"
+  aggressive=0; dry=0; yes=0; targets=""; fix=0
+  while (( $# )); do
+    case "$1" in
+      --keep-days=*)    keep_days="${1#--keep-days=}" ;;
+      --keep-runs=*)    keep_runs="${1#--keep-runs=}" ;;
+      --keep-versions=*)keep_vers="${1#--keep-versions=}" ;;
+      --aggressive)     aggressive=1 ;;
+      --dry-run)        dry=1 ;;
+      --yes)            yes=1 ;;
+      --targets=*)      targets="${1#--targets=}" ;;
+      --fix)            fix=1 ;;
+      --*)              adm_log_warn "Opção ignorada: %s" "$1" ;;
+    esac; shift || true
+  done
+  printf "%s|%s|%s|%s|%s|%s|%s\n" "$keep_days" "$keep_runs" "$keep_vers" "$aggressive" "$dry" "$yes" "$targets|$fix"
+}
+
+_confirm_or_exit(){
+  local yes="$1" dry="$2" targets="$3"
+  adm_log_info "Dry-run: %s | Alvos: %s" "$([[ "$dry" == 1 ]] && echo "sim" || echo "não")" "$targets"
+  if (( yes==0 )); then
+    read -r -p "Continuar? [y/N] " ans || true
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { adm_log_warn "Cancelado."; exit 2; }
+  fi
+}
+
+_print_plan(){
+  local keep_days="$1" keep_runs="$2" keep_vers="$3" aggressive="$4" dry="$5" targets="$6"
+  adm_log_info "Plano: keep_days=%s keep_runs=%s keep_versions=%s aggressive=%s dry=%s targets=%s" \
+    "$keep_days" "$keep_runs" "$keep_vers" "$aggressive" "$dry" "$targets"
+}
+
+_run_targets(){
+  local keep_days="$1" keep_runs="$2" keep_vers="$3" aggressive="$4" dry="$5" targets_csv="$6"
+  local before after
+  before="$(measure_total_space)"
+
+  local -a tgt
+  if [[ -n "$targets_csv" ]]; then IFS=',' read -r -a tgt <<< "$targets_csv"; else tgt=("${TARGETS_DEFAULT[@]}"); fi
+
+  local t
+  for t in "${tgt[@]}"; do
+    case "$t" in
+      state)    clean_state "$keep_days" "$keep_runs" "$dry" "$aggressive" ;;
+      caches)   clean_caches "$keep_days" "$dry" "$aggressive" ;;
+      packages) clean_packages "$keep_vers" "$dry" "$aggressive" ;;
+      logs)     clean_logs "$keep_days" "$dry" ;;
+      tmp)      clean_tmp "$keep_days" "$dry" ;;
+      vacuum)   _vacuum_empty_dirs "$ADM_ROOT"; _vacuum_empty_dirs "$ADM_STATE"; _vacuum_empty_dirs "$ADM_PACKAGES"; _vacuum_empty_dirs "$ADM_TMP" ;;
+      verify)   verify_consistency "$ADM_ROOT" 0 "$dry" ;;
+      *)        adm_log_warn "Alvo desconhecido: %s" "$t" ;;
+    esac
+  done
+
+  after="$(measure_total_space)"
+  report_space_change "$before" "$after"
+
+  # Listagem do que seria/apagou
+  if (( dry==1 )); then
+    adm_log_info "Itens que seriam apagados:"
+  else
+    adm_log_info "Itens apagados:"
+  fi
+  printf "%s\n" "${SAFE_DELETE[@]:-}" | sed '/^$/d' | head -n 1 >/dev/null || echo "(nenhum)"
+  for p in "${SAFE_DELETE[@]:-}"; do echo " - $p"; done
+}
+
+cleanup_main(){
+  local cmd="${1:-run}"; shift || true
+  case "$cmd" in
+    run|state|caches|packages|logs|tmp|vacuum|verify)
+      local parsed; parsed="$(_parse_common "$@")"
+      local keep_days keep_runs keep_vers aggressive dry yes targets_and_fix
+      IFS='|' read -r keep_days keep_runs keep_vers aggressive dry yes targets_and_fix <<< "$parsed"
+      local targets fix
+      IFS='|' read -r targets fix <<< "$targets_and_fix"
+      if [[ "$cmd" != "run" ]]; then
+        targets="$cmd"
+      fi
+      _print_plan "$keep_days" "$keep_runs" "$keep_vers" "$aggressive" "$dry" "${targets:-(padrão)}"
+      _confirm_or_exit "$yes" "$dry" "${targets:-default}"
+      _lock "global" || exit 1
+      trap '_unlock "global"' EXIT
+      if [[ "$cmd" == "verify" ]]; then
+        verify_consistency "$ADM_ROOT" "${fix:-0}" "$dry"
+      else
+        _run_targets "$keep_days" "$keep_runs" "$keep_vers" "$aggressive" "$dry" "$targets"
+      fi
+      ;;
+    doctor)
+      _cleanup_doctor
+      ;;
+    ""|-h|--help|help)
+      _usage
+      ;;
+    *)
+      adm_log_error "Comando desconhecido: %s" "$cmd"; _usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cleanup_main "$@"
+fi
