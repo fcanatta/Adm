@@ -1,0 +1,633 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/34-hooks-runner
+# -----------------------------------------------------------------------------
+# ADM - Hooks Runner
+# - Executa hooks por estágio: hooks/<stage>.d/*.sh
+# - Prioridade determinística, paralelismo por barreiras, timeout, retries
+# - Seletores por nome/tags, include/exclude; metadados in-script #@key: value
+# - Auditoria detalhada em $ADM_STATE/hooks/
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+HOOKS_STATE="$ADM_STATE/hooks"
+DEFAULT_SEARCH_PATHS=(
+  "$ADM_ROOT/hooks"                # global do projeto
+  "$ADM_ROOT/metafiles"            # pacotes (descoberta guiada)
+)
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _H_COLOR=${ADM_COLOR:-auto}
+  _H_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _H_COLOR=false; fi
+  if [[ "$_H_COLOR" == "auto" ]]; then
+    _H_COLOR=$([[ "$_H_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_H_COLOR" == "true" ]]; then
+    __h_red=$'\033[31m'; __h_grn=$'\033[32m'; __h_yel=$'\033[33m'
+    __h_blu=$'\033[34m'; __h_mag=$'\033[35m'; __h_cyn=$'\033[36m'; __h_dim=$'\033[2m'; __h_rst=$'\033[0m'
+    __h_chk=$'\xE2\x9C\x85' # ✔️
+  else
+    __h_red=""; __h_grn=""; __h_yel=""; __h_blu=""; __h_mag=""; __h_cyn=""; __h_dim=""; __h_rst=""; __h_chk="[OK]"
+  fi
+  _h_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_h_ts)" "$__h_dim" "$__h_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_h_ts)" "$__h_blu" "$__h_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_h_ts)" "$__h_yel" "$__h_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_h_ts)" "$__h_red" "$__h_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_h_ts)" "$__h_grn" "$__h_rst" "$*" >&2; }
+fi
+
+# ============================== Utils base ===================================
+_h_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_h_slug(){ printf "%s" "$1" | tr ' /:' '__' | tr -cd '[:alnum:]_-.'); }
+_h_now(){ date +%s; }
+_h_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_h_have(){ command -v "$1" >/dev/null 2>&1; }
+_h_sha(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+_h_json_escape(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_h_nproc(){ command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 2; }
+
+# ============================== Locks ========================================
+_h_lockdir(){ printf "%s" "$HOOKS_STATE/locks"; }
+_h_lock_acquire(){
+  local key="$1"; mkdir -p -- "$(_h_lockdir)" || true
+  local d="$(_h_lockdir)/hooks-$key.lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: $key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_h_lock_release(){ local key="$1"; rm -rf -- "$(_h_lockdir)/hooks-$key.lockdir" 2>/dev/null || true; }
+
+# ============================== Metadados & Descoberta =======================
+# Metadados por comentário no topo do script:
+#   #@stage: pre-build
+#   #@timeout: 120
+#   #@retries: 2
+#   #@parallel: group1          (hooks com a mesma prioridade/ordem executam em paralelo; group é um rótulo)
+#   #@tags: lint,fast
+#   #@requires: tool:git, cmd:patch, env:FOO
+#   #@needs-root: true
+#   #@when: test -f configure
+#   #@if: ${PROFILE} = aggressive
+#   #@before: 50                 (valor menor roda antes)
+#   #@after:  70                 (ajusta prioridade relativa)
+#   #@name:  minha-tarefa        (override do nome)
+#
+# Prioridade base é prefixo numérico do arquivo (ex.: 20-foo.sh => 20).
+# Campos before/after ajustam (+/-) a prioridade.
+# Arquivos com extensão .disabled são ignorados.
+
+declare -A HK_META_      # path -> json of metadata (flatten)
+declare -A HK_ORDER      # path -> ordem (inteiro)
+declare -A HK_NAME       # path -> nome
+declare -A HK_TAGS       # path -> "tag1,tag2"
+declare -A HK_REQS       # path -> requisitos
+declare -A HK_TIMEOUT    # path -> timeout (int)
+declare -A HK_RETRIES    # path -> retries (int)
+declare -A HK_NEEDROOT   # path -> true/false
+declare -A HK_WHEN       # path -> comando shell para decidir
+declare -A HK_IF         # path -> condição simples "VAR OP valor"
+declare -A HK_PAR_GRP    # path -> rótulo de paralelismo
+declare -A HK_STAGE      # path -> stage (override)
+
+_meta_parse_file(){
+  local f="$1"
+  local l key val
+  while IFS= read -r l || [[ -n "$l" ]]; do
+    [[ "$l" =~ ^#@([a-zA-Z0-9_-]+):[[:space:]]*(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; val="$(_h_trim "${BASH_REMATCH[2]}")"
+    case "$key" in
+      stage)     HK_STAGE["$f"]="$val" ;;
+      timeout)   HK_TIMEOUT["$f"]="${val:-0}" ;;
+      retries)   HK_RETRIES["$f"]="${val:-0}" ;;
+      tags)      HK_TAGS["$f"]="$(printf "%s" "$val" | tr -d ' ')" ;;
+      requires)  HK_REQS["$f"]="$val" ;;
+      needs-root)HK_NEEDROOT["$f"]="$(printf "%s" "$val" | tr '[:upper:]' '[:lower:]')" ;;
+      when)      HK_WHEN["$f"]="$val" ;;
+      if)        HK_IF["$f"]="$val" ;;
+      parallel)  HK_PAR_GRP["$f"]="$val" ;;
+      before)    HK_ORDER["$f"]=$(( ${HK_ORDER["$f"]:-$(_order_from_name "$f")} - ${val:-0} )) ;;
+      after)     HK_ORDER["$f"]=$(( ${HK_ORDER["$f"]:-$(_order_from_name "$f")} + ${val:-0} )) ;;
+      name)      HK_NAME["$f"]="$val" ;;
+    esac
+  done < <(head -n 50 -- "$f" 2>/dev/null || true)
+}
+
+_order_from_name(){
+  local base; base="$(basename -- "$1")"
+  if [[ "$base" =~ ^([0-9]{2,3})- ]]; then
+    echo "${BASH_REMATCH[1]}"
+  else
+    echo 50
+  fi
+}
+
+_discover_stage_dirs(){
+  # procura ganchos em locais padrão e em pacotes
+  local stage="$1" root paths=()
+  for root in "${DEFAULT_SEARCH_PATHS[@]}"; do
+    [[ -d "$root" ]] || continue
+    # 1) hooks/<stage>.d
+    [[ -d "$root/hooks/$stage.d" ]] && paths+=("$root/hooks/$stage.d")
+    # 2) pacotes: */*/*/hooks/<stage>.d
+    while IFS= read -r d; do paths+=("$d"); done < <(find "$root" -type d -path "*/hooks/$stage.d" 2>/dev/null)
+  done
+  printf "%s\n" "${paths[@]}" | awk 'NF' | awk '!x[$0]++'
+}
+
+_discover_hooks(){
+  local stage="$1"
+  local -a dirs; mapfile -t dirs < <(_discover_stage_dirs "$stage")
+  local -a files=()
+  local d
+  for d in "${dirs[@]}"; do
+    while IFS= read -r f; do
+      [[ -x "$f" ]] || continue
+      [[ "$f" == *.disabled ]] && continue
+      files+=("$f")
+    done < <(find "$d" -maxdepth 1 -type f -name "*.sh" -print 2>/dev/null)
+  done
+  # parse meta e ordenar
+  local f
+  for f in "${files[@]}"; do
+    HK_ORDER["$f"]="${HK_ORDER["$f"]:-$(_order_from_name "$f")}"
+    HK_NAME["$f"]="${HK_NAME["$f"]:-$(basename -- "$f")}"
+    _meta_parse_file "$f" || true
+  done
+  printf "%s\n" "${files[@]}"
+}
+
+# ============================== Filtros / Seletores ==========================
+_name_match_any(){
+  local name="$1" globs="$2"
+  [[ -z "$globs" ]] && return 0
+  local IFS=','; local g
+  for g in $globs; do
+    [[ "$name" == $g ]] && return 0
+  done
+  return 1
+}
+
+_tags_match(){
+  local have="$1" want="$2"
+  [[ -z "$want" ]] && return 0
+  # want: tag1,tag2 (todas devem existir)
+  local IFS=','; local t
+  for t in $want; do
+    grep -Eq "(^|,)$t(,|$)" <<< "${have:-}" || return 1
+  done
+  return 0
+}
+
+_requires_ok(){
+  local reqs="$1" rc=0
+  [[ -z "$reqs" ]] && return 0
+  local IFS=','; local r
+  for r in $reqs; do
+    r="$(_h_trim "$r")"
+    case "$r" in
+      cmd:*) command -v "${r#cmd:}" >/dev/null 2>&1 || { adm_log_warn "Requisito ausente: ${r#cmd:}"; rc=1; } ;;
+      env:*) [[ -n "${!{r#env:}} " ]] || { adm_log_warn "ENV ausente: ${r#env:}"; rc=1; } ;;
+      tool:*) command -v "${r#tool:}" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: ${r#tool:}"; rc=1; } ;;
+      *) adm_log_warn "Requisito desconhecido: $r" ;;
+    esac
+  done
+  return $rc
+}
+
+_eval_when(){
+  local cmd="$1" wd="$2"
+  [[ -z "$cmd" ]] && return 0
+  ( cd "$wd" && bash -ceu "exit 0; $cmd" ) >/dev/null 2>&1 && return 0 || return 1
+}
+
+_eval_if(){
+  # formato simples: "${VAR} OP valor" (OP: =,!=,~ para regex)
+  local expr="$1"
+  [[ -z "$expr" ]] && return 0
+  local VAR OP VAL
+  if [[ "$expr" =~ ^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?[[:space:]]*(=|!=|~)[[:space:]]*(.*)$ ]]; then
+    VAR="${BASH_REMATCH[1]}"; OP="${BASH_REMATCH[2]}"; VAL="$(_h_trim "${BASH_REMATCH[3]}")"
+    local cur="${!VAR:-}"
+    case "$OP" in
+      "=")  [[ "$cur" == "$VAL" ]] ;;
+      "!=") [[ "$cur" != "$VAL" ]] ;;
+      "~")  [[ "$cur" =~ $VAL ]] ;;
+    esac
+    return $?
+  fi
+  adm_log_warn "Expressão if inválida: $expr"
+  return 1
+}
+
+# ============================== Execução segura ==============================
+_mask_env(){ # oculta valores sensíveis em logs
+  local k
+  for k in ${MASK_ENV_VARS:-TOKEN PASSWORD SECRET KEY PASS}; do
+    [[ -n "${!k:-}" ]] && export "$k"="***"
+  done
+}
+
+_need_root(){
+  local need="$1"
+  [[ "${need:-false}" == "true" ]] || return 1
+  [[ "$(id -u)" -eq 0 ]] && return 0
+  if _h_have sudo; then return 0; else
+    adm_log_error "Hook requer root mas sudo não está disponível"; return 1
+  fi
+}
+
+_run_with_timeout(){
+  local to="$1"; shift
+  if (( to > 0 )) && _h_have timeout; then
+    timeout --signal=TERM --kill-after=10 "$to" "$@"
+  else
+    "$@"
+  fi
+}
+
+_exec_hook(){
+  # executa 1 hook com retries/timeout e captura logs
+  local hook="$1" workdir="$2" outdir="$3" env_mode="$4" timeout_s="$5" retries="$6" needroot="$7"
+  local name="${HK_NAME[$hook]:-$(basename -- "$hook")}"
+  local log_base="$outdir/$(printf "%s" "$name" | tr '/' '_')"
+  local rc=0 attempt=0
+
+  _mask_env
+  while :; do
+    attempt=$((attempt+1))
+    local ts=$(date -Iseconds)
+    adm_log_info "→ [$attempt] ${name} $( [[ "$needroot" == "true" ]] && echo "(root)" )"
+    if [[ "$env_mode" == "clean" ]]; then
+      # ambiente mínimo
+      env -i PATH="$PATH" HOME="$HOME" LANG="${LANG:-C.UTF-8}" \
+        bash -c "cd \"\$1\"; $(_need_root "$needroot" && echo sudo -n bash -c || echo bash -c) 'set -Eeuo pipefail; \"$2\"'" _ "$workdir" "$hook" \
+        1> "${log_base}.out" 2> "${log_base}.err" &
+    else
+      ( cd "$workdir"
+        if _need_root "$needroot"; then
+          _run_with_timeout "$timeout_s" sudo -n bash "$hook"
+        else
+          _run_with_timeout "$timeout_s" bash "$hook"
+        fi
+      ) 1> "${log_base}.out" 2> "${log_base}.err" &
+    fi
+    local pid=$!
+    wait "$pid" || rc=$?
+
+    if (( rc == 0 )); then
+      adm_log_success "${__h_chk} ${name}"
+      break
+    fi
+    adm_log_warn "Falhou (rc=$rc): $name"
+    if (( attempt > retries )); then
+      adm_log_error "Excedeu retries ($retries) em $name"
+      break
+    fi
+    sleep 1
+  done
+  echo "$rc"
+}
+
+# ============================== Planejamento/Barreiras =======================
+_sort_hooks(){
+  # imprime paths ordenados por HK_ORDER + nome
+  local -a all=("$@")
+  printf "%s\n" "${all[@]}" | awk -v OFS="\t" -v q="'" '
+    {
+      path=$0
+    }{
+      # ordem via array HK_ORDER não está no awk: usamos prefixo no shell
+    }' >/dev/null 2>&1 || true
+  # shell sort estável: chave = order:basename
+  local p; for p in "${all[@]}"; do
+    printf "%06d:%s:%s\n" "${HK_ORDER[$p]:-50}" "$(basename -- "$p")" "$p"
+  done | LC_ALL=C sort | awk -F: '{print $3}'
+}
+
+_group_by_priority(){
+  # agrupa por mesma prioridade numérica → uma barreira
+  local -a all=("$@")
+  local key last="" bucket=()
+  local line
+  for line in "${all[@]}"; do
+    key="${HK_ORDER[$line]:-50}"
+    if [[ "$last" != "" && "$key" != "$last" ]]; then
+      printf "::BARRIER:: %s\n" "$last"
+    fi
+    printf "%s\n" "$line"
+    last="$key"
+  done
+}
+# (continuação do arquivo /usr/src/adm/scripts/34-hooks-runner)
+
+# ============================== Execução Orquestrada =========================
+
+run_stage(){
+  local stage="$1"; shift || true
+  local rootdir="${1:-.}"; shift || true
+  local include_globs="" exclude_globs="" tags_need="" names_need=""
+  local env_mode="inherit" dry_run=0 max_jobs="" timeout_default=0 retries_default=0
+  local only_paths=()
+  while (( $# )); do
+    case "$1" in
+      --include=*) include_globs="${1#--include=}" ;;
+      --exclude=*) exclude_globs="${1#--exclude=}" ;;
+      --tags=*)    tags_need="${1#--tags=}" ;;
+      --names=*)   names_need="${1#--names=}" ;;
+      --env=clean) env_mode="clean" ;;
+      --env=inherit) env_mode="inherit" ;;
+      --dry-run)   dry_run=1 ;;
+      --jobs=*)    max_jobs="${1#--jobs=}" ;;
+      --timeout=*) timeout_default="${1#--timeout=}" ;;
+      --retries=*) retries_default="${1#--retries=}" ;;
+      --only=*)    IFS=',' read -r -a only_paths <<< "${1#--only=}" ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+
+  mkdir -p -- "$HOOKS_STATE" || { adm_log_error "Sem acesso a $HOOKS_STATE"; return 1; }
+
+  local -a found; mapfile -t found < <(_discover_hooks "$stage")
+  # Filtro por --only (caminhos completos)
+  if ((${#only_paths[@]})); then
+    local -a f2=()
+    local p
+    for p in "${found[@]}"; do
+      local b="$(basename -- "$p")"
+      local ok=1
+      local x
+      for x in "${only_paths[@]}"; do
+        [[ "$p" == "$x" || "$b" == "$x" ]] && ok=0 && break
+      done
+      (( ok==0 )) && f2+=("$p")
+    done
+    found=("${f2[@]}")
+  fi
+
+  # Filtro por include/exclude/tags/names
+  local -a filt=()
+  local f
+  for f in "${found[@]}"; do
+    local nm="${HK_NAME[$f]:-$(basename -- "$f")}"
+    # include
+    if [[ -n "$include_globs" ]] && ! _name_match_any "$nm" "$include_globs"; then continue; fi
+    # exclude
+    if [[ -n "$exclude_globs" ]] && _name_match_any "$nm" "$exclude_globs"; then continue; fi
+    # tags
+    if ! _tags_match "${HK_TAGS[$f]:-}" "$tags_need"; then continue; fi
+    # requires
+    if ! _requires_ok "${HK_REQS[$f]:-}"; then continue; fi
+    # when / if
+    if ! _eval_when "${HK_WHEN[$f]:-}" "$rootdir"; then continue; fi
+    if ! _eval_if "${HK_IF[$f]:-}"; then continue; fi
+    filt+=("$f")
+  done
+
+  ((${#filt[@]})) || { adm_log_info "Nenhum hook para executar no estágio '$stage'."; return 0; }
+
+  # Ordena e agrupa por prioridade
+  mapfile -t filt < <(_sort_hooks "${filt[@]}")
+  local -a seq=(); while IFS= read -r ln; do seq+=("$ln"); done < <(_group_by_priority "${filt[@]}")
+
+  # Jobs
+  if [[ -z "$max_jobs" ]]; then
+    local np=$(_h_nproc); max_jobs=$(( np/2 )); ((max_jobs<2)) && max_jobs=2; ((max_jobs>8)) && max_jobs=8
+  fi
+
+  # Auditoria da execução
+  local run_id="${stage}-$(date +%Y%m%d_%H%M%S)-$$"
+  local run_dir="$HOOKS_STATE/$run_id"
+  mkdir -p -- "$run_dir" || { adm_log_error "Sem acesso a $run_dir"; return 1; }
+
+  adm_log_info "Stage: $stage  hooks: ${#filt[@]}  jobs: $max_jobs  dry-run: $dry_run"
+  adm_log_info "Run dir: $run_dir"
+
+  # Lista preparatória (imprime)
+  local entry
+  local idx=1
+  for entry in "${filt[@]}"; do
+    printf "  %b%3d%b  p=%-3s  %s  %b%s%b\n" \
+      "$__h_dim" "$idx" "$__h_rst" "${HK_ORDER[$entry]:-50}" \
+      "$(basename -- "$entry")" "$__h_dim" "${HK_TAGS[$entry]:-}" "$__h_rst"
+    idx=$((idx+1))
+  done
+
+  (( dry_run == 1 )) && { adm_log_info "Dry-run solicitado: nada será executado."; return 0; }
+
+  # Lock por estágio
+  _h_lock_acquire "$stage" || return 1
+  trap '_h_lock_release "'"$stage"'"' RETURN
+
+  # Execução com barreiras
+  local running=0 failures=0 started=0
+  local -a pids=() hnames=() outs=()
+
+  local token
+  for token in "${seq[@]}"; do
+    if [[ "$token" == ::BARRIER::* ]]; then
+      # espera todos da barreira anterior
+      local i pid rc
+      for pid in "${pids[@]}"; do
+        wait "$pid" || true
+      done
+      # recolhe RCs
+      failures=0
+      for i in "${!outs[@]}"; do
+        rc="$(cat "${outs[$i]}" 2>/dev/null || echo 1)"
+        (( rc!=0 )) && failures=$((failures+1))
+      done
+      pids=(); outs=(); hnames=(); running=0
+      if (( failures>0 )); then
+        adm_log_error "Falhas na barreira anterior: $failures hook(s). Abortando."
+        return 1
+      fi
+      continue
+    fi
+
+    # token é caminho de hook
+    local hk="$token"
+    local nm="${HK_NAME[$hk]:-$(basename -- "$hk")}"
+    local out_rc="$run_dir/${idx}_${nm}.rc"
+    : > "$out_rc"
+
+    # controle de paralelismo
+    if (( running >= max_jobs )); then
+      wait -n || true
+      # não sabemos qual terminou; seguimos até baixar abaixo de max_jobs
+      running=$((running-1))
+    fi
+
+    # parâmetros do hook
+    local to="${HK_TIMEOUT[$hk]:-$timeout_default}"
+    local rt="${HK_RETRIES[$hk]:-$retries_default}"
+    local need="${HK_NEEDROOT[$hk]:-false}"
+
+    (
+      set -Eeuo pipefail
+      rc="$(_exec_hook "$hk" "$rootdir" "$run_dir" "$env_mode" "${to:-0}" "${rt:-0}" "$need")" || true
+      echo "$rc" > "$out_rc"
+      exit "$rc"
+    ) &
+    pids+=($!)
+    outs+=("$out_rc")
+    hnames+=("$nm")
+    running=$((running+1)); started=$((started+1))
+  done
+
+  # espera final
+  local pid
+  for pid in "${pids[@]}"; do wait "$pid" || true; done
+
+  # checa status final
+  local rc_total=0
+  local rc i
+  for i in "${!outs[@]}"; do
+    rc="$(cat "${outs[$i]}" 2>/dev/null || echo 1)"
+    if (( rc!=0 )); then
+      rc_total=$((rc_total+1))
+      adm_log_error "Hook falhou: ${hnames[$i]} (rc=$rc). Verifique logs em $run_dir"
+    fi
+  done
+
+  if (( rc_total==0 )); then
+    adm_log_success "Todos os hooks do estágio '$stage' concluídos com sucesso."
+  else
+    adm_log_error "Estágio '$stage' finalizado com $rc_total falha(s)."
+    return 1
+  fi
+
+  # Gravando manifest simples
+  {
+    printf "{\n"
+    printf "  \"stage\":\"%s\",\n" "$(_h_json_escape "$stage")"
+    printf "  \"timestamp\":%s,\n" "$(_h_now)"
+    printf "  \"jobs\":%s,\n" "$max_jobs"
+    printf "  \"hooks_total\":%s,\n" "${#filt[@]}"
+    printf "  \"success\":%s\n" "$(( rc_total==0 ? 1 : 0 ))"
+    printf "}\n"
+  } > "$run_dir/run.json" || true
+
+  return 0
+}
+
+list_stage(){
+  local stage="$1"
+  local -a found; mapfile -t found < <(_discover_hooks "$stage")
+  ((${#found[@]})) || { adm_log_info "Nenhum hook encontrado para '$stage'."; return 0; }
+  # ordena
+  mapfile -t found < <(_sort_hooks "${found[@]}")
+  local f i=1
+  for f in "${found[@]}"; do
+    printf "%b%3d%b p=%-3s  %-40s  tags=%s  timeout=%s retries=%s needs-root=%s\n" \
+      "$__h_dim" "$i" "$__h_rst" "${HK_ORDER[$f]:-50}" \
+      "$(basename -- "$f")" "${HK_TAGS[$f]:-}" "${HK_TIMEOUT[$f]:-0}" "${HK_RETRIES[$f]:-0}" "${HK_NEEDROOT[$f]:-false}"
+    i=$((i+1))
+  done
+}
+
+explain_hook(){
+  local stage="$1" name_or_path="$2"
+  [[ -n "$stage" && -n "$name_or_path" ]] || { adm_log_error "Uso: explain <stage> <nome-ou-caminho>"; return 2; }
+  local -a found; mapfile -t found < <(_discover_hooks "$stage")
+  local target=""
+  for f in "${found[@]}"; do
+    if [[ "$f" == "$name_or_path" || "$(basename -- "$f")" == "$name_or_path" ]]; then target="$f"; break; fi
+  done
+  [[ -n "$target" ]] || { adm_log_error "Hook não encontrado: %s" "$name_or_path"; return 1; }
+
+  echo "Arquivo:    $target"
+  echo "Nome:       ${HK_NAME[$target]:-$(basename -- "$target")}"
+  echo "Stage:      ${HK_STAGE[$target]:-$stage}"
+  echo "Prioridade: ${HK_ORDER[$target]:-50}"
+  echo "Tags:       ${HK_TAGS[$target]:-}"
+  echo "Timeout:    ${HK_TIMEOUT[$target]:-0}"
+  echo "Retries:    ${HK_RETRIES[$target]:-0}"
+  echo "NeedsRoot:  ${HK_NEEDROOT[$target]:-false}"
+  echo "Requires:   ${HK_REQS[$target]:-}"
+  echo "When:       ${HK_WHEN[$target]:-}"
+  echo "If:         ${HK_IF[$target]:-}"
+}
+
+hooks_doctor(){
+  local fail=0
+  mkdir -p -- "$HOOKS_STATE" || { adm_log_error "Sem acesso a $HOOKS_STATE"; fail=$((fail+1)); }
+  for b in bash awk sed find sort xargs; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: $b"; }
+  done
+  (( fail>0 )) && { adm_log_error "Doctor encontrou $fail problema(s)."; return 1; }
+  adm_log_success "Hooks Runner OK."
+}
+
+print_env(){
+  echo "ADM_ROOT=$ADM_ROOT"
+  echo "ADM_STATE=$ADM_STATE"
+  echo "ADM_TMP=$ADM_TMP"
+  echo "HOOKS_STATE=$HOOKS_STATE"
+}
+
+# ============================== CLI ==========================================
+
+hooks_usage(){
+  cat <<'USAGE'
+Uso: 34-hooks-runner <comando> [opções]
+
+Comandos:
+  run <stage> [workdir] [opções]    Executa hooks do estágio.
+  list <stage>                      Lista hooks ordenados.
+  explain <stage> <nome|caminho>    Mostra metadados de um hook.
+  doctor                            Checa ambiente do runner.
+  env                               Mostra variáveis relevantes.
+
+Opções para 'run':
+  --include=glob1,glob2   Executa apenas nomes que casem com os globs.
+  --exclude=glob1,glob2   Exclui nomes que casem.
+  --tags=tag1,tag2        Requer todas as tags.
+  --names=glob1,glob2     Alias para --include (por nome).
+  --env=inherit|clean     Ambiente herdado (padrão) ou mínimo.
+  --dry-run               Não executa; apenas imprime o plano.
+  --jobs=N                Paralelismo máximo (por barreira).
+  --timeout=SECS          Timeout padrão (pode ser sobrescrito por hook).
+  --retries=N             Retries padrão (pode ser sobrescrito por hook).
+  --only=NAME[,NAME...]   Executa apenas os nomes/caminhos especificados.
+
+Metadados no hook (primeiras linhas, prefixo '#@'):
+  #@timeout: 120            (segundos)
+  #@retries: 2
+  #@tags: build,fast
+  #@requires: cmd:git, env:PROFILE, tool:patch
+  #@needs-root: true
+  #@when: test -f configure
+  #@if: ${PROFILE} = aggressive
+  #@before: 10              (reduz prioridade)
+  #@after:  10              (aumenta prioridade)
+  #@name: meu-hook          (nome lógico a mostrar)
+
+Diretórios padrão procurados:
+  $ADM_ROOT/hooks/<stage>.d/*.sh
+  $ADM_ROOT/metafiles/**/hooks/<stage>.d/*.sh
+USAGE
+}
+
+hooks_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    run)     run_stage "${1:-}" "${2:-.}" "${@:3}" ;;
+    list)    list_stage "${1:-}" ;;
+    explain) explain_hook "${1:-}" "${2:-}" ;;
+    doctor)  hooks_doctor ;;
+    env)     print_env ;;
+    ""|-h|--help|help) hooks_usage ;;
+    *)       adm_log_error "Comando desconhecido: $cmd"; hooks_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  hooks_main "$@"
+fi
