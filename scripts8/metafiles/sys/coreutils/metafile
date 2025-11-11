@@ -1,0 +1,12 @@
+name=coreutils
+version=9.5
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU core utilities
+homepage=https://www.gnu.org/software/coreutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz,https://ftpmirror.gnu.org/coreutils/coreutils-9.5.tar.xz
