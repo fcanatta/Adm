@@ -1,0 +1,12 @@
+name=llvm
+version=19.1.0
+category=dev
+run_deps=
+build_deps=binutils-stage2,gcc-final,host-cmake,host-ninja,host-python3
+opt_deps=
+num_builds=0
+description=LLVM core (infraestrutura e ferramentas base)
+homepage=https://llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz
