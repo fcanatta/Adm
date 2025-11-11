@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/85-audit
+# -----------------------------------------------------------------------------
+# ADM - Audit
+# - Auditoria de integridade, permissões, conflitos, órfãos e dependências
+# - Relatórios em texto e JSON, paralelismo e verificações robustas
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+AUD_STATE="$ADM_STATE/audit"
+LOCKS="$AUD_STATE/locks"
+REPORT_JSON="$AUD_STATE/report.json"
+mkdir -p -- "$AUD_STATE" "$LOCKS" >/dev/null 2>&1 || true
+
+DB_DIR="$ADM_STATE/db"
+DB_INSTALLED="$DB_DIR/installed"
+DB_FILES="$DB_DIR/files"
+FILES_INDEX="$DB_FILES/index.map"
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _A_COLOR=${ADM_COLOR:-auto}
+  _A_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _A_COLOR=false; fi
+  if [[ "$_A_COLOR" == "auto" ]]; then
+    _A_COLOR=$([[ "$_A_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_A_COLOR" == "true" ]]; then
+    __a_red=$'\033[31m'; __a_grn=$'\033[32m'; __a_yel=$'\033[33m'
+    __a_blu=$'\033[34m'; __a_mag=$'\033[35m'; __a_cyn=$'\033[36m'; __a_dim=$'\033[2m'; __a_rst=$'\033[0m'
+    __a_chk=$'\xE2\x9C\x85'
+  else
+    __a_red=""; __a_grn=""; __a_yel=""; __a_blu=""; __a_mag=""; __a_cyn=""; __a_dim=""; __a_rst=""; __a_chk="[OK]"
+  fi
+  _ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_ts)" "$__a_dim" "$__a_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_ts)" "$__a_blu" "$__a_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_ts)" "$__a_yel" "$__a_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_ts)" "$__a_red" "$__a_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_ts)" "$__a_grn" "$__a_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_a_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_a_have(){ command -v "$1" >/dev/null 2>&1; }
+_a_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_a_date(){ date -Iseconds; }
+_a_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_a_sha256(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+_a_rel(){ local base="$1" path="$2"; python3 - <<PY 2>/dev/null || echo "${path#$base/}"
+import os,sys; print(os.path.relpath(sys.argv[2], sys.argv[1]))
+PY
+}
+_lock(){
+  local key="$1"; mkdir -p -- "$LOCKS" || true
+  local d="$LOCKS/audit-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_unlock(){ local key="$1"; rm -rf -- "$LOCKS/audit-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== DB Helpers ===================================
+_installed_json(){ printf "%s/%s.json" "$DB_INSTALLED" "$(printf "%s" "$1" | tr '/' '__')"; }
+
+_db_list_installed(){
+  find "$DB_INSTALLED" -maxdepth 1 -type f -name "*.json" -printf "%f\n" 2>/dev/null \
+    | sed 's/\.json$//' | tr '__' '/'
+}
+
+_db_pkg_version(){
+  local js="$(_installed_json "$1")"
+  [[ -f "$js" ]] || { echo ""; return 0; }
+  awk -F\" '/"version":/ {print $4; exit}' "$js" 2>/dev/null || echo ""
+}
+
+_db_pkg_files(){
+  local js="$(_installed_json "$1")"
+  [[ -f "$js" ]] || return 1
+  awk -F\" '/^\s*"files":\s*\[/,/\]/{ if ($0 ~ /"/){ gsub(/[",]/,""); gsub(/^[ \t]+/,""); print } }' "$js"
+}
+
+_db_pkg_sha(){
+  local js="$(_installed_json "$1")" rel="$2"
+  [[ -f "$js" ]] || { echo ""; return 0; }
+  awk -v r="$rel" -F\" '/"sha256": \{/,/\}/ {
+    if ($0 ~ /": "/) {
+      # linha "    "path": "hash",
+      gsub(/[",]/,"",$0); gsub(/^[ \t]+/,"",$0);
+      split($0,a,": "); if (a[1]==("./"r) || a[1]==r) {print a[2]; exit}
+    }
+  }' "$js" 2>/dev/null || echo ""
+}
+
+_idx_owner_of(){
+  local rel="${1#/}"
+  [[ -f "$FILES_INDEX" ]] || { echo ""; return 0; }
+  awk -F'\t' -v p="$rel" '$1==p{print $2; exit}' "$FILES_INDEX"
+}
+
+# ============================== Metafile / deps ===============================
+_metafile_of(){
+  local name="$1"
+  # espera estrutura /usr/src/adm/metafiles/<cat>/<pkg>/metafile
+  local path="$ADM_ROOT/metafiles/$name/metafile"
+  [[ -f "$path" ]] && printf "%s" "$path" || printf ""
+}
+
+_parse_deps_from_mf(){
+  local mf="$1"
+  [[ -f "$mf" ]] || { echo ""; return 0; }
+  awk -F= '/^(run_deps)=/{print $2}' "$mf" | tr ',' '\n' | sed 's/^ *//; s/ *$//' | sed '/^$/d'
+}
+
+# ============================== Scopes (checks) ==============================
+# - integrity: sha256
+# - owners: coerência index.map
+# - conflicts: dois pacotes reivindicando mesmo arquivo
+# - perms: SUID/SGID, world-writable, /etc permissões largas
+# - elf: ldd "not found"
+# - deps: run_deps não instalados
+# - orphans: arquivos sem dono
+# - du: bytes por pacote
+
+is_elf(){
+  local p="$1"
+  if _a_have file; then file -b "$p" 2>/dev/null | grep -qi 'ELF' && return 0 || return 1
+  elif _a_have readelf; then readelf -h "$p" >/dev/null 2>&1 && return 0 || return 1
+  fi
+  return 1
+}
+
+ldd_missing(){
+  local p="$1"
+  _a_have ldd || { echo ""; return 0; }
+  ldd "$p" 2>/dev/null | awk '/not found/{print $1}' | paste -sd',' - || true
+}
+
+# ============================== Auditorias por pacote ========================
+audit_integrity_pkg(){
+  local name="$1" root="${2:-/}"
+  local js="$(_installed_json "$name")"; [[ -f "$js" ]] || { echo ""; return 1; }
+  local out_modified=() out_missing=() out_ok=0 out_fail=0
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local p="$root/$rel"
+    local want; want="$(_db_pkg_sha "$name" "$rel")"
+    if [[ -z "$want" ]]; then
+      # sem sha registrado — não tratamos como erro, apenas anotamos
+      continue
+    fi
+    if [[ ! -f "$p" ]]; then
+      out_missing+=("$rel"); continue
+    fi
+    local have; have="$(_a_sha256 "$p")"
+    if [[ "$have" != "$want" ]]; then
+      out_modified+=("$rel")
+    else
+      out_ok=$((out_ok+1))
+    fi
+  done < <(_db_pkg_files "$name")
+  printf "%s|%s|%s|%s\n" "$name" "$(printf "%s," "${out_modified[@]}" | sed 's/,$//')" "$(printf "%s," "${out_missing[@]}" | sed 's/,$//')" "$out_ok"
+}
+
+audit_perms_pkg(){
+  local name="$1" root="${2:-/}"
+  local ww=() wwdir=() suid=() sgid=() etc_loose=()
+  while IFS= read -r rel; do
+    local p="$root/$rel"
+    [[ -e "$p" || -L "$p" ]] || continue
+    # world-writable
+    if [[ -d "$p" && ! -L "$p" ]]; then
+      # diretório world-writable sem sticky
+      if [[ -w "$p" && "$(stat -c '%a' "$p" 2>/dev/null || echo 0)" =~ .*.?.* ]]; then
+        # checagem robusta: bit de others write
+        if python3 - <<PY 2>/dev/null; then :; fi
+PY
+        :
+      fi
+      # shell puro:
+      perm="$(stat -c %a "$p" 2>/dev/null || echo 000)"
+      ow="${perm: -1}"
+      (( ow >= 2 )) && [[ $(stat -c %A "$p" 2>/dev/null || echo "") != *t* ]] && wwdir+=("$rel")
+    else
+      perm="$(stat -c %a "$p" 2>/dev/null || echo 000)"
+      ow="${perm: -1}"
+      (( ow >= 2 )) && ww+=("$rel")
+    fi
+    # SUID/SGID
+    mode="$(stat -c %f "$p" 2>/dev/null || echo 0)"
+    # extrai bits especiais: use %A também
+    fm="$(stat -c %A "$p" 2>/dev/null || echo "----------")"
+    [[ "$fm" == *s* || "$fm" == *S* ]] && suid+=("$rel")
+    [[ "$fm" == ??????s* || "$fm" == ??????S* ]] && sgid+=("$rel")
+    # /etc com permissões amplas
+    if [[ "$rel" == etc/* ]]; then
+      # permissões > 644 para arquivos regulares
+      if [[ -f "$p" && ! -L "$p" ]]; then
+        perm="$(stat -c %a "$p" 2>/dev/null || echo 000)"
+        (( 10#$perm > 644 )) && etc_loose+=("$rel")
+      fi
+    fi
+  done < <(_db_pkg_files "$name")
+  printf "%s|%s|%s|%s|%s\n" "$name" \
+    "$(printf "%s," "${ww[@]}" | sed 's/,$//')" \
+    "$(printf "%s," "${wwdir[@]}" | sed 's/,$//')" \
+    "$(printf "%s," "${suid[@]}" | sed 's/,$//')" \
+    "$(printf "%s," "${sgid[@]}" | sed 's/,$//')" \
+    "$(printf "%s," "${etc_loose[@]}" | sed 's/,$//')"
+}
+
+audit_elf_pkg(){
+  local name="$1" root="${2:-/}"
+  local missing=()
+  while IFS= read -r rel; do
+    local p="$root/$rel"
+    [[ -f "$p" ]] || continue
+    if is_elf "$p"; then
+      local miss; miss="$(ldd_missing "$p")"
+      [[ -n "$miss" ]] && missing+=("$rel:$miss")
+    fi
+  done < <(_db_pkg_files "$name")
+  printf "%s|%s\n" "$name" "$(printf "%s;" "${missing[@]}" | sed 's/;$//')"
+}
+
+audit_du_pkg(){
+  local name="$1" root="${2:-/}"
+  local sum=0
+  while IFS= read -r rel; do
+    local p="$root/$rel"
+    [[ -f "$p" ]] || continue
+    local s; s=$(stat -c %s "$p" 2>/dev/null || echo 0)
+    sum=$((sum + s))
+  done < <(_db_pkg_files "$name")
+  printf "%s|%s\n" "$name" "$sum"
+}
+
+audit_deps_pkg(){
+  local name="$1"
+  local mf="$(_metafile_of "$name")"
+  [[ -f "$mf" ]] || { printf "%s|\n" "$name"; return 0; }
+  local need=() missing=()
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    need+=("$d")
+    # aceita cat/pkg ou basename
+    local ok=0
+    if [[ "$d" == */* ]]; then
+      [[ -f "$DB_INSTALLED/${d//\//__}.json" ]] && ok=1
+    else
+      # basename
+      for n in $(_db_list_installed); do [[ "${n##*/}" == "$d" ]] && ok=1 && break; done
+    fi
+    (( ok==1 )) || missing+=("$d")
+  done < <(_parse_deps_from_mf "$mf")
+  printf "%s|%s\n" "$name" "$(printf "%s," "${missing[@]}" | sed 's/,$//')"
+}
+
+# ============================== Conflitos / órfãos ===========================
+audit_conflicts(){
+  # revarre DB e descobre caminhos duplicados
+  declare -A seen=()
+  declare -A owners=()
+  local path
+  for n in $(_db_list_installed); do
+    while IFS= read -r rel; do
+      [[ -z "$rel" ]] && continue
+      if [[ -n "${seen[$rel]:-}" && "${seen[$rel]}" != "$n" ]]; then
+        owners["$rel"]="${owners[$rel]:-}${owners[$rel]:+,}$n"
+      else
+        seen["$rel"]="$n"
+      fi
+    done < <(_db_pkg_files "$n")
+  done
+  for path in "${!owners[@]}"; do
+    printf "%s|%s\n" "$path" "${owners[$path]}"
+  done
+}
+
+audit_orphan_files(){
+  local root="${1:-/}"
+  # varre prefixos "de sistema" e compara com index.map
+  local prefixes=(usr etc lib lib64 bin sbin opt)
+  local p
+  for p in "${prefixes[@]}"; do
+    [[ -d "$root/$p" ]] || continue
+    find "$root/$p" -xdev -type f -o -type l 2>/dev/null | while read -r abs; do
+      local rel="${abs#$root/}"
+      # ignora caches/logs típicos
+      case "$rel" in
+        var/*|tmp/*|usr/share/man/*|usr/share/doc/*) continue;;
+      esac
+      local owner; owner="$(_idx_owner_of "$rel")"
+      [[ -z "$owner" ]] && printf "%s\n" "$rel"
+    done
+  done | LC_ALL=C sort -u
+}
+# (continuação do arquivo /usr/src/adm/scripts/85-audit)
+
+# ============================== JSON Report ==================================
+
+_json_begin(){ printf "{\n  \"generated_at\":\"%s\",\n  \"packages\":{\n" "$(_a_date)"; }
+_json_end(){ printf "  },\n  \"summary\": %s\n}\n" "$1"; }
+_json_pkg(){
+  local name="$1" ver="$2" integrity_mod="$3" integrity_miss="$4" perms="$5" elfs="$6" depsmiss="$7" du="$8"
+  printf "    \"%s\": {\n" "$(_a_json_e "$name")"
+  printf "      \"version\": \"%s\",\n" "$(_a_json_e "$ver")"
+  printf "      \"integrity\": {\"modified\": [%s], \"missing\": [%s]},\n" \
+    "$(printf "%s" "$integrity_mod" | awk -F, 'NF{ for(i=1;i<=NF;i++){ if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i } }')" \
+    "$(printf "%s" "$integrity_miss" | awk -F, 'NF{ for(i=1;i<=NF;i++){ if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i } }')"
+  printf "      \"perms\": {\"world_writable\": [%s], \"world_writable_dirs\": [%s], \"suid\": [%s], \"sgid\": [%s], \"etc_loose\": [%s]},\n" \
+    "$(echo "$perms" | awk -F'|' '{print $2}' | awk -F, 'NF{for(i=1;i<=NF;i++){if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')" \
+    "$(echo "$perms" | awk -F'|' '{print $3}' | awk -F, 'NF{for(i=1;i<=NF;i++){if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')" \
+    "$(echo "$perms" | awk -F'|' '{print $4}' | awk -F, 'NF{for(i=1;i<=NF;i++){if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')" \
+    "$(echo "$perms" | awk -F'|' '{print $5}' | awk -F, 'NF{for(i=1;i<=NF;i++){if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')" \
+    "$(echo "$perms" | awk -F'|' '{print $6}' | awk -F, 'NF{for(i=1;i<=NF;i++){if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')"
+  printf "      \"elf_missing\": [%s],\n" \
+    "$(printf "%s" "$elfs" | awk -F'|' '{print $2}' | sed 's/;/" , "/g' | sed 's/^/"/; s/$/"/' | sed 's/,""/""/g' | sed 's/^""$//' )"
+  printf "      \"deps_missing\": [%s],\n" \
+    "$(printf "%s" "$depsmiss" | awk -F'|' '{print $2}' | awk -F, 'NF{for(i=1;i<=NF;i++){ if($i!="") printf "%s\"%s\"", (i>1?", ":""), $i}}')"
+  printf "      \"disk_bytes\": %s\n" "$du"
+  printf "    }"
+}
+
+# ============================== Execução principal ===========================
+
+_audit_one_pkg(){
+  local name="$1" root="$2" scopes="$3"
+  local integ="" mod miss ok
+  if [[ "$scopes" == *integrity* ]]; then
+    integ="$(audit_integrity_pkg "$name" "$root" )" || integ=""
+  fi
+  local perms=""; [[ "$scopes" == *perms* ]] && perms="$(audit_perms_pkg "$name" "$root")" || perms="$name|||||"
+  local elfs="";  [[ "$scopes" == *elf* ]]   && elfs="$(audit_elf_pkg "$name" "$root")"   || elfs="$name|"
+  local depsm=""; [[ "$scopes" == *deps* ]]  && depsm="$(audit_deps_pkg "$name")"         || depsm="$name|"
+  local dus="";   [[ "$scopes" == *du* ]]    && dus="$(audit_du_pkg "$name" "$root")"     || dus="$name|0"
+
+  # saída de linha única para agregação
+  # name|ver|modCSV|missCSV|permsPacked|elfPacked|depsMissingCSV|bytes
+  local ver="$(_db_pkg_version "$name")"
+  local modcsv="" misscsv=""
+  if [[ -n "$integ" ]]; then
+    modcsv="$(echo "$integ" | awk -F'|' '{print $2}')"
+    misscsv="$(echo "$integ" | awk -F'|' '{print $3}')"
+  fi
+  printf "%s|%s|%s|%s|%s|%s|%s|%s\n" \
+    "$name" "$ver" "$modcsv" "$misscsv" "$perms" "$elfs" "$depsm" "$(echo "$dus" | awk -F'|' '{print $2}')"
+}
+
+_run_parallel_pkgs(){
+  local root="$1" scopes="$2" maxp="$3"
+  shift 3
+  local -a pkgs=("$@")
+  local tmp; tmp="$(mktemp -d "${ADM_TMP%/}/aud.XXXX")"
+  trap 'rm -rf -- "'"$tmp"'" 2>/dev/null || true' RETURN
+  printf "%s\n" "${pkgs[@]}" > "$tmp/pkgs.txt"
+
+  if _a_have xargs; then
+    < "$tmp/pkgs.txt" xargs -r -n1 -P "$maxp" bash -c '
+      set -Eeuo pipefail
+      name="$0"
+      '"$(declare -f audit_integrity_pkg audit_perms_pkg audit_elf_pkg audit_deps_pkg audit_du_pkg _db_pkg_version)"'
+      '"$(declare -f _audit_one_pkg)"'
+    ' 2>/dev/null || true
+  else
+    local n; for n in "${pkgs[@]}"; do _audit_one_pkg "$n" "$root" "$scopes"; done
+  fi
+}
+
+_build_summary_json(){
+  local totals="$1" upkgs="$2" uptodate="$3" nconf="$4" norph="$5"
+  # severidade heurística
+  local sev="ok"
+  (( upkgs>0 )) && sev="warning"
+  (( nconf>0 || norph>0 )) && sev="error"
+  printf "{ \"total_packages\": %s, \"packages_with_issues\": %s, \"ok_packages\": %s, \"conflicts\": %s, \"orphans\": %s, \"severity\": \"%s\" }" \
+    "$totals" "$upkgs" "$uptodate" "$nconf" "$norph" "$sev"
+}
+
+# ============================== Doctor =======================================
+
+_audit_doctor(){
+  local fail=0
+  for b in find awk sed stat sha256sum; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }
+  done
+  [[ -d "$DB_INSTALLED" ]] || { adm_log_error "DB de pacotes ausente: %s" "$DB_INSTALLED"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Audit OK."
+}
+
+# ============================== CLI ==========================================
+
+_usage(){
+  cat <<'USAGE'
+Uso: 85-audit <comando> [opções]
+
+Comandos:
+  run         [--root=/] [--targets=cat/pkg,... | --all] [--scopes=integrity,perms,elf,deps,du]
+              [--parallel=N] [--with-conflicts] [--with-orphans] [--json] 
+  verify      --name=cat/pkg [--root=/]        # verificação rápida de integridade (sha256)
+  conflicts                                 # lista conflitos de propriedade entre pacotes
+  orphans    [--root=/]                      # lista arquivos órfãos (sem dono)
+  owns       --path=/absoluto                # mostra dono do arquivo (via index.map)
+  doctor                                     # verifica dependências do auditor
+
+Opções:
+  --root=DIR            Raiz do sistema (default "/")
+  --targets=A,B         Pacotes específicos (csv). Se omitido, usa --all.
+  --all                 Todos os pacotes instalados.
+  --scopes=...          Conjuntos: integrity,perms,elf,deps,du (default: todos)
+  --parallel=N          Concorrência (default: núcleos/2, mínimo 2)
+  --with-conflicts      Inclui varredura de conflitos (global)
+  --with-orphans        Inclui varredura de órfãos (global)
+  --json                Escreve relatório JSON consolidado em $ADM_STATE/audit/report.json
+
+Códigos de saída:
+  0 = sem problemas críticos; 1 = problemas encontrados; 2 = uso inválido/erro.
+USAGE
+}
+
+# ============================== Comandos =====================================
+
+_verify_one(){
+  local name="$1" root="${2:-/}"
+  local line; line="$(audit_integrity_pkg "$name" "$root" || true)"
+  [[ -z "$line" ]] && { adm_log_error "Pacote não encontrado: %s" "$name"; return 2; }
+  local mod miss ok
+  IFS='|' read -r _ mod miss ok <<< "$line"
+  local nmod nmiss
+  nmod=$(printf "%s" "$mod"  | awk -F, 'NF{print NF}' 2>/dev/null || echo 0)
+  nmiss=$(printf "%s" "$miss" | awk -F, 'NF{print NF}' 2>/dev/null || echo 0)
+  if (( nmod==0 && nmiss==0 )); then
+    adm_log_success "${__a_chk} OK: %s (integridade)" "$name"; return 0
+  else
+    adm_log_warn "Integridade %s: modificados=%d, ausentes=%d" "$name" "$nmod" "$nmiss"; return 1
+  fi
+}
+
+_cmd_conflicts(){
+  local n=0
+  audit_conflicts | while IFS='|' read -r path owners; do
+    (( n++ ))
+    adm_log_error "Conflito: %s  <- %s" "$path" "$owners"
+  done
+  (( n>0 )) && return 1 || return 0
+}
+
+_cmd_orphans(){
+  local root="${1:-/}"
+  local n=0
+  audit_orphan_files "$root" | while read -r rel; do
+    (( n++ )); echo "$rel"
+  done
+  (( n>0 )) && return 1 || return 0
+}
+
+_run_main(){
+  local root="/" targets="" all=0 scopes="integrity,perms,elf,deps,du" par=0 want_conf=0 want_orph=0 want_json=0
+  while (( $# )); do
+    case "$1" in
+      --root=*) root="${1#--root=}" ;;
+      --targets=*) targets="${1#--targets=}" ;;
+      --all) all=1 ;;
+      --scopes=*) scopes="${1#--scopes=}" ;;
+      --parallel=*) par="${1#--parallel=}" ;;
+      --with-conflicts) want_conf=1 ;;
+      --with-orphans)   want_orph=1 ;;
+      --json) want_json=1 ;;
+      *) adm_log_warn "Opção desconhecida: %s" "$1" ;;
+    esac; shift || true
+  done
+  root="$(_a_abspath "$root")"
+  # pacotes
+  local -a pkgs=()
+  if (( all==1 || -z "$targets" )); then
+    mapfile -t pkgs < <(_db_list_installed)
+  else
+    IFS=',' read -r -a pkgs <<< "$targets"
+  fi
+  ((${#pkgs[@]})) || { adm_log_error "Nenhum pacote alvo."; return 2; }
+
+  # paralelismo
+  if (( par<=0 )); then
+    if _a_have nproc; then par=$(( $(nproc 2>/dev/null || echo 2) / 2 )); else par=2; fi
+    (( par<2 )) && par=2
+  fi
+
+  adm_log_info "Auditoria: pkgs=%d root=%s scopes=%s parallel=%d" "${#pkgs[@]}" "$root" "$scopes" "$par"
+
+  # Executa auditoria por pacote (coleta linhas)
+  local tmp; tmp="$(mktemp -d "${ADM_TMP%/}/audcol.XXXX")"
+  trap 'rm -rf -- "'"$tmp"'" 2>/dev/null || true' RETURN
+
+  # Fallback para execução sequencial com coleta
+  if _a_have xargs; then
+    printf "%s\n" "${pkgs[@]}" | xargs -r -n1 -P "$par" bash -c '
+      set -Eeuo pipefail
+      name="$0"
+      '"$(declare -f _audit_one_pkg audit_integrity_pkg audit_perms_pkg audit_elf_pkg audit_deps_pkg audit_du_pkg _db_pkg_version is_elf ldd_missing _a_sha256)"'
+      _audit_one_pkg "$name" "'"$root"'" "'"$scopes"'"
+    ' > "$tmp/pkgs.txt" 2>/dev/null || true
+  else
+    local n; for n in "${pkgs[@]}"; do _audit_one_pkg "$n" "$root" "$scopes"; done > "$tmp/pkgs.txt"
+  fi
+
+  # Agrega e mostra resultados + produz JSON
+  local issues=0 okpk=0 total="${#pkgs[@]}"
+  local conflicts=0 orphans=0
+  local lines; lines="$(cat "$tmp/pkgs.txt" 2>/dev/null || true)"
+
+  if (( want_conf==1 )); then
+    local ctmp; ctmp="$(mktemp "${ADM_TMP%/}/audc.XXXX")"
+    audit_conflicts > "$ctmp" || true
+    conflicts=$(wc -l < "$ctmp" 2>/dev/null || echo 0)
+    if (( conflicts>0 )); then
+      adm_log_error "Conflitos detectados: %d" "$conflicts"
+      while IFS='|' read -r path owners; do
+        printf "  - %s <- %s\n" "$path" "$owners"
+      done < "$ctmp"
+    fi
+    rm -f -- "$ctmp" || true
+  fi
+
+  if (( want_orph==1 )); then
+    local otmp; otmp="$(mktemp "${ADM_TMP%/}/audO.XXXX")"
+    audit_orphan_files "$root" > "$otmp" || true
+    orphans=$(wc -l < "$otmp" 2>/dev/null || echo 0)
+    if (( orphans>0 )); then
+      adm_log_warn "Arquivos órfãos: %d (exibindo até 20)" "$orphans"
+      head -n 20 -- "$otmp"
+    fi
+    rm -f -- "$otmp" || true
+  fi
+
+  # Impressão por pacote e contagem de issues
+  while IFS='|' read -r name ver mod miss perms elfs depsm bytes; do
+    [[ -z "$name" ]] && continue
+    local nmod nmiss nperms nelf ndeps
+    nmod=$(printf "%s" "$mod"  | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}')
+    nmiss=$(printf "%s" "$miss" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}')
+    ndeps=$(printf "%s" "$depsm" | awk -F'|' '{print $2}' | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}')
+    nelf=$(printf "%s" "$elfs" | awk -F'|' '{print $2}' | sed 's/;$//' | awk -F';' 'NF{print (NF==1 && $1=="" ? 0 : NF)}')
+    # perms: contar campos concatenados
+    nperms=$(
+      p2="$(echo "$perms" | awk -F'|' '{print $2}')"; c2=$(echo "$p2" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}');
+      p3="$(echo "$perms" | awk -F'|' '{print $3}')"; c3=$(echo "$p3" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}');
+      p4="$(echo "$perms" | awk -F'|' '{print $4}')"; c4=$(echo "$p4" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}');
+      p5="$(echo "$perms" | awk -F'|' '{print $5}')"; c5=$(echo "$p5" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}');
+      p6="$(echo "$perms" | awk -F'|' '{print $6}')"; c6=$(echo "$p6" | awk -F, 'NF{print (NF==1 && $1=="" ? 0 : NF)}');
+      echo $((c2+c3+c4+c5+c6))
+    )
+
+    if (( nmod>0 || nmiss>0 || nperms>0 || nelf>0 || ndeps>0 )); then
+      issues=$((issues+1))
+      adm_log_warn "%s %s  (mod:%d miss:%d perms:%d elf:%d deps:%d du:%s B)" "$name" "$ver" "$nmod" "$nmiss" "$nperms" "$nelf" "$ndeps" "$bytes"
+    else
+      okpk=$((okpk+1))
+      adm_log_success "${__a_chk} OK %s %s (du:%s B)" "$name" "$ver" "$bytes"
+    fi
+  done <<< "$lines"
+
+  # JSON
+  if (( want_json==1 )); then
+    local json; json="$(mktemp "${ADM_TMP%/}/audJ.XXXX")"
+    _json_begin > "$json"
+    local first=1
+    while IFS='|' read -r name ver mod miss perms elfs depsm bytes; do
+      [[ -z "$name" ]] && continue
+      (( first==1 )) || printf ",\n" >> "$json"
+      first=0
+      _json_pkg "$name" "$ver" "$mod" "$miss" "$perms" "$elfs" "$depsm" "$bytes" >> "$json"
+    done <<< "$lines"
+    printf "\n" >> "$json"
+    local summary; summary="$(_build_summary_json "$total" "$issues" "$okpk" "$conflicts" "$orphans")"
+    _json_end "$summary" >> "$json"
+    mv -f -- "$json" "$REPORT_JSON"
+    adm_log_info "Relatório JSON: %s" "$REPORT_JSON"
+  fi
+
+  # Exit code (1 se achou problemas)
+  (( issues>0 || conflicts>0 )) && return 1 || return 0
+}
+
+audit_main(){
+  local cmd="${1:-run}"; shift || true
+  case "$cmd" in
+    run)      _run_main "$@" ;;
+    verify)   local name="" root="/"; while (( $# )); do case "$1" in --name=*) name="${1#--name=}";; --root=*) root="${1#--root=}";; *) adm_log_warn "Opção ignorada: %s" "$1";; esac; shift; done; [[ -n "$name" ]] || { adm_log_error "Uso: verify --name=cat/pkg"; exit 2; }; _verify_one "$name" "$root" ;;
+    conflicts) _cmd_conflicts ;;
+    orphans)  local root="/"; while (( $# )); do case "$1" in --root=*) root="${1#--root=}";; *) adm_log_warn "Opção ignorada: %s" "$1";; esac; shift; done; _cmd_orphans "$root" ;;
+    owns)     local p=""; while (( $# )); do case "$1" in --path=*) p="${1#--path=}";; *) adm_log_warn "Opção ignorada: %s" "$1";; esac; shift; done; [[ -n "$p" ]] || { adm_log_error "Uso: owns --path=/absoluto"; exit 2; }; p="${p#/}"; local owner; owner="$(_idx_owner_of "$p")"; [[ -n "$owner" ]] && echo "$owner" || { adm_log_warn "Sem dono: %s" "$p"; exit 1; } ;;
+    doctor)   _audit_doctor ;;
+    ""|-h|--help|help) _usage ;;
+    *)        adm_log_error "Comando desconhecido: %s" "$cmd"; _usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  audit_main "$@"
+fi
