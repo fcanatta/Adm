@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Regenera o grub.cfg (se GRUB estiver instalado)
+MKCFG=""
+for x in /usr/bin/grub-mkconfig /usr/bin/grub2-mkconfig /bin/grub-mkconfig /bin/grub2-mkconfig; do
+  [[ -x "$x" ]] && MKCFG="$x" && break
+done
+CFG_DIR="/boot/grub"; [[ -d /boot/grub2 ]] && CFG_DIR="/boot/grub2"
+[[ -n "$MKCFG" ]] && "$MKCFG" -o "${CFG_DIR}/grub.cfg" || true
