@@ -1,0 +1,12 @@
+name=ninja
+version=1.12.1
+category=dev
+run_deps=
+build_deps=host-cmake,host-make,binutils-stage2,gcc-final
+opt_deps=
+num_builds=0
+description=Ninja build system (binário do target, cross compilado)
+homepage=https://ninja-build.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz
