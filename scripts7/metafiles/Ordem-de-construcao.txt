@@ -123,3 +123,15 @@ adm install libcxx         --jobs=8 --profile=normal
 clang --version
 clang --print-targets | head
 clang --target="$TARGET" --sysroot="$SYSROOT" -v -x c - -c <<< 'int main(){}'
+
+# Instalar a pilha LLVM/Clang (sem alterar padrão do sistema):
+adm install clang-toolchain --jobs=8 --profile=normal
+# Instalar e tornar Clang/Lld o padrão (opcional, consciente):
+ADM_SET_DEFAULT_CLANG=1 adm install clang-toolchain --jobs=8 --profile=normal
+
+# Verificar
+clang --version
+cc --version          # deve apontar para clang se ativou ADM_SET_DEFAULT_CLANG=1
+ld --version          # deve apontar para lld se o symlink foi criado
+
+
