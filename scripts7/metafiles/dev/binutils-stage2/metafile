@@ -1,0 +1,12 @@
+name=binutils-stage2
+version=2.42
+category=dev
+run_deps=
+build_deps=binutils-stage0,gcc-stage1-musl|gcc-stage1-glibc
+opt_deps=zlib,zstd
+num_builds=0
+description=Binutils (stage2) reconstruído para o target com sysroot; plugins e LTO plugin
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.42.tar.xz,https://ftpmirror.gnu.org/binutils/binutils-2.42.tar.xz
