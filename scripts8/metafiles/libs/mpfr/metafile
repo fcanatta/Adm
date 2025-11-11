@@ -1,0 +1,12 @@
+name=mpfr
+version=4.2.1
+category=libs
+run_deps=libs/gmp
+build_deps=libs/gmp
+opt_deps=
+num_builds=0
+description=Multiple-precision floating-point reliable library
+homepage=https://www.mpfr.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz,https://ftpmirror.gnu.org/mpfr/mpfr-4.2.1.tar.xz
