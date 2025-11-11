@@ -1,0 +1,12 @@
+name=file
+version=5.45
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=File type guesser
+homepage=https://astro.github.io/file/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://astron.com/pub/file/file-5.45.tar.gz,https://distfiles.macports.org/file/file-5.45.tar.gz
