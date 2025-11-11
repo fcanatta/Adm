@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/10-parser
+# -----------------------------------------------------------------------------
+# ADM - Parser de Metafiles (key=value)
+# - Leitura robusta, sem erros silenciosos.
+# - Validação de esquema: campos obrigatórios e opcionais.
+# - Normalização de listas CSV, trimming, deduplicação.
+# - Coerência entre 'sources' e 'sha256sums'.
+# - Get/Set/Save com backup e preservação segura.
+# - Incremento de num_builds.
+# - Merge de dependências detectadas (run/build/opt).
+# - Busca por metafile por nome/categoria dentro de /usr/src/adm/metafiles.
+# -----------------------------------------------------------------------------
+# Compatível com 'set -Eeuo pipefail' no chamador (não altera globalmente).
+# Não assume outras libs, mas usa 05-logging se disponível; possui fallback.
+
+# ============================= Logger (fallback) ==============================
+
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _P_COLOR=${ADM_COLOR:-auto}
+  _P_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _P_COLOR=false; fi
+  if [[ "$_P_COLOR" == "auto" ]]; then
+    _P_COLOR=$([[ "$_P_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_P_COLOR" == "true" ]]; then
+    __p_red=$'\033[31m'; __p_grn=$'\033[32m'; __p_yel=$'\033[33m'
+    __p_blu=$'\033[34m'; __p_dim=$'\033[2m' ; __p_rst=$'\033[0m'
+  else
+    __p_red=""; __p_grn=""; __p_yel=""; __p_blu=""; __p_dim=""; __p_rst=""
+  fi
+  _p_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_p_ts)" "$__p_dim" "$__p_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_p_ts)" "$__p_blu" "$__p_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_p_ts)" "$__p_yel" "$__p_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_p_ts)" "$__p_red" "$__p_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_p_ts)" "$__p_grn" "$__p_rst" "$*" >&2; }
+fi
+
+# ================================ Utilidades =================================
+
+# Trim espaços
+_p_trim() {
+  local s="$*"
+  s="$(printf "%s" "$s" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  printf "%s" "$s"
+}
+
+# Divide CSV em array nomeado; remove espaços e itens vazios; deduplica mantendo ordem
+# Uso: _p_csv_to_array "a, b ,c, a" OUT_ARR
+_p_csv_to_array() {
+  local csv="$1" outname="$2"
+  [[ -z "$outname" ]] && { adm_log_error "_p_csv_to_array: nome de array vazio"; return 2; }
+  local raw=() tmp=() x
+  IFS=',' read -r -a raw <<< "${csv:-}"
+  declare -A seen=()
+  for x in "${raw[@]}"; do
+    x="$(_p_trim "$x")"
+    [[ -z "$x" ]] && continue
+    if [[ -z "${seen[$x]:-}" ]]; then
+      tmp+=("$x"); seen["$x"]=1
+    fi
+  done
+  eval "$outname=(${tmp[@]@Q})"
+}
+
+# Junta array em CSV (argumentos após nome do array)
+_p_array_to_csv() {
+  local arrname="$1"; shift || true
+  local sep="${1:-,}"; shift || true
+  local -n _arr="$arrname"
+  local out=""; local x
+  for x in "${_arr[@]}"; do
+    x="$(_p_trim "$x")"; [[ -z "$x" ]] && continue
+    out="${out:+$out$sep}$x"
+  done
+  printf "%s" "$out"
+}
+
+# Teste rápido de URL (bem simples)
+_p_is_url() {
+  [[ "$1" =~ ^https?://[^[:space:]]+$ ]]
+}
+
+# ============================== Esquema/Suporte ==============================
+
+# Campos suportados (key=value)
+# Obrigatórios: name, version, category, sources
+# Opcionais: run_deps, build_deps, opt_deps, num_builds, description, homepage, maintainer, sha256sums
+_P_REQUIRED=(name version category sources)
+_P_OPTIONAL=(run_deps build_deps opt_deps num_builds description homepage maintainer sha256sums)
+
+# Categorias válidas
+_P_CATEGORIES=(apps libs sys dev)
+
+# Ordem canônica para gravar
+_P_CANON_ORDER=(name version category run_deps build_deps opt_deps num_builds description homepage maintainer sha256sums sources)
+
+# ================================ Core Parser ================================
+
+# Lê KV -> associative array nomeado + metadados auxiliares
+# Uso: adm_meta_load "/path/to.meta" META
+adm_meta_load() {
+  local file="$1" arrname="$2"
+  [[ -z "$file" || -z "$arrname" ]] && { adm_log_error "adm_meta_load: uso: adm_meta_load <arquivo> <NOME_ARRAY>"; return 2; }
+  [[ -f "$file" ]] || { adm_log_error "Metafile não encontrado: $file"; return 1; }
+
+  declare -gA "$arrname" 2>/dev/null || true
+  local -n META="$arrname"
+
+  META=()  # reset
+  local line ln=0 key val
+  declare -A seen_keys=()
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ln=$((ln+1))
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]}"
+      val="$(_p_trim "$val")"
+      if [[ -n "${seen_keys[$key]:-}" ]]; then
+        adm_log_warn "Chave duplicada em $file:$ln → '$key' (última ocorrência prevalece)"
+      fi
+      META["$key"]="$val"
+      seen_keys["$key"]=1
+    else
+      adm_log_warn "Linha inválida ignorada em $file:$ln → $(printf %q "$line")"
+    fi
+  done < "$file"
+
+  # pós-processo: normalizar CSVs conhecidos
+  for k in run_deps build_deps opt_deps sha256sums sources; do
+    if [[ -n "${META[$k]:-}" ]]; then
+      _p_csv_to_array "${META[$k]}" "_TMPARR"
+      META["$k"]="$(_p_array_to_csv _TMPARR ,)"
+    fi
+  done
+
+  META["__file"]="$file"
+  adm_log_success "Metafile carregado: $file"
+  return 0
+}
+
+# =============================== Validação ===================================
+
+# Verifica obrigatórios, categoria, coerência sources↔sha256sums, homepage, num_builds etc.
+# STRICT=true (via config) transforma warnings críticos em erro.
+adm_meta_validate() {
+  local arrname="$1"; local strict="${STRICT:-false}"
+  [[ -z "$arrname" ]] && { adm_log_error "adm_meta_validate: nome de array vazio"; return 2; }
+  local -n META="$arrname"
+
+  # 1) Obrigatórios
+  local k
+  for k in "${_P_REQUIRED[@]}"; do
+    if [[ -z "${META[$k]:-}" ]]; then
+      if [[ "$strict" == "true" ]]; then
+        adm_log_error "Campo obrigatório ausente: $k"
+        return 1
+      else
+        adm_log_warn "Campo obrigatório ausente: $k"
+      fi
+    fi
+  done
+
+  # 2) Categoria
+  if [[ -n "${META[category]:-}" ]]; then
+    local ok=false c
+    for c in "${_P_CATEGORIES[@]}"; do
+      [[ "${META[category]}" == "$c" ]] && ok=true && break
+    done
+    if [[ "$ok" != "true" ]]; then
+      if [[ "$strict" == "true" ]]; then
+        adm_log_error "Categoria inválida: ${META[category]} (válidas: ${_P_CATEGORIES[*]})"; return 1
+      else
+        adm_log_warn "Categoria incomum: ${META[category]} (válidas sugeridas: ${_P_CATEGORIES[*]})"
+      fi
+    fi
+  fi
+
+  # 3) sources e sha256sums coerentes
+  local S=() H=()
+  _p_csv_to_array "${META[sources]:-}" S
+  _p_csv_to_array "${META[sha256sums]:-}" H
+  if ((${#S[@]}==0)); then
+    [[ "$strict" == "true" ]] && { adm_log_error "Necessita 'sources' com ao menos 1 item"; return 1; }
+    adm_log_warn "'sources' vazio"
+  fi
+  if ((${#H[@]}>0)); then
+    if ((${#H[@]} != ${#S[@]})); then
+      local msg="sha256sums (${#H[@]}) não bate com sources (${#S[@]})"
+      [[ "$strict" == "true" ]] && { adm_log_error "$msg"; return 1; } || adm_log_warn "$msg"
+    fi
+  else
+    adm_log_warn "Sem sha256sums; integridade não poderá ser verificada"
+  fi
+
+  # 4) version básica (não vazio)
+  if [[ -z "${META[version]:-}" ]]; then
+    [[ "$strict" == "true" ]] && { adm_log_error "version vazio"; return 1; } || adm_log_warn "version vazio"
+  fi
+
+  # 5) homepage simples
+  if [[ -n "${META[homepage]:-}" ]] && ! _p_is_url "${META[homepage]}"; then
+    [[ "$strict" == "true" ]] && { adm_log_error "homepage inválida: ${META[homepage]}"; return 1; } || adm_log_warn "homepage incomum: ${META[homepage]}"
+  fi
+
+  # 6) maintainer formato leve: "Nome <email>"
+  if [[ -n "${META[maintainer]:-}" ]]; then
+    if ! [[ "${META[maintainer]}" =~ ^[^<]+\<[^@]+@[^>]+\>$ ]]; then
+      adm_log_warn "Maintainer não segue 'Nome <email>': ${META[maintainer]}"
+      [[ "$strict" == "true" ]] && return 1 || true
+    fi
+  fi
+
+  # 7) num_builds inteiro não-negativo
+  if [[ -n "${META[num_builds]:-}" ]]; then
+    if ! [[ "${META[num_builds]}" =~ ^[0-9]+$ ]]; then
+      [[ "$strict" == "true" ]] && { adm_log_error "num_builds inválido: ${META[num_builds]}"; return 1; } || adm_log_warn "num_builds não numérico, ajustando para 0"
+      META[num_builds]=0
+    fi
+  else
+    META[num_builds]=0
+  fi
+
+  # 8) chaves desconhecidas → aviso
+  local allowed=("${_P_REQUIRED[@]}" "${_P_OPTIONAL[@]}")
+  for k in "${!META[@]}"; do
+    [[ "$k" == "__file" ]] && continue
+    local known=false a
+    for a in "${allowed[@]}"; do
+      [[ "$k" == "$a" ]] && known=true && break
+    done
+    if [[ "$known" != "true" ]]; then
+      adm_log_warn "Chave desconhecida no metafile: '$k'"
+    fi
+  done
+
+  adm_log_success "Metafile válido: ${META[name]:-?} ${META[version]:-?}"
+  return 0
+}
+
+# ================================ Getters/Setters ============================
+
+# adm_meta_get META key
+adm_meta_get() {
+  local arrname="$1" key="$2"
+  [[ -z "$arrname" || -z "$key" ]] && { adm_log_error "adm_meta_get: uso: <ARR> <key>"; return 2; }
+  local -n META="$arrname"
+  printf "%s" "${META[$key]:-}"
+}
+
+# adm_meta_set META key value
+adm_meta_set() {
+  local arrname="$1" key="$2" value="$3"
+  [[ -z "$arrname" || -z "$key" ]] && { adm_log_error "adm_meta_set: uso: <ARR> <key> <value>"; return 2; }
+  local -n META="$arrname"
+  META["$key"]="$(_p_trim "$value")"
+}
+
+# incrementa num_builds (retorna valor novo)
+adm_meta_inc_builds() {
+  local arrname="$1"
+  [[ -z "$arrname" ]] && { adm_log_error "adm_meta_inc_builds: <ARR>"; return 2; }
+  local -n META="$arrname"
+  local n="${META[num_builds]:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$((n+1))
+  META[num_builds]="$n"
+  printf "%s" "$n"
+}
+
+# ================================ Leitura Arrays ==============================
+
+# Converte campos CSV em arrays nomeados
+# Uso: adm_meta_sources_array META SOURCES_ARR ; adm_meta_sha256_array META SUMS_ARR
+adm_meta_sources_array() {
+  local arrname="$1" outname="$2"; local -n META="$arrname"
+  _p_csv_to_array "${META[sources]:-}" "$outname"
+}
+
+adm_meta_sha256_array() {
+  local arrname="$1" outname="$2"; local -n META="$arrname"
+  _p_csv_to_array "${META[sha256sums]:-}" "$outname"
+}
+
+adm_meta_run_deps_array() {
+  local arrname="$1" outname="$2"; local -n META="$arrname"
+  _p_csv_to_array "${META[run_deps]:-}" "$outname"
+}
+
+adm_meta_build_deps_array() {
+  local arrname="$1" outname="$2"; local -n META="$arrname"
+  _p_csv_to_array "${META[build_deps]:-}" "$outname"
+}
+
+adm_meta_opt_deps_array() {
+  local arrname="$1" outname="$2"; local -n META="$arrname"
+  _p_csv_to_array "${META[opt_deps]:-}" "$outname"
+}
+
+# ================================ Merge Deps =================================
+
+# Mescla dependências detectadas com as declaradas (union, dedup, ordena por nome)
+# Uso: adm_meta_merge_detected_deps META "run:dep1,dep2" "build:depA" "opt:depX,depY"
+adm_meta_merge_detected_deps() {
+  local arrname="$1"; shift || true
+  [[ -z "$arrname" ]] && { adm_log_error "adm_meta_merge_detected_deps: <ARR> ..."; return 2; }
+  local -n META="$arrname"
+  local run_add="" build_add="" opt_add=""
+
+  local seg
+  for seg in "$@"; do
+    case "$seg" in
+      run:*)   run_add="${seg#run:}" ;;
+      build:*) build_add="${seg#build:}" ;;
+      opt:*)   opt_add="${seg#opt:}" ;;
+      *) adm_log_warn "Segmento de merge desconhecido: $seg" ;;
+    esac
+  done
+
+  # helper union + sort
+  _union_sort() {
+    local a="$1" b="$2"
+    local arr=() seen=() x
+    _p_csv_to_array "$a" arr; declare -A seen=()
+    local OUT=()
+    for x in "${arr[@]}"; do
+      if [[ -z "${seen[$x]:-}" ]]; then OUT+=("$x"); seen["$x"]=1; fi
+    done
+    _p_csv_to_array "$b" arr
+    for x in "${arr[@]}"; do
+      if [[ -z "${seen[$x]:-}" ]]; then OUT+=("$x"); seen["$x"]=1; fi
+    done
+    IFS=$'\n' read -r -d '' -a OUT < <(printf "%s\n" "${OUT[@]}" | sort -u && printf '\0')
+    _p_array_to_csv OUT ","
+  }
+
+  [[ -n "$run_add"   ]] && META[run_deps]="$(_union_sort "${META[run_deps]:-}"   "$run_add")"
+  [[ -n "$build_add" ]] && META[build_deps]="$(_union_sort "${META[build_deps]:-}" "$build_add")"
+  [[ -n "$opt_add"   ]] && META[opt_deps]="$(_union_sort "${META[opt_deps]:-}"   "$opt_add")"
+
+  adm_log_success "Dependências mescladas (run/build/opt)."
+}
+
+# ================================ Salvamento =================================
+
+# Salva META em arquivo (overwrite), cria .bak, grava em ordem canônica
+# Preserva apenas dados (comentários originais não são mantidos).
+# Uso: adm_meta_save META [/caminho/arquivo]
+adm_meta_save() {
+  local arrname="$1" file="${2:-}"
+  [[ -z "$arrname" ]] && { adm_log_error "adm_meta_save: uso: adm_meta_save <ARR> [file]"; return 2; }
+  local -n META="$arrname"
+
+  if [[ -z "$file" ]]; then
+    file="${META[__file]:-}"
+  fi
+  [[ -z "$file" ]] && { adm_log_error "adm_meta_save: caminho de arquivo não informado"; return 2; }
+
+  # backup
+  if [[ -f "$file" ]]; then
+    cp -f -- "$file" "$file.bak" 2>/dev/null || { adm_log_error "Não foi possível criar backup: $file.bak"; return 1; }
+  fi
+
+  # validações antes de escrever
+  adm_meta_validate "$arrname" || { adm_log_error "Falha na validação; abortando salvamento"; return 1; }
+
+  # grava
+  : > "$file" || { adm_log_error "Não foi possível abrir $file para escrita"; return 1; }
+  local k
+  for k in "${_P_CANON_ORDER[@]}"; do
+    [[ -n "${META[$k]+x}" ]] && printf "%s=%s\n" "$k" "${META[$k]}" >> "$file" || true
+  done
+  # chaves extras (não canônicas) no final
+  for k in "${!META[@]}"; do
+    [[ "$k" == "__file" ]] && continue
+    local known=false a
+    for a in "${_P_CANON_ORDER[@]}"; do [[ "$k" == "$a" ]] && known=true && break; done
+    [[ "$known" == "true" ]] && continue
+    printf "%s=%s\n" "$k" "${META[$k]}" >> "$file"
+  done
+
+  META["__file"]="$file"
+  adm_log_success "Metafile salvo: $file"
+  return 0
+}
+
+# ============================== Localização ==================================
+
+# Procura arquivo de metafile por nome (e opcional categoria) em $ADM_METAFILES
+# Uso: adm_meta_find foobar [apps]
+adm_meta_find() {
+  local name="$1" category="${2:-}"
+  local root="${ADM_METAFILES:-/usr/src/adm/metafiles}"
+  [[ -z "$name" ]] && { adm_log_error "adm_meta_find: informe <name>"; return 2; }
+  [[ -d "$root" ]] || { adm_log_error "Diretório de metafiles não encontrado: $root"; return 1; }
+
+  if [[ -n "$category" ]]; then
+    local f="$root/$category/$name.meta"
+    [[ -f "$f" ]] && { printf "%s" "$f"; return 0; }
+    adm_log_warn "Metafile não encontrado em categoria '$category': $name"
+    return 1
+  else
+    local hit=""
+    while IFS= read -r -d '' f; do
+      hit="$f"; break
+    done < <(find "$root" -type f -name "$name.meta" -print0 2>/dev/null)
+    if [[ -n "$hit" ]]; then printf "%s" "$hit"; return 0; fi
+    adm_log_warn "Metafile não encontrado: $name"
+    return 1
+  fi
+}
+
+# ============================= Resumos/Exibição ==============================
+
+# Imprime resumo amigável do META (usa logger)
+adm_meta_print_summary() {
+  local arrname="$1"; local -n META="$arrname"
+  local name="${META[name]:-?}" ver="${META[version]:-?}" cat="${META[category]:-?}"
+  local desc="${META[description]:-}" home="${META[homepage]:-}" mnt="${META[maintainer]:-}"
+  local nb="${META[num_builds]:-0}"
+  local RUN=() BLD=() OPT=() SRC=()
+  adm_meta_run_deps_array   "$arrname" RUN
+  adm_meta_build_deps_array "$arrname" BLD
+  adm_meta_opt_deps_array   "$arrname" OPT
+  adm_meta_sources_array    "$arrname" SRC
+
+  adm_log_info    "Pacote: ${name}-${ver}  [${cat}]  (builds=${nb})"
+  [[ -n "$desc" ]] && adm_log_info "Descrição: $desc"
+  [[ -n "$home" ]] && adm_log_info "Homepage:  $home"
+  [[ -n "$mnt"  ]] && adm_log_info "Maintainer: $mnt"
+  adm_log_info    "Sources (${#SRC[@]}): ${SRC[*]}"
+  adm_log_info    "Run Deps (${#RUN[@]}): ${RUN[*]:-"—"}"
+  adm_log_info    "Build Deps (${#BLD[@]}): ${BLD[*]:-"—"}"
+  adm_log_info    "Opt Deps (${#OPT[@]}): ${OPT[*]:-"—"}"
+}
+
+# ============================== CLI de teste =================================
+# Exemplos:
+#   ./10-parser show /usr/src/adm/metafiles/apps/foobar.meta
+#   ./10-parser inc  /usr/src/adm/metafiles/apps/foobar.meta
+#   ./10-parser find foobar [apps]
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cmd="${1:-}"
+  case "$cmd" in
+    show)
+      file="${2:-}"; [[ -z "$file" ]] && { adm_log_error "Uso: $0 show <file>"; exit 2; }
+      declare -A META=()
+      adm_meta_load "$file" META || exit 1
+      adm_meta_validate META || exit 1
+      adm_meta_print_summary META
+      ;;
+    inc)
+      file="${2:-}"; [[ -z "$file" ]] && { adm_log_error "Uso: $0 inc <file>"; exit 2; }
+      declare -A META=()
+      adm_meta_load "$file" META || exit 1
+      adm_meta_inc_builds META >/dev/null
+      adm_meta_save META "$file" || exit 1
+      adm_log_success "num_builds incrementado."
+      ;;
+    find)
+      name="${2:-}"; cat="${3:-}"
+      f="$(adm_meta_find "$name" "$cat")" || exit 1
+      printf "%s\n" "$f"
+      ;;
+    merge-deps)
+      file="${2:-}"; shift 2 || true
+      declare -A META=()
+      adm_meta_load "$file" META || exit 1
+      adm_meta_merge_detected_deps META "$@"
+      adm_meta_save META "$file" || exit 1
+      ;;
+    *)
+      # ajuda curta
+      echo "Uso:"
+      echo "  $0 show <file>"
+      echo "  $0 inc  <file>"
+      echo "  $0 find <name> [category]"
+      echo "  $0 merge-deps <file> [run:csv] [build:csv] [opt:csv]"
+      exit 2
+      ;;
+  esac
+fi
