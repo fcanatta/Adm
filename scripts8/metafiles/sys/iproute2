@@ -1,0 +1,12 @@
+name=iproute2
+version=6.10.0
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=IP routing, network devices, tunnels, shaping
+homepage=https://wiki.linuxfoundation.org/networking/iproute2
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-6.10.0.tar.xz,https://mirrors.edge.kernel.org/pub/linux/utils/net/iproute2/iproute2-6.10.0.tar.xz
