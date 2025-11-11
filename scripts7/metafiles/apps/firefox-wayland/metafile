@@ -1,0 +1,12 @@
+name=firefox-wayland
+version=128.0esr
+category=apps
+run_deps=firefox-bin
+build_deps=
+opt_deps=
+num_builds=0
+description=Habilita execução do Firefox sob Wayland e adiciona lançador dedicado
+homepage=https://www.mozilla.org/firefox/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
