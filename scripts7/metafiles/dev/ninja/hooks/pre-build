@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ADM_OUT_OF_TREE_BUILD:?}"
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+$MAKE -C "${ADM_OUT_OF_TREE_BUILD}" -j"$NPROC"
