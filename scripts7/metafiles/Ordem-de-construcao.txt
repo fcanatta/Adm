@@ -95,3 +95,6 @@ adm install linux-headers --jobs=8 --profile=normal
 
 # (Opcional) Firmwares
 adm install linux-firmware --jobs=8 --profile=normal
+# Config do kernel
+Config do kernel: coloque seu .config em /usr/src/adm/kconfigs/<arch>/kernel.config e ele será usado automaticamente.
+Initramfs: é gerado no post-install do kernel (pelo adm-mkinitramfs) para o KVER instalado.
