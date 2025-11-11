@@ -1,0 +1,694 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/20-detector
+# -----------------------------------------------------------------------------
+# ADM - Detector inteligente de toolchain, buildsystems, linguagens, deps, kernel,
+# drivers, módulos, firmware e docs. Emite relatório JSON e resumo humano.
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+DETECT_STATE_DIR="$ADM_STATE/detect"
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _DT_COLOR=${ADM_COLOR:-auto}
+  _DT_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _DT_COLOR=false; fi
+  if [[ "$_DT_COLOR" == "auto" ]]; then
+    _DT_COLOR=$([[ "$_DT_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_DT_COLOR" == "true" ]]; then
+    __d_red=$'\033[31m'; __d_grn=$'\033[32m'; __d_yel=$'\033[33m'
+    __d_blu=$'\033[34m'; __d_cyn=$'\033[36m'; __d_dim=$'\033[2m'; __d_rst=$'\033[0m'
+  else
+    __d_red=""; __d_grn=""; __d_yel=""; __d_blu=""; __d_cyn=""; __d_dim=""; __d_rst=""
+  fi
+  _d_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_d_ts)" "$__d_dim" "$__d_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_d_ts)" "$__d_blu" "$__d_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_d_ts)" "$__d_yel" "$__d_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_d_ts)" "$__d_red" "$__d_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_d_ts)" "$__d_grn" "$__d_rst" "$*" >&2; }
+fi
+
+# ============================== Utilidades ===================================
+_dt_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_dt_now(){ date +%s; }
+_dt_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_dt_json_escape(){
+  local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"
+  printf "%s" "$s"
+}
+_dt_hash_path(){
+  # hash de caminho (determinístico)
+  printf "%s" "$1" | sha256sum 2>/dev/null | awk '{print $1}'
+}
+_dt_have(){ command -v "$1" >/dev/null 2>&1; }
+_dt_file_size(){ stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null || echo 0; }
+_dt_try(){ local o rc; o="$("$@" 2>/dev/null || true)"; rc=$?; printf "%s" "$o"; return "$rc"; }
+
+_dt_safe_glob(){
+  # find com padrões em árvore (ignora .git/.svn/node_modules/target/…)
+  local root="$1"; shift
+  find "$root" -type f \( "$@" \) \
+    -not -path "*/.git/*" -not -path "*/.svn/*" -not -path "*/.hg/*" \
+    -not -path "*/node_modules/*" -not -path "*/.venv/*" -not -path "*/venv/*" \
+    -not -path "*/target/*" -not -path "*/build/*" -not -path "*/dist/*" 2>/dev/null
+}
+
+# ============================== Estruturas In-mem ============================
+# Relatório em mapas simples (strings CSV/JSON). Ao final, serializamos.
+
+declare -A DETECT=()         # chaves principais
+declare -A COMPILERS=()      # compiler=version
+declare -A LINKERS=()        # linker=version
+declare -A LANGUAGES=()      # lang=1
+declare -A BUILDSYS=()       # cmake=path1;path2 | meson=...
+declare -A DEPS_RUN=()       # nome=origem
+declare -A DEPS_BUILD=()     # nome=origem
+declare -A MODES=()          # flags: debug/release/shared/static/lto/pgo/asan/ubsan/tsan/msan/tests/docs
+declare -A KERNEL=()         # info kernel/módulos
+declare -A DOCS=()           # doc system => path
+declare -A FIRMWARE=()       # arquivo => path
+
+# ============================== Registro helpers =============================
+_reg_compiler(){ local k="$1" v="$2"; [[ -z "$k" ]] && return 0; COMPILERS["$k"]="${v:-}"; }
+_reg_linker(){ local k="$1" v="$2"; [[ -z "$k" ]] && return 0; LINKERS["$k"]="${v:-}"; }
+_reg_lang(){ local l="$1"; [[ -z "$l" ]] && return 0; LANGUAGES["$l"]="1"; }
+_reg_buildsys(){ local k="$1" p="$2"; [[ -z "$k" || -z "$p" ]] && return 0; BUILDSYS["$k"]="${BUILDSYS[$k]:-}${BUILDSYS[$k]:+;}$p"; }
+_reg_dep_run(){ local n="$1" o="$2"; [[ -z "$n" ]] && return 0; DEPS_RUN["$n"]="${o:-auto}"; }
+_reg_dep_build(){ local n="$1" o="$2"; [[ -z "$n" ]] && return 0; DEPS_BUILD["$n"]="${o:-auto}"; }
+_reg_mode(){ local m="$1"; [[ -z "$m" ]] && return 0; MODES["$m"]="1"; }
+_reg_kernel(){ local k="$1" v="$2"; [[ -z "$k" ]] && return 0; KERNEL["$k"]="$v"; }
+_reg_doc(){ local k="$1" p="$2"; [[ -z "$k" || -z "$p" ]] && return 0; DOCS["$k"]="${DOCS[$k]:-}${DOCS[$k]:+;}$p"; }
+_reg_firmware(){ local f="$1" p="$2"; [[ -z "$f" || -z "$p" ]] && return 0; FIRMWARE["$f"]="$p"; }
+
+# ============================== Detecção Ambiente ============================
+_detect_compilers_env(){
+  adm_log_info "Detectando compiladores no PATH…"
+  # C/C++
+  if _dt_have gcc; then _reg_compiler "gcc" "$(_dt_try gcc -dumpfullversion -dumpversion | head -n1)"; _reg_lang "c"; fi
+  if _dt_have g++; then _reg_compiler "g++" "$(_dt_try g++ -dumpfullversion -dumpversion | head -n1)"; _reg_lang "c++"; fi
+  if _dt_have clang; then _reg_compiler "clang" "$(_dt_try clang --version | awk 'NR==1{print $3}')"; _reg_lang "c"; fi
+  if _dt_have clang++; then _reg_compiler "clang++" "$(_dt_try clang++ --version | awk 'NR==1{print $3}')"; _reg_lang "c++"; fi
+  _dt_have musl-gcc && _reg_compiler "musl-gcc" "musl"
+  _dt_have tcc      && { _reg_compiler "tcc" "$(_dt_try tcc -v | awk 'NR==1{print $3}')"; _reg_lang "c"; }
+  _dt_have pcc      && { _reg_compiler "pcc" "1"; _reg_lang "c"; }
+  _dt_have ccache   && _reg_compiler "ccache" "$(_dt_try ccache -V | awk 'NR==1{print $NF}')"
+  _dt_have distcc   && _reg_compiler "distcc" "$(_dt_try distcc --version | awk 'NR==1{print $NF}')"
+  # Fortran
+  _dt_have gfortran && { _reg_compiler "gfortran" "$(_dt_try gfortran -dumpfullversion -dumpversion | head -n1)"; _reg_lang "fortran"; }
+  _dt_have flang    && { _reg_compiler "flang" "$(_dt_try flang --version | awk 'NR==1{print $3}')"; _reg_lang "fortran"; }
+  # Rust
+  _dt_have rustc    && { _reg_compiler "rustc" "$(_dt_try rustc --version | awk '{print $2}')"; _reg_lang "rust"; }
+  # Go
+  _dt_have go       && { _reg_compiler "go" "$(_dt_try go version | awk '{print $3}')"; _reg_lang "go"; }
+  # Java/Kotlin/Scala
+  _dt_have javac    && { _reg_compiler "javac" "$(_dt_try javac -version | awk '{print $2}')"; _reg_lang "java"; }
+  _dt_have kotlinc  && { _reg_compiler "kotlinc" "$(_dt_try kotlinc -version | awk '{print $2}')"; _reg_lang "kotlin"; }
+  _dt_have scalac   && { _reg_compiler "scalac" "$(_dt_try scalac -version | awk '{print $4}')"; _reg_lang "scala"; }
+  # Swift
+  _dt_have swiftc   && { _reg_compiler "swiftc" "$(_dt_try swiftc --version | awk 'NR==1{print $4}')"; _reg_lang "swift"; }
+  # D
+  _dt_have dmd      && { _reg_compiler "dmd" "$(_dt_try dmd --version | awk 'NR==1{print $4}')"; _reg_lang "d"; }
+  _dt_have ldc2     && { _reg_compiler "ldc2" "$(_dt_try ldc2 --version | awk 'NR==1{print $2}')"; _reg_lang "d"; }
+  _dt_have gdc      && { _reg_compiler "gdc" "$(_dt_try gdc -dumpfullversion -dumpversion | head -n1)"; _reg_lang "d"; }
+  # Nim
+  _dt_have nim      && { _reg_compiler "nim" "$(_dt_try nim --version | awk 'NR==1{print $3}')"; _reg_lang "nim"; }
+  # Vala
+  _dt_have valac    && { _reg_compiler "valac" "$(_dt_try valac --version | awk '{print $2}')"; _reg_lang "vala"; }
+  # Haskell
+  _dt_have ghc      && { _reg_compiler "ghc" "$(_dt_try ghc --numeric-version)"; _reg_lang "haskell"; }
+  # OCaml
+  _dt_have ocamlc   && { _reg_compiler "ocamlc" "$(_dt_try ocamlc -version)"; _reg_lang "ocaml"; }
+  # Erlang/Elixir
+  _dt_have erlc     && { _reg_compiler "erlc" "$(_dt_try erlc -version | awk '{print $NF}')"; _reg_lang "erlang"; }
+  _dt_have elixirc  && { _reg_compiler "elixirc" "$(_dt_try elixir -v | awk '{print $2}')"; _reg_lang "elixir"; }
+  # .NET
+  _dt_have dotnet   && { _reg_compiler "dotnet" "$(_dt_try dotnet --version)"; _reg_lang "dotnet"; }
+  # Pascal
+  _dt_have fpc      && { _reg_compiler "fpc" "$(_dt_try fpc -iV)"; _reg_lang "pascal"; }
+  # Dinâmicas / Scripting (para build/test/docs)
+  _dt_have python3  && { _reg_compiler "python3" "$(_dt_try python3 -V | awk '{print $2}')"; _reg_lang "python"; }
+  _dt_have python   && { _reg_compiler "python" "$(_dt_try python -V | awk '{print $2}')"; _reg_lang "python"; }
+  _dt_have pip      && _reg_compiler "pip" "$(_dt_try pip -V | awk '{print $2}')"
+  _dt_have pip3     && _reg_compiler "pip3" "$(_dt_try pip3 -V | awk '{print $2}')"
+  _dt_have ruby     && { _reg_compiler "ruby" "$(_dt_try ruby -v | awk '{print $2}')"; _reg_lang "ruby"; }
+  _dt_have gem      && _reg_compiler "gem" "$(_dt_try gem -v)"
+  _dt_have lua      && { _reg_compiler "lua" "$(_dt_try lua -v | awk '{print $2}')"; _reg_lang "lua"; }
+  _dt_have luajit   && _reg_compiler "luajit" "$(_dt_try luajit -v | awk '{print $2}')"
+  _dt_have perl     && { _reg_compiler "perl" "$(_dt_try perl -e 'print $];')"; _reg_lang "perl"; }
+  _dt_have php      && { _reg_compiler "php" "$(_dt_try php -v | awk 'NR==1{print $2}')"; _reg_lang "php"; }
+  _dt_have node     && { _reg_compiler "node" "$(_dt_try node -v)"; _reg_lang "node"; }
+  _dt_have npm      && _reg_compiler "npm" "$(_dt_try npm -v)"
+  _dt_have yarn     && _reg_compiler "yarn" "$(_dt_try yarn -v)"
+  _dt_have pnpm     && _reg_compiler "pnpm" "$(_dt_try pnpm -v)"
+  _dt_have zig      && { _reg_compiler "zig" "$(_dt_try zig version)"; _reg_lang "zig"; }
+}
+
+_detect_linkers_env(){
+  adm_log_info "Detectando linkers no PATH…"
+  _dt_have ld      && _reg_linker "ld.bfd/ld" "$(_dt_try ld --version | head -n1)"
+  _dt_have ld.gold && _reg_linker "ld.gold" "$(_dt_try ld.gold --version | head -n1)"
+  _dt_have ld.lld  && _reg_linker "ld.lld" "$(_dt_try ld.lld --version | head -n1)"
+  _dt_have mold    && _reg_linker "mold" "$(_dt_try mold --version | head -n1)"
+}
+
+# ============================== Detecção por Árvore ==========================
+_detect_buildsystems_tree(){
+  local root="$1"
+  adm_log_info "Procurando sistemas de build em: $root"
+  # CMake
+  while IFS= read -r f; do _reg_buildsys "cmake" "$f"; done < <(_dt_safe_glob "$root" -name "CMakeLists.txt")
+  # Meson
+  while IFS= read -r f; do _reg_buildsys "meson" "$f"; done < <(_dt_safe_glob "$root" -name "meson.build")
+  # Autotools
+  while IFS= read -r f; do _reg_buildsys "autotools" "$f"; done < <(_dt_safe_glob "$root" -name "configure.ac" -o -name "configure.in")
+  # Make
+  while IFS= read -r f; do _reg_buildsys "make" "$f"; done < <(_dt_safe_glob "$root" -name "Makefile" -o -name "makefile" -o -name "GNUmakefile")
+  # Ninja (build.ninja gerado, mas anotar)
+  while IFS= read -r f; do _reg_buildsys "ninja" "$f"; done < <(_dt_safe_glob "$root" -name "build.ninja")
+  # SCons
+  while IFS= read -r f; do _reg_buildsys "scons" "$f"; done < <(_dt_safe_glob "$root" -name "SConstruct" -o -name "SConscript")
+  # Waf
+  while IFS= read -r f; do _reg_buildsys "waf" "$f"; done < <(_dt_safe_glob "$root" -name "wscript")
+  # Bazel/Buck
+  while IFS= read -r f; do _reg_buildsys "bazel" "$f"; done < <(_dt_safe_glob "$root" -name "WORKSPACE" -o -name "BUILD" -o -name "BUILD.bazel")
+  while IFS= read -r f; do _reg_buildsys "buck" "$f"; done < <(_dt_safe_glob "$root" -name "BUCK")
+  # QMake
+  while IFS= read -r f; do _reg_buildsys "qmake" "$f"; done < <(_dt_safe_glob "$root" -name "*.pro" -o -name "*.pri")
+  # Java/Kotlin
+  while IFS= read -r f; do _reg_buildsys "maven" "$f"; done < <(_dt_safe_glob "$root" -name "pom.xml")
+  while IFS= read -r f; do _reg_buildsys "gradle" "$f"; done < <(_dt_safe_glob "$root" -name "build.gradle" -o -name "build.gradle.kts")
+  # Rust
+  while IFS= read -r f; do _reg_buildsys "cargo" "$f"; done < <(_dt_safe_glob "$root" -name "Cargo.toml")
+  # Go
+  while IFS= read -r f; do _reg_buildsys "go" "$f"; done < <(_dt_safe_glob "$root" -name "go.mod")
+  # Python
+  while IFS= read -r f; do _reg_buildsys "python" "$f"; done < <(_dt_safe_glob "$root" -name "pyproject.toml" -o -name "setup.py" -o -name "setup.cfg" -o -name "requirements.txt")
+  # Node
+  while IFS= read -r f; do _reg_buildsys "node" "$f"; done < <(_dt_safe_glob "$root" -name "package.json")
+  # .NET
+  while IFS= read -r f; do _reg_buildsys "dotnet" "$f"; done < <(_dt_safe_glob "$root" -name "*.csproj" -o -name "*.sln")
+  # SwiftPM
+  while IFS= read -r f; do _reg_buildsys "swiftpm" "$f"; done < <(_dt_safe_glob "$root" -name "Package.swift")
+  # D (dub)
+  while IFS= read -r f; do _reg_buildsys "dub" "$f"; done < <(_dt_safe_glob "$root" -name "dub.json" -o -name "dub.sdl")
+  # Nim
+  while IFS= read -r f; do _reg_buildsys "nimble" "$f"; done < <(_dt_safe_glob "$root" -name "*.nimble")
+  # OCaml
+  while IFS= read -r f; do _reg_buildsys "dune" "$f"; done < <(_dt_safe_glob "$root" -name "dune" -o -name "dune-project")
+  # Haskell
+  while IFS= read -r f; do _reg_buildsys "cabal" "$f"; done < <(_dt_safe_glob "$root" -name "*.cabal")
+  while IFS= read -r f; do _reg_buildsys "stack" "$f"; done < <(_dt_safe_glob "$root" -name "stack.yaml")
+}
+
+_detect_languages_tree(){
+  local root="$1"
+  adm_log_info "Inferindo linguagens pela árvore…"
+  # C/C++
+  _dt_safe_glob "$root" -name "*.c"   | grep -q . && _reg_lang "c"
+  _dt_safe_glob "$root" -name "*.cc" -o -name "*.cpp" -o -name "*.cxx" | grep -q . && _reg_lang "c++"
+  _dt_safe_glob "$root" -name "*.m" -o -name "*.mm" | grep -q . && _reg_lang "objc"
+  # Outros
+  _dt_safe_glob "$root" -name "*.rs"     | grep -q . && _reg_lang "rust"
+  _dt_safe_glob "$root" -name "*.go"     | grep -q . && _reg_lang "go"
+  _dt_safe_glob "$root" -name "*.java"   | grep -q . && _reg_lang "java"
+  _dt_safe_glob "$root" -name "*.kt" -o -name "*.kts" | grep -q . && _reg_lang "kotlin"
+  _dt_safe_glob "$root" -name "*.swift"  | grep -q . && _reg_lang "swift"
+  _dt_safe_glob "$root" -name "*.d"      | grep -q . && _reg_lang "d"
+  _dt_safe_glob "$root" -name "*.nim"    | grep -q . && _reg_lang "nim"
+  _dt_safe_glob "$root" -name "*.vala"   | grep -q . && _reg_lang "vala"
+  _dt_safe_glob "$root" -name "*.hs"     | grep -q . && _reg_lang "haskell"
+  _dt_safe_glob "$root" -name "*.ml" -o -name "*.mli" | grep -q . && _reg_lang "ocaml"
+  _dt_safe_glob "$root" -name "*.erl"    | grep -q . && _reg_lang "erlang"
+  _dt_safe_glob "$root" -name "*.ex" -o -name "*.exs" | grep -q . && _reg_lang "elixir"
+  _dt_safe_glob "$root" -name "*.cs"     | grep -q . && _reg_lang "csharp"
+  _dt_safe_glob "$root" -name "*.pas" -o -name "*.pp" | grep -q . && _reg_lang "pascal"
+  _dt_safe_glob "$root" -name "*.py"     | grep -q . && _reg_lang "python"
+  _dt_safe_glob "$root" -name "*.rb"     | grep -q . && _reg_lang "ruby"
+  _dt_safe_glob "$root" -name "*.lua"    | grep -q . && _reg_lang "lua"
+  _dt_safe_glob "$root" -name "*.pl"     | grep -q . && _reg_lang "perl"
+  _dt_safe_glob "$root" -name "*.php"    | grep -q . && _reg_lang "php"
+  _dt_safe_glob "$root" -name "package.json" | grep -q . && _reg_lang "node"
+  _dt_safe_glob "$root" -name "*.zig"    | grep -q . && _reg_lang "zig"
+  _dt_safe_glob "$root" -name "*.f90" -o -name "*.f" -o -name "*.f95" | grep -q . && _reg_lang "fortran"
+}
+
+_detect_docs_tree(){
+  local root="$1"
+  adm_log_info "Detectando sistemas de documentação…"
+  _dt_safe_glob "$root" -name "Doxyfile" | while read -r f; do _reg_doc "doxygen" "$f"; done
+  _dt_safe_glob "$root" -name "conf.py" | grep -E "/docs/|/doc/" | while read -r f; do _reg_doc "sphinx" "$f"; done
+  _dt_safe_glob "$root" -name "mkdocs.yml" | while read -r f; do _reg_doc "mkdocs" "$f"; done
+  _dt_safe_glob "$root" -name "README.adoc" -o -name "*.adoc" | grep -q . && _reg_doc "asciidoctor" "$root"
+  _dt_safe_glob "$root" -name "man*" -type d | while read -r d; do _reg_doc "manpages" "$d"; done
+  _dt_safe_glob "$root" -name "pom.xml" | grep -q . && _reg_doc "javadoc" "$root"
+  _dt_safe_glob "$root" -name "build.gradle" -o -name "build.gradle.kts" | grep -q . && _reg_doc "dokka" "$root"
+}
+
+_detect_kernel_tree(){
+  local root="$1"
+  # Linux kernel principal?
+  if [[ -f "$root/Makefile" ]] && grep -qE '^VERSION[[:space:]]*=' "$root/Makefile" 2>/dev/null && [[ -d "$root/drivers" ]] && [[ -d "$root/arch" ]]; then
+    local ver major minor
+    major="$(grep -E '^VERSION[[:space:]]*=' "$root/Makefile" | awk -F'= ' '{print $2}' | head -n1)"
+    minor="$(grep -E '^PATCHLEVEL[[:space:]]*=' "$root/Makefile" | awk -F'= ' '{print $2}' | head -n1)"
+    local sub="$(grep -E '^SUBLEVEL[[:space:]]*=' "$root/Makefile" | awk -F'= ' '{print $2}' | head -n1)"
+    ver="${major:-?}.${minor:-?}.${sub:-?}"
+    _reg_kernel "is_kernel_tree" "true"
+    _reg_kernel "kernel_version_mk" "$ver"
+  fi
+  # Módulo out-of-tree (Kbuild)
+  if _dt_safe_glob "$root" -name "Kbuild" -o -name "Kconfig" | grep -q . || grep -q "obj-m +=" "$root"/Makefile 2>/dev/null || grep -q "obj-m +=" "$root"/Kbuild 2>/dev/null; then
+    _reg_kernel "has_kbuild" "true"
+  fi
+  # Firmware
+  if [[ -d "$root/firmware" ]]; then
+    _reg_kernel "has_firmware_dir" "true"
+    while IFS= read -r f; do
+      case "$f" in
+        *.bin|*.fw|*.hex|*.ucode|*.img|*.bin.*) _reg_firmware "$(basename "$f")" "$f" ;;
+      esac
+    done < <(find "$root/firmware" -type f 2>/dev/null)
+  fi
+  # Referências a request_firmware
+  _dt_safe_glob "$root" -name "*.c" -o -name "*.cpp" | xargs -r grep -nH "request_firmware" 2>/dev/null | awk -F: '{print $1}' | sort -u | while read -r f; do
+    _reg_firmware "referenced_by_code" "$f"
+  done
+}
+
+_detect_modes_tree(){
+  local root="$1"
+  adm_log_info "Inferindo modos de build…"
+  # Heurísticas: CMake build types
+  _dt_safe_glob "$root" -name "CMakeLists.txt" | xargs -r grep -nH "CMAKE_BUILD_TYPE" 2>/dev/null | grep -q . && { _reg_mode "cmake_build_type"; }
+  # DEBUG / RELEASE flags
+  _dt_safe_glob "$root" -name "*.cmake" -o -name "CMakeLists.txt" | xargs -r grep -nH -E "RelWithDebInfo|MinSizeRel|Debug|Release" 2>/dev/null | grep -q . && { _reg_mode "debug_release"; }
+  # LTO/PGO
+  _dt_safe_glob "$root" -name "*" | xargs -r grep -nH -E "flto|fprofile-(use|generate)" 2>/dev/null | grep -q . && { _reg_mode "lto_or_pgo"; }
+  # Sanitizers
+  _dt_safe_glob "$root" -name "*" | xargs -r grep -nH -E "fsanitize=" 2>/dev/null | grep -q . && { _reg_mode "sanitizers"; }
+  # Shared/Static
+  _dt_safe_glob "$root" -name "CMakeLists.txt" | xargs -r grep -nH -E "BUILD_SHARED_LIBS" 2>/dev/null | grep -q . && _reg_mode "shared_libs"
+  _dt_safe_glob "$root" -name "meson.build" | xargs -r grep -nH -E "default_library" 2>/dev/null | grep -q . && _reg_mode "meson_shared_static"
+  # Tests
+  _dt_safe_glob "$root" -name "CMakeLists.txt" | xargs -r grep -nH -E "enable_testing|add_test" 2>/dev/null | grep -q . && _reg_mode "tests"
+  _dt_safe_glob "$root" -name "meson.build" | xargs -r grep -nH -E "test\(" 2>/dev/null | grep -q . && _reg_mode "tests"
+  # Docs
+  [[ ${#DOCS[@]} -gt 0 ]] && _reg_mode "docs"
+}
+
+# ============================== Dependências (heurísticas) ===================
+# Observação: tratamos tudo de forma estática (greps parseáveis) sem resolver online.
+
+_parse_pkgconfig_refs(){
+  # Procura pkg-config 'requires' e uso em Make/CMake/Meson
+  local root="$1"
+  # .pc locais
+  _dt_safe_glob "$root" -name "*.pc" | while read -r pc; do
+    grep -E '^Requires(\.private)?:' "$pc" 2>/dev/null | sed -E 's/Requires(\.private)?:\s*//' | tr ',' ' ' | tr -s ' ' '\n' | sed 's/>=.*//;s/>.*//;s/=.*//' | while read -r n; do
+      n="$(_dt_trim "$n")"; [[ -n "$n" ]] && _reg_dep_build "$n" "pc:$pc"
+    done
+  done
+  # Makefiles que usam pkg-config
+  _dt_safe_glob "$root" -name "Makefile" -o -name "makefile" | xargs -r grep -nH "pkg-config" 2>/dev/null | awk -F'--libs|--cflags' '{print $1}' | sed 's/.*pkg-config//;s/`//g' | tr ' ' '\n' | grep -E '^[a-zA-Z0-9._+-]+$' | sort -u | while read -r n; do
+    _reg_dep_build "$n" "make:pkg-config"
+  done
+  # CMake Find/PKG
+  _dt_safe_glob "$root" -name "*.cmake" -o -name "CMakeLists.txt" | while read -r f; do
+    grep -E "find_package\(|pkg_check_modules\(" "$f" 2>/dev/null | sed -E 's/.*\(([^ )]+).*/\1/' | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_build "$n" "cmake:$f"
+    done
+  done
+  # Meson dependency()
+  _dt_safe_glob "$root" -name "meson.build" | while read -r f; do
+    grep -E "dependency\(" "$f" 2>/dev/null | sed -E 's/.*dependency\(\s*'\''([^'\'' ]+)'\''.*/\1/' | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_build "$n" "meson:$f"
+    done
+  done
+}
+
+_parse_common_includes(){
+  # Heurística por includes C/C++
+  local root="$1"
+  local patterns=("openssl/" "zlib.h" "libxml/" "png.h" "jpeglib.h" "sqlite3.h" "curl/" "expat.h" "ssl.h" "uv.h" "libevent" "jansson.h" "yaml.h" "ffi.h")
+  local map=(
+    "openssl/=>openssl"
+    "zlib.h=>zlib"
+    "libxml/=>libxml2"
+    "png.h=>libpng"
+    "jpeglib.h=>libjpeg"
+    "sqlite3.h=>sqlite"
+    "curl/=>libcurl"
+    "expat.h=>expat"
+    "ssl.h=>openssl"
+    "uv.h=>libuv"
+    "libevent=>libevent"
+    "jansson.h=>jansson"
+    "yaml.h=>libyaml"
+    "ffi.h=>libffi"
+  )
+  local idx
+  for idx in "${map[@]}"; do
+    local pat="${idx%%=>*}"; local dep="${idx##*=>}"
+    _dt_safe_glob "$root" -name "*.c" -o -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" | xargs -r grep -nH --include='*' -E "#include <${pat}.*>" 2>/dev/null | grep -q . && _reg_dep_run "$dep" "include"
+  done
+}
+
+_parse_rust_cargo(){
+  local root="$1"
+  _dt_safe_glob "$root" -name "Cargo.toml" | while read -r f; do
+    awk '/^\[dependencies\]/,/^\[/{ if($0 !~ /^\[/ && $0 !~ /^#/){print}}' "$f" 2>/dev/null | sed -E 's/^\s*([A-Za-z0-9_+-]+).*/\1/' | while read -r n; do
+      n="$(_dt_trim "$n")"; [[ -n "$n" ]] && _reg_dep_run "crate:$n" "cargo:$f"
+    done
+    awk '/^\[build-dependencies\]/,/^\[/{ if($0 !~ /^\[/ && $0 !~ /^#/){print}}' "$f" 2>/dev/null | sed -E 's/^\s*([A-Za-z0-9_+-]+).*/\1/' | while read -r n; do
+      n="$(_dt_trim "$n")"; [[ -n "$n" ]] && _reg_dep_build "crate:$n" "cargo:$f"
+    done
+    grep -E "^\[features\]" -n "$f" >/dev/null 2>&1 && _reg_mode "features"
+  done
+}
+
+_parse_go_mod(){
+  local root="$1"
+  _dt_safe_glob "$root" -name "go.mod" | while read -r f; do
+    awk '/^require /{print $2}' "$f" 2>/dev/null | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_run "go:$n" "go.mod:$f"
+    done
+  done
+}
+
+_parse_python_pkgs(){
+  local root="$1"
+  _dt_safe_glob "$root" -name "requirements.txt" | while read -r f; do
+    sed -E 's/#.*//' "$f" | sed '/^\s*$/d' | while read -r n; do
+      n="$(_dt_trim "$n")"; n="${n%%[<>=]*}"; [[ -n "$n" ]] && _reg_dep_run "py:$n" "requirements:$f"
+    done
+  done
+  _dt_safe_glob "$root" -name "pyproject.toml" | while read -r f; do
+    awk '/\[project.dependencies\]/,/\[/{if($0 ~ /\"/){print}}' "$f" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' | while read -r n; do
+      n="${n%%[<>=]*}"; [[ -n "$n" ]] && _reg_dep_run "py:$n" "pyproject:$f"
+    done
+    awk '/\[tool.poetry.dependencies\]/,/\[/{ if($0 ~ /=/ && $0 !~ /^python/){print}}' "$f" 2>/dev/null | sed -E 's/^\s*([A-Za-z0-9_.-]+).*/\1/' | while read -r n; do
+      n="$(_dt_trim "$n")"; [[ -n "$n" ]] && _reg_dep_run "py:$n" "poetry:$f"
+    done
+    awk '/\[build-system\]/,/\[/{ if($0 ~ /requires/){print}}' "$f" 2>/dev/null | grep -Eo "'[^']+'|\"[^\"]+\"" | tr -d \'\" | while read -r n; do
+      n="${n%%[<>=]*}"; [[ -n "$n" ]] && _reg_dep_build "py:$n" "pyproject:build:$f"
+    done
+  done
+  _dt_safe_glob "$root" -name "setup.cfg" | while read -r f; do
+    awk '/install_requires/,/\[/{if($0 !~ /\[/){print}}' "$f" 2>/dev/null | sed -E 's/^\s*([A-Za-z0-9_.-]+).*/\1/' | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_run "py:$n" "setup.cfg:$f"
+    done
+  done
+}
+
+_parse_node_pkg(){
+  local root="$1"
+  _dt_safe_glob "$root" -name "package.json" | while read -r f; do
+    # Extrai chaves topo de dependencies/devDependencies (sem jq)
+    sed -n '/"dependencies": {/,/}/p' "$f" 2>/dev/null | grep -E '"[^"]+":' | awk -F\" '{print $2}' | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_run "npm:$n" "package.json:$f"
+    done
+    sed -n '/"devDependencies": {/,/}/p' "$f" 2>/dev/null | grep -E '"[^"]+":' | awk -F\" '{print $2}' | while read -r n; do
+      [[ -n "$n" ]] && _reg_dep_build "npm:$n" "package.json:$f"
+    done
+  done
+}
+
+_parse_java_dotnet_d_swift_etc(){
+  local root="$1"
+  # Maven
+  _dt_safe_glob "$root" -name "pom.xml" | while read -r f; do
+    grep -E "<dependency>" -n "$f" 2>/dev/null | grep -q . && _reg_dep_run "maven:present" "$f"
+  done
+  # Gradle
+  _dt_safe_glob "$root" -name "build.gradle" -o -name "build.gradle.kts" | while read -r f; do
+    grep -E "implementation|api|compileOnly|runtimeOnly" -n "$f" 2>/dev/null | grep -q . && _reg_dep_run "gradle:present" "$f"
+  done
+  # .NET
+  _dt_safe_glob "$root" -name "*.csproj" | while read -r f; do
+    grep -E "<PackageReference" -n "$f" 2>/dev/null | grep -q . && _reg_dep_run "nuget:present" "$f"
+  done
+  # D
+  _dt_safe_glob "$root" -name "dub.json" -o -name "dub.sdl" | grep -q . && _reg_dep_run "dub:present" "$root"
+  # Swift
+  _dt_safe_glob "$root" -name "Package.swift" | grep -q . && _reg_dep_run "swiftpm:present" "$root"
+}
+
+_detect_dependencies_tree(){
+  local root="$1"
+  adm_log_info "Analisando dependências (heurísticas)…"
+  _parse_pkgconfig_refs "$root"
+  _parse_common_includes "$root"
+  _parse_rust_cargo "$root"
+  _parse_go_mod "$root"
+  _parse_python_pkgs "$root"
+  _parse_node_pkg "$root"
+  _parse_java_dotnet_d_swift_etc "$root"
+}
+
+# ============================== Sugestões ====================================
+_suggest_compiler(){
+  # heurística baseada nas linguagens + buildsystems
+  if [[ -n "${LANGUAGES[rust]:-}" ]] && _dt_have rustc; then echo "rustc"; return; fi
+  if [[ -n "${LANGUAGES[go]:-}" ]] && _dt_have go; then echo "go"; return; fi
+  if [[ -n "${BUILDSYS[meson]:-}" || -n "${BUILDSYS[cmake]:-}" || -n "${LANGUAGES[c]:-}" || -n "${LANGUAGES[c++]:-}" ]]; then
+    if _dt_have clang; then echo "clang"; return; fi
+    if _dt_have gcc; then echo "gcc"; return; fi
+  fi
+  if [[ -n "${LANGUAGES[swift]:-}" ]] && _dt_have swiftc; then echo "swiftc"; return; fi
+  if [[ -n "${LANGUAGES[d]:-}" ]]; then
+    if _dt_have ldc2; then echo "ldc2"; return; fi
+    if _dt_have dmd; then echo "dmd"; return; fi
+    if _dt_have gdc; then echo "gdc"; return; fi
+  fi
+  echo ""
+}
+
+_suggest_linker(){
+  if _dt_have ld.lld; then echo "ld.lld"; return; fi
+  if _dt_have mold; then echo "mold"; return; fi
+  if _dt_have ld.gold; then echo "ld.gold"; return; fi
+  if _dt_have ld; then echo "ld"; return; fi
+  echo ""
+}
+
+_suggest_modes(){
+  # Deriva flags padrão (indicativo)
+  local modes=()
+  [[ -n "${MODES[debug_release]:-}" || -n "${MODES[cmake_build_type]:-}" ]] && modes+=("debug|release")
+  [[ -n "${MODES[meson_shared_static]:-}" || -n "${MODES[shared_libs]:-}" ]] && modes+=("shared|static")
+  [[ -n "${MODES[lto_or_pgo]:-}" ]] && modes+=("lto|pgo")
+  [[ -n "${MODES[sanitizers]:-}" ]] && modes+=("asan|ubsan|tsan|msan")
+  [[ -n "${MODES[tests]:-}" ]] && modes+=("tests")
+  [[ -n "${MODES[docs]:-}" ]] && modes+=("docs")
+  printf "%s" "${modes[*]}"
+}
+
+# ============================== Serialização JSON ============================
+_json_kv_map(){
+  # converte map simples (k -> v) em objeto JSON
+  local -n MAP="$1"
+  local first=1
+  printf "{"
+  for k in "${!MAP[@]}"; do
+    [[ $first -eq 0 ]] && printf ","
+    first=0
+    printf "\"%s\":\"%s\"" "$(_dt_json_escape "$k")" "$(_dt_json_escape "${MAP[$k]}")"
+  done
+  printf "}"
+}
+
+_json_set_object(){
+  local key="$1" json="$2"
+  DETECT["$key"]="$json"
+}
+
+_emit_json(){
+  local root="$1"
+  local j_compilers="$(_json_kv_map COMPILERS)"
+  local j_linkers="$(_json_kv_map LINKERS)"
+  local j_langs="$(_json_kv_map LANGUAGES)"
+  local j_buildsys="$(_json_kv_map BUILDSYS)"
+  local j_deprun="$(_json_kv_map DEPS_RUN)"
+  local j_depbuild="$(_json_kv_map DEPS_BUILD)"
+  local j_modes="$(_json_kv_map MODES)"
+  local j_kernel="$(_json_kv_map KERNEL)"
+  local j_docs="$(_json_kv_map DOCS)"
+  local j_firm="$(_json_kv_map FIRMWARE)"
+
+  _json_set_object "compilers" "$j_compilers"
+  _json_set_object "linkers" "$j_linkers"
+  _json_set_object "languages" "$j_langs"
+  _json_set_object "buildsystems" "$j_buildsys"
+  _json_set_object "deps_run" "$j_deprun"
+  _json_set_object "deps_build" "$j_depbuild"
+  _json_set_object "modes" "$j_modes"
+  _json_set_object "kernel" "$j_kernel"
+  _json_set_object "docs" "$j_docs"
+  _json_set_object "firmware" "$j_firm"
+
+  local suggest_cc="$(_suggest_compiler)"
+  local suggest_ld="$(_suggest_linker)"
+  local suggest_modes="$(_suggest_modes)"
+
+  local hash="$(_dt_hash_path "$(_dt_abspath "$root")")"
+  local out="$DETECT_STATE_DIR/${hash}.json"
+  mkdir -p -- "$DETECT_STATE_DIR" || { adm_log_error "Sem acesso: $DETECT_STATE_DIR"; return 1; }
+
+  {
+    printf "{\n"
+    printf "  \"root\":\"%s\",\n" "$(_dt_json_escape "$(_dt_abspath "$root")")"
+    printf "  \"timestamp\":%s,\n" "$(_dt_now)"
+    printf "  \"compilers\":%s,\n" "${DETECT[compilers]}"
+    printf "  \"linkers\":%s,\n"    "${DETECT[linkers]}"
+    printf "  \"languages\":%s,\n"  "${DETECT[languages]}"
+    printf "  \"buildsystems\":%s,\n" "${DETECT[buildsystems]}"
+    printf "  \"deps_run\":%s,\n"   "${DETECT[deps_run]}"
+    printf "  \"deps_build\":%s,\n" "${DETECT[deps_build]}"
+    printf "  \"modes\":%s,\n"      "${DETECT[modes]}"
+    printf "  \"kernel\":%s,\n"     "${DETECT[kernel]}"
+    printf "  \"docs\":%s,\n"       "${DETECT[docs]}"
+    printf "  \"firmware\":%s,\n"   "${DETECT[firmware]}"
+    printf "  \"suggest\": { \"compiler\":\"%s\", \"linker\":\"%s\", \"modes\":\"%s\" }\n" \
+      "$(_dt_json_escape "$suggest_cc")" "$(_dt_json_escape "$suggest_ld")" "$(_dt_json_escape "$suggest_modes")"
+    printf "}\n"
+  } > "$out" || { adm_log_error "Falha ao gravar relatório: $out"; return 1; }
+
+  printf "%s" "$out"
+}
+
+_print_summary(){
+  local root="$1" json="$2"
+  adm_log_success "Detecção concluída em: $root"
+  adm_log_info    "Relatório JSON: $json"
+  adm_log_info    "Compiladores: $(printf "%s" "${!COMPILERS[@]}" | tr ' ' ',')"
+  adm_log_info    "Linkers:      $(printf "%s" "${!LINKERS[@]}"   | tr ' ' ',')"
+  adm_log_info    "Linguagens:   $(printf "%s" "${!LANGUAGES[@]}" | tr ' ' ',')"
+  adm_log_info    "Buildsystems: $(printf "%s" "${!BUILDSYS[@]}"  | tr ' ' ',')"
+  adm_log_info    "Deps run (~${#DEPS_RUN[@]}):   $(printf "%s" "${!DEPS_RUN[@]}" | head -c 200; [[ ${#DEPS_RUN[@]} -gt 0 ]] && echo "...")"
+  adm_log_info    "Deps build (~${#DEPS_BUILD[@]}): $(printf "%s" "${!DEPS_BUILD[@]}" | head -c 200; [[ ${#DEPS_BUILD[@]} -gt 0 ]] && echo "...")"
+  adm_log_info    "Kernel flags: $(printf "%s" "${!KERNEL[@]}" | tr ' ' ',')"
+  adm_log_info    "Docs:         $(printf "%s" "${!DOCS[@]}" | tr ' ' ',')"
+  local scc="$(_suggest_compiler)"; local sld="$(_suggest_linker)"; local sm="$(_suggest_modes)"
+  adm_log_success "Sugestão: CC=$scc  LD=$sld  MODES={$sm}"
+}
+# (continuação do arquivo /usr/src/adm/scripts/20-detector)
+
+# ============================== Integração Toolchain/Profile =================
+_apply_toolchain_hints(){
+  # Se 14-toolchain-db ativo, anota o toolchain escolhido
+  local tc_db="/usr/src/adm/scripts/14-toolchain-db"
+  if [[ -x "$tc_db" ]] && [[ -f "$ADM_STATE/toolchain/active.name" ]]; then
+    local tcname; tcname="$(cat "$ADM_STATE/toolchain/active.name" 2>/dev/null || true)"
+    [[ -n "$tcname" ]] && DETECT["toolchain_active"]="$tcname"
+  fi
+  # Se 12-profile-manager ativo, anota profile
+  if [[ -f "$ADM_STATE/profiles/active.name" ]]; then
+    local prof; prof="$(cat "$ADM_STATE/profiles/active.name" 2>/dev/null || true)"
+    [[ -n "$prof" ]] && DETECT["profile_active"]="$prof"
+  fi
+}
+
+# ============================== Doctor / Sanity ==============================
+detector_doctor(){
+  local fail=0
+  [[ -d "$ADM_ROOT" ]] || { adm_log_error "ADM_ROOT inexistente: $ADM_ROOT"; fail=$((fail+1)); }
+  mkdir -p -- "$DETECT_STATE_DIR" || { adm_log_error "Sem acesso a $DETECT_STATE_DIR"; fail=$((fail+1)); }
+  # ferramentas recomendadas (não crítico)
+  for c in grep awk sed find sha256sum; do
+    command -v "$c" >/dev/null 2>&1 || adm_log_warn "Ferramenta ausente: $c"
+  done
+  (( fail>0 )) && { adm_log_error "Doctor encontrou $fail problema(s)."; return 1; }
+  adm_log_success "Detector OK."
+}
+
+# ============================== CLI ==========================================
+detector_usage(){
+  cat <<'USAGE'
+Uso: 20-detector <comando> [opções]
+
+Comandos:
+  scan <path> [--json]     Analisa a árvore <path> e o ambiente; gera relatório JSON e resumo.
+  json <path>              Somente emite JSON no stdout (não imprime resumo).
+  env                      Detecta apenas o ambiente (compiladores/linkers); emite JSON no stdout.
+  doctor                   Checa pré-condições e estrutura de estado.
+
+Exemplos:
+  20-detector scan /usr/src/build/linux --json
+  20-detector json .
+  20-detector env
+USAGE
+}
+
+detector_scan(){
+  local root="${1:-}"; shift || true
+  local out_json_only="false"
+  while (( $# )); do
+    case "$1" in
+      --json) out_json_only="true" ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$root" ]] || { adm_log_error "Uso: scan <path> [--json]"; return 2; }
+  [[ -d "$root" ]] || { adm_log_error "Diretório não encontrado: $root"; return 1; }
+  root="$(_dt_abspath "$root")"
+
+  # Reset mapas
+  COMPILERS=(); LINKERS=(); LANGUAGES=(); BUILDSYS=(); DEPS_RUN=(); DEPS_BUILD=(); MODES=(); KERNEL=(); DOCS=(); FIRMWARE=(); DETECT=()
+
+  _detect_compilers_env
+  _detect_linkers_env
+  _detect_buildsystems_tree "$root"
+  _detect_languages_tree "$root"
+  _detect_docs_tree "$root"
+  _detect_kernel_tree "$root"
+  _detect_modes_tree "$root"
+  _detect_dependencies_tree "$root"
+  _apply_toolchain_hints
+
+  local json_path; json_path="$(_emit_json "$root")" || return 1
+  if [[ "$out_json_only" == "true" ]]; then
+    cat "$json_path"
+  else
+    _print_summary "$root" "$json_path"
+  fi
+}
+
+detector_json(){
+  local root="${1:-}"
+  [[ -n "$root" && -d "$root" ]] || { adm_log_error "Uso: json <path_dir>"; return 2; }
+  detector_scan "$root" --json >/dev/null || return 1
+  local hash="$(_dt_hash_path "$(_dt_abspath "$root")")"
+  cat "$DETECT_STATE_DIR/${hash}.json"
+}
+
+detector_env(){
+  # Somente ambiente (sem varredura de árvore)
+  COMPILERS=(); LINKERS=(); LANGUAGES=(); DETECT=()
+  _detect_compilers_env
+  _detect_linkers_env
+  local j_compilers="$(_json_kv_map COMPILERS)"
+  local j_linkers="$(_json_kv_map LINKERS)"
+  printf "{ \"timestamp\": %s, \"compilers\": %s, \"linkers\": %s }\n" "$(_dt_now)" "$j_compilers" "$j_linkers"
+}
+
+detector_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    scan)   detector_scan "$@" ;;
+    json)   detector_json "$@" ;;
+    env)    detector_env "$@" ;;
+    doctor) detector_doctor ;;
+    ""|-h|--help|help) detector_usage ;;
+    *)      adm_log_error "Comando desconhecido: $cmd"; detector_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  detector_main "$@"
+fi
