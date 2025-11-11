@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+install -d "${DESTDIR}/lib/firmware"
+# Copiar apenas conjuntos comuns (ajuste à vontade):
+for d in amdgpu i915 radeon rtl_bt rtl_nic ath brcm qcom bnx2; do
+  [[ -d "$d" ]] && rsync -a "$d" "${DESTDIR}/lib/firmware/$d"
+done
