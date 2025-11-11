@@ -1,0 +1,12 @@
+name=xorg-meta
+version=1.0
+category=sys
+run_deps=xorg-server,xorgproto,libx11,libxext,libxau,libxdmcp,libxcb,xcb-util,xcb-util-keysyms,xcb-util-wm,xkbcomp,xkeyboard-config,libxkbfile,libxfixes,libxdamage,libxcomposite,libxrender,libxi,libxrandr,libxtst,libice,libsm,libdrm,mesa,libinput,xf86-input-libinput,xinit,xauth,xrandr,xset,xsetroot,xhost,xprop,xev
+build_deps=
+opt_deps=xorg-server-xwayland,mesa-vulkan-drivers,xf86-video-amdgpu,xf86-video-intel,xf86-video-nouveau,xf86-video-ati,xf86-video-vesa,xf86-video-fbdev,xterm,xcursor-themes,encodings,dejavu-fonts,libxshmfence,wayland,wlroots
+num_builds=0
+description=Meta-pacote do Xorg (servidor, libs e utilitários essenciais) com drivers opcionais
+homepage=https://www.x.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
