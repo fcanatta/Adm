@@ -10,3 +10,11 @@ adm info sys/linux-headers
 
 # Ou com musl:
 #/usr/src/adm/scripts/90-bootstrap-toolchain run --libc=musl --fetch --profile=minimal --jobs=$(nproc)
+
+# Exemplo: instalar curl com deps
+adm install apps/curl --with-deps --pack --parallel=$(nproc)
+
+# Ver versões
+adm info apps/curl
+adm info libs/openssl
+adm info dev/pkgconf
