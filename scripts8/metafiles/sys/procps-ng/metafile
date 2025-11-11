@@ -1,0 +1,12 @@
+name=procps-ng
+version=4.0.5
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Utilities for monitoring processes (ps, top, free, sysctl, ...)
+homepage=https://gitlab.com/procps-ng/procps
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://sourceforge.net/projects/procps-ng/files/Production/procps-ng-4.0.5.tar.xz/download,https://sources.buildroot.net/procps-ng/procps-ng-4.0.5.tar.xz
