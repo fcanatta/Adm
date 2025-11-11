@@ -143,3 +143,8 @@ adm install clang-runtime       --jobs=8 --profile=normal
 
 # (opcional) Unwinder mais completo
 adm install libunwind           --jobs=8 --profile=normal
+
+# Python
+# Recomendado: Stage2 já feito (binutils-stage2, gcc-final), e profile 'normal' ativo
+adm install ninja  --jobs=8 --profile=normal
+adm install python --jobs=8 --profile=normal
