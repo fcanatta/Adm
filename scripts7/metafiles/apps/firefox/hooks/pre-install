@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${DESTDIR:?DESTDIR não definido}"
+: "${PYTHON_FOR_BUILD:=python3}"
+
+# Instala sob /usr (o mach respeita --prefix do .mozconfig); usamos DESTDIR para empacotar
+$PYTHON_FOR_BUILD mach install --verbose --prefix=/usr --destdir="${DESTDIR}"
+
+# Symlink amigável /usr/bin/firefox -> /usr/lib/firefox/firefox
+if [[ -x "${DESTDIR}/usr/lib/firefox/firefox" ]]; then
+  install -d "${DESTDIR}/usr/bin"
+  ln -snf "../lib/firefox/firefox" "${DESTDIR}/usr/bin/firefox"
+fi
+
+# Desktop file e ícones (se não vierem prontos do 'mach install', garantimos)
+if [[ ! -f "${DESTDIR}/usr/share/applications/firefox.desktop" ]]; then
+  install -d "${DESTDIR}/usr/share/applications"
+  cat > "${DESTDIR}/usr/share/applications/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the World Wide Web
+Exec=firefox %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+EOF
+fi
+
+# Ícones comuns (se presentes na árvore ou já instalados)
+for sz in 16 22 24 32 48 64 128 256; do
+  if [[ -f browser/branding/official/default${sz}.png ]]; then
+    install -d "${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps"
+    install -m 0644 "browser/branding/official/default${sz}.png" \
+      "${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps/firefox.png"
+  fi
+done
