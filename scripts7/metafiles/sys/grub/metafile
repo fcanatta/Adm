@@ -1,0 +1,12 @@
+name=grub
+version=2.12
+category=sys
+run_deps=
+build_deps=binutils-stage2,gcc-final
+opt_deps=freetype,efivar,device-mapper
+num_builds=0
+description=GNU GRUB bootloader (EFI/BIOS) com geração automática de grub.cfg e integração a kernels instalados
+homepage=https://www.gnu.org/software/grub/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grub/grub-2.12.tar.xz
