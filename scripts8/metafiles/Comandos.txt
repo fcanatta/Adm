@@ -63,3 +63,8 @@ adm install sys/gcc-pass1      --with-deps --pack
 adm install sys/linux-headers  --pack
 adm install sys/musl           --pack
 adm install sys/gcc-pass2      --with-deps --pack --parallel="$JOBS"
+
+# Instalar gcc-final
+adm install sys/gcc-final --with-deps --pack --parallel=$(nproc)
+
+
