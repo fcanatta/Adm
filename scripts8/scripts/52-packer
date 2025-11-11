@@ -1,0 +1,515 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/52-packer
+# -----------------------------------------------------------------------------
+# ADM - Packer
+# - Empacota DESTDIRs gerados pelo 40-builder em tar.{zst,xz} reprodutíveis
+# - Gera manifesto JSON, sha256sums, BUILDINFO, subpacotes (dev, doc, dbg)
+# - Assinatura GPG opcional; hooks pre/post-package; verificação completa
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+PK_STATE="$ADM_STATE/packer"
+LOCKS="$PK_STATE/locks"
+mkdir -p -- "$PK_STATE" "$LOCKS" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _P_COLOR=${ADM_COLOR:-auto}
+  _P_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _P_COLOR=false; fi
+  if [[ "$_P_COLOR" == "auto" ]]; then
+    _P_COLOR=$([[ "$_P_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_P_COLOR" == "true" ]] then
+    __p_red=$'\033[31m'; __p_grn=$'\033[32m'; __p_yel=$'\033[33m'
+    __p_blu=$'\033[34m'; __p_mag=$'\033[35m'; __p_cyn=$'\033[36m'; __p_dim=$'\033[2m'; __p_rst=$'\033[0m'
+    __p_chk=$'\xE2\x9C\x85'
+  else
+    __p_red=""; __p_grn=""; __p_yel=""; __p_blu=""; __p_mag=""; __p_cyn=""; __p_dim=""; __p_rst=""; __p_chk="[OK]"
+  fi
+  _p_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_p_ts)" "$__p_dim" "$__p_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_p_ts)" "$__p_blu" "$__p_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_p_ts)" "$__p_yel" "$__p_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_p_ts)" "$__p_red" "$__p_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_p_ts)" "$__p_grn" "$__p_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_p_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_p_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_p_have(){ command -v "$1" >/dev/null 2>&1; }
+_p_now(){ date +%s; }
+_p_date(){ date -Iseconds; }
+_p_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+
+_lock(){
+  local key="$1"; mkdir -p -- "$LOCKS" || true
+  local d="$LOCKS/packer-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_unlock(){ local key="$1"; rm -rf -- "$LOCKS/packer-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== Metafile / Identidade ========================
+declare -A MF=()
+
+_parse_metafile(){
+  MF=()
+  local metafile="$1"
+  [[ -f "$metafile" ]] || { adm_log_error "Metafile não encontrado: %s" "$metafile"; return 1; }
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      MF["${BASH_REMATCH[1]}"]="$(_p_trim "${BASH_REMATCH[2]}")"
+    else
+      adm_log_warn "Linha ignorada no metafile: %s" "$line"
+    fi
+  done < "$metafile"
+}
+
+_pkg_id(){ printf "%s-%s" "${MF[name]:-unknown}" "${MF[version]:-0}"; }
+_pkg_name(){ printf "%s" "${MF[name]:-unknown}"; }
+_pkg_ver(){ printf "%s" "${MF[version]:-0}"; }
+_pkg_cat(){ printf "%s" "${MF[category]:-apps}"; }
+
+# ============================== Regras/Subpacotes ============================
+# Regras padrão; podem ser expandidas por CLI.
+DEFAULT_DEV_GLOBS=("usr/include/**" "usr/lib/*.a" "usr/lib/*.la" "usr/lib/pkgconfig/**" "usr/share/aclocal/**" "usr/share/cmake/**" "usr/lib/*.so" "usr/lib/*.so.*" )
+DEFAULT_DOC_GLOBS=("usr/share/doc/**" "usr/share/man/**" "usr/share/gtk-doc/**" "usr/share/info/**" "usr/share/licenses/**" )
+DEFAULT_DBG_GLOBS=("usr/lib/debug/**" "*.debug")
+DEFAULT_LOCALE_GLOBS=("usr/share/locale/**")
+
+# ============================== Reprodutibilidade ============================
+_p_tar_xz(){ (cd "$1" && tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -c .) | xz -9eT0 > "$2"; }
+_p_tar_zst(){ (cd "$1" && tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -c .) | zstd -19 -T0 -q -o "$2"; }
+
+# ============================== SHA / BUILDINFO ==============================
+_sha256_tree(){
+  local root="$1" outfile="$2"
+  ( cd "$root"
+    if _p_have sha256sum; then
+      find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum > "$outfile"
+    else
+      find . -type f -print | LC_ALL=C sort | while read -r f; do
+        printf "%s  %s\n" "$(openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $2}')" "$f"
+      done > "$outfile"
+    fi
+  )
+}
+
+_buildinfo_write(){
+  local root="$1" file="$2"
+  {
+    echo "build_time=$(_p_date)"
+    echo "source_date_epoch=${SOURCE_DATE_EPOCH:-1577836800}"
+    echo "profile=${ADM_PROFILE:-normal}"
+    echo "toolchain=${ADM_TOOLCHAIN:-}"
+    echo "host=$(uname -msr || true)"
+    echo "arch=$(uname -m || true)"
+    echo "cc=$(command -v cc || true)"
+    echo "cxx=$(command -v c++ || true)"
+    echo "ld_name=${LD_NAME:-}"
+  } > "$file"
+}
+
+# ============================== Hooks ========================================
+_run_hooks(){
+  local stage="$1" workdir="$2"
+  local hr="$ADM_ROOT/scripts/34-hooks-runner"
+  [[ -x "$hr" ]] || { adm_log_debug "hooks-runner ausente; pulando $stage"; return 0; }
+  "$hr" run "$stage" "$workdir"
+}
+
+# ============================== Coleta DESTDIR ===============================
+_collect_destdir(){
+  local dir="$1"
+  [[ -d "$dir" ]] || { adm_log_error "DESTDIR inválido: %s" "$dir"; return 1; }
+  # normaliza removendo ./ e entradas vazias
+  ( cd "$dir" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort )
+}
+
+# ============================== Split helpers ================================
+_match_globs(){
+  # STDIN: caminhos; args: globs...  → OUT: caminhos que casam
+  local -a globs=("$@")
+  awk -v RS='\n' -v ORS='\n' 'NF' | while read -r path; do
+    for g in "${globs[@]}"; do
+      # converte glob rudimentar p/ regex
+      local rgx="$(printf "%s" "$g" | sed 's/\./\\./g;s/\*/.*/g;s/\?/./g')"
+      [[ "$path" =~ ^$rgx$ ]] && { printf "%s\n" "$path"; break; }
+    done
+  done | LC_ALL=C sort -u
+}
+
+_copy_paths(){
+  # Copia uma lista de paths relativos de SRC para DST (preservando perms/links)
+  local src="$1" dst="$2"
+  mkdir -p -- "$dst" || return 1
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local s="$src/$rel" d="$dst/$rel"
+    mkdir -p -- "$(dirname "$d")" 2>/dev/null || true
+    if [[ -d "$s" && ! -L "$s" ]]; then
+      mkdir -p -- "$d" 2>/dev/null || true
+    else
+      cp -a -- "$s" "$d" 2>/dev/null || rsync -a -- "$s" "$d" 2>/dev/null || {
+        adm_log_warn "Falha ao copiar: %s" "$rel"
+      }
+    fi
+  done
+}
+
+_remove_paths(){
+  local root="$1"
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local p="$root/$rel"
+    if [[ -d "$p" && ! -L "$p" ]]; then
+      rmdir --ignore-fail-on-non-empty -- "$p" 2>/dev/null || true
+    else
+      rm -f -- "$p" 2>/dev/null || true
+    fi
+  done
+}
+
+# ============================== Manifesto ====================================
+_manifest_write(){
+  local out="$1" name="$2" version="$3" category="$4" root="$5" metafile="$6"
+  local files="$7" sums="$8"
+  {
+    printf "{\n"
+    printf "  \"name\":\"%s\",\n" "$(_p_json_e "$name")"
+    printf "  \"version\":\"%s\",\n" "$(_p_json_e "$version")"
+    printf "  \"category\":\"%s\",\n" "$(_p_json_e "$category")"
+    printf "  \"root\":\"%s\",\n" "$(_p_json_e "$root")"
+    printf "  \"built_at\":\"%s\",\n" "$(_p_json_e "$(_p_date)")"
+    printf "  \"source_date_epoch\":%s,\n" "${SOURCE_DATE_EPOCH:-1577836800}"
+    printf "  \"metafile\":\"%s\",\n" "$(_p_json_e "$metafile")"
+    printf "  \"files\": [\n"
+    sed -E 's/"/\\"/g; s/.*/    "&",/;' "$files" 2>/dev/null | sed '$ s/,$//' || true
+    printf "  ],\n"
+    printf "  \"sha256\": {\n"
+    sed -E 's|^([0-9a-f]{64})  \./?(.*)$|    "\2": "\1",|' "$sums" 2>/dev/null | sed '$ s/,$//' || true
+    printf "  }\n"
+    printf "}\n"
+  } > "$out".tmp
+  mv -f -- "$out".tmp "$out"
+}
+
+# ============================== Empacotamento =================================
+_pack_one(){
+  local payload_dir="$1" out_dir="$2" base="$3" want_xz="$4" want_zst="$5"
+  mkdir -p -- "$out_dir" || { adm_log_error "Sem acesso a %s" "$out_dir"; return 1; }
+  local txz="$out_dir/$base.tar.xz"
+  local tzs="$out_dir/$base.tar.zst"
+
+  if [[ "$want_xz" == "1" ]]; then
+    adm_log_info "Gerando: %s" "$(basename "$txz")"
+    _p_tar_xz "$payload_dir" "$txz" || { adm_log_error "Falha gerando tar.xz"; return 1; }
+  fi
+  if [[ "$want_zst" == "1" ]]; then
+    adm_log_info "Gerando: %s" "$(basename "$tzs")"
+    _p_tar_zst "$payload_dir" "$tzs" || { adm_log_error "Falha gerando tar.zst"; return 1; }
+  fi
+}
+
+# ============================== Assinatura ===================================
+_sign_files(){
+  local out_dir="$1" base="$2" gpg_key="$3"
+  [[ -n "$gpg_key" ]] || return 0
+  _p_have gpg || { adm_log_error "gpg não encontrado para assinar"; return 1; }
+  local f
+  for f in "$out_dir/$base".tar.*; do
+    [[ -f "$f" ]] || continue
+    adm_log_info "Assinando: %s" "$(basename "$f")"
+    gpg --batch --yes --local-user "$gpg_key" --output "$f.sig" --detach-sign "$f" || {
+      adm_log_error "Falha ao assinar %s" "$f"; return 1;
+    }
+  done
+}
+
+# ============================== Verificação ==================================
+_verify_pkg_dir(){
+  local dir="$1"
+  [[ -d "$dir" ]] || { adm_log_error "Payload inválido: %s" "$dir"; return 1; }
+  # checa conteúdo mínimo
+  [[ -f "$dir/.PKGINFO.json" ]] || adm_log_warn "Faltando .PKGINFO.json"
+  [[ -f "$dir/.BUILDINFO"   ]] || adm_log_warn "Faltando .BUILDINFO"
+  [[ -f "$dir/sha256sums.txt" ]] || adm_log_warn "Faltando sha256sums.txt"
+  return 0
+}
+# (continuação do arquivo /usr/src/adm/scripts/52-packer)
+
+# ============================== Operação principal ===========================
+
+_make_package(){
+  local meta_arg="" destdir="" outfmt="xz,zst" gpg_key="" outbase="" outdir="" split_rules="" keep_workspace=0
+  while (( $# )); do
+    case "$1" in
+      --meta=*)        meta_arg="${1#--meta=}" ;;
+      --destdir=*)     destdir="${1#--destdir=}" ;;
+      --formats=*)     outfmt="${1#--formats=}" ;;        # xz,zst
+      --gpg-key=*)     gpg_key="${1#--gpg-key=}" ;;
+      --outdir=*)      outdir="${1#--outdir=}" ;;
+      --outbase=*)     outbase="${1#--outbase=}" ;;       # override do nome-base
+      --split=*)       split_rules="${1#--split=}" ;;     # dev,doc,dbg,locale
+      --keep-workspace) keep_workspace=1 ;;
+      *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+    esac; shift || true
+  done
+
+  [[ -n "$meta_arg" && -n "$destdir" ]] || { adm_log_error "Uso: make --meta=<metafile|dir> --destdir=<path>"; return 2; }
+
+  local meta_dir meta_file
+  if [[ -d "$meta_arg" && -f "$meta_arg/metafile" ]]; then
+    meta_dir="$meta_arg"; meta_file="$meta_arg/metafile"
+  elif [[ -f "$meta_arg" ]]; then
+    meta_dir="$(dirname "$meta_arg")"; meta_file="$meta_arg"
+  else
+    adm_log_error "Caminho inválido para metafile: %s" "$meta_arg"; return 1
+  fi
+
+  _parse_metafile "$meta_file" || return 1
+  local pkgid="$(_pkg_id)" name="$(_pkg_name)" ver="$(_pkg_ver)" cat="$(_pkg_cat)"
+
+  destdir="$(_p_abspath "$destdir")"
+  [[ -d "$destdir" ]] || { adm_log_error "DESTDIR inexistente: %s" "$destdir"; return 1; }
+
+  outdir="${outdir:-$ADM_PACKAGES/$pkgid}"
+  outdir="$(_p_abspath "$outdir")"
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso a outdir: %s" "$outdir"; return 1; }
+  outbase="${outbase:-$pkgid}"
+
+  # Locks por pacote
+  _lock "$pkgid" || return 1
+  trap '_unlock "'"$pkgid"'"' RETURN
+
+  adm_log_info "Empacotando: %s (categoria=%s)  DESTDIR=%s  OUTDIR=%s" "$pkgid" "$cat" "$destdir" "$outdir"
+
+  # Hooks
+  _run_hooks "pre-package" "$destdir" || true
+
+  # Workspace (payload) estabelecido
+  local ws; ws="$(mktemp -d "${ADM_TMP%/}/pkgws.XXXX")"
+  trap 'rm -rf -- "'"$ws"'" 2>/dev/null || true' RETURN
+  local payload="$ws/payload"
+  mkdir -p -- "$payload" || true
+
+  # Copia todo DESTDIR para payload
+  (cd "$destdir" && tar -c .) | (cd "$payload" && tar -x) || { adm_log_error "Falha copiando DESTDIR"; return 1; }
+
+  # Coleta lista de arquivos
+  local list_all="$ws/files_all.txt"
+  (cd "$payload" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort) > "$list_all"
+
+  # SPLIT (subpacotes)
+  local do_dev=0 do_doc=0 do_dbg=0 do_loc=0
+  if [[ -n "$split_rules" ]]; then
+    [[ "$split_rules" == *dev* ]]    && do_dev=1
+    [[ "$split_rules" == *doc* ]]    && do_doc=1
+    [[ "$split_rules" == *dbg* ]]    && do_dbg=1
+    [[ "$split_rules" == *locale* ]] && do_loc=1
+  fi
+
+  # Cria diretórios para subpacotes
+  local p_main="$ws/p_main"
+  local p_dev="$ws/p_dev"
+  local p_doc="$ws/p_doc"
+  local p_dbg="$ws/p_dbg"
+  local p_loc="$ws/p_loc"
+  mkdir -p -- "$p_main" "$p_dev" "$p_doc" "$p_dbg" "$p_loc"
+
+  # Por padrão, o main recebe tudo; depois removemos o que for para subpacotes
+  (cd "$payload" && tar -c .) | (cd "$p_main" && tar -x)
+
+  # DEV
+  if (( do_dev==1 )); then
+    adm_log_info "Separando subpacote -dev…"
+    local dev_sel; dev_sel="$(cat "$list_all" | _match_globs "${DEFAULT_DEV_GLOBS[@]}")"
+    printf "%s\n" "$dev_sel" | _copy_paths "$p_main" "$p_dev"
+    printf "%s\n" "$dev_sel" | _remove_paths "$p_main"
+  fi
+
+  # DOC
+  if (( do_doc==1 )); then
+    adm_log_info "Separando subpacote -doc…"
+    local doc_sel; doc_sel="$(cat "$list_all" | _match_globs "${DEFAULT_DOC_GLOBS[@]}")"
+    printf "%s\n" "$doc_sel" | _copy_paths "$p_main" "$p_doc"
+    printf "%s\n" "$doc_sel" | _remove_paths "$p_main"
+  fi
+
+  # DBG
+  if (( do_dbg==1 )); then
+    adm_log_info "Separando símbolos de depuração -dbg…"
+    # Heurística: tudo que casar com DEFAULT_DBG_GLOBS e arquivos *.debug em /usr/lib*/debug
+    local dbg_sel; dbg_sel="$(cat "$list_all" | _match_globs "${DEFAULT_DBG_GLOBS[@]}")"
+    # Captura *.debug comuns também:
+    dbg_sel="$( { printf "%s\n" "$dbg_sel"; grep -E '\.debug$' "$list_all" || true; } | LC_ALL=C sort -u )"
+    printf "%s\n" "$dbg_sel" | _copy_paths "$p_main" "$p_dbg"
+    printf "%s\n" "$dbg_sel" | _remove_paths "$p_main"
+  fi
+
+  # LOCALE
+  if (( do_loc==1 )); then
+    adm_log_info "Separando localidades -locale…"
+    local loc_sel; loc_sel="$(cat "$list_all" | _match_globs "${DEFAULT_LOCALE_GLOBS[@]}")"
+    printf "%s\n" "$loc_sel" | _copy_paths "$p_main" "$p_loc"
+    printf "%s\n" "$loc_sel" | _remove_paths "$p_main"
+  fi
+
+  # Gera manifestos, BUILDINFO e sha256 para cada pacote não-vazio
+  local want_xz=0 want_zst=0
+  [[ "$outfmt" == *xz* ]]  && want_xz=1
+  [[ "$outfmt" == *zst* ]] && want_zst=1
+
+  _emit_package(){
+    local pay="$1" suffix="$2"
+    # se vazio, não gera
+    if ! (cd "$pay" && find . -mindepth 1 -print -quit) >/dev/null 2>&1; then
+      adm_log_debug "Subpacote %s vazio — ignorando." "$suffix"
+      return 0
+    fi
+    local files="$ws/files_${suffix}.txt"; (cd "$pay" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort) > "$files"
+    local sums="$ws/sha_${suffix}.txt"; _sha256_tree "$pay" "$sums"
+    local info="$pay/.PKGINFO.json"; _manifest_write "$info" "$name${suffix}" "$ver" "$cat" "/" "$meta_file" "$files" "$sums"
+    _buildinfo_write "$pay" "$pay/.BUILDINFO"
+    # empacota
+    local base="${outbase}${suffix}"
+    _pack_one "$pay" "$outdir" "$base" "$want_xz" "$want_zst"
+    # assina
+    _sign_files "$outdir" "$base" "$gpg_key" || return 1
+    adm_log_success "${__p_chk} Gerado: %s{.tar.xz,.tar.zst}" "$base"
+  }
+
+  _emit_package "$p_main"    ""
+  (( do_dev==1 )) && _emit_package "$p_dev"    "-dev"
+  (( do_doc==1 )) && _emit_package "$p_doc"    "-doc"
+  (( do_dbg==1 )) && _emit_package "$p_dbg"    "-dbg"
+  (( do_loc==1 )) && _emit_package "$p_loc"    "-locale"
+
+  # Hooks
+  _run_hooks "post-package" "$outdir" || true
+
+  (( keep_workspace==1 )) && { adm_log_info "Workspace mantido: %s" "$ws"; trap - RETURN; } || true
+  adm_log_success "${__p_chk} Empacotamento finalizado: %s" "$pkgid"
+}
+
+# ============================== Manifest/Verify/Sign isolados =================
+
+_write_manifest_only(){
+  local meta_arg="" root=""
+  while (( $# )); do
+    case "$1" in
+      --meta=*) meta_arg="${1#--meta=}" ;;
+      --root=*) root="${1#--root=}" ;;
+      *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$meta_arg" && -n "$root" ]] || { adm_log_error "Uso: manifest --meta= --root="; return 2; }
+  local meta_file meta_dir
+  if [[ -d "$meta_arg" && -f "$meta_arg/metafile" ]]; then meta_dir="$meta_arg"; meta_file="$meta_arg/metafile"
+  elif [[ -f "$meta_arg" ]]; then meta_dir="$(dirname "$meta_arg")"; meta_file="$meta_arg"
+  else adm_log_error "Caminho inválido p/ metafile"; return 1; fi
+  _parse_metafile "$meta_file"
+  root="$(_p_abspath "$root")"
+  [[ -d "$root" ]] || { adm_log_error "Root inválido"; return 1; }
+
+  local files sums
+  files="$(mktemp "${ADM_TMP%/}/files.XXXX")"
+  sums="$(mktemp "${ADM_TMP%/}/sha.XXXX")"
+  trap 'rm -f -- "'"$files"'" "'"$sums"'" 2>/dev/null || true' RETURN
+
+  (cd "$root" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort) > "$files"
+  _sha256_tree "$root" "$sums"
+  _manifest_write "$root/.PKGINFO.json" "$(_pkg_name)" "$(_pkg_ver)" "$(_pkg_cat)" "/" "$meta_file" "$files" "$sums"
+  _buildinfo_write "$root" "$root/.BUILDINFO"
+  cp -f -- "$sums" "$root/sha256sums.txt"
+  adm_log_success "${__p_chk} Manifesto e BUILDINFO escritos em %s" "$root"
+}
+
+_verify_payload(){
+  local root="$1"
+  _verify_pkg_dir "$root" || return 1
+  local sums="$root/sha256sums.txt"
+  [[ -f "$sums" ]] || { adm_log_error "sha256sums.txt ausente"; return 1; }
+  ( cd "$root"
+    awk '{print $1"  "$2}' "$sums" | sha256sum -c - 2>/dev/null
+  ) || { adm_log_error "Verificação de checksums falhou"; return 1; }
+  adm_log_success "${__p_chk} Payload OK: %s" "$root"
+}
+
+_sign_outputs(){
+  local outdir="" base="" gpg_key=""
+  while (( $# )); do
+    case "$1" in
+      --outdir=*) outdir="${1#--outdir=}" ;;
+      --base=*)   base="${1#--base=}" ;;
+      --gpg-key=*) gpg_key="${1#--gpg-key=}" ;;
+      *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$outdir" && -n "$base" && -n "$gpg_key" ]] || { adm_log_error "Uso: sign --outdir= --base= --gpg-key="; return 2; }
+  _sign_files "$outdir" "$base" "$gpg_key"
+}
+
+# ============================== Doctor =======================================
+
+_packer_doctor(){
+  local fail=0
+  for b in tar xargs awk sed find; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }
+  done
+  if ! _p_have xz && ! _p_have zstd; then
+    adm_log_error "Nem xz nem zstd disponíveis."; fail=$((fail+1))
+  fi
+  mkdir -p -- "$ADM_PACKAGES" "$PK_STATE" "$LOCKS" || { adm_log_error "Sem acesso a diretórios base"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Packer OK."
+}
+
+# ============================== CLI ==========================================
+
+_packer_usage(){
+  cat <<'USAGE'
+Uso: 52-packer <comando> [opções]
+
+Comandos:
+  make      --meta=<metafile|dir> --destdir=<path> [--formats=xz,zst] [--outdir=...] [--outbase=...] [--split=dev,doc,dbg,locale] [--gpg-key=ID] [--keep-workspace]
+  manifest  --meta=<metafile|dir> --root=<dir>     # gera somente .PKGINFO.json, .BUILDINFO e sha256sums.txt
+  verify    --root=<dir>                            # verifica sha256sums.txt do payload
+  sign      --outdir=<dir> --base=<name-version> --gpg-key=<ID>
+  doctor
+
+Exemplos:
+  52-packer make --meta=/usr/src/adm/metafiles/apps/htop --destdir=/usr/src/adm/state/stage/htop-3.3.0 --formats=zst --split=dev,doc
+  52-packer manifest --meta=./metafiles/libs/zlib --root=/tmp/payload
+  52-packer verify --root=/usr/src/adm/packages/zlib-1.3.1/payload
+  52-packer sign --outdir=/usr/src/adm/packages/zlib-1.3.1 --base=zlib-1.3.1 --gpg-key=ABCDEF123456
+USAGE
+}
+
+packer_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    make)     _make_package "$@" ;;
+    manifest) _write_manifest_only "$@" ;;
+    verify)   local root=""; while (( $# )); do case "$1" in --root=*) root="${1#--root=}";; *) adm_log_warn "Arg ignorado: %s" "$1";; esac; shift; done; [[ -n "$root" ]] || { adm_log_error "Uso: verify --root=<dir>"; return 2; }; _verify_payload "$root" ;;
+    sign)     _sign_outputs "$@" ;;
+    doctor)   _packer_doctor ;;
+    ""|-h|--help|help) _packer_usage ;;
+    *)        adm_log_error "Comando desconhecido: %s" "$cmd"; _packer_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  packer_main "$@"
+fi
