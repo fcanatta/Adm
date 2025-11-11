@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Atualiza caches de desktop/ícones se disponíveis (idempotente)
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  for theme in hicolor; do
+    if [[ -d "/usr/share/icons/${theme}" ]]; then
+      gtk-update-icon-cache -q -t -f "/usr/share/icons/${theme}" || true
+    fi
+  done
+fi
