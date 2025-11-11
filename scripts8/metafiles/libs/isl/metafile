@@ -1,0 +1,12 @@
+name=isl
+version=0.26
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=ISL - Integer Set Library (Graphite support)
+homepage=https://libisl.sourceforge.io/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://libisl.sourceforge.io/isl-0.26.tar.xz,https://mirrors.ustc.edu.cn/gnu/isl/isl-0.26.tar.xz
