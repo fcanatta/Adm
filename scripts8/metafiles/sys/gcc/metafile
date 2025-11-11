@@ -1,0 +1,12 @@
+name=gcc
+version=14.2.0
+category=sys
+run_deps=libs/gmp,libs/mpfr,libs/mpc,libs/isl
+build_deps=libs/gmp,libs/mpfr,libs/mpc,libs/isl
+opt_deps=
+num_builds=0
+description=GNU Compiler Collection (C/C++)
+homepage=https://gcc.gnu.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz,https://ftpmirror.gnu.org/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
