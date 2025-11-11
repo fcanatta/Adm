@@ -1,0 +1,12 @@
+name=gettext
+version=0.22.5
+category=dev
+run_deps=
+build_deps=dev/perl
+opt_deps=
+num_builds=0
+description=GNU internationalization (msgfmt, msgmerge, ...)
+homepage=https://www.gnu.org/software/gettext/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gettext/gettext-0.22.5.tar.xz,https://ftpmirror.gnu.org/gettext/gettext-0.22.5.tar.xz
