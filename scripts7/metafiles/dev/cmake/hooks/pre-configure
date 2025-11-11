@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+# Compiladores/arquivos de ferramenta do TARGET
+export CC="${TARGET}-gcc"
+export CXX="${TARGET}-g++"
+export AR="${TARGET}-ar"
+export RANLIB="${TARGET}-ranlib"
+export NM="${TARGET}-nm"
+export STRIP="${TARGET}-strip"
+
+# Evitar testes 'try-run' no cross (usa defaults seguros)
+export CFLAGS="${CFLAGS:-} -O2 -pipe"
+export CXXFLAGS="${CXXFLAGS:-} -O2 -pipe"
+export LDFLAGS="${LDFLAGS:-}"
+
+# Argumentos do bootstrap:
+#  - prefix em /usr
+#  - ativa uso de libs do sistema quando possível
+#  - sinaliza cross-compiling explicitamente
+#  - desliga rpaths
+BOOTSTRAP_ARGS=(
+  --prefix=/usr
+  --parallel="${NPROC}"
+  --no-system-libs               # (recomendado: deixe OFF; se quiser forçar system-libs, remova)
+  --                                # tudo após '--' vai como -D... para CMake
+  -DCMAKE_SYSTEM_NAME=Linux
+  -DCMAKE_CROSSCOMPILING=ON
+  -DCMAKE_C_COMPILER="${CC}"
+  -DCMAKE_CXX_COMPILER="${CXX}"
+  -DCMAKE_AR="${AR}"
+  -DCMAKE_RANLIB="${RANLIB}"
+  -DCMAKE_NM="${NM}"
+  -DCMAKE_STRIP="${STRIP}"
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_SKIP_RPATH=ON
+  -DBUILD_CursesDialog=ON
+  -DCMAKE_USE_OPENSSL=ON
+)
+
+# Permitir override por variável (se quiser passar algo a mais via adm)
+if [[ -n "${ADM_CMAKE_EXTRA_DEFINES:-}" ]]; then
+  # Ex.: ADM_CMAKE_EXTRA_DEFINES="-DCMAKE_EXE_LINKER_FLAGS='-static'"
+  BOOTSTRAP_ARGS+=(${ADM_CMAKE_EXTRA_DEFINES})
+fi
+
+# Salva os args para depuração
+printf '%q ' ./bootstrap "${BOOTSTRAP_ARGS[@]}" > .adm-bootstrap-cmd
+echo
+
+export CONFIGURE_EXTRAS+=" $(cat .adm-bootstrap-cmd)"
