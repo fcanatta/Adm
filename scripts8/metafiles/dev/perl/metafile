@@ -1,0 +1,12 @@
+name=perl
+version=5.40.0
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Practical Extraction and Report Language
+homepage=https://www.perl.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.cpan.org/src/5.0/perl-5.40.0.tar.xz,https://www.mirrorservice.org/sites/cpan.perl.org/CPAN/src/5.0/perl-5.40.0.tar.xz
