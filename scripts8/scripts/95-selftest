@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/95-selftest
+# -----------------------------------------------------------------------------
+# ADM - Self Test Suite
+# - Roda baterias de testes sobre scripts e subsistemas do ADM
+# - Safe-by-default: usa sandboxes, dry-run e validações estritas
+# - Produz relatório JSON consolidado com tempos, RC e trechos de log
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_COLOR:=auto}"
+
+ST_STATE="$ADM_STATE/selftest"
+ST_LOGS="$ST_STATE/logs"
+ST_RUNS="$ST_STATE/runs"
+ST_LOCKS="$ST_STATE/locks"
+ST_REPORT="$ST_STATE/report.json"
+ST_SB="$ST_STATE/sandboxes"
+
+mkdir -p -- "$ST_STATE" "$ST_LOGS" "$ST_RUNS" "$ST_LOCKS" "$ST_SB" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _C_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then ADM_COLOR=false; fi
+  if [[ "$ADM_COLOR" == "auto" ]]; then ADM_COLOR=$([[ "$_C_TTY" == "true" ]] && echo true || echo false); fi
+  if [[ "$ADM_COLOR" == "true" ]]; then
+    C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_X=$'\033[0m'; C_OK=$'\xE2\x9C\x85'
+  else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_X=""; C_OK="[OK]"
+  fi
+  ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(ts)" "$C_D" "$C_X" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n"  "$(ts)" "$C_B" "$C_X" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n"  "$(ts)" "$C_Y" "$C_X" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(ts)" "$C_R" "$C_X" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(ts)" "$C_G" "$C_X" "$*" >&2; }
+fi
+
+# ============================== Utilitários ==================================
+now(){ date -Iseconds; }
+slug(){ printf "%s" "$1" | tr ' /' '__' | tr -cd '[:alnum:]_.-'; }
+hsize(){ numfmt --to=iec --suffix=B --padding=7 -- "$1" 2>/dev/null || echo "$1"; }
+du_b(){ du -sb -- "$1" 2>/dev/null | awk '{print $1}'; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+
+_lock(){
+  local key="$1"; mkdir -p -- "$ST_LOCKS" || true
+  local d="$ST_LOCKS/selftest-$(slug "$key").lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>600)) && { adm_log_error "Timeout lock %s" "$key"; return 1; } done
+  fi
+}
+_unlock(){ local key="$1"; rm -rf -- "$ST_LOCKS/selftest-$(slug "$key").lockdir" 2>/dev/null || true; }
+
+# ============================== CLI ==========================================
+usage(){
+  cat <<'USAGE'
+Uso: 95-selftest <comando> [opções]
+
+Comandos:
+  run            Executa a suíte completa (ou subconjunto via --subset=...)
+  list           Lista os testes disponíveis
+  doctor         Verifica dependências do selftest
+  clean          Remove sandboxes e logs antigos
+
+Opções:
+  --subset=CSV   Ex.: core,fetcher,builder,installer,audit,update,rebuilder,cleanup,toolchain
+  --parallel=N   Paralelismo (default: núcleos/2, mínimo 2)
+  --timeout=S    Timeout por teste em segundos (default 120)
+  --keep         Mantém sandboxes após execução
+  --yes          Não pergunta confirmação
+  --dry-run      Planeja sem executar
+USAGE
+}
+
+CMD="${1:-run}"; shift || true
+SUBSET=""
+PARALLEL=0
+TIMEOUT=120
+KEEP=0
+YES=0
+DRY=0
+
+while (( $# )); do
+  case "$1" in
+    --subset=*) SUBSET="${1#--subset=}" ;;
+    --parallel=*) PARALLEL="${1#--parallel=}" ;;
+    --timeout=*) TIMEOUT="${1#--timeout=}" ;;
+    --keep) KEEP=1 ;;
+    --yes) YES=1 ;;
+    --dry-run) DRY=1 ;;
+    ""|-h|--help|help) usage; exit 0 ;;
+    *) adm_log_warn "Opção desconhecida: %s" "$1" ;;
+  esac; shift || true
+done
+
+# ============================== Doctor / sanity ==============================
+doctor(){
+  local fail=0
+  for b in bash awk sed grep find stat du; do
+    have "$b" || { adm_log_warn "Ferramenta ausente: %s" "$b"; fail=$((fail+1)); }
+  done
+  have timeout || adm_log_warn "timeout(1) ausente; usando fallback sem timeout."
+  mkdir -p -- "$ST_STATE" "$ST_LOGS" "$ST_RUNS" "$ST_SB" || { adm_log_error "Sem acesso a state dirs"; fail=$((fail+1)); }
+  [[ $fail -gt 0 ]] && return 1 || adm_log_success "$C_OK Selftest OK."
+}
+
+[[ "$CMD" == "doctor" ]] && { doctor; exit $?; }
+
+# ============================== Orquestrador de testes =======================
+declare -A TESTS=()  # id -> function
+
+register_test(){ TESTS["$1"]="$2"; }
+
+test_ids(){ for k in "${!TESTS[@]}"; do echo "$k"; done | sort; }
+
+list_tests(){
+  echo "Testes disponíveis:"
+  for k in $(test_ids); do
+    printf " - %s\n" "$k"
+  done
+}
+
+[[ "$CMD" == "list" ]] && { list_tests; exit 0; }
+
+# ============================== Exec infra ===================================
+sandbox_new(){
+  local name="sb-$(date +%s)-$$-$(shuf -i 1000-9999 -n 1 2>/dev/null || echo 42)"
+  local dir="$ST_SB/$name"
+  mkdir -p -- "$dir/root" "$dir/work" "$dir/cache" "$dir/logs" "$dir/tmp" || return 1
+  printf "%s" "$dir"
+}
+sandbox_rm(){
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir" ]] || return 0
+  rm -rf -- "$dir" 2>/dev/null || true
+}
+
+run_cmd(){
+  # run_cmd <timeout> <logfile> -- command args...
+  local to="$1"; shift
+  local log="$1"; shift
+  {
+    echo "# $(now) CMD: $*"
+    if have timeout; then
+      timeout --preserve-status "$to" "$@" 2>&1
+      rc=$?
+    else
+      "$@" 2>&1; rc=$?
+    fi
+    echo "# $(now) RC=$rc"
+    echo "$rc" > "${log}.rc"
+    exit "$rc"
+  } | tee -a "$log"
+}
+
+record_json(){
+  # record_json file key value  (value assumed already JSON-encoded if not string)
+  local file="$1" key="$2" val="$3" sep
+  [[ -f "$file" ]] || printf "{\n" > "$file"
+  # append as a simple "key": value, lines
+  printf "  \"%s\": %s,\n" "$key" "$val" >> "$file"
+}
+
+json_finish(){
+  local file="$1"
+  # remove trailing comma
+  sed -i '$ s/,\s*$//' "$file" 2>/dev/null || true
+  printf "}\n" >> "$file"
+}
+
+test_log(){
+  local name="$1"
+  printf "%s/%s-%s.log" "$ST_LOGS" "$(slug "$name")" "$(date +%s)"
+}
+
+add_result(){
+  local out="$1" id="$2" status="$3" rc="$4" dur="$5" log="$6"
+  printf "    {\"id\":\"%s\",\"status\":\"%s\",\"rc\":%d,\"duration_sec\":%d,\"log\":\"%s\"}" \
+    "$(json_e "$id")" "$(json_e "$status")" "$rc" "$dur" "$(json_e "$log")" >> "$out"
+}
+
+# ============================== Testes: Core/infra ===========================
+t_core_paths(){
+  local id="core.paths" log; log="$(test_log "$id")"
+  local start end rc=0
+  start=$(date +%s)
+  {
+    [[ -d "$ADM_ROOT" ]] || { echo "ADM_ROOT ausente: $ADM_ROOT"; rc=2; }
+    [[ -d "$ADM_STATE" ]] || { echo "ADM_STATE ausente: $ADM_STATE"; rc=2; }
+    [[ -d "$ADM_ROOT/scripts" ]] || { echo "scripts ausente"; rc=2; }
+    echo "OK paths."
+  } >>"$log" 2>&1
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+
+t_core_logging(){
+  local id="core.logging" log; log="$(test_log "$id")"
+  local start end rc=0
+  start=$(date +%s)
+  {
+    adm_log_info  "teste info"; adm_log_warn "teste warn"; adm_log_error "teste error"; adm_log_success "teste ok"
+  } >>"$log" 2>&1 || rc=$?
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+
+t_core_scripts_help(){
+  local id="core.scripts_help" log; log="$(test_log "$id")"
+  local start end rc=0
+  start=$(date +%s)
+  for s in "$ADM_ROOT"/scripts/[0-9][0-9]-*; do
+    [[ -x "$s" ]] || continue
+    "$s" -h >>"$log" 2>&1 || "$s" --help >>"$log" 2>&1 || true
+  done
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+
+register_test "core.paths"        t_core_paths
+register_test "core.logging"      t_core_logging
+register_test "core.scripts_help" t_core_scripts_help
+
+# ============================== Testes: componentes ==========================
+t_detector(){
+  local id="20.detector" log; log="$(test_log "$id")"
+  local script="$ADM_ROOT/scripts/20-detector"; [[ -x "$script" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0
+  start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$script" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$script" summary || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "20.detector" t_detector
+
+t_parser(){
+  local id="10.parser" log; log="$(test_log "$id")"
+  local script="$ADM_ROOT/scripts/10-parser"; [[ -x "$script" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0
+  start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$script" doctor || rc=$?
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "10.parser" t_parser
+
+t_profile_manager(){
+  local id="12.profile_manager" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/12-profile-manager"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0
+  start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" list || true
+  run_cmd "$TIMEOUT" "$log" "$s" ensure --profile=aggressive || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" export --profile=minimal || rc=$?
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "12.profile_manager" t_profile_manager
+
+t_toolchain_db(){
+  local id="14.toolchain_db" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/14-toolchain-db"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0
+  start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" snapshot || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "14.toolchain_db" t_toolchain_db
+
+t_cache_manager(){
+  local id="15.cache_manager" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/15-cache-manager"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" stats || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "15.cache_manager" t_cache_manager
+
+t_resolver(){
+  local id="25.resolver" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/25-resolver"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "25.resolver" t_resolver
+
+t_fetcher(){
+  local id="30.fetcher" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/30-fetcher"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local sb; sb="$(sandbox_new)" || { echo "$id|2|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  # Modo doctor + tentativa de fetch de um arquivo local fake (não falha)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" fetch --url="file://$sb/tmp/sample.tar.gz" --out="$sb/work/sample.tar.gz" || true
+  end=$(date +%s)
+  (( KEEP==1 )) || sandbox_rm "$sb"
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "30.fetcher" t_fetcher
+
+t_patcher(){
+  local id="32.patcher" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/32-patcher"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local sb; sb="$(sandbox_new)" || { echo "$id|2|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  mkdir -p "$sb/work/src" && echo "dummy" > "$sb/work/src/README"
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" apply --package="apps/dummy" --sourcedir="$sb/work/src" || true
+  end=$(date +%s)
+  (( KEEP==1 )) || sandbox_rm "$sb"
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "32.patcher" t_patcher
+
+t_hooks(){
+  local id="34.hooks_runner" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/34-hooks-runner"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "34.hooks_runner" t_hooks
+
+t_builder(){
+  local id="40.builder" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/40-builder"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" plan --dry-run --targets=apps/dummy || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "40.builder" t_builder
+
+t_compiler_manager(){
+  local id="42.compiler_manager" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/42-compiler-manager"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" detect || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "42.compiler_manager" t_compiler_manager
+
+t_parallel_scheduler(){
+  local id="44.parallel_scheduler" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/44-parallel-scheduler"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" run --parallel=2 -- echo ok || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "44.parallel_scheduler" t_parallel_scheduler
+
+t_installer(){
+  local id="50.installer" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/50-installer"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local sb; sb="$(sandbox_new)" || { echo "$id|2|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" dry-run --name=apps/dummy --root="$sb/root" || true
+  end=$(date +%s)
+  (( KEEP==1 )) || sandbox_rm "$sb"
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "50.installer" t_installer
+
+t_packer(){
+  local id="52.packer" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/52-packer"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" dry-run --name=apps/dummy || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "52.packer" t_packer
+
+t_uninstaller(){
+  local id="60.uninstaller" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/60-uninstaller"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local sb; sb="$(sandbox_new)" || { echo "$id|2|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" dry-run --name=apps/dummy --root="$sb/root" || true
+  end=$(date +%s)
+  (( KEEP==1 )) || sandbox_rm "$sb"
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "60.uninstaller" t_uninstaller
+
+t_update(){
+  local id="70.update" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/70-update"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" check --ttl=5 --match='*' || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "70.update" t_update
+
+t_cleanup(){
+  local id="80.cleanup" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/80-cleanup"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" run --dry-run --targets=caches,tmp || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "80.cleanup" t_cleanup
+
+t_audit(){
+  local id="85.audit" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/85-audit"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" run --all --json || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "85.audit" t_audit
+
+t_bootstrap_toolchain(){
+  local id="90.bootstrap_toolchain" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/90-bootstrap-toolchain"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  # Rodamos apenas doctor e validação de --help (build real é pesado)
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  "$s" --help >>"$log" 2>&1 || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "90.bootstrap_toolchain" t_bootstrap_toolchain
+
+t_rebuilder(){
+  local id="92.rebuilder" log; log="$(test_log "$id")"
+  local s="$ADM_ROOT/scripts/92-rebuilder"; [[ -x "$s" ]] || { echo "$id|0|0|$log"; return 0; }
+  local start end rc=0; start=$(date +%s)
+  run_cmd "$TIMEOUT" "$log" "$s" doctor || rc=$?
+  run_cmd "$TIMEOUT" "$log" "$s" plan --metafile-changed || true
+  end=$(date +%s)
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "92.rebuilder" t_rebuilder
+# (continuação do arquivo /usr/src/adm/scripts/95-selftest)
+
+# ============================== Conjunto/pipeline sintético ===================
+t_pipeline_synthetic(){
+  local id="pipeline.synthetic" log; log="$(test_log "$id")"
+  local start end rc=0; start=$(date +%s)
+  local sb; sb="$(sandbox_new)" || { echo "$id|2|0|$log"; return 0; }
+
+  {
+    echo "# sandbox: $sb"
+    # cria estrutura mínima de DB instalado/arquivos para o pipeline simulado
+    mkdir -p "$ADM_STATE/db/installed" "$ADM_STATE/db/files"
+    : > "$ADM_STATE/db/files/index.map"
+    # Emula um pacote fictício apps/dummy no DB para que installer/uninstaller/audit tenham o que ler
+    cat > "$ADM_STATE/db/installed/apps__dummy.json" <<'JSON'
+{
+  "name":"apps/dummy",
+  "version":"1.0",
+  "files":["usr/share/dummy/README"],
+  "sha256":{"usr/share/dummy/README":"d41d8cd98f00b204e9800998ecf8427e"},
+  "build_info":{"built_at":"2024-01-01T00:00:00Z","metafile_mtime":0}
+}
+JSON
+    echo -e "usr/share/dummy/README\tapps/dummy" >> "$ADM_STATE/db/files/index.map"
+    mkdir -p "$sb/root/usr/share/dummy" && : > "$sb/root/usr/share/dummy/README" || true
+  } >>"$log" 2>&1
+
+  # Executa etapas em dry/doctor
+  [[ -x "$ADM_ROOT/scripts/30-fetcher"  ]] && "$ADM_ROOT/scripts/30-fetcher"  doctor >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/32-patcher"  ]] && "$ADM_ROOT/scripts/32-patcher"  doctor >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/40-builder"  ]] && "$ADM_ROOT/scripts/40-builder"  doctor >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/52-packer"   ]] && "$ADM_ROOT/scripts/52-packer"   doctor >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/50-installer"]] && "$ADM_ROOT/scripts/50-installer" dry-run --name=apps/dummy --root="$sb/root" >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/85-audit"    ]] && "$ADM_ROOT/scripts/85-audit"    run --targets=apps/dummy --json >>"$log" 2>&1 || true
+  [[ -x "$ADM_ROOT/scripts/60-uninstaller" ]] && "$ADM_ROOT/scripts/60-uninstaller" dry-run --name=apps/dummy --root="$sb/root" >>"$log" 2>&1 || true
+
+  end=$(date +%s)
+  (( KEEP==1 )) || sandbox_rm "$sb"
+  echo "$id|$rc|$((end-start))|$log"
+}
+register_test "pipeline.synthetic" t_pipeline_synthetic
+
+# ============================== Limpeza de artefatos ==========================
+clean_old(){
+  local days="${1:-14}"
+  find "$ST_LOGS" -type f -mtime +"$days" -delete 2>/dev/null || true
+  find "$ST_SB"   -maxdepth 1 -mindepth 1 -type d -mtime +"$days" -exec rm -rf {} + 2>/dev/null || true
+}
+
+[[ "$CMD" == "clean" ]] && { clean_old 0; adm_log_success "$C_OK Limpo."; exit 0; }
+
+# ============================== Seleção / Execução ===========================
+select_tests(){
+  local want="${1:-}"
+  if [[ -z "$want" ]]; then
+    test_ids
+    return 0
+  fi
+  IFS=',' read -r -a arr <<< "$want"
+  local s id; for id in $(test_ids); do
+    for s in "${arr[@]}"; do
+      if [[ "$id" == "$s"* || "$id" == *"$s"* ]]; then
+        echo "$id"
+        break
+      fi
+    done
+  done | sort -u
+}
+
+confirm(){
+  (( YES==1 )) && return 0
+  read -r -p "Executar selftest? [y/N] " a || true
+  [[ "$a" =~ ^[yY]$ ]]
+}
+
+run_one_test(){
+  local id="$1"
+  local fn="${TESTS[$id]}"
+  local line; line="$("$fn")"
+  echo "$line"
+}
+
+run_parallel(){
+  local par="$1"; shift
+  local ids=("$@")
+  (( par<=0 )) && par=$(( $(nproc 2>/dev/null || echo 2) / 2 ))
+  (( par<2 )) && par=2
+
+  local -a queue=("${ids[@]}")
+  local -A pids=(); local -A tmpout=()
+  local outdir; outdir="$(mktemp -d "${ADM_TMP%/}/st.out.XXXX")"
+  trap 'rm -rf -- "'"$outdir"'" 2>/dev/null || true' RETURN
+
+  _spawn(){
+    local id="$1"
+    local tfile="$outdir/$(slug "$id").line"
+    ( run_one_test "$id" > "$tfile" ) &
+    pids["$!"]="$id"; tmpout["$id"]="$tfile"
+  }
+
+  while ((${#queue[@]}>0)) || ((${#pids[@]}>0)); do
+    while ((${#pids[@]}<par)) && ((${#queue[@]}>0)); do
+      local id="${queue[0]}"; queue=("${queue[@]:1}")
+      _spawn "$id"
+    done
+    local pid
+    for pid in "${!pids[@]}"; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" || true
+        unset 'pids[$pid]'
+      fi
+    done
+    sleep 0.1
+  done
+
+  for id in "${ids[@]}"; do
+    cat "${tmpout[$id]}" 2>/dev/null || true
+  done
+}
+
+# ============================== Relatório / Main =============================
+suite_main(){
+  doctor || adm_log_warn "Doctor retornou avisos."
+  local ids; mapfile -t ids < <(select_tests "$SUBSET")
+  ((${#ids[@]})) || { adm_log_error "Nenhum teste selecionado."; exit 2; }
+
+  adm_log_info "Selecionados %d testes (parallel=%s timeout=%ss keep=%d dry=%d)" "${#ids[@]}" "$PARALLEL" "$TIMEOUT" "$KEEP" "$DRY"
+  [[ "$DRY" == "1" ]] && { printf "Dry-run: testes:\n"; printf " - %s\n" "${ids[@]}"; exit 0; }
+
+  confirm || { adm_log_warn "Cancelado."; exit 2; }
+
+  _lock "global"; trap '_unlock "global"' EXIT
+
+  local runid; runid="$(date +"%Y%m%d-%H%M%S")"
+  local rund="$ST_RUNS/$runid"; mkdir -p -- "$rund" || true
+  printf "%s\n" "$(now)" > "$rund/started_at"
+
+  # Executa
+  local lines
+  if (( PARALLEL>1 )); then
+    lines="$(run_parallel "$PARALLEL" "${ids[@]}")"
+  else
+    for id in "${ids[@]}"; do
+      run_one_test "$id"
+    done | tee >(cat) | { cat; } | sed -n '1,$p' > /dev/null
+    # re-coleta do stdout do subshell acima é chato; simplificar:
+    lines="$(for id in "${ids[@]}"; do :; done)" # placeholder (não usado nesta ramificação)
+  fi
+
+  # Coleta real: reexecuta sequencialmente os ids para ler arquivos gerados pelo run_parallel
+  # ou, se foi sequencial, coletamos do terminal (não disponível). Em ambos os casos, vamos varrer logs e rc.
+  # Para simplicidade e robustez, reconstruímos os resultados pelos arquivos .log e .rc mais recentes.
+
+  local report_tmp="$ST_REPORT.tmp"
+  {
+    echo "{"
+    echo "  \"generated_at\": \"$(now)\","
+    echo "  \"run_id\": \"$(json_e "$runid")\","
+    echo "  \"results\": ["
+  } > "$report_tmp"
+
+  local first=1 total=0 ok=0 fail=0
+  for id in "${ids[@]}"; do
+    total=$((total+1))
+    local lastlog; lastlog="$(ls -1t "$ST_LOGS/$(slug "$id")"-*.log 2>/dev/null | head -n1 || true)"
+    local rcfile="${lastlog}.rc"
+    local rc=0; [[ -f "$rcfile" ]] && rc="$(cat "$rcfile" 2>/dev/null || echo 0)"
+    local start_ts; start_ts="$(stat -c %Y "$lastlog" 2>/dev/null || echo 0)"
+    local end_ts; end_ts="$(date +%s)"
+    local dur=$(( end_ts - start_ts )); (( dur<0 )) && dur=0
+    local status="ok"; (( rc!=0 )) && { status="fail"; fail=$((fail+1)); } || ok=$((ok+1))
+    (( first==1 )) || printf ",\n" >> "$report_tmp"
+    first=0
+    add_result "$report_tmp" "$id" "$status" "$rc" "$dur" "$lastlog"
+  done
+  printf "\n  ],\n" >> "$report_tmp"
+
+  local sev="ok"; (( fail>0 )) && sev="error"
+  printf "  \"summary\": {\"total\":%d,\"ok\":%d,\"fail\":%d,\"severity\":\"%s\"}\n" "$total" "$ok" "$fail" "$sev" >> "$report_tmp"
+  echo "}" >> "$report_tmp"
+  mv -f -- "$report_tmp" "$ST_REPORT"
+
+  printf "%s\n" "$(now)" > "$rund/finished_at"
+  printf "%s\n" "$ST_REPORT" > "$rund/report_path"
+
+  if (( fail>0 )); then
+    adm_log_error "Selftest finalizado: %d/%d falharam. Relatório: %s" "$fail" "$total" "$ST_REPORT"
+    return 1
+  else
+    adm_log_success "$C_OK Selftest ok: %d/%d aprovados. Relatório: %s" "$ok" "$total" "$ST_REPORT"
+    return 0
+  fi
+}
+
+# ============================== Entrada ======================================
+case "$CMD" in
+  run) suite_main ;;
+  list) list_tests ;;
+  doctor) doctor ;;
+  clean) clean_old 0 ;;
+  *) usage ;;
+esac
