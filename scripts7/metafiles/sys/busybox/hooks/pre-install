@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+# Instala em /usr/bin/busybox e cria symlinks padrão em /bin, /sbin, etc.
+$MAKE install CONFIG_PREFIX="${DESTDIR}"
