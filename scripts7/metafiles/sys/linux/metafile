@@ -1,0 +1,12 @@
+name=linux
+version=6.10.10
+category=sys
+run_deps=
+build_deps=binutils-stage2,gcc-final
+opt_deps=linux-firmware
+num_builds=0
+description=Linux kernel: image, módulos, System.map e config com integração ao adm-mkinitramfs
+homepage=https://www.kernel.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.10.10.tar.xz
