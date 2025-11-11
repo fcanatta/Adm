@@ -134,4 +134,12 @@ clang --version
 cc --version          # deve apontar para clang se ativou ADM_SET_DEFAULT_CLANG=1
 ld --version          # deve apontar para lld se o symlink foi criado
 
+# Instalado a pilha
+# Se ainda não instalou a pilha base:
+adm install clang-toolchain     --jobs=8 --profile=normal
 
+# Runtimes do target (inclui compiler-rt, libcxxabi, libcxx)
+adm install clang-runtime       --jobs=8 --profile=normal
+
+# (opcional) Unwinder mais completo
+adm install libunwind           --jobs=8 --profile=normal
