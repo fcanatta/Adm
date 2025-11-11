@@ -1,0 +1,12 @@
+name=util-linux
+version=2.40.2
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Misc Linux utilities
+homepage=https://util-linux.readthedocs.io/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz,https://www.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz
