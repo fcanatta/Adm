@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/99-main
+# -----------------------------------------------------------------------------
+# ADM - Main CLI
+# - Porta de entrada única: 'adm <ação> [opções]'
+# - Orquestra: resolver -> fetch -> patch -> hooks -> build -> pack -> install
+# - Inclui 'adm install <programa>', 'adm search', 'adm info', 'adm menu' (TUI)
+# - Pass-through para todos os scripts (00..95), com validações e logs
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+# ============================== Caminhos & Estado ============================
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_COLOR:=auto}"
+: "${ADM_PROFILE:=normal}"
+
+MAIN_STATE="$ADM_STATE/main"
+MAIN_LOGS="$MAIN_STATE/logs"
+MAIN_RUNS="$MAIN_STATE/runs"
+MAIN_LOCKS="$MAIN_STATE/locks"
+MAIN_REPORT="$MAIN_STATE/report.json"
+
+mkdir -p -- "$MAIN_STATE" "$MAIN_LOGS" "$MAIN_RUNS" "$MAIN_LOCKS" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) ============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _TTY=$([[ -t 1 ]] && echo 1 || echo 0)
+  [[ "${NO_COLOR:-}" != "" ]] && ADM_COLOR=false
+  [[ "$ADM_COLOR" == "auto" ]] && ADM_COLOR=$([[ "$_TTY" == 1 ]] && echo true || echo false)
+  if [[ "$ADM_COLOR" == "true" ]]; then
+    C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_M=$'\033[35m'; C_C=$'\033[36m'; C_D=$'\033[2m'; C_X=$'\033[0m'
+    C_OK=$'\xE2\x9C\x85'; C_NO=$'\xE2\x9D\x8C'; C_SP=$'\xE2\x8C\x9B'
+  else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_M=""; C_C=""; C_D=""; C_X=""
+    C_OK="[OK]"; C_NO="[X]"; C_SP="[...]"
+  fi
+  ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(ts)" "$C_D" "$C_X" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n"  "$(ts)" "$C_B" "$C_X" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n"  "$(ts)" "$C_Y" "$C_X" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(ts)" "$C_R" "$C_X" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(ts)" "$C_G" "$C_X" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+now(){ date -Iseconds; }
+slug(){ printf "%s" "$1" | tr ' /' '__' | tr -cd '[:alnum:]_.-'; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+
+lock_get(){
+  local key="$1"; mkdir -p -- "$MAIN_LOCKS" || true
+  local d="$MAIN_LOCKS/main-$(slug "$key").lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>900)) && { adm_log_error "Timeout lock %s" "$key"; return 1; } done
+  fi
+}
+lock_rel(){ local key="$1"; rm -rf -- "$MAIN_LOCKS/main-$(slug "$key").lockdir" 2>/dev/null || true; }
+
+# ============================== Arte de logo =================================
+logo(){
+  cat <<'L'
+   ___    ____  __  __
+  / _ \  / __ \/ / / /   ADM
+ / /_/ / / / / / /_/ /   build from source, smart.
+/ ____/ / /_/ / __  /    99-main
+/_/      \____/_/ /_/
+
+L
+}
+
+# ============================== Ajuda ========================================
+usage(){
+  cat <<'USAGE'
+Uso: adm <comando> [opções]
+
+Comandos principais:
+  install <cat/pkg|pkg>   Constrói e instala o(s) programa(s) (pipeline completo)
+  search  <termo>         Procura programas nos metafiles
+  info    <cat/pkg|pkg>   Mostra informações do programa (metafile + instalado)
+  menu                    UI interativa (fzf/gum/dialog) para operações comuns
+  doctor                  Checa o ecossistema, scripts e diretórios
+  status                  Mostra panorama (toolchain, perfis, pacotes)
+  plan    [filtros]       Gera ordem topológica de build (sem executar)
+  build   [filtros]       Orquestra fetch->patch->build (opções abaixo)
+  update  [opções]        Encaminha para 70-update
+  rebuild [gatilhos]      Encaminha para 92-rebuilder
+  audit   [opções]        Encaminha para 85-audit
+  cleanup [opções]        Encaminha para 80-cleanup
+  selftest [opções]       Encaminha para 95-selftest
+  pass    <NN-nome> ...   Pass-through para um script ADM (NN-nome)
+
+Opções globais:
+  --yes              Não perguntar confirmação
+  --dry-run          Simular sem executar efeitos
+  --parallel=N       Paralelismo para compilações
+  --profile=P        aggressive|normal|minimal (default: normal)
+  --root=DIR         Raiz de instalação (default: /)
+  --json-out=ARQ     Salvar relatório JSON desta execução
+  --color=auto|always|never
+  --debug            Verbose interno
+
+Exemplos:
+  adm install apps/wget
+  adm search zlib
+  adm info libs/zlib
+  adm build --targets=apps/wget --with-deps --pack --install --parallel=8
+  adm rebuild --toolchain-diff --with-rdeps --parallel=8 --keep-going
+  adm pass 40-builder plan --dry-run --targets=apps/wget
+USAGE
+}
+
+# ============================== Globals (CLI) ================================
+YES=0; DRY=0; PARALLEL=0; PROFILE="$ADM_PROFILE"; ROOT="/"; JSON_OUT=""
+COLOR="$ADM_COLOR"; DEBUG="${ADM_DEBUG:-false}"
+
+# ============================== Leitura de config ============================
+read_conf(){
+  local f
+  for f in /etc/adm/adm.conf "$ADM_ROOT/adm.conf" "${HOME:-}/.config/adm/adm.conf"; do
+    [[ -f "$f" ]] || continue
+    # formato: chave=valor (ignora comentários)
+    while IFS='=' read -r k v; do
+      k="${k%%#*}"; v="${v%%#*}"; k="$(echo "$k" | xargs)" ; v="$(echo "$v" | xargs)"
+      [[ -z "$k" ]] && continue
+      case "$k" in
+        yes) YES="$v" ;; dry_run) DRY="$v" ;; parallel) PARALLEL="$v" ;;
+        profile) PROFILE="$v" ;; root) ROOT="$v" ;; json_out) JSON_OUT="$v" ;;
+        color) COLOR="$v" ;; debug) DEBUG="$v" ;;
+      esac
+    done < "$f"
+  done
+}
+
+# ============================== Parse CLI ====================================
+CMD="${1:-}"; shift || true
+read_conf
+
+while (( $# )); do
+  case "$1" in
+    --yes) YES=1 ;;
+    --dry-run) DRY=1 ;;
+    --parallel=*) PARALLEL="${1#--parallel=}" ;;
+    --profile=*) PROFILE="${1#--profile=}" ;;
+    --root=*) ROOT="${1#--root=}" ;;
+    --json-out=*) JSON_OUT="${1#--json-out=}" ;;
+    --color=*) COLOR="${1#--color=}" ;;
+    --debug) DEBUG=true ;;
+    ""|-h|--help|help) usage; exit 0 ;;
+    *) set -- "$@" "$1"; break ;; # devolve para subcomandos
+  esac; shift || true
+done
+
+[[ -z "${CMD:-}" ]] && { logo; usage; exit 0; }
+
+# normaliza ROOT
+ROOT="$(abspath "$ROOT")"
+
+# ============================== TUI helpers ==================================
+tui_have(){ have gum || have fzf || have dialog || have whiptail; }
+tui_menu(){
+  local title="$1"; shift
+  if have gum; then
+    gum choose --header "$title" "$@"
+  elif have fzf; then
+    printf "%s\n" "$@" | fzf --prompt "$title > " --height=80% --reverse
+  elif have dialog; then
+    local tmp; tmp="$(mktemp)"; local opts=()
+    local i=1; for item in "$@"; do opts+=("$i" "$item"); i=$((i+1)); done
+    dialog --clear --stdout --title "$title" --menu "Selecione" 20 70 12 "${opts[@]}" > "$tmp" || return 1
+    local idx; idx="$(cat "$tmp")"; idx=${idx:-1}; echo "${!idx}"
+  elif have whiptail; then
+    local opts=(); local i=1; for item in "$@"; do opts+=("$i" "$item"); i=$((i+1)); done
+    local idx; idx=$(whiptail --title "$title" --menu "Selecione" 20 70 12 "${opts[@]}" 3>&1 1>&2 2>&3) || return 1
+    idx=${idx:-1}; echo "${!idx}"
+  else
+    printf "%s\n" "$@" | nl -ba
+    read -r -p "Escolha [número]: " n || true
+    sed -n "${n:-1}p" <<< "$(printf "%s\n" "$@")"
+  fi
+}
+
+# ============================== Checagens base ===============================
+doctor(){
+  local fail=0
+  for b in bash awk sed grep find tar xz; do
+    have "$b" || { adm_log_warn "Ferramenta ausente: %s" "$b"; fail=$((fail+1)); }
+  done
+  mkdir -p -- "$MAIN_STATE" "$MAIN_LOGS" "$MAIN_RUNS" || { adm_log_error "Sem acesso a state dirs"; fail=$((fail+1)); }
+  [[ $fail -gt 0 ]] && return 1 || return 0
+}
+
+confirm(){
+  (( YES==1 )) && return 0
+  read -r -p "Confirmar? [y/N] " a || true
+  [[ "$a" =~ ^[yY]$ ]]
+}
+
+# ============================== Ajuda de scripts =============================
+script_path(){ local n="$1"; echo "$ADM_ROOT/scripts/$n"; }
+script_have(){ [[ -x "$(script_path "$1")" ]]; }
+
+# ============================== Busca/Info ===================================
+mf_path(){
+  local name="$1"
+  [[ "$name" == */* ]] && { [[ -f "$ADM_ROOT/metafiles/$name/metafile" ]] && echo "$ADM_ROOT/metafiles/$name/metafile" || echo ""; return; }
+  # busca por basename
+  local m; m="$(find "$ADM_ROOT/metafiles" -mindepth 3 -maxdepth 3 -name metafile -path "*/$name/metafile" -print -quit 2>/dev/null || true)"
+  echo "${m:-}"
+}
+mf_read(){
+  local mf="$1" key="$2"
+  awk -F= -v k="$key" '$1==k{print substr($0,length(k)+2)}' "$mf" 2>/dev/null || echo ""
+}
+search_programs(){
+  local term="$1"
+  find "$ADM_ROOT/metafiles" -mindepth 3 -maxdepth 3 -name metafile -print 2>/dev/null \
+    | while read -r mf; do
+        local cat; cat="$(basename "$(dirname "$(dirname "$mf")")")"
+        local pkg; pkg="$(basename "$(dirname "$mf")")"
+        local name="$cat/$pkg"
+        local desc; desc="$(mf_read "$mf" description)"
+        if [[ "$name" == *"$term"* || "$pkg" == *"$term"* || "$desc" == *"$term"* ]]; then
+          printf "%-32s  %s\n" "$name" "${desc:-"(sem descrição)"}"
+        fi
+      done
+}
+info_program(){
+  local spec="$1"
+  local mf; mf="$(mf_path "$spec")"
+  [[ -n "$mf" ]] || { adm_log_error "Metafile não encontrado para '%s'." "$spec"; return 2; }
+  local cat; cat="$(basename "$(dirname "$(dirname "$mf")")")"
+  local pkg; pkg="$(basename "$(dirname "$mf")")"
+  local name="$cat/$pkg"
+  local ver desc home maint run build opt src sums
+  ver="$(mf_read "$mf" version)"; desc="$(mf_read "$mf" description)"; home="$(mf_read "$mf" homepage)"
+  maint="$(mf_read "$mf" maintainer)"; run="$(mf_read "$mf" run_deps)"; build="$(mf_read "$mf" build_deps)"; opt="$(mf_read "$mf" opt_deps)"
+  src="$(mf_read "$mf" sources)"; sums="$(mf_read "$mf" sha256sums)"
+
+  echo "== $name =="
+  echo "versão      : $ver"
+  echo "descrição   : ${desc:-"(sem)"}"
+  echo "homepage    : ${home:-"(sem)"}"
+  echo "maintainer  : ${maint:-"(sem)"}"
+  echo "run_deps    : ${run:-"(nenhum)"}"
+  echo "build_deps  : ${build:-"(nenhum)"}"
+  echo "opt_deps    : ${opt:-"(nenhum)"}"
+  echo "sources     : ${src:-"(sem)"}"
+  echo "sha256sums  : ${sums:-"(sem)"}"
+
+  # se instalado:
+  local js="$ADM_STATE/db/installed/${name//\//__}.json"
+  if [[ -f "$js" ]]; then
+    local iver; iver="$(awk -F\" '/"version":/ {print $4; exit}' "$js" 2>/dev/null || echo "")"
+    echo "instalado   : sim ($iver)"
+  else
+    echo "instalado   : não"
+  fi
+}
+# (continuação de /usr/src/adm/scripts/99-main)
+
+# ============================== Orquestração: pipeline =======================
+apply_profile_env(){
+  local p="$1"
+  if script_have 12-profile-manager; then
+    eval "$("$(script_path 12-profile-manager)" export --profile="$p" 2>/dev/null || true)"
+  else
+    case "$p" in
+      aggressive) export CFLAGS="-O3 -pipe" CXXFLAGS="-O3 -pipe" LDFLAGS="-Wl,-O1" ;;
+      minimal)    export CFLAGS="-O2 -pipe" CXXFLAGS="-O2 -pipe" LDFLAGS="" ;;
+      normal|*)   export CFLAGS="-O2 -pipe" CXXFLAGS="-O2 -pipe" LDFLAGS="-Wl,-O1" ;;
+    esac
+  fi
+}
+
+ensure_scripts(){
+  local req=(10-parser 25-resolver 30-fetcher 32-patcher 34-hooks-runner 40-builder 50-installer 52-packer)
+  local missing=0
+  for s in "${req[@]}"; do
+    script_have "$s" || { adm_log_error "Script obrigatório ausente: %s" "$s"; missing=1; }
+  done
+  (( missing == 0 ))
+}
+
+resolve_targets(){
+  # Entrada: nomes CSV/array; se vazio, erro
+  local -a in=("$@")
+  ((${#in[@]})) || { adm_log_error "Nenhum alvo especificado."; return 2; }
+  # normaliza cat/pkg
+  local out=()
+  for x in "${in[@]}"; do
+    if [[ "$x" == */* ]]; then out+=("$x"); else
+      # tenta localizar por basename
+      local mf; mf="$(mf_path "$x")"; [[ -n "$mf" ]] || { adm_log_error "Metafile não encontrado para '%s'." "$x"; return 2; }
+      local cat; cat="$(basename "$(dirname "$(dirname "$mf")")")"
+      local pkg; pkg="$(basename "$(dirname "$mf")")"
+      out+=("$cat/$pkg")
+    fi
+  done
+  printf "%s\n" "${out[@]}"
+}
+
+# Executa todo o pipeline para 1 pacote (com deps se --with-deps)
+pipeline_one(){
+  local name="$1" with_deps="$2" do_pack="$3" do_install="$4" par="$5"
+  local targets=("$name")
+  if (( with_deps==1 )); then
+    if script_have 25-resolver; then
+      mapfile -t targets < <( "$(script_path 25-resolver)" tree --name="$name" --order=topo 2>/dev/null || echo "$name" )
+    else
+      adm_log_warn "Resolver ausente; seguindo apenas '%s'." "$name"
+      targets=("$name")
+    fi
+  fi
+
+  # Hooks pre-build global
+  script_have 34-hooks-runner && "$(script_path 34-hooks-runner)" run --stage=pre-build --name="$name" || true
+
+  # Paralelismo opcional: usa 44 se existir; senão sequencial
+  if (( par>1 )) && script_have 44-parallel-scheduler; then
+    adm_log_info "Agendando pipeline com %d tarefas paralelas…" "$par"
+    "$(script_path 44-parallel-scheduler)" run --parallel="$par" -- \
+      /bin/bash -lc "set -Eeuo pipefail; $(printf '%q ' "$0") __internal_build %q %q %q %q ${targets[*]@Q}" \
+      || return 1
+  else
+    __internal_build "$name" "$with_deps" "$do_pack" "$do_install" "$par" "${targets[@]}" || return 1
+  fi
+
+  # Hooks post-build global
+  script_have 34-hooks-runner && "$(script_path 34-hooks-runner)" run --stage=post-build --name="$name" || true
+}
+
+# Modo interno para chamadas paralelas: compila a lista calculada (já ordenada)
+if [[ "${1:-}" == "__internal_build" ]]; then
+  shift || true
+  _root_name="$1"; _with_deps="$2"; _do_pack="$3"; _do_install="$4"; _par="$5"; shift 5 || true
+  set -o pipefail
+  for n in "$@"; do
+    adm_log_info "▶ Construindo %s" "$n"
+    # fetch
+    "$(script_path 30-fetcher)" fetch --name="$n" || exit 2
+    # patch
+    "$(script_path 32-patcher)" apply --package="$n" || true
+    # hooks pre pkg
+    script_have 34-hooks-runner && "$(script_path 34-hooks-runner)" run --stage=pre-package --name="$n" || true
+    # build
+    "$(script_path 40-builder)" build --name="$n" --profile="${PROFILE}" ${PARALLEL:+--parallel="$PARALLEL"} || exit 2
+    # pack opcional
+    if (( _do_pack==1 )); then
+      "$(script_path 52-packer)" pack --name="$n" || exit 2
+    fi
+    # install opcional
+    if (( _do_install==1 )); then
+      "$(script_path 50-installer)" install --name="$n" --root="${ROOT}" || exit 2
+    fi
+    # hooks post pkg
+    script_have 34-hooks-runner && "$(script_path 34-hooks-runner)" run --stage=post-package --name="$n" || true
+  done
+  exit 0
+fi
+
+# ============================== Comandos de alto nível =======================
+
+cmd_install(){
+  local arg="${1:-}"; shift || true
+  [[ -n "$arg" ]] || { adm_log_error "Uso: adm install <cat/pkg|pkg> [--with-deps] [--pack] [--parallel=N]"; return 2; }
+  local WITH_DEPS=1 PACK=0
+  while (( $# )); do
+    case "$1" in
+      --with-deps) WITH_DEPS=1 ;;
+      --no-deps)   WITH_DEPS=0 ;;
+      --pack)      PACK=1 ;;
+      --no-pack)   PACK=0 ;;
+      --parallel=*) PARALLEL="${1#--parallel=}" ;;
+      *) adm_log_warn "Opção desconhecida: %s" "$1" ;;
+    esac; shift || true
+  done
+
+  ensure_scripts || return 2
+  apply_profile_env "$PROFILE"
+
+  mapfile -t names < <(resolve_targets "$arg") || return 2
+  ((${#names[@]})) || { adm_log_error "Nenhum alvo resolvido."; return 2; }
+
+  adm_log_info "Instalação: targets=%s deps=%s pack=%s install_root=%s profile=%s parallel=%s" \
+      "${names[*]}" "$WITH_DEPS" "$PACK" "$ROOT" "$PROFILE" "${PARALLEL:-0}"
+
+  (( DRY==1 )) && { echo "[dry-run] pipeline seria executado."; return 0; }
+  confirm || { adm_log_warn "Cancelado."; return 2; }
+
+  lock_get "install"
+  trap 'lock_rel "install"' RETURN
+
+  local rc=0
+  for nm in "${names[@]}"; do
+    pipeline_one "$nm" "$WITH_DEPS" "$PACK" 1 "${PARALLEL:-0}" || { rc=1; break; }
+  done
+
+  # auditoria rápida do pacote raiz (se disponível)
+  if (( rc==0 )) && script_have 85-audit; then
+    "$(script_path 85-audit)" run --targets="${names[0]}" --json || true
+  fi
+
+  (( rc==0 )) && adm_log_success "$C_OK Instalação concluída." || adm_log_error "Instalação finalizada com erros."
+  return "$rc"
+}
+
+cmd_search(){
+  local term="${1:-}"
+  [[ -n "$term" ]] || { adm_log_error "Uso: adm search <termo>"; return 2; }
+  search_programs "$term" | sed 's/^/ - /'
+}
+
+cmd_info(){
+  local spec="${1:-}"
+  [[ -n "$spec" ]] || { adm_log_error "Uso: adm info <cat/pkg|pkg>"; return 2; }
+  info_program "$spec"
+}
+
+cmd_menu(){
+  logo
+  tui_have || adm_log_warn "Ferramentas TUI não encontradas; usando menu básico."
+  local choice
+  choice="$(tui_menu "ADM Menu" \
+      "Instalar programa" \
+      "Buscar programa" \
+      "Informações do programa" \
+      "Build (com opções)" \
+      "Update" \
+      "Rebuild" \
+      "Audit" \
+      "Cleanup" \
+      "Selftest" \
+      "Sair")" || return 2
+  case "$choice" in
+    "Instalar programa")
+      read -r -p "Nome (cat/pkg ou pkg): " p || true
+      [[ -n "$p" ]] && cmd_install "$p" --with-deps --pack
+      ;;
+    "Buscar programa")
+      read -r -p "Termo: " t || true
+      [[ -n "$t" ]] && cmd_search "$t"
+      ;;
+    "Informações do programa")
+      read -r -p "Nome (cat/pkg ou pkg): " i || true
+      [[ -n "$i" ]] && cmd_info "$i"
+      ;;
+    "Build (com opções)")
+      read -r -p "Targets (csv cat/pkg): " tg || true
+      [[ -n "$tg" ]] && cmd_build --targets="$tg" --with-deps
+      ;;
+    "Update")
+      cmd_update --apply
+      ;;
+    "Rebuild")
+      cmd_rebuild --toolchain-diff --with-rdeps
+      ;;
+    "Audit")
+      cmd_audit --all --json
+      ;;
+    "Cleanup")
+      cmd_cleanup --dry-run
+      ;;
+    "Selftest")
+      cmd_selftest --subset=core,fetcher,builder,installer,audit --parallel=4
+      ;;
+    *) echo "Saindo."; return 0 ;;
+  esac
+}
+# (continuação de /usr/src/adm/scripts/99-main)
+
+# ============================== Encaminhadores ================================
+cmd_build(){
+  # Opções: --targets= --with-deps --pack --install --parallel=N
+  ensure_scripts || return 2
+  apply_profile_env "$PROFILE"
+  local TARGETS="" WITH_DEPS=0 DO_PACK=0 DO_INSTALL=0
+  while (( $# )); do
+    case "$1" in
+      --targets=*) TARGETS="${1#--targets=}" ;;
+      --with-deps) WITH_DEPS=1 ;;
+      --pack)      DO_PACK=1 ;;
+      --install)   DO_INSTALL=1 ;;
+      --parallel=*) PARALLEL="${1#--parallel=}" ;;
+      *) adm_log_warn "Opção desconhecida: %s" "$1" ;;
+    esac; shift || true
+  done
+  [[ -n "$TARGETS" ]] || { adm_log_error "Uso: adm build --targets=cat/pkg,..."; return 2; }
+  IFS=',' read -r -a arr <<< "$TARGETS"
+  ((${#arr[@]})) || { adm_log_error "Nenhum alvo."; return 2; }
+  (( DRY==1 )) && { echo "[dry-run] build seria executado."; return 0; }
+  confirm || { adm_log_warn "Cancelado."; return 2; }
+
+  lock_get "build"; trap 'lock_rel "build"' RETURN
+  local rc=0
+  for nm in "${arr[@]}"; do
+    pipeline_one "$nm" "$WITH_DEPS" "$DO_PACK" "$DO_INSTALL" "${PARALLEL:-0}" || { rc=1; break; }
+  done
+  return "$rc"
+}
+
+cmd_update(){ # encaminha para 70-update
+  script_have 70-update || { adm_log_error "70-update ausente."; return 2; }
+  "$(script_path 70-update)" "$@" || return $?
+}
+
+cmd_rebuild(){ # encaminha para 92-rebuilder
+  script_have 92-rebuilder || { adm_log_error "92-rebuilder ausente."; return 2; }
+  "$(script_path 92-rebuilder)" "$@" || return $?
+}
+
+cmd_audit(){ # encaminha para 85-audit
+  script_have 85-audit || { adm_log_error "85-audit ausente."; return 2; }
+  "$(script_path 85-audit)" "$@" || return $?
+}
+
+cmd_cleanup(){ # encaminha para 80-cleanup
+  script_have 80-cleanup || { adm_log_error "80-cleanup ausente."; return 2; }
+  "$(script_path 80-cleanup)" "$@" || return $?
+}
+
+cmd_selftest(){ # encaminha para 95-selftest
+  script_have 95-selftest || { adm_log_error "95-selftest ausente."; return 2; }
+  "$(script_path 95-selftest)" "$@" || return $?
+}
+
+cmd_status(){
+  echo "== ADM Status =="
+  echo "root       : $ADM_ROOT"
+  echo "state      : $ADM_STATE"
+  echo "profile    : $PROFILE"
+  echo "rootfs     : $ROOT"
+  if script_have 14-toolchain-db; then
+    echo "-- toolchain --"
+    "$(script_path 14-toolchain-db)" snapshot || true
+  fi
+  if script_have 12-profile-manager; then
+    echo "-- profile snapshot --"
+    "$(script_path 12-profile-manager)" snapshot || true
+  fi
+  local n_inst; n_inst=$(find "$ADM_STATE/db/installed" -maxdepth 1 -name '*.json' 2>/dev/null | wc -l || echo 0)
+  echo "installed  : $n_inst pacotes"
+}
+
+cmd_plan(){
+  # Usa 25-resolver se houver
+  script_have 25-resolver || { adm_log_error "25-resolver ausente."; return 2; }
+  "$(script_path 25-resolver)" plan "$@" || return $?
+}
+
+cmd_pass(){
+  local sc="${1:-}"; shift || true
+  [[ -n "$sc" ]] || { adm_log_error "Uso: adm pass <NN-nome> [args...]"; return 2; }
+  script_have "$sc" || { adm_log_error "Script não encontrado: %s" "$sc"; return 2; }
+  "$(script_path "$sc")" "$@" || return $?
+}
+
+# ============================== Relatório JSON ===============================
+report_begin(){
+  local out="$1"
+  {
+    echo "{"
+    echo "  \"generated_at\": \"$(now)\","
+    echo "  \"cmd\": \"$(json_e "$CMD")\","
+    echo "  \"args\": \"$(json_e "$*")\","
+    echo "  \"profile\": \"$(json_e "$PROFILE")\","
+    echo "  \"root\": \"$(json_e "$ROOT")\","
+    echo "  \"results\": {"
+  } > "$out"
+}
+report_end(){
+  local out="$1" rc="$2"
+  echo "  },\"rc\": $rc" >> "$out"
+  echo "}" >> "$out"
+}
+
+# ============================== Main dispatch ================================
+main(){
+  doctor || adm_log_warn "Doctor apontou avisos."
+  local rc=0
+  local runid; runid="$(date +"%Y%m%d-%H%M%S")"
+  local rdir="$MAIN_RUNS/$runid"; mkdir -p -- "$rdir" || true
+  local jout="${JSON_OUT:-$MAIN_REPORT}"
+
+  case "$CMD" in
+    install) report_begin "$jout" "$@"; cmd_install "$@"; rc=$?; echo "    \"install_rc\": $rc" >> "$jout" ;;
+    search)  report_begin "$jout" "$@"; cmd_search "$@"; rc=$?; echo "    \"search_rc\": $rc"  >> "$jout" ;;
+    info)    report_begin "$jout" "$@"; cmd_info "$@";   rc=$?; echo "    \"info_rc\": $rc"    >> "$jout" ;;
+    menu)    cmd_menu; rc=$? ;;  # menu é interativo, sem json
+    doctor)  report_begin "$jout" "$@"; doctor; rc=$?;   echo "    \"doctor_rc\": $rc"  >> "$jout" ;;
+    status)  report_begin "$jout" "$@"; cmd_status "$@"; rc=$?; echo "    \"status_rc\": $rc"  >> "$jout" ;;
+    build)   report_begin "$jout" "$@"; cmd_build "$@";  rc=$?; echo "    \"build_rc\": $rc"   >> "$jout" ;;
+    update)  report_begin "$jout" "$@"; cmd_update "$@"; rc=$?; echo "    \"update_rc\": $rc"  >> "$jout" ;;
+    rebuild) report_begin "$jout" "$@"; cmd_rebuild "$@";rc=$?; echo "    \"rebuild_rc\": $rc" >> "$jout" ;;
+    audit)   report_begin "$jout" "$@"; cmd_audit "$@";  rc=$?; echo "    \"audit_rc\": $rc"   >> "$jout" ;;
+    cleanup) report_begin "$jout" "$@"; cmd_cleanup "$@";rc=$?; echo "    \"cleanup_rc\": $rc" >> "$jout" ;;
+    selftest)report_begin "$jout" "$@"; cmd_selftest "$@";rc=$?;echo "    \"selftest_rc\": $rc\" " >> "$jout" ;;
+    plan)    report_begin "$jout" "$@"; cmd_plan "$@";   rc=$?; echo "    \"plan_rc\": $rc"    >> "$jout" ;;
+    pass)    cmd_pass "$@"; rc=$? ;; # pass-through sem json para não poluir
+    *)       usage; rc=2 ;;
+  esac
+
+  # Fecha JSON (se não interativo/pass)
+  case "$CMD" in
+    menu|pass) : ;;
+    *) report_end "$jout" "$rc" ;;
+  esac
+
+  return "$rc"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
