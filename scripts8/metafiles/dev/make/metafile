@@ -1,0 +1,12 @@
+name=make
+version=4.4.1
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU make
+homepage=https://www.gnu.org/software/make/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz,https://ftpmirror.gnu.org/make/make-4.4.1.tar.gz
