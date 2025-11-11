@@ -1,0 +1,12 @@
+name=grep
+version=3.11
+category=apps
+run_deps=
+build_deps=
+opt_deps=pcre2
+num_builds=0
+description=GNU grep (busca por padrões)
+homepage=https://www.gnu.org/software/grep/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz
