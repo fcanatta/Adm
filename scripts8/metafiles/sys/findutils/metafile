@@ -1,0 +1,12 @@
+name=findutils
+version=4.10.0
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU findutils
+homepage=https://www.gnu.org/software/findutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz,https://ftpmirror.gnu.org/findutils/findutils-4.10.0.tar.xz
