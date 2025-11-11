@@ -1,0 +1,655 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/25-resolver
+# -----------------------------------------------------------------------------
+# ADM - Dependency Resolver
+# - Indexa metafiles (key=value)
+# - Alternativas (a|b) + restrições de versão (>=,>,=,<,<=,~)
+# - Virtuais via provides= ; conflitos via conflicts=
+# - Integra 20-detector (deps heurísticas)
+# - Toposort, detecção de ciclos, plano JSON e DOT
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_META_ROOT:=$ADM_ROOT/metafiles}"
+: "${ADM_UPDATE_ROOT:=$ADM_ROOT/update}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_DETECT_STATE:=$ADM_STATE/detect}"
+RESOLVER_STATE="$ADM_STATE/resolver"
+INDEX_DIR="$RESOLVER_STATE/index"
+INDEX_FILE="$INDEX_DIR/index.tsv"  # cols: name  version  category  path  provides  conflicts
+PROVIDE_MAP="$INDEX_DIR/provides.tsv" # provide -> names (TAB sep)
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _RV_COLOR=${ADM_COLOR:-auto}
+  _RV_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _RV_COLOR=false; fi
+  if [[ "$_RV_COLOR" == "auto" ]]; then
+    _RV_COLOR=$([[ "$_RV_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_RV_COLOR" == "true" ]]; then
+    __r_red=$'\033[31m'; __r_grn=$'\033[32m'; __r_yel=$'\033[33m'
+    __r_blu=$'\033[34m'; __r_mag=$'\033[35m'; __r_dim=$'\033[2m'; __r_rst=$'\033[0m'
+  else
+    __r_red=""; __r_grn=""; __r_yel=""; __r_blu=""; __r_mag=""; __r_dim=""; __r_rst=""
+  fi
+  _r_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_r_ts)" "$__r_dim" "$__r_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_r_ts)" "$__r_blu" "$__r_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_r_ts)" "$__r_yel" "$__r_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_r_ts)" "$__r_red" "$__r_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_r_ts)" "$__r_grn" "$__r_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_rv_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_rv_now(){ date +%s; }
+_rv_json_escape(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_rv_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+
+# Semver-like compare (inteiros por ponto; suporta letras ao final ignorando)
+_rv_ver_norm(){ printf "%s" "$1" | sed -E 's/[^0-9.].*$//' ; }
+_rv_ver_cmp(){
+  # echo -1, 0, 1 (a<b, a=b, a>b)
+  local A="$(_rv_ver_norm "$1")" B="$(_rv_ver_norm "$2")"
+  local IFS=.; local -a a=($A) b=($B)
+  local n=${#a[@]}; (( ${#b[@]} > n )) && n=${#b[@]}
+  for ((i=0;i<n;i++)); do
+    local ai=${a[i]:-0}; local bi=${b[i]:-0}
+    ((10#$ai<10#$bi)) && { echo -1; return; }
+    ((10#$ai>10#$bi)) && { echo 1; return; }
+  done
+  echo 0
+}
+_rv_ver_satisfies(){
+  # arg1=ver, arg2=constraint (>=1.2, <=2, =1.0, >, <, ~1.2 (compat: same major))
+  local v="$1" c="$2"
+  [[ -z "$c" ]] && { echo 1; return; }
+  if [[ "$c" =~ ^~([0-9]+)(\.[0-9]+)?$ ]]; then
+    local major="${BASH_REMATCH[1]}"
+    local vmaj="$(echo "$(_rv_ver_norm "$v")" | cut -d. -f1)"
+    [[ "$vmaj" == "$major" ]] && { echo 1; } || echo 0
+    return
+  fi
+  if [[ "$c" =~ ^([><=]{1,2})(.+)$ ]]; then
+    local op="${BASH_REMATCH[1]}" ; local tgt="$(_rv_trim "${BASH_REMATCH[2]}")"
+    local cmp="$(_rv_ver_cmp "$v" "$tgt")"
+    case "$op" in
+      "=")  [[ "$cmp" == "0"  ]] && echo 1 || echo 0 ;;
+      ">")  [[ "$cmp" == "1"  ]] && echo 1 || echo 0 ;;
+      "<")  [[ "$cmp" == "-1" ]] && echo 1 || echo 0 ;;
+      ">=") [[ "$cmp" == "1"  || "$cmp" == "0" ]] && echo 1 || echo 0 ;;
+      "<=") [[ "$cmp" == "-1" || "$cmp" == "0" ]] && echo 1 || echo 0 ;;
+      *) echo 0 ;;
+    esac
+    return
+  fi
+  # nu se constraint inválida → não satisfaz
+  echo 0
+}
+
+# ============================== Metafile parse ===============================
+# Formato base esperado:
+# name=programa
+# version=1.2.3
+# category=apps|libs|sys|dev|...
+# run_deps=dep1,dep2
+# build_deps=depA,depB
+# opt_deps=depX,depY
+# num_builds=0
+# description=...
+# homepage=https://...
+# maintainer=...
+# sha256sums=sum1,sum2
+# sources=url1,url2
+# (opcionais ampliados pelo resolver)
+# provides=virt1,virt2
+# conflicts=pkgA,pkgB
+
+declare -A MF=()
+
+_rv_kv_read(){
+  local file="$1"
+  MF=()
+  [[ -f "$file" ]] || { adm_log_error "Metafile não encontrado: $file"; return 1; }
+  local line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"; v="$(_rv_trim "${BASH_REMATCH[2]}")"
+      MF["$k"]="$v"
+    else
+      adm_log_warn "Linha inválida em $(basename "$file"): $(printf %q "$line")"
+    fi
+  done < "$file"
+}
+
+_rv_split_csv(){
+  local s="$1"; IFS=',' read -r -a _arr <<< "$s"; printf "%s\n" "${_arr[@]}"
+}
+
+_rv_dep_tokens(){
+  # transforma "a>=1, b|c<=2" em linhas tokenizadas (uma por dep, preservando alternativas)
+  local s="$1"
+  s="$(echo "$s" | tr -s ' ' | sed 's/[[:space:]]*,[[:space:]]*/,/g')"
+  IFS=',' read -r -a parts <<< "$s"
+  local p
+  for p in "${parts[@]}"; do
+    p="$(_rv_trim "$p")"
+    [[ -n "$p" ]] && printf "%s\n" "$p"
+  done
+}
+
+_rv_parse_alt(){
+  # Entrada "a|b<=2|virt/foo>=1" → imprime alternativas "name constraint"
+  local token="$1"
+  IFS='|' read -r -a opts <<< "$token"
+  local o
+  for o in "${opts[@]}"; do
+    o="$(_rv_trim "$o")"
+    local name="$o" c=""
+    if [[ "$o" =~ ^([^<>=~]+)([<>=~].+)?$ ]]; then
+      name="$(_rv_trim "${BASH_REMATCH[1]}")"
+      c="$(_rv_trim "${BASH_REMATCH[2]:-}")"
+    fi
+    [[ -n "$name" ]] && printf "%s\t%s\n" "$name" "$c"
+  done
+}
+
+# ============================== Indexação ====================================
+# Indexa todos os metafiles em ADM_META_ROOT e ADM_UPDATE_ROOT (update sobrepõe).
+
+_resolver_init(){
+  mkdir -p -- "$INDEX_DIR" "$RESOLVER_STATE" || { adm_log_error "Sem acesso a $RESOLVER_STATE"; return 1; }
+  : > "$INDEX_FILE"
+  : > "$PROVIDE_MAP"
+  adm_log_success "Resolver: diretórios prontos em $RESOLVER_STATE"
+}
+
+_index_scan_dir(){
+  local base="$1"
+  [[ -d "$base" ]] || return 0
+  find "$base" -type f -name "metafile" 2>/dev/null | while read -r f; do
+    _rv_kv_read "$f" || continue
+    local name="${MF[name]:-}" ver="${MF[version]:-}" cat="${MF[category]:-}" prov="${MF[provides]:-}" conf="${MF[conflicts]:-}"
+    if [[ -z "$name" || -z "$ver" ]]; then
+      adm_log_warn "Ignorando metafile sem name/version: $f"; continue
+    fi
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$name" "$ver" "$cat" "$f" "${prov:-}" "${conf:-}" >> "$INDEX_FILE"
+    if [[ -n "$prov" ]]; then
+      local p; IFS=',' read -r -a arr <<< "$prov"
+      for p in "${arr[@]}"; do p="$(_rv_trim "$p")"; [[ -n "$p" ]] && printf "%s\t%s\n" "$p" "$name" >> "$PROVIDE_MAP"; done
+    fi
+  done
+}
+
+resolver_index(){
+  _resolver_init || return 1
+  adm_log_info "Indexando metafiles em: $ADM_META_ROOT"
+  _index_scan_dir "$ADM_META_ROOT"
+  adm_log_info "Indexando overrides (update) em: $ADM_UPDATE_ROOT"
+  _index_scan_dir "$ADM_UPDATE_ROOT"
+
+  # Normaliza: se mesmo nome aparece múltiplas versões, manter todas; ordenação ficará para seleção.
+  sort -u -o "$INDEX_FILE" "$INDEX_FILE" || true
+  sort -o "$PROVIDE_MAP" "$PROVIDE_MAP" || true
+
+  local n=$(wc -l < "$INDEX_FILE" 2>/dev/null || echo 0)
+  adm_log_success "Indexados $n pacotes."
+}
+
+# ============================== Pesquisa / seleção ===========================
+
+_index_find_pkg_rows(){
+  local name="$1"
+  awk -F'\t' -v n="$name" '$1==n {print $0}' "$INDEX_FILE" 2>/dev/null
+}
+_index_find_providers(){
+  local provide="$1"
+  awk -F'\t' -v p="$provide" '$1==p {print $2}' "$PROVIDE_MAP" 2>/dev/null | sort -u
+}
+_index_best_version_row(){
+  # name + optional constraint; retorna row inteiro da melhor versão compatível (maior que satisfaz)
+  local name="$1" constraint="$2"
+  local best_row="" best_ver=""
+  while IFS=$'\t' read -r n v cat path prov conf; do
+    [[ -z "$n" ]] && continue
+    if [[ -n "$constraint" ]]; then
+      [[ "$(_rv_ver_satisfies "$v" "$constraint")" == "1" ]] || continue
+    fi
+    if [[ -z "$best_ver" ]] || [[ "$(_rv_ver_cmp "$v" "$best_ver")" == "1" ]]; then
+      best_ver="$v"; best_row="$n"$'\t'"$v"$'\t'"$cat"$'\t'"$path"$'\t'"$prov"$'\t'"$conf"
+    fi
+  done < <(_index_find_pkg_rows "$name")
+  [[ -n "$best_row" ]] && printf "%s\n" "$best_row"
+}
+
+_select_provider_for_token(){
+  # token pode ser literal de pacote ou virtual "virt/foo"
+  local name="$1" constraint="$2"
+  local row=""
+  if [[ "$name" == virt/* || "$name" == virtual/* ]]; then
+    local vname="${name#*/}"
+    local p
+    while read -r p; do
+      row="$(_index_best_version_row "$p" "$constraint")"
+      [[ -n "$row" ]] && { printf "%s\n" "$row"; return 0; }
+    done < <(_index_find_providers "$vname")
+    echo "" ; return 0
+  else
+    row="$(_index_best_version_row "$name" "$constraint")"
+    [[ -n "$row" ]] && { printf "%s\n" "$row"; return 0; }
+  fi
+  echo ""
+}
+
+# ============================== Integra 20-detector ==========================
+
+# Se houver JSON em $ADM_STATE/detect/<hash>.json correspondente ao source analisado,
+# extraímos deps detectadas e adicionamos como sugestões (peso menor que metafile).
+
+_detector_pick_json_for_path(){
+  local path="$1"
+  local hash; hash="$(printf "%s" "$(_rv_abspath "$path")" | sha256sum | awk '{print $1}')"
+  local f="$ADM_DETECT_STATE/$hash.json"
+  [[ -f "$f" ]] && printf "%s" "$f" || printf ""
+}
+
+_detector_merge_deps(){
+  local srcdir="$1"
+  local jf="$(_detector_pick_json_for_path "$srcdir")"
+  [[ -n "$jf" ]] || return 0
+  local add_run add_build
+  add_run="$(grep -o '"deps_run":[^}]*' "$jf" 2>/dev/null | sed -E 's/.*\{(.*)\}.*/\1/' | tr ',' '\n' | awk -F: '{gsub(/"/,"");print $1}' | tr -d ' ' | sort -u)"
+  add_build="$(grep -o '"deps_build":[^}]*' "$jf" 2>/dev/null | sed -E 's/.*\{(.*)\}.*/\1/' | tr ',' '\n' | awk -F: '{gsub(/"/,"");print $1}' | tr -d ' ' | sort -u)"
+  printf "%s" "$add_run" | while read -r d; do [[ -n "$d" ]] && RESOLVE_SUGG_RUN["$d"]="detector"; done
+  printf "%s" "$add_build" | while read -r d; do [[ -n "$d" ]] && RESOLVE_SUGG_BUILD["$d"]="detector"; done
+  adm_log_info "Detector integrado: +$(echo "$add_run" | wc -l) run, +$(echo "$add_build" | wc -l) build (heurística)."
+}
+
+# ============================== Resolved Graph ===============================
+
+# Tabelas do resolver (resetadas por plano):
+declare -A PKG_PATH=()      # name -> path
+declare -A PKG_VER=()       # name -> version
+declare -A PKG_CAT=()       # name -> category
+declare -A PKG_PROV=()      # name -> provides CSV
+declare -A PKG_CONFLICTS=() # name -> conflicts CSV
+
+declare -A GRAPH_DEPS=()    # "name" -> "dep1 dep2 dep3" (somente nomes finais)
+declare -A GRAPH_EDGES=()   # "name:dep" -> reason (run/build/opt/detected)
+declare -A VISITED=()       # name -> 1
+declare -A STACK=()         # name -> 1 (para ciclos)
+declare -A REASONS=()       # depName -> parent:reason
+
+declare -A RESOLVE_SUGG_RUN=()   # from detector
+declare -A RESOLVE_SUGG_BUILD=() # from detector
+
+_add_pkg_row(){
+  local row="$1"
+  local n v c p prov conf
+  IFS=$'\t' read -r n v c p prov conf <<< "$row"
+  PKG_PATH["$n"]="$p"; PKG_VER["$n"]="$v"; PKG_CAT["$n"]="$c"; PKG_PROV["$n"]="$prov"; PKG_CONFLICTS["$n"]="$conf"
+}
+
+_add_edge(){
+  local from="$1" to="$2" why="$3"
+  local set="${GRAPH_DEPS[$from]:-}"
+  if ! grep -qw -- "$to" <<< "$set"; then
+    GRAPH_DEPS["$from"]="$set $to"
+  fi
+  GRAPH_EDGES["$from:$to"]="$why"
+  [[ -z "${REASONS[$to]:-}" ]] && REASONS["$to"]="$from:$why"
+}
+
+_check_conflicts(){
+  local name="$1"
+  local conf="${PKG_CONFLICTS[$name]:-}"
+  [[ -z "$conf" ]] && return 0
+  local c
+  IFS=',' read -r -a arr <<< "$conf"
+  for c in "${arr[@]}"; do
+    c="$(_rv_trim "$c")"; [[ -z "$c" ]] && continue
+    if [[ -n "${PKG_VER[$c]:-}" ]]; then
+      adm_log_error "Conflito: %s <-> %s" "$name" "$c"
+      return 1
+    fi
+  done
+}
+
+_resolve_token(){
+  # resolve uma dependência tokenizada com alternativas
+  local parent="$1" token="$2" why="$3"
+  local best="" bestv=""
+  while IFS=$'\t' read -r nm cons; do
+    [[ -z "$nm" ]] && continue
+    local row; row="$(_select_provider_for_token "$nm" "$cons")"
+    if [[ -z "$row" ]]; then
+      adm_log_debug "Sem provedor para '$nm$cons' (alternativa de $token)"
+      continue
+    fi
+    local n v; IFS=$'\t' read -r n v _ <<< "$row"
+    if [[ -z "$best" || "$(_rv_ver_cmp "$v" "$bestv")" == "1" ]]; then best="$row"; bestv="$v"; fi
+  done < <(_rv_parse_alt "$token")
+
+  if [[ -z "$best" ]]; then
+    adm_log_error "Dependência não resolvida para '%s' (em %s)" "$token" "$parent"
+    return 1
+  fi
+
+  _add_pkg_row "$best"
+  local depn; depn="$(printf "%s" "$best" | awk -F'\t' '{print $1}')"
+  _add_edge "$parent" "$depn" "$why"
+  _check_conflicts "$depn" || return 1
+}
+
+_resolve_pkg(){
+  local name="$1"
+  [[ -n "$name" ]] || return 0
+  [[ -n "${VISITED[$name]:-}" ]] && return 0
+  [[ -n "${STACK[$name]:-}" ]] && { adm_log_error "Ciclo detectado envolvendo: $name"; return 1; }
+  STACK["$name"]=1
+
+  local row; row="$(_index_best_version_row "$name" "")"
+  [[ -n "$row" ]] || { adm_log_error "Pacote '%s' não encontrado no índice" "$name"; return 1; }
+  _add_pkg_row "$row"
+  _check_conflicts "$name" || return 1
+
+  # Parse deps do próprio metafile
+  local mf="${PKG_PATH[$name]}"
+  _rv_kv_read "$mf" || return 1
+  local srcdir="$(dirname "$mf")"
+  # merge detector
+  RESOLVE_SUGG_RUN=(); RESOLVE_SUGG_BUILD=()
+  _detector_merge_deps "$srcdir" || true
+
+  local tokens
+  for kind in run_deps build_deps opt_deps; do
+    tokens="$(_rv_dep_tokens "${MF[$kind]:-}")"
+    while read -r tkn; do
+      [[ -z "$tkn" ]] && continue
+      local why="run"
+      [[ "$kind" == "build_deps" ]] && why="build"
+      [[ "$kind" == "opt_deps" ]] && why="opt"
+      _resolve_token "$name" "$tkn" "$why" || return 1
+    done <<< "$tokens"
+  done
+
+  # detector (peso baixo: apenas se ainda não tem algo parecido)
+  for d in "${!RESOLVE_SUGG_BUILD[@]}"; do
+    # pular se já resolvido como nome exato
+    [[ -n "${PKG_VER[$d]:-}" ]] && continue
+    # tentar provider por nome/virtual leve (sem constraint)
+    local row="$(_select_provider_for_token "$d" "")"
+    [[ -z "$row" ]] && continue
+    local depn; depn="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
+    # evita loops triviais
+    [[ "$depn" == "$name" ]] && continue
+    _add_pkg_row "$row"
+    _add_edge "$name" "$depn" "detected-build"
+  done
+  for d in "${!RESOLVE_SUGG_RUN[@]}"; do
+    [[ -n "${PKG_VER[$d]:-}" ]] && continue
+    local row="$(_select_provider_for_token "$d" "")"
+    [[ -z "$row" ]] && continue
+    local depn; depn="$(printf "%s" "$row" | awk -F'\t' '{print $1}')"
+    [[ "$depn" == "$name" ]] && continue
+    _add_pkg_row "$row"
+    _add_edge "$name" "$depn" "detected-run"
+  done
+
+  # Recurse em deps
+  local dep
+  for dep in ${GRAPH_DEPS[$name]:-}; do
+    _resolve_pkg "$dep" || return 1
+  done
+
+  VISITED["$name"]=1
+  unset STACK["$name"]
+  return 0
+}
+
+_toposort(){
+  # Kahn
+  local -A indeg=()
+  local n d
+  for n in "${!PKG_VER[@]}"; do indeg["$n"]=0; done
+  for n in "${!GRAPH_DEPS[@]}"; do
+    for d in ${GRAPH_DEPS[$n]:-}; do indeg["$d"]=$(( ${indeg[$d]} + 1 )); done
+  done
+  local q=() ; for n in "${!PKG_VER[@]}"; do (( ${indeg[$n]} == 0 )) && q+=("$n"); done
+  local out=()
+  while ((${#q[@]})); do
+    local x="${q[0]}"; q=("${q[@]:1}")
+    out+=("$x")
+    for d in ${GRAPH_DEPS[$x]:-}; do
+      indeg["$d"]=$(( ${indeg[$d]} - 1 ))
+      (( ${indeg[$d]} == 0 )) && q+=("$d")
+    done
+  done
+  # checar se todos foram emitidos
+  if ((${#out[@]} != ${#PKG_VER[@]})); then
+    adm_log_error "Não foi possível linearizar (há ciclo remanescente)."
+    return 1
+  fi
+  printf "%s\n" "${out[@]}"
+}
+
+_emit_plan_json(){
+  local rootpkg="$1"
+  local ts="$(_rv_now)"
+  local dir="$RESOLVER_STATE/plans"; mkdir -p -- "$dir" || { adm_log_error "Sem acesso a $dir"; return 1; }
+  local out="$dir/${rootpkg}-${ts}.json"
+  {
+    printf "{\n"
+    printf "  \"root\":\"%s\",\n" "$(_rv_json_escape "$rootpkg")"
+    printf "  \"timestamp\":%s,\n" "$ts"
+    printf "  \"packages\": [\n"
+    local first=1
+    local n
+    for n in "${!PKG_VER[@]}"; do
+      [[ $first -eq 0 ]] && printf ",\n"
+      first=0
+      printf "    {\"name\":\"%s\",\"version\":\"%s\",\"category\":\"%s\",\"path\":\"%s\"}" \
+        "$(_rv_json_escape "$n")" "$(_rv_json_escape "${PKG_VER[$n]}")" "$(_rv_json_escape "${PKG_CAT[$n]}")" "$(_rv_json_escape "${PKG_PATH[$n]}")"
+    done
+    printf "\n  ],\n"
+    printf "  \"edges\": [\n"
+    first=1
+    local key why from to
+    for key in "${!GRAPH_EDGES[@]}"; do
+      why="${GRAPH_EDGES[$key]}"
+      from="${key%%:*}"; to="${key##*:}"
+      [[ $first -eq 0 ]] && printf ",\n"
+      first=0
+      printf "    {\"from\":\"%s\",\"to\":\"%s\",\"why\":\"%s\"}" "$(_rv_json_escape "$from")" "$(_rv_json_escape "$to")" "$(_rv_json_escape "$why")"
+    done
+    printf "\n  ]\n"
+    printf "}\n"
+  } > "$out" || { adm_log_error "Falha ao gravar plano: $out"; return 1; }
+  printf "%s" "$out"
+}
+
+_print_plan_summary(){
+  local root="$1"
+  local order; mapfile -t order < <(_toposort) || return 1
+  local n_total="${#order[@]}"
+  adm_log_success "Plano para: $root"
+  adm_log_info    "Total de pacotes: $n_total"
+  local i=1 n
+  for n in "${order[@]}"; do
+    local reason="${REASONS[$n]:-root}"
+    printf "  %b%3d/%-3d%b  %b%s%b  %s  %b%s%b\n" \
+      "$__r_dim" "$i" "$n_total" "$__r_rst" \
+      "$__r_mag" "$n" "$__r_rst" \
+      "${PKG_VER[$n]}" \
+      "$__r_dim" "$reason" "$__r_rst"
+    i=$((i+1))
+  done
+}
+
+_emit_graph_dot(){
+  local root="$1"
+  local out="$RESOLVER_STATE/graphs/${root}-$(date +%s).dot"
+  mkdir -p -- "$(dirname "$out")" || { adm_log_error "Sem acesso a $(dirname "$out")"; return 1; }
+  {
+    echo "digraph adm_resolve {"
+    echo "  rankdir=LR;"
+    local key from to why
+    for key in "${!GRAPH_EDGES[@]}"; do
+      from="${key%%:*}"; to="${key##*:}"; why="${GRAPH_EDGES[$key]}"
+      local color="black"
+      [[ "$why" == "build" || "$why" == "detected-build" ]] && color="blue"
+      [[ "$why" == "run" || "$why" == "detected-run" ]] && color="darkgreen"
+      [[ "$why" == "opt" ]] && color="orange"
+      printf "  \"%s\" -> \"%s\" [color=%s,label=\"%s\"];\n" "$from" "$to" "$color" "$why"
+    done
+    echo "}"
+  } > "$out" || { adm_log_error "Falha ao gravar DOT: $out"; return 1; }
+  printf "%s" "$out"
+}
+# (continuação do arquivo /usr/src/adm/scripts/25-resolver)
+
+# ============================== EXPLAIN / SEARCH / LIST ======================
+
+resolver_list(){
+  [[ -f "$INDEX_FILE" ]] || { adm_log_error "Índice ausente. Rode: 25-resolver index"; return 1; }
+  printf "%-28s %-12s  %s\n" "NAME" "VERSION" "CATEGORY"
+  awk -F'\t' '{printf "%-28s %-12s  %s\n",$1,$2,$3}' "$INDEX_FILE" | sort
+}
+
+resolver_search(){
+  local re="${1:-}"
+  [[ -z "$re" ]] && { adm_log_error "Uso: search <regex>"; return 2; }
+  [[ -f "$INDEX_FILE" ]] || { adm_log_error "Índice ausente. Rode: 25-resolver index"; return 1; }
+  awk -F'\t' -v R="$re" '$0 ~ R {printf "%-28s %-12s  %s\n",$1,$2,$3}' "$INDEX_FILE" | sort || true
+}
+
+resolver_explain(){
+  local root="$1" target="$2"
+  [[ -n "$root" && -n "$target" ]] || { adm_log_error "Uso: explain <root> <target>"; return 2; }
+  # Planeja (não imprime) e mostra cadeia para target
+  resolver_plan "$root" --quiet || return 1
+  if [[ -z "${REASONS[$target]:-}" && "$root" != "$target" ]]; then
+    adm_log_warn "Alvo não encontrado no plano: $target"; return 1
+  fi
+  local chain=("$target")
+  local cur="$target"
+  while [[ "$cur" != "$root" && -n "${REASONS[$cur]:-}" ]]; do
+    local p="${REASONS[$cur]%%:*}"
+    chain+=("$p")
+    cur="$p"
+  done
+  local i; for ((i=${#chain[@]}-1;i>=0;i--)); do
+    local x="${chain[$i]}"; local reason="${REASONS[${chain[$i+1]:-}]:-root}"
+    printf "%s%s%b --(%s)--> %s%b\n" \
+      "$__r_mag" "$x" "$__r_rst" \
+      "${reason##*:}" \
+      "$__r_mag" "${chain[$((i-1))]:-}" "$__r_rst"
+  done
+}
+
+# ============================== PLAN =========================================
+
+resolver_plan(){
+  local root="$1"; shift || true
+  local quiet="false"
+  while (( $# )); do
+    case "$1" in
+      --quiet) quiet="true" ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$root" ]] || { adm_log_error "Uso: plan <root_pkg>"; return 2; }
+
+  [[ -f "$INDEX_FILE" ]] || { adm_log_info "Índice não encontrado. Rodando index…"; resolver_index || return 1; }
+
+  # reset tables
+  PKG_PATH=(); PKG_VER=(); PKG_CAT=(); PKG_PROV=(); PKG_CONFLICTS=()
+  GRAPH_DEPS=(); GRAPH_EDGES=(); VISITED=(); STACK=(); REASONS=()
+  RESOLVE_SUGG_RUN=(); RESOLVE_SUGG_BUILD=()
+
+  _resolve_pkg "$root" || return 1
+  local plan_json; plan_json="$(_emit_plan_json "$root")" || return 1
+  if [[ "$quiet" != "true" ]]; then
+    _print_plan_summary "$root" || return 1
+    adm_log_info "Plano JSON: $plan_json"
+  fi
+}
+
+resolver_graph(){
+  local root="$1"
+  [[ -n "$root" ]] || { adm_log_error "Uso: graph <root_pkg>"; return 2; }
+  resolver_plan "$root" --quiet || return 1
+  local dot; dot="$(_emit_graph_dot "$root")" || return 1
+  adm_log_success "Grafo DOT: $dot"
+}
+
+# ============================== INIT / DOCTOR ================================
+
+resolver_init(){
+  resolver_index
+}
+
+resolver_doctor(){
+  local fail=0
+  [[ -d "$ADM_META_ROOT" ]] || { adm_log_error "Metafiles root ausente: $ADM_META_ROOT"; fail=$((fail+1)); }
+  mkdir -p -- "$RESOLVER_STATE" "$INDEX_DIR" || { adm_log_error "Sem acesso a $RESOLVER_STATE"; fail=$((fail+1)); }
+  # formato do índice (quando existir)
+  if [[ -f "$INDEX_FILE" ]]; then
+    awk -F'\t' 'NF==6' "$INDEX_FILE" >/dev/null 2>&1 || { adm_log_error "Formato inválido de index.tsv"; fail=$((fail+1)); }
+  fi
+  (( fail>0 )) && { adm_log_error "Doctor encontrou $fail problema(s)."; return 1; }
+  adm_log_success "Resolver OK."
+}
+
+# ============================== CLI ==========================================
+
+resolver_usage(){
+  cat <<'USAGE'
+Uso: 25-resolver <comando> [opções]
+
+Comandos:
+  init                 Inicializa e indexa todos os metafiles.
+  index                Apenas (re)constrói o índice.
+  list                 Lista pacotes do índice.
+  search <regex>       Busca por nome/categoria/linha no índice.
+  plan <pkg>           Resolve dependências e gera plano (resumo + JSON).
+  graph <pkg>          Gera grafo DOT do plano.
+  explain <root> <dep> Mostra a cadeia de dependências até <dep>.
+  doctor               Valida ambientes e estruturas do resolver.
+
+Detalhes do formato de deps:
+  - Alternativas com '|':  ssl|libressl
+  - Restrições: >=, <=, =, >, <, ~major   (ex: foo>=1.2, bar=2.0, virt/ssl~1)
+  - Virtuais: 'virt/ssl' (casadas em provides=ssl do provedor)
+
+Exemplos:
+  25-resolver init
+  25-resolver list
+  25-resolver plan busybox
+  25-resolver graph mesa
+  25-resolver explain mesa llvm
+USAGE
+}
+
+resolver_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)    resolver_init ;;
+    index)   resolver_index ;;
+    list)    resolver_list ;;
+    search)  resolver_search "${1:-}" ;;
+    plan)    resolver_plan "${1:-}" ;;
+    graph)   resolver_graph "${1:-}" ;;
+    explain) resolver_explain "${1:-}" "${2:-}" ;;
+    doctor)  resolver_doctor ;;
+    ""|-h|--help|help) resolver_usage ;;
+    *)       adm_log_error "Comando desconhecido: $cmd"; resolver_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  resolver_main "$@"
+fi
