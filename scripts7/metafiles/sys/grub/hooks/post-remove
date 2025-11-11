@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Atualiza config pois o pacote do GRUB foi removido/atualizado
+MKCFG=""
+for x in /usr/bin/grub-mkconfig /usr/bin/grub2-mkconfig /bin/grub-mkconfig /bin/grub2-mkconfig; do
+  [[ -x "$x" ]] && MKCFG="$x" && break
+done
+CFG_DIR="/boot/grub"
+[[ -d /boot/grub2 ]] && CFG_DIR="/boot/grub2"
+CFG_PATH="${CFG_DIR}/grub.cfg"
+[[ -n "$MKCFG" ]] && "$MKCFG" -o "$CFG_PATH" || true
