@@ -1,0 +1,10 @@
+# instalar grub, colocar loader no ESP e criar/atualizar entrada NVRAM
+ADM_GRUB_INSTALL=1 ADM_EFI_UPDATE_NVRAM=1 ADM_EFI_LABEL="ADM Linux" adm install grub
+
+# testar boot no próximo reinício com BootNext (opcional)
+ADM_GRUB_INSTALL=1 ADM_EFI_UPDATE_NVRAM=1 ADM_EFI_SET_BOOTNEXT=1 adm install grub
+
+# remover grub e limpar entrada (se nenhum loader continuar no ESP)
+adm remove grub
+# (ou force independente do loader)
+ADM_EFI_FORCE_REMOVE=1 adm remove grub
