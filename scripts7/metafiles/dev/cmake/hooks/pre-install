@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+
+# Instala binários/arquivos do CMake do TARGET sob /usr
+$MAKE install DESTDIR="${DESTDIR}"
+
+# Conveniências: 'cmake3' apontando para 'cmake' (idempotente)
+if [[ -x "${DESTDIR}/usr/bin/cmake" ]]; then
+  ln -snf cmake "${DESTDIR}/usr/bin/cmake3"
+fi
