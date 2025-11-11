@@ -1,0 +1,12 @@
+name=llvm
+version=18.1.8
+category=dev
+run_deps=libs/zlib,sys/zstd,libs/ncurses,dev/cmake,dev/ninja
+build_deps=libs/zlib,sys/zstd,libs/ncurses,dev/cmake,dev/ninja,dev/python
+opt_deps=
+num_builds=0
+description=LLVM + Clang toolchain
+homepage=https://llvm.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/llvm-project-18.1.8.src.tar.xz,https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-18.1.8.tar.gz
