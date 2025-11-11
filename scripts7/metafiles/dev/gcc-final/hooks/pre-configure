@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+CONFIGURE_EXTRAS+=" --prefix=/usr --with-sysroot=${SYSROOT} --target=${TARGET}"
+CONFIGURE_EXTRAS+=" --enable-languages=c,c++ --disable-multilib --disable-nls --disable-werror"
+# Reaproveita binutils-stage2 e libc do SYSROOT. libstdc++ será instalada por este build.
+export CONFIGURE_EXTRAS
