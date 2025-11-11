@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+# Compilar imagem do kernel, módulos e (se aplicável) DTBs
+$MAKE -j"$NPROC"
+$MAKE -j"$NPROC" modules
+# DTBs são relevantes em ARM/ARM64
+case "${ARCH:-}" in arm|arm64) $MAKE -j"$NPROC" dtbs || true ;; esac
