@@ -1,0 +1,12 @@
+name=lzip
+version=1.24.1
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=LZMA-like lossless data compressor with recovery capabilities
+homepage=https://www.nongnu.org/lzip/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/lzip/lzip-1.24.1.tar.gz,https://mirrors.kernel.org/savannah/lzip/lzip-1.24.1.tar.gz
