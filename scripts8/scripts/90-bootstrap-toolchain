@@ -1,0 +1,615 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/90-bootstrap-toolchain
+# -----------------------------------------------------------------------------
+# ADM - Bootstrap Toolchain
+# - Constrói toolchain isolado (binutils, gcc, linux-headers, glibc/musl, libstdc++)
+# - Stage1 (sem libs), Stage2 (com runtime), sysroot e prefix separados
+# - Reentrante, com checkpoints e logs; integra com 30-fetcher/32-patcher/12-profile-manager
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_JOBS:=$(nproc 2>/dev/null || echo 2)}"
+: "${ADM_COLOR:=auto}"
+
+TC_STATE="$ADM_STATE/toolchain"
+TC_LOGS="$TC_STATE/logs"
+TC_LOCKS="$TC_STATE/locks"
+TC_SOURCES="$ADM_ROOT/sources"
+TC_BUILD="$TC_STATE/build"
+TC_PKGS="$ADM_ROOT/metafiles/sys"   # sugere onde ficam os metafiles sys/*
+mkdir -p -- "$TC_STATE" "$TC_LOGS" "$TC_LOCKS" "$TC_BUILD" "$TC_SOURCES" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _C_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then ADM_COLOR=false; fi
+  if [[ "$ADM_COLOR" == "auto" ]]; then ADM_COLOR=$([[ "$_C_TTY" == "true" ]] && echo true || echo false); fi
+  if [[ "$ADM_COLOR" == "true" ]]; then
+    C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_X=$'\033[0m'; C_OK=$'\xE2\x9C\x85'
+  else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_X=""; C_OK="[OK]"
+  fi
+  ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(ts)" "$C_D" "$C_X" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(ts)" "$C_B" "$C_X" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n"  "$(ts)" "$C_Y" "$C_X" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(ts)" "$C_R" "$C_X" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(ts)" "$C_G" "$C_X" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+die(){ adm_log_error "$@"; exit 2; }
+trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+ncpus(){ nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 2; }
+bytes(){ du -sb -- "$1" 2>/dev/null | awk '{print $1}'; }
+need_space(){ local dir="$1" min="$2"; local b; b=$(bytes "$dir"); [[ -z "$b" || "$b" -lt "$min" ]] && return 1 || return 0; }
+lock_acquire(){
+  local key="$1"; mkdir -p -- "$TC_LOCKS" || true
+  local d="$TC_LOCKS/tc-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>900)) && { adm_log_error "Timeout lock %s" "$key"; return 1; } done
+  fi
+}
+lock_release(){ local key="$1"; rm -rf -- "$TC_LOCKS/tc-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+checkpoint(){ local name="$1"; mkdir -p -- "$TC_STATE/checkpoints" || true; printf "%s\n" "$(date -Iseconds)" > "$TC_STATE/checkpoints/$name.done"; }
+is_done(){ [[ -f "$TC_STATE/checkpoints/$1.done" ]]; }
+
+# ============================== CLI / Config =================================
+usage(){
+  cat <<'USAGE'
+Uso: 90-bootstrap-toolchain run [opções]
+     90-bootstrap-toolchain doctor
+     90-bootstrap-toolchain clean [--prefix=...] [--sysroot=...]
+Opções:
+  --libc=glibc|musl        (default: glibc)
+  --target=TRIPLET         (ex: x86_64-linux-gnu | x86_64-linux-musl)
+  --prefix=DIR             (default: /usr/src/adm/toolchains/<target>)
+  --sysroot=DIR            (default: <prefix>/<target>/sysroot)
+  --jobs=N                 (default: nproc)
+  --ccache                 habilita ccache se presente
+  --no-ccache              desabilita ccache
+  --with-isl               compila GCC com ISL/Graphite se disponível
+  --fetch                  baixa fontes via 30-fetcher/curl
+  --patch                  aplica patches via 32-patcher se existirem
+  --keep-build             mantém diretórios de build
+  --force                  ignora alguns bloqueios/checagens (use com cuidado)
+  --profile=aggressive|normal|minimal   (otimizações do 12-profile-manager)
+Exemplos:
+  90-bootstrap-toolchain run --libc=musl --target=x86_64-linux-musl --fetch --ccache
+  90-bootstrap-toolchain run --profile=minimal --jobs=16
+USAGE
+}
+
+LIBC="glibc"
+TARGET=""
+PREFIX=""
+SYSROOT=""
+JOBS="$ADM_JOBS"
+WANT_FETCH=0
+WANT_PATCH=0
+WANT_ISL=0
+WANT_CCACHE=${ADM_CCACHE:-0}
+KEEP_BUILD=0
+FORCE=0
+PROFILE="${ADM_PROFILE:-normal}"
+
+cmd="${1:-}"; shift || true
+case "${cmd:-}" in
+  run|doctor|clean) : ;;
+  ""|-h|--help|help) usage; exit 0 ;;
+  *) die "Comando desconhecido: $cmd" ;;
+esac
+
+while (( $# )); do
+  case "$1" in
+    --libc=*)    LIBC="${1#--libc=}";;
+    --target=*)  TARGET="${1#--target=}";;
+    --prefix=*)  PREFIX="${1#--prefix=}";;
+    --sysroot=*) SYSROOT="${1#--sysroot=}";;
+    --jobs=*)    JOBS="${1#--jobs=}";;
+    --ccache)    WANT_CCACHE=1;;
+    --no-ccache) WANT_CCACHE=0;;
+    --with-isl)  WANT_ISL=1;;
+    --fetch)     WANT_FETCH=1;;
+    --patch)     WANT_PATCH=1;;
+    --keep-build)KEEP_BUILD=1;;
+    --force)     FORCE=1;;
+    --profile=*) PROFILE="${1#--profile=}";;
+    *) adm_log_warn "Opção ignorada: %s" "$1";;
+  esac; shift || true
+done
+
+# ============================== Saneamento e defaults ========================
+doctor(){
+  local fail=0
+  for b in bash make tar xz patch awk sed grep find; do have "$b" || { adm_log_warn "Ferramenta ausente: %s" "$b"; fail=$((fail+1)); }; done
+  have curl || have wget || adm_log_warn "Sem curl/wget (fetch opcional)."
+  have gpg || true
+  mkdir -p -- "$TC_STATE" "$TC_LOGS" "$TC_BUILD" "$TC_SOURCES" || { adm_log_error "Sem acesso a diretórios."; fail=$((fail+1)); }
+  [[ $fail -eq 0 ]] && adm_log_success "$C_OK Ambiente OK." || return 1
+}
+
+[[ "$cmd" == "doctor" ]] && { doctor; exit $?; }
+
+# Sugere TARGET via detector
+if [[ -z "$TARGET" ]]; then
+  if [[ -x "$ADM_ROOT/scripts/20-detector" ]]; then
+    TARGET="$("$ADM_ROOT/scripts/20-detector" triplet 2>/dev/null || true)"
+  fi
+  [[ -z "$TARGET" ]] && TARGET="$(uname -m)-linux-${LIBC/musl/musl}"
+fi
+
+# Prefix/Sysroot
+[[ -z "$PREFIX" ]] && PREFIX="$ADM_ROOT/toolchains/$TARGET"
+[[ -z "$SYSROOT" ]] && SYSROOT="$PREFIX/$TARGET/sysroot"
+
+PREFIX="$(abspath "$PREFIX")"
+SYSROOT="$(abspath "$SYSROOT")"
+mkdir -p -- "$PREFIX" "$SYSROOT" "$TC_BUILD" "$TC_SOURCES" "$TC_LOGS" || die "Sem acesso a PREFIX/SYSROOT."
+
+# Perfis (12-profile-manager)
+apply_profile_env(){
+  local p="${1:-$PROFILE}"
+  if [[ -x "$ADM_ROOT/scripts/12-profile-manager" ]]; then
+    # exporta variáveis de flags
+    eval "$("$ADM_ROOT/scripts/12-profile-manager" export --profile="$p" 2>/dev/null || true)"
+  else
+    case "$p" in
+      aggressive) export CFLAGS="-O3 -pipe"; export CXXFLAGS="$CFLAGS"; export LDFLAGS="-Wl,-O1";;
+      minimal)    export CFLAGS="-O2 -pipe"; export CXXFLAGS="$CFLAGS"; export LDFLAGS="";;
+      normal|*)   export CFLAGS="-O2 -pipe"; export CXXFLAGS="$CFLAGS"; export LDFLAGS="-Wl,-O1";;
+    esac
+  fi
+}
+
+# Ccache
+setup_ccache(){
+  if (( WANT_CCACHE==1 )) && have ccache; then
+    export CCACHE_DIR="${CCACHE_DIR:-$TC_STATE/ccache}"
+    export CCACHE_BASEDIR="$TC_STATE"
+    export CCACHE_SLOPPINESS="time_macros"
+    export CC="ccache gcc" CXX="ccache g++"
+    adm_log_info "ccache habilitado em: %s" "$CCACHE_DIR"
+  fi
+}
+
+# Paths isolados
+tool_env(){
+  export PATH="$PREFIX/bin:$PREFIX/$TARGET/bin:$PATH"
+  export AR=ar AS=as RANLIB=ranlib LD=ld STRIP=strip
+  export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/$TARGET/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export PKG_CONFIG_LIBDIR="$SYSROOT/usr/lib/pkgconfig:$SYSROOT/usr/share/pkgconfig"
+}
+
+# ============================== Metafiles/Sources ============================
+# Preferimos usar metafiles sys/binutils, sys/gcc, sys/glibc, sys/musl, sys/linux-headers
+mf_path(){ printf "%s/%s/metafile" "$TC_PKGS" "$1"; }
+mf_get(){ awk -F= -v k="$2" '$1==k{print substr($0,length(k)+2)}' "$(mf_path "$1")" 2>/dev/null || true; }
+mf_sources(){ mf_get "$1" "sources" | tr ',' '\n' | sed '/^$/d'; }
+mf_sha256(){ mf_get "$1" "sha256sums" | tr ',' '\n' | sed '/^$/d'; }
+mf_version(){ mf_get "$1" "version"; }
+
+fetch_one(){
+  local url="$1" out="$2"
+  mkdir -p -- "$(dirname "$out")" || return 1
+  if [[ -x "$ADM_ROOT/scripts/30-fetcher" ]]; then
+    "$ADM_ROOT/scripts/30-fetcher" fetch --url="$url" --out="$out" >/dev/null
+  else
+    if have curl; then curl -fL --retry 2 -A "ADM-TC/1.0" -o "$out" -- "$url"
+    else wget -O "$out" -- "$url"
+    fi
+  fi
+}
+
+sha256_file(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+
+ensure_sources(){
+  # args: label (ex: binutils) ; usa metafile sys/<label>
+  local name="$1"
+  local list=() sums=()
+  mapfile -t list < <(mf_sources "$name")
+  mapfile -t sums < <(mf_sha256 "$name")
+  local i url sum file
+  for i in "${!list[@]}"; do
+    url="${list[$i]}"
+    file="$TC_SOURCES/$(basename "${url%%\?*}")"
+    if [[ ! -f "$file" || ! -s "$file" ]]; then
+      (( WANT_FETCH==1 )) || die "Falta source: $file (use --fetch)"
+      adm_log_info "Baixando: %s" "$url"
+      fetch_one "$url" "$file" || die "Falha ao baixar: $url"
+    fi
+    # valida sha (se disponível)
+    sum="${sums[$i]:-}"
+    if [[ -n "$sum" ]]; then
+      local have; have="$(sha256_file "$file")"
+      [[ "$have" == "$sum" ]] || die "sha256 incorreto p/ $file: got=$have want=$sum"
+    fi
+  done
+}
+
+apply_patches_if_any(){
+  local label="$1" srcdir="$2"
+  (( WANT_PATCH==1 )) || return 0
+  local hook="$ADM_ROOT/scripts/32-patcher"
+  [[ -x "$hook" ]] || { adm_log_debug "patcher ausente; pulando"; return 0; }
+  "$hook" apply --package="sys/$label" --sourcedir="$srcdir"
+}
+
+unpack_first(){
+  # retorna diretório base extraído
+  local label="$1"
+  local first
+  first="$(mf_sources "$label" | head -n1)"
+  [[ -n "$first" ]] || die "Sem source para $label"
+  local arch="$TC_SOURCES/$(basename "${first%%\?*}")"
+  [[ -f "$arch" ]] || die "Arquivo não encontrado: $arch"
+  local dir; dir="$(tar -tf "$arch" 2>/dev/null | head -n1 | cut -d/ -f1)"
+  local wd="$TC_BUILD/src-$label"
+  rm -rf -- "$wd" 2>/dev/null || true
+  mkdir -p -- "$wd"
+  case "$arch" in
+    *.tar.xz)  tar -xJf "$arch" -C "$wd" ;;
+    *.tar.zst) zstd -dc "$arch" | tar -x -C "$wd" ;;
+    *.tar.gz|*.tgz) tar -xzf "$arch" -C "$wd" ;;
+    *.tar.bz2) tar -xjf "$arch" -C "$wd" ;;
+    *) die "Formato não suportado: $arch" ;;
+  esac
+  echo "$wd/$dir"
+}
+
+# ============================== Build helpers =================================
+build_log(){ printf "%s/%s.log" "$TC_LOGS" "$1"; }
+run_build(){
+  local step="$1"; shift || true
+  local log; log="$(build_log "$step")"
+  adm_log_info ">>> %s" "$step"
+  { "$@"; } >>"$log" 2>&1 || { adm_log_error "Falha em %s (veja %s)" "$step" "$log"; return 1; }
+  adm_log_success "$C_OK %s concluído" "$step"
+}
+
+with_build_dir(){
+  local name="$1"; shift || true
+  local bd="$TC_BUILD/build-$name"
+  rm -rf -- "$bd" 2>/dev/null || true
+  mkdir -p -- "$bd"
+  ( cd "$bd" && "$@" )
+  (( KEEP_BUILD==1 )) || rm -rf -- "$bd" 2>/dev/null || true
+}
+
+# ============================== Stages ========================================
+stage_00_sanity(){
+  lock_acquire "toolchain-global"
+  trap 'lock_release "toolchain-global"' RETURN
+
+  apply_profile_env "$PROFILE"
+  setup_ccache
+
+  # Checagem de espaço (mínimos aproximados)
+  need_space "$ADM_ROOT" 500000000 || adm_log_warn "Pouco espaço em %s (<500MB)" "$ADM_ROOT"
+  need_space "$TC_BUILD" 500000000 || adm_log_warn "Pouco espaço em %s (<500MB)" "$TC_BUILD"
+
+  # Limpesa de env host que atrapalha
+  unset CFLAGS CXXFLAGS LDFLAGS CPPFLAGS || true
+  apply_profile_env "$PROFILE"
+
+  tool_env
+
+  # Teste básico do host compiler
+  if ! echo 'int main(){return 0;}' | gcc -x c - -o "$TC_STATE/.host-cc.test" >/dev/null 2>&1; then
+    adm_log_warn "GCC host indisponível; vamos compilar GCC do zero (ok)."
+  fi
+  rm -f -- "$TC_STATE/.host-cc.test" 2>/dev/null || true
+
+  checkpoint "00-sanity"
+}
+
+stage_10_linux_headers(){
+  is_done "10-headers" && { adm_log_info "Headers já instalados (checkpoint)"; return 0; }
+  ensure_sources "linux-headers"
+  local src; src="$(unpack_first linux-headers)"
+  apply_patches_if_any "linux-headers" "$src"
+
+  run_build "linux-headers-prepare" bash -c "
+    make -C '$src' mrproper
+  "
+  mkdir -p -- "$SYSROOT/usr"
+  run_build "linux-headers-install" bash -c "
+    make -C '$src' ARCH=$(uname -m) headers
+    find '$src/usr/include' -name '.*' -delete
+    cp -a '$src/usr/include' '$SYSROOT/usr/'
+  "
+  checkpoint "10-headers"
+}
+
+stage_20_binutils_pass1(){
+  is_done "20-binutils-p1" && { adm_log_info "binutils pass1 já presente"; return 0; }
+  ensure_sources "binutils"
+  local src; src="$(unpack_first binutils)"
+  apply_patches_if_any "binutils" "$src"
+
+  with_build_dir "binutils-p1" bash -c "
+    '$src/configure' \
+      --prefix='$PREFIX' \
+      --with-sysroot='$SYSROOT' \
+      --target='$TARGET' \
+      --disable-nls --disable-werror
+    make -j'$JOBS'
+    make install
+  "
+  checkpoint "20-binutils-p1"
+}
+
+stage_30_gcc_pass1(){
+  is_done "30-gcc-p1" && { adm_log_info "gcc pass1 já presente"; return 0; }
+
+  ensure_sources "gcc"
+  local src; src="$(unpack_first gcc)"
+  apply_patches_if_any "gcc" "$src"
+
+  # deps do GCC (gmp/mpfr/mpc/isl) podem vir como tarballs colocados em subdir
+  for dep in gmp mpfr mpc; do
+    if [[ -d "$src/$dep" ]]; then :; else
+      if [[ -f "$TC_SOURCES/$dep.tar."* ]]; then
+        ( cd "$src" && tar -xf "$TC_SOURCES/$dep.tar."* )
+      fi
+    fi
+  done
+  if (( WANT_ISL==1 )); then
+    [[ -d "$src/isl" ]] || { adm_log_warn "ISL ausente; prosseguindo sem Graphite."; }
+  fi
+
+  with_build_dir "gcc-p1" bash -c "
+    '$src/configure' \
+      --target='$TARGET' --prefix='$PREFIX' --with-sysroot='$SYSROOT' \
+      --with-newlib --without-headers \
+      --enable-languages=c \
+      --disable-nls --disable-shared --disable-multilib --disable-threads --disable-libatomic \
+      --disable-libgomp --disable-libquadmath --disable-libssp --disable-libvtv --disable-libstdcxx
+    make -j'$JOBS' all-gcc all-target-libgcc
+    make install-gcc install-target-libgcc
+  "
+  checkpoint "30-gcc-p1"
+}
+
+stage_40_libc_headers_startfiles(){
+  is_done "40-libc-start" && { adm_log_info "libc startfiles já presentes"; return 0; }
+
+  case "$LIBC" in
+    glibc)
+      ensure_sources "glibc"
+      local src; src="$(unpack_first glibc)"
+      apply_patches_if_any "glibc" "$src"
+
+      mkdir -p -- "$SYSROOT/usr/include"
+      with_build_dir "glibc" bash -c "
+        BUILD_CC=gcc \
+        '$src/configure' \
+          --prefix=/usr \
+          --host='$TARGET' \
+          --build='$(../config.guess 2>/dev/null || echo $(uname -m)-unknown-linux-gnu)' \
+          --with-headers='$SYSROOT/usr/include' \
+          --disable-multilib
+        make -j'$JOBS' csu/subdir_lib
+        install -v csu/crt1.o csu/crti.o csu/crtn.o '$SYSROOT/usr/lib/'
+        '$TARGET-gcc' -nostdlib -nostartfiles -shared -x c /dev/null -o '$SYSROOT/usr/lib/libc.so'
+        touch '$SYSROOT/usr/include/gnu/stubs.h' || true
+      "
+      ;;
+    musl)
+      ensure_sources "musl"
+      local src; src="$(unpack_first musl)"
+      apply_patches_if_any "musl" "$src"
+
+      with_build_dir "musl" bash -c "
+        '$src/configure' \
+          --prefix=/usr \
+          --target='$TARGET' \
+          --host='$TARGET' \
+          --syslibdir=/usr/lib \
+          --disable-shared
+        make -j'$JOBS' include/bits/alltypes.h
+        make -j'$JOBS' crt
+        mkdir -p '$SYSROOT/usr/include' '$SYSROOT/usr/lib'
+        cp -a '$src/include'/* '$SYSROOT/usr/include/'
+        cp -a '$src/arch/generic'/* '$SYSROOT/usr/include/' 2>/dev/null || true
+        cp -a crt/*.o '$SYSROOT/usr/lib/'
+        '$TARGET-gcc' -nostdlib -nostartfiles -shared -x c /dev/null -o '$SYSROOT/usr/lib/libc.so'
+        touch '$SYSROOT/usr/include/gnu/stubs.h' || true
+      "
+      ;;
+    *) die "LIBC desconhecida: $LIBC" ;;
+  esac
+
+  checkpoint "40-libc-start"
+}
+
+stage_50_gcc_pass2(){
+  is_done "50-gcc-p2" && { adm_log_info "gcc pass2 já presente"; return 0; }
+
+  ensure_sources "gcc"
+  local src; src="$(unpack_first gcc)"
+  apply_patches_if_any "gcc" "$src"
+
+  with_build_dir "gcc-p2" bash -c "
+    '$src/configure' \
+      --target='$TARGET' --prefix='$PREFIX' --with-sysroot='$SYSROOT' \
+      --enable-languages=c,c++ \
+      --disable-nls --disable-multilib
+    make -j'$JOBS'
+    make install
+  "
+  checkpoint "50-gcc-p2"
+}
+
+stage_60_libc_full(){
+  is_done "60-libc-full" && { adm_log_info "libc full já presente"; return 0; }
+
+  case "$LIBC" in
+    glibc)
+      ensure_sources "glibc"
+      local src; src="$(unpack_first glibc)"
+      apply_patches_if_any "glibc" "$src"
+      with_build_dir "glibc-full" bash -c "
+        BUILD_CC=gcc \
+        '$src/configure' \
+          --prefix=/usr \
+          --host='$TARGET' \
+          --build='$(../config.guess 2>/dev/null || echo $(uname -m)-unknown-linux-gnu)' \
+          --with-headers='$SYSROOT/usr/include' \
+          --disable-multilib
+        make -j'$JOBS'
+        make DESTDIR='$SYSROOT' install
+      "
+      ;;
+    musl)
+      ensure_sources "musl"
+      local src; src="$(unpack_first musl)"
+      apply_patches_if_any "musl" "$src"
+      with_build_dir "musl-full" bash -c "
+        CC='$TARGET-gcc' \
+        '$src/configure' \
+          --prefix=/usr \
+          --host='$TARGET' \
+          --syslibdir=/usr/lib
+        make -j'$JOBS'
+        make DESTDIR='$SYSROOT' install
+      "
+      ;;
+  esac
+  checkpoint "60-libc-full"
+}
+
+stage_70_libstdcxx(){
+  is_done "70-libstdcxx" && { adm_log_info "libstdc++ já presente"; return 0; }
+
+  ensure_sources "gcc"
+  local src; src="$(unpack_first gcc)"
+  apply_patches_if_any "gcc" "$src"
+
+  with_build_dir "libstdcxx" bash -c "
+    cd '$src/libstdc++-v3'
+    mkdir -p build && cd build
+    ../configure \
+      --host='$TARGET' --build='$(../config-ml.in --print-prog-name=build 2>/dev/null || echo $(uname -m)-linux)' \
+      --prefix=/usr \
+      --disable-multilib --disable-nls \
+      --with-gxx-include-dir='/usr/include/c++'
+    make -j'$JOBS'
+    make DESTDIR='$SYSROOT' install
+  "
+  checkpoint "70-libstdcxx"
+}
+
+stage_80_binutils_pass2(){
+  is_done "80-binutils-p2" && { adm_log_info "binutils pass2 já presente"; return 0; }
+  ensure_sources "binutils"
+  local src; src="$(unpack_first binutils)"
+  apply_patches_if_any "binutils" "$src"
+
+  with_build_dir "binutils-p2" bash -c "
+    '$src/configure' \
+      --prefix='$PREFIX' \
+      --with-sysroot='$SYSROOT' \
+      --target='$TARGET' \
+      --disable-nls --enable-gold --enable-ld=default
+    make -j'$JOBS'
+    make install
+  "
+  checkpoint "80-binutils-p2"
+}
+# (continuação do arquivo /usr/src/adm/scripts/90-bootstrap-toolchain)
+
+post_checks(){
+  adm_log_info "Testes mínimos de toolchain…"
+  tool_env
+
+  local tdir; tdir="$(mktemp -d "${ADM_TMP%/}/tct.XXXX")"
+  trap 'rm -rf -- "'"$tdir"'" 2>/dev/null || true' RETURN
+
+  cat > "$tdir/hello.c" <<'C'
+#include <stdio.h>
+int main(){ puts("hello"); return 0; }
+C
+
+  if ! "$TARGET-gcc" --sysroot="$SYSROOT" "$tdir/hello.c" -o "$tdir/hello" >/dev/null 2>&1; then
+    adm_log_error "Falha ao compilar hello.c com $TARGET-gcc --sysroot."
+    return 1
+  fi
+
+  # Verifica se binários principais existem
+  for b in "$PREFIX/bin/$TARGET-gcc" "$PREFIX/bin/$TARGET-ld" "$PREFIX/bin/$TARGET-ar"; do
+    [[ -x "$b" ]] || { adm_log_error "Ferramenta faltando: %s" "$b"; return 1; }
+  done
+
+  adm_log_success "$C_OK Toolchain funcional."
+}
+
+write_env_file(){
+  local f="$PREFIX/env.sh"
+  cat > "$f" <<EOF
+# Fonte este arquivo para ativar a toolchain:
+export PATH="$PREFIX/bin:$PREFIX/$TARGET/bin:\$PATH"
+export CC="$TARGET-gcc"
+export CXX="$TARGET-g++"
+export AR="$TARGET-ar"
+export AS="$TARGET-as"
+export LD="$TARGET-ld"
+export STRIP="$TARGET-strip"
+export RANLIB="$TARGET-ranlib"
+export SYSROOT="$SYSROOT"
+export PKG_CONFIG_SYSROOT_DIR="\$SYSROOT"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/$TARGET/lib/pkgconfig:\$PKG_CONFIG_PATH"
+export PKG_CONFIG_LIBDIR="\$SYSROOT/usr/lib/pkgconfig:\$SYSROOT/usr/share/pkgconfig"
+EOF
+  adm_log_success "$C_OK Ambiente salvo: %s" "$f"
+}
+
+clean_builddirs(){
+  (( KEEP_BUILD==1 )) && { adm_log_info "Mantendo build dirs (--keep-build)"; return 0; }
+  rm -rf -- "$TC_BUILD"/build-* "$TC_BUILD"/src-* 2>/dev/null || true
+  adm_log_info "Build dirs limpos."
+}
+
+run_all(){
+  stage_00_sanity
+  stage_10_linux_headers
+  stage_20_binutils_pass1
+  stage_30_gcc_pass1
+  stage_40_libc_headers_startfiles
+  stage_50_gcc_pass2
+  stage_60_libc_full
+  stage_70_libstdcxx
+  stage_80_binutils_pass2
+  post_checks
+  write_env_file
+  clean_builddirs
+  adm_log_success "$C_OK Bootstrap finalizado. Use:  source '%s/env.sh'" "$PREFIX"
+}
+
+clean_prefix(){
+  local pfx="${1:-$PREFIX}" srt="${2:-$SYSROOT}"
+  read -r -p "Confirma remover PREFIX=$pfx e SYSROOT=$srt ? [y/N] " ans || true
+  [[ "$ans" =~ ^[yY]$ ]] || { adm_log_warn "Cancelado."; return 2; }
+  rm -rf -- "$pfx" "$srt" 2>/dev/null || true
+  rm -rf -- "$TC_STATE/checkpoints" 2>/dev/null || true
+  adm_log_success "$C_OK Removido."
+}
+
+main(){
+  case "$cmd" in
+    run)   run_all ;;
+    clean) clean_prefix "$PREFIX" "$SYSROOT" ;;
+    *)     usage; exit 0 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
