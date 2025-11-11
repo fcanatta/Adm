@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${WORKDIR:?WORKDIR não definido}"
+: "${TARGET:?TARGET não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+
+BUILD_DIR="${WORKDIR}/build-ninja"
+mkdir -p "$BUILD_DIR"
+export ADM_OUT_OF_TREE_BUILD="$BUILD_DIR"
+
+# Cross real via CMake com "Unix Makefiles" (evita rodar o binário alvo durante build)
+cat > "${BUILD_DIR}/CMAKE_ARGS.txt" <<EOF
+-DCMAKE_INSTALL_PREFIX=/usr
+-DCMAKE_BUILD_TYPE=Release
+-DCMAKE_SYSTEM_NAME=Linux
+-DCMAKE_C_COMPILER=${TARGET}-gcc
+-DCMAKE_CXX_COMPILER=${TARGET}-g++
+-DCMAKE_AR=${TARGET}-ar
+-DCMAKE_RANLIB=${TARGET}-ranlib
+-G "Unix Makefiles"
+EOF
+
+# Diretório-fonte do projeto Ninja (topo do tarball)
+export CONFIGURE_EXTRAS+=" -S . -B ${BUILD_DIR} $(tr '\n' ' ' < ${BUILD_DIR}/CMAKE_ARGS.txt)"
