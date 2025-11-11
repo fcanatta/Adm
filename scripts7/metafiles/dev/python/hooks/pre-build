@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+# Constrói sem rodar testes (não dá para executar binário do target aqui)
+$MAKE -j"$NPROC"
