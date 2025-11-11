@@ -1,0 +1,12 @@
+name=nghttp2
+version=1.62.1
+category=libs
+run_deps=
+build_deps=dev/pkgconf,libs/openssl
+opt_deps=sys/zlib
+num_builds=0
+description=HTTP/2 C library and tools
+homepage=https://nghttp2.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/nghttp2/nghttp2/releases/download/v1.62.1/nghttp2-1.62.1.tar.xz,https://nghttp2.org/packages/nghttp2-1.62.1.tar.xz
