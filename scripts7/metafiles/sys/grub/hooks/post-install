@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Se ADM_GRUB_INSTALL=1, executa grub-install de forma segura (detectando destino)
+: "${ADM_GRUB_INSTALL:=0}"
+
+# Localizar mkconfig e destino do cfg
+MKCFG=""
+for x in /usr/bin/grub-mkconfig /usr/bin/grub2-mkconfig /bin/grub-mkconfig /bin/grub2-mkconfig; do
+  [[ -x "$x" ]] && MKCFG="$x" && break
+done
+
+CFG_DIR="/boot/grub"
+[[ -d /boot/grub2 ]] && CFG_DIR="/boot/grub2"
+CFG_PATH="${CFG_DIR}/grub.cfg"
+install -d "$CFG_DIR"
+
+# Tentar detectar ESP
+ESP=""
+for d in /boot/efi /efi; do
+  if mountpoint -q "$d"; then ESP="$d"; break; fi
+done
+
+# Gerar configuração automaticamente (se mkconfig existir)
+if [[ -n "$MKCFG" ]]; then
+  "$MKCFG" -o "$CFG_PATH" || {
+    echo "Falha ao gerar grub.cfg com $MKCFG — gerando básico..." >&2
+    MKCFG=""
+  }
+fi
+
+# Fallback: escrever um grub.cfg mínimo, listando kernels presentes
+if [[ ! -s "$CFG_PATH" ]]; then
+  KERNS=( $(ls -1 /boot/vmlinuz-* 2>/dev/null | sed 's#^/boot/vmlinuz-##') )
+  {
+    echo 'set default=0'
+    echo 'set timeout=5'
+    echo 'if [ -s $prefix/grub.cfg ]; then source $prefix/grub.cfg; fi'
+    echo 'menuentry "Auto-detect kernels" {'
+    echo '  insmod part_gpt; insmod part_msdos; insmod ext2; insmod xfs; insmod btrfs; insmod f2fs;'
+    for kv in "${KERNS[@]}"; do
+      echo "  menuentry 'Linux $kv' {"
+      echo "    linux  /boot/vmlinuz-$kv root=\$rootfs rw"
+      echo "    if [ -f /boot/initramfs-$kv.img ]; then initrd /boot/initramfs-$kv.img; fi"
+      echo "  }"
+    done
+    echo '}'
+  } > "$CFG_PATH"
+fi
+
+# Instala o GRUB no disco somente se explicitamente solicitado
+if [[ "$ADM_GRUB_INSTALL" = "1" ]]; then
+  # Determinar modo de boot: EFI x BIOS
+  if [[ -d /sys/firmware/efi ]]; then
+    # EFI: precisa do ESP montado (típico /boot/efi)
+    [[ -n "$ESP" ]] || { echo "ESP não montado (/boot/efi ou /efi). Pulei grub-install EFI." >&2; exit 0; }
+    # Detecta a plataforma-alvo pela arquitetura do sistema
+    case "$(uname -m)" in
+      x86_64)   TARGET_PLAT="x86_64-efi" ;;
+      aarch64)  TARGET_PLAT="arm64-efi" ;;
+      arm*)     TARGET_PLAT="arm-efi" ;;
+      riscv64)  TARGET_PLAT="riscv64-efi" ;;
+      i?86)     TARGET_PLAT="i386-efi" ;;
+      *)        TARGET_PLAT="" ;;
+    esac
+    if [[ -n "$TARGET_PLAT" ]]; then
+      # Copia os arquivos EFI para o ESP e registra entrada (sem escolher disco específico)
+      /usr/bin/grub-install --target="$TARGET_PLAT" --efi-directory="$ESP" --bootloader-id="ADM" --recheck || \
+      /usr/bin/grub2-install --target="$TARGET_PLAT" --efi-directory="$ESP" --bootloader-id="ADM" --recheck || true
+    else
+      echo "Plataforma EFI não suportada para grub-install automática" >&2
+    fi
+  else
+    # BIOS/Legacy: tenta detectar o disco do root
+    ROOTDEV="$(findmnt -n -o SOURCE / 2>/dev/null || true)"
+    DISK=""
+    # /dev/sdaX -> /dev/sda ; /dev/nvme0n1pX -> /dev/nvme0n1 ; /dev/vdaX -> /dev/vda
+    if [[ "$ROOTDEV" =~ ^/dev/(sd.|vd.|xvd.)[0-9]+$ ]]; then
+      DISK="/dev/${BASH_REMATCH[1]%?}${BASH_REMATCH[0]:8:1}"
+    elif [[ "$ROOTDEV" =~ ^/dev/(nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then
+      DISK="/dev/${BASH_REMATCH[1]}"
+    fi
+    if [[ -n "$DISK" ]]; then
+      /usr/bin/grub-install --target=i386-pc --recheck "$DISK" || \
+      /usr/bin/grub2-install --target=i386-pc --recheck "$DISK" || true
+    else
+      echo "Não consegui deduzir o disco para grub-install BIOS — pulei." >&2
+    fi
+  fi
+
+  # Regenerar cfg após a instalação do core
+  if [[ -n "$MKCFG" ]]; then
+    "$MKCFG" -o "$CFG_PATH" || true
+  fi
+fi
