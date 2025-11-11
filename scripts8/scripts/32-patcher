@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/32-patcher
+# -----------------------------------------------------------------------------
+# ADM - Patcher: aplica/reverte/refresh patches + hooks a partir de metafiles.
+# - Ordem via patches/series ou lexicográfica.
+# - patch/git apply/git am; autodetecta -pN; suporta three-way.
+# - Verificação sha256 opcional; compressões .gz .xz .bz2 .zst; mbox.
+# - Mantém estado em $ADM_STATE/patcher/<pkg>/; reentrante.
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+PATCH_STATE="$ADM_STATE/patcher"
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _P_COLOR=${ADM_COLOR:-auto}
+  _P_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _P_COLOR=false; fi
+  if [[ "$_P_COLOR" == "auto" ]]; then
+    _P_COLOR=$([[ "$_P_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_P_COLOR" == "true" ]]; then
+    __p_red=$'\033[31m'; __p_grn=$'\033[32m'; __p_yel=$'\033[33m'
+    __p_blu=$'\033[34m'; __p_mag=$'\033[35m'; __p_cyn=$'\033[36m'; __p_dim=$'\033[2m'; __p_rst=$'\033[0m'
+  else
+    __p_red=""; __p_grn=""; __p_yel=""; __p_blu=""; __p_mag=""; __p_cyn=""; __p_dim=""; __p_rst=""
+  fi
+  _p_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_p_ts)" "$__p_dim" "$__p_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_p_ts)" "$__p_blu" "$__p_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_p_ts)" "$__p_yel" "$__p_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_p_ts)" "$__p_red" "$__p_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_p_ts)" "$__p_grn" "$__p_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_p_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_p_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_p_sha256(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+_p_is_git(){ git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+_p_zcat_cmd(){
+  case "$1" in
+    *.gz)  echo "gzip -dc" ;;
+    *.xz)  echo "xz -dc" ;;
+    *.bz2) echo "bzip2 -dc" ;;
+    *.zst) echo "zstd -dc" ;;
+    *)     echo "cat" ;;
+  esac
+}
+_p_filename(){ basename -- "$1"; }
+_p_dirname(){ dirname -- "$1"; }
+_p_have(){ command -v "$1" >/dev/null 2>&1; }
+_p_now(){ date +%s; }
+
+# ============================== Locks ========================================
+_p_lockdir(){ printf "%s" "$PATCH_STATE/locks"; }
+_p_lock_acquire(){
+  local key="$1"; mkdir -p -- "$(_p_lockdir)" || true
+  local d="$(_p_lockdir)/patch-$key.lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: $key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; t=$((t+1)); ((t>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_p_lock_release(){ local key="$1"; rm -rf -- "$(_p_lockdir)/patch-$key.lockdir" 2>/dev/null || true; }
+
+# ============================== Metafile / árvore ============================
+declare -A MF=()
+
+_p_parse_metafile(){
+  local file="$1"; MF=()
+  [[ -f "$file" ]] || { adm_log_error "Metafile não encontrado: %s" "$file"; return 1; }
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      MF["${BASH_REMATCH[1]}"]="$(_p_trim "${BASH_REMATCH[2]}")"
+    else
+      adm_log_warn "Linha ignorada em metafile: $(printf %q "$line")"
+    fi
+  done < "$file"
+}
+
+_p_meta_root_for(){
+  # Entrada pode ser: caminho do metafile, ou raiz do pacote (/usr/src/adm/metafiles/cat/pkg)
+  local arg="$1"
+  if [[ -f "$arg" ]]; then
+    printf "%s" "$(_p_dirname "$arg")"
+  elif [[ -d "$arg" && -f "$arg/metafile" ]]; then
+    printf "%s" "$arg"
+  else
+    adm_log_error "Parâmetro não parece um pacote/metafile: %s" "$arg"; return 1
+  fi
+}
+
+_p_series_read(){
+  local patchdir="$1"
+  local series="$patchdir/series"
+  local -a lst=()
+  if [[ -f "$series" ]]; then
+    while IFS= read -r ln || [[ -n "$ln" ]]; do
+      ln="$(_p_trim "$ln")"
+      [[ -z "$ln" || "$ln" =~ ^# ]] && continue
+      lst+=("$ln")
+    done < "$series"
+  else
+    # ordem lexicográfica de .patch/.diff/.mbox e comprimidos
+    mapfile -t lst < <(find "$patchdir" -maxdepth 1 -type f \( -name "*.patch" -o -name "*.diff" -o -name "*.mbox" -o -name "*.patch.*" -o -name "*.diff.*" \) -printf "%f\n" 2>/dev/null | LC_ALL=C sort)
+  fi
+  printf "%s\n" "${lst[@]}"
+}
+
+_p_checksums_load(){
+  # Prefere arquivo ao lado do patch com extensão .sha256 contendo "<hash>  <filename>"
+  # Opcionalmente, aceita um checksums.txt no patchdir com esse mesmo formato.
+  local patchdir="$1"
+  local sums_file=""
+  if [[ -f "$patchdir/checksums.txt" ]]; then
+    sums_file="$patchdir/checksums.txt"
+  fi
+  printf "%s" "$sums_file"
+}
+
+_p_checksum_for(){
+  local sums_file="$1" fname="$2"
+  [[ -f "$sums_file" ]] || { echo ""; return 0; }
+  awk -v F="$fname" '{ if ($2==F || $2==("./"F)) print $1 }' "$sums_file" 2>/dev/null | head -n1
+}
+
+# ============================== Hooks ========================================
+_p_run_hooks_dir(){
+  local dir="$1" srcdir="$2" meta="$3"
+  [[ -d "$dir" ]] || return 0
+  local s; mapfile -t s < <(find "$dir" -type f -name "*.sh" -print | LC_ALL=C sort)
+  local f
+  for f in "${s[@]}"; do
+    adm_log_info "Hook: $(basename -- "$f")"
+    ( set -Eeuo pipefail; SRC_DIR="$srcdir" META_DIR="$meta" bash "$f" ) || { adm_log_error "Hook falhou: $f"; return 1; }
+  done
+}
+
+_run_hooks(){
+  local stage="$1" meta="$2" srcdir="$3"
+  local hookdir="$meta/hooks"
+  case "$stage" in
+    pre-patch)  _p_run_hooks_dir "$hookdir/pre-patch.d"  "$srcdir" "$meta" ;;
+    post-patch) _p_run_hooks_dir "$hookdir/post-patch.d" "$srcdir" "$meta" ;;
+    pre-refresh)  _p_run_hooks_dir "$hookdir/pre-refresh.d"  "$srcdir" "$meta" ;;
+    post-refresh) _p_run_hooks_dir "$hookdir/post-refresh.d" "$srcdir" "$meta" ;;
+  esac
+}
+
+# ============================== Estado/Audit =================================
+_p_state_dir_for(){
+  local pkg="$1"; printf "%s/%s" "$PATCH_STATE" "$pkg"
+}
+_p_state_reset_if_new_tree(){
+  local st="$1" src="$2"
+  mkdir -p -- "$st"/{rejected,backups,.pc} || { adm_log_error "Sem acesso a $st"; return 1; }
+  # guard: se o src mudou muito (HEAD git diferente), apenas avisa
+  if _p_is_git "$src"; then
+    git -C "$src" rev-parse HEAD >/dev/null 2>&1 || true
+  fi
+}
+
+_p_applied_log(){ printf "%s" "$1/applied.log"; }
+_p_mark_applied(){ local st="$1" p="$2"; echo "$p" >> "$(_p_applied_log "$st")"; }
+_p_mark_unapplied(){ local st="$1"; sed -i '$d' "$(_p_applied_log "$st")" 2>/dev/null || true; }
+_p_applied_list(){
+  local st="$1"; [[ -f "$(_p_applied_log "$st")" ]] && cat "$(_p_applied_log "$st")" || true
+}
+
+# ============================== Aplicação ====================================
+_try_patch_levels(){
+  # tenta -p0..-p7 em dry-run para inferir nível
+  local patchfile="$1" srcdir="$2"
+  local zcmd; zcmd="$(_p_zcat_cmd "$patchfile")"
+  local n
+  for n in 1 0 2 3 4 5 6 7; do  # tenta 1 primeiro (mais comum), depois 0,2...
+    if ( cd "$srcdir" && eval "$zcmd" "'$patchfile'" | patch --dry-run -p"$n" -s >/dev/null 2>&1 ); then
+      echo "$n"; return 0
+    fi
+  done
+  echo "" ; return 1
+}
+
+_apply_with_patch(){
+  local patchfile="$1" srcdir="$2" state="$3" opts="${4:-}"
+  local level; level="$(_try_patch_levels "$patchfile" "$srcdir")" || level=""
+  [[ -z "$level" ]] && { adm_log_warn "Não conseguiu inferir -pN; tentando -p1"; level=1; }
+  local zcmd; zcmd="$(_p_zcat_cmd "$patchfile")"
+  adm_log_info "patch: $(basename -- "$patchfile") (p=$level $opts)"
+  # backup por arquivo (quilt-like .pc)
+  local backupdir="$state/backups/$(basename -- "$patchfile")-$(date +%s)"
+  mkdir -p -- "$backupdir" || true
+  # aplica
+  set +e
+  ( cd "$srcdir" && eval "$zcmd" "'$patchfile'" | patch -p"$level" -t -N $opts ) 1> >(sed 's/^/[patch] /') 2> >(sed 's/^/[patch-err] /' >&2)
+  local rc=$?
+  set -e
+  if (( rc != 0 )); then
+    # tenta three-way se possível
+    if grep -q "^diff --git " <("$(_p_zcat_cmd "$patchfile")" "$patchfile" 2>/dev/null || true) 2>/dev/null && _p_have git; then
+      adm_log_warn "patch falhou; tentando git apply --3way --recount"
+      if ( cd "$srcdir" && git apply --3way --recount "$patchfile" ); then
+        adm_log_success "git apply (3way) OK"
+        return 0
+      fi
+    fi
+    # salva rejeições
+    local rejdir="$state/rejected/$(basename -- "$patchfile").$(date +%s)"
+    mkdir -p -- "$rejdir" || true
+    find "$srcdir" -type f -name "*.rej" -exec cp -f -- "{}" "$rejdir/" \; 2>/dev/null || true
+    adm_log_error "Falha ao aplicar patch: $patchfile (rejeições em $rejdir)"
+    return 1
+  fi
+  adm_log_success "Aplicado: $(basename -- "$patchfile")"
+}
+
+_apply_with_git_am(){
+  local mbox="$1" srcdir="$2"
+  adm_log_info "git am: $(basename -- "$mbox")"
+  ( cd "$srcdir" && git am --3way --keep-cr --committer-date-is-author-date "$mbox" ) || {
+    adm_log_error "git am falhou: $mbox"
+    ( cd "$srcdir" && git am --abort ) >/dev/null 2>&1 || true
+    return 1
+  }
+  adm_log_success "git am OK"
+}
+
+_verify_sha_opt(){
+  local patchdir="$1" patchfile="$2" sums="$3"
+  [[ -z "$sums" ]] && return 0
+  local base="$(basename -- "$patchfile")"
+  local want="$(_p_checksum_for "$sums" "$base")"
+  [[ -z "$want" ]] && return 0
+  local got="$(_p_sha256 "$patchfile")"
+  if [[ "$got" != "$want" ]]; then
+    adm_log_error "SHA256 mismatch em %s (got=%s expect=%s)" "$base" "$got" "$want"
+    return 1
+  fi
+  adm_log_debug "sha256 OK: $base"
+}
+
+_apply_one(){
+  local patchpath="$1" srcdir="$2" state="$3" opts="$4"
+  # mbox?
+  if [[ "$patchpath" == *.mbox ]]; then
+    if _p_is_git "$srcdir"; then
+      _apply_with_git_am "$patchpath" "$srcdir" || return 1
+    else
+      adm_log_error "mbox exige repositório git: %s" "$patchpath"; return 1
+    fi
+    return 0
+  fi
+  _apply_with_patch "$patchpath" "$srcdir" "$state" "$opts"
+}
+
+_apply_all(){
+  local meta="$1" srcdir="$2" opts="$3"
+  local patchdir="$meta/patches"
+  [[ -d "$patchdir" ]] || { adm_log_info "Sem diretório de patches: $patchdir (nada a aplicar)"; return 0; }
+  local sums; sums="$(_p_checksums_load "$patchdir")"
+  local -a series; mapfile -t series < <(_p_series_read "$patchdir")
+  [[ ${#series[@]} -eq 0 ]] && { adm_log_info "Nenhum patch listado."; return 0; }
+
+  local pkgname="$(basename -- "$meta")"
+  local st; st="$(_p_state_dir_for "$pkgname")"
+  _p_state_reset_if_new_tree "$st" "$srcdir" || return 1
+
+  _run_hooks pre-patch "$meta" "$srcdir" || return 1
+
+  local p
+  for p in "${series[@]}"; do
+    local full="$patchdir/$p"
+    [[ -f "$full" ]] || { adm_log_error "Patch não encontrado: %s" "$full"; return 1; }
+    _verify_sha_opt "$patchdir" "$full" "$sums" || return 1
+    _apply_one "$full" "$srcdir" "$st" "$opts" || return 1
+    _p_mark_applied "$st" "$p"
+  done
+
+  _run_hooks post-patch "$meta" "$srcdir" || return 1
+  adm_log_success "Todos patches aplicados."
+}
+
+# ============================== Reverse/Unapply ===============================
+_reverse_try_levels(){
+  local patchfile="$1" srcdir="$2"
+  local zcmd; zcmd="$(_p_zcat_cmd "$patchfile")"
+  local n
+  for n in 1 0 2 3 4 5 6 7; do
+    if ( cd "$srcdir" && eval "$zcmd" "'$patchfile'" | patch --dry-run -R -p"$n" -s >/dev/null 2>&1 ); then
+      echo "$n"; return 0
+    fi
+  done
+  echo ""; return 1
+}
+
+_reverse_one(){
+  local meta="$1" srcdir="$2" file_in_series="$3"
+  local patchfile="$meta/patches/$file_in_series"
+  [[ -f "$patchfile" ]] || { adm_log_error "Patch ausente para reverter: %s" "$patchfile"; return 1; }
+  local level; level="$(_reverse_try_levels "$patchfile" "$srcdir")" || level=""
+  [[ -z "$level" ]] && { adm_log_warn "Não pôde inferir pN para reverse; tentando -p1"; level=1; }
+  local zcmd; zcmd="$(_p_zcat_cmd "$patchfile")"
+  adm_log_info "Revertendo: $file_in_series (p=$level)"
+  ( cd "$srcdir" && eval "$zcmd" "'$patchfile'" | patch -R -p"$level" -t -N ) 1> >(sed 's/^/[reverse] /') 2> >(sed 's/^/[reverse-err] /' >&2) || {
+    adm_log_error "Falha ao reverter patch: %s" "$file_in_series"
+    return 1
+  }
+  adm_log_success "Revertido: $file_in_series"
+}
+
+_reverse_top_or_all(){
+  local meta="$1" srcdir="$2" all="${3:-0}"
+  local pkgname="$(basename -- "$meta")"
+  local st; st="$(_p_state_dir_for "$pkgname")"
+  local log="$(_p_applied_log "$st")"
+  [[ -f "$log" ]] || { adm_log_info "Nada aplicado ainda."; return 0; }
+  local arr; mapfile -t arr < "$log"
+  if (( ${#arr[@]} == 0 )); then adm_log_info "Sem itens aplicados."; return 0; fi
+  if (( all == 0 )); then
+    local last="${arr[-1]}"
+    _reverse_one "$meta" "$srcdir" "$last" || return 1
+    _p_mark_unapplied "$st"
+  else
+    local i
+    for ((i=${#arr[@]}-1;i>=0;i--)); do
+      _reverse_one "$meta" "$srcdir" "${arr[$i]}" || return 1
+      _p_mark_unapplied "$st"
+    done
+  fi
+}
+
+# ============================== Refresh ======================================
+# Regrava patches a partir do estado atual do código:
+#  - Em repositório git: usa `git format-patch` do range criado pelos commits após um marcador.
+#  - Em árvore solta: calcula diffs por arquivo alterado e cria um patch único por item da série.
+#  - Normaliza tar/diff: timestamps fixos, owner root:root, sort name.
+
+_mark_refresh_point_git(){
+  local src="$1" meta="$2"
+  # cria/atualiza tag leve local para âncora de refresh
+  local tag="adm/patch-base"
+  ( cd "$src" && git rev-parse --verify "$tag" >/dev/null 2>&1 ) || {
+    ( cd "$src" && git tag -f "$tag" ) || true
+  }
+}
+
+_refresh_git(){
+  local src="$1" meta="$2"
+  _run_hooks pre-refresh "$meta" "$src" || return 1
+  local tag="adm/patch-base"
+  ( cd "$src" && git rev-parse "$tag" >/dev/null 2>&1 ) || { adm_log_warn "Tag base ausente; criando no HEAD atual"; ( cd "$src" && git tag -f "$tag" ) || true; }
+  local outdir="$meta/patches"
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso: $outdir"; return 1; }
+  # gera série de patches do range tag..HEAD
+  local tmpd; tmpd="$(mktemp -d "${ADM_TMP%/}/pfmt.XXXX")"
+  ( cd "$src" && git format-patch --stdout "$tag"..HEAD ) > "$tmpd/series.mbox" || {
+    rm -rf -- "$tmpd"; adm_log_error "git format-patch falhou"; return 1; }
+  # divide em arquivos numerados .patch
+  ( cd "$tmpd" && csplit -z -f part- series.mbox '/^From /' '{*}' >/dev/null 2>&1 || true )
+  local i=1
+  for f in "$tmpd"/part-*; do
+    [[ -s "$f" ]] || continue
+    local n=$(printf "%04d" "$i")
+    mv -f -- "$f" "$outdir/${n}-refreshed.patch"
+    i=$((i+1))
+  done
+  rm -rf -- "$tmpd" || true
+  _run_hooks post-refresh "$meta" "$src" || return 1
+  adm_log_success "Refresh (git) gerou $(ls -1 "$outdir"/*.patch 2>/dev/null | wc -l) arquivo(s)."
+}
+
+_refresh_plain(){
+  local src="$1" meta="$2"
+  _run_hooks pre-refresh "$meta" "$src" || return 1
+  local outdir="$meta/patches"
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso: $outdir"; return 1; }
+  # compara com cópia limpa? Se não houver, calcula diff inteiro
+  local n="0001-local-refresh.patch"
+  ( cd "$src" && LC_ALL=C TZ=UTC0 \
+    find . -type f -not -path "*/.git/*" -print0 | xargs -0r stat -c '%n' \
+    >/dev/null 2>&1 || true )
+  ( cd "$src" && LC_ALL=C TZ=UTC0 git diff --no-index -- . /dev/null >/dev/null 2>&1 ) || true
+  # fallback: diff -Naur do diretório atual contra snapshot `.pc/base` se existir
+  if [[ -d "$(_p_state_dir_for "$(basename -- "$meta")")/.pc/base" ]]; then
+    ( cd "$src" && diff -Naur -x '.git' . "$(_p_state_dir_for "$(basename -- "$meta")")/.pc/base" ) > "$outdir/$n" 2>/dev/null || true
+  else
+    ( cd "$src" && diff -Naur -x '.git' . /dev/null ) > "$outdir/$n" 2>/dev/null || true
+  fi
+  _run_hooks post-refresh "$meta" "$src" || return 1
+  adm_log_success "Refresh (plain) gerou $n"
+}
+
+refresh_patches(){
+  local meta="$1" src="$2"
+  if _p_is_git "$src"; then
+    _refresh_git "$src" "$meta"
+  else
+    _refresh_plain "$src" "$meta"
+  fi
+}
+# (continuação do arquivo /usr/src/adm/scripts/32-patcher)
+
+# ============================== Comandos de alto nível =======================
+
+patcher_list(){
+  local meta_root="$1"
+  local meta; meta="$(_p_meta_root_for "$meta_root")" || return 1
+  local patchdir="$meta/patches"
+  [[ -d "$patchdir" ]] || { adm_log_info "Sem patches em $patchdir"; return 0; }
+  adm_log_info "Patches em: $patchdir"
+  local series; mapfile -t series < <(_p_series_read "$patchdir")
+  local sums="$(_p_checksums_load "$patchdir")"
+  local i=1
+  local p
+  for p in "${series[@]}"; do
+    local f="$patchdir/$p"
+    local sha=""; [[ -n "$sums" ]] && sha="$(_p_checksum_for "$sums" "$p")"
+    printf "  %b%3d%b %s  %b%s%b\n" "$__p_dim" "$i" "$__p_rst" "$p" "$__p_dim" "${sha:-"-"}" "$__p_rst"
+    i=$((i+1))
+  done
+}
+
+patcher_apply(){
+  local srcdir="" meta_arg="" opts_extra=""
+  while (( $# )); do
+    case "$1" in
+      --srcdir=*) srcdir="${1#--srcdir=}" ;;
+      --meta=*)   meta_arg="${1#--meta=}" ;;
+      --whitespace=*) opts_extra="$opts_extra --whitespace=${1#--whitespace=}" ;;
+      --fuzz=*)       opts_extra="$opts_extra --fuzz=${1#--fuzz=}" ;;
+      --dry-run)      opts_extra="$opts_extra --dry-run" ;; # respeitado apenas se patch suportar
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$srcdir" && -n "$meta_arg" ]] || { adm_log_error "Uso: apply --srcdir=<dir> --meta=<metafile|pkg-dir>"; return 2; }
+  srcdir="$(_p_abspath "$srcdir")"
+  [[ -d "$srcdir" ]] || { adm_log_error "SRC inválido: %s" "$srcdir"; return 1; }
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+
+  local pkg="$(basename -- "$meta")"
+  _p_lock_acquire "apply-$pkg" || return 1
+  trap '_p_lock_release "apply-'$pkg'"' RETURN
+
+  _apply_all "$meta" "$srcdir" "$opts_extra"
+}
+
+patcher_reverse(){
+  local srcdir="" meta_arg="" all=0
+  while (( $# )); do
+    case "$1" in
+      --srcdir=*) srcdir="${1#--srcdir=}" ;;
+      --meta=*)   meta_arg="${1#--meta=}" ;;
+      --all|--reverse-all) all=1 ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$srcdir" && -n "$meta_arg" ]] || { adm_log_error "Uso: reverse --srcdir=<dir> --meta=<metafile|pkg-dir> [--all]"; return 2; }
+  srcdir="$(_p_abspath "$srcdir")"
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+
+  local pkg="$(basename -- "$meta")"
+  _p_lock_acquire "reverse-$pkg" || return 1
+  trap '_p_lock_release "reverse-'$pkg'"' RETURN
+
+  _reverse_top_or_all "$meta" "$srcdir" "$all"
+}
+
+patcher_refresh(){
+  local srcdir="" meta_arg=""
+  while (( $# )); do
+    case "$1" in
+      --srcdir=*) srcdir="${1#--srcdir=}" ;;
+      --meta=*)   meta_arg="${1#--meta=}" ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$srcdir" && -n "$meta_arg" ]] || { adm_log_error "Uso: refresh --srcdir=<dir> --meta=<metafile|pkg-dir>"; return 2; }
+  srcdir="$(_p_abspath "$srcdir")"
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+
+  local pkg="$(basename -- "$meta")"
+  _p_lock_acquire "refresh-$pkg" || return 1
+  trap '_p_lock_release "refresh-'$pkg'"' RETURN
+
+  refresh_patches "$meta" "$srcdir"
+}
+
+patcher_status(){
+  local meta_arg="$1" srcdir="${2:-}"
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+  local pkg="$(basename -- "$meta")"
+  local st; st="$(_p_state_dir_for "$pkg")"
+  local applied; applied="$(_p_applied_list "$st" || true)"
+  local n=$(printf "%s\n" "$applied" | sed '/^$/d' | wc -l)
+  adm_log_info "Status: %s (%d aplicado(s))" "$pkg" "$n"
+  [[ -n "$applied" ]] && printf "%s\n" "$applied" | nl -w2 -s'. '
+  if [[ -n "$srcdir" ]] && _p_is_git "$srcdir"; then
+    ( cd "$srcdir" && git status --porcelain ) | sed 's/^/[git] /'
+  fi
+}
+
+patcher_verify(){
+  local meta_arg="$1"
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+  local patchdir="$meta/patches"
+  [[ -d "$patchdir" ]] || { adm_log_info "Sem patches: %s" "$patchdir"; return 0; }
+  local sums="$(_p_checksums_load "$patchdir")"
+  [[ -z "$sums" ]] && { adm_log_info "Sem checksums.txt; verificação opcional ignorada."; return 0; }
+  local ok=0 bad=0
+  while IFS= read -r f; do
+    local base="$(basename -- "$f")"
+    local want="$(_p_checksum_for "$sums" "$base")"
+    if [[ -z "$want" ]]; then
+      adm_log_warn "Sem hash para %s (ok)" "$base"
+      continue
+    fi
+    local got="$(_p_sha256 "$f")"
+    if [[ "$got" == "$want" ]]; then
+      adm_log_info "OK  %s" "$base"
+      ok=$((ok+1))
+    else
+      adm_log_error "BAD %s (got=%s expect=%s)" "$base" "$got" "$want"
+      bad=$((bad+1))
+    fi
+  done < <(find "$patchdir" -maxdepth 1 -type f \( -name "*.patch" -o -name "*.diff" -o -name "*.mbox" -o -name "*.patch.*" -o -name "*.diff.*" \) -print | LC_ALL=C sort)
+  (( bad>0 )) && return 1
+  adm_log_success "Verificação concluída: OK=$ok BAD=$bad"
+}
+
+patcher_clean(){
+  local meta_arg="$1"
+  local meta; meta="$(_p_meta_root_for "$meta_arg")" || return 1
+  local pkg="$(basename -- "$meta")"
+  local st; st="$(_p_state_dir_for "$pkg")"
+  rm -rf -- "$st/rejected" "$st/backups" "$st/.pc" 2>/dev/null || true
+  adm_log_success "Limpeza de estado concluída para %s" "$pkg"
+}
+
+patcher_doctor(){
+  local fail=0
+  mkdir -p -- "$PATCH_STATE" || { adm_log_error "Sem acesso a $PATCH_STATE"; fail=$((fail+1)); }
+  for b in patch git gzip xz bzip2; do
+    command -v "$b" >/dev/null 2>&1 || adm_log_warn "Ferramenta ausente: %s" "$b"
+  done
+  (( fail>0 )) && { adm_log_error "Doctor apontou $fail problema(s)."; return 1; }
+  adm_log_success "Patcher OK."
+}
+
+# ============================== CLI ==========================================
+
+patcher_usage(){
+  cat <<'USAGE'
+Uso: 32-patcher <comando> [opções]
+
+Comandos:
+  list --meta=<metafile|pkg-dir>                       Lista patches na ordem de aplicação.
+  apply --srcdir=<dir> --meta=<metafile|pkg-dir> [--whitespace=nowarn|fix] [--fuzz=N] [--dry-run]
+  reverse --srcdir=<dir> --meta=<metafile|pkg-dir> [--all|--reverse-all]
+  refresh --srcdir=<dir> --meta=<metafile|pkg-dir>    Regera patches (git ou diff plano).
+  status --meta=<metafile|pkg-dir> [srcdir]           Mostra patches aplicados e status (git opcional).
+  verify --meta=<metafile|pkg-dir>                    Confere hashes sha256 (checksums.txt).
+  clean  --meta=<metafile|pkg-dir>                    Limpa backups/.pc/rejects do estado.
+  doctor                                              Checa ambiente e diretórios.
+
+Notas:
+- Ordem preferencial via patches/series; se ausente, usa ordem lexicográfica.
+- Suporta .patch/.diff(.gz|.xz|.bz2|.zst) e .mbox (git am).
+- Autodetecta nível de patch (-pN) por dry-run. Em falha, tenta git apply --3way.
+- Hooks: hooks/pre-patch.d/*.sh , hooks/post-patch.d/*.sh , hooks/pre-refresh.d/*.sh , hooks/post-refresh.d/*.sh
+- Estado: $ADM_STATE/patcher/<pkg>/{applied.log,rejected,backups,.pc}
+USAGE
+}
+
+patcher_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    list)    patcher_list "${1:-}";;
+    apply)   patcher_apply "$@";;
+    reverse) patcher_reverse "$@";;
+    refresh) patcher_refresh "$@";;
+    status)  patcher_status "${1:-}" "${2:-}";;
+    verify)  patcher_verify "${1:-}";;
+    clean)   patcher_clean "${1:-}";;
+    doctor)  patcher_doctor;;
+    ""|-h|--help|help) patcher_usage;;
+    *)       adm_log_error "Comando desconhecido: $cmd"; patcher_usage; exit 2;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  patcher_main "$@"
+fi
