@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${PYTHON_FOR_BUILD:=python3}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+# Baixa toolchains internos se necessário (sem bootstrap agressivo)
+# $PYTHON_FOR_BUILD mach bootstrap --no-interaction || true   # opcional, normalmente evitamos
+
+# Build (mach usa .mozconfig)
+$PYTHON_FOR_BUILD mach build -v -j"${NPROC}"
