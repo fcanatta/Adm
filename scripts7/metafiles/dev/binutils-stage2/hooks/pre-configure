@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+CONFIGURE_EXTRAS+=" --prefix=/usr --with-sysroot=${SYSROOT} --target=${TARGET}"
+CONFIGURE_EXTRAS+=" --enable-plugins --enable-lto --disable-werror --disable-nls"
+# gold é opcional; deixe desligado no Stage2 inicial para reduzir riscos:
+CONFIGURE_EXTRAS+=" --disable-gold --enable-default-hash-style=gnu"
+export CONFIGURE_EXTRAS
