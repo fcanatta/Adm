@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ADM_SET_DEFAULT_CLANG:=0}"   # 1 = tornar clang/lld padrão
+[[ "$ADM_SET_DEFAULT_CLANG" = "1" ]] || exit 0
+
+# 1) Symlinks cc/c++ -> clang/clang++ (não sobrescreve se já existir binário real)
+link_safe() {
+  local src="$1" dst="$2"
+  if [[ -e "$dst" && ! -L "$dst" ]]; then
+    echo "Mantendo existente: $dst" >&2
+    return 0
+  fi
+  ln -snf "$src" "$dst"
+}
+
+# clang/clang++
+if command -v /usr/bin/clang >/dev/null 2>&1; then
+  link_safe /usr/bin/clang   /usr/bin/cc
+fi
+if command -v /usr/bin/clang++ >/dev/null 2>&1; then
+  link_safe /usr/bin/clang++ /usr/bin/c++
+fi
+
+# ld -> lld (mantém ld do binutils se for binário real)
+if command -v /usr/bin/ld.lld >/dev/null 2>&1; then
+  link_safe /usr/bin/ld.lld /usr/bin/ld
+fi
+
+# 2) Drop-in de ambiente para facilitar builds com Clang/Lld por padrão
+install -d /etc/profile.d
+cat > /etc/profile.d/adm-clang-toolchain.sh <<'EOF'
+# habilitado pelo clang-toolchain (ADM_SET_DEFAULT_CLANG=1)
+export CC=${CC:-clang}
+export CXX=${CXX:-clang++}
+export LD=${LD:-ld.lld}
+# Se existir SYSROOT no ambiente (via adm-paths), o Clang já honra --sysroot automaticamente
+EOF
