@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Remover lançador e symlink (sem tocar em perfis do usuário)
+rm -f /usr/share/applications/firefox.desktop 2>/dev/null || true
+rm -f /usr/bin/firefox 2>/dev/null || true
+
+# Remover ícones instalados por este pacote
+for sz in 16 22 24 32 48 64 128 256; do
+  rm -f "/usr/share/icons/hicolor/${sz}x${sz}/apps/firefox.png" 2>/dev/null || true
+done
+
+# Atualizar caches
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  if [[ -d "/usr/share/icons/hicolor" ]]; then
+    gtk-update-icon-cache -q -t -f "/usr/share/icons/hicolor" || true
+  fi
+fi
+
+# Remover dir vazio se sobrar
+rmdir /usr/lib/firefox 2>/dev/null || true
