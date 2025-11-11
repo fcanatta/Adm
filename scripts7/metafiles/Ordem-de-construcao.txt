@@ -85,3 +85,13 @@ adm paths profile select normal
 
 # Para builds agressivos
 adm paths profile select aggressive
+
+# Ordem de construção do kernel
+# Kernel (compila + instala + gera initramfs no post-install)
+adm install linux --jobs=8 --profile=normal
+
+# (Opcional) Headers: para desenvolvimento no target
+adm install linux-headers --jobs=8 --profile=normal
+
+# (Opcional) Firmwares
+adm install linux-firmware --jobs=8 --profile=normal
