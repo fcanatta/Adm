@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Habilita os-prober no GRUB de forma não invasiva (drop-in)
+GRUB_DEFAULT_DIR="/etc/default"
+install -d "$GRUB_DEFAULT_DIR/grub.d"
+# drop-in que define GRUB_DISABLE_OS_PROBER=false se não houver override do usuário
+DROPIN="$GRUB_DEFAULT_DIR/grub.d/10-adm-os-prober"
+cat > "$DROPIN" <<'EOF'
+# criado pelo ADM: habilita os-prober por padrão
+GRUB_DISABLE_OS_PROBER=false
+EOF
