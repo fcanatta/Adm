@@ -1,0 +1,12 @@
+name=clang
+version=19.1.0
+category=dev
+run_deps=llvm
+build_deps=llvm,binutils-stage2,gcc-final,host-cmake,host-ninja,host-python3
+opt_deps=lld
+num_builds=0
+description=Clang/Clang++ (frontends C/C++)
+homepage=https://clang.llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz
