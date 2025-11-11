@@ -1,0 +1,12 @@
+name=kmod
+version=33
+category=sys
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Linux kernel module tools
+homepage=https://github.com/kmod-project/kmod
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/utils/kernel/kmod/kmod-33.tar.xz,https://mirrors.edge.kernel.org/pub/linux/utils/kernel/kmod/kmod-33.tar.xz
