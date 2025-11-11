@@ -1,0 +1,12 @@
+name=clang-toolchain
+version=19.1.0
+category=dev
+run_deps=llvm,clang,lld,compiler-rt,libcxxabi,libcxx
+build_deps=
+opt_deps=libunwind
+num_builds=0
+description=Meta-pacote do toolchain LLVM/Clang (llvm+clang+lld+compiler-rt+libcxxabi+libcxx)
+homepage=https://llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
