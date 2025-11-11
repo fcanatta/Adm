@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+
+# Descobrir "build triplet" do host
+BUILD_TRIPLET="$(
+  ./config.guess 2>/dev/null || \
+  python3 - <<'PY'
+import platform
+print(platform.machine() + "-unknown-linux-gnu")
+PY
+)"
+
+# Variáveis que ajudam o autoconf a não testar rodando binário-alvo
+export ac_cv_file__dev_ptmx=yes
+export ac_cv_file__dev_ptc=yes
+
+# Python usa PYTHON_FOR_BUILD durante o cross
+: "${PYTHON_FOR_BUILD:=python3}"
+export PYTHON_FOR_BUILD
+
+# Alguns módulos opcionalmente falham sem deps; não tratar como erro
+export CPPFLAGS="${CPPFLAGS:-}"
+export LDFLAGS="${LDFLAGS:-}"
+
+# Configuração padrão (shared + prefix em /usr)
+CONFIGURE_EXTRAS+=" --host=${TARGET} --build=${BUILD_TRIPLET}"
+CONFIGURE_EXTRAS+=" --prefix=/usr --enable-shared"
+CONFIGURE_EXTRAS+=" --with-system-expat --with-system-ffi"
+CONFIGURE_EXTRAS+=" --without-ensurepip"   # evite rodar pip no cross; você pode usar ensurepip depois no target
+
+export CONFIGURE_EXTRAS
