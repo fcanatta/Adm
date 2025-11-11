@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ADM_OUT_OF_TREE_BUILD:?}"
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+DESTDIR="${DESTDIR}" $MAKE -C "${ADM_OUT_OF_TREE_BUILD}" install
