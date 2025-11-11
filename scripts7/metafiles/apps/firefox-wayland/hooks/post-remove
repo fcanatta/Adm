@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+rm -f /usr/bin/firefox-wayland 2>/dev/null || true
+rm -f /usr/share/applications/firefox-wayland.desktop 2>/dev/null || true
+rm -f /etc/profile.d/adm-firefox-wayland.sh 2>/dev/null || true
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications || true
+fi
