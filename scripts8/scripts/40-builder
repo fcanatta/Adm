@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/40-builder
+# -----------------------------------------------------------------------------
+# ADM - Builder Universal
+# - Detecta tipo de projeto (autotools/cmake/meson/make/kernel/cargo/go/python/node)
+# - Integra fetcher, patcher, hooks-runner, profiles e toolchains
+# - Compila com gcc/clang/(zig opcional), linka com bfd/gold/lld/mold
+# - Suporta musl/glibc, cross e kernel/toolchain/firmware básicos
+# - Instala em DESTDIR, empacota, gera logs e artefatos reprodutíveis
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_CACHE:=$ADM_ROOT/cache}"
+: "${ADM_BUILD_ROOT:=$ADM_ROOT/build}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+BUILDER_STATE="$ADM_STATE/builder"
+mkdir -p -- "$BUILDER_STATE" "$ADM_BUILD_ROOT" "$ADM_PACKAGES" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _B_COLOR=${ADM_COLOR:-auto}
+  _B_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _B_COLOR=false; fi
+  if [[ "$_B_COLOR" == "auto" ]]; then
+    _B_COLOR=$([[ "$_B_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_B_COLOR" == "true" ]]; then
+    __b_red=$'\033[31m'; __b_grn=$'\033[32m'; __b_yel=$'\033[33m'
+    __b_blu=$'\033[34m'; __b_mag=$'\033[35m'; __b_cyn=$'\033[36m'; __b_dim=$'\033[2m'; __b_rst=$'\033[0m'
+    __b_chk=$'\xE2\x9C\x85'
+  else
+    __b_red=""; __b_grn=""; __b_yel=""; __b_blu=""; __b_mag=""; __b_cyn=""; __b_dim=""; __b_rst=""; __b_chk="[OK]"
+  fi
+  _b_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_b_ts)" "$__b_dim" "$__b_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_b_ts)" "$__b_blu" "$__b_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_b_ts)" "$__b_yel" "$__b_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_b_ts)" "$__b_red" "$__b_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_b_ts)" "$__b_grn" "$__b_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_b_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_b_slug(){ printf "%s" "$1" | tr ' /:' '__' | tr -cd '[:alnum:]_-.'); }
+_babspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_bsha(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+_bnproc(){ command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 2; }
+_bdie(){ adm_log_error "$*"; exit 1; }
+_bhave(){ command -v "$1" >/dev/null 2>&1; }
+_bsize(){ stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null || echo 0; }
+
+# horários determinísticos ao empacotar
+_b_tar_xz(){ tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -c "$1" | xz -9eT0 > "$2"; }
+_b_tar_zst(){ tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -c "$1" | zstd -19 -T0 -q -o "$2"; }
+
+# ============================== Metafile / Paths =============================
+declare -A MF=()
+_parse_metafile(){
+  local file="$1"; MF=()
+  [[ -f "$file" ]] || _bdie "Metafile não encontrado: $file"
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      MF["${BASH_REMATCH[1]}"]="$(_b_trim "${BASH_REMATCH[2]}")"
+    else
+      adm_log_warn "Linha ignorada no metafile: $(printf %q "$line")"
+    fi
+  done < "$file"
+}
+
+_pkg_id(){
+  local name="${MF[name]:-unknown}" ver="${MF[version]:-0}"
+  printf "%s-%s" "$name" "$ver"
+}
+
+_meta_dir_from_arg(){
+  local arg="$1"
+  if [[ -d "$arg" && -f "$arg/metafile" ]]; then
+    printf "%s" "$arg"
+  elif [[ -f "$arg" ]]; then
+    dirname -- "$arg"
+  else
+    _bdie "Caminho inválido (esperado diretório do pacote ou metafile): $arg"
+  fi
+}
+
+# ============================== Environment / Profiles =======================
+# Integra com 12-profile-manager e 14-toolchain-db (se existirem).
+# Exporta CC/CXX/LD/AR/PKG_CONFIG_LIBDIR/MAKEFLAGS/CFLAGS/… e toggles (LTO, SAN, etc.)
+
+declare -A ENVX=()
+
+_env_reset(){
+  ENVX=()
+  # defaults mínimos
+  ENVX[MAKEFLAGS]="-j$((_bnproc)))"
+  ENVX[LC_ALL]="C.UTF-8"
+  ENVX[LANG]="C.UTF-8"
+  ENVX[SOURCE_DATE_EPOCH]="1577836800" # 2020-01-01
+  ENVX[DESTDIR]="" # setada por build
+}
+
+_env_export(){
+  local k; for k in "${!ENVX[@]}"; do export "$k"="${ENVX[$k]}"; done
+}
+
+_env_from_profile(){
+  local profile="${1:-}"
+  [[ -z "$profile" ]] && profile="${ADM_PROFILE:-normal}"
+  local pm="$ADM_ROOT/scripts/12-profile-manager"
+  if [[ -x "$pm" ]]; then
+    # modo: print-env devolve pares KEY=VAL
+    local kv
+    while IFS= read -r kv; do
+      [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
+      local key="${kv%%=*}" val="${kv#*=}"
+      ENVX["$key"]="$val"
+    done < <("$pm" print-env --profile="$profile" 2>/dev/null || true)
+  else
+    # fallback simples
+    ENVX[CFLAGS]="${CFLAGS:- -O2 -pipe}"
+    ENVX[CXXFLAGS]="${CXXFLAGS:- -O2 -pipe}"
+    ENVX[LDFLAGS]="${LDFLAGS:- }"
+  fi
+}
+
+_env_from_toolchain(){
+  local tc="$1"
+  local tdb="$ADM_ROOT/scripts/14-toolchain-db"
+  if [[ -x "$tdb" && -n "$tc" ]]; then
+    local kv
+    while IFS= read -r kv; do
+      [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
+      local key="${kv%%=*}" val="${kv#*=}"
+      ENVX["$key"]="$val"
+    done < <("$tdb" env --select="$tc" 2>/dev/null || true)
+  fi
+}
+
+_env_choose_compiler(){
+  # Decide CC/CXX conforme ENV, profile, preferências e disponibilidade
+  local cc="${ENVX[CC]:-}" cxx="${ENVX[CXX]:-}" ldname="${ENVX[LD_NAME]:-}"
+  if [[ -z "$cc" ]]; then
+    if _bhave clang; then cc="clang"; else cc="gcc"; fi
+  fi
+  if [[ -z "$cxx" ]]; then
+    if _bhave clang++; then cxx="clang++"; else cxx="g++"; fi
+  fi
+  ENVX[CC]="$cc"; ENVX[CXX]="$cxx"
+
+  # Linker preferido
+  if [[ -z "$ldname" ]]; then
+    if _bhave mold; then ldname="mold"
+    elif _bhave lld; then ldname="lld"
+    elif _bhave ld.gold; then ldname="gold"
+    else ldname="bfd"; fi
+  fi
+  ENVX[LD_NAME]="$ldname"
+
+  # -fuse-ld quando suportado
+  if [[ "$cc" == clang || "$cc" == *gcc* ]]; then
+    case "$ldname" in
+      lld|mold|gold) ENVX[LDFLAGS]="${ENVX[LDFLAGS]:-} -Wl,-O1 -fuse-ld=$ldname" ;;
+      bfd|ld)        ENVX[LDFLAGS]="${ENVX[LDFLAGS]:-} -Wl,-O1" ;;
+    esac
+  fi
+
+  # ccache
+  if _bhave ccache && [[ "${ADM_USE_CCACHE:-1}" == "1" ]]; then
+    ENVX[CC]="ccache $cc"; ENVX[CXX]="ccache $cxx"
+  fi
+}
+
+_env_apply_libc_target(){
+  # Seleciona musl/glibc/cross
+  local target="${ENVX[TARGET_TRIPLE]:-}" host="${ENVX[HOST_TRIPLE]:-}"
+  [[ -n "$target" ]] && ENVX[CROSS_COMPILE]="${target}-"
+  # PKG_CONFIG path para sysroot, se informado
+  if [[ -n "${ENVX[SYSROOT_DIR]:-}" ]]; then
+    ENVX[PKG_CONFIG_SYSROOT_DIR]="${ENVX[SYSROOT_DIR]}"
+  fi
+}
+
+_env_print(){
+  local k
+  for k in CC CXX AR RANLIB NM STRIP LD_NAME CFLAGS CXXFLAGS LDFLAGS PKG_CONFIG_PATH PKG_CONFIG_LIBDIR HOST_TRIPLE TARGET_TRIPLE SYSROOT_DIR MAKEFLAGS; do
+    [[ -n "${ENVX[$k]:-}" ]] && printf "  %s=%q\n" "$k" "${ENVX[$k]}"
+  done
+}
+
+# ============================== Unpack (fetch + extract) =====================
+_unpack_sources(){
+  local meta_dir="$1" workdir="$2"
+  local fetch="$ADM_ROOT/scripts/30-fetcher"
+  local cache_src="$ADM_CACHE/sources"
+  mkdir -p -- "$workdir/src" || _bdie "Sem acesso: $workdir/src"
+
+  # 1) Fetch (se existirem sources no metafile)
+  if [[ -x "$fetch" ]]; then
+    "$fetch" fetch --metafile="$meta_dir/metafile" || _bdie "Fetcher falhou"
+  else
+    adm_log_warn "30-fetcher não encontrado; assumindo que os arquivos já estão em $cache_src"
+  fi
+
+  # 2) Unpack: tenta todos tarballs em cache que correspondam aos nomes de sources
+  local sources="${MF[sources]:-}"
+  local -a SRC=(); IFS=',' read -r -a SRC <<< "$sources"
+  local s
+  for s in "${SRC[@]}"; do
+    s="$(_b_trim "$s")"; [[ -z "$s" ]] && continue
+    local base="$(basename -- "${s%%\?*}")"
+    local path=""
+    if [[ -f "$cache_src/$base" ]]; then
+      path="$cache_src/$base"
+    elif [[ -f "$cache_src/$base.tar.xz" ]]; then
+      path="$cache_src/$base.tar.xz"
+    elif [[ -f "$cache_src/$base.tar.gz" ]]; then
+      path="$cache_src/$base.tar.gz"
+    elif [[ -d "$cache_src/$base" ]]; then
+      path="$cache_src/$base"
+    fi
+    [[ -z "$path" ]] && { adm_log_warn "Fonte não encontrada na cache: $base"; continue; }
+
+    adm_log_info "Unpack: $base"
+    if [[ -f "$path" ]]; then
+      case "$path" in
+        *.tar.xz|*.txz)  tar -xJf "$path" -C "$workdir/src" ;;
+        *.tar.gz|*.tgz)  tar -xzf "$path" -C "$workdir/src" ;;
+        *.tar.zst)       zstd -dc "$path" | tar -x -C "$workdir/src" ;;
+        *.zip)           unzip -q "$path" -d "$workdir/src" ;;
+        *.xz)            mkdir -p "$workdir/src/$base.dir" && xz -dc "$path" | tar -x -C "$workdir/src/$base.dir" || true ;;
+        *.gz)            mkdir -p "$workdir/src/$base.dir" && gzip -dc "$path" | tar -x -C "$workdir/src/$base.dir" || true ;;
+        *.bz2)           mkdir -p "$workdir/src/$base.dir" && bzip2 -dc "$path" | tar -x -C "$workdir/src/$base.dir" || true ;;
+        *)               mkdir -p "$workdir/src/$base.dir" && tar -x -f "$path" -C "$workdir/src/$base.dir" || cp -a "$path" "$workdir/src/" ;;
+      esac
+    else
+      cp -a "$path" "$workdir/src/"
+    fi
+  done
+
+  # 3) Seleciona diretório de topo (primeiro dir criado)
+  local top
+  top="$(find "$workdir/src" -mindepth 1 -maxdepth 1 -type d -print | head -n1)"
+  [[ -n "$top" ]] || _bdie "Não foi possível determinar diretório de fonte"
+  printf "%s" "$top"
+}
+
+# ============================== Patches & Hooks ==============================
+_run_hooks(){ # wrapper 34-hooks-runner
+  local stage="$1" workdir="$2"
+  local hr="$ADM_ROOT/scripts/34-hooks-runner"
+  if [[ -x "$hr" ]]; then
+    "$hr" run "$stage" "$workdir" || _bdie "Hook stage '$stage' falhou"
+  else
+    adm_log_debug "hooks-runner ausente; pulando $stage"
+  fi
+}
+
+_apply_patches(){
+  local meta_dir="$1" srcdir="$2"
+  local patcher="$ADM_ROOT/scripts/32-patcher"
+  if [[ -x "$patcher" ]]; then
+    "$patcher" apply --srcdir="$srcdir" --meta="$meta_dir" || _bdie "Patcher falhou"
+  else
+    adm_log_debug "patcher ausente; sem patches aplicados"
+  fi
+}
+
+# ============================== Detect/Plan ==================================
+_detect_build_system(){
+  local srcdir="$1"
+  # 1) detector (se existir) — pode exportar build_system=… via arquivo json/ini
+  local det="$ADM_ROOT/scripts/20-detector"
+  if [[ -x "$det" ]]; then
+    "$det" scan "$srcdir" >/dev/null 2>&1 || true
+  fi
+  # 2) heurística por arquivos
+  if [[ -f "$srcdir/configure.ac" || -f "$srcdir/configure.in" || -f "$srcdir/configure" ]]; then
+    echo "autotools"; return
+  fi
+  if [[ -f "$srcdir/CMakeLists.txt" ]]; then echo "cmake"; return; fi
+  if [[ -f "$srcdir/meson.build" ]]; then echo "meson"; return; fi
+  if [[ -f "$srcdir/Makefile" || -f "$srcdir/makefile" ]]; then
+    # kernel?
+    if [[ -f "$srcdir/Kconfig" || -d "$srcdir/arch" ]]; then echo "kernel"; return; fi
+    # busybox?
+    if [[ -f "$srcdir/Config.in" && -f "$srcdir/applets/applets.c" ]]; then echo "busybox"; return; fi
+    echo "make"; return
+  fi
+  if [[ -f "$srcdir/Cargo.toml" ]]; then echo "cargo"; return; fi
+  if [[ -f "$srcdir/go.mod" ]]; then echo "go"; return; fi
+  if [[ -f "$srcdir/pyproject.toml" || -f "$srcdir/setup.py" ]]; then echo "python"; return; fi
+  if [[ -f "$srcdir/package.json" ]]; then echo "node"; return; fi
+  echo "unknown"
+}
+
+# ============================== Build steps ==================================
+_configure_autotools(){
+  local src="$1" bld="$2" dest="$3"
+  mkdir -p -- "$bld" || _bdie "Sem acesso: $bld"
+  ( cd "$src"
+    [[ -x ./autogen.sh ]] && ./autogen.sh || true
+  )
+  local host=""; [[ -n "${ENVX[HOST_TRIPLE]:-}" ]] && host="--host=${ENVX[HOST_TRIPLE]}"
+  ( cd "$bld"
+    "$src/configure" $host --prefix=/usr --sysconfdir=/etc --localstatedir=/var \
+      CFLAGS="${ENVX[CFLAGS]:-}" CXXFLAGS="${ENVX[CXXFLAGS]:-}" LDFLAGS="${ENVX[LDFLAGS]:-}" \
+      CC="${ENVX[CC]}" CXX="${ENVX[CXX]}" \
+      || _bdie "configure (autotools) falhou"
+  )
+}
+
+_build_make_like(){
+  local dir="$1"
+  ( cd "$dir"
+    make ${ENVX[MAKEFLAGS]:-} V=1 || _bdie "make falhou"
+  )
+}
+
+_install_make_like(){
+  local dir="$1" dest="$2"
+  ( cd "$dir"
+    make DESTDIR="$dest" install || _bdie "make install falhou"
+  )
+}
+
+_configure_cmake(){
+  local src="$1" bld="$2"
+  mkdir -p -- "$bld"
+  local gen="Ninja"
+  local cmake=cmake
+  local ldflag="${ENVX[LDFLAGS]:-}"
+  ( cd "$bld"
+    $cmake -G "$gen" "$src" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_C_COMPILER="${ENVX[CC]}" -DCMAKE_CXX_COMPILER="${ENVX[CXX]}" \
+      -DCMAKE_EXE_LINKER_FLAGS="$ldflag" -DCMAKE_SHARED_LINKER_FLAGS="$ldflag" \
+      || _bdie "cmake configure falhou"
+  )
+}
+
+_build_ninja(){
+  local dir="$1"
+  if _bhave ninja; then (cd "$dir" && ninja -j "$((_bnproc))") || _bdie "ninja falhou"
+  else (cd "$dir" && make ${ENVX[MAKEFLAGS]:-}) || _bdie "make (cmake) falhou"
+  fi
+}
+
+_install_cmake(){
+  local dir="$1" dest="$2"
+  if _bhave ninja; then (cd "$dir" && DESTDIR="$dest" ninja install) || _bdie "ninja install falhou"
+  else (cd "$dir" && DESTDIR="$dest" make install) || _bdie "make install falhou"
+  fi
+}
+
+_configure_meson(){
+  local src="$1" bld="$2"
+  mkdir -p -- "$bld"
+  local meson=meson
+  ( cd "$bld"
+    $meson setup "$src" --prefix=/usr --buildtype=release \
+      -Dstrip=false -Db_lto=false \
+      --libdir=lib \
+      -Dcpp_std=c++17 \
+      || _bdie "meson setup falhou"
+  )
+}
+
+_build_meson(){ local dir="$1"; (cd "$dir" && meson compile -j "$((_bnproc))") || _bdie "meson compile falhou"; }
+_install_meson(){ local dir="$1" dest="$2"; (cd "$dir" && DESTDIR="$dest" meson install) || _bdie "meson install falhou"; }
+
+_build_kernel(){
+  local src="$1" bld="$2" dest="$3"
+  mkdir -p -- "$bld"
+  local jobs="$((_bnproc))"
+  local O="O=$bld"
+  # Config: usa defconfig se não houver .config
+  if [[ ! -f "$bld/.config" ]]; then
+    ( cd "$src" && make $O defconfig ) || _bdie "kernel defconfig falhou"
+  fi
+  ( cd "$src" && make $O -j"$jobs" ) || _bdie "kernel build falhou"
+  ( cd "$src" && make $O -j"$jobs" modules ) || true
+  ( cd "$src" && make $O INSTALL_MOD_PATH="$dest" modules_install ) || true
+  # Instala kernel imagem e headers básicos
+  mkdir -p "$dest/boot" "$dest/usr/src/linux"
+  cp -a "$bld/arch/"*/boot/*Image* "$dest/boot/" 2>/dev/null || true
+  make -C "$src" $O INSTALL_HDR_PATH="$dest/usr" headers_install || adm_log_warn "kernel headers falharam (opcional)"
+}
+
+_build_busybox(){
+  local src="$1" dest="$2"
+  ( cd "$src"
+    [[ -f .config ]] || make defconfig
+    make -j "$((_bnproc))" || _bdie "busybox build falhou"
+    make CONFIG_PREFIX="$dest" install || _bdie "busybox install falhou"
+  )
+}
+
+_build_cargo(){
+  local src="$1" dest="$2"
+  ( cd "$src"
+    cargo build --release || _bdie "cargo build falhou"
+    # instala binários (heurística: target/*/release/* executáveis)
+    mkdir -p "$dest/usr/bin"
+    find target -type f -perm -111 -maxdepth 3 -name "*" -path "*/release/*" -exec cp -a "{}" "$dest/usr/bin/" \; || true
+    cargo install --path . --root "$dest/usr" || true
+  )
+}
+
+_build_go(){
+  local src="$1" dest="$2"
+  ( cd "$src"
+    GOPATH="${GOPATH:-$HOME/go}" go build ./... || _bdie "go build falhou"
+    mkdir -p "$dest/usr/bin"
+    find . -maxdepth 1 -type f -perm -111 -exec cp -a "{}" "$dest/usr/bin/" \; || true
+  )
+}
+
+_build_python(){
+  local src="$1" dest="$2"
+  ( cd "$src"
+    if [[ -f pyproject.toml ]]; then
+      if _bhave pip; then
+        PIP_CONFIG_FILE=/dev/null pip wheel -w dist . || _bdie "pip wheel falhou"
+        pip install --no-index --find-links=dist --root "$dest" --prefix /usr . || _bdie "pip install falhou"
+      else
+        python -m pip wheel -w dist . || _bdie "pip wheel (python -m) falhou"
+        python -m pip install --no-index --find-links=dist --root "$dest" --prefix /usr . || _bdie "pip install falhou"
+      fi
+    elif [[ -f setup.py ]]; then
+      python setup.py build || _bdie "setup.py build falhou"
+      python setup.py install --root "$dest" --prefix /usr || _bdie "setup.py install falhou"
+    else
+      _bdie "Projeto Python sem pyproject/setup.py"
+    fi
+  )
+}
+
+_build_node(){
+  local src="$1" dest="$2"
+  ( cd "$src"
+    if _bhave pnpm; then pnpm i --frozen-lockfile || _bdie "pnpm install falhou"
+    elif _bhave yarn; then yarn --frozen-lockfile || _bdie "yarn install falhou"
+    else npm ci || _bdie "npm ci falhou"; fi
+    npm run build || true
+    # heurística: copiar artefatos
+    mkdir -p "$dest/usr/lib/${MF[name]:-nodepkg}"
+    cp -a dist build lib "$dest/usr/lib/${MF[name]:-nodepkg}" 2>/dev/null || true
+    # se bin em package.json
+    if jq -e '.bin' package.json >/dev/null 2>&1; then
+      mkdir -p "$dest/usr/bin"
+      local k v; while IFS="=" read -r k v; do
+        [[ -z "$k" || -z "$v" ]] && continue
+        install -Dm0755 "$v" "$dest/usr/bin/$k"
+      done < <(node -e 'let p=require("./package.json"); if(p.bin){ for (const k in p.bin) console.log(k+"="+p.bin[k]); }')
+    fi
+  )
+}
+# (continuação do arquivo /usr/src/adm/scripts/40-builder)
+
+# ============================== Strip & QA ===================================
+
+_strip_binaries(){
+  local root="$1"
+  local strip="${ENVX[STRIP]:-strip}"
+  [[ "${ADM_STRIP_DISABLE:-0}" == "1" ]] && { adm_log_info "Strip desabilitado"; return 0; }
+  command -v "$strip" >/dev/null 2>&1 || { adm_log_warn "strip não encontrado"; return 0; }
+  find "$root" -type f -perm -111 -exec file "{}" \; | awk -F: '/ELF/ {print $1}' | while read -r f; do
+    "$strip" --strip-unneeded "$f" || adm_log_warn "strip falhou em $f (continuando)"
+  done
+}
+
+_fix_rpaths(){
+  local root="$1"
+  command -v patchelf >/dev/null 2>&1 || return 0
+  find "$root/usr/bin" "$root/usr/lib" -type f 2>/dev/null | while read -r f; do
+    file "$f" | grep -q ELF || continue
+    local r
+    r="$(patchelf --print-rpath "$f" 2>/dev/null || true)"
+    [[ -z "$r" ]] && continue
+    # saneia RPATH fora de /usr/lib e /lib
+    local clean="$(echo "$r" | tr ':' '\n' | grep -E '^(/usr)?/lib' | paste -sd: -)"
+    [[ -n "$clean" && "$clean" != "$r" ]] && patchelf --set-rpath "$clean" "$f" || true
+  done
+}
+
+# ============================== Packaging ====================================
+
+_package(){
+  local dest="$1" pkgid="$2"
+  local outdir="$ADM_PACKAGES/$pkgid"
+  mkdir -p -- "$outdir" || _bdie "Sem acesso: $outdir"
+  local tarxz="$outdir/$pkgid.tar.xz"
+  local tarzst="$outdir/$pkgid.tar.zst"
+  _b_tar_xz  -C "$dest" . "$tarxz" || _bdie "tar.xz falhou"
+  _b_tar_zst -C "$dest" . "$tarzst" || _bdie "tar.zst falhou"
+  adm_log_success "Pacotes: $(basename "$tarxz") (~$(_bsize "$tarxz") bytes), $(basename "$tarzst") (~$(_bsize "$tarzst") bytes)"
+}
+
+# ============================== Orquestração =================================
+
+builder_build(){
+  local meta_arg="" profile="" toolchain="" only_stage=""
+  local keep_build=0 run_tests=0
+  while (( $# )); do
+    case "$1" in
+      --meta=*)      meta_arg="${1#--meta=}" ;;
+      --profile=*)   profile="${1#--profile=}" ;;
+      --toolchain=*) toolchain="${1#--toolchain=}" ;;
+      --tests)       run_tests=1 ;;
+      --keep-build)  keep_build=1 ;;
+      --only-stage=*) only_stage="${1#--only-stage=}" ;; # fetch|unpack|patch|configure|build|test|install|package
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$meta_arg" ]] || _bdie "Uso: build --meta=<metafile|dir> [--profile=...] [--toolchain=...]"
+
+  local meta_dir; meta_dir="$(_meta_dir_from_arg "$meta_arg")"
+  _parse_metafile "$meta_dir/metafile"
+
+  local pkgid; pkgid="$(_pkg_id)"
+  local builddir="$ADM_BUILD_ROOT/$pkgid"
+  local destdir="$ADM_STATE/stage/$pkgid"
+  rm -rf -- "$destdir" 2>/dev/null || true
+  mkdir -p -- "$builddir" "$destdir" || _bdie "Sem acesso a build/stage"
+
+  adm_log_info "==> Iniciando build: $pkgid"
+  _run_hooks "pre-fetch" "$builddir" || true
+  [[ -n "$only_stage" && "$only_stage" != "fetch" ]] || true
+
+  # 1) FETCH/UNPACK
+  if [[ -z "$only_stage" || "$only_stage" == "fetch" || "$only_stage" == "unpack" ]]; then
+    _run_hooks "pre-unpack" "$builddir" || true
+    local srcdir; srcdir="$(_unpack_sources "$meta_dir" "$builddir")"
+    adm_log_success "Fonte: $srcdir"
+    _run_hooks "post-unpack" "$srcdir" || true
+    echo "$srcdir" > "$builddir/.srcdir"
+  else
+    # reutilizar srcdir salvo
+    [[ -f "$builddir/.srcdir" ]] || _bdie "Não há .srcdir salvo; não foi feito unpack"
+    srcdir="$(cat "$builddir/.srcdir")"
+  fi
+
+  # 2) PATCH
+  if [[ -z "$only_stage" || "$only_stage" == "patch" ]]; then
+    _run_hooks "pre-patch" "$srcdir" || true
+    _apply_patches "$meta_dir" "$srcdir"
+    _run_hooks "post-patch" "$srcdir" || true
+  fi
+
+  # 3) ENV
+  _env_reset
+  _env_from_profile "$profile"
+  _env_from_toolchain "$toolchain"
+  _env_choose_compiler
+  _env_apply_libc_target
+  adm_log_info "Toolchain/Env:"
+  _env_print
+
+  # 4) DETECT BUILD SYSTEM
+  local sys="$(_detect_build_system "$srcdir")"
+  adm_log_info "Sistema de build: $sys"
+
+  # 5) CONFIGURE
+  local bld="$builddir/build"
+  if [[ -z "$only_stage" || "$only_stage" == "configure" ]]; then
+    _run_hooks "pre-configure" "$srcdir" || true
+    case "$sys" in
+      autotools) _configure_autotools "$srcdir" "$bld" "$destdir" ;;
+      cmake)     _configure_cmake "$srcdir" "$bld" ;;
+      meson)     _configure_meson "$srcdir" "$bld" ;;
+      make)      mkdir -p -- "$bld"; cp -aT "$srcdir" "$bld" || _bdie "cp src->bld falhou" ;;
+      kernel)    mkdir -p -- "$bld" ;;
+      busybox)   mkdir -p -- "$bld"; cp -aT "$srcdir" "$bld" ;;
+      cargo|go|python|node) mkdir -p -- "$bld"; cp -aT "$srcdir" "$bld" ;;
+      *) adm_log_warn "Sistema 'unknown' — tentando make direto"; mkdir -p -- "$bld"; cp -aT "$srcdir" "$bld" ;;
+    esac
+    _run_hooks "post-configure" "$bld" || true
+  fi
+
+  # 6) BUILD
+  if [[ -z "$only_stage" || "$only_stage" == "build" ]]; then
+    _run_hooks "pre-build" "$bld" || true
+    case "$sys" in
+      autotools) _build_make_like "$bld" ;;
+      cmake)     _build_ninja "$bld" ;;
+      meson)     _build_meson "$bld" ;;
+      make)      _build_make_like "$bld" ;;
+      kernel)    _build_kernel "$srcdir" "$bld" "$destdir" ;;
+      busybox)   _build_busybox "$bld" "$destdir" ;;
+      cargo)     _build_cargo "$bld" "$destdir" ;;
+      go)        _build_go "$bld" "$destdir" ;;
+      python)    _build_python "$bld" "$destdir" ;;
+      node)      _build_node "$bld" "$destdir" ;;
+      *)         _build_make_like "$bld" ;;
+    esac
+    _run_hooks "post-build" "$bld" || true
+  fi
+
+  # 7) TEST
+  if (( run_tests==1 )) && [[ -z "$only_stage" || "$only_stage" == "test" ]]; then
+    _run_hooks "pre-test" "$bld" || true
+    case "$sys" in
+      cmake) (cd "$bld" && ctest --output-on-failure) || adm_log_warn "ctest falhou (continuando)" ;;
+      meson) (cd "$bld" && meson test --print-errorlogs) || adm_log_warn "meson test falhou" ;;
+      make|autotools|unknown) (cd "$bld" && make check) || adm_log_warn "make check falhou" ;;
+      cargo) (cd "$bld" && cargo test --release) || adm_log_warn "cargo test falhou" ;;
+      go)    (cd "$bld" && go test ./...) || adm_log_warn "go test falhou" ;;
+      python) (cd "$bld" && pytest -q) || true ;;
+    esac
+    _run_hooks "post-test" "$bld" || true
+  fi
+
+  # 8) INSTALL
+  if [[ -z "$only_stage" || "$only_stage" == "install" ]]; then
+    _run_hooks "pre-install" "$bld" || true
+    case "$sys" in
+      autotools|make|unknown) _install_make_like "$bld" "$destdir" ;;
+      cmake)     _install_cmake "$bld" "$destdir" ;;
+      meson)     _install_meson "$bld" "$destdir" ;;
+      kernel)    : ;; # kernel já instalou modules/headers; imagem já copiada
+      busybox|cargo|go|python|node) : ;; # já instalaram dentro dos steps
+    esac
+    _run_hooks "post-install" "$destdir" || true
+  fi
+
+  # 9) STRIP/RPATH/QA
+  _strip_binaries "$destdir"
+  _fix_rpaths "$destdir"
+
+  # 10) PACKAGE
+  if [[ -z "$only_stage" || "$only_stage" == "package" ]]; then
+    _run_hooks "pre-package" "$destdir" || true
+    _package "$destdir" "$pkgid"
+    _run_hooks "post-package" "$destdir" || true
+  fi
+
+  # 11) CLEAN
+  if (( keep_build==0 )); then
+    rm -rf -- "$builddir" 2>/dev/null || true
+  fi
+
+  adm_log_success "${__b_chk} Build concluído: $pkgid"
+}
+
+builder_usage(){
+  cat <<'USAGE'
+Uso: 40-builder build --meta=<metafile|pkg-dir> [opções]
+
+Opções:
+  --profile=NAME        Usa o profile do 12-profile-manager (aggressive|normal|minimal|custom).
+  --toolchain=NAME      Seleciona toolchain do 14-toolchain-db.
+  --tests               Roda a suíte de testes quando suportado.
+  --keep-build          Mantém diretório de build após finalizar.
+  --only-stage=STAGE    Executa só um estágio (fetch|unpack|patch|configure|build|test|install|package).
+
+Exemplos:
+  40-builder build --meta=/usr/src/adm/metafiles/apps/busybox
+  40-builder build --meta=./metafiles/sys/linux --profile=aggressive --toolchain=x86_64-linux-musl
+USAGE
+}
+
+builder_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    build) builder_build "$@" ;;
+    ""|-h|--help|help) builder_usage ;;
+    *) adm_log_error "Comando desconhecido: $cmd"; builder_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  builder_main "$@"
+fi
