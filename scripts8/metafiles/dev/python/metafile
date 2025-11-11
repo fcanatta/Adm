@@ -1,0 +1,12 @@
+name=python
+version=3.12.6
+category=dev
+run_deps=libs/openssl,sys/zlib,sys/xz,sys/bzip2,sys/gzip
+build_deps=libs/openssl,sys/zlib,sys/xz,sys/bzip2,sys/gzip
+opt_deps=
+num_builds=0
+description=Python programming language
+homepage=https://www.python.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.python.org/ftp/python/3.12.6/Python-3.12.6.tgz,https://www.python.org/ftp/python/3.12.6/Python-3.12.6.tar.xz
