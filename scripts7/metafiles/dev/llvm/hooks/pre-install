@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ADM_OUT_OF_TREE_BUILD:?}"
+: "${DESTDIR:?DESTDIR não definido}"
+DESTDIR="${DESTDIR}" ninja -C "${ADM_OUT_OF_TREE_BUILD}" install
