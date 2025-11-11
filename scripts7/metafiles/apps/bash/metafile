@@ -1,0 +1,12 @@
+name=bash
+version=5.2.26
+category=apps
+run_deps=
+build_deps=
+opt_deps=ncurses
+num_builds=0
+description=Bourne Again SHell (bash)
+homepage=https://www.gnu.org/software/bash/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bash/bash-5.2.26.tar.gz
