@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+
+# Wrapper /usr/bin/firefox-wayland (exporta variáveis e chama firefox)
+install -d "${DESTDIR}/usr/bin"
+cat > "${DESTDIR}/usr/bin/firefox-wayland" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+export MOZ_ENABLE_WAYLAND=1
+# Força preferências comuns a Wayland (opcional)
+# export EGL_PLATFORM=wayland
+exec /usr/bin/firefox "$@"
+EOF
+chmod 0755 "${DESTDIR}/usr/bin/firefox-wayland"
+
+# Drop-in de ambiente para sessões gráficas (opcional, não intrusivo)
+install -d "${DESTDIR}/etc/profile.d"
+cat > "${DESTDIR}/etc/profile.d/adm-firefox-wayland.sh" <<'EOF'
+# Habilita Wayland por padrão se sessão for Wayland (não afeta X11)
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+  export MOZ_ENABLE_WAYLAND=${MOZ_ENABLE_WAYLAND:-1}
+fi
+EOF
+
+# Desktop entry dedicada
+install -d "${DESTDIR}/usr/share/applications"
+cat > "${DESTDIR}/usr/share/applications/firefox-wayland.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox (Wayland)
+GenericName=Web Browser
+Comment=Browse the Web (Wayland)
+Exec=firefox-wayland %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;
+EOF
