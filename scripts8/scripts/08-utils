@@ -1,0 +1,530 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/08-utils
+# -----------------------------------------------------------------------------
+# ADM - Utilidades Gerais (strings, paths, CSV, KV, semver, locks, retries)
+# - Sem erros silenciosos: retorna códigos e emite mensagens claras.
+# - Usa logger do 05-logging se disponível; caso contrário, fallback mínimo.
+# - Compatível com 'set -Eeuo pipefail' no chamador (não altera globalmente).
+# -----------------------------------------------------------------------------
+
+# ============================== Logger (fallback) =============================
+
+# Detecta se o logger do 05-logging está carregado
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _UTILS_COLOR=${ADM_COLOR:-auto}
+  _UTILS_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _UTILS_COLOR=false; fi
+  if [[ "$_UTILS_COLOR" == "auto" ]]; then
+    _UTILS_COLOR=$([[ "$_UTILS_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_UTILS_COLOR" == "true" ]]; then
+    __u_red=$'\033[31m'; __u_grn=$'\033[32m'; __u_yel=$'\033[33m'
+    __u_blu=$'\033[34m'; __u_dim=$'\033[2m' ; __u_rst=$'\033[0m'
+  else
+    __u_red=""; __u_grn=""; __u_yel=""; __u_blu=""; __u_dim=""; __u_rst=""
+  fi
+  _u_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_u_ts)" "$__u_dim" "$__u_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_u_ts)" "$__u_blu" "$__u_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_u_ts)" "$__u_yel" "$__u_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_u_ts)" "$__u_red" "$__u_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_u_ts)" "$__u_grn" "$__u_rst" "$*" >&2; }
+fi
+
+# ================================ Asserts ====================================
+
+# Verifica arquivo existente
+adm_require_file() {
+  local f="$1"
+  [[ -z "${f:-}" ]] && { adm_log_error "adm_require_file: caminho vazio"; return 2; }
+  [[ -f "$f" ]] || { adm_log_error "Arquivo não encontrado: $f"; return 1; }
+}
+
+# Verifica diretório existente
+adm_require_dir() {
+  local d="$1"
+  [[ -z "${d:-}" ]] && { adm_log_error "adm_require_dir: caminho vazio"; return 2; }
+  [[ -d "$d" ]] || { adm_log_error "Diretório não encontrado: $d"; return 1; }
+}
+
+# Verifica executável no PATH
+adm_require_cmd() {
+  local c="$1"
+  [[ -z "${c:-}" ]] && { adm_log_error "adm_require_cmd: comando vazio"; return 2; }
+  command -v -- "$c" >/dev/null 2>&1 || { adm_log_error "Comando não encontrado: $c"; return 1; }
+}
+
+# Verifica permissão de escrita no caminho (arquivo ou diretório)
+adm_require_writable() {
+  local p="$1"
+  [[ -z "${p:-}" ]] && { adm_log_error "adm_require_writable: caminho vazio"; return 2; }
+  [[ -e "$p" && -w "$p" ]] && return 0
+  [[ ! -e "$p" && -w "$(dirname -- "$p")" ]] && return 0
+  adm_log_error "Sem permissão de escrita: $p"
+  return 1
+}
+
+# Verifica root
+adm_is_root() {
+  [[ "$(id -u)" -eq 0 ]]
+}
+
+# ================================ Paths ======================================
+
+# Normaliza caminho (realpath com fallback)
+adm_realpath() {
+  local p="$1"
+  [[ -z "${p:-}" ]] && { adm_log_error "adm_realpath: caminho vazio"; return 2; }
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m -- "$p" || { adm_log_error "realpath falhou: $p"; return 1; }
+  else
+    # Fallback simples
+    (cd "$(dirname -- "$p")" 2>/dev/null && pwd -P)/"$(basename -- "$p")"
+  fi
+}
+
+# Junta caminhos removendo barras duplicadas
+adm_path_join() {
+  local base="$1"; local sub="$2"
+  [[ -z "${base:-}" || -z "${sub:-}" ]] && { adm_log_error "adm_path_join: parâmetros insuficientes"; return 2; }
+  local out="${base%/}/${sub#/}"
+  printf "%s" "$out"
+}
+
+# Cria diretório com permissão segura
+adm_mkdirp() {
+  local d="$1"; local mode="${2:-0755}"
+  [[ -z "${d:-}" ]] && { adm_log_error "adm_mkdirp: caminho vazio"; return 2; }
+  mkdir -p -- "$d" 2>/dev/null || { adm_log_error "Falha ao criar diretório: $d"; return 1; }
+  chmod "$mode" -- "$d" 2>/dev/null || adm_log_warn "Falha ao ajustar permissão $mode: $d"
+}
+
+# Cria dir temporário e retorna o caminho
+adm_mktemp_dir() {
+  local prefix="${1:-adm-tmp.XXXXXX}"
+  local tmp
+  tmp=$(mktemp -d -p "${TMPDIR:-/tmp}" "$prefix" 2>/dev/null) || { adm_log_error "mktemp falhou"; return 1; }
+  printf "%s" "$tmp"
+}
+
+# =============================== Strings/CSV =================================
+
+# Trim espaços
+adm_str_trim() {
+  local s="$*"
+  # shellcheck disable=SC2001
+  s="$(printf "%s" "$s" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  printf "%s" "$s"
+}
+
+# Separa CSV em array global __ADM_CSV_ARR
+adm_csv_to_array() {
+  local csv="$1"
+  IFS=',' read -r -a __ADM_CSV_ARR <<< "${csv:-}"
+  # Normaliza removendo espaços e itens vazios
+  local tmp=() x
+  for x in "${__ADM_CSV_ARR[@]}"; do
+    x="$(adm_str_trim "$x")"
+    [[ -n "$x" ]] && tmp+=("$x")
+  done
+  __ADM_CSV_ARR=("${tmp[@]}")
+}
+
+# De array para CSV
+adm_array_to_csv() {
+  local sep="${1:-,}"; shift || true
+  local out="" x
+  for x in "$@"; do
+    x="$(adm_str_trim "$x")"
+    [[ -z "$x" ]] && continue
+    out="${out:+$out$sep}$x"
+  done
+  printf "%s" "$out"
+}
+
+# União de dois CSV (sem duplicatas), mantém ordem de A depois B
+adm_csv_union() {
+  local a="$1" b="$2"
+  declare -A seen=()
+  local out=() x
+  adm_csv_to_array "$a"; for x in "${__ADM_CSV_ARR[@]}"; do [[ -z "${seen[$x]:-}" ]] && { out+=("$x"); seen["$x"]=1; }; done
+  adm_csv_to_array "$b"; for x in "${__ADM_CSV_ARR[@]}"; do [[ -z "${seen[$x]:-}" ]] && { out+=("$x"); seen["$x"]=1; }; done
+  adm_array_to_csv "," "${out[@]}"
+}
+
+# Diferença A-B (itens em A que não estão em B)
+adm_csv_diff() {
+  local a="$1" b="$2"
+  declare -A seen=()
+  local out=() x
+  adm_csv_to_array "$b"; for x in "${__ADM_CSV_ARR[@]}"; do seen["$x"]=1; done
+  adm_csv_to_array "$a"; for x in "${__ADM_CSV_ARR[@]}"; do [[ -z "${seen[$x]:-}" ]] && out+=("$x"); done
+  adm_array_to_csv "," "${out[@]}"
+}
+
+# Contém?
+adm_csv_contains() {
+  local csv="$1" item="$2"
+  adm_csv_to_array "$csv"
+  local x
+  for x in "${__ADM_CSV_ARR[@]}"; do [[ "$x" == "$item" ]] && return 0; done
+  return 1
+}
+
+# Ordena CSV (alfabético)
+adm_csv_sort() {
+  local csv="$1"
+  adm_csv_to_array "$csv"
+  IFS=$'\n' read -r -d '' -a __ADM_CSV_ARR < <(printf "%s\n" "${__ADM_CSV_ARR[@]}" | sort -u && printf '\0')
+  adm_array_to_csv "," "${__ADM_CSV_ARR[@]}"
+}
+
+# =============================== SemVer ======================================
+
+# Compara duas versões semver-like (major.minor.patch[-pre][+build])
+# Saída: 0 se iguais; retorno 0/1/2? Não. Retorna via echo: -1 / 0 / 1
+adm_semver_cmp() {
+  local A="$1" B="$2"
+  [[ -z "$A" || -z "$B" ]] && { adm_log_error "adm_semver_cmp: parâmetros vazios"; echo 2; return 2; }
+
+  # Função para normalizar (divide por ., remove sufixos não numéricos preservando ordem)
+  _sv_parts() {
+    local v="$1" i part out=()
+    v="${v%%+*}"            # remove +build
+    v="${v/-/~}"            # ~ marca pre-release para ordenar antes
+    IFS='.' read -r -a out <<< "$v"
+    for ((i=0;i<${#out[@]};i++)); do
+      part="${out[$i]}"
+      # separa numérico e sufixo (~pre)
+      if [[ "$part" =~ ^([0-9]+)(.*)$ ]]; then
+        printf "%s\n" "${BASH_REMATCH[1]}"
+        [[ -n "${BASH_REMATCH[2]}" ]] && printf "%s\n" "sfx:${BASH_REMATCH[2]}"
+      else
+        printf "0\n"
+      fi
+    done
+  }
+
+  mapfile -t PA < <(_sv_parts "$A")
+  mapfile -t PB < <(_sv_parts "$B")
+  local len=${#PA[@]}
+  (( ${#PB[@]} > len )) && len=${#PB[@]}
+
+  local i a b
+  for ((i=0;i<len;i++)); do
+    a="${PA[$i]:-0}" ; b="${PB[$i]:-0}"
+    if [[ "$a" =~ ^sfx: || "$b" =~ ^sfx: ]]; then
+      # regra simples: presença de pre-release (~) ordena antes (menor)
+      if [[ "$a" =~ ^sfx: && ! "$b" =~ ^sfx: ]]; then echo -1; return 0; fi
+      if [[ ! "$a" =~ ^sfx: && "$b" =~ ^sfx: ]]; then echo 1; return 0; fi
+      continue
+    fi
+    (( a = 10#$a, b = 10#$b ))
+    if (( a < b )); then echo -1; return 0; fi
+    if (( a > b )); then echo 1;  return 0; fi
+  done
+  echo 0
+}
+
+# ================================ Checksums ==================================
+
+# Calcula sha256 de um arquivo
+adm_sha256_file() {
+  local f="$1"
+  adm_require_file "$f" || return 1
+  sha256sum -- "$f" 2>/dev/null | awk '{print $1}' || { adm_log_error "sha256sum falhou: $f"; return 1; }
+}
+
+# Verifica sha256 esperado
+adm_sha256_verify() {
+  local f="$1" expect="$2"
+  adm_require_file "$f" || return 1
+  [[ -z "${expect:-}" ]] && { adm_log_error "adm_sha256_verify: hash esperado vazio"; return 2; }
+  local got
+  got="$(adm_sha256_file "$f")" || return 1
+  if [[ "$got" != "$expect" ]]; then
+    adm_log_error "SHA256 mismatch em '$f' (got=$got expect=$expect)"
+    return 1
+  fi
+  adm_log_success "SHA256 OK: $f"
+}
+
+# ================================ Locks ======================================
+
+# Usa flock se disponível; fallback para lockdir.
+adm_lock_acquire() {
+  local name="$1"; local var_fd_name="${2:-}"
+  [[ -z "$name" ]] && { adm_log_error "adm_lock_acquire: nome vazio"; return 2; }
+  local lock_dir="${ADM_STATE:-/usr/src/adm/state}/locks"
+  adm_mkdirp "$lock_dir" || return 1
+  if command -v flock >/dev/null 2>&1; then
+    # file lock
+    local lock_file="$lock_dir/$name.lock"
+    exec {__fd}>"$lock_file" || { adm_log_error "Não abre lock file: $lock_file"; return 1; }
+    if ! flock -n "$__fd"; then
+      adm_log_error "Lock já em uso: $name"
+      return 1
+    fi
+    [[ -n "$var_fd_name" ]] && printf -v "$var_fd_name" "%s" "$__fd"
+    adm_log_debug "Lock (flock) adquirido: $name (fd=$__fd)"
+  else
+    # lockdir
+    local ld="$lock_dir/$name.lockdir"
+    if mkdir "$ld" 2>/dev/null; then
+      echo "$$" > "$ld/pid"
+      echo "$(date -Is)" > "$ld/when"
+      adm_log_debug "Lock (dir) adquirido: $name"
+    else
+      adm_log_error "Lock já em uso (dir): $name"
+      return 1
+    fi
+  fi
+}
+
+adm_lock_release() {
+  local name="$1"; local fd="${2:-}"
+  [[ -z "$name" ]] && { adm_log_error "adm_lock_release: nome vazio"; return 2; }
+  local lock_dir="${ADM_STATE:-/usr/src/adm/state}/locks"
+  if command -v flock >/dev/null 2>&1; then
+    if [[ -n "$fd" ]]; then
+      flock -u "$fd" 2>/dev/null || true
+      eval "exec ${fd}>&-"
+    else
+      adm_log_warn "Lock (flock): fd não informado para $name"
+    fi
+  else
+    rm -rf -- "$lock_dir/$name.lockdir" 2>/dev/null || adm_log_warn "Falha ao remover lockdir: $name"
+  fi
+  adm_log_debug "Lock liberado: $name"
+}
+
+# ================================ Retry/Timeout ==============================
+
+# Executa comando com retries e backoff exponencial
+# Uso: adm_try <retries> <sleep_base_sec> -- <cmd> [args...]
+adm_try() {
+  local retries="$1"; shift
+  local base="$1"; shift
+  [[ "${1:-}" == "--" ]] && shift || { adm_log_error "adm_try: use '--' antes do comando"; return 2; }
+  local n=0 rc=0
+  while :; do
+    "$@" && { return 0; }
+    rc=$?
+    n=$((n+1))
+    if (( n > retries )); then
+      adm_log_error "Comando falhou após $retries tentativas: $* (rc=$rc)"
+      return "$rc"
+    fi
+    local sl=$(( base * 2 ** (n-1) ))
+    adm_log_warn "Falha (tentativa $n/$retries, rc=$rc). Aguardando ${sl}s e tentando novamente..."
+    sleep "$sl"
+  done
+}
+
+# Executa comando com timeout em segundos (usa 'timeout' se existir; senão, subshell + trap)
+adm_timeout() {
+  local secs="$1"; shift
+  [[ -z "$secs" || -z "${1:-}" ]] && { adm_log_error "adm_timeout: uso: adm_timeout <segundos> <cmd>..."; return 2; }
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --preserve-status "$secs" "$@"
+    return $?
+  else
+    # Fallback ingênuo
+    ( "$@" & echo $! >"${TMPDIR:-/tmp}/adm_timeout.$$"; ) &
+    local pid; pid=$(cat "${TMPDIR:-/tmp}/adm_timeout.$$" 2>/dev/null || true)
+    local slept=0
+    while kill -0 "$pid" 2>/dev/null; do
+      if (( slept >= secs )); then
+        kill -TERM "$pid" 2>/dev/null || true
+        adm_log_warn "Timeout atingido (${secs}s) — processo $pid sinalizado."
+        rm -f "${TMPDIR:-/tmp}/adm_timeout.$$" 2>/dev/null || true
+        return 124
+      fi
+      sleep 1; slept=$((slept+1))
+    done
+    rm -f "${TMPDIR:-/tmp}/adm_timeout.$$" 2>/dev/null || true
+    return 0
+  fi
+}
+
+# ================================ KV (key=value) =============================
+
+# Lê KV para associative array passada por nome
+# Uso: adm_kv_read "/caminho" "NOME_ARRAY"
+adm_kv_read() {
+  local file="$1" arrname="$2"
+  adm_require_file "$file" || return 1
+  [[ -z "$arrname" ]] && { adm_log_error "adm_kv_read: nome de array vazio"; return 2; }
+  declare -gA "$arrname" 2>/dev/null || true
+  local line k v
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+      v="$(adm_str_trim "$v")"
+      eval "$arrname[\"\$k\"]=\$v"
+    else
+      adm_log_warn "KV inválido (ignorado): $line"
+    fi
+  done < "$file"
+}
+
+# Escreve KV (sobrescrevendo arquivo). Recebe pares k=v como argumentos
+# Uso: adm_kv_write "/caminho" KEY1=VAL1 KEY2=VAL2 ...
+adm_kv_write() {
+  local file="$1"; shift || true
+  [[ -z "$file" ]] && { adm_log_error "adm_kv_write: arquivo vazio"; return 2; }
+  adm_require_writable "$file" || adm_mkdirp "$(dirname -- "$file")" || return 1
+  : > "$file" || { adm_log_error "Não foi possível criar $file"; return 1; }
+  local kv
+  for kv in "$@"; do
+    if [[ "$kv" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; then
+      printf "%s\n" "$kv" >> "$file" || { adm_log_error "Falha ao escrever em $file"; return 1; }
+    else
+      adm_log_warn "Par inválido ignorado: $kv"
+    fi
+  done
+}
+
+# Atualiza/insere chaves em arquivo KV existente sem perder outras
+# Uso: adm_kv_upsert "/caminho" KEY1=VAL1 KEY2=VAL2 ...
+adm_kv_upsert() {
+  local file="$1"; shift || true
+  [[ -z "$file" ]] && { adm_log_error "adm_kv_upsert: arquivo vazio"; return 2; }
+  declare -A KV=()
+  [[ -f "$file" ]] && adm_kv_read "$file" KV
+  local kv k v
+  for kv in "$@"; do
+    if [[ "$kv" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+      KV["$k"]="$v"
+    else
+      adm_log_warn "Par inválido (ignorado): $kv"
+    fi
+  done
+  : > "$file" || { adm_log_error "Não foi possível abrir $file"; return 1; }
+  for k in "${!KV[@]}"; do
+    printf "%s=%s\n" "$k" "${KV[$k]}" >> "$file" || { adm_log_error "Falha ao gravar $k em $file"; return 1; }
+  done
+}
+
+# =============================== Manifesto ===================================
+
+# Calcula manifest (sha256 e tamanho) de todos os arquivos sob um diretório
+# Uso: adm_manifest_write <dir> <outfile>
+adm_manifest_write() {
+  local dir="$1" out="$2"
+  adm_require_dir "$dir" || return 1
+  adm_require_writable "$out" || true
+  : > "$out" || { adm_log_error "Não foi possível criar manifest: $out"; return 1; }
+  local f sum size rel
+  while IFS= read -r -d '' f; do
+    sum="$(adm_sha256_file "$f")" || return 1
+    size=$(stat -c '%s' -- "$f" 2>/dev/null || stat -f '%z' -- "$f" 2>/dev/null || echo 0)
+    rel="${f#$dir/}"
+    printf "%s  %s  %s\n" "$sum" "$size" "$rel" >> "$out" || { adm_log_error "Falha ao escrever manifest"; return 1; }
+  done < <(find "$dir" -type f -print0 | sort -z)
+  adm_log_success "Manifesto gerado: $out"
+}
+
+# =============================== Ambiente ====================================
+
+# Sanitiza ambiente perigoso para subprocessos de build
+adm_env_sanitize() {
+  unset CDPATH GREP_OPTIONS || true
+  export LC_ALL="${LC_ALL:-C}" LANG="${LANG:-C}"
+  export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
+}
+
+# Prepend ao PATH se diretório existe e não estiver já presente
+adm_path_prepend() {
+  local d="$1"
+  [[ -z "$d" ]] && { adm_log_error "adm_path_prepend: diretório vazio"; return 2; }
+  [[ -d "$d" ]] || { adm_log_warn "adm_path_prepend: diretório inexistente: $d"; return 1; }
+  case ":$PATH:" in
+    *":$d:"*) return 0 ;;
+    *) PATH="$d:$PATH"; export PATH; adm_log_debug "PATH prepend: $d" ;;
+  esac
+}
+
+# =============================== Helpers HTTP ================================
+
+# Extrai basename de URL
+adm_url_basename() {
+  local url="$1"
+  [[ -z "$url" ]] && { adm_log_error "adm_url_basename: URL vazia"; return 2; }
+  url="${url%%\?*}"
+  printf "%s" "${url##*/}"
+}
+
+# HEAD simples (requer curl OU wget). Retorna 0 se sucesso HTTP (2xx/3xx)
+adm_http_head() {
+  local url="$1"
+  [[ -z "$url" ]] && { adm_log_error "adm_http_head: URL vazia"; return 2; }
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsIL "$url" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget --spider -S "$url" >/dev/null 2>&1
+  else
+    adm_log_warn "Sem curl/wget para HEAD: $url"
+    return 1
+  fi
+}
+
+# =============================== Misc/Outros =================================
+
+# Converte bytes em string humana (KiB, MiB, GiB)
+adm_human_size() {
+  local bytes="$1" units=(B KiB MiB GiB TiB)
+  local i=0
+  while (( bytes >= 1024 && i < ${#units[@]}-1 )); do
+    bytes=$((bytes/1024)); i=$((i+1))
+  done
+  printf "%d %s" "$bytes" "${units[$i]}"
+}
+
+# Verifica espaço livre mínimo (KB) em um caminho; retorna 0 se ok
+adm_check_disk_kb() {
+  local path="$1" min_kb="$2"
+  [[ -z "$path" || -z "$min_kb" ]] && { adm_log_error "adm_check_disk_kb: uso: <path> <minKB>"; return 2; }
+  local avail
+  avail=$(df -Pk "$path" | awk 'NR==2 {print $4}' 2>/dev/null || echo 0)
+  [[ "$avail" =~ ^[0-9]+$ ]] || { adm_log_error "df inválido para $path"; return 1; }
+  if (( avail < min_kb )); then
+    adm_log_warn "Espaço insuficiente em $path (livre=${avail}KB < mínimo=${min_kb}KB)"
+    return 1
+  fi
+  return 0
+}
+
+# Saída protegida (escapa caracteres potencialmente problemáticos para logs simples)
+adm_safe_echo() {
+  local s="$*"
+  s="${s//$'\r'/ }"
+  s="${s//$'\t'/ }"
+  printf "%s" "$s"
+}
+
+# ============================== CLI de teste =================================
+# Uso:
+#   ./08-utils demo
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    demo)
+      adm_log_info  "Demo 08-utils"
+      adm_log_info  "realpath de /tmp: $(adm_realpath /tmp)"
+      adm_log_info  "join: $(adm_path_join /usr/src foo/bar)"
+      adm_log_info  "csv_union: $(adm_csv_union 'a,b,c' 'b,c,d')"
+      adm_log_info  "csv_diff:  $(adm_csv_diff  'a,b,c' 'b,d')"
+      adm_log_info  "csv_sort:  $(adm_csv_sort  'c,a,b,a')"
+      adm_log_info  "semver a<b? $(adm_semver_cmp 1.2.3 1.3.0)"
+      local tmpd; tmpd="$(adm_mktemp_dir)" || exit 1
+      printf "hello" > "$tmpd/x"
+      adm_log_info  "sha256: $(adm_sha256_file "$tmpd/x")"
+      adm_manifest_write "$tmpd" "$tmpd/manifest.txt" || exit 1
+      adm_log_success "Manifest: $(wc -l < "$tmpd/manifest.txt") linha(s)"
+      ;;
+    *) ;;
+  esac
+fi
