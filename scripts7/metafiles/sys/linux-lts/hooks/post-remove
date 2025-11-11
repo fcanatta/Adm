@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+KVER="${KVER:-}"
+if [[ -z "$KVER" ]]; then
+  CAND=$(ls -1 /boot/vmlinuz-lts-* 2>/dev/null | sed 's#^/boot/vmlinuz-lts-##' | sort -V | tail -n1 || true)
+  [[ -n "$CAND" ]] && KVER="$CAND"
+fi
+[[ -z "$KVER" ]] && exit 0
+
+RUNNING="$(uname -r 2>/dev/null || true)"
+[[ "$RUNNING" == "$KVER" ]] && exit 0
+
+rm -f "/boot/vmlinuz-lts-${KVER}" "/boot/System.map-lts-${KVER}" "/boot/config-lts-${KVER}" 2>/dev/null || true
+rm -rf "/boot/dtbs-lts-${KVER}" 2>/dev/null || true
+rm -rf "/lib/modules/${KVER}" 2>/dev/null || true
