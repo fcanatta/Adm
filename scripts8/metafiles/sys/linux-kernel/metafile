@@ -1,0 +1,12 @@
+name=linux-kernel
+version=6.12.1
+category=sys
+run_deps=
+build_deps=dev/make,dev/gawk,sys/xz
+opt_deps=
+num_builds=0
+description=Linux kernel (mainline)
+homepage=https://kernel.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.12.1.tar.xz,https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.12.1.tar.xz
