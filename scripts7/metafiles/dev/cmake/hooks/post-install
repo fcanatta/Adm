@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Instala completions simples (se o CMake trouxe; caso contrário, ignore)
+if [[ -d "/usr/share/bash-completion/completions" ]]; then
+  # Nada específico necessário aqui por padrão; mantenha como ponto de extensão
+  :
+fi
