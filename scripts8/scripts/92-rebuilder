@@ -1,0 +1,655 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/92-rebuilder
+# -----------------------------------------------------------------------------
+# ADM - Rebuilder
+# - Planeja e executa reconstruções de pacotes quando o toolchain/perfis/deps mudam
+# - Integra com: 12-profile-manager, 14-toolchain-db, 25-resolver, 30-fetcher,
+#                32-patcher, 40-builder, 50-installer, 52-packer, 44-parallel-scheduler
+# - Sem erros silenciosos: validações, locks, logs, códigos de saída
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+RB_STATE="$ADM_STATE/rebuilder"
+RB_LOCKS="$RB_STATE/locks"
+RB_LOGS="$RB_STATE/logs"
+RB_PLANS="$RB_STATE/plans"
+RB_RUNS="$RB_STATE/runs"
+RB_SUMMARY="$RB_STATE/summary.json"
+
+DB_DIR="$ADM_STATE/db"
+DB_INSTALLED="$DB_DIR/installed"
+DB_FILES="$DB_DIR/files"
+
+mkdir -p -- "$RB_STATE" "$RB_LOCKS" "$RB_LOGS" "$RB_PLANS" "$RB_RUNS" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _C=${ADM_COLOR:-auto}; _TTY=$([[ -t 1 ]] && echo 1 || echo 0)
+  [[ "${NO_COLOR:-}" != "" ]] && _C=false
+  [[ "$_C" == "auto" ]] && _C=$([[ "$_TTY" == 1 ]] && echo true || echo false)
+  if [[ "$_C" == "true" ]]; then
+    C_R=$'\033[31m'; C_G=$'\033[32m'; C_Y=$'\033[33m'; C_B=$'\033[34m'; C_D=$'\033[2m'; C_X=$'\033[0m'; C_OK=$'\xE2\x9C\x85'
+  else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_D=""; C_X=""; C_OK="[OK]"
+  fi
+  ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(ts)" "$C_D" "$C_X" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n"  "$(ts)" "$C_B" "$C_X" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n"  "$(ts)" "$C_Y" "$C_X" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(ts)" "$C_R" "$C_X" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(ts)" "$C_G" "$C_X" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+now(){ date -Iseconds; }
+slug(){ printf "%s" "$1" | tr ' /' '__' | tr -cd '[:alnum:]_-.'); }
+
+lock_acquire(){
+  local key="$1"; mkdir -p -- "$RB_LOCKS" || true
+  local d="$RB_LOCKS/rb-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>600)) && { adm_log_error "Timeout lock %s" "$key"; return 1; } done
+  fi
+}
+lock_release(){ local key="$1"; rm -rf -- "$RB_LOCKS/rb-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== CLI ==========================================
+usage(){
+  cat <<'USAGE'
+Uso: 92-rebuilder <comando> [opções]
+
+Comandos:
+  plan        [targets|filters]   Gera um plano de rebuild (não executa)
+  run         [targets|filters]   Gera (se preciso) e executa o plano
+  resume      [--run-id=...]      Retoma uma execução interrompida
+  list-plans                     Lista planos existentes
+  show-plan   --plan=FILE        Mostra resumo de um plano
+  doctor                         Checa dependências do rebuilder
+
+Filtros comuns (tanto para plan/run):
+  --targets=cat/pkg,cat2/pkg2   Alvos explícitos (CSV)
+  --categories='libs|apps'       Filtra categorias
+  --match='glob'                 Filtra por nome
+  --all                          Considera todos os pacotes instalados
+
+Gatilhos de rebuild (OR entre eles, depois fecha em reverse-deps):
+  --toolchain-diff               Rebuild se toolchain mudou (via 14-toolchain-db)
+  --profile-diff                 Rebuild se perfil/env mudou (12-profile-manager ou flags)
+  --metafile-changed             Rebuild se metafile de cat/pkg mudou (timestamp/sha/sources)
+  --since='2025-01-01'           Rebuild se build anterior é anterior a esta data
+  --touched=/path/a,/path/b      Rebuild de pacotes que possuem esses caminhos
+  --with-deps                    Inclui dependências dos alvos
+  --with-rdeps                   Inclui reverse-deps dos alvos
+  --depth=N                      Limita profundidade de reverse-deps (default: ilimitado)
+
+Execução:
+  --parallel=N                   Paralelismo (default: nproc)
+  --keep-going                   Não para no primeiro erro; continua o restante
+  --resume                       Se existir run inacabado compatível, retoma
+  --dry-run                      Não executa passos, só mostra
+  --yes                          Não perguntar confirmação
+  --root=/                       Diretório raiz para instalar (default "/")
+  --pack                         Empacota (52-packer) antes de instalar
+  --force                        Ignora algumas salvaguardas (use com cuidado)
+
+Exemplos:
+  92-rebuilder plan --toolchain-diff --with-rdeps
+  92-rebuilder run  --profiles-diff --parallel=8 --keep-going
+  92-rebuilder run  --targets=apps/wget --with-deps --pack
+USAGE
+}
+
+cmd="${1:-}"; shift || true
+case "${cmd:-}" in
+  plan|run|resume|list-plans|show-plan|doctor) : ;;
+  ""|-h|--help|help) usage; exit 0 ;;
+  *) adm_log_error "Comando desconhecido: %s" "$cmd"; usage; exit 2 ;;
+esac
+
+# ============================== Opções & defaults ============================
+TARGETS=""
+CATS=""
+MATCH=""
+ALL=0
+
+TR_TOOLCHAIN=0
+TR_PROFILE=0
+TR_META=0
+TR_SINCE=""
+TR_TOUCHED=""
+WITH_DEPS=0
+WITH_RDEPS=0
+DEPTH=0
+
+PARALLEL=0
+KEEP_GOING=0
+RESUME=0
+DRY=0
+YES=0
+ROOT="/"
+PACK=0
+FORCE=0
+PLAN_FILE=""
+RUN_ID=""
+
+while (( $# )); do
+  case "$1" in
+    --targets=*) TARGETS="${1#--targets=}" ;;
+    --categories=*) CATS="${1#--categories=}" ;;
+    --match=*) MATCH="${1#--match=}" ;;
+    --all) ALL=1 ;;
+    --toolchain-diff) TR_TOOLCHAIN=1 ;;
+    --profile-diff)   TR_PROFILE=1 ;;
+    --metafile-changed) TR_META=1 ;;
+    --since=*) TR_SINCE="${1#--since=}" ;;
+    --touched=*) TR_TOUCHED="${1#--touched=}" ;;
+    --with-deps) WITH_DEPS=1 ;;
+    --with-rdeps) WITH_RDEPS=1 ;;
+    --depth=*) DEPTH="${1#--depth=}" ;;
+    --parallel=*) PARALLEL="${1#--parallel=}" ;;
+    --keep-going) KEEP_GOING=1 ;;
+    --resume) RESUME=1 ;;
+    --dry-run) DRY=1 ;;
+    --yes) YES=1 ;;
+    --root=*) ROOT="${1#--root=}" ;;
+    --pack) PACK=1 ;;
+    --force) FORCE=1 ;;
+    --plan=*) PLAN_FILE="${1#--plan=}" ;;
+    --run-id=*) RUN_ID="${1#--run-id=}" ;;
+    --*) adm_log_warn "Opção ignorada: %s" "$1" ;;
+    *) adm_log_warn "Argumento desconhecido: %s" "$1" ;;
+  esac; shift || true
+done
+
+ROOT="$(abspath "$ROOT")"
+
+# ============================== Doctor =======================================
+doctor(){
+  local fail=0
+  for b in awk sed grep find xargs sha256sum; do have "$b" || { adm_log_warn "Ferramenta ausente: %s" "$b"; }; done
+  [[ -d "$DB_INSTALLED" ]] || { adm_log_error "DB installed ausente: %s" "$DB_INSTALLED"; fail=$((fail+1)); }
+  mkdir -p -- "$RB_STATE" "$RB_LOCKS" "$RB_LOGS" "$RB_PLANS" "$RB_RUNS" || { adm_log_error "Sem acesso a state dirs"; fail=$((fail+1)); }
+  [[ $fail -gt 0 ]] && return 1 || adm_log_success "$C_OK Rebuilder OK."
+}
+[[ "$cmd" == "doctor" ]] && { doctor; exit $?; }
+
+# ============================== DB / Metafile Helpers ========================
+installed_list(){
+  find "$DB_INSTALLED" -maxdepth 1 -type f -name "*.json" -printf "%f\n" 2>/dev/null \
+   | sed 's/\.json$//' | tr '__' '/'
+}
+installed_version(){ local js="$DB_INSTALLED/${1//\//__}.json"; awk -F\" '/"version":/ {print $4; exit}' "$js" 2>/dev/null || echo ""; }
+installed_build_info(){ # extrai build_info.* se existir
+  local js="$DB_INSTALLED/${1//\//__}.json"
+  awk -v k="$2" -F\" '$0 ~ "\"build_info\"" { f=1 } f && $0 ~ "\""k"\"" { getline; gsub(/[",]/,""); gsub(/^[ \t]+/,""); print $0; exit }' "$js" 2>/dev/null || echo ""
+}
+package_metafile(){
+  local name="$1"; local mf="$ADM_ROOT/metafiles/$name/metafile"; [[ -f "$mf" ]] && echo "$mf" || echo ""
+}
+metafile_mtime(){
+  local mf; mf="$(package_metafile "$1")"; [[ -f "$mf" ]] && stat -c %Y "$mf" 2>/dev/null || echo 0
+}
+metafile_sources_csv(){
+  local mf; mf="$(package_metafile "$1")"; [[ -f "$mf" ]] || { echo ""; return 0; }
+  awk -F= '$1=="sources"{print $2}' "$mf" 2>/dev/null || echo ""
+}
+
+# ============================== Toolchain/Profile snapshot ===================
+toolchain_snapshot(){
+  # Usa 14-toolchain-db se existir; senão heurística básica (gcc/clang --version, ld --version, libc.so strings)
+  local out="{"
+  if [[ -x "$ADM_ROOT/scripts/14-toolchain-db" ]]; then
+    local js; js="$("$ADM_ROOT/scripts/14-toolchain-db" snapshot 2>/dev/null || true)"
+    if [[ -n "$js" ]]; then echo "$js"; return 0; fi
+  fi
+  local gccv="$(gcc -dumpfullversion -dumpversion 2>/dev/null || echo "none")"
+  local clangv="$(clang --version 2>/dev/null | head -n1 || true)"
+  local lddv="$(ldd --version 2>&1 | head -n1 || true)"
+  out="$out\"gcc\":\"$(json_e "$gccv")\",\"clang\":\"$(json_e "$clangv")\",\"ldd\":\"$(json_e "$lddv")\"}"
+  echo "$out"
+}
+
+profile_snapshot(){
+  if [[ -x "$ADM_ROOT/scripts/12-profile-manager" ]]; then
+    "$ADM_ROOT/scripts/12-profile-manager" snapshot 2>/dev/null || echo "{}"
+  else
+    echo "{\"CFLAGS\":\"$(json_e "${CFLAGS:-}")\",\"CXXFLAGS\":\"$(json_e "${CXXFLAGS:-}")\",\"LDFLAGS\":\"$(json_e "${LDFLAGS:-}")\"}"
+  fi
+}
+
+# ============================== Gatilhos (seleção de candidatos) =============
+filter_by_targets(){
+  # devolve nomes cat/pkg
+  if [[ -n "$TARGETS" ]]; then
+    IFS=',' read -r -a arr <<< "$TARGETS"
+    printf "%s\n" "${arr[@]}" | sed '/^$/d'
+    return 0
+  fi
+  local names; names="$(installed_list)"
+  printf "%s\n" "$names" | while read -r n; do
+    [[ -z "$n" ]] && continue
+    local cat="${n%/*}" pkg="${n##*/}"
+    [[ -n "$CATS"  && ! "$cat" == $CATS ]] && continue
+    [[ -n "$MATCH" && ! "$pkg" == $MATCH ]] && continue
+    printf "%s\n" "$n"
+  done
+}
+
+trigger_toolchain_diff(){
+  (( TR_TOOLCHAIN==1 )) || return 0
+  local snap; snap="$(toolchain_snapshot)"
+  local key="$RB_STATE/last-toolchain.json"
+  if [[ ! -f "$key" ]]; then
+    printf "%s\n" "$snap" > "$key"
+    adm_log_warn "Sem snapshot anterior de toolchain; considerando todos como candidatos."
+    filter_by_targets
+    return 0
+  fi
+  local prev; prev="$(cat "$key" 2>/dev/null || echo "{}")"
+  if [[ "$prev" != "$snap" ]]; then
+    adm_log_info "Toolchain mudou; rebuild candidatos."
+    printf "%s\n" "$snap" > "$key"
+    filter_by_targets
+  else
+    adm_log_info "Toolchain não mudou."
+    true
+  fi
+}
+
+trigger_profile_diff(){
+  (( TR_PROFILE==1 )) || return 0
+  local snap; snap="$(profile_snapshot)"
+  local key="$RB_STATE/last-profile.json"
+  if [[ ! -f "$key" ]]; then
+    printf "%s\n" "$snap" > "$key"
+    adm_log_warn "Sem snapshot anterior de profile; considerando todos como candidatos."
+    filter_by_targets
+    return 0
+  fi
+  local prev; prev="$(cat "$key" 2>/dev/null || echo "{}")"
+  if [[ "$prev" != "$snap" ]]; then
+    adm_log_info "Perfil/env mudou; rebuild candidatos."
+    printf "%s\n" "$snap" > "$key"
+    filter_by_targets
+  else
+    adm_log_info "Perfil/env não mudou."
+    true
+  fi
+}
+
+trigger_metafile_changed(){
+  (( TR_META==1 )) || return 0
+  # Compara mtime do metafile vs build_info.metafile_mtime (quando existir)
+  filter_by_targets | while read -r n; do
+    local mfmt; mfmt="$(metafile_mtime "$n")"
+    local bpm; bpm="$(installed_build_info "$n" "metafile_mtime")"
+    if [[ -z "$bpm" || "$mfmt" -gt "${bpm:-0}" ]]; then
+      echo "$n"
+    fi
+  done
+}
+
+trigger_since(){
+  [[ -n "$TR_SINCE" ]] || return 0
+  local since_ts; since_ts="$(date -d "$TR_SINCE" +%s 2>/dev/null || echo 0)"
+  filter_by_targets | while read -r n; do
+    local bi; bi="$(installed_build_info "$n" "built_at")"
+    local ts; ts="$(date -d "$bi" +%s 2>/dev/null || echo 0)"
+    (( ts < since_ts )) && echo "$n" || true
+  done
+}
+
+trigger_touched(){
+  [[ -n "$TR_TOUCHED" ]] || return 0
+  IFS=',' read -r -a arr <<< "$TR_TOUCHED"
+  # Procura donos no index.map
+  local idx="$DB_FILES/index.map"
+  for p in "${arr[@]}"; do
+    p="${p#/}"
+    awk -F'\t' -v f="$p" '$1==f {print $2}' "$idx" 2>/dev/null || true
+  done | sort -u
+}
+
+# ============================== Dependências (resolver) ======================
+resolver_available(){ [[ -x "$ADM_ROOT/scripts/25-resolver" ]]; }
+compute_deps(){
+  local name="$1"
+  if resolver_available; then
+    "$ADM_ROOT/scripts/25-resolver" deps --name="$name" 2>/dev/null || true
+  else
+    # Fallback: parse metafile run_deps+build_deps
+    local mf; mf="$(package_metafile "$name")"; [[ -f "$mf" ]] || { echo ""; return 0; }
+    awk -F= '/^(run_deps|build_deps)=/ {print $2}' "$mf" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | sed '/^$/d'
+  fi
+}
+compute_rdeps(){
+  local name="$1"
+  # Fallback: varre todos metafiles e encontra quem depende de 'name' ou basename
+  local base="${name##*/}"
+  find "$ADM_ROOT/metafiles" -mindepth 3 -maxdepth 3 -name metafile -print 2>/dev/null \
+    | while read -r mf; do
+        local cat pkg; cat="$(basename "$(dirname "$(dirname "$mf")")")"; pkg="$(basename "$(dirname "$mf")")"
+        local d; d="$(awk -F= '/^(run_deps|build_deps)=/ {print $2}' "$mf" | tr ',' '\n' | sed 's/^ *//;s/ *$//' )"
+        if echo "$d" | grep -qx "$name" || echo "$d" | grep -qx "$base"; then
+          echo "$cat/$pkg"
+        fi
+      done | sort -u
+}
+
+# ============================== Fecho de candidatos ==========================
+set_union(){ printf "%s\n" "$@" | sed '/^$/d' | sort -u; }
+expand_with_deps(){
+  local -a base=("$@"); local out=(); local seen=()
+  _walk(){ local n="$1"; [[ -n "${seen[$n]:-}" ]] && return; seen["$n"]=1; out+=("$n"); local d; while read -r d; do [[ -z "$d" ]] && continue; _walk "$d"; done < <(compute_deps "$n"); }
+  local n; for n in "${base[@]}"; do _walk "$n"; done
+  printf "%s\n" "${out[@]}" | sort -u
+}
+expand_with_rdeps(){
+  local -a base=("$@"); local out=(); local seen=()
+  _walk(){ local n="$1" depth="${2:-0}"; [[ -n "${seen[$n]:-}" ]] && return; seen["$n"]=1; out+=("$n"); local d; while read -r d; do [[ -z "$d" ]] && continue; if (( DEPTH>0 && depth>=DEPTH )); then :; else _walk "$d" "$((depth+1))"; fi; done < <(compute_rdeps "$n"); }
+  local n; for n in "${base[@]}"; do _walk "$n" 0; done
+  printf "%s\n" "${out[@]}" | sort -u
+}
+
+# ============================== DAG / ordenação topo =========================
+topo_sort(){
+  # entrada: lista de nomes; usamos compute_deps para cada e ordenamos (Kahn)
+  local tmpd; tmpd="$(mktemp -d "${ADM_TMP%/}/rb.dag.XXXX")"
+  trap 'rm -rf -- "'"$tmpd"'" 2>/dev/null || true' RETURN
+  local nodes=("$@")
+  printf "%s\n" "${nodes[@]}" | sed '/^$/d' | sort -u > "$tmpd/nodes"
+
+  # constroi arestas somente entre nós presentes
+  awk 'NR==FNR{s[$0]=1;next} s[$0]{print $0}' "$tmpd/nodes" "$tmpd/nodes" >/dev/null
+  : > "$tmpd/edges"
+  while read -r n; do
+    while read -r d; do
+      grep -qx "$d" "$tmpd/nodes" 2>/dev/null && printf "%s %s\n" "$d" "$n" >> "$tmpd/edges"
+    done < <(compute_deps "$n")
+  done < "$tmpd/nodes"
+
+  # Kahn
+  awk '
+    { if (NF==2) { out[$1]=out[$1] " " $2; indeg[$2]++ } }
+    END{
+      # fila = nós com indeg 0
+      while ((getline n < ARGV[1])>0) {
+        if (!(n in indeg)) { q[++qend]=n }
+        all[++t]=n
+      }
+      while (qstart<=qend) {
+        n=q[qstart++]; print n; seen[n]=1
+        split(out[n],arr," ")
+        for (i in arr) { v=arr[i]; if (v!="") { indeg[v]--; if (indeg[v]==0) q[++qend]=v } }
+      }
+      # detecta ciclos
+      for (i=1;i<=t;i++){n=all[i]; if (!(n in seen)) { printf "CYCLE:%s\n", n > "/dev/stderr" } }
+    }
+  ' "$tmpd/nodes" "$tmpd/edges"
+}
+
+# ============================== Plano / Persistência =========================
+new_run_id(){ date +"%Y%m%d-%H%M%S"; }
+write_plan(){
+  local outfile="$1"; shift || true
+  local -a pkgs=("$@")
+  mkdir -p -- "$(dirname "$outfile")" || return 1
+  {
+    echo "{"
+    echo "  \"generated_at\": \"$(now)\","
+    echo "  \"count\": ${#pkgs[@]},"
+    echo "  \"packages\": ["
+    local i=0; for p in "${pkgs[@]}"; do
+      i=$((i+1)); printf "    \"%s\"%s\n" "$(json_e "$p")" "$([[ $i -lt ${#pkgs[@]} ]] && echo "," || echo "")"
+    done
+    echo "  ]"
+    echo "}"
+  } > "$outfile".tmp
+  mv -f -- "$outfile".tmp "$outfile"
+}
+
+load_plan_pkgs(){
+  local file="$1"
+  awk -F\" '/^\s*"/ {print $2}' "$file" 2>/dev/null
+}
+
+list_plans(){ find "$RB_PLANS" -type f -name "*.json" -printf "%T@ %p\n" 2>/dev/null | sort -nr | awk '{print $2}'; }
+show_plan(){
+  local f="$1"; [[ -f "$f" ]] || { adm_log_error "Plano não encontrado: %s" "$f"; return 2; }
+  local cnt; cnt="$(awk -F: '/"count"/{gsub(/[ ,]/,"");print $2}' "$f" 2>/dev/null || echo 0)"
+  adm_log_info "Plano: %s  (itens=%s)" "$f" "$cnt"
+  awk -F\" '/^\s*"/ {printf " - %s\n",$2}' "$f"
+}
+# (continuação de /usr/src/adm/scripts/92-rebuilder)
+
+# ============================== Execução das etapas ==========================
+log_for(){ printf "%s/%s-%s.log" "$RB_LOGS" "$1" "$(date +%s)"; }
+
+step_fetch(){ local name="$1"; [[ -x "$ADM_ROOT/scripts/30-fetcher" ]] || return 0; "$ADM_ROOT/scripts/30-fetcher" fetch --name="$name"; }
+step_patch(){ local name="$1"; [[ -x "$ADM_ROOT/scripts/32-patcher" ]] || return 0; "$ADM_ROOT/scripts/32-patcher" apply --package="$name"; }
+step_build(){ local name="$1"; [[ -x "$ADM_ROOT/scripts/40-builder"  ]] || { adm_log_error "40-builder ausente"; return 2; }; "$ADM_ROOT/scripts/40-builder" build --name="$name"; }
+step_pack(){  local name="$1"; [[ -x "$ADM_ROOT/scripts/52-packer"   ]] || return 0; "$ADM_ROOT/scripts/52-packer" pack --name="$name"; }
+step_install(){local name="$1"; [[ -x "$ADM_ROOT/scripts/50-installer" ]] || { adm_log_error "50-installer ausente"; return 2; }; "$ADM_ROOT/scripts/50-installer" install --name="$name" --root="$ROOT"; }
+
+run_one(){
+  local name="$1" pack="$2"
+  adm_log_info "▶ Rebuild: %s" "$name"
+  local ok=1
+  local l; l="$(log_for "$(slug "$name")")"
+  {
+    echo "# $(now) Rebuild $name"
+    step_fetch  "$name" || ok=0
+    (( ok==1 )) && step_patch  "$name" || true
+    (( ok==1 )) && step_build  "$name" || ok=0
+    if (( ok==1 && pack==1 )); then step_pack "$name" || ok=0; fi
+    (( ok==1 )) && step_install "$name" || ok=0
+    echo "# $(now) done=$ok"
+  } >> "$l" 2>&1
+  if (( ok==1 )); then adm_log_success "$C_OK %s concluído" "$name"; return 0; else adm_log_error "Falha: %s (log: %s)" "$name" "$l"; return 1; fi
+}
+
+# ============================== Scheduler ====================================
+scheduler_internal(){
+  local par="$1" pack="$2"; shift 2
+  local -a pkgs=("$@")
+  (( par<=0 )) && par=$(nproc 2>/dev/null || echo 2)
+  (( par<1 )) && par=1
+
+  local -a queue=("${pkgs[@]}")
+  local -A pids=(); local -A names=()
+  local fails=0
+
+  _spawn(){
+    local n="$1"
+    ( run_one "$n" "$pack" ) &
+    local pid=$!
+    pids["$pid"]=1; names["$pid"]="$n"
+  }
+
+  while ((${#queue[@]}>0)) || ((${#pids[@]}>0)); do
+    while ((${#pids[@]}<par)) && ((${#queue[@]}>0)); do
+      local n="${queue[0]}"; queue=("${queue[@]:1}")
+      _spawn "$n"
+    done
+    local pid
+    for pid in "${!pids[@]}"; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" || { (( KEEP_GOING==1 )) || return 1; fails=$((fails+1)); }
+        unset 'pids[$pid]'
+      fi
+    done
+    sleep 0.2
+  done
+  (( fails>0 )) && return 1 || return 0
+}
+
+scheduler_run(){
+  local par="$1" pack="$2"; shift 2
+  local -a pkgs=("$@")
+  if [[ -x "$ADM_ROOT/scripts/44-parallel-scheduler" ]]; then
+    adm_log_info "Usando 44-parallel-scheduler (parallel=%s)" "$par"
+    "$ADM_ROOT/scripts/44-parallel-scheduler" run --parallel="$par" -- \
+      "${pkgs[@]/#/92-rebuilder __exec_one }"  # chama este script no modo exec interno
+    return $?
+  else
+    adm_log_info "Usando scheduler interno (parallel=%s)" "$par"
+    scheduler_internal "$par" "$pack" "${pkgs[@]}"
+  fi
+}
+
+# Modo interno para execução unitária (usado pelo 44-parallel-scheduler)
+if [[ "${1:-}" == "__exec_one" ]]; then
+  shift || true
+  run_one "$1" "$PACK"
+  exit $?
+fi
+
+# ============================== Planejamento =================================
+build_plan(){
+  local rid; rid="$(new_run_id)"
+  local plan="$RB_PLANS/plan-$rid.json"
+
+  # 1) candidatos a partir dos gatilhos
+  local cand=""
+  local any=0
+  if (( TR_TOOLCHAIN==1 )); then cand="$(set_union "$cand" "$(trigger_toolchain_diff || true)")"; any=1; fi
+  if (( TR_PROFILE==1   )); then cand="$(set_union "$cand" "$(trigger_profile_diff   || true)")"; any=1; fi
+  if (( TR_META==1      )); then cand="$(set_union "$cand" "$(trigger_metafile_changed|| true)")"; any=1; fi
+  if [[ -n "$TR_SINCE"  ]]; then cand="$(set_union "$cand" "$(trigger_since        || true)")"; any=1; fi
+  if [[ -n "$TR_TOUCHED"]]; then cand="$(set_union "$cand" "$(trigger_touched      || true)")"; any=1; fi
+
+  # Se nenhum gatilho especificado, usa targets/filters diretos
+  if (( any==0 )); then
+    cand="$(filter_by_targets)"
+  fi
+
+  mapfile -t base < <(printf "%s\n" "$cand" | sed '/^$/d' | sort -u)
+  ((${#base[@]})) || { adm_log_warn "Nenhum candidato encontrado."; echo ""; return 0; }
+
+  # 2) expand com deps/rdeps
+  local -a expanded=("${base[@]}")
+  (( WITH_DEPS==1 )) && mapfile -t expanded < <(expand_with_deps "${expanded[@]}")
+  (( WITH_RDEPS==1 )) && mapfile -t expanded < <(expand_with_rdeps "${expanded[@]}")
+
+  # 3) ordenação topológica
+  mapfile -t ordered < <(topo_sort "${expanded[@]}" 2> "$RB_STATE/.cycles.warn" || true)
+
+  # Se houve ciclos, avisa
+  if [[ -s "$RB_STATE/.cycles.warn" ]]; then
+    adm_log_warn "Ciclos detectados em dependências (verifique %s/.cycles.warn)." "$RB_STATE"
+    if (( FORCE==0 )); then
+      adm_log_error "Abortado por ciclo de dependência. Use --force para tentar mesmo assim."
+      return 2
+    fi
+  fi
+
+  # Elimina linhas "CYCLE:..."
+  ordered=( $(printf "%s\n" "${ordered[@]}" | sed '/^CYCLE:/d;/^$/d' | awk '!seen[$0]++') )
+
+  write_plan "$plan" "${ordered[@]}"
+  echo "$plan"
+}
+
+# ============================== Execução do plano ============================
+confirm(){
+  (( YES==1 )) && return 0
+  read -r -p "Continuar? [y/N] " a || true
+  [[ "$a" =~ ^[yY]$ ]]
+}
+
+run_plan(){
+  local plan="$1"
+  mapfile -t pkgs < <(load_plan_pkgs "$plan")
+  ((${#pkgs[@]})) || { adm_log_warn "Plano vazio."; return 0; }
+
+  local par="$PARALLEL"
+  (( par<=0 )) && par=$(nproc 2>/dev/null || echo 2)
+
+  adm_log_info "Plano %s contém %d pacotes. parallel=%d pack=%d keep-going=%d dry=%d" \
+    "$plan" "${#pkgs[@]}" "$par" "$PACK" "$KEEP_GOING" "$DRY"
+
+  if (( DRY==1 )); then
+    printf "DRY-RUN: ordem de build:\n"
+    printf "  - %s\n" "${pkgs[@]}"
+    return 0
+  fi
+
+  confirm || { adm_log_warn "Cancelado."; return 2; }
+  lock_acquire "global"
+  trap 'lock_release "global"' RETURN
+
+  # registra run
+  local rid; rid="$(basename "$plan" .json | sed 's/^plan-//')"
+  local rund="$RB_RUNS/$rid"; mkdir -p -- "$rund" || true
+  printf "%s\n" "$(now)" > "$rund/started_at"
+  cp -f -- "$plan" "$rund/plan.json" 2>/dev/null || true
+
+  scheduler_run "$par" "$PACK" "${pkgs[@]}"
+  local rc=$?
+
+  printf "%s\n" "$(now)" > "$rund/finished_at"
+  echo "$rc" > "$rund/rc"
+
+  # sumário
+  {
+    echo "{"
+    echo "  \"run_id\": \"$(json_e "$rid")\","
+    echo "  \"plan\": \"$(json_e "$plan")\","
+    echo "  \"started_at\": \"$(now)\","
+    echo "  \"finished_at\": \"$(now)\","
+    echo "  \"parallel\": $par,"
+    echo "  \"rc\": $rc,"
+    echo "  \"count\": ${#pkgs[@]}"
+    echo "}"
+  } > "$RB_SUMMARY".tmp
+  mv -f -- "$RB_SUMMARY".tmp "$RB_SUMMARY"
+
+  (( rc==0 )) && adm_log_success "$C_OK Rebuild concluído (run_id=%s)" "$rid" || adm_log_error "Rebuild finalizado com erros (rc=%d)" "$rc"
+  return "$rc"
+}
+
+resume_run(){
+  local rid="$1"
+  [[ -n "$rid" ]] || { adm_log_error "Uso: resume --run-id=..."; return 2; }
+  local rund="$RB_RUNS/$rid"; [[ -d "$rund" ]] || { adm_log_error "run-id não existe: %s" "$rid"; return 2; }
+  local plan="$rund/plan.json"; [[ -f "$plan" ]] || { adm_log_error "Plano ausente em run-id %s" "$rid"; return 2; }
+  # Para simplificar, reexecuta o plano inteiro; em futuro, podemos excluir já concluídos por parsing dos logs.
+  run_plan "$plan"
+}
+
+# ============================== Comandos =====================================
+case "$cmd" in
+  list-plans)
+    list_plans
+    ;;
+  show-plan)
+    [[ -n "$PLAN_FILE" ]] || { adm_log_error "Uso: show-plan --plan=/caminho.json"; exit 2; }
+    show_plan "$PLAN_FILE"
+    ;;
+  plan)
+    p="$(build_plan || true)"
+    [[ -n "$p" ]] && { adm_log_success "$C_OK Plano gerado: %s" "$p"; } || adm_log_warn "Nenhum plano gerado."
+    ;;
+  run)
+    if [[ -n "$PLAN_FILE" && -f "$PLAN_FILE" ]]; then
+      run_plan "$PLAN_FILE"
+    else
+      p="$(build_plan || true)"; [[ -z "$p" ]] && { adm_log_warn "Plano vazio."; exit 0; }
+      run_plan "$p"
+    fi
+    ;;
+  resume)
+    resume_run "$RUN_ID"
+    ;;
+  *)
+    usage; exit 0 ;;
+esac
