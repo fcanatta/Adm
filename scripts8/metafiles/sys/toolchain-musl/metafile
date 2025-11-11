@@ -1,0 +1,12 @@
+name=toolchain-musl
+version=1
+category=sys
+run_deps=sys/binutils-pass1,sys/gcc-pass1,sys/linux-headers,sys/musl,sys/gcc-pass2
+build_deps=sys/binutils-pass1,sys/gcc-pass1,sys/linux-headers,sys/musl,sys/gcc-pass2
+opt_deps=
+num_builds=0
+description=Virtual package: complete MUSL toolchain (binutils p1, gcc p1, headers, musl, gcc p2)
+homepage=https://example.invalid
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
