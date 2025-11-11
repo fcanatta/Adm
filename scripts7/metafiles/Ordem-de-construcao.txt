@@ -110,3 +110,16 @@ KCONFIG=/caminho/meu.config adm install linux
 # Conferir resultado
 ls /boot/vmlinuz-* /boot/initramfs-* /boot/config-* /boot/System.map-*    # artefatos
 ls /lib/modules                                                           # módulos
+
+# Ordem de construção llvm
+adm install llvm           --jobs=8 --profile=normal
+adm install clang          --jobs=8 --profile=normal
+adm install lld            --jobs=8 --profile=normal
+adm install compiler-rt    --jobs=8 --profile=normal
+adm install libcxxabi      --jobs=8 --profile=normal
+adm install libcxx         --jobs=8 --profile=normal
+
+# Cross confirm após instalar confirm
+clang --version
+clang --print-targets | head
+clang --target="$TARGET" --sysroot="$SYSROOT" -v -x c - -c <<< 'int main(){}'
