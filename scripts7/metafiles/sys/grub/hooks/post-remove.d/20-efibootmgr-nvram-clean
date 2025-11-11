@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ADM_EFI_LABEL:=ADM Linux}"  # rótulo usado na criação
+command -v efibootmgr >/dev/null 2>&1 || exit 0
+[[ -d /sys/firmware/efi ]] || exit 0
+
+# Se ainda existir outra instalação do GRUB, não remova (checa presença do loader no ESP)
+ESP=""
+for d in /boot/efi /efi; do
+  if mountpoint -q "$d"; then ESP="$d"; break; fi
+done
+
+# Se quiser remover independentemente do loader, defina ADM_EFI_FORCE_REMOVE=1
+FORCE="${ADM_EFI_FORCE_REMOVE:-0}"
+
+maybe_have_loader=0
+if [[ -n "$ESP" ]]; then
+  shopt -s nullglob
+  for f in "$ESP"/EFI/*/grub*.efi; do
+    [[ -f "$f" ]] && maybe_have_loader=1 && break
+  done
+  shopt -u nullglob
+fi
+
+if [[ "$FORCE" = "1" || "$maybe_have_loader" = "0" ]]; then
+  # Remove todas entradas com o mesmo label
+  while read -r num rest; do
+    [[ "$num" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+(.*)$ ]] || continue
+    bootnum="${BASH_REMATCH[1]}"
+    label="${BASH_REMATCH[2]}"
+    if [[ "$label" == "$ADM_EFI_LABEL" ]]; then
+      efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
+    fi
+  done < <(efibootmgr -v 2>/dev/null | grep -E '^Boot[0-9A-Fa-f]{4}')
+fi
+
+exit 0
