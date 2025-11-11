@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Remove apenas os artefatos criados por este meta-pacote (symlinks e drop-in)
+remove_safe_link() {
+  local path="$1"
+  [[ -L "$path" ]] && rm -f "$path" || true
+}
+remove_safe_link /usr/bin/cc
+remove_safe_link /usr/bin/c++
+# só remova ld se for link apontando para ld.lld
+if [[ -L /usr/bin/ld ]] && [[ "$(readlink -f /usr/bin/ld)" == "/usr/bin/ld.lld" ]]; then
+  rm -f /usr/bin/ld
+fi
+rm -f /etc/profile.d/adm-clang-toolchain.sh 2>/dev/null || true
