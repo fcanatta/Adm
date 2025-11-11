@@ -1,0 +1,12 @@
+name=libtool
+version=2.4.7
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU libtool
+homepage=https://www.gnu.org/software/libtool/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.xz,https://ftpmirror.gnu.org/libtool/libtool-2.4.7.tar.xz
