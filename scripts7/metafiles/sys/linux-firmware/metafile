@@ -1,0 +1,12 @@
+name=linux-firmware
+version=2025.01
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Conjunto de firmwares para drivers do kernel (rede, wifi, gpu, etc.)
+homepage=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/snapshot/linux-firmware-2025.01.tar.gz
