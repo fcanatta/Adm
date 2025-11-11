@@ -41,3 +41,30 @@ adm install xz zstd tar         --profile=minimum --jobs=8
 
 # (Opcional) Migrar para GNU completos, substituindo aos poucos o BusyBox:
 adm install coreutils sed grep gawk bash --profile=minimum --jobs=8
+
+
+# Local dos profiles
+/usr/src/adm/env/profiles/<nome>/
+
+# Criação de profile
+adm paths profile apply --name=minimum \
+  --set TARGET=x86_64-linux-musl \
+  --set SYSROOT=/usr/x86_64-linux-musl \
+  --set CFLAGS="-O2 -pipe" \
+  --set CXXFLAGS="-O2 -pipe" \
+  --set LDFLAGS="" \
+  --set MAKEFLAGS="-j$(nproc)" \
+  --set PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Para instalar com profile
+adm --profile=minimum install gcc-final
+
+# Alternar profile
+# Para build inicial (bootstrap)
+adm paths profile select minimum
+
+# Para builds normais
+adm paths profile select normal
+
+# Para builds agressivos
+adm paths profile select aggressive
