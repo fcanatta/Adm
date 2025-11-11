@@ -1,0 +1,12 @@
+name=pkgconf
+version=2.2.0
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=pkg-config implementation
+homepage=https://github.com/pkgconf/pkgconf
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://distfiles.ariadne.space/pkgconf/pkgconf-2.2.0.tar.xz,https://github.com/pkgconf/pkgconf/releases/download/pkgconf-2.2.0/pkgconf-2.2.0.tar.xz
