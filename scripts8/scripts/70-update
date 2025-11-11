@@ -1,0 +1,665 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/70-update
+# -----------------------------------------------------------------------------
+# ADM - Updater
+# - Verifica versões mais novas no upstream e gera metafiles de atualização em:
+#     /usr/src/adm/update/<programa>/metafile
+# - Integra 30-fetcher para baixar fontes e calcular sha256sums
+# - Providers suportados: GitHub, GitLab, SourceForge, GNU/ftp, HTTP dir, Git
+# - Cache, retries, parallel, dry-run, resumo JSON e logs bonitos
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+UPD_STATE="$ADM_STATE/update"
+UPD_CACHE="$UPD_STATE/cache"
+UPD_LOCKS="$UPD_STATE/locks"
+UPD_OUTDIR="$ADM_ROOT/update"
+
+mkdir -p -- "$UPD_STATE" "$UPD_CACHE" "$UPD_LOCKS" "$UPD_OUTDIR" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _U_COLOR=${ADM_COLOR:-auto}
+  _U_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _U_COLOR=false; fi
+  if [[ "$_U_COLOR" == "auto" ]]; then
+    _U_COLOR=$([[ "$_U_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_U_COLOR" == "true" ]]; then
+    __c_red=$'\033[31m'; __c_grn=$'\033[32m'; __c_yel=$'\033[33m'
+    __c_blu=$'\033[34m'; __c_mag=$'\033[35m'; __c_cyn=$'\033[36m'; __c_dim=$'\033[2m'; __c_rst=$'\033[0m'
+    __c_chk=$'\xE2\x9C\x85'
+  else
+    __c_red=""; __c_grn=""; __c_yel=""; __c_blu=""; __c_mag=""; __c_cyn=""; __c_dim=""; __c_rst=""; __c_chk="[OK]"
+  fi
+  _ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_ts)" "$__c_dim" "$__c_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_ts)" "$__c_blu" "$__c_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_ts)" "$__c_yel" "$__c_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_ts)" "$__c_red" "$__c_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_ts)" "$__c_grn" "$__c_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_u_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_u_slug(){ printf "%s" "$1" | tr ' /' '__' | tr -cd '[:alnum:]_-.'); }
+_u_now(){ date +%s; }
+_u_date(){ date -Iseconds; }
+_u_tmpd(){ mktemp -d "${ADM_TMP%/}/upd.XXXX"; }
+_u_have(){ command -v "$1" >/dev/null 2>&1; }
+_u_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_u_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_u_ua(){ printf "ADM-Updater/1.0 (+https://local)"; }
+
+# versão: split por '.'
+_u_ver_norm(){ printf "%s" "$1" | sed -E 's/[^0-9.].*$//' ; }
+_u_ver_cmp(){ local A="$(_u_ver_norm "$1")" B="$(_u_ver_norm "$2")"; local IFS=.; local -a a=($A) b=($B); local n=${#a[@]}; (( ${#b[@]} > n )) && n=${#b[@]}; for ((i=0;i<n;i++)); do local ai=${a[i]:-0} bi=${b[i]:-0}; ((10#$ai<10#$bi)) && { echo -1; return; }; ((10#$ai>10#$bi)) && { echo 1; return; }; done; echo 0; }
+
+# ============================== Locks ========================================
+_lock_acquire(){
+  local key="$1"; mkdir -p -- "$UPD_LOCKS" || true
+  local d="$UPD_LOCKS/upd-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_lock_release(){ local key="$1"; rm -rf -- "$UPD_LOCKS/upd-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== Metafile I/O =================================
+declare -A MF=()
+
+_parse_metafile(){
+  MF=()
+  local mf="$1" line
+  [[ -f "$mf" ]] || { adm_log_error "Metafile não encontrado: %s" "$mf"; return 1; }
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      MF["${BASH_REMATCH[1]}"]="$(_u_trim "${BASH_REMATCH[2]}")"
+    fi
+  done < "$mf"
+}
+
+_mf_get(){ printf "%s" "${MF[$1]:-}"; }
+_mf_set(){ MF["$1"]="$2"; }
+
+_mf_sources_array(){
+  local s="$(_mf_get sources)"
+  printf "%s\n" "$s" | tr ',' '\n' | sed '/^$/d'
+}
+_mf_sha_array(){
+  local s="$(_mf_get sha256sums)"
+  printf "%s\n" "$s" | tr ',' '\n' | sed '/^$/d'
+}
+
+_mf_write(){
+  local out="$1"
+  {
+    echo "name=$(_mf_get name)"
+    echo "version=$(_mf_get version)"
+    echo "category=$(_mf_get category)"
+    echo "run_deps=$(_mf_get run_deps)"
+    echo "build_deps=$(_mf_get build_deps)"
+    echo "opt_deps=$(_mf_get opt_deps)"
+    echo "num_builds=0"
+    echo "description=$(_mf_get description)"
+    echo "homepage=$(_mf_get homepage)"
+    echo "maintainer=$(_mf_get maintainer)"
+    echo "sha256sums=$(_mf_get sha256sums)"
+    echo "sources=$(_mf_get sources)"
+  } > "$out".tmp
+  mv -f -- "$out".tmp "$out"
+}
+
+# ============================== Coleta de alvos ==============================
+_collect_metafiles(){
+  # args: cats_glob match_glob or explicit "cat/pkg,cat2/pkg2"
+  local targets_csv="$1" cats_glob="$2" match_glob="$3"
+  local base="$ADM_ROOT/metafiles"
+  if [[ -n "$targets_csv" ]]; then
+    IFS=',' read -r -a arr <<< "$targets_csv"
+    local k; for k in "${arr[@]}"; do
+      k="$(_u_trim "$k")"; [[ -z "$k" ]] && continue
+      local mf="$base/$k/metafile"
+      [[ -f "$mf" ]] && printf "%s|%s\n" "$k" "$mf" || adm_log_warn "Metafile ausente: %s" "$k"
+    done
+    return 0
+  fi
+  [[ -d "$base" ]] || { adm_log_error "Diretório de metafiles não encontrado: %s" "$base"; return 1; }
+  while IFS= read -r f; do
+    local cat pkg; pkg="$(basename "$(dirname "$f")")"; cat="$(basename "$(dirname "$(dirname "$f")")")"
+    [[ -n "$cats_glob" && ! "$cat" == $cats_glob ]] && continue
+    [[ -n "$match_glob" && ! "$pkg" == $match_glob ]] && continue
+    printf "%s/%s|%s\n" "$cat" "$pkg" "$f"
+  done < <(find "$base" -mindepth 3 -maxdepth 3 -path "$base/*/*/metafile" -type f -print 2>/dev/null | LC_ALL=C sort)
+}
+
+# ============================== HTTP/GIT helpers =============================
+_http_get(){
+  local url="$1" out="$2" to="${3:-20}" retry="${4:-2}"
+  local ua; ua="$(_u_ua)"
+  local extra=()
+  [[ -n "${GITHUB_TOKEN:-}" && "$url" == https://api.github.com/* ]] && extra+=( -H "Authorization: Bearer $GITHUB_TOKEN" )
+  while :; do
+    if curl -fsSL --retry "$retry" --retry-delay 1 --connect-timeout 5 --max-time "$to" -A "$ua" "${extra[@]}" -- "$url" -o "$out"; then
+      return 0
+    fi
+    (( retry-- <= 0 )) && break
+    sleep 1
+  done
+  return 1
+}
+
+_git_ls_remote_tags(){
+  local url="$1"
+  _u_have git || { adm_log_error "git ausente para ls-remote"; return 1; }
+  git ls-remote --tags --refs "$url" 2>/dev/null | awk '{print $2}' | sed 's|refs/tags/||' | sed 's/\^{}$//' | LC_ALL=C sort -V
+}
+
+# ============================== Providers ====================================
+# Saída das funções *_latest_version: "version|download_url_1,download_url_2"
+# Devem retornar 0 ao encontrar; 2 = não aplicável; 1 = erro.
+
+_provider_guess(){
+  local url="$1"
+  if [[ "$url" =~ ^https://github.com/([^/]+)/([^/]+)(/|$) ]]; then echo "github|${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; return
+  fi
+  if [[ "$url" =~ ^https://gitlab.com/([^/]+)/([^/]+)(/|$) ]]; then echo "gitlab|${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; return
+  fi
+  if [[ "$url" =~ ^https?://sourceforge.net/projects/([^/]+)/files/ ]]; then echo "sf|${BASH_REMATCH[1]}"; return
+  fi
+  if [[ "$url" =~ ^https?://(ftp\.)?gnu\.org/ ]]; then echo "gnu|"; return
+  fi
+  if [[ "$url" =~ ^(git|https?)://.*\.git$ ]]; then echo "git|$url"; return
+  fi
+  echo "generic|"
+}
+
+_github_latest(){
+  local repo="$1"                    # owner/name
+  local prefer_tag="${2:-}"
+  local tmp; tmp="$(_u_tmpd)"
+  local api="https://api.github.com/repos/$repo/releases?per_page=50"
+  if _http_get "$api" "$tmp/r.json" 20 2; then
+    # pega a release mais recente com tag sem rótulos estranhos (sem rc/beta preferencialmente)
+    local vers urls
+    vers="$(jq -r '.[].tag_name' "$tmp/r.json" 2>/dev/null || awk -F'"tag_name":' '{print $2}' "$tmp/r.json" | sed -E 's/[" ,]//g')"
+    if [[ -z "$vers" ]]; then
+      # fallback: tags
+      local tapi="https://api.github.com/repos/$repo/tags?per_page=100"
+      _http_get "$tapi" "$tmp/t.json" 20 2 || return 1
+      vers="$(jq -r '.[].name' "$tmp/t.json" 2>/dev/null || awk -F'"name":' '{print $2}' "$tmp/t.json" | sed -E 's/[" ,]//g')"
+    fi
+    vers="$(printf "%s\n" "$vers" | sed 's/^v//' | grep -E '^[0-9]+(\.[0-9]+)*(-rc[0-9]+)?$' || true)"
+    local best; best="$(printf "%s\n" "$vers" | LC_ALL=C sort -V | tail -n1)"
+    [[ -n "$best" ]] || return 2
+    # monta URLs padrão de tarball
+    local vtag="v$best"
+    local dl="https://github.com/$repo/archive/refs/tags/$vtag.tar.gz"
+    printf "%s|%s\n" "$best" "$dl"
+    rm -rf -- "$tmp" || true
+    return 0
+  fi
+  rm -rf -- "$tmp" || true
+  return 1
+}
+
+_gitlab_latest(){
+  local repo="$1" # group/name
+  local tmp; tmp="$(_u_tmpd)"
+  local api="https://gitlab.com/api/v4/projects/$(python3 - <<PY 2>/dev/null || echo)"; if false; then :; fi
+PY
+  # fallback simples sem Python: usar tags HTML/atom é frágil; então tenta tags via git ls-remote se ssh/http disponível
+  local url="https://gitlab.com/$repo.git"
+  local tags; tags="$(_git_ls_remote_tags "$url" 2>/dev/null || true)"
+  tags="$(printf "%s\n" "$tags" | sed 's/^v//' | grep -E '^[0-9]+(\.[0-9]+)*(-rc[0-9]+)?$' || true)"
+  local best; best="$(printf "%s\n" "$tags" | LC_ALL=C sort -V | tail -n1)"
+  [[ -n "$best" ]] || return 2
+  local dl="https://gitlab.com/$repo/-/archive/v$best/$(basename "$repo")-v$best.tar.gz"
+  printf "%s|%s\n" "$best" "$dl"
+  return 0
+}
+
+_sf_latest(){
+  local proj="$1"
+  # tenta HTML de /files/ + grep de versões
+  local tmp; tmp="$(_u_tmpd)"
+  local url="https://sourceforge.net/projects/$proj/files/"
+  if ! _http_get "$url" "$tmp/h.html" 20 2; then rm -rf -- "$tmp" || true; return 2; fi
+  local vers; vers="$(grep -Eo '>[0-9]+(\.[0-9]+)*(-rc[0-9]+)?/' "$tmp/h.html" | tr -cd '0-9.\n-' | sed '/^$/d' | sort -V | uniq)"
+  local best; best="$(printf "%s\n" "$vers" | tail -n1)"
+  [[ -n "$best" ]] || { rm -rf -- "$tmp" || true; return 2; }
+  # Não sabemos nome do arquivo; apontamos para diretório da versão (52/30 devem resolver mirrors)
+  printf "%s|https://sourceforge.net/projects/%s/files/%s/\n" "$best" "$proj" "$best"
+  rm -rf -- "$tmp" || true
+  return 0
+}
+
+_gnu_latest(){
+  # muito variável; heurística por diretório listando números
+  local any_url="$1"
+  local tmp; tmp="$(_u_tmpd)"
+  if ! _http_get "$any_url" "$tmp/i.html" 20 2; then rm -rf -- "$tmp" || true; return 2; fi
+  local vers; vers="$(grep -Eo '[^0-9]([0-9]+\.[0-9]+(\.[0-9]+)?)' "$tmp/i.html" | tr -cd '0-9.\n' | sed '/^$/d' | sort -V | uniq)"
+  local best; best="$(printf "%s\n" "$vers" | tail -n1)"
+  [[ -n "$best" ]] || { rm -rf -- "$tmp" || true; return 2; }
+  # tenta montar um tarball .tar.xz comum
+  # ex: https://ftp.gnu.org/gnu/wget/wget-1.24.5.tar.xz
+  local base="$(echo "$any_url" | sed -E 's#(.*/)[^/]*$#\1#')"
+  local proj="$(basename "$(echo "$base" | sed 's#/$##')" )"
+  local dl="${base}${proj}-${best}.tar.xz"
+  printf "%s|%s\n" "$best" "$dl"
+  rm -rf -- "$tmp" || true
+  return 0
+}
+
+_git_latest(){
+  local url="$1"
+  local tags; tags="$(_git_ls_remote_tags "$url" 2>/dev/null || true)"
+  tags="$(printf "%s\n" "$tags" | sed 's/^v//' | grep -E '^[0-9]+(\.[0-9]+)*(-rc[0-9]+)?$' || true)"
+  local best; best="$(printf "%s\n" "$tags" | LC_ALL=C sort -V | tail -n1)"
+  [[ -n "$best" ]] || return 2
+  # não temos tarball HTTP garantido; devolve só a versão e deixa 30-fetcher lidar via git
+  printf "%s|\n" "$best"
+  return 0
+}
+
+_generic_dir_latest(){
+  local any_url="$1"
+  local tmp; tmp="$(_u_tmpd)"
+  if ! _http_get "$any_url" "$tmp/i.html" 20 1; then rm -rf -- "$tmp" || true; return 2; fi
+  local vers; vers="$(grep -Eo '[ >]v?([0-9]+\.[0-9]+(\.[0-9]+)?)' "$tmp/i.html" | tr -cd '0-9.\nv.' | sed 's/^v//' | sed '/^$/d' | sort -V | uniq)"
+  local best; best="$(printf "%s\n" "$vers" | tail -n1)"
+  [[ -n "$best" ]] || { rm -rf -- "$tmp" || true; return 2; }
+  # tenta substituir o número antigo no URL (se houver)
+  local guess="$any_url"
+  if [[ "$guess" =~ [0-9]+\.[0-9]+(\.[0-9]+)? ]]; then
+    guess="$(echo "$guess" | sed -E "s/[0-9]+\.[0-9]+(\.[0-9]+)?/$best/g")"
+  fi
+  printf "%s|%s\n" "$best" "$guess"
+  rm -rf -- "$tmp" || true
+  return 0
+}
+
+_latest_for_source(){
+  # entrada: 1 url
+  local url="$1"
+  local prov meta; prov="$(_provider_guess "$url")"
+  local kind="${prov%%|*}" arg="${prov#*|}"
+  case "$kind" in
+    github) _github_latest "$arg" ;;
+    gitlab) _gitlab_latest "$arg" ;;
+    sf)     _sf_latest "$arg" ;;
+    gnu)    _gnu_latest "$url" ;;
+    git)    _git_latest "$arg" ;;
+    generic) _generic_dir_latest "$url" ;;
+    *) return 2 ;;
+  esac
+}
+
+# ============================== Cache de versões =============================
+_cache_key(){ printf "%s" "$1" | sha256sum | awk '{print $1}'; }
+_cache_get(){
+  local key="$1" ttl="${2:-3600}"
+  local f="$UPD_CACHE/$key.txt"
+  [[ -f "$f" ]] || return 1
+  local age=$(( $(_u_now) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  (( age > ttl )) && return 1
+  cat "$f"
+}
+_cache_put(){
+  local key="$1"
+  cat > "$UPD_CACHE/$key.txt".tmp
+  mv -f -- "$UPD_CACHE/$key.txt".tmp "$UPD_CACHE/$key.txt"
+}
+
+# ============================== SHA256 e fetch ================================
+_sha256_file(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+
+_fetch_and_sha256(){
+  # usa 30-fetcher se disponível; senão tenta curl/wget
+  local url="$1" outdir="$2"
+  mkdir -p -- "$outdir" || true
+  local dest="$outdir/$(basename "$url" | sed 's/[?#].*$//')"
+  if [[ -x "$ADM_ROOT/scripts/30-fetcher" ]]; then
+    if "$ADM_ROOT/scripts/30-fetcher" fetch --url="$url" --out="$dest" >/dev/null 2>&1; then
+      :
+    fi
+  fi
+  if [[ ! -f "$dest" ]]; then
+    if _u_have curl; then curl -fL --connect-timeout 5 --max-time 300 -A "$(_u_ua)" -- "$url" -o "$dest" || true
+    elif _u_have wget; then wget -U "$(_u_ua)" -O "$dest" -- "$url" || true
+    fi
+  fi
+  [[ -f "$dest" ]] || return 1
+  local sum; sum="$(_sha256_file "$dest")"
+  printf "%s|%s\n" "$sum" "$dest"
+}
+
+# ============================== Planejamento de update =======================
+_plan_for_metafile(){
+  local key="$1" mf="$2" ttl="${3:-3600}" want_fetch="${4:-0}"
+  _parse_metafile "$mf" || return 1
+  local cur_ver="$(_mf_get version)"
+  local name="$(_mf_get name)"; local cat="$(_mf_get category)"
+  local out_pkg="$cat/$name"
+  local best_ver=""; local urls_new=()
+
+  local s; while IFS= read -r s; do
+    s="$(_u_trim "$s")"; [[ -z "$s" ]] && continue
+    local ck; ck="$(_cache_key "latest::$s")"
+    local cached; cached="$(_cache_get "$ck" "$ttl" 2>/dev/null || true)"
+    local rec
+    if [[ -n "$cached" ]]; then
+      rec="$cached"
+      adm_log_debug "cache hit latest: %s -> %s" "$s" "$rec"
+    else
+      rec="$(_latest_for_source "$s" 2>/dev/null || true)"
+      [[ -n "$rec" ]] && printf "%s\n" "$rec" | _cache_put "$ck"
+    fi
+    if [[ -z "$rec" ]]; then
+      adm_log_warn "[%s] sem resultado de upstream para: %s" "$out_pkg" "$s"
+      continue
+    fi
+    local v="${rec%%|*}" dl="${rec#*|}"
+    # mantém a maior versão vista
+    if [[ -z "$best_ver" || "$(_u_ver_cmp "$v" "$best_ver")" == "1" ]]; then
+      best_ver="$v"
+    fi
+    [[ -n "$dl" ]] && urls_new+=("$dl")
+  done < <(_mf_sources_array)
+
+  if [[ -z "$best_ver" ]]; then
+    printf "NONE|%s|%s\n" "$cur_ver" "$out_pkg"
+    return 0
+  fi
+
+  local cmp; cmp="$(_u_ver_cmp "$best_ver" "$cur_ver")"
+  if [[ "$cmp" != "1" ]]; then
+    # não há atualização maior
+    printf "UP_TO_DATE|%s|%s\n" "$cur_ver" "$out_pkg"
+    return 0
+  fi
+
+  # Se vamos buscar e calcular sha256
+  local sha_list=()
+  if (( want_fetch==1 )); then
+    local ws; ws="$(_u_tmpd)"
+    local u
+    for u in "${urls_new[@]}"; do
+      local r; r="$(_fetch_and_sha256 "$u" "$ws" 2>/dev/null || true)"
+      if [[ -n "$r" ]]; then
+        sha_list+=( "${r%%|*}" )
+      else
+        adm_log_warn "[%s] falha ao baixar: %s" "$out_pkg" "$u"
+      fi
+    done
+    rm -rf -- "$ws" || true
+  fi
+
+  # prepara linha de plano
+  local urls_csv; urls_csv="$(printf "%s\n" "${urls_new[@]}" | sed '/^$/d' | paste -sd',' -)"
+  local shas_csv; shas_csv="$(printf "%s\n" "${sha_list[@]}" | sed '/^$/d' | paste -sd',' -)"
+  printf "UPDATE|%s|%s|%s|%s\n" "$out_pkg" "$best_ver" "$urls_csv" "$shas_csv"
+}
+# (continuação do arquivo /usr/src/adm/scripts/70-update)
+
+# ============================== Escrita do metafile de update ================
+
+_write_update_metafile(){
+  local pkg="$1" mf="$2" new_ver="$3" urls_csv="$4" shas_csv="$5" dry="${6:-0}"
+  _parse_metafile "$mf" || return 1
+  _mf_set version "$new_ver"
+  [[ -n "$urls_csv" ]] && _mf_set sources "$urls_csv"
+  [[ -n "$shas_csv" ]] && _mf_set sha256sums "$shas_csv"
+  _mf_set num_builds "0"
+  local outdir="$UPD_OUTDIR/$pkg"
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso a %s" "$outdir"; return 1; }
+  local out="$outdir/metafile"
+  if (( dry==1 )); then
+    adm_log_info "[DRY] Geraria metafile em: %s" "$out"
+    return 0
+  fi
+  _mf_write "$out"
+  adm_log_success "${__c_chk} Atualização escrita: %s (versão %s)" "$out" "$new_ver"
+}
+
+# ============================== Dependências =================================
+
+_collect_with_deps(){
+  # Entrada: "cat/pkg|/path/metafile" por linha
+  # Saída: mesmas linhas + dependências encontradas (com caminho)
+  local lines=("$@")
+  local seen=()
+  local out=()
+
+  # index rápido: cat/pkg -> metafile path
+  declare -A MFIDX=()
+  while IFS= read -r pair; do
+    [[ -z "$pair" ]] && continue
+    MFIDX["${pair%%|*}"]="${pair#*|}"
+  done < <(find "$ADM_ROOT/metafiles" -mindepth 3 -maxdepth 3 -name metafile -printf "%P\n" \
+            | awk -v b="$ADM_ROOT/metafiles" -F/ '{printf "%s/%s|%s/%s/%s/%s\n",$1,$2,b,$1,$2,$3}')
+
+  _walk(){
+    local key="$1"
+    [[ -n "${seen[$key]:-}" ]] && return 0
+    seen["$key"]=1
+    local mf="${MFIDX[$key]:-}"
+    [[ -f "$mf" ]] || { adm_log_warn "Metafile de dep ausente: %s" "$key"; return 0; }
+    out+=( "$key|$mf" )
+    _parse_metafile "$mf" || return 0
+    local all_deps; all_deps="$(_u_trim "$(_mf_get run_deps),$(_mf_get build_deps)")"
+    printf "%s" "$all_deps" | tr ',' '\n' | sed '/^$/d' | while read -r d; do
+      # aceita cat/pkg ou basename; tenta resolver basename nas categorias
+      if [[ "$d" == */* ]]; then
+        [[ -n "${MFIDX[$d]:-}" ]] && _walk "$d"
+      else
+        local m; for m in "${!MFIDX[@]}"; do
+          [[ "${m##*/}" == "$d" ]] && _walk "$m"
+        done
+      fi
+    done
+  }
+
+  local l; for l in "${lines[@]}"; do _walk "${l%%|*}"; done
+  printf "%s\n" "${out[@]}" | LC_ALL=C sort -u
+}
+
+# ============================== Paralelismo ==================================
+
+_run_parallel(){
+  local maxp="${1:-4}" ttl="${2:-3600}" fetch="${3:-0}" dry="${4:-0}"
+  shift 4
+  local -a pairs=("$@")  # elementos "key|/path/metafile"
+  local tmp; tmp="$(_u_tmpd)"
+  printf "%s\n" "${pairs[@]}" > "$tmp/pairs.txt"
+
+  # usa xargs -P para concorrência
+  local rc=0
+  if _u_have xargs; then
+    < "$tmp/pairs.txt" xargs -r -n1 -P "$maxp" bash -c '
+      set -Eeuo pipefail
+      IFS="|" read -r key mf <<< "$0"
+      '"$(declare -f _parse_metafile _mf_get _plan_for_metafile _write_update_metafile _u_trim adm_log_info adm_log_warn adm_log_error _u_ver_cmp _mf_set _mf_write)"'
+      res="$(_plan_for_metafile "$key" "$mf" "'"$ttl"'" "'"$fetch"'")" || res=""
+      [[ -n "$res" ]] || exit 0
+      status="${res%%|*}"
+      if [[ "$status" == "UPDATE" ]]; then
+        pkg="$(echo "$res" | awk -F"|" "{print \$2}")"
+        newv="$(echo "$res" | awk -F"|" "{print \$3}")"
+        urls="$(echo "$res" | awk -F"|" "{print \$4}")"
+        shas="$(echo "$res" | awk -F"|" "{print \$5}")"
+        '"$(declare -f _write_update_metafile _parse_metafile _mf_get _mf_set _mf_write _u_trim adm_log_success adm_log_warn adm_log_error)"'
+        _write_update_metafile "$pkg" "$mf" "$newv" "$urls" "$shas" "'"$dry"'"
+      else
+        :
+      fi
+    ' 2>/dev/null || rc=1
+  else
+    # sequencial fallback
+    local p; for p in "${pairs[@]}"; do
+      IFS='|' read -r key mf <<< "$p"
+      local res; res="$(_plan_for_metafile "$key" "$mf" "$ttl" "$fetch" 2>/dev/null || true)"
+      [[ -z "$res" ]] && continue
+      local status="${res%%|*}"
+      if [[ "$status" == "UPDATE" ]]; then
+        local pkg newv urls shas
+        pkg="$(echo "$res" | awk -F"|" '{print $2}')"
+        newv="$(echo "$res" | awk -F"|" '{print $3}')"
+        urls="$(echo "$res" | awk -F"|" '{print $4}')"
+        shas="$(echo "$res" | awk -F"|" '{print $5}')"
+        _write_update_metafile "$pkg" "$mf" "$newv" "$urls" "$shas" "$dry"
+      fi
+    done
+  fi
+  rm -rf -- "$tmp" || true
+  return "$rc"
+}
+
+# ============================== Resumo JSON ==================================
+
+_write_summary(){
+  local file="$1" total="$2" updates="$3" uptodate="$4" none="$5"
+  {
+    printf "{\n"
+    printf "  \"generated_at\":\"%s\",\n" "$(_u_date)"
+    printf "  \"total\":%s,\n" "$total"
+    printf "  \"updates\":%s,\n" "$updates"
+    printf "  \"up_to_date\":%s,\n" "$uptodate"
+    printf "  \"no_info\":%s\n" "$none"
+    printf "}\n"
+  } > "$file".tmp
+  mv -f -- "$file".tmp "$file"
+}
+
+# ============================== Doctor =======================================
+
+_updater_doctor(){
+  local fail=0
+  for b in curl awk sed find xargs sha256sum; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }
+  done
+  mkdir -p -- "$UPD_STATE" "$UPD_CACHE" "$UPD_LOCKS" "$UPD_OUTDIR" || { adm_log_error "Sem acesso a state/update dirs"; fail=$((fail+1)); }
+  [[ -d "$ADM_ROOT/metafiles" ]] || { adm_log_error "Metafiles dir ausente: %s" "$ADM_ROOT/metafiles"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Updater OK."
+}
+
+# ============================== CLI ==========================================
+
+_usage(){
+  cat <<'USAGE'
+Uso: 70-update <comando> [opções]
+
+Comandos:
+  check     [--targets=cat/pkg,... | --categories='libs|apps' --match='glob'] [--ttl=3600] [--with-deps] [--parallel=N]
+            Apenas verifica upstream e relata (sem escrever arquivos).
+  plan      (alias de check)
+  write     [mesmas opções que check] [--fetch] [--dry-run] [--parallel=N]
+            Gera metafiles atualizados em /usr/src/adm/update/<cat/pkg>/metafile
+            Se --fetch: baixa fontes e preenche sha256sums.
+  doctor    Checa dependências e diretórios.
+
+Opções:
+  --targets=cat/pkg[,cat2/pkg2]     Limita a estes pacotes.
+  --categories='libs|sys|apps'      Filtra por categorias.
+  --match='glob'                    Filtra pelo nome do pacote.
+  --ttl=SEG                         TTL do cache de versão (default 3600s).
+  --with-deps                       Inclui dependências (run+build) no processamento.
+  --parallel=N                      Concorrência (default: núcleos/2, mínimo 2).
+  --fetch                           Ao escrever, baixar fontes e calcular sha256sums.
+  --dry-run                         Não escreve nada; mostra o que faria.
+
+Saída:
+  - Relatório em tempo real e resumo JSON em $ADM_STATE/update/summary.json
+  - Metafiles em: /usr/src/adm/update/<cat/pkg>/metafile
+USAGE
+}
+
+# ============================== Comandos =====================================
+
+_cmd_check_or_write(){
+  local do_write="$1"   # 0=check, 1=write
+  shift
+  local targets="" cats="" match="" ttl=3600 with_deps=0 par=0 fetch=0 dry=0
+  while (( $# )); do
+    case "$1" in
+      --targets=*) targets="${1#--targets=}" ;;
+      --categories=*) cats="${1#--categories=}" ;;
+      --match=*) match="${1#--match=}" ;;
+      --ttl=*) ttl="${1#--ttl=}" ;;
+      --with-deps) with_deps=1 ;;
+      --parallel=*) par="${1#--parallel=}" ;;
+      --fetch) fetch=1 ;;
+      --dry-run) dry=1 ;;
+      --*) adm_log_warn "Opção ignorada: %s" "$1" ;;
+      *) adm_log_warn "Arg desconhecido: %s" "$1" ;;
+    esac; shift || true
+  done
+
+  # coleta
+  mapfile -t pairs < <(_collect_metafiles "$targets" "$cats" "$match")
+  ((${#pairs[@]})) || { adm_log_error "Nenhum metafile encontrado."; return 1; }
+
+  # deps
+  if (( with_deps==1 )); then
+    mapfile -t pairs < <(_collect_with_deps "${pairs[@]}")
+  fi
+
+  # paralelismo
+  if (( par<=0 )); then
+    if _u_have nproc; then par=$(( $(nproc 2>/dev/null || echo 2) / 2 )); else par=2; fi
+    (( par<2 )) && par=2
+  fi
+
+  adm_log_info "Processando %d pacotes (parallel=%d ttl=%ds fetch=%d write=%d)…" "${#pairs[@]}" "$par" "$ttl" "$fetch" "$do_write"
+
+  local total="${#pairs[@]}" updates=0 uptodate=0 none=0
+
+  # Executa plano (sequencial para contagem precisa; quando write, usamos _run_parallel para escrever)
+  local resfile="$UPD_STATE/summary.json"
+  : > "$resfile".tmp
+
+  if (( do_write==1 )); then
+    _run_parallel "$par" "$ttl" "$fetch" "$dry" "${pairs[@]}" || true
+  else
+    local p
+    for p in "${pairs[@]}"; do
+      IFS='|' read -r key mf <<< "$p"
+      local r; r="$(_plan_for_metafile "$key" "$mf" "$ttl" 0 2>/dev/null || true)"
+      [[ -z "$r" ]] && { none=$((none+1)); continue; }
+      local status="${r%%|*}"
+      case "$status" in
+        UPDATE) updates=$((updates+1));;
+        UP_TO_DATE) uptodate=$((uptodate+1));;
+        NONE) none=$((none+1));;
+        *) : ;;
+      esac
+    done
+  fi
+
+  _write_summary "$resfile" "$total" "$updates" "$uptodate" "$none"
+  adm_log_success "${__c_chk} Resumo: total=%d updates=%d up_to_date=%d no_info=%d" "$total" "$updates" "$uptodate" "$none"
+  adm_log_info "Resumo JSON: %s" "$resfile"
+}
+
+upd_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    check|plan) _cmd_check_or_write 0 "$@" ;;
+    write)      _cmd_check_or_write 1 "$@" ;;
+    doctor)     _updater_doctor ;;
+    ""|-h|--help|help) _usage ;;
+    *)          adm_log_error "Comando desconhecido: %s" "$cmd"; _usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  upd_main "$@"
+fi
