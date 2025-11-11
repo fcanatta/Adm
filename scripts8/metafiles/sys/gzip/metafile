@@ -1,0 +1,12 @@
+name=gzip
+version=1.13
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU gzip
+homepage=https://www.gnu.org/software/gzip/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz,https://ftpmirror.gnu.org/gzip/gzip-1.13.tar.xz
