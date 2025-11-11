@@ -1,0 +1,12 @@
+name=firefox-bin
+version=128.0esr
+category=apps
+run_deps=
+build_deps=
+opt_deps=gtk3,dbus,alsa-lib,pulseaudio,libX11,libXext,libXt,libxcb,libXrender,libXcomposite,libXdamage,cairo,pango,fontconfig,freetype,icu,libjpeg,libpng,libwebp,zlib,brotli,nspr,nss
+num_builds=0
+description=Mozilla Firefox (binário oficial pré-compilado) com integração desktop
+homepage=https://www.mozilla.org/firefox/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://archive.mozilla.org/pub/firefox/releases/128.0esr/linux-x86_64/pt-BR/firefox-128.0esr.tar.bz2,https://archive.mozilla.org/pub/firefox/releases/128.0esr/linux-aarch64/pt-BR/firefox-128.0esr.tar.bz2
