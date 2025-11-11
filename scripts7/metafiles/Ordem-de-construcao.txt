@@ -98,3 +98,15 @@ adm install linux-firmware --jobs=8 --profile=normal
 # Config do kernel
 Config do kernel: coloque seu .config em /usr/src/adm/kconfigs/<arch>/kernel.config e ele será usado automaticamente.
 Initramfs: é gerado no post-install do kernel (pelo adm-mkinitramfs) para o KVER instalado.
+
+# Selecionar profiles 
+adm paths profile select normal   # ou minimum/aggressive
+# Instalar kernel
+adm install linux --jobs=8
+# Headers e firmware
+adm install linux-headers
+adm install linux-firmware
+KCONFIG=/caminho/meu.config adm install linux
+# Conferir resultado
+ls /boot/vmlinuz-* /boot/initramfs-* /boot/config-* /boot/System.map-*    # artefatos
+ls /lib/modules                                                           # módulos
