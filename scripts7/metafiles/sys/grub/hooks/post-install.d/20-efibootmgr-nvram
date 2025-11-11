@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ---------- Configuração controlável (valores padrão) ----------
+: "${ADM_EFI_UPDATE_NVRAM:=0}"      # 1 para habilitar; 0 (default) não mexe em NVRAM
+: "${ADM_EFI_LABEL:=ADM Linux}"     # rótulo da entrada
+: "${ADM_EFI_REPLACE:=1}"           # 1 remove entradas antigas com mesmo label
+: "${ADM_EFI_BOOTORDER_POLICY:=top}"# top|append|none  (coloca no topo, adiciona ao fim, ou não mexe)
+: "${ADM_EFI_SET_BOOTNEXT:=0}"      # 1 seta BootNext para a nova entrada
+: "${ADM_EFI_LOADER_DIR:=EFI/ADM}"  # diretório dentro do ESP (sem barra inicial)
+
+# ---------- Pré-requisitos ----------
+[[ "$ADM_EFI_UPDATE_NVRAM" = "1" ]] || exit 0
+[[ -d /sys/firmware/efi ]] || exit 0
+command -v efibootmgr >/dev/null 2>&1 || exit 0
+
+# Detectar ESP montado
+ESP=""
+for d in /boot/efi /efi; do
+  if mountpoint -q "$d"; then ESP="$d"; break; fi
+done
+[[ -n "$ESP" ]] || { echo "ESP não montado (/boot/efi ou /efi). Pulando NVRAM." >&2; exit 0; }
+
+# Detectar plataforma → nome do loader
+ARCH="$(uname -m)"
+case "$ARCH" in
+  x86_64)  LOADER="grubx64.efi" ;;
+  i?86)    LOADER="grubia32.efi" ;;
+  aarch64) LOADER="grubaa64.efi" ;;
+  arm*)    LOADER="grubarm.efi" ;;
+  riscv64) LOADER="grubriscv64.efi" ;;
+  *) echo "Arquitetura EFI não suportada: $ARCH"; exit 0 ;;
+esac
+
+# Caminho do loader no ESP (EFI path usa barras invertidas)
+ESP_LOADER_UNIX="${ESP}/${ADM_EFI_LOADER_DIR}/${LOADER}"
+ESP_LOADER_EFI="\\${ADM_EFI_LOADER_DIR//\//\\}\\\${LOADER}"
+mkdir -p "$(dirname "$ESP_LOADER_UNIX")"
+
+# Se o grub-install já tiver colocado um loader, ótimo. Senão, tente copiar um conhecido.
+if [[ ! -f "$ESP_LOADER_UNIX" ]]; then
+  # candidatos comuns instalados pelo grub
+  for cand in \
+    "/boot/efi/EFI/ADM/${LOADER}" \
+    "/usr/lib/grub/${ARCH}-efi/${LOADER}" \
+    "/usr/lib/grub/${ARCH}-efi/monolithic/${LOADER}" \
+    "/usr/share/grub/${LOADER}"
+  do
+    [[ -f "$cand" ]] && install -m 0644 "$cand" "$ESP_LOADER_UNIX" && break
+  done
+fi
+
+[[ -f "$ESP_LOADER_UNIX" ]] || { echo "Loader EFI não encontrado: $ESP_LOADER_UNIX"; exit 0; }
+
+# Descobrir disco/partição do ESP para efibootmgr
+SRC="$(findmnt -n -o SOURCE --target "$ESP" 2>/dev/null || true)"
+DISK="" PART=""
+case "$SRC" in
+  /dev/nvme*n*p[0-9]*) DISK="/dev/${SRC#/dev/}"; DISK="${DISK%p*}"; DISK="/dev/${DISK##/dev/}"; PART="${SRC##*p}";;
+  /dev/*[0-9])         DISK="${SRC%[0-9]}"; PART="${SRC##*[!0-9]}";;
+  /dev/*)              # partição sem dígito? tenta blkid
+                      DISK="$(lsblk -no PKNAME "$SRC" 2>/dev/null || true)"
+                      [[ -n "$DISK" ]] && DISK="/dev/$DISK"
+                      PART="$(lsblk -no PARTNUM "$SRC" 2>/dev/null || true)"
+                      ;;
+esac
+[[ -n "$DISK" && -n "$PART" ]] || { echo "Não consegui deduzir disco/partição do ESP ($SRC)"; exit 0; }
+
+# Remover entradas antigas com mesmo label (se habilitado)
+if [[ "$ADM_EFI_REPLACE" = "1" ]]; then
+  while read -r num rest; do
+    [[ "$num" =~ ^Boot([0-9A-Fa-f]{4})\*?[[:space:]]+(.*)$ ]] || continue
+    bootnum="${BASH_REMATCH[1]}"
+    label="${BASH_REMATCH[2]}"
+    if [[ "$label" == "$ADM_EFI_LABEL" ]]; then
+      efibootmgr -b "$bootnum" -B >/dev/null 2>&1 || true
+    fi
+  done < <(efibootmgr -v 2>/dev/null | grep -E '^Boot[0-9A-Fa-f]{4}')
+fi
+
+# Criar nova entrada
+if ! OUT_CREATE="$(efibootmgr -c -d "$DISK" -p "$PART" -L "$ADM_EFI_LABEL" -l "$ESP_LOADER_EFI" 2>&1)"; then
+  echo "efibootmgr falhou: $OUT_CREATE" >&2
+  exit 0
+fi
+
+# Capturar o Boot#### criado
+NEWNUM="$(efibootmgr 2>/dev/null | awk '/^Boot[0-9A-Fa-f]{4}\*/ {print $1}' | sed 's/[^0-9A-Fa-f]//g' | sort | tail -n1 || true)"
+[[ -n "$NEWNUM" ]] || exit 0
+
+# Política de BootOrder
+if [[ "$ADM_EFI_BOOTORDER_POLICY" != "none" ]]; then
+  CUR="$(efibootmgr 2>/dev/null | awk -F'[: ]+' '/BootOrder/ {print $2; exit}')"
+  CUR="${CUR//,/ }"
+  # remove duplicados; posiciona novo no topo ou no fim
+  NEWLIST=()
+  if [[ "$ADM_EFI_BOOTORDER_POLICY" = "top" ]]; then
+    NEWLIST+=("$NEWNUM")
+    for x in $CUR; do [[ "$x" != "$NEWNUM" ]] && NEWLIST+=("$x"); done
+  else
+    for x in $CUR; do [[ "$x" != "$NEWNUM" ]] && NEWLIST+=("$x"); done
+    NEWLIST+=("$NEWNUM")
+  fi
+  efibootmgr -o "$(IFS=,; echo "${NEWLIST[*]}")" >/dev/null 2>&1 || true
+fi
+
+# Opcional: BootNext
+if [[ "$ADM_EFI_SET_BOOTNEXT" = "1" ]]; then
+  efibootmgr -n "$NEWNUM" >/dev/null 2>&1 || true
+fi
+
+exit 0
