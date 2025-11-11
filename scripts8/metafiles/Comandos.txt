@@ -46,3 +46,20 @@ adm install sys/binutils-pass1 --with-deps --pack
 
 # 2) GCC PASS1 (usa gmp/mpfr/mpc/isl)
 adm install sys/gcc-pass1 --with-deps --pack
+
+# Variáveis
+export TARGET=x86_64-linux-musl
+export PREFIX=/usr/src/adm/toolchain
+export SYSROOT=/usr/src/adm/sysroot
+export JOBS=$(nproc)
+
+# Pré-requisitos: você já instalou gmp/mpfr/mpc/isl (fez antes com gcc-pass1).
+# Agora basta:
+adm install sys/toolchain-musl --with-deps --pack --parallel="$JOBS"
+
+# Passo a passo a construção 
+adm install sys/binutils-pass1 --with-deps --pack
+adm install sys/gcc-pass1      --with-deps --pack
+adm install sys/linux-headers  --pack
+adm install sys/musl           --pack
+adm install sys/gcc-pass2      --with-deps --pack --parallel="$JOBS"
