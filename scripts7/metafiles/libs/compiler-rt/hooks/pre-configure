@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${WORKDIR:?}"
+: "${TARGET:?TARGET não definido}"
+: "${SYSROOT:?SYSROOT não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+BUILD_DIR="${WORKDIR}/build-compiler-rt"
+mkdir -p "$BUILD_DIR"
+export ADM_OUT_OF_TREE_BUILD="$BUILD_DIR"
+
+# Compila runtimes para o TARGET, usando clang como compilador host
+cat > "${BUILD_DIR}/CMAKE_ARGS.txt" <<EOF
+-DCMAKE_INSTALL_PREFIX=/usr
+-DCMAKE_BUILD_TYPE=Release
+-DLLVM_ENABLE_PROJECTS=
+-DLLVM_ENABLE_RUNTIMES=compiler-rt
+-DCMAKE_SYSROOT=${SYSROOT}
+-DCMAKE_C_COMPILER=clang
+-DCMAKE_C_COMPILER_TARGET=${TARGET}
+-DCMAKE_ASM_COMPILER=clang
+-DCMAKE_ASM_COMPILER_TARGET=${TARGET}
+-DCMAKE_SKIP_RPATH=ON
+-GNinja
+EOF
+
+export CONFIGURE_EXTRAS+=" -S runtimes -B ${BUILD_DIR} $(tr '\n' ' ' < ${BUILD_DIR}/CMAKE_ARGS.txt)"
