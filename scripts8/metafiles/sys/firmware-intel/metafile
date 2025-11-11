@@ -1,0 +1,12 @@
+name=firmware-intel
+version=20241113
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Intel Wi-Fi / Bluetooth firmware
+homepage=https://git.kernel.org/?p=linux/kernel/git/firmware/linux-firmware.git
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/snapshot/linux-firmware-20241113.tar.gz
