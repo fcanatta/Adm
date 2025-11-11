@@ -1,0 +1,12 @@
+name=qutebrowser
+version=3.2.0
+category=apps
+run_deps=dev/python,libs/qt6-base,libs/qt6-webengine,dev/pyqt6,dev/pyqt6-webengine
+build_deps=dev/python,dev/cmake,dev/ninja,libs/qt6-base,libs/qt6-webengine,dev/pyqt6,dev/pyqt6-webengine
+opt_deps=libs/icu,libs/sqlite,libs/openssl
+num_builds=0
+description=Keyboard-focused browser with a minimal GUI and Vim-like keybindings
+homepage=https://www.qutebrowser.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/qutebrowser/qutebrowser/archive/refs/tags/v3.2.0.tar.gz,https://codeload.github.com/qutebrowser/qutebrowser/tar.gz/refs/tags/v3.2.0
