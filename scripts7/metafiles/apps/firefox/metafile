@@ -1,0 +1,12 @@
+name=firefox
+version=128.0esr
+category=apps
+run_deps=
+build_deps=clang,lld,rust,cargo,python,host-python3,host-ninja,host-cmake,nodejs,nasm,yasm
+opt_deps=gtk3,dbus,alsa-lib,pulseaudio,libX11,libXext,libXt,libxcb,libXrender,libXcomposite,libXdamage,cairo,pango,fontconfig,freetype,icu,libjpeg,libpng,libwebp,zlib,brotli,nspr,nss
+num_builds=0
+description=Mozilla Firefox (ESR), com suporte a cross-build, instalação em /usr e integração desktop
+homepage=https://www.mozilla.org/firefox/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://archive.mozilla.org/pub/firefox/releases/128.0esr/source/firefox-128.0esr.source.tar.xz
