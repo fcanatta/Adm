@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+
+KVER="$(make -s kernelrelease)"
+: "${KVER:?Falha ao detectar kernelrelease}"
+
+$MAKE modules_install INSTALL_MOD_PATH="${DESTDIR}"
+
+install -d "${DESTDIR}/boot"
+IMG=""
+for cand in arch/${ARCH:-x86}/boot/bzImage arch/${ARCH:-arm64}/boot/Image arch/${ARCH:-arm}/boot/zImage vmlinux; do
+  [[ -f "$cand" ]] && IMG="$cand" && break
+done
+[[ -n "$IMG" ]] || { echo "Imagem do kernel não encontrada"; exit 60; }
+install -m 0644 "$IMG" "${DESTDIR}/boot/vmlinuz-lts-${KVER}"
+
+[[ -f System.map ]] && install -m 0644 System.map "${DESTDIR}/boot/System.map-lts-${KVER}" || true
+[[ -f .config    ]] && install -m 0644 .config    "${DESTDIR}/boot/config-lts-${KVER}"     || true
+
+if [[ -d arch/${ARCH:-}/boot/dts ]]; then
+  install -d "${DESTDIR}/boot/dtbs-lts-${KVER}"
+  rsync -a --delete "arch/${ARCH}/boot/dts/" "${DESTDIR}/boot/dtbs-lts-${KVER}/" 2>/dev/null || true
+fi
