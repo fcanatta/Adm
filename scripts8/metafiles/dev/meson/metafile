@@ -1,0 +1,12 @@
+name=meson
+version=1.5.1
+category=dev
+run_deps=dev/python
+build_deps=dev/python
+opt_deps=dev/ninja
+num_builds=0
+description=Meson build system (Python package)
+homepage=https://mesonbuild.com
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/mesonbuild/meson/releases/download/1.5.1/meson-1.5.1.tar.gz,https://pypi.io/packages/source/m/meson/meson-1.5.1.tar.gz
