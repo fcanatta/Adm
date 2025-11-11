@@ -1,0 +1,12 @@
+name=bzip2
+version=1.0.8
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=bzip2 compressor
+homepage=https://www.sourceware.org/bzip2/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz,https://fossies.org/linux/misc/bzip2-1.0.8.tar.gz
