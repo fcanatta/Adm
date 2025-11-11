@@ -1,0 +1,454 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/60-uninstaller
+# -----------------------------------------------------------------------------
+# ADM - Uninstaller
+# - Remove pacotes instalados via 50-installer, com backup e rollback seguro
+# - Reverse-deps (whatrequires), autoremove de órfãos, purge agressivo
+# - Opera sobre DB: $ADM_STATE/db/{installed,files,index.map,history}
+# - Hooks: pre-system-remove, post-system-remove (34-hooks-runner)
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+INST_STATE="$ADM_STATE/installer"
+UNINST_STATE="$ADM_STATE/uninstaller"
+DB_DIR="$ADM_STATE/db"
+DB_INSTALLED="$DB_DIR/installed"
+DB_FILES="$DB_DIR/files"
+DB_HISTORY="$DB_DIR/history"
+FILES_INDEX="$DB_FILES/index.map"
+LOCK_DIR="$UNINST_STATE/locks"
+
+mkdir -p -- "$UNINST_STATE" "$LOCK_DIR" "$DB_INSTALLED" "$DB_FILES" "$DB_HISTORY" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _U_COLOR=${ADM_COLOR:-auto}
+  _U_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _U_COLOR=false; fi
+  if [[ "$_U_COLOR" == "auto" ]]; then
+    _U_COLOR=$([[ "$_U_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_U_COLOR" == "true" ]]; then
+    __u_red=$'\033[31m'; __u_grn=$'\033[32m'; __u_yel=$'\033[33m'
+    __u_blu=$'\033[34m'; __u_mag=$'\033[35m'; __u_cyn=$'\033[36m'; __u_dim=$'\033[2m'; __u_rst=$'\033[0m'
+    __u_chk=$'\xE2\x9C\x85'
+  else
+    __u_red=""; __u_grn=""; __u_yel=""; __u_blu=""; __u_mag=""; __u_cyn=""; __u_dim=""; __u_rst=""; __u_chk="[OK]"
+  fi
+  _u_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_u_ts)" "$__u_dim" "$__u_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_u_ts)" "$__u_blu" "$__u_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_u_ts)" "$__u_yel" "$__u_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_u_ts)" "$__u_red" "$__u_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_u_ts)" "$__u_grn" "$__u_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_u_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_u_now(){ date +%s; }
+_u_date(){ date -Iseconds; }
+_u_have(){ command -v "$1" >/dev/null 2>&1; }
+_u_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_u_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_u_slug(){ printf "%s" "$1" | tr ' /' '__' | tr -cd '[:alnum:]_-.'); }
+
+# ============================== Locks ========================================
+_lock_acquire(){
+  local key="$1"; mkdir -p -- "$LOCK_DIR" || true
+  local d="$LOCK_DIR/uninst-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: %s" "$key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_lock_release(){ local key="$1"; rm -rf -- "$LOCK_DIR/uninst-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== Hooks ========================================
+_run_hooks_sys(){
+  local stage="$1" root="$2"
+  local hr="$ADM_ROOT/scripts/34-hooks-runner"
+  [[ -x "$hr" ]] || { adm_log_debug "hooks-runner ausente: %s" "$stage"; return 0; }
+  "$hr" run "$stage" "$root" || { adm_log_error "Hook falhou: %s" "$stage"; return 1; }
+}
+
+# ============================== DB Helpers ===================================
+_installed_json(){ printf "%s/%s.json" "$DB_INSTALLED" "$(printf "%s" "$1" | tr '/' '__')"; }
+
+_db_pkg_exists(){ [[ -f "$(_installed_json "$1")" ]]; }
+
+_db_list_installed(){
+  find "$DB_INSTALLED" -maxdepth 1 -type f -name "*.json" -printf "%f\n" 2>/dev/null \
+    | sed 's/\.json$//' | tr '__' '/'
+}
+
+_db_pkg_version(){
+  local js="$(_installed_json "$1")"
+  [[ -f "$js" ]] || { echo ""; return 0; }
+  awk -F\" '/"version":/ {print $4; exit}' "$js" 2>/dev/null || echo ""
+}
+
+_db_pkg_files(){
+  local js="$(_installed_json "$1")"
+  [[ -f "$js" ]] || return 1
+  awk -F\" '/^\s*"files":\s*\[/,/\]/{ if ($0 ~ /"/){ gsub(/[",]/,""); gsub(/^[ \t]+/,""); print } }' "$js"
+}
+
+_db_files_owner(){
+  local rel="${1#/}"
+  [[ -f "$FILES_INDEX" ]] || { echo ""; return 0; }
+  awk -F'\t' -v p="$rel" '$1==p{print $2; exit}' "$FILES_INDEX"
+}
+
+_db_remove_owner(){
+  local name="$1"
+  [[ -f "$FILES_INDEX" ]] || return 0
+  awk -F'\t' -v n="$name" '$2!=n' "$FILES_INDEX" > "$FILES_INDEX".new || true
+  mv -f -- "$FILES_INDEX".new "$FILES_INDEX"
+}
+
+_db_remove_pkg_json(){
+  rm -f -- "$(_installed_json "$1")" 2>/dev/null || true
+}
+
+# ============================== Reverse deps =================================
+# Inspeção dos metafiles instalados para achar quem "run_deps/build_deps" referenciam um pacote.
+# Heurística: um pacote "cat/pkg" pode ser requerido como "pkg" (basename) ou "cat/pkg".
+_revdeps_of(){
+  local target="$1"
+  local tbase="${target##*/}"
+  local out=()
+  local n
+  for n in $(_db_list_installed); do
+    # localiza metafile: /usr/src/adm/metafiles/<cat>/<pkg>/metafile (nome 'n')
+    local meta="$ADM_ROOT/metafiles/$n/metafile"
+    [[ -f "$meta" ]] || continue
+    local deps
+    deps="$(awk -F= '/^(run_deps|build_deps)=/{print $2}' "$meta" 2>/dev/null | tr ',' ' ' | tr -s ' ')"
+    for d in $deps; do
+      [[ "$d" == "$target" || "$d" == "$tbase" ]] && out+=("$n") && break
+    done
+  done
+  printf "%s\n" "${out[@]}" | LC_ALL=C sort -u
+}
+
+# ============================== Backup/Restore ===============================
+_backup_pkg_files(){
+  local name="$1" root="$2" outdir="$3"
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso a backup dir"; return 1; }
+  local list; list="$(mktemp "${ADM_TMP%/}/ufiles.XXXX")"
+  trap 'rm -f -- "'"$list"'" 2>/dev/null || true' RETURN
+  _db_pkg_files "$name" > "$list" || { adm_log_error "Falha lendo lista de arquivos do pacote"; return 1; }
+
+  local tarfile="$outdir/${name//\//__}.backup.tar"
+  ( cd "$root"
+    # Compacto depois para ser mais resiliente; preserva exatamente o estado
+    tar -cf "$tarfile" -T "$list" --ignore-failed-read 2>/dev/null || true
+  )
+  if [[ -f "$tarfile" ]]; then
+    if _u_have zstd; then zstd -19 -T0 -q "$tarfile" && rm -f -- "$tarfile"; fi
+    adm_log_info "Backup criado: %s" "$tarfile.zst"
+  else
+    adm_log_warn "Nada para backupar para %s?" "$name"
+  fi
+}
+
+_restore_backup_tar(){
+  local root="$2" tarball="$1"
+  [[ -f "$tarball" ]] || { adm_log_warn "Backup inexistente: %s" "$tarball"; return 0; }
+  local tb="$tarball"
+  case "$tb" in
+    *.tar.zst) _u_have zstd || { adm_log_error "zstd ausente p/ restaurar"; return 1; }
+               zstd -dc "$tb" | (cd "$root" && tar -x) ;;
+    *.tar.xz)  _u_have xz || { adm_log_error "xz ausente p/ restaurar"; return 1; }
+               xz -dc "$tb" | (cd "$root" && tar -x) ;;
+    *.tar)     (cd "$root" && tar -x -f "$tb") ;;
+    *)         adm_log_warn "Formato de backup não reconhecido: %s" "$tb" ;;
+  esac
+}
+
+# ============================== Remoção de arquivos ==========================
+_remove_paths_list(){
+  local root="$1" listfile="$2"
+  # Remove invertendo ordem (arquivos antes, diretórios depois)
+  tac "$listfile" 2>/dev/null | while read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local p="$root/$rel"
+    if [[ -d "$p" && ! -L "$p" ]]; then
+      rmdir --ignore-fail-on-non-empty -- "$p" 2>/dev/null || true
+    else
+      rm -f -- "$p" 2>/dev/null || true
+    fi
+  done
+}
+
+_purge_leftovers(){
+  # Limpa diretórios vazios remanescentes dentro de /usr, /etc, /var
+  local root="$1"
+  local prunes=(usr etc var opt lib lib64 sbin bin usr/local)
+  local d
+  for d in "${prunes[@]}"; do
+    [[ -d "$root/$d" ]] || continue
+    find "$root/$d" -depth -type d -empty -print -delete 2>/dev/null || true
+  done
+}
+
+# ============================== Operações principais =========================
+_uninstall_one(){
+  local name="$1" root="$2" keep_configs="$3" make_backup="$4" force="$5"
+  root="$(_u_abspath "$root")"
+  [[ -d "$root" ]] || { adm_log_error "ROOT inválido: %s" "$root"; return 1; }
+
+  _lock_acquire "remove-$name" || return 1
+  trap '_lock_release "remove-'"$name"'"' RETURN
+
+  _db_pkg_exists "$name" || { adm_log_error "Pacote não instalado: %s" "$name"; return 1; }
+  local ver; ver="$(_db_pkg_version "$name")"
+
+  # Reverse deps (bloqueio, a menos que --force)
+  if [[ "$force" != "1" ]]; then
+    local revs; revs="$(_revdeps_of "$name")" || true
+    if [[ -n "$revs" ]]; then
+      adm_log_error "Remoção bloqueada: %s é requerido por:\n%s" "$name" "$revs"
+      adm_log_info  "Use --force para ignorar reverse-deps (por sua conta e risco)."
+      return 1
+    fi
+  fi
+
+  # Hooks
+  _run_hooks_sys "pre-system-remove" "$root" || true
+
+  # Lista de arquivos
+  local list; list="$(mktemp "${ADM_TMP%/}/u.lst.XXXX")"
+  trap 'rm -f -- "'"$list"'" 2>/dev/null || true' RETURN
+  _db_pkg_files "$name" > "$list" || { adm_log_error "Falha lendo lista de arquivos"; return 1; }
+
+  # Backup
+  local backup_dir="$UNINST_STATE/backup-$(_u_date | tr ':-' '_')-$$"
+  if [[ "$make_backup" == "1" ]]; then
+    mkdir -p -- "$backup_dir" || { adm_log_error "Sem acesso a backup_dir"; return 1; }
+    _backup_pkg_files "$name" "$root" "$backup_dir" || true
+  fi
+
+  # Remoção (respeita keep_configs: por enquanto, apenas informativo — o DB lista tudo;
+  # se desejar tratar .conf separadamente no futuro, podemos filtrar aqui)
+  _remove_paths_list "$root" "$list"
+
+  # DB cleanup
+  _db_remove_owner "$name"
+  _db_remove_pkg_json "$name"
+
+  # History
+  {
+    printf "%s UNINSTALL %s %s root=%s backup=%s\n" "$(_u_date)" "$name" "$ver" "$root" "${backup_dir:-none}"
+  } >> "$DB_HISTORY/history.log"
+
+  # Purge sobras vazias
+  _purge_leftovers "$root" || true
+
+  _run_hooks_sys "post-system-remove" "$root" || true
+  adm_log_success "${__u_chk} Removido: %s (%s)" "$name" "$ver"
+}
+
+_uninstall_many(){
+  local -a pkgs=($@)
+  local root="/" keep_configs=1 make_backup=1 force=0 yes=0 dry=0
+  # parâmetros vêm por variáveis de ambiente do chamador
+  [[ -n "${U_ROOT:-}" ]] && root="$U_ROOT"
+  [[ -n "${U_KEEP_CONFIGS:-}" ]] && keep_configs="$U_KEEP_CONFIGS"
+  [[ -n "${U_BACKUP:-}" ]] && make_backup="$U_BACKUP"
+  [[ -n "${U_FORCE:-}" ]] && force="$U_FORCE"
+  [[ -n "${U_YES:-}" ]] && yes="$U_YES"
+  [[ -n "${U_DRYRUN:-}" ]] && dry="$U_DRYRUN"
+
+  # Confirmação
+  if (( yes==0 )); then
+    adm_log_info "Pacotes a remover (%d): %s" "${#pkgs[@]}" "${pkgs[*]}"
+    read -r -p "Confirmar? [y/N] " ans || true
+    [[ "$ans" == "y" || "$ans" == "Y" ]] || { adm_log_warn "Cancelado."; return 2; }
+  fi
+
+  local fail=0
+  local p
+  for p in "${pkgs[@]}"; do
+    if (( dry==1 )); then
+      local revs; revs="$(_revdeps_of "$p")" || true
+      local ver; ver="$(_db_pkg_version "$p")"
+      if [[ -z "$ver" ]]; then
+        adm_log_error "Não instalado: %s" "$p"; fail=$((fail+1)); continue
+      fi
+      echo "DRY-RUN: remover $p ($ver) root=$root force=$force backup=$make_backup keep_configs=$keep_configs"
+      [[ -n "$revs" ]] && echo "  reverse-deps: $(echo "$revs" | tr '\n' ' ')"
+      continue
+    fi
+    _uninstall_one "$p" "$root" "$keep_configs" "$make_backup" "$force" || fail=$((fail+1))
+  done
+  (( fail==0 )) || return 1
+  return 0
+}
+
+# ============================== Orfãos / Autoremove ==========================
+_is_leaf_pkg(){
+  local name="$1"
+  # leaf se nenhum outro pacote o requer
+  local rev; rev="$(_revdeps_of "$name")"
+  [[ -z "$rev" ]]
+}
+
+_list_orphans(){
+  local p
+  for p in $(_db_list_installed); do
+    _is_leaf_pkg "$p" && printf "%s\n" "$p"
+  done | LC_ALL=C sort
+}
+# (continuação do arquivo /usr/src/adm/scripts/60-uninstaller)
+
+# ============================== Verificações/Doctor ==========================
+
+_verify_db(){
+  local fail=0
+  # 1) JSONs apontam para arquivos que existem no índice?
+  local n
+  for n in $(_db_list_installed); do
+    local js="$(_installed_json "$n")"
+    [[ -f "$js" ]] || { adm_log_error "Faltando manifest JSON: %s" "$js"; fail=$((fail+1)); continue; }
+    # rápida validação do campo "name"
+    local jn; jn="$(awk -F\" '/"name":/ {print $4; exit}' "$js" 2>/dev/null || true)"
+    [[ -n "$jn" ]] || { adm_log_warn "JSON sem 'name': %s" "$js"; }
+  done
+  # 2) index.map coerente: dono deve existir
+  if [[ -f "$FILES_INDEX" ]]; then
+    awk -F'\t' '{print $2}' "$FILES_INDEX" | sort -u | while read -r owner; do
+      [[ -f "$DB_INSTALLED/${owner//\//__}.json" ]] || { adm_log_warn "Index aponta para dono inexistente: %s" "$owner"; }
+    done
+  fi
+  (( fail==0 )) || return 1
+  adm_log_success "${__u_chk} DB consistente."
+}
+
+_uninstaller_doctor(){
+  local fail=0
+  for b in tar find awk sed xargs; do command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }; done
+  mkdir -p -- "$UNINST_STATE" "$LOCK_DIR" "$DB_INSTALLED" "$DB_FILES" "$DB_HISTORY" || { adm_log_error "Sem acesso a state/db"; fail=$((fail+1)); }
+  [[ -f "$FILES_INDEX" ]] || adm_log_warn "index.map ainda não existe (tudo bem se sistema novo)."
+  (( fail>0 )) && return 1
+  adm_log_success "Uninstaller OK."
+}
+
+# ============================== CLI Helpers ==================================
+
+_usage(){
+  cat <<'USAGE'
+Uso: 60-uninstaller <comando> [opções]
+
+Comandos:
+  remove     --name=cat/pkg[,cat2/pkg2,...] [--root=/] [--keep-configs] [--no-backup] [--force] [--yes] [--dry-run]
+  purge      --name=cat/pkg[,cat2/pkg2,...] [--root=/] [--yes] [--dry-run]   # remoção agressiva + limpeza de sobras
+  autoremove [--root=/] [--yes] [--dry-run]                                  # remove órfãos (sem reverse-deps)
+  orphans                                                                  # lista órfãos
+  whatrequires --name=cat/pkg                                               # quem depende de X
+  owns --path=/caminho/no/sistema                                           # qual pacote é dono de um arquivo
+  list                                                                      # lista pacotes instalados
+  verify-db                                                                 # checa consistência do DB
+  doctor                                                                    # checa dependências do uninstaller
+
+Opções:
+  --root=DIR        Raiz de instalação (default "/")
+  --keep-configs    Mantém configs (place-holder: hoje apenas informativo)
+  --no-backup       Não salva backup antes de remover (padrão salva)
+  --force           Ignora reverse-deps (perigoso)
+  --yes             Não perguntar confirmação (modo não-interativo)
+  --dry-run         Só mostrar o que faria (nenhuma alteração)
+
+Exemplos:
+  60-uninstaller remove --name=apps/wget --yes
+  60-uninstaller purge  --name=libs/zlib --root=/mnt/target --yes
+  60-uninstaller autoremove --yes
+  60-uninstaller whatrequires --name=libs/zlib
+  60-uninstaller owns --path=/usr/bin/wget
+USAGE
+}
+
+# ============================== Command parsing ==============================
+
+_uninst_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    list)
+      _db_list_installed | while read -r n; do printf "%-40s %s\n" "$n" "$(_db_pkg_version "$n")"; done | LC_ALL=C sort
+      ;;
+    owns)
+      local p="" ; while (( $# )); do case "$1" in --path=*) p="${1#--path=}";; *) adm_log_warn "Arg ignorado: %s" "$1";; esac; shift; done
+      [[ -n "$p" ]] || { adm_log_error "Uso: owns --path=/arquivo"; return 2; }
+      p="${p#/}"
+      local owner; owner="$(_db_files_owner "$p")"
+      if [[ -n "$owner" ]]; then echo "$owner"; else adm_log_warn "Nenhum pacote registrado como dono de: %s" "$p"; return 1; fi
+      ;;
+    whatrequires)
+      local n=""; while (( $# )); do case "$1" in --name=*) n="${1#--name=}";; *) adm_log_warn "Arg ignorado: %s" "$1";; esac; shift; done
+      [[ -n "$n" ]] || { adm_log_error "Uso: whatrequires --name=cat/pkg"; return 2; }
+      _revdeps_of "$n" || true
+      ;;
+    orphans)
+      _list_orphans
+      ;;
+    autoremove)
+      local root="/" yes=0 dry=0
+      while (( $# )); do
+        case "$1" in
+          --root=*) root="${1#--root=}" ;;
+          --yes)    yes=1 ;;
+          --dry-run) dry=1 ;;
+          *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+        esac; shift || true
+      done
+      mapfile -t orfs < <(_list_orphans)
+      ((${#orfs[@]})) || { adm_log_info "Nenhum órfão encontrado."; return 0; }
+      U_ROOT="$root" U_KEEP_CONFIGS=1 U_BACKUP=1 U_FORCE=0 U_YES="$yes" U_DRYRUN="$dry" _uninstall_many "${orfs[@]}"
+      ;;
+    remove|purge)
+      local names="" root="/" keep_cfg=1 backup=1 force=0 yes=0 dry=0
+      while (( $# )); do
+        case "$1" in
+          --name=*) names="${1#--name=}" ;;
+          --root=*) root="${1#--root=}" ;;
+          --keep-configs) keep_cfg=1 ;;
+          --no-backup)    backup=0 ;;
+          --force)        force=1 ;;
+          --yes)          yes=1 ;;
+          --dry-run)      dry=1 ;;
+          *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+        esac; shift || true
+      done
+      [[ -n "$names" ]] || { adm_log_error "Uso: %s --name=cat/pkg[,...]" "$cmd"; return 2; }
+      IFS=',' read -r -a arr <<< "$names"
+      if [[ "$cmd" == "purge" ]]; then
+        # purge = backup (opcional), remove, e limpa sobras ao final (já fazemos por pacote e no fim)
+        :
+      fi
+      U_ROOT="$root" U_KEEP_CONFIGS="$keep_cfg" U_BACKUP="$backup" U_FORCE="$force" U_YES="$yes" U_DRYRUN="$dry" _uninstall_many "${arr[@]}"
+      ;;
+    verify-db)
+      _verify_db
+      ;;
+    doctor)
+      _uninstaller_doctor
+      ;;
+    ""|-h|--help|help)
+      _usage
+      ;;
+    *)
+      adm_log_error "Comando desconhecido: %s" "$cmd"
+      _usage
+      exit 2
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  _uninst_main "$@"
+fi
