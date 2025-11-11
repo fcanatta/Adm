@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${WORKDIR:?}"
+: "${TARGET:?TARGET não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+BUILD_DIR="${WORKDIR}/build-lld"
+mkdir -p "$BUILD_DIR"
+export ADM_OUT_OF_TREE_BUILD="$BUILD_DIR"
+
+cat > "${BUILD_DIR}/CMAKE_ARGS.txt" <<EOF
+-DCMAKE_INSTALL_PREFIX=/usr
+-DCMAKE_BUILD_TYPE=Release
+-DLLVM_ENABLE_PROJECTS=lld
+-DLLVM_TARGETS_TO_BUILD=all
+-DLLVM_DEFAULT_TARGET_TRIPLE=${TARGET}
+-DBUILD_SHARED_LIBS=ON
+-DCMAKE_SKIP_RPATH=ON
+-GNinja
+EOF
+
+export CONFIGURE_EXTRAS+=" -S llvm -B ${BUILD_DIR} $(tr '\n' ' ' < ${BUILD_DIR}/CMAKE_ARGS.txt)"
