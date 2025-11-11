@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Remove sobras de integração (sem tocar em $HOME do usuário)
+rm -f  /usr/share/applications/firefox.desktop 2>/dev/null || true
+rm -f  /usr/bin/firefox                          2>/dev/null || true
+
+# Limpa ícones instalados por este pacote (padrão hicolor)
+for sz in 16 22 24 32 48 64 128 256; do
+  rm -f "/usr/share/icons/hicolor/${sz}x${sz}/apps/firefox.png" 2>/dev/null || true
+done
+
+# Atualiza caches (idempotente)
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  for theme in hicolor; do
+    if [[ -d "/usr/share/icons/${theme}" ]]; then
+      gtk-update-icon-cache -q -t -f "/usr/share/icons/${theme}" || true
+    fi
+  done
+fi
+
+# (Opcional) se o pacote criou /usr/lib/firefox, remova diretório vazio
+rmdir /usr/lib/firefox 2>/dev/null || true
