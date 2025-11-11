@@ -1,0 +1,12 @@
+name=vivaldi
+version=stable
+category=apps
+run_deps=apps/ca-certificates
+build_deps=apps/ca-certificates,sys/xz,sys/zstd
+opt_deps=libs/openssl,libs/icu
+num_builds=0
+description=Vivaldi Browser (binary repack)
+homepage=https://vivaldi.com
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://downloads.vivaldi.com/stable/vivaldi-stable_amd64.deb,https://downloads.vivaldi.com/stable/vivaldi-stable.rpm
