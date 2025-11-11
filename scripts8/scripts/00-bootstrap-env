@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/00-bootstrap-env
+# -----------------------------------------------------------------------------
+# ADM - Bootstrap do ambiente base
+# - Idempotente: pode ser chamado várias vezes, configurando tudo apenas 1x.
+# - Sem dependência de outros módulos (ex.: 05-logging).
+# - Fail-fast com mensagens claras; nada de erros silenciosos.
+# - Cria diretórios essenciais, carrega config key=value, define variáveis ADM_*,
+#   checa ferramentas mínimas, espaço em disco, locks e traps.
+# -----------------------------------------------------------------------------
+
+set -Eeuo pipefail
+
+# ----------------------------- Configuração base ------------------------------
+
+# Permitir override (ex.: ADM_ROOT=/usr/src/adm ./00-bootstrap-env init)
+: "${ADM_ROOT:=/usr/src/adm}"
+readonly ADM_ROOT
+
+# Variáveis padrão (preenchidas no init)
+ADM_SCRIPTS="" ADM_CACHE="" ADM_CACHE_SOURCES="" ADM_CACHE_PACKAGES=""
+ADM_STATE="" ADM_STATE_INSTALLED="" ADM_STATE_PROFILES="" ADM_STATE_CHECKSUMS=""
+ADM_LOGS="" ADM_BUILDS="" ADM_TOOLCHAIN="" ADM_METAFILES="" ADM_UPDATES=""
+ADM_PACKAGES="" ADM_TMP="" ADM_CONFIG_GLOBAL="" ADM_CONFIG_USER=""
+ADM_LOCK_DIR="" ADM_RUN_ID="" ADM_TTY="" ADM_COLOR="auto" ADM_UMASK="022"
+ADM_HOST_ARCH="" ADM_TOOLCHAIN_STAGE=""
+
+# Configs padrão (se arquivos de config não existirem)
+declare -A _ADM_DEFAULT_CFG=(
+  [CACHE_MAX_SIZE]="10737418240"   # 10 GiB
+  [CACHE_KEEP_VERSIONS]="3"
+  [LOG_RETENTION_DAYS]="30"
+  [DEFAULT_PACKAGE_FORMAT]="zst"
+  [ZSTD_LEVEL]="15"
+  [XZ_OPTIONS]="-6 -T0"
+  [COLOR]="auto"
+  [PROGRESS]="auto"
+  [STRICT]="false"
+  [DRY_RUN]="false"
+)
+
+# ------------------------------ Logger interno -------------------------------
+
+# Detecção básica de TTY e cores (sem depender do módulo 05-logging)
+_bootstrap_detect_tty() {
+  if [[ -t 1 ]]; then
+    ADM_TTY="true"
+  else
+    ADM_TTY="false"
+  fi
+}
+
+_bootstrap_color_enable() {
+  local want="${1:-auto}"
+  if [[ "${NO_COLOR:-}" != "" ]]; then
+    ADM_COLOR="false"; return
+  fi
+  case "$want" in
+    true)  ADM_COLOR="true" ;;
+    false) ADM_COLOR="false" ;;
+    auto|*) ADM_COLOR=$([[ "$ADM_TTY" == "true" ]] && echo "true" || echo "false") ;;
+  esac
+}
+
+# Códigos ANSI (ativados só quando ADM_COLOR=true)
+_c_red=""; _c_grn=""; _c_yel=""; _c_blu=""; _c_dim=""; _c_rst=""
+_bootstrap_set_colors() {
+  if [[ "$ADM_COLOR" == "true" ]]; then
+    _c_red=$'\033[31m'; _c_grn=$'\033[32m'; _c_yel=$'\033[33m'
+    _c_blu=$'\033[34m'; _c_dim=$'\033[2m';  _c_rst=$'\033[0m'
+  else
+    _c_red=""; _c_grn=""; _c_yel=""; _c_blu=""; _c_dim=""; _c_rst=""
+  fi
+}
+
+# Timestamp curto
+_ts() { date +"%H:%M:%S"; }
+
+# Impressão segura (sem spinner). Prefixo "BOOTSTRAP:"
+_log() {
+  # $1=level, $2=msg
+  local level="$1"; shift
+  local msg="$*"
+  local prefix icon color
+  case "$level" in
+    DEBUG) icon=".." ; color="$_c_dim" ;;
+    INFO)  icon="ℹ️ " ; color="$_c_blu" ;;
+    WARN)  icon="⚠️ " ; color="$_c_yel" ;;
+    ERROR) icon="✖️ " ; color="$_c_red" ;;
+    OK)    icon="✔️ " ; color="$_c_grn" ;;
+    *)     icon="• "  ; color="" ;;
+  esac
+  printf "BOOTSTRAP %s %b[%s]%b %s%s%b\n" "$(_ts)" "$color" "$level" "$_c_rst" "$icon" "$msg" "$_c_rst" 1>&2
+}
+
+die() { _log ERROR "$*"; exit 1; }
+warn(){ _log WARN  "$*"; }
+info(){ _log INFO  "$*"; }
+ok()  { _log OK    "$*"; }
+dbg() { [[ "${ADM_DEBUG:-false}" == "true" ]] && _log DEBUG "$*" || true; }
+
+# ------------------------------ Utilidades -----------------------------------
+
+# Checa se comando existe; se "require" for true, falha. Caso contrário, apenas avisa.
+require_cmd() {
+  local cmd="$1"; local required="${2:-true}"; local hint="${3:-}"
+  if ! command -v -- "$cmd" >/dev/null 2>&1; then
+    if [[ "$required" == "true" ]]; then
+      die "Ferramenta obrigatória não encontrada: '$cmd' ${hint:+($hint)}"
+    else
+      warn "Ferramenta opcional ausente: '$cmd' ${hint:+($hint)}"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Cria diretório com permissão; corrige permissões incorretas
+ensure_dir() {
+  local d="$1"; local mode="${2:-0755}"
+  if [[ -e "$d" && ! -d "$d" ]]; then
+    die "Caminho existe mas não é diretório: $d"
+  fi
+  if [[ ! -d "$d" ]]; then
+    mkdir -p -- "$d" || die "Falha ao criar diretório: $d"
+  fi
+  chmod "$mode" -- "$d" || warn "Falha ao definir permissão $mode para $d"
+}
+
+# Lê arquivo key=value (ignora linhas em branco e comentários '#' no início)
+# Preenche variáveis de ambiente (export).
+load_kv_config() {
+  local file="$1"
+  [[ ! -f "$file" ]] && return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+      # shellcheck disable=SC2163
+      export "$line" || warn "Config inválida (ignorada): $line"
+    else
+      warn "Linha inválida em config (ignorada): $line"
+    fi
+  done < "$file"
+}
+
+# Grava arquivo key=value com defaults, sem sobrescrever chaves existentes
+write_default_config() {
+  local file="$1"
+  ensure_dir "$(dirname "$file")"
+  touch -- "$file" || die "Não consigo criar $file"
+  # Lê existente em hash para não duplicar
+  declare -A have=()
+  while IFS='=' read -r k v; do
+    [[ -z "${k:-}" ]] && continue
+    [[ "$k" =~ ^[[:space:]]*# ]] && continue
+    have["$k"]=1
+  done < "$file"
+  for k in "${!_ADM_DEFAULT_CFG[@]}"; do
+    if [[ -z "${have[$k]:-}" ]]; then
+      printf "%s=%s\n" "$k" "${_ADM_DEFAULT_CFG[$k]}" >> "$file"
+    fi
+  done
+}
+
+# Espaço em disco mínimo (em KB). Retorna 0 se OK, 1 se baixo.
+check_disk_space_kb() {
+  local path="$1"; local min_kb="$2"
+  local avail
+  # df em KB (blocos de 1K)
+  avail=$(df -Pk "$path" | awk 'NR==2 {print $4}' || echo 0)
+  if [[ "$avail" =~ ^[0-9]+$ ]] && (( avail >= min_kb )); then
+    return 0
+  fi
+  return 1
+}
+
+# Gera RUN_ID curto: epoch + rand
+_make_run_id() {
+  printf "%s-%04x" "$(date +%s)" "$(( RANDOM & 0xFFFF ))"
+}
+
+# ------------------------------ Locks & Traps --------------------------------
+
+# Implementação de lock por diretório + PID file (compatível sem flock).
+lock_acquire_global() {
+  ensure_dir "$ADM_LOCK_DIR"
+  local lock="$ADM_LOCK_DIR/global.lock"
+  if mkdir "$lock" 2>/dev/null; then
+    echo "$$" > "$lock/pid"
+    echo "$(date -Is)" > "$lock/when"
+    echo "$ADM_RUN_ID" > "$lock/runid"
+    dbg "Global lock adquirido: $lock"
+  else
+    local pid when runid
+    pid=$(cat "$lock/pid" 2>/dev/null || echo "?")
+    when=$(cat "$lock/when" 2>/dev/null || echo "?")
+    runid=$(cat "$lock/runid" 2>/dev/null || echo "?")
+    die "Outro processo do adm está ativo (pid=$pid, desde $when, runid=$runid)."
+  fi
+}
+
+lock_release_global() {
+  local lock="$ADM_LOCK_DIR/global.lock"
+  if [[ -d "$lock" ]]; then
+    rm -rf -- "$lock" || warn "Falha ao liberar lock: $lock (remova manualmente)"
+  fi
+}
+
+# Limpeza de temporários e liberação de locks
+_teardown_tmp_and_locks() {
+  [[ -n "${ADM_TMP:-}" && -d "${ADM_TMP:-}" ]] && rm -rf -- "$ADM_TMP" || true
+  lock_release_global || true
+}
+
+trap '_teardown_tmp_and_locks' EXIT
+trap 'die "Interrompido por sinal."' INT TERM
+
+# ----------------------------- Init principal --------------------------------
+
+adm_bootstrap_env_init() {
+  # 1) TTY e cores
+  _bootstrap_detect_tty
+  _bootstrap_color_enable "${COLOR:-auto}"
+  _bootstrap_set_colors
+
+  info "Inicializando ambiente base em: $ADM_ROOT"
+
+  # 2) Valida ADM_ROOT
+  [[ -d "$ADM_ROOT" ]] || die "ADM_ROOT não existe: $ADM_ROOT"
+  [[ -w "$ADM_ROOT" ]] || die "Sem permissão de escrita em ADM_ROOT: $ADM_ROOT"
+
+  # 3) Define caminhos
+  ADM_SCRIPTS="$ADM_ROOT/scripts"
+  ADM_CACHE="$ADM_ROOT/cache";         ADM_CACHE_SOURCES="$ADM_CACHE/sources"; ADM_CACHE_PACKAGES="$ADM_CACHE/packages"
+  ADM_STATE="$ADM_ROOT/state";         ADM_STATE_INSTALLED="$ADM_STATE/installed"; ADM_STATE_PROFILES="$ADM_STATE/profiles"; ADM_STATE_CHECKSUMS="$ADM_STATE/checksums"
+  ADM_LOGS="$ADM_ROOT/logs";           ADM_BUILDS="$ADM_ROOT/builds";        ADM_TOOLCHAIN="$ADM_ROOT/toolchain"
+  ADM_METAFILES="$ADM_ROOT/metafiles"; ADM_UPDATES="$ADM_ROOT/update";       ADM_PACKAGES="$ADM_ROOT/packages"
+  ADM_CONFIG_GLOBAL="$ADM_ROOT/config"; ADM_CONFIG_USER="${HOME:-/root}/.config/adm/config"
+  ADM_LOCK_DIR="$ADM_STATE/locks"
+  export ADM_ROOT ADM_SCRIPTS ADM_CACHE ADM_CACHE_SOURCES ADM_CACHE_PACKAGES ADM_STATE ADM_STATE_INSTALLED ADM_STATE_PROFILES ADM_STATE_CHECKSUMS ADM_LOGS ADM_BUILDS ADM_TOOLCHAIN ADM_METAFILES ADM_UPDATES ADM_PACKAGES ADM_CONFIG_GLOBAL ADM_CONFIG_USER ADM_LOCK_DIR
+
+  # 4) Verifica scripts/ e 99-main
+  [[ -d "$ADM_SCRIPTS" ]] || die "Diretório 'scripts' não encontrado em $ADM_ROOT"
+  if [[ ! -f "$ADM_SCRIPTS/99-main" ]]; then
+    warn "Entry-point 99-main não encontrado em $ADM_SCRIPTS (ok para primeira instalação)"
+  fi
+
+  # 5) Cria estrutura de diretórios com permissões
+  ensure_dir "$ADM_CACHE" 0755; ensure_dir "$ADM_CACHE_SOURCES" 0755; ensure_dir "$ADM_CACHE_PACKAGES" 0755
+  ensure_dir "$ADM_LOGS" 0755;  ensure_dir "$ADM_BUILDS" 0755; ensure_dir "$ADM_TOOLCHAIN" 0755
+  ensure_dir "$ADM_METAFILES" 0755; ensure_dir "$ADM_UPDATES" 0755; ensure_dir "$ADM_PACKAGES" 0755
+  ensure_dir "$ADM_STATE" 0755; ensure_dir "$ADM_STATE_INSTALLED" 0755; ensure_dir "$ADM_STATE_PROFILES" 0755; ensure_dir "$ADM_STATE_CHECKSUMS" 0755
+  ensure_dir "$ADM_LOCK_DIR" 0755
+
+  # 6) Umask
+  umask "$ADM_UMASK" || warn "Falha ao aplicar umask $ADM_UMASK"
+
+  # 7) Carrega configs (global e user); cria global com defaults se inexistente
+  if [[ ! -f "$ADM_CONFIG_GLOBAL" ]]; then
+    info "Escrevendo config global com defaults em $ADM_CONFIG_GLOBAL"
+    write_default_config "$ADM_CONFIG_GLOBAL"
+  else
+    # Garantir que defaults ausentes sejam adicionados (sem sobrescrever)
+    write_default_config "$ADM_CONFIG_GLOBAL"
+  fi
+  load_kv_config "$ADM_CONFIG_GLOBAL"
+  if [[ -f "$ADM_CONFIG_USER" ]]; then
+    info "Carregando config de usuário: $ADM_CONFIG_USER"
+    load_kv_config "$ADM_CONFIG_USER"
+  fi
+
+  # 8) Aplicar configs relevantes ao bootstrap
+  _bootstrap_color_enable "${COLOR:-auto}"
+  _bootstrap_set_colors
+
+  # 9) Verificações essenciais do host
+  [[ "$(uname -s)" == "Linux" ]] || die "Sistema não é Linux (uname -s=$(uname -s))"
+  ADM_HOST_ARCH="$(uname -m || echo unknown)"
+  export ADM_HOST_ARCH
+
+  # 10) Ferramentas essenciais
+  require_cmd sh true
+  require_cmd printf true
+  require_cmd awk true
+  require_cmd sed true
+  require_cmd grep true
+  require_cmd cut true
+  require_cmd tr true
+  require_cmd find true
+  require_cmd xargs true
+  require_cmd tar true
+  require_cmd gzip true
+  require_cmd xz false "(necessário para .tar.xz)"
+  require_cmd zstd false "(necessário para .tar.zst)"
+  require_cmd sha256sum true
+  # rede: curl ou wget
+  if ! require_cmd curl false "(preferido)"; then
+    require_cmd wget false "(alternativa)"
+  fi
+
+  # 11) Espaço em disco (mínimos conservadores)
+  # 500MB no ADM_ROOT e 256MB no TMPDIR
+  local_min_root_kb=$((500*1024))
+  local_min_tmp_kb=$((256*1024))
+  if ! check_disk_space_kb "$ADM_ROOT" "$local_min_root_kb"; then
+    warn "Pouco espaço livre em $ADM_ROOT (mín: 500MB). Pode falhar em builds grandes."
+  fi
+  if ! check_disk_space_kb "${TMPDIR:-/tmp}" "$local_min_tmp_kb"; then
+    warn "Pouco espaço livre em ${TMPDIR:-/tmp} (mín: 256MB)."
+  fi
+
+  # 12) RUN_ID e locks
+  ADM_RUN_ID="$(_make_run_id)"; export ADM_RUN_ID
+  lock_acquire_global
+
+  # 13) TMP de execução
+  ADM_TMP="$(mktemp -d -p "${TMPDIR:-/tmp}" "adm-tmp.XXXXXX")" || die "Falha ao criar TMP"
+  export ADM_TMP
+
+  # 14) Locale/ENV seguro
+  export LC_ALL="${LC_ALL:-C}" LANG="${LANG:-C}"
+  export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date +%s)}"
+
+  # 15) PATH
+  # (Se toolchain existir, não ativamos aqui; apenas registramos estágio)
+  if [[ -d "$ADM_TOOLCHAIN/stage2/bin" ]]; then
+    ADM_TOOLCHAIN_STAGE="2"
+  elif [[ -d "$ADM_TOOLCHAIN/stage1/bin" ]]; then
+    ADM_TOOLCHAIN_STAGE="1"
+  elif [[ -d "$ADM_TOOLCHAIN/stage0/bin" ]]; then
+    ADM_TOOLCHAIN_STAGE="0"
+  else
+    ADM_TOOLCHAIN_STAGE=""
+  fi
+  export ADM_TOOLCHAIN_STAGE
+
+  # 16) Stamps e auditoria mínima
+  ensure_dir "$ADM_STATE/env" 0755
+  echo "os=$(uname -s)"           >  "$ADM_STATE/env/host.info"
+  echo "kernel=$(uname -r)"       >> "$ADM_STATE/env/host.info"
+  echo "arch=$ADM_HOST_ARCH"      >> "$ADM_STATE/env/host.info"
+  echo "shell=$SHELL"             >> "$ADM_STATE/env/host.info"
+  echo "path=$PATH"               >> "$ADM_STATE/env/host.info"
+  echo "toolchain_stage=${ADM_TOOLCHAIN_STAGE:-none}" >> "$ADM_STATE/env/host.info"
+
+  # Config efetiva (após load dos arquivos)
+  {
+    echo "# EFEITO DE CONFIGS (key=value)"; 
+    echo "CACHE_MAX_SIZE=${CACHE_MAX_SIZE:-${_ADM_DEFAULT_CFG[CACHE_MAX_SIZE]}}"
+    echo "CACHE_KEEP_VERSIONS=${CACHE_KEEP_VERSIONS:-${_ADM_DEFAULT_CFG[CACHE_KEEP_VERSIONS]}}"
+    echo "LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-${_ADM_DEFAULT_CFG[LOG_RETENTION_DAYS]}}"
+    echo "DEFAULT_PACKAGE_FORMAT=${DEFAULT_PACKAGE_FORMAT:-${_ADM_DEFAULT_CFG[DEFAULT_PACKAGE_FORMAT]}}"
+    echo "ZSTD_LEVEL=${ZSTD_LEVEL:-${_ADM_DEFAULT_CFG[ZSTD_LEVEL]}}"
+    echo "XZ_OPTIONS=${XZ_OPTIONS:-${_ADM_DEFAULT_CFG[XZ_OPTIONS]}}"
+    echo "COLOR=${COLOR:-${_ADM_DEFAULT_CFG[COLOR]}}"
+    echo "PROGRESS=${PROGRESS:-${_ADM_DEFAULT_CFG[PROGRESS]}}"
+    echo "STRICT=${STRICT:-${_ADM_DEFAULT_CFG[STRICT]}}"
+    echo "DRY_RUN=${DRY_RUN:-${_ADM_DEFAULT_CFG[DRY_RUN]}}"
+  } > "$ADM_STATE/env/config.effective"
+
+  ensure_dir "$ADM_STATE/run" 0755
+  {
+    echo "run_id=$ADM_RUN_ID"
+    echo "start=$(date -Is)"
+    echo "user=${USER:-unknown}"
+    echo "cmdline=$0 ${*:-}"
+  } > "$ADM_STATE/run/${ADM_RUN_ID}.start"
+
+  # 17) Primeira execução (bootstrap.stamp)
+  if [[ ! -f "$ADM_STATE/bootstrap.stamp" ]]; then
+    {
+      echo "first_bootstrap=$(date -Is)"
+      echo "host_arch=$ADM_HOST_ARCH"
+      echo "kernel=$(uname -r)"
+      echo "toolchain_stage=${ADM_TOOLCHAIN_STAGE:-none}"
+    } > "$ADM_STATE/bootstrap.stamp"
+    ok "Bootstrap inicial concluído."
+  else
+    info "Bootstrap já existente em $ADM_STATE/bootstrap.stamp"
+  fi
+
+  ok "Ambiente base pronto. (RUN_ID=$ADM_RUN_ID)"
+  return 0
+}
+
+# Validar requisitos opcionais sob demanda (ex.: zstd, xz, gpg, network)
+adm_bootstrap_env_require() {
+  local feature="${1:-}"
+  [[ -z "$feature" ]] && die "Uso: adm_bootstrap_env_require <feature>"
+  local strict="${STRICT:-false}"
+
+  case "$feature" in
+    zstd)
+      if ! require_cmd zstd false; then
+        [[ "$strict" == "true" ]] && die "zstd é requerido em modo STRICT"
+        return 1
+      fi
+      ;;
+    xz)
+      if ! require_cmd xz false; then
+        [[ "$strict" == "true" ]] && die "xz é requerido em modo STRICT"
+        return 1
+      fi
+      ;;
+    gpg)
+      if ! require_cmd gpg false "(para verificação de assinaturas)"; then
+        [[ "$strict" == "true" ]] && die "gpg é requerido em modo STRICT"
+        return 1
+      fi
+      ;;
+    network)
+      if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
+        return 0
+      fi
+      warn "Sem curl/wget; modo 'cache-only'."
+      [[ "$strict" == "true" ]] && die "Rede necessária em modo STRICT"
+      return 1
+      ;;
+    *)
+      warn "Feature desconhecida: $feature (ignorando)"
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# Teardown manual (traps já chamam automaticamente)
+adm_bootstrap_env_teardown() {
+  _teardown_tmp_and_locks
+  ok "Teardown concluído."
+}
+
+# --------------------------- Execução standalone -----------------------------
+# Permite testar o script sozinho: ./00-bootstrap-env init|require|teardown
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cmd="${1:-}"
+  case "$cmd" in
+    init|"")
+      adm_bootstrap_env_init
+      ;;
+    require)
+      shift || true
+      adm_bootstrap_env_init
+      adm_bootstrap_env_require "${1:-network}"
+      ;;
+    teardown)
+      adm_bootstrap_env_teardown
+      ;;
+    *)
+      echo "Uso: $0 [init|require|teardown]" >&2
+      exit 2
+      ;;
+  esac
+fi
