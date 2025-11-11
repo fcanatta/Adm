@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/42-compiler-manager
+# -----------------------------------------------------------------------------
+# ADM - Compiler Manager
+# - Detecta compilers/linkers/toolchains e gera ambiente consistente
+# - Seleção persistente por projeto/usuário
+# - Integra perfis (12-profile-manager) e toolchains (14-toolchain-db)
+# - Testes de sanidade, wrappers e saída reprodutível
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+
+CM_STATE="$ADM_STATE/compiler"
+CM_SEL="$CM_STATE/selection.env"       # seleção persistente (KEY=VAL)
+CM_LOCKS="$CM_STATE/locks"
+mkdir -p -- "$CM_STATE" "$CM_LOCKS" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _C_COLOR=${ADM_COLOR:-auto}
+  _C_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _C_COLOR=false; fi
+  if [[ "$_C_COLOR" == "auto" ]]; then
+    _C_COLOR=$([[ "$_C_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_C_COLOR" == "true" ]]; then
+    __c_red=$'\033[31m'; __c_grn=$'\033[32m'; __c_yel=$'\033[33m'
+    __c_blu=$'\033[34m'; __c_mag=$'\033[35m'; __c_cyn=$'\033[36m'; __c_dim=$'\033[2m'; __c_rst=$'\033[0m'
+    __c_chk=$'\xE2\x9C\x85'
+  else
+    __c_red=""; __c_grn=""; __c_yel=""; __c_blu=""; __c_mag=""; __c_cyn=""; __c_dim=""; __c_rst=""; __c_chk="[OK]"
+  fi
+  _c_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_c_ts)" "$__c_dim" "$__c_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_c_ts)" "$__c_blu" "$__c_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_c_ts)" "$__c_yel" "$__c_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_c_ts)" "$__c_red" "$__c_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_c_ts)" "$__c_grn" "$__c_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_c_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_c_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_c_have(){ command -v "$1" >/dev/null 2>&1; }
+_c_lockdir(){ printf "%s" "$CM_LOCKS/$(printf "%s" "$1" | tr '/ ' '__')"; }
+_c_lock_acquire(){ local k="$1"; mkdir -p -- "$CM_LOCKS" || true; local d; d="$(_c_lockdir "$k")"; if mkdir "$d" 2>/dev/null; then :; else adm_log_warn "Esperando lock: $k"; local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $k"; return 1; } done; fi; }
+_c_lock_release(){ local k="$1"; rm -rf -- "$(_c_lockdir "$k")" 2>/dev/null || true; }
+_c_now(){ date +%s; }
+_c_json_escape(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_c_ver_norm(){ printf "%s" "$1" | sed -E 's/[^0-9.].*$//' ; }
+_c_ver_cmp(){ local A="$(_c_ver_norm "$1")" B="$(_c_ver_norm "$2")"; local IFS=.; local -a a=($A) b=($B); local n=${#a[@]}; (( ${#b[@]} > n )) && n=${#b[@]}; for ((i=0;i<n;i++)); do local ai=${a[i]:-0} bi=${b[i]:-0}; ((10#$ai<10#$bi)) && { echo -1; return; }; ((10#$ai>10#$bi)) && { echo 1; return; }; done; echo 0; }
+
+# ============================== Modelos de dados =============================
+# Estruturas em memória (arrays associativos)
+declare -A CC_BIN=()   # cc_name -> caminho
+declare -A CC_VER=()   # cc_name -> versão
+declare -A CXX_BIN=()
+declare -A CXX_VER=()
+declare -A LD_KIND=()  # ld_name -> caminho
+declare -A LD_VER=()
+declare -A BIN_MISC=() # ar/nm/ranlib/strip/as
+declare -A PC_PATH=()  # pkg-config vars
+
+declare -A SEL=()      # seleção efetiva (CC/CXX/LD...); persistida em CM_SEL
+
+# ============================== Detecção =====================================
+_detect_cc(){
+  local c; for c in clang gcc "zig cc" tcc; do
+    if [[ "$c" == "zig cc" ]]; then command -v zig >/dev/null 2>&1 || continue; CC_BIN["zig-cc"]="zig cc"; CC_VER["zig-cc"]="$(zig version 2>/dev/null || echo 0)"; continue; fi
+    _c_have "${c%% *}" || continue
+    local nm="${c// /-}"
+    CC_BIN["$nm"]="$c"
+    local v; v="$(${c%% *} --version 2>/dev/null | head -n1 | sed 's/[^0-9.]*\([0-9][0-9.]*\).*/\1/')" || v="0"
+    CC_VER["$nm"]="$v"
+  done
+}
+
+_detect_cxx(){
+  local c; for c in "clang++" "g++" "zig c++"; do
+    if [[ "$c" == "zig c++" ]]; then command -v zig >/dev/null 2>&1 || continue; CXX_BIN["zig-cxx"]="zig c++"; CXX_VER["zig-cxx"]="$(zig version 2>/dev/null || echo 0)"; continue; fi
+    _c_have "${c%% *}" || continue
+    local nm="${c// /-}"
+    CXX_BIN["$nm"]="$c"
+    local v; v="$(${c%% *} --version 2>/dev/null | head -n1 | sed 's/[^0-9.]*\([0-9][0-9.]*\).*/\1/')" || v="0"
+    CXX_VER["$nm"]="$v"
+  done
+}
+
+_detect_ld(){
+  local c; for c in mold ld.lld ld.gold ld; do
+    _c_have "$c" || continue
+    LD_KIND["$c"]="$(command -v "$c")"
+    local v; v="$("$c" --version 2>/dev/null | head -n1 | sed 's/[^0-9.]*\([0-9][0-9.]*\).*/\1/')" || v="0"
+    LD_VER["$c"]="$v"
+  done
+}
+
+_detect_bins_misc(){
+  local k; for k in ar nm ranlib strip as; do
+    if _c_have "$k"; then BIN_MISC["$k"]="$(command -v "$k")"; fi
+  done
+  if _c_have llvm-ar;   then BIN_MISC["ar"]="$(command -v llvm-ar)"; fi
+  if _c_have llvm-nm;   then BIN_MISC["nm"]="$(command -v llvm-nm)"; fi
+  if _c_have llvm-ranlib; then BIN_MISC["ranlib"]="$(command -v llvm-ranlib)"; fi
+  if _c_have llvm-strip;  then BIN_MISC["strip"]="$(command -v llvm-strip)"; fi
+  if _c_have llvm-as;     then BIN_MISC["as"]="$(command -v llvm-as)"; fi
+}
+
+_detect_pkg_config(){
+  if _c_have pkg-config; then
+    PC_PATH[bin]="$(command -v pkg-config)"
+    PC_PATH[path]="${PKG_CONFIG_PATH:-}"
+    PC_PATH[libdir]="${PKG_CONFIG_LIBDIR:-}"
+    PC_PATH[sysroot]="${PKG_CONFIG_SYSROOT_DIR:-}"
+  fi
+}
+
+_detect_all(){
+  CC_BIN=(); CC_VER=(); CXX_BIN=(); CXX_VER=(); LD_KIND=(); LD_VER=(); BIN_MISC=(); PC_PATH=()
+  _detect_cc; _detect_cxx; _detect_ld; _detect_bins_misc; _detect_pkg_config
+}
+
+# ============================== Listagem =====================================
+_list(){
+  echo "== Compilers (C):"
+  local k; for k in "${!CC_BIN[@]}"; do printf "  %-10s  %s  (v%s)\n" "$k" "${CC_BIN[$k]}" "${CC_VER[$k]}"; done | LC_ALL=C sort
+  echo "== Compilers (C++):"
+  for k in "${!CXX_BIN[@]}"; do printf "  %-10s  %s  (v%s)\n" "$k" "${CXX_BIN[$k]}" "${CXX_VER[$k]}"; done | LC_ALL=C sort
+  echo "== Linkers:"
+  for k in "${!LD_KIND[@]}"; do printf "  %-10s  %s  (v%s)\n" "$k" "${LD_KIND[$k]}" "${LD_VER[$k]}"; done | LC_ALL=C sort
+  echo "== Binutils/LLVM utils:"
+  for k in "${!BIN_MISC[@]}"; do printf "  %-10s  %s\n" "$k" "${BIN_MISC[$k]}"; done | LC_ALL=C sort
+  echo "== pkg-config:"
+  if [[ -n "${PC_PATH[bin]:-}" ]]; then
+    printf "  bin: %s\n  PKG_CONFIG_PATH=%s\n  PKG_CONFIG_LIBDIR=%s\n  PKG_CONFIG_SYSROOT_DIR=%s\n" \
+      "${PC_PATH[bin]}" "${PC_PATH[path]}" "${PC_PATH[libdir]}" "${PC_PATH[sysroot]}"
+  else
+    echo "  (não encontrado)"
+  fi
+}
+
+# ============================== Seleção persistente ==========================
+_sel_load(){
+  SEL=()
+  if [[ -f "$CM_SEL" ]]; then
+    while IFS='=' read -r k v; do
+      [[ -z "$k" || "$k" =~ ^# ]] && continue
+      SEL["$k"]="$v"
+    done < "$CM_SEL"
+  fi
+}
+_sel_save(){
+  : > "$CM_SEL".tmp
+  local k
+  for k in "${!SEL[@]}"; do printf "%s=%s\n" "$k" "${SEL[$k]}" >> "$CM_SEL".tmp; done
+  mv -f -- "$CM_SEL".tmp "$CM_SEL"
+}
+
+_select_auto(){
+  # Escolhe “melhor” CC/CXX e linker disponíveis.
+  local best_cc="" best_cc_v="0" n
+  for n in "${!CC_BIN[@]}"; do
+    if [[ -z "$best_cc" || "$(_c_ver_cmp "${CC_VER[$n]}" "$best_cc_v")" == "1" || "$n" == "clang" ]]; then
+      best_cc="$n"; best_cc_v="${CC_VER[$n]}"
+    fi
+  done
+  local best_cxx="" best_cxx_v="0"
+  for n in "${!CXX_BIN[@]}"; do
+    if [[ -z "$best_cxx" || "$(_c_ver_cmp "${CXX_VER[$n]}" "$best_cxx_v")" == "1" || "$n" == "clang++" ]]; then
+      best_cxx="$n"; best_cxx_v="${CXX_VER[$n]}"
+    fi
+  done
+  local best_ld=""
+  if [[ -n "${LD_KIND[mold]:-}" ]]; then best_ld="mold"
+  elif [[ -n "${LD_KIND[ld.lld]:-}" ]]; then best_ld="ld.lld"
+  elif [[ -n "${LD_KIND[ld.gold]:-}" ]]; then best_ld="ld.gold"
+  elif [[ -n "${LD_KIND[ld]:-}" ]]; then best_ld="ld"; fi
+
+  SEL[CC]="${CC_BIN[$best_cc]:-gcc}"
+  SEL[CXX]="${CXX_BIN[$best_cxx]:-g++}"
+  SEL[LD_NAME]="${best_ld:-ld}"
+  SEL[AR]="${BIN_MISC[ar]:-ar}"
+  SEL[NM]="${BIN_MISC[nm]:-nm}"
+  SEL[RANLIB]="${BIN_MISC[ranlib]:-ranlib}"
+  SEL[STRIP]="${BIN_MISC[strip]:-strip}"
+}
+
+_select_set(){
+  local cc="${1:-}" cxx="${2:-}" ld="${3:-}"
+  [[ -n "$cc"  ]] && SEL[CC]="$cc"
+  [[ -n "$cxx" ]] && SEL[CXX]="$cxx"
+  [[ -n "$ld"  ]] && SEL[LD_NAME]="$ld"
+}
+
+_reset(){
+  rm -f -- "$CM_SEL" 2>/dev/null || true
+  SEL=()
+  adm_log_success "Seleção resetada."
+}
+
+# ============================== Profiles e Toolchain DB ======================
+_apply_profile_env(){
+  local profile="${1:-${ADM_PROFILE:-normal}}"
+  local pm="$ADM_ROOT/scripts/12-profile-manager"
+  if [[ -x "$pm" ]]; then
+    while IFS= read -r kv; do
+      [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
+      local k="${kv%%=*}" v="${kv#*=}"
+      SEL["$k"]="$v"
+    done < <("$pm" print-env --profile="$profile" 2>/dev/null || true)
+  else
+    SEL[CFLAGS]="${SEL[CFLAGS]:- -O2 -pipe}"
+    SEL[CXXFLAGS]="${SEL[CXXFLAGS]:- -O2 -pipe}"
+    SEL[LDFLAGS]="${SEL[LDFLAGS]:- }"
+  fi
+}
+
+_apply_toolchain_env(){
+  local tc="${1:-}"
+  local tdb="$ADM_ROOT/scripts/14-toolchain-db"
+  if [[ -x "$tdb" && -n "$tc" ]]; then
+    while IFS= read -r kv; do
+      [[ "$kv" =~ ^[A-Z0-9_]+= ]] || continue
+      local k="${kv%%=*}" v="${kv#*=}"
+      SEL["$k"]="$v"
+    done < <("$tdb" env --select="$tc" 2>/dev/null || true)
+  fi
+}
+
+# ============================== Fuse-ld / Flags ==============================
+_apply_linker_flags(){
+  local cc_bin="${SEL[CC]:-gcc}"
+  local ld_name="${SEL[LD_NAME]:-ld}"
+  case "$ld_name" in
+    mold|lld|gold) SEL[LDFLAGS]="${SEL[LDFLAGS]:-} -Wl,-O1 -fuse-ld=$ld_name" ;;
+    ld|bfd|"")     SEL[LDFLAGS]="${SEL[LDFLAGS]:-} -Wl,-O1" ;;
+  esac
+  # Reproducibilidade padrão
+  SEL[SOURCE_DATE_EPOCH]="${SEL[SOURCE_DATE_EPOCH]:-1577836800}"
+}
+
+# ============================== pkg-config/sysroot ===========================
+_apply_pkg_config(){
+  # Se SYSROOT_DIR foi definido via toolchain/profile, aponte PKG_CONFIG_SYSROOT_DIR e calcule libdir.
+  if [[ -n "${SEL[SYSROOT_DIR]:-}" ]]; then
+    SEL[PKG_CONFIG_SYSROOT_DIR]="${SEL[SYSROOT_DIR]}"
+    # se PKG_CONFIG_LIBDIR não veio do DB, heurística: <sysroot>/usr/lib/pkgconfig:<sysroot>/usr/share/pkgconfig
+    if [[ -z "${SEL[PKG_CONFIG_LIBDIR]:-}" ]]; then
+      local s="${SEL[SYSROOT_DIR]}"
+      SEL[PKG_CONFIG_LIBDIR]="$s/usr/lib/pkgconfig:$s/usr/share/pkgconfig:$s/usr/lib64/pkgconfig"
+    fi
+  fi
+}
+
+# ============================== Wrappers =====================================
+_make_wrappers(){
+  # Gera wrappers opcionais para CC/CXX (forçando ccache, -fuse-ld, flags).
+  local dir="$CM_STATE/wrappers"; rm -rf -- "$dir" 2>/dev/null || true; mkdir -p -- "$dir"
+  local cc_wr="$dir/cc" cxx_wr="$dir/c++"
+  cat > "$cc_wr" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_STATE:=/usr/src/adm/state}"
+WR_ENV="$ADM_STATE/compiler/selection.env"
+declare -A E=()
+if [[ -f "$WR_ENV" ]]; then
+  while IFS='=' read -r k v; do [[ -z "$k" || "$k" =~ ^# ]] && continue; E["$k"]="$v"; done < "$WR_ENV"
+fi
+exec ${E[CC]:-cc} ${E[CFLAGS]:-} ${E[LDFLAGS]:-} "$@"
+EOF
+  cat > "$cxx_wr" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${ADM_STATE:=/usr/src/adm/state}"
+WR_ENV="$ADM_STATE/compiler/selection.env"
+declare -A E=()
+if [[ -f "$WR_ENV" ]]; then
+  while IFS='=' read -r k v; do [[ -z "$k" || "$k" =~ ^# ]] && continue; E["$k"]="$v"; done < "$WR_ENV"
+fi
+exec ${E[CXX]:-c++} ${E[CXXFLAGS]:-} ${E[LDFLAGS]:-} "$@"
+EOF
+  chmod +x "$cc_wr" "$cxx_wr"
+  SEL[CC]="$cc_wr"; SEL[CXX]="$cxx_wr"
+  adm_log_success "Wrappers criados em: $dir"
+}
+
+# ============================== Print-env ====================================
+_print_env(){
+  local keys=(CC CXX CPP LD_NAME AR NM RANLIB STRIP CFLAGS CXXFLAGS LDFLAGS PKG_CONFIG_PATH PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR HOST_TRIPLE TARGET_TRIPLE SYSROOT_DIR SOURCE_DATE_EPOCH)
+  local k
+  for k in "${keys[@]}"; do [[ -n "${SEL[$k]:-}" ]] && printf "%s=%s\n" "$k" "${SEL[$k]}"; done
+}
+
+# ============================== Testes/sanity =================================
+_test_compile(){
+  local tmpd; tmpd="$(mktemp -d "${ADM_TMP%/}/cmtest.XXXX")"
+  trap 'rm -rf -- "$tmpd" 2>/dev/null || true' RETURN
+  local cc="${SEL[CC]:-gcc}" cxx="${SEL[CXX]:-g++}"
+  local ld="${SEL[LD_NAME]:-ld}" cflags="${SEL[CFLAGS]:-}" ldflags="${SEL[LDFLAGS]:-}"
+
+  cat > "$tmpd/hello.c" <<'C'
+#include <stdio.h>
+int main(){ puts("hello-c"); return 0; }
+C
+  cat > "$tmpd/hello.cpp" <<'CPP'
+#include <iostream>
+int main(){ std::cout<<"hello-cpp\n"; return 0; }
+CPP
+
+  adm_log_info "Compilando teste C com '$cc'…"
+  if ! $cc $cflags $ldflags "$tmpd/hello.c" -o "$tmpd/hello_c"; then adm_log_error "Falha compilando C"; return 1; fi
+  adm_log_info "Compilando teste C++ com '$cxx'…"
+  if ! $cxx ${SEL[CXXFLAGS]:-} $ldflags "$tmpd/hello.cpp" -o "$tmpd/hello_cpp"; then adm_log_error "Falha compilando C++"; return 1; fi
+
+  local out1; out1="$("$tmpd/hello_c" 2>/dev/null || true)"
+  local out2; out2="$("$tmpd/hello_cpp" 2>/dev/null || true)"
+  [[ "$out1" == "hello-c" ]] || adm_log_warn "Execução C inesperada: '$out1'"
+  [[ "$out2" == "hello-cpp" ]] || adm_log_warn "Execução C++ inesperada: '$out2'"
+
+  # Descobrir libc
+  local libc="unknown"
+  if ldd "$tmpd/hello_c" 2>/dev/null | grep -qi musl; then libc="musl"
+  elif ldd "$tmpd/hello_c" 2>/dev/null | grep -qi glibc; then libc="glibc"
+  fi
+  adm_log_success "Teste OK. Linker=${ld}  Libc=${libc}"
+}
+
+_doctor(){
+  local fail=0
+  for b in bash awk sed grep sort xargs; do command -v "$b" >/dev/null 2>&1 || { adm_log_error "Ferramenta básica ausente: $b"; fail=$((fail+1)); }; done
+  [[ $fail -gt 0 ]] && return 1
+  adm_log_success "compiler-manager pronto."
+}
+# (continuação do arquivo /usr/src/adm/scripts/42-compiler-manager)
+
+# ============================== Pipeline principal ===========================
+
+cm_detect(){
+  _c_lock_acquire "detect" || return 1
+  trap '_c_lock_release detect' RETURN
+  _detect_all
+  _list
+}
+
+cm_list(){
+  _detect_all
+  _list
+}
+
+cm_select(){
+  local cc="" cxx="" ld="" profile="" toolchain="" make_wrappers=0
+  while (( $# )); do
+    case "$1" in
+      --cc=*)        cc="${1#--cc=}" ;;
+      --cxx=*)       cxx="${1#--cxx=}" ;;
+      --ld=*)        ld="${1#--ld=}" ;;
+      --profile=*)   profile="${1#--profile=}" ;;
+      --toolchain=*) toolchain="${1#--toolchain=}" ;;
+      --wrappers)    make_wrappers=1 ;;
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+
+  _detect_all
+  _sel_load
+  if [[ -z "$cc$cxx$ld" ]]; then
+    _select_auto
+  else
+    _select_set "$cc" "$cxx" "$ld"
+  fi
+  _apply_profile_env "$profile"
+  _apply_toolchain_env "$toolchain"
+  _apply_linker_flags
+  _apply_pkg_config
+  (( make_wrappers==1 )) && _make_wrappers
+  _sel_save
+  adm_log_success "Seleção aplicada e salva em $CM_SEL"
+  _print_env
+}
+
+cm_auto(){
+  cm_select "$@"
+}
+
+cm_print_env(){
+  _sel_load
+  if [[ ${#SEL[@]} -eq 0 ]]; then
+    adm_log_info "Nenhuma seleção persistida. Rodando auto…"
+    cm_select
+    return
+  fi
+  _print_env
+}
+
+cm_wrap(){
+  _sel_load
+  [[ ${#SEL[@]} -gt 0 ]] || { adm_log_error "Nenhuma seleção ativa. Rode: 42-compiler-manager select"; return 1; }
+  _make_wrappers
+}
+
+cm_test(){
+  _sel_load
+  if [[ ${#SEL[@]} -eq 0 ]]; then
+    adm_log_info "Nenhuma seleção ativa. Rodando auto…"
+    cm_select
+  fi
+  _test_compile
+}
+
+cm_reset(){
+  _reset
+}
+
+cm_usage(){
+  cat <<'USAGE'
+Uso: 42-compiler-manager <comando> [opções]
+
+Comandos:
+  detect                 Detecta e lista compilers/linkers/binutils/pkg-config.
+  list                   Lista os itens detectados (atalho para detect).
+  select [opções]        Seleciona e salva CC/CXX/LD, aplica profile/toolchain.
+  auto [opções]          Seleciona automaticamente os “melhores” e salva.
+  print-env              Imprime o ambiente atual (a partir da seleção salva).
+  wrap                   Cria wrappers para CC/CXX usando a seleção salva.
+  test                   Compila/roda “hello” (C/C++) e reporta linker/libc.
+  reset                  Limpa seleção persistida.
+  doctor                 Confere dependências básicas.
+
+Opções para 'select/auto':
+  --cc=PATH|NAME         Define CC (ex.: clang, gcc, "zig cc", /opt/tc/bin/cc)
+  --cxx=PATH|NAME        Define CXX (ex.: clang++, g++, "zig c++")
+  --ld=NAME              Define linker preferido (mold|lld|gold|ld)
+  --profile=NAME         Carrega flags do 12-profile-manager (aggressive|normal|minimal|custom)
+  --toolchain=NAME       Carrega variáveis do 14-toolchain-db (HOST_TRIPLE, TARGET_TRIPLE, SYSROOT_DIR, etc.)
+  --wrappers             Gera wrappers que injetam as flags/ld na chamada
+
+Variáveis/Chaves salvas:
+  CC, CXX, LD_NAME, AR, NM, RANLIB, STRIP,
+  CFLAGS, CXXFLAGS, LDFLAGS,
+  HOST_TRIPLE, TARGET_TRIPLE, SYSROOT_DIR,
+  PKG_CONFIG_PATH, PKG_CONFIG_LIBDIR, PKG_CONFIG_SYSROOT_DIR,
+  SOURCE_DATE_EPOCH
+
+Exemplos:
+  42-compiler-manager detect
+  42-compiler-manager select --profile=aggressive --toolchain=x86_64-linux-musl --ld=mold --wrappers
+  42-compiler-manager print-env | sed 's/^/export /'
+  42-compiler-manager test
+USAGE
+}
+
+cm_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    detect)    cm_detect "$@" ;;
+    list)      cm_list "$@" ;;
+    select)    cm_select "$@" ;;
+    auto)      cm_auto "$@" ;;
+    print-env) cm_print_env "$@" ;;
+    wrap)      cm_wrap "$@" ;;
+    test)      cm_test "$@" ;;
+    reset)     cm_reset "$@" ;;
+    doctor)    _doctor "$@" ;;
+    ""|-h|--help|help) cm_usage ;;
+    *)         adm_log_error "Comando desconhecido: $cmd"; cm_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cm_main "$@"
+fi
