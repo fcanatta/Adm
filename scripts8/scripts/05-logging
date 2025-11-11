@@ -1,0 +1,455 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/05-logging
+# -----------------------------------------------------------------------------
+# ADM - Módulo de Logging, Spinner, Progresso e UI
+# - Saída bonita com cores/ícones (TTY) e fallback plain (não-TTY).
+# - Logs nível: DEBUG/INFO/WARN/ERROR/SUCCESS/NOTICE.
+# - Spinner e barra de progresso sem erros silenciosos.
+# - Tabela de etapas (fetch, verify, build, install...) com status/elapsed.
+# - Exibição de dependências (run/build/opt) formatada.
+# - Resumo de fila (total, ready, building, done, failed, blocked).
+# - Espelhamento opcional para arquivo sem ANSI.
+# -----------------------------------------------------------------------------
+
+# Não altere opções de erro globais do chamador; trate dentro das funções.
+
+# ---------------------------- Estado e Configuração --------------------------
+
+: "${ADM_COLOR:=auto}"
+: "${ADM_TTY:=$([[ -t 1 ]] && echo true || echo false)}"
+: "${ADM_RUN_ID:=$(date +%s)}"
+
+# arquivo para log sem cores (opcional)
+__ADM_LOG_FILE=""
+# largura do terminal
+__ADM_TERM_COLS=80
+# spinner
+__ADM_SPINNER_PID=""
+__ADM_SPINNER_TEXT=""
+__ADM_SPINNER_ACTIVE="false"
+# progresso
+__ADM_PROG_TOTAL=0
+__ADM_PROG_DONE=0
+__ADM_PROG_ACTIVE="false"
+# tabela de etapas
+declare -A __ADM_STEPS_STATUS=()
+declare -A __ADM_STEPS_START=()
+# fila
+__ADM_Q_TOTAL=0
+__ADM_Q_READY=0
+__ADM_Q_BUILDING=0
+__ADM_Q_DONE=0
+__ADM_Q_FAILED=0
+__ADM_Q_BLOCKED=0
+
+# ------------------------------- Cores/ANSI ---------------------------------
+
+__c_red=""; __c_grn=""; __c_yel=""; __c_blu=""; __c_cyn=""
+__c_dim=""; __c_rst=""
+
+_adm__detect_colors() {
+  if [[ "${NO_COLOR:-}" != "" ]]; then ADM_COLOR="false"; fi
+  case "$ADM_COLOR" in
+    true)  ;; # força
+    false) ;; # desliga
+    auto|*)
+      ADM_COLOR=$([[ "$ADM_TTY" == "true" ]] && echo "true" || echo "false")
+      ;;
+  esac
+  if [[ "$ADM_COLOR" == "true" ]]; then
+    __c_red=$'\033[31m'; __c_grn=$'\033[32m'; __c_yel=$'\033[33m'
+    __c_blu=$'\033[34m'; __c_cyn=$'\033[36m'; __c_dim=$'\033[2m'
+    __c_rst=$'\033[0m'
+  fi
+}
+
+_adm__term_cols() {
+  local c
+  if [[ "$ADM_TTY" == "true" ]] && c=$(tput cols 2>/dev/null); then
+    __ADM_TERM_COLS="${c:-80}"
+  else
+    __ADM_TERM_COLS=120
+  fi
+}
+
+# ------------------------------- Utilidades ---------------------------------
+
+_adm__ts() { date +"%H:%M:%S"; }
+
+# remove ANSI
+_adm__strip_ansi() { sed -E "s/\x1B\[[0-9;]*[JKmsu]//g"; }
+
+# write to logfile (stripped)
+_adm__tee_file() {
+  [[ -n "$__ADM_LOG_FILE" ]] || return 0
+  printf "%s\n" "$1" | _adm__strip_ansi >> "$__ADM_LOG_FILE" 2>/dev/null || true
+}
+
+# crop para largura do terminal
+_adm__crop() {
+  local s="$1" max=$((__ADM_TERM_COLS>2 ? __ADM_TERM_COLS-1 : 80))
+  if (( ${#s} > max )); then
+    printf "%s" "${s:0:max}"
+  else
+    printf "%s" "$s"
+  fi
+}
+
+# alinhar colunas simples
+_adm__pad_right() {
+  local s="$1" w="$2"
+  printf "%-*s" "$w" "$s"
+}
+
+# ------------------------------- Núcleo Log ---------------------------------
+
+# ícones por nível
+_adm__icon() {
+  case "$1" in
+    DEBUG)  echo "..";;
+    INFO)   echo "ℹ️ ";;
+    NOTICE) echo "🔔";;
+    WARN)   echo "⚠️ ";;
+    ERROR)  echo "✖️ ";;
+    SUCCESS)echo "✔️ ";;
+    *)      echo "• ";;
+  esac
+}
+
+# cor por nível
+_adm__color_for() {
+  case "$1" in
+    DEBUG)  echo "$__c_dim";;
+    INFO)   echo "$__c_blu";;
+    NOTICE) echo "$__c_cyn";;
+    WARN)   echo "$__c_yel";;
+    ERROR)  echo "$__c_red";;
+    SUCCESS)echo "$__c_grn";;
+    *)      echo "";;
+  esac
+}
+
+# linha única formatada
+_adm__print_line() {
+  local level="$1"; shift
+  local msg="$*"
+  local icon="$(_adm__icon "$level")"
+  local color="$(_adm__color_for "$level")"
+  local line
+  line=$(printf "%s %b[%s]%b %s%s%b" "$(_adm__ts)" "$color" "$level" "$__c_rst" "$icon" "$msg" "$__c_rst")
+  line="$(_adm__crop "$line")"
+  # se spinner ativo, sobrescreve a linha
+  if [[ "$__ADM_SPINNER_ACTIVE" == "true" && "$ADM_TTY" == "true" ]]; then
+    printf "\r%s\n" "$line"
+    # reimprime a linha do spinner
+    printf "\r%s" "$__ADM_SPINNER_TEXT"
+  else
+    printf "%s\n" "$line"
+  fi
+  _adm__tee_file "$line"
+}
+
+adm_log_set_file() {
+  local f="${1:-}"
+  [[ -z "$f" ]] && { _adm__print_line ERROR "Caminho de log vazio."; return 2; }
+  if touch "$f" 2>/dev/null; then
+    __ADM_LOG_FILE="$f"
+    _adm__print_line INFO "Espelhando log (plain) em: $f"
+  else
+    _adm__print_line WARN "Não foi possível abrir arquivo de log: $f"
+    return 1
+  fi
+}
+
+adm_log_init() {
+  _adm__detect_colors
+  _adm__term_cols
+  # registrar cabeçalho
+  _adm__print_line INFO "Iniciando logging (TTY=$ADM_TTY, COLOR=$ADM_COLOR, COLS=$__ADM_TERM_COLS, RUN_ID=${ADM_RUN_ID:-n/a})"
+}
+
+adm_log_debug()   { [[ "${ADM_DEBUG:-false}" == "true" ]] && _adm__print_line DEBUG "$*" || true; }
+adm_log_info()    { _adm__print_line INFO "$*"; }
+adm_log_notice()  { _adm__print_line NOTICE "$*"; }
+adm_log_warn()    { _adm__print_line WARN "$*"; }
+adm_log_error()   { _adm__print_line ERROR "$*"; }
+adm_log_success() { _adm__print_line SUCCESS "$*"; }
+
+# ------------------------------- Spinner -------------------------------------
+
+# spinner simples em background; seguro em TTY; no non-TTY vira no-op
+adm_spinner_start() {
+  local text="$*"
+  [[ "$ADM_TTY" == "true" ]] || { __ADM_SPINNER_ACTIVE="false"; return 0; }
+  adm_spinner_stop || true
+  __ADM_SPINNER_TEXT=""
+  __ADM_SPINNER_ACTIVE="true"
+  (
+    # loop do spinner
+    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+    while true; do
+      local f="${frames[$i]}"
+      i=$(( (i+1) % ${#frames[@]} ))
+      __ADM_SPINNER_TEXT="$(printf "%s %s" "$f" "$text")"
+      printf "\r%s" "$(__ADM_SPINNER_TEXT)"
+      sleep 0.08
+    done
+  ) &
+  __ADM_SPINNER_PID=$!
+  disown "$__ADM_SPINNER_PID" 2>/dev/null || true
+}
+
+adm_spinner_update() {
+  local text="$*"
+  [[ "$ADM_TTY" == "true" && "$__ADM_SPINNER_ACTIVE" == "true" ]] || return 0
+  __ADM_SPINNER_TEXT="$(printf "⠙ %s" "$text")"
+  printf "\r%s" "$(__ADM_SPINNER_TEXT)"
+}
+
+adm_spinner_stop() {
+  if [[ -n "$__ADM_SPINNER_PID" ]] && kill -0 "$__ADM_SPINNER_PID" 2>/dev/null; then
+    kill "$__ADM_SPINNER_PID" 2>/dev/null || true
+    wait "$__ADM_SPINNER_PID" 2>/dev/null || true
+  fi
+  __ADM_SPINNER_PID=""
+  __ADM_SPINNER_ACTIVE="false"
+  __ADM_SPINNER_TEXT=""
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "\r\033[K" # limpa linha
+  fi
+}
+
+adm_spinner_stop_success() {
+  local msg="$*"
+  adm_spinner_stop
+  adm_log_success "$msg"
+}
+
+adm_spinner_stop_fail() {
+  local msg="$*"
+  adm_spinner_stop
+  adm_log_error "$msg"
+}
+
+# --------------------------- Barra de Progresso ------------------------------
+
+adm_progress_start() {
+  local total_bytes="${1:-0}"
+  __ADM_PROG_TOTAL="$total_bytes"
+  __ADM_PROG_DONE=0
+  __ADM_PROG_ACTIVE="true"
+  [[ "$ADM_TTY" == "true" ]] || return 0
+  printf "\r" # posição inicial
+}
+
+adm_progress_tick() {
+  local done="${1:-0}"
+  __ADM_PROG_DONE="$done"
+  [[ "$ADM_TTY" == "true" && "$__ADM_PROG_ACTIVE" == "true" && "$__ADM_PROG_TOTAL" -gt 0 ]] || return 0
+  local cols=$(( __ADM_TERM_COLS - 30 ))
+  (( cols<10 )) && cols=10
+  local pct=$(( __ADM_PROG_DONE * 100 / __ADM_PROG_TOTAL ))
+  (( pct>100 )) && pct=100
+  local filled=$(( cols * pct / 100 ))
+  local bar
+  bar=$(printf "%0.s#" $(seq 1 $filled))
+  local spaces
+  spaces=$(printf "%0.s " $(seq 1 $((cols-filled))))
+  local line
+  line=$(printf "[%s%s] %3d%% %s/%s" "$bar" "$spaces" "$pct" "$__ADM_PROG_DONE" "$__ADM_PROG_TOTAL")
+  printf "\r%s" "$(_adm__crop "$line")"
+}
+
+adm_progress_stop() {
+  [[ "$__ADM_PROG_ACTIVE" == "true" ]] || return 0
+  __ADM_PROG_ACTIVE="false"
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "\r\033[K"
+  fi
+}
+
+# --------------------------- Tabela de Etapas --------------------------------
+
+# Registram início e status (pending/running/ok/fail/skipped)
+adm_steps_reset() {
+  __ADM_STEPS_STATUS=()
+  __ADM_STEPS_START=()
+}
+
+adm_step_start() {
+  local step="$1"
+  __ADM_STEPS_STATUS["$step"]="running"
+  __ADM_STEPS_START["$step"]="$(date +%s)"
+  adm_log_info "Iniciando etapa: $step"
+  adm_steps_render
+}
+
+adm_step_ok() {
+  local step="$1"
+  local st="${__ADM_STEPS_START[$step]:-$(date +%s)}"
+  local elapsed=$(( $(date +%s) - st ))
+  __ADM_STEPS_STATUS["$step"]="ok(${elapsed}s)"
+  adm_log_success "Etapa concluída: $step (${elapsed}s)"
+  adm_steps_render
+}
+
+adm_step_fail() {
+  local step="$1"
+  local st="${__ADM_STEPS_START[$step]:-$(date +%s)}"
+  local elapsed=$(( $(date +%s) - st ))
+  __ADM_STEPS_STATUS["$step"]="fail(${elapsed}s)"
+  adm_log_error "Etapa falhou: $step (${elapsed}s)"
+  adm_steps_render
+}
+
+adm_step_skip() {
+  local step="$1"
+  __ADM_STEPS_STATUS["$step"]="skipped"
+  adm_log_notice "Etapa ignorada: $step"
+  adm_steps_render
+}
+
+adm_steps_render() {
+  local cols=$__ADM_TERM_COLS
+  local head
+  head="$(printf "%s %s %s" "STEP" "$(printf '%*s' 20 '')" "STATUS")"
+  head="$(_adm__crop "$head")"
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "\n%s\n" "$(__c_dim)$(_adm__crop "── Etapas ─────────────────────────────────────────────────────────")$__c_rst"
+  fi
+  local step status pad
+  for step in fetch verify patch hooks build test install package; do
+    status="${__ADM_STEPS_STATUS[$step]:-pending}"
+    pad="$(_adm__pad_right "$step" 12)"
+    printf "%s %s\n" "$pad" "$status"
+  done
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "%s\n\n" "$(__c_dim)$(_adm__crop "──────────────────────────────────────────────────────────────────")$__c_rst"
+  fi
+}
+
+# -------------------------- Dependências (display) ---------------------------
+
+# Argumentos podem ser listas separadas por vírgula ou vazias.
+adm_log_show_dependencies() {
+  local name="$1"; local run="$2"; local build="$3"; local opt="$4"
+  local title="Dependências de $name"
+  local line
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "%s\n" "$(__c_dim)$title$__c_rst"
+  else
+    printf "%s\n" "$title"
+  fi
+
+  _adm__dep_print "Execução" "$run"
+  _adm__dep_print "Build   " "$build"
+  _adm__dep_print "Opcionais" "$opt"
+}
+
+_adm__dep_print() {
+  local label="$1"; local list="$2"
+  local arr=()
+  IFS=',' read -r -a arr <<< "${list:-}"
+  if [[ "${#arr[@]}" -eq 0 || -z "${arr[0]:-}" ]]; then
+    printf "  %s: %s\n" "$label" "—"
+    return 0
+  fi
+  # imprime em colunas
+  local cols=$((__ADM_TERM_COLS-14))
+  (( cols<20 )) && cols=20
+  local line=""
+  local first=true
+  local item
+  for item in "${arr[@]}"; do
+    item="${item//[[:space:]]/}"
+    if (( ${#line} + ${#item} + 2 > cols )); then
+      printf "  %s: %s\n" "$label" "$line"
+      label="        "
+      line="$item"
+    else
+      line="${line:+$line, }$item"
+    fi
+  done
+  [[ -n "$line" ]] && printf "  %s: %s\n" "$label" "$line"
+}
+
+# ------------------------------ Resumo da Fila -------------------------------
+
+adm_queue_update() {
+  __ADM_Q_TOTAL="${1:-$__ADM_Q_TOTAL}"
+  __ADM_Q_READY="${2:-$__ADM_Q_READY}"
+  __ADM_Q_BUILDING="${3:-$__ADM_Q_BUILDING}"
+  __ADM_Q_DONE="${4:-$__ADM_Q_DONE}"
+  __ADM_Q_FAILED="${5:-$__ADM_Q_FAILED}"
+  __ADM_Q_BLOCKED="${6:-$__ADM_Q_BLOCKED}"
+  adm_queue_render
+}
+
+adm_queue_render() {
+  local s
+  s=$(printf "Fila: total=%d | pronto=%d | build=%d | ok=%d | falha=%d | bloqueado=%d" \
+      "$__ADM_Q_TOTAL" "$__ADM_Q_READY" "$__ADM_Q_BUILDING" "$__ADM_Q_DONE" "$__ADM_Q_FAILED" "$__ADM_Q_BLOCKED")
+  s="$(_adm__crop "$s")"
+  if [[ "$ADM_TTY" == "true" ]]; then
+    printf "%s\n" "$(__c_cyn)$s$__c_rst"
+  else
+    printf "%s\n" "$s"
+  fi
+  _adm__tee_file "$s"
+}
+
+# ------------------------------- Tratadores ----------------------------------
+
+# Encerrar spinner/progresso ao sair (caso o chamador não tenha parado)
+_adm__on_exit() {
+  adm_progress_stop || true
+  adm_spinner_stop  || true
+}
+trap '_adm__on_exit' EXIT
+
+# ------------------------------- CLI de teste --------------------------------
+# Uso standalone:
+#   ./05-logging demo
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    demo)
+      adm_log_init
+      adm_log_set_file "${TMPDIR:-/tmp}/adm-demo-${ADM_RUN_ID}.log"
+      adm_log_info "Iniciando demo"
+      adm_queue_update 7 3 1 2 1 0
+
+      adm_log_show_dependencies "foobar" "zlib,openssl" "pkgconfig,cmake" "libxml2"
+
+      adm_steps_reset
+      adm_step_start fetch
+      adm_spinner_start "Baixando fontes (23 MiB)"
+      adm_progress_start 23000000
+      for x in $(seq 0 23000000 4600000); do
+        adm_progress_tick "$x"; sleep 0.05
+      done
+      adm_progress_stop
+      adm_spinner_stop_success "Download concluído"
+      adm_step_ok fetch
+
+      adm_step_start verify
+      sleep 0.3
+      adm_step_ok verify
+
+      adm_step_start build
+      adm_spinner_start "Compilando..."
+      sleep 0.8
+      adm_spinner_update "Compilando... (fase 2/3)"
+      sleep 0.8
+      adm_spinner_stop_success "Build ok"
+      adm_step_ok build
+
+      adm_step_start install
+      sleep 0.3
+      adm_step_ok install
+
+      adm_log_success "Demo finalizada"
+      ;;
+    *) ;;
+  esac
+fi
