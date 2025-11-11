@@ -1,0 +1,12 @@
+name=git
+version=2.47.0
+category=apps
+run_deps=apps/curl,libs/openssl,sys/zlib
+build_deps=apps/curl,libs/openssl,sys/zlib,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Distributed version control system
+homepage=https://git-scm.com
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/software/scm/git/git-2.47.0.tar.xz,https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.47.0.tar.xz
