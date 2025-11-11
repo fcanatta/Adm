@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${CONFIGURE_EXTRAS:=}"
+
+# Mapear plataforma GRUB a partir do TARGET e do modo de boot atual
+PLAT=""
+case "$TARGET" in
+  x86_64-*)   if [[ -d /sys/firmware/efi ]]; then PLAT="x86_64-efi"; else PLAT="i386-pc"; fi ;;
+  i?86-*)     PLAT="i386-pc" ;;
+  aarch64-*)  PLAT="arm64-efi" ;;   # GRUB chama 'arm64-efi'
+  arm-*)      PLAT="arm-efi"   ;;
+  riscv64-*)  PLAT="riscv64-efi" ;;
+  *) echo "TARGET não suportado para GRUB: $TARGET" >&2; exit 70 ;;
+esac
+
+# Prefixo padrão da instalação do GRUB
+# (grub-install definirá automaticamente os caminhos sob /boot/grub* em runtime)
+CONFIGURE_EXTRAS+=" --host=${TARGET} --prefix=/usr --sbindir=/usr/bin"
+CONFIGURE_EXTRAS+=" --with-platform=${PLAT}"
+CONFIGURE_EXTRAS+=" --disable-werror"
+# O resto (freetype, dm-crypt, etc.) pode ser habilitado conforme opt_deps disponíveis
+
+export CONFIGURE_EXTRAS
