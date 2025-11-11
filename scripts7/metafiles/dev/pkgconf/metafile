@@ -1,0 +1,12 @@
+name=pkgconf
+version=2.2.0
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Alternativa moderna ao pkg-config, pequena e rápida
+homepage=https://pkgconf.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://distfiles.dereference.de/pkgconf/pkgconf-2.2.0.tar.xz
