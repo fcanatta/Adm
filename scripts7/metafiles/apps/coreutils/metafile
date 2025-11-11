@@ -1,0 +1,12 @@
+name=coreutils
+version=9.5
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU coreutils (cat, ls, cp, mv, rm, etc.)
+homepage=https://www.gnu.org/software/coreutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz
