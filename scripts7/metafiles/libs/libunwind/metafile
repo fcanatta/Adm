@@ -1,0 +1,12 @@
+name=libunwind
+version=19.1.0
+category=libs
+run_deps=
+build_deps=llvm,clang,lld,compiler-rt,binutils-stage2,gcc-final,host-cmake,host-ninja,host-python3
+opt_deps=
+num_builds=0
+description=LLVM libunwind (implementação de unwinder) para o target; instala no SYSROOT
+homepage=https://libunwind.llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz
