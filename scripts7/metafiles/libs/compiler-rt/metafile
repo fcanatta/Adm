@@ -1,0 +1,12 @@
+name=compiler-rt
+version=19.1.0
+category=libs
+run_deps=
+build_deps=llvm,clang,lld,binutils-stage2,gcc-final,host-cmake,host-ninja,host-python3
+opt_deps=
+num_builds=0
+description=LLVM compiler-rt (builtins/sanitizers) para o target; instala no SYSROOT
+homepage=https://compiler-rt.llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.0/llvm-project-19.1.0.src.tar.xz
