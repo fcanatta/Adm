@@ -27,3 +27,17 @@ adm install gcc-stage1-musl    --profile=minimum --jobs=8
 # stage0 já pronto: linux-headers-stage0, binutils-stage0, gcc-stage0, glibc-headers-stage0
 adm install glibc-stage1       --profile=minimum --jobs=8
 adm install gcc-stage1-glibc   --profile=minimum --jobs=8
+
+# Musl ou Glibc
+# Stage2
+adm install binutils-stage2     --profile=minimum --jobs=8
+adm install gcc-final           --profile=minimum --jobs=8
+
+# Essenciais mínimos
+adm install pkgconf             --profile=minimum --jobs=8
+adm install make                --profile=minimum --jobs=8
+adm install busybox             --profile=minimum --jobs=8
+adm install xz zstd tar         --profile=minimum --jobs=8
+
+# (Opcional) Migrar para GNU completos, substituindo aos poucos o BusyBox:
+adm install coreutils sed grep gawk bash --profile=minimum --jobs=8
