@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+# Instala headers POSIX para o userland do target (em /usr/include)
+$MAKE mrproper   >/dev/null 2>&1 || true
+$MAKE headers
+$MAKE headers_install INSTALL_HDR_PATH="${DESTDIR}/usr"
