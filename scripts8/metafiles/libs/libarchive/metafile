@@ -1,0 +1,12 @@
+name=libarchive
+version=3.7.4
+category=libs
+run_deps=sys/zlib,sys/xz,sys/zstd,sys/bzip2
+build_deps=sys/zlib,sys/xz,sys/zstd,sys/bzip2,dev/pkgconf
+opt_deps=apps/lzip
+num_builds=0
+description=Multi-format archive and compression library (bsdtar/bsdtar provided)
+homepage=https://www.libarchive.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.libarchive.org/downloads/libarchive-3.7.4.tar.xz,https://github.com/libarchive/libarchive/releases/download/v3.7.4/libarchive-3.7.4.tar.xz
