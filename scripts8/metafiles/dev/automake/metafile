@@ -1,0 +1,12 @@
+name=automake
+version=1.16.5
+category=dev
+run_deps=dev/autoconf
+build_deps=dev/autoconf
+opt_deps=
+num_builds=0
+description=Automake - Makefile generator
+homepage=https://www.gnu.org/software/automake/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.xz,https://ftpmirror.gnu.org/automake/automake-1.16.5.tar.xz
