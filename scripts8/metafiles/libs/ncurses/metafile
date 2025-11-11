@@ -1,0 +1,12 @@
+name=ncurses
+version=6.5
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Terminal handling library
+homepage=https://invisible-island.net/ncurses/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz,https://ftp.gnu.org/pub/gnu/ncurses/ncurses-6.5.tar.gz
