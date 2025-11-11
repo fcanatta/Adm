@@ -1,0 +1,12 @@
+# Checar que os metafiles são visíveis:
+adm info sys/binutils
+adm info sys/gcc
+adm info sys/glibc
+adm info sys/musl
+adm info sys/linux-headers
+
+# Rodar bootstrap (exemplo com glibc):
+/usr/src/adm/scripts/90-bootstrap-toolchain run --libc=glibc --fetch --profile=minimal --jobs=$(nproc)
+
+# Ou com musl:
+#/usr/src/adm/scripts/90-bootstrap-toolchain run --libc=musl --fetch --profile=minimal --jobs=$(nproc)
