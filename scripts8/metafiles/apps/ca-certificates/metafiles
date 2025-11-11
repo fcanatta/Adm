@@ -1,0 +1,12 @@
+name=ca-certificates
+version=2024.08
+category=apps
+run_deps=libs/openssl
+build_deps=libs/openssl
+opt_deps=
+num_builds=0
+description=CA bundle (Mozilla)
+homepage=https://curl.se/docs/caextract.html
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://curl.se/ca/cacert.pem
