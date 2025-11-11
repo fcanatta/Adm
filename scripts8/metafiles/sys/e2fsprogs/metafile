@@ -1,0 +1,12 @@
+name=e2fsprogs
+version=1.47.1
+category=sys
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=ext2/3/4 filesystem utilities
+homepage=https://e2fsprogs.sourceforge.net/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://downloads.sourceforge.net/project/e2fsprogs/e2fsprogs/v1.47.1/e2fsprogs-1.47.1.tar.xz,https://sourceforge.net/projects/e2fsprogs/files/e2fsprogs/v1.47.1/e2fsprogs-1.47.1.tar.xz/download
