@@ -1,3 +1,19 @@
+# Musl toolchain 
+binutils-pass1
+gcc-pass1
+linux-headers
+musl
+gcc-pass2
+(opcional: llvm/clang)
+
+# Glibc toolchain
+binutils-pass1
+gcc-pass1
+linux-headers
+glibc
+binutils-pass2  (opcional)
+gcc-pass2
+
 # Checar que os metafiles são visíveis:
 adm info sys/binutils
 adm info sys/gcc
@@ -18,3 +34,15 @@ adm install apps/curl --with-deps --pack --parallel=$(nproc)
 adm info apps/curl
 adm info libs/openssl
 adm info dev/pkgconf
+
+# Exemplo de variáveis p/ um bootstrap glibc:
+export TARGET=x86_64-linux-gnu
+export PREFIX=/usr/src/adm/toolchain
+export SYSROOT=/usr/src/adm/sysroot
+export JOBS=$(nproc)
+
+# 1) Binutils PASS1
+adm install sys/binutils-pass1 --with-deps --pack
+
+# 2) GCC PASS1 (usa gmp/mpfr/mpc/isl)
+adm install sys/gcc-pass1 --with-deps --pack
