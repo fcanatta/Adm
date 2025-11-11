@@ -1,0 +1,779 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/44-parallel-scheduler
+# -----------------------------------------------------------------------------
+# ADM - Parallel Scheduler (DAG)
+# - Planeja e executa builds em paralelo com dependências e prioridades
+# - Limites de recursos: CPU (jobs) e RAM (MiB)
+# - Integra 40-builder, 25-resolver (opcional), 34-hooks-runner, 05-logging
+# - Estado persistente e reentrante; pausa/retoma/cancelamento/timeout/retries
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_BUILD_ROOT:=$ADM_ROOT/build}"
+
+SCHED_STATE="$ADM_STATE/scheduler"
+mkdir -p -- "$SCHED_STATE" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _S_COLOR=${ADM_COLOR:-auto}
+  _S_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _S_COLOR=false; fi
+  if [[ "$_S_COLOR" == "auto" ]]; then
+    _S_COLOR=$([[ "$_S_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_S_COLOR" == "true" ]]; then
+    __s_red=$'\033[31m'; __s_grn=$'\033[32m'; __s_yel=$'\033[33m'
+    __s_blu=$'\033[34m'; __s_mag=$'\033[35m'; __s_cyn=$'\033[36m'; __s_dim=$'\033[2m'; __s_rst=$'\033[0m'
+    __s_chk=$'\xE2\x9C\x85'
+  else
+    __s_red=""; __s_grn=""; __s_yel=""; __s_blu=""; __s_mag=""; __s_cyn=""; __s_dim=""; __s_rst=""; __s_chk="[OK]"
+  fi
+  _s_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_s_ts)" "$__s_dim" "$__s_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_s_ts)" "$__s_blu" "$__s_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_s_ts)" "$__s_yel" "$__s_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_s_ts)" "$__s_red" "$__s_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_s_ts)" "$__s_grn" "$__s_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_s_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_s_slug(){ printf "%s" "$1" | tr ' /:' '__' | tr -cd '[:alnum:]_-.'); }
+_s_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_s_nproc(){ command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 2; }
+_s_mem_total_mib(){ awk '/MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 2048; }
+_s_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+_s_now(){ date +%s; }
+
+# ============================== CLI/Defaults =================================
+DEFAULT_JOBS="$((_s_nproc))"
+DEFAULT_RAM_MIB="$((_s_mem_total_mib*85/100))"   # usa 85% da RAM disponível
+DEFAULT_RETRIES="${ADM_SCHED_RETRIES:-1}"
+DEFAULT_TIMEOUT="${ADM_SCHED_TIMEOUT:-0}"        # 0 = sem timeout
+DEFAULT_PROFILE="${ADM_PROFILE:-normal}"
+DEFAULT_TOOLCHAIN="${ADM_TOOLCHAIN:-}"
+
+# ============================== Estado de uma execução =======================
+# Estrutura de diretório:
+#  $SCHED_STATE/<run_id>/
+#    run.env                  # parâmetros da execução
+#    graph/                   # grafo e metadados
+#      nodes.list             # lista de nós (cat/pkg)
+#      <node>.deps            # dependências diretas
+#      <node>.meta            # chaves do metafile
+#    tasks/
+#      <node>.state           # PENDING|RUNNING|OK|FAILED|SKIPPED
+#      <node>.pid             # pid atual (se RUNNING)
+#      <node>.rc              # exit code final
+#      <node>.try             # tentativas feitas
+#      <node>.cpu             # cpus reservados
+#      <node>.ram             # ram MiB reservada
+#      <node>.log             # stdout+stderr do builder
+#    control/
+#      pause.flag             # pausar (bloqueia novos lançamentos)
+#      cancel.flag            # cancelar (tentar parar o que der e encerrar)
+#    summary.json             # resumo final
+#
+# Node key = "<category>/<programa>"
+
+declare -A N_DEPS=()     # key -> "dep1 dep2 ..."
+declare -A N_RDEG=()     # key -> grau residual
+declare -A N_STATE=()    # key -> PENDING/RUNNING/OK/FAILED/SKIPPED
+declare -A N_TRY=()      # key -> tentativas
+declare -A N_CPU=()      # key -> reserva de cpu (heurística)
+declare -A N_RAM=()      # key -> reserva de ram MiB (heurística)
+declare -A N_META=()     # key -> path to metafile dir
+declare -A N_PRIO=()     # key -> prioridade calculada
+
+RUN_ID=""
+RUN_DIR=""
+JOBS_MAX=0
+RAM_MAX=0
+RETRIES=0
+TIMEOUT=0
+PROFILE=""
+TOOLCHAIN=""
+ONLY_SET=""    # lista “cat/pkg” separados por vírgula (filtro alvo opcional)
+
+# ============================== Locks globais =================================
+_lockdir(){ printf "%s" "$RUN_DIR/locks"; }
+_lock_acquire(){
+  local key="$1"; mkdir -p -- "$(_lockdir)" || true
+  local d="$(_lockdir)/sched-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: $key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_lock_release(){ local key="$1"; rm -rf -- "$(_lockdir)/sched-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== Metafile scan/parse ==========================
+_parse_metafile(){
+  # retorna via stdout pares KEY=VAL (apenas campos suportados)
+  local mf="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      local k="${BASH_REMATCH[1]}" v="$(_s_trim "${BASH_REMATCH[2]}")"
+      case "$k" in
+        name|version|category|run_deps|build_deps|opt_deps|num_builds) echo "$k=$v" ;;
+      esac
+    fi
+  done < "$mf"
+}
+
+_collect_targets_from_dirs(){
+  # Procura por /usr/src/adm/metafiles/<cat>/<pkg>/metafile (filtro por --categories/--match opcional)
+  local cats_glob="$1" match_glob="$2"
+  local base="$ADM_ROOT/metafiles"
+  [[ -d "$base" ]] || { adm_log_error "Diretório de metafiles não encontrado: $base"; return 1; }
+  local f
+  while IFS= read -r f; do
+    local cat pkg; cat="$(basename "$(dirname "$f")")"; pkg="$(basename "$(dirname "$(dirname "$f")")")"
+    # caminho é .../metafiles/<cat>/<pkg>/metafile
+    pkg="$(basename "$(dirname "$f")")"; cat="$(basename "$(dirname "$(dirname "$f")")")"
+    local key="$cat/$pkg"
+    [[ -n "$cats_glob" && ! "$cat" == $cats_glob ]] && continue
+    [[ -n "$match_glob" && ! "$pkg" == $match_glob ]] && continue
+    echo "$key|$f"
+  done < <(find "$base" -mindepth 3 -maxdepth 3 -path "$base/*/*/metafile" -type f -print 2>/dev/null | LC_ALL=C sort)
+}
+
+# ============================== Grafo & prioridades ==========================
+_prio_for_category(){
+  case "$1" in
+    libs) echo 100 ;;
+    sys)  echo 90 ;;
+    dev)  echo 80 ;;
+    toolchain) echo 95 ;;
+    apps) echo 50 ;;
+    *) echo 60 ;;
+  esac
+}
+
+_build_graph_from_metafiles(){
+  # Preenche N_DEPS, N_RDEG, N_META, N_PRIO
+  local list_file="$RUN_DIR/graph/nodes.list"
+  : > "$list_file"
+  local ent
+  for ent in "$@"; do
+    IFS='|' read -r key mf <<< "$ent"
+    local meta_dir; meta_dir="$(dirname "$mf")"
+    local meta_kv; meta_kv="$(_parse_metafile "$mf")"
+    local name="${meta_kv##*name=}" ; name="${name%%$'\n'*}" # não é necessário; manteremos key
+    local category="$(printf "%s\n" "$meta_kv" | awk -F= '/^category=/{print $2}' | head -n1)"
+    local run_deps="$(printf "%s\n" "$meta_kv" | awk -F= '/^run_deps=/{print $2}' | head -n1)"
+    local build_deps="$(printf "%s\n" "$meta_kv" | awk -F= '/^build_deps=/{print $2}' | head -n1)"
+    local deps=""
+    [[ -n "$run_deps"   ]] && deps+="$run_deps"
+    [[ -n "$build_deps" ]] && deps+="${deps:+,}$build_deps"
+    deps="$(printf "%s" "$deps" | tr ',' ' ' | sed 's/[[:space:]]\+/\n/g' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+    N_DEPS["$key"]="$(_s_trim "$deps")"
+    N_RDEG["$key"]=0
+    N_META["$key"]="$meta_dir"
+    N_PRIO["$key"]="$(_prio_for_category "$category")"
+    echo "$key" >> "$list_file"
+    # persist meta
+    mkdir -p -- "$RUN_DIR/graph" "$RUN_DIR/tasks"
+    printf "%s\n" "$meta_kv" > "$RUN_DIR/graph/${key//\//__}.meta"
+    printf "%s\n" "$(_s_trim "$deps" | tr ' ' '\n')" > "$RUN_DIR/graph/${key//\//__}.deps"
+  done
+
+  # Calcula grau residual
+  local k d
+  for k in "${!N_DEPS[@]}"; do
+    for d in ${N_DEPS[$k]}; do
+      # somente conta se o dep estiver no conjunto alvo
+      if [[ -n "${N_DEPS[$d]+_}" || -n "${N_META[$d]+_}" ]]; then
+        N_RDEG["$k"]=$(( ${N_RDEG[$k]} + 1 ))
+      fi
+    done
+  done
+}
+
+_try_resolver_if_available(){
+  local targets_csv="$1" # "cat/pkg,cat2/pkg2"
+  local res="$ADM_ROOT/scripts/25-resolver"
+  if [[ ! -x "$res" ]]; then
+    echo ""; return 0
+  fi
+  adm_log_info "Usando 25-resolver para expandir dependências…"
+  # saída esperada (uma por linha): cat/pkg
+  local out; out="$("$res" plan --targets="$targets_csv" 2>/dev/null || true)"
+  printf "%s" "$out"
+}
+
+# ============================== Planejamento =================================
+_plan_from_targets(){
+  # targets_csv pode ser vazio → escanear diretórios filtrados por --categories/--match
+  local targets_csv="$1" cats_glob="$2" match_glob="$3"
+
+  local -a pairs=()
+
+  if [[ -n "$targets_csv" ]]; then
+    # tenta resolver com 25-resolver
+    local from_resolver; from_resolver="$(_try_resolver_if_available "$targets_csv")"
+    if [[ -n "$from_resolver" ]]; then
+      while IFS= read -r k; do
+        [[ -z "$k" ]] && continue
+        local mf="$ADM_ROOT/metafiles/${k}/metafile"
+        [[ -f "$mf" ]] || { adm_log_warn "Metafile ausente p/ alvo: $k"; continue; }
+        pairs+=("$k|$mf")
+      done <<< "$from_resolver"
+    else
+      # usa apenas os alvos explícitos (sem expansão)
+      local t
+      IFS=',' read -r -a t <<< "$targets_csv"
+      local k
+      for k in "${t[@]}"; do
+        k="$(_s_trim "$k")"; [[ -z "$k" ]] && continue
+        local mf="$ADM_ROOT/metafiles/${k}/metafile"
+        [[ -f "$mf" ]] || { adm_log_error "Metafile não achado: $k"; return 1; }
+        pairs+=("$k|$mf")
+      done
+    fi
+  else
+    # varredura por diretórios (pode ser grande; use com filtros)
+    local ent; while IFS= read -r ent; do pairs+=("$ent"); done < <(_collect_targets_from_dirs "$cats_glob" "$match_glob")
+  fi
+
+  ((${#pairs[@]})) || { adm_log_error "Nenhum alvo encontrado."; return 1; }
+  _build_graph_from_metafiles "${pairs[@]}"
+}
+
+# ============================== Recursos e custos ============================
+_guess_cpu_for(){
+  # heurísticas simples por categoria/tipo; pode evoluir no futuro
+  local key="$1"
+  local pr="${N_PRIO[$key]:-60}"
+  if   (( pr >= 95 )); then echo 4   # toolchains/kernel
+  elif (( pr >= 90 )); then echo 3   # sys
+  elif (( pr >= 80 )); then echo 2   # dev
+  else echo 1; fi                     # apps/libs pequenas
+}
+_guess_ram_for(){
+  local key="$1"
+  local pr="${N_PRIO[$key]:-60}"
+  if   (( pr >= 95 )); then echo 4096
+  elif (( pr >= 90 )); then echo 2048
+  elif (( pr >= 80 )); then echo 1024
+  else echo 512; fi
+}
+
+_init_resources(){
+  local k
+  for k in "${!N_META[@]}"; do
+    N_CPU["$k"]="${N_CPU[$k]:-$(_guess_cpu_for "$k")}"
+    N_RAM["$k"]="${N_RAM[$k]:-$(_guess_ram_for "$k")}"
+  done
+}
+
+# ============================== Persistência de tarefa =======================
+_tfile(){ printf "%s" "$RUN_DIR/tasks/${1//\//__}.$2"; }
+_state_set(){ echo "$2" > "$(_tfile "$1" state)"; N_STATE["$1"]="$2"; }
+_state_get(){ [[ -f "$(_tfile "$1" state)" ]] && cat "$(_tfile "$1" state)" || echo "PENDING"; }
+_try_get(){  [[ -f "$(_tfile "$1" try)" ]] && cat "$(_tfile "$1" try)" || echo 0; }
+_try_inc(){  local t="$(_try_get "$1")"; t=$((t+1)); echo "$t" > "$(_tfile "$1" try)"; N_TRY["$1"]="$t"; }
+_pid_set(){  echo "$2" > "$(_tfile "$1" pid)"; }
+_pid_get(){  [[ -f "$(_tfile "$1" pid)" ]] && cat "$(_tfile "$1" pid)" || echo ""; }
+_rc_set(){   echo "$2" > "$(_tfile "$1" rc)"; }
+_rc_get(){   [[ -f "$(_tfile "$1" rc)" ]] && cat "$(_tfile "$1" rc)" || echo ""; }
+_reserve_write(){
+  echo "${N_CPU[$1]:-1}" > "$(_tfile "$1" cpu)"
+  echo "${N_RAM[$1]:-512}" > "$(_tfile "$1" ram)"
+}
+
+_load_previous_state_if_any(){
+  # Recarrega estados de execução anterior (resume)
+  local f
+  for f in "$RUN_DIR/tasks"/*.state 2>/dev/null; do
+    [[ -f "$f" ]] || continue
+    local base="$(basename "$f" .state)"; local key="${base//__/\/}"
+    local st; st="$(cat "$f" 2>/dev/null || echo PENDING)"
+    N_STATE["$key"]="$st"
+    N_TRY["$key"]="$(_try_get "$key")"
+    # mantém N_RDEG coerente: decrementa deps já OK
+  done
+}
+
+# ============================== Fila/seleção de prontos ======================
+_ready_nodes(){
+  # Lista os nós PENDING com grau residual == 0 (deps satisfeitas) e não bloqueados por ONLY_SET
+  local k
+  for k in "${!N_META[@]}"; do
+    [[ "${N_STATE[$k]:-PENDING}" == "PENDING" ]] || continue
+    [[ "${N_RDEG[$k]:-0}" -eq 0 ]] || continue
+    if [[ -n "$ONLY_SET" ]]; then
+      # Se ONLY_SET foi dado, só agenda nós que sejam alvo direto ou dependência deles
+      # (para simplificar, se key não estiver na lista e também não for dep direta de algum alvo, pula)
+      local in_list=0
+      IFS=',' read -r -a arr <<< "$ONLY_SET"
+      local x
+      for x in "${arr[@]}"; do
+        [[ "$k" == "$x" ]] && { in_list=1; break; }
+      done
+      (( in_list==0 )) && continue
+    fi
+    printf "%s\n" "$k"
+  done | while read -r k; do
+          printf "%06d\t%s\n" "${N_PRIO[$k]:-60}" "$k"
+        done | LC_ALL=C sort -r | awk '{print $2}'
+}
+
+# ============================== Recursos correntes ===========================
+_current_usage(){
+  local used_cpu=0 used_ram=0
+  local k
+  for k in "${!N_META[@]}"; do
+    [[ "${N_STATE[$k]:-}" == "RUNNING" ]] || continue
+    used_cpu=$(( used_cpu + ${N_CPU[$k]:-1} ))
+    used_ram=$(( used_ram + ${N_RAM[$k]:-512} ))
+  done
+  echo "$used_cpu $used_ram"
+}
+
+_can_launch(){
+  local k="$1"
+  local used cpu ram
+  read -r used ram <<< "$(_current_usage)"
+  cpu="${N_CPU[$k]:-1}"; ram="${N_RAM[$k]:-512}"
+  local will_cpu=$(( used + cpu ))
+  local will_ram=$(( ram + ram ))  # (nome variável 'ram' reaproveitada; calc separadamente)
+  # recalcula corretamente:
+  read -r used ram <<< "$(_current_usage)"
+  will_cpu=$(( used + cpu ))
+  local used_ram="$ram"; will_ram=$(( used_ram + ${N_RAM[$k]:-512} ))
+  if (( will_cpu <= JOBS_MAX && will_ram <= RAM_MAX )); then return 0; fi
+  return 1
+}
+
+# ============================== Execução de nó ================================
+_launch_node(){
+  local key="$1"
+  local meta_dir="${N_META[$key]}"
+  local logf="$RUN_DIR/tasks/${key//\//__}.log"
+  local tries="$(_try_get "$key")"
+  local try=$((tries+1))
+
+  _reserve_write "$key"
+  _state_set "$key" "RUNNING"
+  _pid_set "$key" ""
+  _try_inc "$key"
+
+  adm_log_info "→ [%s] iniciando (try=%d cpu=%s ram=%sMiB)" "$key" "$try" "${N_CPU[$key]}" "${N_RAM[$key]}"
+
+  # comando (40-builder)
+  local builder="$ADM_ROOT/scripts/40-builder"
+  [[ -x "$builder" ]] || { adm_log_error "40-builder não encontrado"; _state_set "$key" "FAILED"; _rc_set "$key" 127; return 1; }
+
+  # timeout
+  local to_args=()
+  if (( TIMEOUT > 0 )) && command -v timeout >/dev/null 2>&1; then
+    to_args=( timeout --signal=TERM --kill-after=30 "$TIMEOUT" )
+  fi
+
+  # executa em subshell e captura PID
+  (
+    set -Eeuo pipefail
+    exec "${to_args[@]}" "$builder" build --meta="$meta_dir" --profile="$PROFILE" ${TOOLCHAIN:+--toolchain="$TOOLCHAIN"} \
+      ${ADM_SCHED_TESTS:+--tests}
+  ) >"$logf".out 2>"$logf".err &
+  local pid=$!
+  _pid_set "$key" "$pid"
+}
+
+_check_finished(){
+  # examina tarefas RUNNING; atualiza estados e graus dos dependentes
+  local any=0
+  local k
+  for k in "${!N_META[@]}"; do
+    [[ "${N_STATE[$k]:-}" == "RUNNING" ]] || continue
+    local pid="$(_pid_get "$k")"
+    if [[ -z "$pid" ]]; then continue; fi
+    if kill -0 "$pid" 2>/dev/null; then
+      any=1; continue
+    fi
+    # terminou; lê RC
+    local rc=0
+    wait "$pid" || rc=$?
+    _rc_set "$k" "$rc"
+    if (( rc==0 )); then
+      _state_set "$k" "OK"
+      adm_log_success "${__s_chk} [%s] OK" "$k"
+      # diminui grau dos dependentes
+      local d
+      for d in "${!N_META[@]}"; do
+        [[ "$d" == "$k" ]] && continue
+        for dep in ${N_DEPS[$d]:-}; do
+          [[ "$dep" == "$k" ]] || continue
+          N_RDEG["$d"]=$(( ${N_RDEG[$d]} - 1 ))
+        done
+      done
+    else
+      adm_log_warn "[%s] falhou (rc=%d)" "$k" "$rc"
+      if (( N_TRY[$k] <= RETRIES )); then
+        _state_set "$k" "PENDING"  # volta para fila
+      else
+        _state_set "$k" "FAILED"
+        adm_log_error "[%s] excedeu tentativas (%d)" "$k" "$RETRIES"
+        # marca dependentes como SKIPPED
+        local d
+        for d in "${!N_META[@]}"; do
+          for dep in ${N_DEPS[$d]:-}; do
+            [[ "$dep" == "$k" ]] || continue
+            if [[ "${N_STATE[$d]:-PENDING}" == "PENDING" || "${N_STATE[$d]}" == "RUNNING" ]]; then
+              _state_set "$d" "SKIPPED"
+            fi
+          done
+        done
+      fi
+    fi
+  done
+  return $any
+}
+
+_progress_summary(){
+  local total=${#N_META[@]} p=0 r=0 o=0 f=0 s=0
+  local k
+  for k in "${!N_META[@]}"; do
+    case "${N_STATE[$k]:-PENDING}" in
+      PENDING) p=$((p+1));;
+      RUNNING) r=$((r+1));;
+      OK)      o=$((o+1));;
+      FAILED)  f=$((f+1));;
+      SKIPPED) s=$((s+1));;
+    esac
+  done
+  local used_cpu used_ram
+  read -r used_cpu used_ram <<< "$(_current_usage)"
+  printf "queue=%d running=%d ok=%d fail=%d skip=%d | cpu=%d/%d ram=%d/%dMiB\n" \
+    "$p" "$r" "$o" "$f" "$s" "$used_cpu" "$JOBS_MAX" "$used_ram" "$RAM_MAX"
+}
+
+_maybe_pause_or_cancel(){
+  if [[ -f "$RUN_DIR/control/cancel.flag" ]]; then
+    adm_log_warn "Cancelamento solicitado. Encerrando…"
+    # tenta matar todos RUNNING
+    local k
+    for k in "${!N_META[@]}"; do
+      [[ "${N_STATE[$k]:-}" == "RUNNING" ]] || continue
+      local pid="$(_pid_get "$k")"
+      kill -TERM "$pid" 2>/dev/null || true
+    done
+    return 1
+  fi
+  if [[ -f "$RUN_DIR/control/pause.flag" ]]; then
+    adm_log_warn "Pausado. Remova control/pause.flag para continuar."
+    while [[ -f "$RUN_DIR/control/pause.flag" ]]; do sleep 1; done
+    adm_log_info "Retomado."
+  fi
+  return 0
+}
+# (continuação do arquivo /usr/src/adm/scripts/44-parallel-scheduler)
+
+# ============================== Loop principal ===============================
+
+_run_loop(){
+  local max_fail="${1:-0}"   # 0 = não aborta por falhas
+  mkdir -p -- "$RUN_DIR/control" "$RUN_DIR/graph" "$RUN_DIR/tasks" || { adm_log_error "Sem acesso ao run dir"; return 1; }
+
+  # restaurar estados se houver
+  _load_previous_state_if_any
+  _init_resources
+
+  local fail_stop=0
+  while :; do
+    _maybe_pause_or_cancel || return 1
+
+    # finalizou?
+    local all_done=1
+    local k
+    for k in "${!N_META[@]}"; do
+      case "${N_STATE[$k]:-PENDING}" in
+        PENDING|RUNNING) all_done=0; break;;
+      esac
+    done
+    (( all_done==1 )) && break
+
+    # checa terminos
+    _check_finished || true
+
+    # lança novos, respeitando recursos
+    local launched_any=0
+    local rn
+    while read -r rn; do
+      # pode lançar?
+      _can_launch "$rn" || break
+      _launch_node "$rn" || true
+      launched_any=1
+    done < <(_ready_nodes)
+
+    # política de abortar se falhas excederem max_fail
+    if (( max_fail>0 )); then
+      local fcount=0
+      for k in "${!N_META[@]}"; do [[ "${N_STATE[$k]:-}" == "FAILED" ]] && fcount=$((fcount+1)); done
+      if (( fcount >= max_fail )); then
+        adm_log_error "Atingido limite de falhas (max_fail=$max_fail). Abortando loop."
+        break
+      fi
+    fi
+
+    # status curto
+    adm_log_info "$(_progress_summary)"
+
+    # espera pequena
+    sleep 1
+  done
+
+  # sumariza
+  local ok=0 fail=0 skip=0 pend=0
+  local k
+  for k in "${!N_META[@]}"; do
+    case "${N_STATE[$k]:-PENDING}" in
+      OK) ok=$((ok+1));;
+      FAILED) fail=$((fail+1));;
+      SKIPPED) skip=$((skip+1));;
+      PENDING|RUNNING) pend=$((pend+1));;
+    esac
+  done
+  {
+    printf "{\n"
+    printf "  \"run_id\":\"%s\",\n" "$(_s_json_e "$RUN_ID")"
+    printf "  \"total\":%d,\n" "${#N_META[@]}"
+    printf "  \"ok\":%d,\n" "$ok"
+    printf "  \"failed\":%d,\n" "$fail"
+    printf "  \"skipped\":%d,\n" "$skip"
+    printf "  \"pending\":%d\n" "$pend"
+    printf "}\n"
+  } > "$RUN_DIR/summary.json" || true
+
+  if (( fail>0 )); then
+    adm_log_error "Resumo: OK=%d FAIL=%d SKIP=%d PENDING=%d" "$ok" "$fail" "$skip" "$pend"
+    return 1
+  fi
+  adm_log_success "${__s_chk} Sched concluído: OK=%d FAIL=%d SKIP=%d PENDING=%d" "$ok" "$fail" "$skip" "$pend"
+  return 0
+}
+
+# ============================== Comandos =====================================
+
+_ps_usage(){
+  cat <<'USAGE'
+Uso: 44-parallel-scheduler <comando> [opções]
+
+Comandos:
+  plan [alvos]          Planeja e mostra o DAG (sem executar).
+  run  [alvos]          Executa o plano em paralelo até concluir.
+  status <run_id>       Mostra status resumido/ao vivo de uma execução.
+  pause  <run_id>       Pausa (cria control/pause.flag).
+  resume <run_id>       Retoma (remove control/pause.flag).
+  cancel <run_id>       Cancela (cria control/cancel.flag e tenta encerrar).
+  list-runs             Lista execuções anteriores.
+  doctor                Checa ambiente do scheduler.
+
+Formato de "alvos":
+  --targets=cat/pkg[,cat2/pkg2]   # explícitos; tenta expandir via 25-resolver se existir
+  --categories='libs|sys|apps'    # varredura por categorias
+  --match='glob'                  # filtra nome do pacote por glob
+  --only='cat/pkg,...'            # agenda apenas estes nós (e suas deps se usar resolver)
+
+Opções gerais:
+  --jobs=N                        # paralelismo máximo (CPU virtual). Padrão: núcleos.
+  --ram-mib=N                     # orçamento total de RAM (MiB). Padrão: ~85% disponível.
+  --retries=N                     # tentativas extras por pacote (padrão 1).
+  --timeout=SECS                  # timeout do 40-builder por pacote (0=sem).
+  --profile=NAME                  # profile (aggressive|normal|minimal|...).
+  --toolchain=NAME                # toolchain do 14-toolchain-db.
+  --max-fail=N                    # aborta loop ao atingir N falhas (0=desliga).
+  --run-id=ID                     # define o ID da execução (senão é timestamp).
+  --dry-run                       # somente imprime o plano.
+  --tests                         # ativa --tests no 40-builder.
+
+Exemplos:
+  44-parallel-scheduler run --categories='libs' --match='*ssl*' --jobs=8 --ram-mib=8192
+  44-parallel-scheduler run --targets=libs/zlib,apps/wget --profile=aggressive --toolchain=x86_64-linux-musl
+  44-parallel-scheduler status  sched-20250101_120000-12345
+USAGE
+}
+
+# ============================== Helpers CLI ==================================
+_parse_common_flags(){
+  # parse flags que afetam variáveis globais da run
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --jobs=*)      JOBS_MAX="${arg#--jobs=}" ;;
+      --ram-mib=*)   RAM_MAX="${arg#--ram-mib=}" ;;
+      --retries=*)   RETRIES="${arg#--retries=}" ;;
+      --timeout=*)   TIMEOUT="${arg#--timeout=}" ;;
+      --profile=*)   PROFILE="${arg#--profile=}" ;;
+      --toolchain=*) TOOLCHAIN="${arg#--toolchain=}" ;;
+      --only=*)      ONLY_SET="${arg#--only=}" ;;
+      --tests)       ADM_SCHED_TESTS=1 ;;
+    esac
+  done
+  (( JOBS_MAX<=0 )) && JOBS_MAX="$DEFAULT_JOBS"
+  (( RAM_MAX<=0 ))  && RAM_MAX="$DEFAULT_RAM_MIB"
+  (( RETRIES<0 ))   && RETRIES="$DEFAULT_RETRIES"
+  (( TIMEOUT<0 ))   && TIMEOUT="$DEFAULT_TIMEOUT"
+  [[ -z "$PROFILE" ]]   && PROFILE="$DEFAULT_PROFILE"
+  [[ -z "$TOOLCHAIN" ]] && TOOLCHAIN="$DEFAULT_TOOLCHAIN"
+}
+
+_make_run_id(){
+  local rid
+  rid="${1:-sched-$(date +%Y%m%d_%H%M%S)-$$}"
+  RUN_ID="$rid"
+  RUN_DIR="$SCHED_STATE/$RUN_ID"
+  mkdir -p -- "$RUN_DIR" "$RUN_DIR/control" "$RUN_DIR/graph" "$RUN_DIR/tasks" || { adm_log_error "Sem acesso a $RUN_DIR"; return 1; }
+  # salva parâmetros
+  {
+    echo "RUN_ID=$RUN_ID"
+    echo "JOBS_MAX=$JOBS_MAX"
+    echo "RAM_MAX=$RAM_MAX"
+    echo "RETRIES=$RETRIES"
+    echo "TIMEOUT=$TIMEOUT"
+    echo "PROFILE=$PROFILE"
+    echo "TOOLCHAIN=$TOOLCHAIN"
+    echo "ONLY_SET=$ONLY_SET"
+  } > "$RUN_DIR/run.env"
+}
+
+_doctor(){
+  local fail=0
+  for b in bash awk sed sort xargs find timeout; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: $b"; }
+  done
+  [[ -x "$ADM_ROOT/scripts/40-builder" ]] || { adm_log_error "Requer 40-builder executável"; fail=$((fail+1)); }
+  mkdir -p -- "$SCHED_STATE" || { adm_log_error "Sem acesso ao state: $SCHED_STATE"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Scheduler OK."
+}
+
+# ============================== Comandos =====================================
+
+ps_plan(){
+  local targets_csv="" cats_glob="" match_glob="" dry_run=0 run_id=""
+  while (( $# )); do
+    case "$1" in
+      --targets=*) targets_csv="${1#--targets=}" ;;
+      --categories=*) cats_glob="${1#--categories=}" ;;
+      --match=*) match_glob="${1#--match=}" ;;
+      --run-id=*) run_id="${1#--run-id=}" ;;
+      --dry-run) dry_run=1 ;;
+      --*) ;; # comuns tratados depois
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  _parse_common_flags "$@"
+  _make_run_id "$run_id" || return 1
+  _plan_from_targets "$targets_csv" "$cats_glob" "$match_glob" || return 1
+  _init_resources
+
+  adm_log_info "Plano criado (run_id=$RUN_ID). Nós: ${#N_META[@]}  jobs=$JOBS_MAX ram=${RAM_MAX}MiB profile=$PROFILE toolchain=${TOOLCHAIN:--}"
+  # imprime DAG condensado
+  local k
+  for k in "${!N_META[@]}"; do
+    printf "%s | deps: %s | cpu=%s ram=%sMiB | prio=%s\n" "$k" "${N_DEPS[$k]:--}" "${N_CPU[$k]}" "${N_RAM[$k]}" "${N_PRIO[$k]}"
+  done | LC_ALL=C sort
+  (( dry_run==1 )) && return 0
+  adm_log_info "Use: 44-parallel-scheduler run --run-id=$RUN_ID  (para executar o plano)."
+}
+
+ps_run(){
+  local targets_csv="" cats_glob="" match_glob="" run_id="" max_fail=0
+  while (( $# )); do
+    case "$1" in
+      --targets=*) targets_csv="${1#--targets=}" ;;
+      --categories=*) cats_glob="${1#--categories=}" ;;
+      --match=*) match_glob="${1#--match=}" ;;
+      --run-id=*) run_id="${1#--run-id=}" ;;
+      --max-fail=*) max_fail="${1#--max-fail=}" ;;
+      --*) ;; # comuns tratados depois
+      *) adm_log_warn "Arg ignorado: $1" ;;
+    esac; shift || true
+  done
+  _parse_common_flags "$@"
+
+  if [[ -n "$run_id" && -d "$SCHED_STATE/$run_id" ]]; then
+    RUN_ID="$run_id"; RUN_DIR="$SCHED_STATE/$RUN_ID"
+    adm_log_info "Retomando plano existente: $RUN_ID"
+    # carrega gráfico de disco
+    local n
+    for n in "$RUN_DIR/graph"/*.meta; do
+      [[ -f "$n" ]] || continue
+      local key="${n##*/}"; key="${key%.meta}"; key="${key//__/\/}"
+      N_META["$key"]="$(dirname "$n")/../.."
+      N_META["$key"]="$ADM_ROOT/metafiles/${key}"
+      N_DEPS["$key"]="$(tr '\n' ' ' < "$RUN_DIR/graph/${key//\//__}.deps" 2>/dev/null || echo)"
+      N_PRIO["$key"]="$(_prio_for_category "$(awk -F= '/^category=/{print $2}' "$n" 2>/dev/null)")"
+    done
+    _init_resources
+  else
+    _make_run_id "$run_id" || return 1
+    _plan_from_targets "$targets_csv" "$cats_glob" "$match_glob" || return 1
+  fi
+
+  # registra trap para não deixar locks presos
+  trap 'adm_log_warn "Interrompido"; touch "$RUN_DIR/control/pause.flag" || true' INT TERM
+
+  _run_loop "$max_fail"
+}
+
+ps_status(){
+  local rid="${1:-}"
+  [[ -n "$rid" ]] || { adm_log_error "Uso: status <run_id>"; return 2; }
+  local d="$SCHED_STATE/$rid"
+  [[ -d "$d" ]] || { adm_log_error "run_id não encontrado: $rid"; return 1; }
+  local ok=0 fail=0 skip=0 run=0 pend=0
+  local f
+  for f in "$d/tasks"/*.state 2>/dev/null; do
+    local st; st="$(cat "$f" 2>/dev/null || echo PENDING)"
+    case "$st" in
+      OK) ok=$((ok+1));;
+      FAILED) fail=$((fail+1));;
+      SKIPPED) skip=$((skip+1));;
+      RUNNING) run=$((run+1));;
+      PENDING) pend=$((pend+1));;
+    esac
+  done
+  echo "run_id: $rid"
+  echo "OK=$ok FAIL=$fail SKIP=$skip RUN=$run PENDING=$pend"
+  if [[ -f "$d/summary.json" ]]; then
+    adm_log_info "Resumo final em: $d/summary.json"
+  fi
+}
+
+ps_pause(){ local rid="${1:-}"; [[ -n "$rid" ]] || { adm_log_error "Uso: pause <run_id>"; return 2; }; touch "$SCHED_STATE/$rid/control/pause.flag" && adm_log_success "Pausado." || adm_log_error "Falha ao pausar"; }
+ps_resume(){ local rid="${1:-}"; [[ -n "$rid" ]] || { adm_log_error "Uso: resume <run_id>"; return 2; }; rm -f "$SCHED_STATE/$rid/control/pause.flag" && adm_log_success "Retomado." || adm_log_error "Falha ao retomar"; }
+ps_cancel(){ local rid="${1:-}"; [[ -n "$rid" ]] || { adm_log_error "Uso: cancel <run_id>"; return 2; }; touch "$SCHED_STATE/$rid/control/cancel.flag" && adm_log_warn "Cancelamento solicitado." || adm_log_error "Falha ao cancelar"; }
+
+ps_list_runs(){
+  find "$SCHED_STATE" -maxdepth 1 -mindepth 1 -type d -printf "%f\n" 2>/dev/null | LC_ALL=C sort
+}
+
+# ============================== Main =========================================
+
+ps_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    plan)    ps_plan "$@" ;;
+    run)     ps_run "$@" ;;
+    status)  ps_status "$@" ;;
+    pause)   ps_pause "$@" ;;
+    resume)  ps_resume "$@" ;;
+    cancel)  ps_cancel "$@" ;;
+    list-runs) ps_list_runs ;;
+    doctor)  _doctor ;;
+    ""|-h|--help|help) _ps_usage ;;
+    *)       adm_log_error "Comando desconhecido: $cmd"; _ps_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  ps_main "$@"
+fi
