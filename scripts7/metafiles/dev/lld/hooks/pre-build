@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ADM_OUT_OF_TREE_BUILD:?}"
+ninja -C "${ADM_OUT_OF_TREE_BUILD}" -v lld
