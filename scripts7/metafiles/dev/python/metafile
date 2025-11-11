@@ -1,0 +1,12 @@
+name=python
+version=3.13.0
+category=dev
+run_deps=
+build_deps=host-python3,binutils-stage2,gcc-final
+opt_deps=openssl,readline,ncurses,zlib,bzip2,xz,sqlite,expat
+num_builds=0
+description=CPython 3 (binários do target, cross compilado; --enable-shared)
+homepage=https://www.python.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.python.org/ftp/python/3.13.0/Python-3.13.0.tgz
