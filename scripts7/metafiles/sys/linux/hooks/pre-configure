@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${TARGET:?TARGET não definido}"
+: "${MAKE:=make}"
+: "${NPROC:=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
+
+# Mapear ARCH a partir do TARGET
+case "${TARGET}" in
+  x86_64-*)   export ARCH=x86_64;   ;;
+  i?86-*)     export ARCH=i386;     ;;
+  aarch64-*)  export ARCH=arm64;    ;;
+  arm-*)      export ARCH=arm;      ;;
+  riscv64-*)  export ARCH=riscv;    ;;
+  powerpc64le-*) export ARCH=powerpc; ;;
+  *) echo "TARGET não mapeado para ARCH: $TARGET" >&2; exit 70 ;;
+esac
+
+# Cross-compile prefix (se o toolchain do target está instalado)
+export CROSS_COMPILE="${TARGET}-"
+
+# Seleção de .config (prioridade):
+# 1) /usr/src/adm/kconfigs/${ARCH}/kernel.config
+# 2) variável KCONFIG apontando para um arquivo
+# 3) olddefconfig a partir de /proc/config.gz (se disponível)
+# 4) defconfig do kernel
+CFG_DIR="/usr/src/adm/kconfigs/${ARCH}"
+if [[ -f "${CFG_DIR}/kernel.config" ]]; then
+  cp -f "${CFG_DIR}/kernel.config" .config
+elif [[ -n "${KCONFIG:-}" && -f "${KCONFIG}" ]]; then
+  cp -f "${KCONFIG}" .config
+elif zcat /proc/config.gz >/dev/null 2>&1; then
+  zcat /proc/config.gz > .config || true
+  $MAKE olddefconfig
+else
+  $MAKE defconfig
+fi
+
+# Ajustes básicos seguros
+# (se quiser, injete flags extras via CONFIG_EXTRA ou use scripts/kconfig)
+: "${KCFLAGS:=}"
+export KCFLAGS
