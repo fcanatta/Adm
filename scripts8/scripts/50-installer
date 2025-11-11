@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/50-installer
+# -----------------------------------------------------------------------------
+# ADM - Installer (transacional)
+# - Instala/atualiza/remove pacotes tar.{zst,xz} produzidos pelo 40-builder
+# - DB de arquivos, verificação de integridade, rollback e hooks de sistema
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_TMP:=${TMPDIR:-/tmp}}"
+: "${ADM_PACKAGES:=$ADM_ROOT/packages}"
+
+INST_STATE="$ADM_STATE/installer"
+DB_DIR="$ADM_STATE/db"
+DB_INSTALLED="$DB_DIR/installed"
+DB_FILES="$DB_DIR/files"
+DB_HISTORY="$DB_DIR/history"
+LOCK_DIR="$INST_STATE/locks"
+
+mkdir -p -- "$INST_STATE" "$DB_INSTALLED" "$DB_FILES" "$DB_HISTORY" "$LOCK_DIR" >/dev/null 2>&1 || true
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _I_COLOR=${ADM_COLOR:-auto}
+  _I_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _I_COLOR=false; fi
+  if [[ "$_I_COLOR" == "auto" ]]; then
+    _I_COLOR=$([[ "$_I_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_I_COLOR" == "true" ]]; then
+    __i_red=$'\033[31m'; __i_grn=$'\033[32m'; __i_yel=$'\033[33m'
+    __i_blu=$'\033[34m'; __i_mag=$'\033[35m'; __i_cyn=$'\033[36m'; __i_dim=$'\033[2m'; __i_rst=$'\033[0m'
+    __i_chk=$'\xE2\x9C\x85'
+  else
+    __i_red=""; __i_grn=""; __i_yel=""; __i_blu=""; __i_mag=""; __i_cyn=""; __i_dim=""; __i_rst=""; __i_chk="[OK]"
+  fi
+  _i_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_i_ts)" "$__i_dim" "$__i_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_i_ts)" "$__i_blu" "$__i_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_i_ts)" "$__i_yel" "$__i_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_i_ts)" "$__i_red" "$__i_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_i_ts)" "$__i_grn" "$__i_rst" "$*" >&2; }
+fi
+
+# ============================== Utils ========================================
+_i_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+_i_slug(){ printf "%s" "$1" | tr ' /:' '__' | tr -cd '[:alnum:]_-.'); }
+_i_now(){ date +%s; }
+_i_date(){ date -Iseconds; }
+_i_have(){ command -v "$1" >/dev/null 2>&1; }
+_i_sha256(){ sha256sum -- "$1" 2>/dev/null | awk '{print $1}'; }
+_i_abspath(){ (cd "${1:-.}" 2>/dev/null && pwd -P) || echo "$1"; }
+_i_json_e(){ local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; printf "%s" "$s"; }
+
+_lock_acquire(){
+  local key="$1"; mkdir -p -- "$LOCK_DIR" || true
+  local d="$LOCK_DIR/inst-$(printf "%s" "$key" | tr '/ ' '__').lockdir"
+  if mkdir "$d" 2>/dev/null; then :; else
+    adm_log_warn "Aguardando lock: $key"
+    local t=0; while ! mkdir "$d" 2>/dev/null; do sleep 1; ((t++>300)) && { adm_log_error "Timeout lock $key"; return 1; } done
+  fi
+}
+_lock_release(){ local key="$1"; rm -rf -- "$LOCK_DIR/inst-$(printf "%s" "$key" | tr '/ ' '__').lockdir" 2>/dev/null || true; }
+
+# ============================== Hooks de Sistema ==============================
+_run_hooks_sys(){
+  local stage="$1" workdir="$2"
+  local hr="$ADM_ROOT/scripts/34-hooks-runner"
+  [[ -x "$hr" ]] || { adm_log_debug "hooks-runner ausente: $stage"; return 0; }
+  "$hr" run "$stage" "$workdir" || { adm_log_error "Hook falhou em $stage"; return 1; }
+}
+
+# ============================== DB Helpers ===================================
+_installed_json(){ printf "%s/%s.json" "$DB_INSTALLED" "$(printf "%s" "$1" | tr '/' '__')"; }
+_files_index(){ printf "%s/index.map" "$DB_FILES"; }
+
+_db_load_pkg_version(){
+  local name="$1" f; f="$(_installed_json "$name")"
+  [[ -f "$f" ]] || { echo ""; return 0; }
+  awk -F\" '/"version":/ {print $4; exit}' "$f" 2>/dev/null || echo ""
+}
+
+_db_record_install(){
+  local name="$1" version="$2" root="$3" filelist="$4" sha_file="$5"
+  local js="$(_installed_json "$name")"
+  local ts="$(_i_date)"
+  # constrói JSON simples
+  {
+    printf "{\n"
+    printf "  \"name\":\"%s\",\n" "$(_i_json_e "$name")"
+    printf "  \"version\":\"%s\",\n" "$(_i_json_e "$version")"
+    printf "  \"root\":\"%s\",\n" "$(_i_json_e "$root")"
+    printf "  \"installed_at\":\"%s\",\n" "$(_i_json_e "$ts")"
+    printf "  \"files\":[\n"
+    sed -E 's/"/\\"/g; s/.*/    "&",/;' "$filelist" 2>/dev/null | sed '$ s/,$//' || true
+    printf "  ],\n"
+    printf "  \"sha256\":{\n"
+    sed -E 's/^([0-9a-f]{64})  (.*)$/    "\2": "\1",/;' "$sha_file" 2>/dev/null | sed '$ s/,$//' || true
+    printf "  }\n"
+    printf "}\n"
+  } > "$js".tmp
+  mv -f -- "$js".tmp "$js"
+}
+
+_db_update_files_index_add(){
+  local name="$1" filelist="$2"
+  local idx="$(_files_index)"; touch "$idx"
+  # adiciona linhas "path<TAB>name"
+  awk -v n="$name" 'NF{print $0"\t"n}' "$filelist" >> "$idx".tmp || true
+  sort -u "$idx" "$idx".tmp > "$idx".new 2>/dev/null || cat "$idx".tmp > "$idx".new
+  mv -f -- "$idx".new "$idx"
+  rm -f -- "$idx".tmp 2>/dev/null || true
+}
+
+_db_update_files_index_remove(){
+  local name="$1"
+  local idx="$(_files_index)"; [[ -f "$idx" ]] || return 0
+  awk -v n="$name" -F'\t' '$2!=n' "$idx" > "$idx".new || true
+  mv -f -- "$idx".new "$idx"
+}
+
+_db_list_files_of(){
+  local name="$1"
+  local js="$(_installed_json "$name")"
+  [[ -f "$js" ]] || return 1
+  awk -F\" '/^\s*"files":\s*\[/,/]/ { if ($0 ~ /"/) { gsub(/^[ \t"]+|[",]+$/,""); print } }' "$js"
+}
+
+_db_pkg_owns(){
+  local path="$1"
+  local idx="$(_files_index)"
+  [[ -f "$idx" ]] || { echo ""; return 0; }
+  awk -v p="$path" -F'\t' '$1==p {print $2; exit}' "$idx"
+}
+
+# ============================== Pacote / Artefatos ===========================
+_find_package_archives(){
+  # procura por $ADM_PACKAGES/<name-version>/{*.tar.zst,*.tar.xz}
+  local name="$1" version="$2" found=()
+  local dir="$ADM_PACKAGES/$name-$version"
+  [[ -d "$dir" ]] || { adm_log_error "Diretório do pacote não encontrado: %s" "$dir"; return 1; }
+  while IFS= read -r f; do found+=("$f"); done < <(find "$dir" -maxdepth 1 -type f \( -name "*.tar.zst" -o -name "*.tar.xz" \) -print 2>/dev/null | LC_ALL=C sort)
+  ((${#found[@]})) || { adm_log_error "Nenhum tar.{zst,xz} encontrado em %s" "$dir"; return 1; }
+  printf "%s\n" "${found[@]}"
+}
+
+_verify_archive(){
+  local f="$1"
+  [[ -f "$f" ]] || { adm_log_error "Arquivo não existe: %s" "$f"; return 1; }
+  case "$f" in
+    *.tar.zst) _i_have zstd || { adm_log_error "zstd ausente"; return 1; }
+               zstd -tq -- "$f" || { adm_log_error "zstd teste falhou em %s" "$f"; return 1; } ;;
+    *.tar.xz)  _i_have xz || { adm_log_error "xz ausente"; return 1; }
+               xz -t -- "$f" || { adm_log_error "xz teste falhou em %s" "$f"; return 1; } ;;
+    *)         adm_log_warn "Extensão desconhecida: %s" "$f" ;;
+  esac
+}
+
+# ============================== Staging / Transação ==========================
+_txn_begin(){
+  local name="$1" version="$2"
+  local id="txn-$name-$version-$(date +%Y%m%d_%H%M%S)-$$"
+  local dir="$INST_STATE/$id"
+  mkdir -p -- "$dir"/{staging,files,backup,logs} || { adm_log_error "Sem acesso a $dir"; return 1; }
+  printf "%s" "$dir"
+}
+
+_extract_to_staging(){
+  local archive="$1" staging="$2"
+  adm_log_info "Extraindo: $(basename "$archive")"
+  case "$archive" in
+    *.tar.zst) zstd -dc -- "$archive" | tar -x -C "$staging" ;;
+    *.tar.xz)  xz -dc -- "$archive"  | tar -x -C "$staging" ;;
+    *)         tar -xf "$archive" -C "$staging" ;;
+  esac
+}
+
+_list_staging_files(){
+  local staging="$1" outlist="$2"
+  (cd "$staging" && find . -mindepth 1 -printf "%P\n" | LC_ALL=C sort) > "$outlist"
+}
+
+_sha256_tree(){
+  local root="$1" outfile="$2"
+  ( cd "$root"
+    # sha256sum lista "hash<2spaces>path"
+    if _i_have sha256sum; then
+      find . -type f -print0 | xargs -0 sha256sum > "$outfile"
+    else
+      # fallback pobre (não esperado)
+      find . -type f -print | while read -r f; do printf "%s  %s\n" "$(_i_sha256 "$f")" "$f"; done > "$outfile"
+    fi
+  )
+  # normaliza caminhos sem prefixo "./"
+  sed -E 's|^\s*([0-9a-f]{64})\s+\./| \1  |' -i "$outfile" || true
+}
+
+# ============================== Conflitos / Backup ===========================
+_plan_conflicts(){
+  local root="$1" staging="$2" filelist="$3" out_conflicts="$4"
+  : > "$out_conflicts"
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    # apenas arquivos e symlinks são relevantes para conflito direto
+    if [[ -e "$root/$rel" || -L "$root/$rel" ]]; then
+      printf "%s\n" "$rel" >> "$out_conflicts"
+    fi
+  done < "$filelist"
+}
+
+_make_backups(){
+  local root="$1" conflict_list="$2" backup_dir="$3"
+  local rel
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local src="$root/$rel"
+    if [[ -d "$src" && ! -L "$src" ]]; then
+      # diretórios não precisam de backup (mantemos como estão)
+      continue
+    fi
+    local dst="$backup_dir/$rel"
+    mkdir -p -- "$(dirname "$dst")"
+    if [[ -e "$src" || -L "$src" ]]; then
+      cp -a -- "$src" "$dst" 2>/dev/null || rsync -a -- "$src" "$dst" 2>/dev/null || {
+        adm_log_warn "Falha ao fazer backup de %s" "$rel"
+      }
+    fi
+  done < "$conflict_list"
+}
+
+_restore_backups(){
+  local root="$1" backup_dir="$2"
+  [[ -d "$backup_dir" ]] || return 0
+  ( cd "$backup_dir"
+    find . -mindepth 1 -print | while read -r rel; do
+      local src="$backup_dir/$rel" dst="$root/$rel"
+      mkdir -p -- "$(dirname "$dst")" 2>/dev/null || true
+      cp -a -- "$src" "$dst" 2>/dev/null || rsync -a -- "$src" "$dst" 2>/dev/null || true
+    done
+  )
+}
+
+# ============================== Aplicar (commit) =============================
+_commit_staging(){
+  local root="$1" staging="$2"
+  # preferir rsync se disponível (preserva perms/links/dispositivos)
+  if _i_have rsync; then
+    rsync -aHAX --info=progress2 --delete-after -- "$staging"/ "$root"/
+  else
+    ( cd "$staging" && tar -c . ) | ( cd "$root" && tar -x )
+  fi
+}
+
+# ============================== Remoção ======================================
+_remove_package_files(){
+  local root="$1" filelist="$2"
+  tac "$filelist" 2>/dev/null | while read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local p="$root/$rel"
+    if [[ -d "$p" && ! -L "$p" ]]; then
+      rmdir --ignore-fail-on-non-empty -- "$p" 2>/dev/null || true
+    else
+      rm -f -- "$p" 2>/dev/null || true
+    fi
+  done
+}
+# (continuação do arquivo /usr/src/adm/scripts/50-installer)
+
+# ============================== Instalar / Atualizar =========================
+
+_do_install(){
+  local name="$1" version="$2" root="${3:-/}" archive_arg="${4:-}" allow_downgrade="${5:-0}" keep_backups="${6:-1}"
+  root="$(_i_abspath "$root")"
+  [[ -d "$root" ]] || { adm_log_error "ROOT inválido: %s" "$root"; return 1; }
+
+  _lock_acquire "install-$name" || return 1
+  trap '_lock_release "install-'"$name"'"' RETURN
+
+  local current_ver; current_ver="$(_db_load_pkg_version "$name")"
+  if [[ -n "$current_ver" ]]; then
+    if [[ "$version" == "$current_ver" ]]; then
+      adm_log_info "Pacote já instalado na mesma versão: %s-%s" "$name" "$version"
+    else
+      # upgrade/downgrade
+      if [[ "$allow_downgrade" != "1" ]]; then
+        # tentativa de detectar downgrade ingênua (lexicográfica)
+        if [[ "$version" < "$current_ver" ]]; then
+          adm_log_error "Downgrade detectado (%s -> %s). Use --allow-downgrade para prosseguir." "$current_ver" "$version"
+          return 1
+        fi
+      fi
+      adm_log_info "Atualização: %s (%s -> %s)" "$name" "$current_ver" "$version"
+    fi
+  fi
+
+  local archives=()
+  if [[ -n "$archive_arg" ]]; then
+    archives=("$archive_arg")
+  else
+    mapfile -t archives < <(_find_package_archives "$name" "$version")
+  fi
+  ((${#archives[@]})) || { adm_log_error "Nenhum artefato encontrado para %s-%s" "$name" "$version"; return 1; }
+
+  # Verifica e escolhe o maior (heurística para build multi-formato)
+  local ar; for ar in "${archives[@]}"; do _verify_archive "$ar"; done
+  local archive="${archives[0]}"
+
+  local txn; txn="$(_txn_begin "$name" "$version")" || return 1
+  local staging="$txn/staging" files="$txn/files" backup="$txn/backup" logs="$txn/logs"
+  mkdir -p -- "$staging" "$files" "$backup" "$logs" || true
+
+  _run_hooks_sys "pre-system-install" "$staging" || true
+
+  _extract_to_staging "$archive" "$staging"
+
+  local listfile="$files/list.txt"
+  _list_staging_files "$staging" "$listfile"
+
+  # plano de conflitos & backup
+  local conflicts="$files/conflicts.txt"
+  _plan_conflicts "$root" "$staging" "$listfile" "$conflicts"
+  if [[ -s "$conflicts" ]]; then
+    adm_log_info "Arquivos existentes serão sobrescritos (%s itens). Fazendo backup…" "$(wc -l < "$conflicts" | tr -d ' ')"
+    _make_backups "$root" "$conflicts" "$backup"
+  fi
+
+  # checksums do staging
+  local sha_list="$files/sha256sums.txt"
+  _sha256_tree "$staging" "$sha_list"
+
+  # commit
+  adm_log_info "Aplicando ao sistema (root=%s)..." "$root"
+  if ! _commit_staging "$root" "$staging"; then
+    adm_log_error "Falha ao aplicar staging. Restaurando backups…"
+    _restore_backups "$root" "$backup"
+    return 1
+  fi
+
+  # atualiza DB
+  _db_record_install "$name" "$version" "$root" "$listfile" "$sha_list"
+  _db_update_files_index_remove "$name" || true
+  _db_update_files_index_add "$name" "$listfile"
+
+  # histórico
+  {
+    printf "%s INSTALL %s %s root=%s archive=%s\n" "$(_i_date)" "$name" "$version" "$root" "$archive"
+  } >> "$DB_HISTORY/history.log"
+
+  # limpa backups (opcional)
+  if [[ "$keep_backups" != "1" ]]; then
+    rm -rf -- "$backup" 2>/dev/null || true
+  else
+    adm_log_info "Backups preservados em: %s" "$backup"
+  fi
+
+  _run_hooks_sys "post-system-install" "$root" || true
+
+  adm_log_success "${__i_chk} Instalado: %s-%s" "$name" "$version"
+  return 0
+}
+
+# ============================== Remover ======================================
+
+_do_remove(){
+  local name="$1" root="${2:-/}" keep_configs="${3:-1}" create_backup="${4:-1}"
+  root="$(_i_abspath "$root")"
+  [[ -d "$root" ]] || { adm_log_error "ROOT inválido: %s" "$root"; return 1; }
+
+  _lock_acquire "install-$name" || return 1
+  trap '_lock_release "install-'"$name"'"' RETURN
+
+  local js="$(_installed_json "$name")"
+  [[ -f "$js" ]] || { adm_log_error "Pacote não instalado: %s" "$name"; return 1; }
+
+  _run_hooks_sys "pre-system-remove" "$root" || true
+
+  local txn; txn="$(_txn_begin "$name" "remove")" || return 1
+  local backup="$txn/backup" files="$txn/files"
+  mkdir -p -- "$backup" "$files" || true
+
+  local listfile="$files/list.txt"
+  _db_list_files_of "$name" > "$listfile" || { adm_log_error "Falha ao ler lista de arquivos"; return 1; }
+
+  # backup opcional antes de remover
+  if [[ "$create_backup" == "1" ]]; then
+    adm_log_info "Gerando backup dos arquivos a remover…"
+    _make_backups "$root" "$listfile" "$backup"
+  fi
+
+  _remove_package_files "$root" "$listfile"
+
+  # Atualiza DB: remove dono de todos arquivos
+  _db_update_files_index_remove "$name"
+  rm -f -- "$js" 2>/dev/null || true
+
+  {
+    printf "%s REMOVE %s root=%s\n" "$(_i_date)" "$name" "$root"
+  } >> "$DB_HISTORY/history.log"
+
+  _run_hooks_sys "post-system-remove" "$root" || true
+
+  adm_log_success "${__i_chk} Removido: %s" "$name"
+  return 0
+}
+
+# ============================== Verificações =================================
+
+_do_verify(){
+  local name="$1" root="${2:-/}"
+  local js="$(_installed_json "$name")"
+  [[ -f "$js" ]] || { adm_log_error "Pacote não instalado: %s" "$name"; return 1; }
+
+  local tmp; tmp="$(mktemp -d "${ADM_TMP%/}/ivfy.XXXX")"
+  trap 'rm -rf -- "$tmp" 2>/dev/null || true' RETURN
+
+  # extrai chaves do JSON (sem depender de jq)
+  local files="$tmp/files.txt" sums="$tmp/sums.txt"
+  awk '
+    /"files": \[/,/\]/{ if ($0 ~ /"/){ gsub(/[",]/,""); gsub(/^[ \t]+/,""); print } }
+  ' "$js" > "$files"
+  awk -F\" '
+    /"sha256": \{/,/\}/{ if ($0 ~ /".*":/){ gsub(/[",]/,""); gsub(/^[ \t]+/,""); if ($2!=""){print $2"  "$1} } }
+  ' "$js" > "$sums"
+
+  local root_abs="$(_i_abspath "$root")"
+  local fail=0 ok=0 miss=0
+  while IFS= read -r rel; do
+    [[ -z "$rel" ]] && continue
+    local p="$root_abs/$rel"
+    if [[ ! -f "$p" ]]; then
+      adm_log_warn "Faltando: %s" "$rel"; miss=$((miss+1)); continue
+    fi
+    local want; want="$(awk -v r="$rel" '$2==("./"r || r){ print $1; exit }' "$sums" 2>/dev/null || true)"
+    if [[ -z "$want" ]]; then
+      adm_log_warn "Sem checksum em DB: %s" "$rel"; continue
+    fi
+    local have; have="$(_i_sha256 "$p")"
+    if [[ "$have" != "$want" ]]; then
+      adm_log_error "Checksum divergente: %s" "$rel"; fail=$((fail+1))
+    else
+      ok=$((ok+1))
+    fi
+  done < "$files"
+
+  adm_log_info "Verificação: OK=%d FAIL=%d MISSING=%d" "$ok" "$fail" "$miss"
+  (( fail==0 )) || return 1
+  return 0
+}
+
+# ============================== Listar / Consultar ===========================
+
+_list_installed(){
+  find "$DB_INSTALLED" -maxdepth 1 -type f -name "*.json" -printf "%f\n" 2>/dev/null \
+    | sed 's/\.json$//' | tr '__' '/' | while read -r n; do
+        local v="$(_db_load_pkg_version "$n")"
+        printf "%-40s %s\n" "$n" "$v"
+      done | LC_ALL=C sort
+}
+
+_query_pkg(){
+  local name="$1"
+  local v="$(_db_load_pkg_version "$name")"
+  if [[ -z "$v" ]]; then adm_log_error "Pacote não instalado: %s" "$name"; return 1; fi
+  printf "%s %s\n" "$name" "$v"
+}
+
+_files_of(){
+  local name="$1"
+  _db_list_files_of "$name" || { adm_log_error "Pacote não instalado: %s" "$name"; return 1; }
+}
+
+_owns_file(){
+  local path="$1"
+  path="${path#/}" # normaliza
+  local owner; owner="$(_db_pkg_owns "$path")"
+  if [[ -z "$owner" ]]; then adm_log_warn "Nenhum pacote declarado dono de: %s" "$path"; return 1; fi
+  echo "$owner"
+}
+
+# ============================== Doctor =======================================
+
+_installer_doctor(){
+  local fail=0
+  for b in tar find xargs awk sed; do
+    command -v "$b" >/dev/null 2>&1 || { adm_log_warn "Ferramenta ausente: %s" "$b"; }
+  done
+  if ! _i_have zstd && ! _i_have xz; then
+    adm_log_error "Nem zstd nem xz encontrados (necessário para extrair pacotes)."; fail=$((fail+1))
+  end
+  mkdir -p -- "$DB_INSTALLED" "$DB_FILES" "$DB_HISTORY" "$LOCK_DIR" || { adm_log_error "Sem acesso a DB/state"; fail=$((fail+1)); }
+  (( fail>0 )) && return 1
+  adm_log_success "Installer OK."
+}
+
+# ============================== CLI ==========================================
+
+_inst_usage(){
+  cat <<'USAGE'
+Uso: 50-installer <comando> [opções]
+
+Comandos:
+  install  --name=PKG --version=VER [--root=/] [--archive=/path/pkg.tar.zst] [--allow-downgrade] [--keep-backups]
+  upgrade  --name=PKG --version=VER [--root=/] [--archive=...] [--keep-backups]
+  remove   --name=PKG [--root=/] [--keep-configs] [--backup]
+  list
+  query    --name=PKG
+  files    --name=PKG
+  owns     --path=/arquivo/no/sistema
+  verify   --name=PKG [--root=/]
+  doctor
+
+Notas:
+- Por padrão, procura pacotes em $ADM_PACKAGES/<name-version>/*.tar.{zst,xz}.
+- A instalação é transacional: staging → backup de sobrescritos → commit. Falhou? Rollback com backups.
+- Hooks de sistema (se existirem): pre-system-install, post-system-install, pre-system-remove, post-system-remove.
+USAGE
+}
+
+installer_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    install|upgrade)
+      local name="" version="" root="/" archive="" allow_dg=0 keep_bk=1
+      while (( $# )); do
+        case "$1" in
+          --name=*)    name="${1#--name=}" ;;
+          --version=*) version="${1#--version=}" ;;
+          --root=*)    root="${1#--root=}" ;;
+          --archive=*) archive="${1#--archive=}" ;;
+          --allow-downgrade) allow_dg=1 ;;
+          --keep-backups)    keep_bk=1 ;;
+          --no-keep-backups) keep_bk=0 ;;
+          *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+        esac; shift || true
+      done
+      [[ -n "$name" && -n "$version" ]] || { adm_log_error "Uso: %s --name=PKG --version=VER" "$cmd"; return 2; }
+      _do_install "$name" "$version" "$root" "$archive" "$allow_dg" "$keep_bk"
+      ;;
+    remove)
+      local name="" root="/" keep_cfg=1 backup=1
+      while (( $# )); do
+        case "$1" in
+          --name=*) name="${1#--name=}" ;;
+          --root=*) root="${1#--root=}" ;;
+          --keep-configs) keep_cfg=1 ;;
+          --no-keep-configs) keep_cfg=0 ;; # (placeholder caso evolua para arquivos *.conf)
+          --backup) backup=1 ;;
+          --no-backup) backup=0 ;;
+          *) adm_log_warn "Arg ignorado: %s" "$1" ;;
+        esac; shift || true
+      done
+      [[ -n "$name" ]] || { adm_log_error "Uso: remove --name=PKG"; return 2; }
+      _do_remove "$name" "$root" "$keep_cfg" "$backup"
+      ;;
+    list)    _list_installed ;;
+    query)   local name=""; while (( $# )); do case "$1" in --name=*) name="${1#--name=}";; esac; shift; done; [[ -n "$name" ]] || { adm_log_error "Uso: query --name=PKG"; return 2; }; _query_pkg "$name" ;;
+    files)   local name=""; while (( $# )); do case "$1" in --name=*) name="${1#--name=}";; esac; shift; done; [[ -n "$name" ]] || { adm_log_error "Uso: files --name=PKG"; return 2; }; _files_of "$name" ;;
+    owns)    local p="";    while (( $# )); do case "$1" in --path=*) p="${1#--path=}";; esac; shift; done; [[ -n "$p" ]]   || { adm_log_error "Uso: owns --path=/arquivo"; return 2; }; _owns_file "${p#/}" ;;
+    verify)  local name="" root="/"; while (( $# )); do case "$1" in --name=*) name="${1#--name=}";; --root=*) root="${1#--root=}";; esac; shift; done; [[ -n "$name" ]] || { adm_log_error "Uso: verify --name=PKG"; return 2; }; _do_verify "$name" "$root" ;;
+    doctor)  _installer_doctor ;;
+    ""|-h|--help|help) _inst_usage ;;
+    *)       adm_log_error "Comando desconhecido: %s" "$cmd"; _inst_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  installer_main "$@"
+fi
