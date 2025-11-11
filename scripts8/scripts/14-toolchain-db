@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/14-toolchain-db
+# -----------------------------------------------------------------------------
+# ADM - Toolchain DB
+# - Descobre toolchains (nativo e cross), versões e componentes.
+# - Registra cada toolchain em key=value: state/toolchain/<name>.tc
+# - Seleciona melhor toolchain conforme preferências (profile).
+# - Expõe env do toolchain ativo (CC/CXX/AR/RANLIB/STRIP/NM/OBJCOPY/LDFLAGS...).
+# - CLI: init, scan, list, show <name>, set <name>, env [name], doctor, best [...]
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+ADM_TC_DIR="$ADM_STATE/toolchain"
+ADM_TC_ACTIVE_LINK="$ADM_TC_DIR/ACTIVE"           # symlink → <name>.tc
+ADM_TC_ACTIVE_NAME="$ADM_TC_DIR/active.name"      # nome ativo
+ADM_TC_ACTIVE_EFFECTIVE="$ADM_TC_DIR/active.tc"   # cópia efetiva
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _TC_COLOR=${ADM_COLOR:-auto}
+  _TC_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _TC_COLOR=false; fi
+  if [[ "$_TC_COLOR" == "auto" ]]; then
+    _TC_COLOR=$([[ "$_TC_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_TC_COLOR" == "true" ]]; then
+    __t_red=$'\033[31m'; __t_grn=$'\033[32m'; __t_yel=$'\033[33m'
+    __t_blu=$'\033[34m'; __t_dim=$'\033[2m' ; __t_rst=$'\033[0m'
+  else
+    __t_red=""; __t_grn=""; __t_yel=""; __t_blu=""; __t_dim=""; __t_rst=""
+  fi
+  _t_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_t_ts)" "$__t_dim" "$__t_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_t_ts)" "$__t_blu" "$__t_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_t_ts)" "$__t_yel" "$__t_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_t_ts)" "$__t_red" "$__t_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_t_ts)" "$__t_grn" "$__t_rst" "$*" >&2; }
+fi
+
+# ============================== Utilidades KV ================================
+_tc_trim() { printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')" ; }
+
+_tc_kv_write() {
+  local file="$1" arrname="$2"
+  declare -n A="$arrname"
+  : > "$file" || { adm_log_error "Não abre para escrita: $file"; return 1; }
+  local k
+  IFS=$'\n' read -r -d '' -a _keys < <(printf "%s\n" "${!A[@]}" | sort && printf '\0')
+  for k in "${_keys[@]}"; do
+    printf "%s=%s\n" "$k" "${A[$k]}" >> "$file" || { adm_log_error "Falha ao gravar $k em $file"; return 1; }
+  done
+}
+
+_tc_kv_read() {
+  local file="$1" arrname="$2"
+  [[ -f "$file" ]] || { adm_log_error "TC não encontrado: $file"; return 1; }
+  declare -gA "$arrname" 2>/dev/null || true
+  local -n A="$arrname"
+  A=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      A["${BASH_REMATCH[1]}"]="$(_tc_trim "${BASH_REMATCH[2]}")"
+    else
+      adm_log_warn "Linha inválida em $file: $(printf %q "$line")"
+    fi
+  done < "$file"
+}
+
+# ============================== Detecção Básica ==============================
+_tc_have() { command -v "$1" >/dev/null 2>&1; }
+
+_tc_try() {
+  # Executa e captura saída/rc sem abortar pipefail do chamador
+  local out rc
+  out="$("$@" 2>/dev/null || true)"; rc=$?
+  printf "%s" "$out"
+  return "$rc"
+}
+
+_tc_gcc_triplet()      { _tc_try "$1" -dumpmachine | head -n1 | tr -d '\r'; }
+_tc_gcc_version()      { _tc_try "$1" -dumpfullversion -dumpversion | head -n1 | tr -d '\r'; }
+_tc_clang_triplet()    { _tc_try "$1" -print-target-triple | head -n1 | tr -d '\r'; }
+_tc_clang_version()    { _tc_try "$1" --version | awk 'NR==1{print $3}' | tr -d '\r'; }
+_tc_binutils_version() { _tc_try "$1" --version | awk 'NR==1{print $NF}' | tr -d '\r'; }
+_tc_ld_id()            { _tc_try "$1" --version | head -n1; }
+
+_tc_detect_libc() {
+  # Detecta libc e versão do sistema apontado pelo ldd
+  local ldd_bin="${1:-ldd}"
+  if ! _tc_have "$ldd_bin"; then
+    printf "libc=unknown\nlibc_version=\n"; return 0
+  fi
+  local first
+  first="$("$ldd_bin" --version 2>&1 | head -n1 || true)"
+  if echo "$first" | grep -qi musl; then
+    local v
+    v="$(echo "$first" | sed -E 's/.*musl[^0-9]*([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/i')"
+    printf "libc=musl\nlibc_version=%s\n" "${v:-}"
+  elif echo "$first" | grep -qi glibc\|gnu; then
+    local v
+    v="$(echo "$first" | sed -E 's/.*(GLIBC|glibc)[^0-9]*([0-9]+\.[0-9]+(\.[0-9]+)?).*/\2/i')"
+    printf "libc=glibc\nlibc_version=%s\n" "${v:-}"
+  else
+    # fallback: strings em libc
+    if [[ -e /lib/libc.musl-*.so || -e /lib/*/libc.musl-*.so ]]; then
+      local v="$(ls /lib/libc.musl-*.so /lib/*/libc.musl-*.so 2>/dev/null | head -n1 | sed -E 's/.*musl-([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')"
+      printf "libc=musl\nlibc_version=%s\n" "${v:-}"
+    else
+      printf "libc=unknown\nlibc_version=\n"
+    fi
+  fi
+}
+
+_tc_is_cross_triplet() { [[ "$1" =~ [^-]+-[^-]+-[^-]+ ]]; }
+
+# ============================== Registro de TC ===============================
+# Arquivo key=value .tc contém:
+# name, type(native|cross), triplet, root, sysroot, priority, stage(0|1|2|),
+# cc,cxx,ld,ar,ranlib,strip,nm,objcopy,as,
+# compiler(gcc|clang), compiler_version, binutils_version, linker(lld|gold|ld),
+# libc(glibc|musl|unknown), libc_version
+
+_tc_tc_path()   { printf "%s/%s.tc" "$ADM_TC_DIR" "$1"; }
+_tc_tc_exists() { [[ -f "$(_tc_tc_path "$1")" ]]; }
+
+_tc_tc_save() {
+  local name="$1" arrname="$2"
+  declare -n T="$arrname"
+  mkdir -p -- "$ADM_TC_DIR" || { adm_log_error "Sem acesso a $ADM_TC_DIR"; return 1; }
+  T[name]="$name"
+  _tc_kv_write "$(_tc_tc_path "$name")" T || return 1
+  adm_log_success "Toolchain registrado: $name"
+}
+
+_tc_tc_load() {
+  local name="$1" arrname="$2"
+  _tc_kv_read "$(_tc_tc_path "$name")" "$arrname"
+}
+
+# ============================== Scan Nativo ==================================
+_tc_scan_native() {
+  # Procura gcc/clang nativos e binutils
+  local cc="" cxx="" compiler="" cver="" trip="" ld="" ld_id="" bver=""
+  if _tc_have gcc; then
+    compiler="gcc"; cc="gcc"; cxx=$(_tc_have g++ && echo g++ || echo "")
+    cver="$(_tc_gcc_version gcc)"
+    trip="$(_tc_gcc_triplet gcc)"
+  fi
+  if _tc_have clang; then
+    # prefer clang se não há gcc, ou manter ambos (criamos dois registros)
+    local cverc="$(_tc_clang_version clang)"
+    local tripc="$(_tc_clang_triplet clang)"
+    # clang como toolchain próprio
+    declare -A T=(
+      [type]="native" [compiler]="clang" [compiler_version]="$cverc"
+      [triplet]="$tripc" [priority]="50"
+      [cc]="clang" [cxx]="$(_tc_have clang++ && echo clang++ || echo "")"
+      [ar]="$(_tc_have llvm-ar && echo llvm-ar || echo ar)"
+      [ranlib]="$(_tc_have llvm-ranlib && echo llvm-ranlib || echo ranlib)"
+      [strip]="$(_tc_have llvm-strip && echo llvm-strip || echo strip)"
+      [nm]="$(_tc_have llvm-nm && echo llvm-nm || echo nm)"
+      [objcopy]="$(_tc_have llvm-objcopy && echo llvm-objcopy || echo objcopy)"
+      [as]="$(_tc_have llvm-as && echo llvm-as || echo as)"
+    )
+    # linker preferido
+    if _tc_have ld.lld; then T[ld]="ld.lld"; T[linker]="lld"; T[binutils_version]="$(_tc_binutils_version ld.lld)"; else T[ld]="ld"; T[linker]="ld"; T[binutils_version]="$(_tc_binutils_version ld)"; fi
+    # libc
+    eval "$(_tc_detect_libc ldd)"
+    T[libc]="${libc:-unknown}"; T[libc_version]="${libc_version:-}"
+    # stage (heurística: presença de toolchain/stage*)
+    if [[ -d "$ADM_ROOT/toolchain/stage2/bin" ]]; then T[stage]="2"
+    elif [[ -d "$ADM_ROOT/toolchain/stage1/bin" ]]; then T[stage]="1"
+    elif [[ -d "$ADM_ROOT/toolchain/stage0/bin" ]]; then T[stage]="0"
+    else T[stage]="" ; fi
+    _tc_tc_save "native-clang" T
+  fi
+
+  if _tc_have gcc; then
+    declare -A T=(
+      [type]="native" [compiler]="gcc" [compiler_version]="$cver"
+      [triplet]="$trip" [priority]="40"
+      [cc]="$cc" [cxx]="$cxx"
+      [ar]="ar" [ranlib]="ranlib" [strip]="strip" [nm]="nm" [objcopy]="objcopy" [as]="as"
+    )
+    if _tc_have ld.gold; then T[ld]="ld.gold"; T[linker]="gold"; T[binutils_version]="$(_tc_binutils_version ld.gold)"; 
+    elif _tc_have ld.lld; then T[ld]="ld.lld"; T[linker]="lld"; T[binutils_version]="$(_tc_binutils_version ld.lld)";
+    else T[ld]="ld"; T[linker]="ld"; T[binutils_version]="$(_tc_binutils_version ld)"; fi
+    eval "$(_tc_detect_libc ldd)"
+    T[libc]="${libc:-unknown}"; T[libc_version]="${libc_version:-}"
+    if [[ -d "$ADM_ROOT/toolchain/stage2/bin" ]]; then T[stage]="2"
+    elif [[ -d "$ADM_ROOT/toolchain/stage1/bin" ]]; then T[stage]="1"
+    elif [[ -d "$ADM_ROOT/toolchain/stage0/bin" ]]; then T[stage]="0"
+    else T[stage]="" ; fi
+    _tc_tc_save "native-gcc" T
+  fi
+
+  if ! _tc_have gcc && ! _tc_have clang; then
+    adm_log_warn "Nenhum compilador nativo encontrado no PATH."
+    return 1
+  fi
+}
+
+# ============================== Scan Cross ===================================
+_tc_scan_cross_from_cc() {
+  # $1=cc path (ex: aarch64-linux-gnu-gcc)
+  local cc="$1"; local name trip compiler cver
+  compiler="gcc"; [[ "$cc" =~ clang ]] && compiler="clang"
+  if [[ "$compiler" == "gcc" ]]; then
+    trip="$(_tc_gcc_triplet "$cc")"; cver="$(_tc_gcc_version "$cc")"
+  else
+    trip="$(_tc_clang_triplet "$cc")"; cver="$(_tc_clang_version "$cc")"
+  fi
+  [[ -z "$trip" ]] && { adm_log_warn "Não foi possível obter triplet para $cc"; return 1; }
+  name="cross-${trip}-${compiler}"
+  local prefix="${trip}-"
+  # Descobrir ferramentas com prefixo
+  local cxx="" ld="" ar="" ranlib="" strip="" nm="" objcopy="" as=""
+  if command -v "${prefix}g++" >/dev/null 2>&1; then cxx="${prefix}g++"; fi
+  if command -v "${prefix}clang++" >/dev/null 2>&1; then cxx="${prefix}clang++"; fi
+
+  if command -v "${prefix}ld.lld" >/dev/null 2>&1; then ld="${prefix}ld.lld"; linker="lld"
+  elif command -v "${prefix}ld.gold" >/dev/null 2>&1; then ld="${prefix}ld.gold"; linker="gold"
+  elif command -v "${prefix}ld" >/dev/null 2>&1; then ld="${prefix}ld"; linker="ld"
+  else ld=""; linker=""; fi
+
+  for t in ar ranlib strip nm objcopy as; do
+    if command -v "${prefix}${t}" >/dev/null 2>&1; then
+      eval "$t='${prefix}${t}'"
+    else
+      eval "$t=''"
+    fi
+  done
+
+  # sysroot (heurística)
+  local sysroot=""
+  if [[ "$compiler" == "gcc" ]]; then
+    sysroot="$(_tc_try "$cc" --print-sysroot | head -n1)"
+  else
+    sysroot="$(_tc_try "$cc" --print-sysroot | head -n1)"
+  fi
+
+  # libc do target é difícil sem sysroot; registrar unknown e permitir override
+  declare -A T=(
+    [type]="cross" [triplet]="$trip" [compiler]="$compiler" [compiler_version]="$cver"
+    [priority]="30" [cc]="$cc" [cxx]="$cxx" [ld]="$ld" [ar]="$ar" [ranlib]="$ranlib" [strip]="$strip" [nm]="$nm" [objcopy]="$objcopy" [as]="$as"
+    [sysroot]="$sysroot" [root]="" [linker]="${linker:-}"
+    [libc]="unknown" [libc_version]="" [stage]=""
+  )
+  if [[ -n "$ld" ]]; then T[binutils_version]="$(_tc_binutils_version "$ld")"; else T[binutils_version]="" ; fi
+  _tc_tc_save "$name" T
+}
+
+_tc_scan_cross() {
+  # Heurística: procurar *-gcc e *-clang no PATH
+  local p cc
+  IFS=: read -r -a _PATH <<< "${PATH:-}"
+  declare -A seen=()
+  for p in "${_PATH[@]}"; do
+    [[ -d "$p" ]] || continue
+    while IFS= read -r -d '' cc; do
+      local base="$(basename "$cc")"
+      # match triplet prefixado
+      if [[ "$base" =~ ^([^-]+-[^-]+-[^-]+)-gcc$ || "$base" =~ ^([^-]+-[^-]+-[^-]+)-clang$ ]]; then
+        local key="${BASH_REMATCH[1]}"
+        [[ -n "${seen[$key]:-}" ]] && continue
+        seen["$key"]=1
+        _tc_scan_cross_from_cc "$cc" || true
+      fi
+    done < <(find "$p" -maxdepth 1 -type f -executable \( -name "*-gcc" -o -name "*-clang" \) -print0 2>/dev/null)
+  done
+}
+
+# ============================== Lista/Show ===================================
+tc_list() {
+  mkdir -p -- "$ADM_TC_DIR" || { adm_log_error "Sem acesso a $ADM_TC_DIR"; return 1; }
+  local active=""; [[ -f "$ADM_TC_ACTIVE_NAME" ]] && active="$(cat "$ADM_TC_ACTIVE_NAME" 2>/dev/null || true)"
+  printf "Toolchains em %s\n" "$ADM_TC_DIR"
+  local f name
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f" .tc)"
+    if [[ "$name" == "$active" ]]; then
+      printf "  * %s\n" "$name"
+    else
+      printf "    %s\n" "$name"
+    fi
+  done < <(find "$ADM_TC_DIR" -maxdepth 1 -type f -name "*.tc" -print0 | sort -z)
+}
+
+tc_show() {
+  local name="$1"
+  [[ -z "$name" ]] && { adm_log_error "Uso: show <name>"; return 2; }
+  local f="$(_tc_tc_path "$name")"
+  [[ -f "$f" ]] || { adm_log_error "Toolchain não encontrado: $name"; return 1; }
+  printf "== %s ==\n" "$name"; cat "$f"
+}
+
+# ============================== Set/Env/Best =================================
+tc_set_active() {
+  local name="$1"
+  [[ -z "$name" ]] && { adm_log_error "Uso: set <name>"; return 2; }
+  _tc_tc_exists "$name" || { adm_log_error "Toolchain não encontrado: $name"; return 1; }
+  declare -A T=()
+  _tc_tc_load "$name" T
+  _tc_kv_write "$ADM_TC_ACTIVE_EFFECTIVE" T
+  printf "%s\n" "$name" > "$ADM_TC_ACTIVE_NAME"
+  ln -sfn -- "$(_tc_tc_path "$name")" "$ADM_TC_ACTIVE_LINK"
+  adm_log_success "Toolchain ativo: $name"
+}
+
+tc_env() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    [[ -f "$ADM_TC_ACTIVE_NAME" ]] || { adm_log_error "Nenhum toolchain ativo."; return 1; }
+    name="$(cat "$ADM_TC_ACTIVE_NAME" 2>/dev/null || true)"
+  fi
+  declare -A T=()
+  _tc_tc_load "$name" T
+  # exports
+  cat <<EOF
+export CC="${T[cc]:-cc}"
+export CXX="${T[cxx]:-c++}"
+export AR="${T[ar]:-ar}"
+export RANLIB="${T[ranlib]:-ranlib}"
+export STRIP="${T[strip]:-strip}"
+export NM="${T[nm]:-nm}"
+export OBJCOPY="${T[objcopy]:-objcopy}"
+export AS="${T[as]:-as}"
+# Linker preferido (pode ser respeitado por flags -fuse-ld)
+export ADM_TC_LINKER="${T[linker]:-}"
+# Info adicional
+export ADM_TC_NAME="${T[name]:-}"
+export ADM_TC_TYPE="${T[type]:-}"
+export ADM_TC_TRIPLET="${T[triplet]:-}"
+export ADM_TC_LIBC="${T[libc]:-}"
+export ADM_TC_LIBC_VERSION="${T[libc_version]:-}"
+export ADM_TC_COMPILER="${T[compiler]:-}"
+export ADM_TC_COMPILER_VERSION="${T[compiler_version]:-}"
+export ADM_TC_BINUTILS_VERSION="${T[binutils_version]:-}"
+export ADM_TC_SYSROOT="${T[sysroot]:-}"
+EOF
+}
+
+# Seleção do "melhor" toolchain conforme preferências
+tc_best() {
+  local pref_compiler="" pref_linker="" pref_libc="" want_static=""
+  while (( $# )); do
+    case "$1" in
+      --compiler=*) pref_compiler="${1#--compiler=}" ;;
+      --linker=*)   pref_linker="${1#--linker=}" ;;
+      --libc=*)     pref_libc="${1#--libc=}" ;;
+      --static=*)   want_static="${1#--static=}" ;; # hint para perfis
+      *) adm_log_warn "Ignorando arg: $1" ;;
+    esac
+    shift || true
+  done
+
+  mkdir -p -- "$ADM_TC_DIR" || { adm_log_error "Sem acesso a $ADM_TC_DIR"; return 1; }
+  local best="" best_score=-999
+  local f name
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f" .tc)"
+    declare -A T=(); _tc_kv_read "$f" T || continue
+    local score=0
+    # prioridade base
+    local prio="${T[priority]:-0}"; [[ "$prio" =~ ^-?[0-9]+$ ]] || prio=0
+    score=$((score + prio))
+    # preferências
+    [[ -n "$pref_compiler" && "${T[compiler]:-}" == "$pref_compiler" ]] && score=$((score+15))
+    [[ -n "$pref_linker"   && "${T[linker]:-}"   == "$pref_linker"   ]] && score=$((score+8))
+    [[ -n "$pref_libc"     && "${T[libc]:-}"     == "$pref_libc"     ]] && score=$((score+10))
+    # nativo ganha um pouco
+    [[ "${T[type]:-}" == "native" ]] && score=$((score+5))
+    # stage mais alto ganha
+    case "${T[stage]:-}" in 2) score=$((score+3));; 1) score=$((score+1));; esac
+    # linker conhecido
+    [[ -n "${T[ld]:-}" ]] && score=$((score+2))
+    if (( score > best_score )); then best="$name"; best_score="$score"; fi
+  done < <(find "$ADM_TC_DIR" -maxdepth 1 -type f -name "*.tc" -print0 2>/dev/null)
+
+  if [[ -z "$best" ]]; then
+    adm_log_error "Nenhum toolchain registrado."
+    return 1
+  fi
+  printf "%s\n" "$best"
+}
+
+# (continuação do arquivo /usr/src/adm/scripts/14-toolchain-db)
+
+# ================================ Doctor =====================================
+tc_doctor() {
+  mkdir -p -- "$ADM_TC_DIR" || { adm_log_error "Sem acesso a $ADM_TC_DIR"; return 1; }
+  local failed=0
+  local f name
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f" .tc)"
+    declare -A T=()
+    _tc_kv_read "$f" T || { adm_log_error "Falha ao ler $f"; failed=$((failed+1)); continue; }
+
+    # Checagens mínimas
+    local ok=true
+    [[ -z "${T[cc]:-}" ]]  && { adm_log_error "[$name] CC ausente"; ok=false; }
+    [[ -n "${T[cc]:-}" && ! $(command -v "${T[cc]}") ]] && { adm_log_error "[$name] CC não encontrado no PATH: ${T[cc]}"; ok=false; }
+    [[ -n "${T[cxx]:-}" && ! $(command -v "${T[cxx]}") ]] && { adm_log_warn  "[$name] CXX não encontrado no PATH: ${T[cxx]}"; }
+    [[ -n "${T[ld]:-}"  && ! $(command -v "${T[ld]}")  ]] && { adm_log_warn  "[$name] LD não encontrado no PATH: ${T[ld]}"; }
+    [[ -n "${T[ar]:-}"  && ! $(command -v "${T[ar]}")  ]] && { adm_log_warn  "[$name] AR não encontrado no PATH: ${T[ar]}"; }
+    [[ -n "${T[ranlib]:-}" && ! $(command -v "${T[ranlib]}") ]] && { adm_log_warn "[$name] RANLIB não encontrado: ${T[ranlib]}"; }
+
+    if [[ "$ok" == "true" ]]; then
+      adm_log_success "[OK] $name (${T[compiler]:-?} ${T[compiler_version]:-?} / ${T[triplet]:-?})"
+    else
+      failed=$((failed+1))
+    fi
+  done < <(find "$ADM_TC_DIR" -maxdepth 1 -type f -name "*.tc" -print0 2>/dev/null)
+
+  if (( failed>0 )); then
+    adm_log_error "Doctor encontrou $failed toolchain(s) com problemas."
+    return 1
+  fi
+  adm_log_success "Todos os toolchains estão válidos."
+}
+
+# ================================ Init/Scan ==================================
+tc_init() {
+  mkdir -p -- "$ADM_TC_DIR" || { adm_log_error "Sem acesso a $ADM_TC_DIR"; return 1; }
+  adm_log_success "Diretório de toolchain inicializado: $ADM_TC_DIR"
+}
+
+tc_scan() {
+  tc_init || return 1
+  adm_log_info "Escaneando toolchain nativo..."
+  _tc_scan_native || true
+  adm_log_info "Escaneando toolchains cross no PATH..."
+  _tc_scan_cross  || true
+  adm_log_success "Scan concluído."
+  # definir ativo se nenhum
+  if [[ ! -f "$ADM_TC_ACTIVE_NAME" ]]; then
+    local best; best="$(tc_best || true)"
+    if [[ -n "$best" ]]; then
+      tc_set_active "$best" || true
+    fi
+  fi
+}
+
+# ================================ CLI/MAIN ===================================
+tc_usage() {
+  cat <<'USAGE'
+Uso: 14-toolchain-db <comando> [opções]
+
+Comandos:
+  init                 Inicializa o diretório do DB de toolchains.
+  scan                 Varre o sistema e registra toolchains nativos e cross.
+  list                 Lista toolchains registrados; marca o ativo com '*'.
+  show <name>          Mostra conteúdo (key=value) do toolchain.
+  set <name>           Define toolchain ativo.
+  env [name]           Imprime exports de ambiente do toolchain (ativo ou <name>).
+  doctor               Valida toolchains (binários, PATH).
+  best [--compiler=clang|gcc] [--linker=lld|gold|ld] [--libc=glibc|musl] [--static=bool]
+                       Escolhe o melhor nome com base nas preferências.
+
+Exemplos:
+  14-toolchain-db scan
+  14-toolchain-db list
+  14-toolchain-db set native-clang
+  eval "$(/usr/src/adm/scripts/14-toolchain-db env)"
+  14-toolchain-db best --compiler=clang --linker=lld
+USAGE
+}
+
+tc_main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)   tc_init ;;
+    scan)   tc_scan ;;
+    list)   tc_list ;;
+    show)   tc_show "${1:-}" ;;
+    set)    tc_set_active "${1:-}" ;;
+    env)    tc_env "${1:-}" ;;
+    doctor) tc_doctor ;;
+    best)   tc_best "$@" ;;
+    ""|-h|--help|help) tc_usage ;;
+    *)      adm_log_error "Comando desconhecido: $cmd"; tc_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  tc_main "$@"
+fi
