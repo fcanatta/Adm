@@ -1,0 +1,12 @@
+name=musl
+version=1.2.5
+category=sys
+run_deps=
+build_deps=sys/linux-headers
+opt_deps=
+num_builds=0
+description=Lightweight, fast, simple libc for Linux
+homepage=https://musl.libc.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz,https://musl.cc/releases/musl-1.2.5.tar.gz
