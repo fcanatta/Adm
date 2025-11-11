@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Remove alias/links que este pacote cria
+rm -f /usr/bin/cmake3 2>/dev/null || true
