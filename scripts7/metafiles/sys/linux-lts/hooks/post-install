@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ADM_SCRIPTS:=/usr/src/adm/scripts}"
+ADM_MKINIT="${ADM_SCRIPTS}/adm-mkinitramfs"
+
+KVER="$(ls -1 /lib/modules 2>/dev/null | sort -V | tail -n1 || true)"
+[[ -z "$KVER" ]] && exit 0
+
+if [[ -x "$ADM_MKINIT" ]]; then
+  "$ADM_MKINIT" --kver="$KVER" --hostonly --compress=zstd || "$ADM_MKINIT" --kver="$KVER" --compress=zstd || true
+fi
