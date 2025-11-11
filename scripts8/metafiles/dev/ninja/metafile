@@ -1,0 +1,12 @@
+name=ninja
+version=1.12.1
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Small build system with a focus on speed
+homepage=https://ninja-build.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/ninja-build/ninja/archive/refs/tags/v1.12.1.tar.gz
