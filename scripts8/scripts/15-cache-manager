@@ -1,0 +1,724 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/15-cache-manager
+# -----------------------------------------------------------------------------
+# ADM - Cache Manager (sources e packages)
+# - Diretórios: $ADM_CACHE/sources, $ADM_CACHE/packages
+# - Índices:    index.tsv (TAB: type  key  path  size  sha256  atime  mtime  meta)
+# - Metadados:  <arquivo>.meta (key=value: url=, sha256=, category=, name=, version=)
+# - Cotas:      CACHE_MAX_SIZE (bytes); política de GC: LRU + idade + peso
+# - Download:   curl/wget com retomada; .partial; verificação sha256; move atômico
+# - Locks:      por chave; evita corrida/arquivos corrompidos
+# - CLI: init, stat, list, add, get, fetch, verify, prune, gc, import, export, clean, doctor
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CACHE:=$ADM_ROOT/cache}"
+: "${ADM_CACHE_SOURCES:=$ADM_CACHE/sources}"
+: "${ADM_CACHE_PACKAGES:=$ADM_CACHE/packages}"
+: "${ADM_STATE:=$ADM_ROOT/state}"
+: "${ADM_STATE_CHECKSUMS:=$ADM_STATE/checksums}"
+
+INDEX_SOURCES="$ADM_CACHE_SOURCES/index.tsv"
+INDEX_PACKAGES="$ADM_CACHE_PACKAGES/index.tsv"
+
+: "${CACHE_MAX_SIZE:=10737418240}"   # 10 GiB default (pode vir do config)
+: "${CACHE_KEEP_VERSIONS:=3}"
+
+# ============================== Logger (fallback) =============================
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _CM_COLOR=${ADM_COLOR:-auto}
+  _CM_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _CM_COLOR=false; fi
+  if [[ "$_CM_COLOR" == "auto" ]]; then
+    _CM_COLOR=$([[ "$_CM_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_CM_COLOR" == "true" ]]; then
+    __c_red=$'\033[31m'; __c_grn=$'\033[32m'; __c_yel=$'\033[33m'
+    __c_blu=$'\033[34m'; __c_dim=$'\033[2m' ; __c_rst=$'\033[0m'
+  else
+    __c_red=""; __c_grn=""; __c_yel=""; __c_blu=""; __c_dim=""; __c_rst=""
+  fi
+  _c_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_c_ts)" "$__c_dim" "$__c_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_c_ts)" "$__c_blu" "$__c_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_c_ts)" "$__c_yel" "$__c_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_c_ts)" "$__c_red" "$__c_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_c_ts)" "$__c_grn" "$__c_rst" "$*" >&2; }
+fi
+
+# ============================== Utilidades ===================================
+
+_cm_trim(){ printf "%s" "$(printf "%s" "$*" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"; }
+_cm_now(){ date +%s; }
+
+_cm_hsize(){
+  local b="${1:-0}" u=(B KiB MiB GiB TiB) i=0
+  while (( b>=1024 && i<${#u[@]}-1 )); do b=$((b/1024)); i=$((i+1)); done
+  printf "%d %s" "$b" "${u[$i]}"
+}
+
+_cm_sha256(){
+  local f="$1"
+  sha256sum -- "$f" 2>/dev/null | awk '{print $1}'
+}
+
+_cm_file_size(){
+  stat -c '%s' -- "$1" 2>/dev/null || stat -f '%z' -- "$1" 2>/dev/null || echo 0
+}
+
+_cm_mkparents(){
+  mkdir -p -- "$1" 2>/dev/null || { adm_log_error "Falha ao criar dir: $1"; return 1; }
+}
+
+_cm_atomic_move(){
+  local src="$1" dst="$2"
+  mv -f -- "$src" "$dst" 2>/dev/null || { adm_log_error "Falha ao mover $src → $dst"; return 1; }
+}
+
+_cm_touch(){
+  touch -c -- "$1" 2>/dev/null || true
+}
+
+# lock por chave (arquivo)
+_cm_lock_acquire(){
+  local name="$1"
+  local lockdir="$ADM_STATE/locks"; _cm_mkparents "$lockdir" || return 1
+  local lf="$lockdir/cache-$name.lockdir"
+  if mkdir "$lf" 2>/dev/null; then
+    echo "$$" > "$lf/pid"
+    echo "$(_cm_now)" > "$lf/when"
+    adm_log_debug "Lock OK: $name"
+  else
+    adm_log_warn "Aguardando lock: $name"
+    # espera simples (timeout 300s)
+    local t=0
+    while ! mkdir "$lf" 2>/dev/null; do
+      sleep 1; t=$((t+1))
+      if (( t>300 )); then adm_log_error "Timeout lock: $name"; return 1; fi
+    done
+    echo "$$" > "$lf/pid"
+    echo "$(_cm_now)" > "$lf/when"
+  fi
+}
+
+_cm_lock_release(){
+  local name="$1"
+  local lf="$ADM_STATE/locks/cache-$name.lockdir"
+  rm -rf -- "$lf" 2>/dev/null || adm_log_warn "Falha ao soltar lock: $name"
+}
+
+# ============================== Índice =======================================
+
+# linhas: type<TAB>key<TAB>path<TAB>size<TAB>sha256<TAB>atime<TAB>mtime<TAB>meta
+_cm_index_init(){
+  local idx="$1" dir="$(dirname -- "$1")"
+  _cm_mkparents "$dir" || return 1
+  [[ -f "$idx" ]] || : > "$idx"
+}
+
+_cm_index_add(){
+  local idx="$1" type="$2" key="$3" path="$4" size="$5" sha="$6" meta="$7"
+  local atime="$(_cm_now)" mtime="$atime"
+  # remove anteriores do mesmo key
+  _cm_index_remove_key "$idx" "$key" || true
+  printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$type" "$key" "$path" "$size" "$sha" "$atime" "$mtime" "$meta" >> "$idx" \
+    || { adm_log_error "Falha ao escrever índice: $idx"; return 1; }
+}
+
+_cm_index_remove_key(){
+  local idx="$1" key="$2"
+  [[ -f "$idx" ]] || return 0
+  awk -F'\t' -v k="$key" 'NF && $2!=k {print $0}' "$idx" > "$idx.tmp" || return 1
+  mv -f -- "$idx.tmp" "$idx"
+}
+
+_cm_index_touch_key(){
+  local idx="$1" key="$2"
+  [[ -f "$idx" ]] || return 0
+  awk -F'\t' -v k="$key" -v now="$(_cm_now)" 'BEGIN{OFS="\t"} NF { if($2==k){$6=now;$7=now} ; print $0 }' "$idx" > "$idx.tmp" || return 1
+  mv -f -- "$idx.tmp" "$idx"
+}
+
+_cm_index_get_row(){
+  local idx="$1" key="$2"
+  [[ -f "$idx" ]] || return 1
+  awk -F'\t' -v k="$key" 'NF && $2==k {print $0; exit 0}' "$idx"
+}
+
+_cm_index_iter(){
+  local idx="$1"
+  [[ -f "$idx" ]] || return 0
+  cat "$idx"
+}
+
+# ============================== Chaves/Rotas =================================
+
+# key determinística para sources:
+#   sha se disponível → "sha256:<hash>"
+#   senão → "url:<sha256(url)>[:<fname>]"
+_cm_key_source(){
+  local url="$1" sha="${2:-}" fname="${3:-}"
+  if [[ -n "$sha" ]]; then
+    printf "sha256:%s" "$sha"
+    return 0
+  fi
+  # sha do URL: evita chars ruins
+  local uhash
+  uhash="$(printf "%s" "$url" | sha256sum | awk '{print $1}')"
+  if [[ -n "$fname" ]]; then
+    printf "url:%s:%s" "$uhash" "$fname"
+  else
+    printf "url:%s" "$uhash"
+  fi
+}
+
+# key para packages: "pkg:<name>-<version>[:<arch>][:<format>]"
+_cm_key_package(){
+  local name="$1" ver="$2" arch="${3:-}" fmt="${4:-}"
+  local k="pkg:${name}-${ver}"
+  [[ -n "$arch" ]] && k="$k:$arch"
+  [[ -n "$fmt"  ]] && k="$k:$fmt"
+  printf "%s" "$k"
+}
+
+_cm_source_dest_path(){
+  local fname="$1"
+  printf "%s/%s" "$ADM_CACHE_SOURCES" "$fname"
+}
+
+_cm_package_dest_path(){
+  local fname="$1"
+  printf "%s/%s" "$ADM_CACHE_PACKAGES" "$fname"
+}
+
+# ============================== Download/Fetch ================================
+
+_cm_downloader(){
+  if command -v curl >/dev/null 2>&1; then
+    echo "curl"
+  elif command -v wget >/dev/null 2>&1; then
+    echo "wget"
+  else
+    echo ""
+  fi
+}
+
+_cm_fetch_url(){
+  # $1=url $2=outpath (dest definitivo) $3=sha256 (opcional) $4=timeout(s)
+  local url="$1" dest="$2" expect_sha="${3:-}" to="${4:-0}"
+  local tmp="${dest}.partial"
+  local dl; dl="$(_cm_downloader)"
+  [[ -z "$dl" ]] && { adm_log_error "Sem curl/wget para baixar: $url"; return 1; }
+
+  adm_log_info "Baixando: $url → $dest"
+  if [[ "$dl" == "curl" ]]; then
+    local args=( -fL --retry 3 --retry-delay 2 -C - -o "$tmp" "$url" )
+    (( to>0 )) && args=( --max-time "$to" "${args[@]}" )
+    if ! curl "${args[@]}"; then
+      adm_log_error "curl falhou para $url"; rm -f -- "$tmp" 2>/dev/null || true; return 1
+    fi
+  else
+    local args=( -c - -O )
+    # wget não usa -O com -c sem -O -, então: -O "$tmp"
+    args=( -c -O "$tmp" )
+    (( to>0 )) && args=( --timeout="$to" "${args[@]}" )
+    if ! wget "${args[@]}" "$url"; then
+      adm_log_error "wget falhou para $url"; rm -f -- "$tmp" 2>/dev/null || true; return 1
+    fi
+  fi
+
+  if [[ -n "$expect_sha" ]]; then
+    local got; got="$(_cm_sha256 "$tmp")" || { adm_log_error "sha256sum falhou: $tmp"; return 1; }
+    if [[ "$got" != "$expect_sha" ]]; then
+      adm_log_error "SHA256 mismatch (got=$got expect=$expect_sha) em $url"
+      rm -f -- "$tmp" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  _cm_atomic_move "$tmp" "$dest" || return 1
+  return 0
+}
+
+# ============================== API Sources ==================================
+
+cache_sources_init(){
+  _cm_mkparents "$ADM_CACHE_SOURCES" || return 1
+  _cm_index_init "$INDEX_SOURCES" || return 1
+  adm_log_success "Cache de sources pronta: $ADM_CACHE_SOURCES"
+}
+
+cache_sources_add(){
+  # add arquivo já existente ao cache com metadados
+  # args: --file= --url= --sha256= --name= --version= --category=
+  local file="" url="" sha="" name="" ver="" cat=""
+  while (( $# )); do
+    case "$1" in
+      --file=*) file="${1#--file=}" ;;
+      --url=*)  url="${1#--url=}" ;;
+      --sha256=*) sha="${1#--sha256=}" ;;
+      --name=*) name="${1#--name=}" ;;
+      --version=*) ver="${1#--version=}" ;;
+      --category=*) cat="${1#--category=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  [[ -f "$file" ]] || { adm_log_error "Arquivo não encontrado: $file"; return 1; }
+  cache_sources_init || return 1
+
+  local fname; fname="$(basename -- "$file")"
+  local dest="$(_cm_source_dest_path "$fname")"
+  local key; key="$(_cm_key_source "${url:-$fname}" "$sha" "$fname")"
+
+  _cm_lock_acquire "src-$key" || return 1
+  trap '_cm_lock_release "src-'$key'"' RETURN
+
+  local sum="${sha:-$(_cm_sha256 "$file")}"
+  cp -f -- "$file" "$dest" || { adm_log_error "Falha ao copiar para cache: $dest"; return 1; }
+  local sz="$(_cm_file_size "$dest")"
+  local meta="url=${url:-};name=${name:-};version=${ver:-};category=${cat:-}"
+  _cm_index_add "$INDEX_SOURCES" "source" "$key" "$dest" "$sz" "$sum" "$meta" || return 1
+  printf "url=%s\nsha256=%s\nname=%s\nversion=%s\ncategory=%s\n" "${url:-}" "$sum" "${name:-}" "${ver:-}" "${cat:-}" > "${dest}.meta" || true
+  adm_log_success "Adicionado ao cache (sources): $fname"
+}
+
+cache_sources_fetch(){
+  # baixa e adiciona ao cache; reusa se existir e confere sha
+  # args: --url= --sha256= --name= --version= --category= [--timeout=]
+  local url="" sha="" name="" ver="" cat="" to="0"
+  while (( $# )); do
+    case "$1" in
+      --url=*) url="${1#--url=}" ;;
+      --sha256=*) sha="${1#--sha256=}" ;;
+      --name=*) name="${1#--name=}" ;;
+      --version=*) ver="${1#--version=}" ;;
+      --category=*) cat="${1#--category=}" ;;
+      --timeout=*) to="${1#--timeout=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$url" ]] || { adm_log_error "Obrigatório --url="; return 2; }
+
+  cache_sources_init || return 1
+  local fname; fname="$(basename -- "${url%%\?*}")"
+  local key; key="$(_cm_key_source "$url" "$sha" "$fname")"
+
+  _cm_lock_acquire "src-$key" || return 1
+  trap '_cm_lock_release "src-'$key'"' RETURN
+
+  # já no índice?
+  local row; row="$(_cm_index_get_row "$INDEX_SOURCES" "$key" || true)"
+  if [[ -n "$row" ]]; then
+    adm_log_info "Hit no cache (sources): $key"
+    _cm_index_touch_key "$INDEX_SOURCES" "$key" || true
+    local path sum
+    path="$(printf "%s" "$row" | awk -F'\t' '{print $3}')"
+    sum="$(printf "%s" "$row" | awk -F'\t' '{print $5}')"
+    if [[ -n "$sha" && "$sha" != "$sum" ]]; then
+      adm_log_warn "SHA diferente do índice. Revalidando arquivo…"
+      local got; got="$(_cm_sha256 "$path")" || return 1
+      if [[ "$got" != "$sha" ]]; then
+        adm_log_warn "Re-baixando (hash diverge do esperado)"
+        rm -f -- "$path" 2>/dev/null || true
+        # cai para download
+      else
+        adm_log_success "OK (hash confere)."
+        return 0
+      fi
+    else
+      adm_log_success "OK (cache reutilizado)."
+      return 0
+    fi
+  fi
+
+  # baixar
+  local dest="$(_cm_source_dest_path "$fname")"
+  _cm_fetch_url "$url" "$dest" "${sha:-}" "$to" || return 1
+  local sz="$(_cm_file_size "$dest")"
+  local sum="${sha:-$(_cm_sha256 "$dest")}"
+  local meta="url=$url;name=${name:-};version=${ver:-};category=${cat:-}"
+  _cm_index_add "$INDEX_SOURCES" "source" "$key" "$dest" "$sz" "$sum" "$meta" || return 1
+  printf "url=%s\nsha256=%s\nname=%s\nversion=%s\ncategory=%s\n" "$url" "$sum" "${name:-}" "${ver:-}" "${cat:-}" > "${dest}.meta" || true
+  adm_log_success "Download concluído e armazenado: $fname"
+}
+
+cache_sources_get(){
+  # retorna caminho (stdout) se existir na cache (por --url= / --sha256= / --key=)
+  local url="" sha="" key=""
+  while (( $# )); do
+    case "$1" in
+      --url=*) url="${1#--url=}" ;;
+      --sha256=*) sha="${1#--sha256=}" ;;
+      --key=*) key="${1#--key=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  cache_sources_init || return 1
+  if [[ -z "$key" ]]; then
+    if [[ -z "$url" && -z "$sha" ]]; then
+      adm_log_error "Informe --key= ou (--url=|--sha256=)"; return 2
+    fi
+    local fname=""; [[ -n "$url" ]] && fname="$(basename -- "${url%%\?*}")"
+    key="$(_cm_key_source "${url:-$fname}" "${sha:-}" "${fname:-}")"
+  fi
+  local row; row="$(_cm_index_get_row "$INDEX_SOURCES" "$key" || true)"
+  [[ -z "$row" ]] && { adm_log_error "Não encontrado na cache: $key"; return 1; }
+  _cm_index_touch_key "$INDEX_SOURCES" "$key" || true
+  printf "%s\n" "$(printf "%s" "$row" | awk -F'\t' '{print $3}')"
+}
+
+# ============================== API Packages =================================
+
+cache_packages_init(){
+  _cm_mkparents "$ADM_CACHE_PACKAGES" || return 1
+  _cm_index_init "$INDEX_PACKAGES" || return 1
+  adm_log_success "Cache de packages pronta: $ADM_CACHE_PACKAGES"
+}
+
+cache_packages_add(){
+  # args: --file= --name= --version= [--arch=] [--format=zst|xz] [--sha256=]
+  local file="" name="" ver="" arch="" fmt="" sha=""
+  while (( $# )); do
+    case "$1" in
+      --file=*) file="${1#--file=}" ;;
+      --name=*) name="${1#--name=}" ;;
+      --version=*) ver="${1#--version=}" ;;
+      --arch=*) arch="${1#--arch=}" ;;
+      --format=*) fmt="${1#--format=}" ;;
+      --sha256=*) sha="${1#--sha256=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  [[ -f "$file" ]] || { adm_log_error "Arquivo não encontrado: $file"; return 1; }
+  [[ -n "$name" && -n "$ver" ]] || { adm_log_error "Obrigatórios: --name= e --version="; return 2; }
+
+  cache_packages_init || return 1
+
+  local fname; fname="$(basename -- "$file")"
+  local dest="$(_cm_package_dest_path "$fname")"
+  local key; key="$(_cm_key_package "$name" "$ver" "$arch" "$fmt")"
+
+  _cm_lock_acquire "pkg-$key" || return 1
+  trap '_cm_lock_release "pkg-'$key'"' RETURN
+
+  local sum="${sha:-$(_cm_sha256 "$file")}"
+  cp -f -- "$file" "$dest" || { adm_log_error "Falha ao copiar para cache: $dest"; return 1; }
+  local sz="$(_cm_file_size "$dest")"
+  local meta="name=$name;version=$ver;arch=${arch:-};format=${fmt:-}"
+  _cm_index_add "$INDEX_PACKAGES" "package" "$key" "$dest" "$sz" "$sum" "$meta" || return 1
+  printf "name=%s\nversion=%s\narch=%s\nformat=%s\nsha256=%s\n" "$name" "$ver" "${arch:-}" "${fmt:-}" "$sum" > "${dest}.meta" || true
+  adm_log_success "Pacote adicionado ao cache: $fname"
+}
+
+cache_packages_get(){
+  # args: --name= --version= [--arch=] [--format=]  ou  --key=
+  local name="" ver="" arch="" fmt="" key=""
+  while (( $# )); do
+    case "$1" in
+      --name=*) name="${1#--name=}" ;;
+      --version=*) ver="${1#--version=}" ;;
+      --arch=*) arch="${1#--arch=}" ;;
+      --format=*) fmt="${1#--format=}" ;;
+      --key=*) key="${1#--key=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  cache_packages_init || return 1
+  if [[ -z "$key" ]]; then
+    [[ -n "$name" && -n "$ver" ]] || { adm_log_error "Informe --key= ou (--name= e --version=)"; return 2; }
+    key="$(_cm_key_package "$name" "$ver" "$arch" "$fmt")"
+  fi
+  local row; row="$(_cm_index_get_row "$INDEX_PACKAGES" "$key" || true)"
+  [[ -z "$row" ]] && { adm_log_error "Pacote não encontrado: $key"; return 1; }
+  _cm_index_touch_key "$INDEX_PACKAGES" "$key" || true
+  printf "%s\n" "$(printf "%s" "$row" | awk -F'\t' '{print $3}')"
+}
+
+# ============================== List/Stat/Verify =============================
+
+cache_list(){
+  local what="${1:-all}" ; shift || true
+  case "$what" in
+    sources|src)
+      [[ -f "$INDEX_SOURCES" ]] || { echo "vazio"; return 0; }
+      printf "type\tkey\tpath\tsize\tsha256\tatime\tmtime\tmeta\n"
+      cat "$INDEX_SOURCES"
+      ;;
+    packages|pkg)
+      [[ -f "$INDEX_PACKAGES" ]] || { echo "vazio"; return 0; }
+      printf "type\tkey\tpath\tsize\tsha256\tatime\tmtime\tmeta\n"
+      cat "$INDEX_PACKAGES"
+      ;;
+    all|*)
+      echo "== sources =="; cache_list sources
+      echo "== packages =="; cache_list packages
+      ;;
+  esac
+}
+
+cache_stat(){
+  local ds="${ADM_CACHE_SOURCES}" dp="${ADM_CACHE_PACKAGES}"
+  local ss=0 sp=0 ns=0 np=0
+  [[ -d "$ds" ]] && ss=$(du -sk "$ds" 2>/dev/null | awk '{print $1*1024}')
+  [[ -d "$dp" ]] && sp=$(du -sk "$dp" 2>/dev/null | awk '{print $1*1024}')
+  [[ -f "$INDEX_SOURCES" ]] && ns=$(wc -l < "$INDEX_SOURCES")
+  [[ -f "$INDEX_PACKAGES" ]] && np=$(wc -l < "$INDEX_PACKAGES")
+  adm_log_info "Sources: $ns entradas, tamanho ~$(_cm_hsize $ss)"
+  adm_log_info "Packages: $np entradas, tamanho ~$(_cm_hsize $sp)"
+  local tot=$((ss+sp))
+  adm_log_info "Total: ~$(_cm_hsize $tot)  (cota: ~$(_cm_hsize ${CACHE_MAX_SIZE:-0}))"
+}
+
+cache_verify(){
+  local target="${1:-all}" ; shift || true
+  local idx=""
+  case "$target" in
+    sources|src) idx="$INDEX_SOURCES" ;;
+    packages|pkg) idx="$INDEX_PACKAGES" ;;
+    all|*) ;;
+  esac
+  local failed=0
+  if [[ -z "$idx" ]]; then
+    cache_verify sources || failed=$((failed+1))
+    cache_verify packages || failed=$((failed+1))
+    (( failed>0 )) && return 1 || return 0
+  fi
+  [[ -f "$idx" ]] || { adm_log_info "Índice vazio: $idx"; return 0; }
+  while IFS=$'\t' read -r type key path size sha atime mtime meta; do
+    [[ -z "$type" || ! -f "$path" ]] && { adm_log_warn "Arquivo ausente: $key ($path)"; failed=$((failed+1)); continue; }
+    local got; got="$(_cm_sha256 "$path")" || { adm_log_error "sha256 falhou: $path"; failed=$((failed+1)); continue; }
+    if [[ -n "$sha" && "$got" != "$sha" ]]; then
+      adm_log_error "HASH MISMATCH [$key]: got=$got expect=$sha ($path)"
+      failed=$((failed+1))
+    fi
+  done < "$idx"
+  (( failed>0 )) && { adm_log_error "Falhas de verificação: $failed"; return 1; }
+  adm_log_success "Verificação ok: $(basename "$idx")"
+}
+
+# (continuação do arquivo /usr/src/adm/scripts/15-cache-manager)
+
+# ============================== Prune / GC ===================================
+
+cache_prune(){
+  # remove entradas órfãs (arquivo não existe) e metas sem índice
+  local pruned=0
+  for idx in "$INDEX_SOURCES" "$INDEX_PACKAGES"; do
+    [[ -f "$idx" ]] || continue
+    awk -F'\t' 'NF{print $2"\t"$3}' "$idx" | while IFS=$'\t' read -r key path; do
+      [[ -f "$path" ]] || {
+        adm_log_warn "Removendo do índice (órfão): $key ($path)"
+        _cm_index_remove_key "$idx" "$key" || true
+        pruned=$((pruned+1))
+      }
+    done
+  done
+  # remove .meta sem arquivo
+  find "$ADM_CACHE" -type f -name "*.meta" 2>/dev/null | while read -r m; do
+    local d="${m%.meta}"
+    [[ -f "$d" ]] || { rm -f -- "$m" 2>/dev/null || true; }
+  done
+  adm_log_success "Prune concluído."
+}
+
+cache_gc(){
+  # respeita CACHE_MAX_SIZE: remove LRU mais antigo até caber
+  local cap="${CACHE_MAX_SIZE:-0}"
+  (( cap<=0 )) && { adm_log_info "GC: cota desativada (CACHE_MAX_SIZE<=0)"; return 0; }
+
+  # tamanho atual
+  local used=0
+  [[ -d "$ADM_CACHE" ]] && used=$(du -sk "$ADM_CACHE" 2>/dev/null | awk '{print $1*1024}')
+  (( used<=cap )) && { adm_log_info "GC: uso ~$(_cm_hsize $used) ≤ cota ~$(_cm_hsize $cap)."; return 0; }
+
+  adm_log_info "GC: reduzindo de ~$(_cm_hsize $used) para ≤ ~$(_cm_hsize $cap)"
+  # compilar lista LRU de ambos índices
+  local tmplist; tmplist="$(mktemp)"
+  for idx in "$INDEX_SOURCES" "$INDEX_PACKAGES"; do
+    [[ -f "$idx" ]] || continue
+    awk -F'\t' -v SRC="$idx" 'NF{print $6"\t"$2"\t"$3"\t"SRC}' "$idx" >> "$tmplist"
+  done
+  # Ordena por atime crescente (mais velho primeiro)
+  sort -n "$tmplist" -o "$tmplist"
+
+  local freed=0
+  while read -r atime key path idx; do
+    (( used - freed <= cap )) && break
+    if [[ -f "$path" ]]; then
+      local sz; sz="$(_cm_file_size "$path")"
+      rm -f -- "$path" 2>/dev/null || { adm_log_warn "GC: não removeu $path"; continue; }
+      rm -f -- "${path}.meta" 2>/dev/null || true
+      _cm_index_remove_key "$idx" "$key" || true
+      freed=$((freed + sz))
+      adm_log_info "GC: removido $key (~$(_cm_hsize $sz))"
+    else
+      _cm_index_remove_key "$idx" "$key" || true
+    fi
+  done < "$tmplist"
+
+  rm -f -- "$tmplist" 2>/dev/null || true
+  local newused=0
+  [[ -d "$ADM_CACHE" ]] && newused=$(du -sk "$ADM_CACHE" 2>/dev/null | awk '{print $1*1024}')
+  adm_log_success "GC: liberado ~$(_cm_hsize $freed). Uso atual: ~$(_cm_hsize $newused)."
+}
+
+# ============================== Import/Export/Clean ==========================
+
+cache_import(){
+  # Importa arquivo para sources ou packages (detecta pelo sufixo ou --type=)
+  # args: --file= --type=sources|packages --meta-kv="k=v;..." [--key=]
+  local file="" type="" metav="" key=""
+  while (( $# )); do
+    case "$1" in
+      --file=*) file="${1#--file=}" ;;
+      --type=*) type="${1#--type=}" ;;
+      --meta-kv=*) metav="${1#--meta-kv=}" ;;
+      --key=*) key="${1#--key=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  [[ -f "$file" ]] || { adm_log_error "Arquivo não encontrado: $file"; return 1; }
+
+  local sum; sum="$(_cm_sha256 "$file")" || return 1
+  local sz;  sz="$(_cm_file_size "$file")"
+  local fname="$(basename -- "$file")"
+
+  case "$type" in
+    sources|src|"")
+      cache_sources_init || return 1
+      local dest="$(_cm_source_dest_path "$fname")"
+      cp -f -- "$file" "$dest" || { adm_log_error "Falha ao copiar para cache"; return 1; }
+      local k="${key:-$(_cm_key_source "$fname" "$sum" "$fname")}"
+      _cm_index_add "$INDEX_SOURCES" "source" "$k" "$dest" "$sz" "$sum" "${metav:-}" || return 1
+      printf "%s\n" "$metav" | tr ';' '\n' > "${dest}.meta" || true
+      adm_log_success "Importado em sources: $fname"
+      ;;
+    packages|pkg)
+      cache_packages_init || return 1
+      local dest="$(_cm_package_dest_path "$fname")"
+      cp -f -- "$file" "$dest" || { adm_log_error "Falha ao copiar para cache"; return 1; }
+      local k="${key:-pkg:${fname}}"
+      _cm_index_add "$INDEX_PACKAGES" "package" "$k" "$dest" "$sz" "$sum" "${metav:-}" || return 1
+      printf "%s\n" "$metav" | tr ';' '\n' > "${dest}.meta" || true
+      adm_log_success "Importado em packages: $fname"
+      ;;
+    *)
+      adm_log_error "Tipo inválido: $type"; return 2
+      ;;
+  esac
+}
+
+cache_export(){
+  # args: --key=  --outdir=
+  local key="" outdir=""
+  while (( $# )); do
+    case "$1" in
+      --key=*) key="${1#--key=}" ;;
+      --outdir=*) outdir="${1#--outdir=}" ;;
+      *) adm_log_warn "Arg desconhecido: $1" ;;
+    esac; shift || true
+  done
+  [[ -n "$key" && -n "$outdir" ]] || { adm_log_error "Uso: export --key= --outdir="; return 2; }
+  mkdir -p -- "$outdir" || { adm_log_error "Sem acesso a $outdir"; return 1; }
+
+  local row; row="$(_cm_index_get_row "$INDEX_SOURCES" "$key" || true)"
+  local path=""
+  if [[ -n "$row" ]]; then
+    path="$(printf "%s" "$row" | awk -F'\t' '{print $3}')"
+  else
+    row="$(_cm_index_get_row "$INDEX_PACKAGES" "$key" || true)"
+    [[ -n "$row" ]] && path="$(printf "%s" "$row" | awk -F'\t' '{print $3}')"
+  fi
+  [[ -z "$path" ]] && { adm_log_error "Chave não encontrada: $key"; return 1; }
+
+  cp -f -- "$path" "$outdir/" || { adm_log_error "Falha ao exportar: $path"; return 1; }
+  [[ -f "${path}.meta" ]] && cp -f -- "${path}.meta" "$outdir/" || true
+  adm_log_success "Exportado: $key → $outdir"
+}
+
+cache_clean(){
+  # remove arquivos temporários (.partial) e entradas quebradas
+  find "$ADM_CACHE" -type f -name "*.partial" -print0 2>/dev/null | xargs -0r rm -f -- || true
+  cache_prune || true
+  adm_log_success "Limpeza concluída."
+}
+
+# ============================== Doctor =======================================
+
+cache_doctor(){
+  local fail=0
+  # estrutura
+  for d in "$ADM_CACHE" "$ADM_CACHE_SOURCES" "$ADM_CACHE_PACKAGES"; do
+    [[ -d "$d" ]] || { adm_log_error "Diretório ausente: $d"; fail=$((fail+1)); }
+    [[ -w "$d" ]] || { adm_log_error "Sem escrita em: $d"; fail=$((fail+1)); }
+  done
+  # índices
+  for i in "$INDEX_SOURCES" "$INDEX_PACKAGES"; do
+    [[ -f "$i" ]] || { adm_log_warn "Índice ausente (ok em vazio): $i"; continue; }
+    awk -F'\t' 'NF==8' "$i" >/dev/null 2>&1 || { adm_log_error "Formato inválido de índice: $i"; fail=$((fail+1)); }
+  done
+  # verificação de hashes
+  cache_verify all || fail=$((fail+1))
+  (( fail>0 )) && { adm_log_error "Doctor encontrou $fail problema(s)."; return 1; }
+  adm_log_success "Cache OK."
+}
+
+# ============================== CLI / MAIN ===================================
+
+cache_usage(){
+  cat <<'USAGE'
+Uso: 15-cache-manager <comando> [opções]
+
+Comandos:
+  init                          Inicializa estrutura e índices.
+  stat                          Mostra estatísticas e uso de disco.
+  list [sources|packages|all]   Lista entradas.
+  add-source  --file= --url= [--sha256=] [--name=] [--version=] [--category=]
+  fetch-source --url= [--sha256=] [--name=] [--version=] [--category=] [--timeout=]
+  get-source [--key= | --url= | --sha256=]     Retorna caminho do arquivo.
+  add-package --file= --name= --version= [--arch=] [--format=] [--sha256=]
+  get-package [--key= | --name= --version= [--arch=] [--format=]]
+  verify [sources|packages|all] Verifica hashes.
+  prune                         Remove órfãos e entradas quebradas.
+  gc                            Executa coleta por cota (CACHE_MAX_SIZE).
+  import --file= [--type=sources|packages] [--meta-kv="k=v;..."] [--key=]
+  export --key= --outdir=
+  clean                         Remove .partial e roda prune.
+  doctor                        Valida cache, índices e hashes.
+
+Exemplos:
+  15-cache-manager init
+  15-cache-manager fetch-source --url=https://.../foo-1.0.tar.xz --sha256=ABC...
+  15-cache-manager get-source --sha256=ABC...
+  15-cache-manager add-package --file=/tmp/app-1.0.tar.zst --name=app --version=1.0 --format=zst
+  15-cache-manager gc
+USAGE
+}
+
+cache_main(){
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)          cache_sources_init; cache_packages_init ;;
+    stat)          cache_stat ;;
+    list)          cache_list "${1:-all}" ;;
+    add-source)    cache_sources_add "$@" ;;
+    fetch-source)  cache_sources_fetch "$@" ;;
+    get-source)    cache_sources_get "$@" ;;
+    add-package)   cache_packages_add "$@" ;;
+    get-package)   cache_packages_get "$@" ;;
+    verify)        cache_verify "${1:-all}" ;;
+    prune)         cache_prune ;;
+    gc)            cache_gc ;;
+    import)        cache_import "$@" ;;
+    export)        cache_export "$@" ;;
+    clean)         cache_clean ;;
+    doctor)        cache_doctor ;;
+    ""|-h|--help|help) cache_usage ;;
+    *)             adm_log_error "Comando desconhecido: $cmd"; cache_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  cache_main "$@"
+fi
