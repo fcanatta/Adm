@@ -1,3 +1,20 @@
+# ver perfis e qual está ativo
+adm paths profile list
+adm paths profile current
+
+# (re)criar/ajustar perfis prontos
+adm paths profile apply --name=minimum   --set TARGET=x86_64-linux-musl --set SYSROOT=/usr/x86_64-linux-musl --set CFLAGS="-O2 -pipe" --set CXXFLAGS="-O2 -pipe"
+adm paths profile apply --name=normal    --set CFLAGS="-O2 -fstack-protector-strong -pipe" --set CXXFLAGS="-O2 -fstack-protector-strong -pipe"
+adm paths profile apply --name=aggressive --set CFLAGS="-O3 -march=native -mtune=native -pipe -fomit-frame-pointer" --set CXXFLAGS="-O3 -march=native -mtune=native -pipe -fomit-frame-pointer"
+
+# escolher qual usar (vale para todos os builds do ADM)
+adm paths profile select minimum
+
+# Depois pode rodar
+adm install binutils-stage0
+adm install gcc-stage0
+# etc.
+
 # Caminho musl
 adm install linux-headers-stage0      --profile=minimum --jobs=8
 adm install binutils-stage0           --profile=minimum --jobs=8
