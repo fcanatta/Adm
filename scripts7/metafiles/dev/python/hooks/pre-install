@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${DESTDIR:?DESTDIR não definido}"
+: "${MAKE:=make}"
+
+# Instala o Python do target em /usr (rootfs)
+$MAKE install DESTDIR="${DESTDIR}"
+
+# Opcional: gerar binários "python3" e "pip3" symlinks idempotentes
+if [[ -x "${DESTDIR}/usr/bin/python3.13" && ! -e "${DESTDIR}/usr/bin/python3" ]]; then
+  ln -snf "python3.13" "${DESTDIR}/usr/bin/python3"
+fi
+# pip é instalado só se ensurepip estiver habilitado; por padrão desabilitamos no cross
