@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+: "${DESTDIR:=/}"
+
+if [[ -f include/config/kernel.release ]]; then
+    KERNEL_VERSION="$(cat include/config/kernel.release)"
+fi
+
+if [[ -z "${KERNEL_VERSION:-}" ]]; then
+    echo "[kernel performance] Aviso: versão desconhecida"
+    exit 0
+fi
+
+make O="${KBUILD_OUTPUT}" INSTALL_MOD_PATH="${DESTDIR}" modules_install
+echo "[kernel performance] módulos OK"
