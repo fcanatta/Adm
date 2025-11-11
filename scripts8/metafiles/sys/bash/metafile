@@ -1,0 +1,12 @@
+name=bash
+version=5.2.26
+category=sys
+run_deps=libs/readline,libs/ncurses
+build_deps=libs/readline,libs/ncurses
+opt_deps=
+num_builds=0
+description=GNU Bourne Again SHell
+homepage=https://www.gnu.org/software/bash/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bash/bash-5.2.26.tar.gz,https://ftpmirror.gnu.org/bash/bash-5.2.26.tar.gz
