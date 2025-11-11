@@ -1,0 +1,12 @@
+name=curl
+version=8.9.1
+category=apps
+run_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz
+build_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz,dev/pkgconf
+opt_deps=apps/ca-certificates
+num_builds=0
+description=Command line tool and library for transferring data with URLs
+homepage=https://curl.se
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://curl.se/download/curl-8.9.1.tar.xz,https://github.com/curl/curl/releases/download/curl-8_9_1/curl-8.9.1.tar.xz
