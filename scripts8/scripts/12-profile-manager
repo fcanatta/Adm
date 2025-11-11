@@ -1,0 +1,717 @@
+#!/usr/bin/env bash
+# /usr/src/adm/scripts/12-profile-manager
+# -----------------------------------------------------------------------------
+# ADM - Profile Manager (inteligente)
+# - Perfis key=value em /usr/src/adm/state/profiles/*.profile
+# - Criação auto de aggressive/normal/minimal
+# - Auto-optimized por hardware
+# - Aplicação ao ambiente (export vars)
+# - LTO/PGO/STATIC, musl/glibc, linker (lld/gold/ld)
+# - CLI: init, list, show, create, set, remove, export, import, clone, auto, tune, env, doctor
+# -----------------------------------------------------------------------------
+set -Eeuo pipefail
+
+# ============================== Logger (fallback) =============================
+
+if ! command -v adm_log_info >/dev/null 2>&1; then
+  _PM_COLOR=${ADM_COLOR:-auto}
+  _PM_TTY=$([[ -t 1 ]] && echo true || echo false)
+  if [[ "${NO_COLOR:-}" != "" ]]; then _PM_COLOR=false; fi
+  if [[ "$_PM_COLOR" == "auto" ]]; then
+    _PM_COLOR=$([[ "$_PM_TTY" == "true" ]] && echo true || echo false)
+  fi
+  if [[ "$_PM_COLOR" == "true" ]]; then
+    __pm_red=$'\033[31m'; __pm_grn=$'\033[32m'; __pm_yel=$'\033[33m'
+    __pm_blu=$'\033[34m'; __pm_dim=$'\033[2m' ; __pm_rst=$'\033[0m'
+  else
+    __pm_red=""; __pm_grn=""; __pm_yel=""; __pm_blu=""; __pm_dim=""; __pm_rst=""
+  fi
+  _pm_ts(){ date +"%H:%M:%S"; }
+  adm_log_debug(){ [[ "${ADM_DEBUG:-false}" == "true" ]] && printf "%s %b[DEBUG]%b %s\n" "$(_pm_ts)" "$__pm_dim" "$__pm_rst" "$*" >&2 || true; }
+  adm_log_info(){  printf "%s %b[INFO ]%b %s\n" "$(_pm_ts)" "$__pm_blu" "$__pm_rst" "$*" >&2; }
+  adm_log_warn(){  printf "%s %b[WARN ]%b %s\n" "$(_pm_ts)" "$__pm_yel" "$__pm_rst" "$*" >&2; }
+  adm_log_error(){ printf "%s %b[ERROR]%b %s\n" "$(_pm_ts)" "$__pm_red" "$__pm_rst" "$*" >&2; }
+  adm_log_success(){ printf "%s %b[SUCCESS]%b %s\n" "$(_pm_ts)" "$__pm_grn" "$__pm_rst" "$*" >&2; }
+fi
+
+# ============================== Constantes/Dirs ==============================
+
+: "${ADM_ROOT:=/usr/src/adm}"
+ADM_STATE="${ADM_STATE:-$ADM_ROOT/state}"
+ADM_STATE_PROFILES="${ADM_STATE_PROFILES:-$ADM_STATE/profiles}"
+
+ACTIVE_LINK="$ADM_STATE_PROFILES/ACTIVE"            # symlink → <name>.profile
+ACTIVE_NAME_FILE="$ADM_STATE_PROFILES/active.name"  # nome ativa
+ACTIVE_EFFECTIVE="$ADM_STATE_PROFILES/active.profile" # cópia efetiva (expandida)
+
+# Schema de perfil (key=value)
+# Chaves suportadas:
+#  name, base, libc(musl|glibc), static(true|false), lto(true|false), pgo(auto|off|gen|use),
+#  cc, cxx, ld, ar, ranlib, strip, nm, objcopy,
+#  cflags, cxxflags, ldflags, cppflags,
+#  jobs, ninja_jobs, pkg_config_path,
+#  package_format(zst|xz|both|none), zstd_level, xz_options,
+#  arch, march, mtune,
+#  optimize_level (O0|O1|O2|O3|Ofast),
+#  sanitize (empty|asan|ubsan|msan|tsan),
+#  color_diagnostics(true|false),
+#  prefer_linker(lld|gold|ld),
+#  prefer_compiler(clang|gcc),
+#  use_ccache(true|false)
+
+declare -A _PM_DEFAULT_BASE_aggressive=(
+  [base]="aggressive"
+  [optimize_level]="O3"
+  [lto]="true"
+  [pgo]="auto"
+  [static]="false"
+  [libc]="glibc"
+  [prefer_compiler]="clang"
+  [prefer_linker]="lld"
+  [color_diagnostics]="true"
+  [use_ccache]="true"
+  [package_format]="zst"
+  [zstd_level]="15"
+  [xz_options]="-6 -T0"
+)
+
+declare -A _PM_DEFAULT_BASE_normal=(
+  [base]="normal"
+  [optimize_level]="O2"
+  [lto]="false"
+  [pgo]="off"
+  [static]="false"
+  [libc]="glibc"
+  [prefer_compiler]="gcc"
+  [prefer_linker]="ld"
+  [color_diagnostics]="true"
+  [use_ccache]="true"
+  [package_format]="zst"
+  [zstd_level]="15"
+  [xz_options]="-6 -T0"
+)
+
+declare -A _PM_DEFAULT_BASE_minimal=(
+  [base]="minimal"
+  [optimize_level]="O0"
+  [lto]="false"
+  [pgo]="off"
+  [static]="false"
+  [libc]="musl"
+  [prefer_compiler]="gcc"
+  [prefer_linker]="ld"
+  [color_diagnostics]="false"
+  [use_ccache]="false"
+  [package_format]="zst"
+  [zstd_level]="3"
+  [xz_options]="-2 -T0"
+)
+
+# ============================== Utilidades KV ================================
+
+_pm_trim() {
+  local s="$*"
+  s="$(printf "%s" "$s" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+  printf "%s" "$s"
+}
+
+# Lê key=value para assoc array por nome
+_pm_kv_read() {
+  local file="$1" arrname="$2"
+  [[ -f "$file" ]] || { adm_log_error "Perfil não encontrado: $file"; return 1; }
+  declare -gA "$arrname" 2>/dev/null || true
+  local -n A="$arrname"
+  A=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      A["${BASH_REMATCH[1]}"]="$(_pm_trim "${BASH_REMATCH[2]}")"
+    else
+      adm_log_warn "Linha inválida em $file: $(printf %q "$line")"
+    fi
+  done < "$file"
+}
+
+# Escreve assoc array ordenado por chave (estável)
+_pm_kv_write() {
+  local file="$1" arrname="$2"
+  declare -n A="$arrname"
+  : > "$file" || { adm_log_error "Não abre para escrita: $file"; return 1; }
+  local k
+  IFS=$'\n' read -r -d '' -a _keys < <(printf "%s\n" "${!A[@]}" | sort && printf '\0')
+  for k in "${_keys[@]}"; do
+    printf "%s=%s\n" "$k" "${A[$k]}" >> "$file" || { adm_log_error "Falha ao gravar $k em $file"; return 1; }
+  done
+}
+
+# Atualiza/injeta pares k=v em array
+_pm_kv_upsert_pairs() {
+  local arrname="$1"; shift || true
+  declare -n A="$arrname"
+  local kv k v
+  for kv in "$@"; do
+    if [[ "$kv" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      k="${BASH_REMATCH[1]}"; v="${BASH_REMATCH[2]}"
+      A["$k"]="$(_pm_trim "$v")"
+    else
+      adm_log_warn "Par inválido (ignorado): $kv"
+    fi
+  done
+}
+
+# ============================== Detecção HW ==================================
+
+_pm_nproc() {
+  if command -v nproc >/dev/null 2>&1; then nproc; else getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1; fi
+}
+_pm_arch() { uname -m || echo unknown; }
+_pm_mem_total_kb() {
+  awk '/MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+# ========================== Helpers de Toolchain =============================
+
+_pm_have() { command -v "$1" >/dev/null 2>&1; }
+_pm_choose_linker() {
+  local prefer="${1:-}" chosen=""
+  case "$prefer" in
+    lld)  _pm_have ld.lld  && chosen="ld.lld" ;;
+    gold) _pm_have gold    && chosen="ld.gold" ;;
+    ld|*) _pm_have ld      && chosen="ld" ;;
+  esac
+  if [[ -z "$chosen" ]]; then
+    if _pm_have ld.lld; then chosen="ld.lld"
+    elif _pm_have ld.gold; then chosen="ld.gold"
+    elif _pm_have ld; then chosen="ld"
+    else adm_log_warn "Nenhum linker encontrado no PATH"; fi
+  fi
+  printf "%s" "$chosen"
+}
+_pm_choose_cc() {
+  local prefer="${1:-}"
+  case "$prefer" in
+    clang) _pm_have clang && { printf "clang"; return 0; } ;;
+    gcc)   _pm_have gcc   && { printf "gcc";   return 0; } ;;
+  esac
+  _pm_have clang && { printf "clang"; return 0; }
+  _pm_have gcc   && { printf "gcc";   return 0; }
+  printf ""
+}
+_pm_choose_cxx() {
+  local cc="$1"
+  case "$cc" in
+    clang) _pm_have clang++ && { printf "clang++"; return 0; } ;;
+    gcc)   _pm_have g++     && { printf "g++";     return 0; } ;;
+  esac
+  _pm_have clang++ && { printf "clang++"; return 0; }
+  _pm_have g++     && { printf "g++";     return 0; }
+  printf ""
+}
+
+# ============================ Construção de Flags ============================
+
+_pm_make_flags() {
+  # Entradas: assoc PROFILE; saída: define cflags, cxxflags, ldflags coerentes
+  local arrname="$1"; declare -n P="$arrname"
+  local arch="${P[arch]:-$(_pm_arch)}"
+  local opt="${P[optimize_level]:-O2}"
+  local march="${P[march]:-native}"
+  local mtune="${P[mtune]:-}"
+  local color="${P[color_diagnostics]:-true}"
+  local lto="${P[lto]:-false}"
+  local pgo="${P[pgo]:-off}"
+  local static="${P[static]:-false}"
+  local prefer_linker="${P[prefer_linker]:-ld}"
+  local ld chosen_ld
+  chosen_ld="$(_pm_choose_linker "$prefer_linker")"
+  ld="${P[ld]:-$chosen_ld}"
+
+  # Base C/C++ flags
+  local base="-pipe -march=$march"
+  [[ -n "$mtune" ]] && base="$base -mtune=$mtune"
+  case "$opt" in
+    O0|O1|O2|O3|Ofast) base="$base -$opt" ;;
+    *) adm_log_warn "optimize_level inválido: $opt, usando O2"; base="$base -O2" ;;
+  esac
+  [[ "$color" == "true" ]] && {
+    # clang: -fcolor-diagnostics; gcc: -fdiagnostics-color=always
+    if [[ "${P[prefer_compiler]:-gcc}" == "clang" ]] || _pm_have clang; then
+      P[cflags_extra]="${P[cflags_extra]:-} -fcolor-diagnostics"
+      P[cxxflags_extra]="${P[cxxflags_extra]:-} -fcolor-diagnostics"
+    else
+      P[cflags_extra]="${P[cflags_extra]:-} -fdiagnostics-color=always"
+      P[cxxflags_extra]="${P[cxxflags_extra]:-} -fdiagnostics-color=always"
+    fi
+  }
+
+  local lto_flags="" pgo_flags=""
+  [[ "$lto" == "true" ]] && lto_flags="-flto"
+  case "$pgo" in
+    gen) pgo_flags="-fprofile-generate" ;;
+    use) pgo_flags="-fprofile-use -fprofile-correction" ;;
+    auto) pgo_flags="" ;; # builder pode decidir
+    off|"") ;;
+    *) adm_log_warn "pgo inválido: $pgo";;
+  esac
+
+  local static_ld=""
+  [[ "$static" == "true" ]] && static_ld="-static"
+
+  # Linker flags preferidos
+  local ldflags="-Wl,--as-needed"
+  [[ "$ld" == "ld.lld" ]]  && ldflags="$ldflags -fuse-ld=lld"
+  [[ "$ld" == "ld.gold" ]] && ldflags="$ldflags -fuse-ld=gold"
+
+  # Compose
+  P[cflags]="${P[cflags]:-$base} ${P[cflags_extra]:-} $lto_flags $pgo_flags"
+  P[cxxflags]="${P[cxxflags]:-$base} ${P[cxxflags_extra]:-} $lto_flags $pgo_flags"
+  P[ldflags]="${P[ldflags]:-$static_ld $ldflags ${P[ldflags_extra]:-}}"
+  P[cppflags]="${P[cppflags]:-${P[cppflags_extra]:-}}"
+
+  # Limpeza de espaços
+  P[cflags]="$(echo "${P[cflags]}" | xargs || true)"
+  P[cxxflags]="$(echo "${P[cxxflags]}" | xargs || true)"
+  P[ldflags]="$(echo "${P[ldflags]}" | xargs || true)"
+  P[cppflags]="$(echo "${P[cppflags]}" | xargs || true)"
+
+  # Jobs/Ninja
+  local nproc="$(_pm_nproc)"
+  local jobs="${P[jobs]:-$nproc}"
+  local ninja_jobs="${P[ninja_jobs]:-$nproc}"
+  P[jobs]="$jobs"
+  P[ninja_jobs]="$ninja_jobs"
+
+  # cc/cxx se não setados
+  local cc="${P[cc]:-$(_pm_choose_cc "${P[prefer_compiler]:-}")}"
+  local cxx="${P[cxx]:-$(_pm_choose_cxx "$cc")}"
+  [[ -z "$cc"  ]] && adm_log_warn "Nenhum compilador C encontrado no PATH"
+  [[ -z "$cxx" ]] && adm_log_warn "Nenhum compilador C++ encontrado no PATH"
+  P[cc]="$cc"; P[cxx]="$cxx"; P[ld]="$ld"
+
+  # pkg-config e ccache
+  P[pkg_config_path]="${P[pkg_config_path]:-}"
+  P[use_ccache]="${P[use_ccache]:-true}"
+
+  # Ferramentas binutils (preferir do PATH)
+  for t in ar ranlib strip nm objcopy; do
+    [[ -z "${P[$t]:-}" ]] && P[$t]="$t"
+  done
+
+  # Formatos de pacote
+  P[package_format]="${P[package_format]:-zst}"
+  P[zstd_level]="${P[zstd_level]:-15}"
+  P[xz_options]="${P[xz_options]:--6 -T0}"
+}
+
+# =========================== Validação de Profile ============================
+
+_pm_profile_validate() {
+  local arrname="$1"; declare -n P="$arrname"
+  local ok=true
+  # libc
+  case "${P[libc]:-glibc}" in
+    glibc|musl) ;;
+    *) adm_log_warn "libc inválida: ${P[libc]} (usando glibc)"; P[libc]="glibc";;
+  esac
+  # booleans
+  for b in lto static color_diagnostics use_ccache; do
+    case "${P[$b]:-false}" in true|false) ;; *) adm_log_warn "$b inválido: ${P[$b]} (ajustando)"; P[$b]="false";; esac
+  done
+  # pgo
+  case "${P[pgo]:-off}" in off|gen|use|auto|"") ;; *) adm_log_warn "pgo inválido: ${P[pgo]}"; P[pgo]="off";; esac
+  # optimize_level
+  case "${P[optimize_level]:-O2}" in O0|O1|O2|O3|Ofast) ;; *) adm_log_warn "optimize_level inválido, usando O2"; P[optimize_level]="O2";; esac
+  # prefer_compiler/linker
+  case "${P[prefer_compiler]:-gcc}" in gcc|clang) ;; *) P[prefer_compiler]="gcc";; esac
+  case "${P[prefer_linker]:-ld}" in lld|gold|ld) ;; *) P[prefer_linker]="ld";; esac
+  # sanitize
+  case "${P[sanitize]:-}" in ""|asan|ubsan|msan|tsan) ;; *) adm_log_warn "sanitize inválido: ${P[sanitize]}"; P[sanitize]="";; esac
+  # jobs
+  [[ "${P[jobs]:-}" =~ ^[0-9]+$ ]] || P[jobs]=$(_pm_nproc)
+  [[ "${P[ninja_jobs]:-}" =~ ^[0-9]+$ ]] || P[ninja_jobs]=$(_pm_nproc)
+  # march/mtune
+  [[ -z "${P[march]:-}" ]] && P[march]="native"
+  # finalize flags
+  _pm_make_flags P
+  $ok
+}
+
+# ============================ Persistência/Paths =============================
+
+_pm_profiles_dir() {
+  printf "%s" "$ADM_STATE_PROFILES"
+}
+_pm_profile_path() {
+  local name="$1"
+  printf "%s/%s.profile" "$ADM_STATE_PROFILES" "$name"
+}
+_pm_profile_exists() {
+  [[ -f "$(_pm_profile_path "$1")" ]]
+}
+
+# Salva perfil
+_pm_profile_save() {
+  local name="$1" arrname="$2"
+  [[ -z "$name" ]] && { adm_log_error "Nome de profile vazio"; return 2; }
+  declare -n P="$arrname"
+  local f="$(_pm_profile_path "$name")"
+  mkdir -p -- "$ADM_STATE_PROFILES" || { adm_log_error "Não cria diretório de profiles"; return 1; }
+  P[name]="$name"
+  _pm_kv_write "$f" P || return 1
+  adm_log_success "Profile salvo: $name ($f)"
+}
+
+# Carrega perfil
+_pm_profile_load() {
+  local name="$1" arrname="$2"
+  local f="$(_pm_profile_path "$name")"
+  _pm_kv_read "$f" "$arrname"
+}
+
+# ============================ Defaults/AUTO/Init =============================
+
+_pm_profile_default_from_base() {
+  local base="$1" name="$2" arrname="$3"
+  declare -gA "$arrname" 2>/dev/null || true
+  declare -n P="$arrname"
+  P=()
+  case "$base" in
+    aggressive)
+      local k; for k in "${!_PM_DEFAULT_BASE_aggressive[@]}"; do P["$k"]="${_PM_DEFAULT_BASE_aggressive[$k]}"; done ;;
+    normal)
+      local k; for k in "${!_PM_DEFAULT_BASE_normal[@]}"; do P["$k"]="${_PM_DEFAULT_BASE_normal[$k]}"; done ;;
+    minimal|minimal|minimum)
+      local k; for k in "${!_PM_DEFAULT_BASE_minimal[@]}"; do P["$k"]="${_PM_DEFAULT_BASE_minimal[$k]}"; done ;;
+    *)
+      adm_log_warn "Base desconhecida '$base', usando 'normal'"; 
+      local k; for k in "${!_PM_DEFAULT_BASE_normal[@]}"; do P["$k"]="${_PM_DEFAULT_BASE_normal[$k]}"; done ;;
+  esac
+  P[name]="$name"
+  P[arch]="$(_pm_arch)"
+  # heurísticas iniciais
+  if [[ "$base" == "aggressive" ]]; then
+    P[march]="native"; P[mtune]="native"; P[lto]="true"; P[pgo]="auto"; P[color_diagnostics]="true"
+  elif [[ "$base" == "minimal" ]]; then
+    P[march]="generic"; P[optimize_level]="O0"; P[lto]="false"; P[pgo]="off"; P[color_diagnostics]="false"
+  else
+    P[march]="native"; P[optimize_level]="O2"
+  fi
+  _pm_profile_validate P
+}
+
+_pm_profile_auto_from_hw() {
+  # Cria perfil auto-optimized baseado no hardware
+  local name="${1:-auto-optimized}"
+  declare -gA AUTO=()
+  _pm_profile_default_from_base "normal" "$name" AUTO
+  local cores="$(_pm_nproc)"
+  local mem_kb="$(_pm_mem_total_kb)"
+  # Regras simples
+  if (( cores >= 8 )); then
+    AUTO[prefer_compiler]="clang"; AUTO[prefer_linker]="lld"
+    AUTO[lto]="true"; AUTO[optimize_level]="O3"
+  fi
+  if (( mem_kb < 2*1024*1024 )); then # < 2 GiB
+    AUTO[optimize_level]="O2"; AUTO[lto]="false"; AUTO[zstd_level]="3"; AUTO[xz_options]="-2 -T0"
+  fi
+  AUTO[jobs]="$cores"; AUTO[ninja_jobs]="$cores"
+  _pm_profile_validate AUTO
+  _pm_profile_save "$name" AUTO
+}
+
+pm_profiles_init() {
+  mkdir -p -- "$ADM_STATE_PROFILES" || { adm_log_error "Falha em criar $ADM_STATE_PROFILES"; return 1; }
+  local created=0
+  for base in aggressive normal minimal; do
+    local f="$(_pm_profile_path "$base")"
+    if [[ ! -f "$f" ]]; then
+      declare -A P=()
+      _pm_profile_default_from_base "$base" "$base" P
+      _pm_profile_save "$base" P
+      created=$((created+1))
+    fi
+  done
+  if [[ $created -gt 0 ]]; then
+    adm_log_success "Perfis padrão criados ($created)."
+  else
+    adm_log_info "Perfis padrão já existem."
+  fi
+  # se não houver ativo, set normal
+  if [[ ! -L "$ACTIVE_LINK" && ! -f "$ACTIVE_EFFECTIVE" ]]; then
+    pm_profile_set "normal" || true
+  fi
+}
+
+# ============================ CRUD/Operações ================================
+
+pm_profile_list() {
+  [[ -d "$ADM_STATE_PROFILES" ]] || { adm_log_error "Sem diretório de perfis: $ADM_STATE_PROFILES"; return 1; }
+  local cur=""; [[ -f "$ACTIVE_NAME_FILE" ]] && cur="$(cat "$ACTIVE_NAME_FILE" 2>/dev/null || true)"
+  printf "Profiles em %s\n" "$ADM_STATE_PROFILES"
+  local f name
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f" .profile)"
+    if [[ "$name" == "$cur" ]]; then
+      printf "  * %s\n" "$name"
+    else
+      printf "    %s\n" "$name"
+    fi
+  done < <(find "$ADM_STATE_PROFILES" -maxdepth 1 -type f -name "*.profile" -print0 | sort -z)
+}
+
+pm_profile_show() {
+  local name="$1"
+  [[ -z "$name" ]] && { adm_log_error "Uso: show <name>"; return 2; }
+  local f="$(_pm_profile_path "$name")"
+  [[ -f "$f" ]] || { adm_log_error "Profile não encontrado: $name"; return 1; }
+  printf "== %s ==\n" "$name"
+  cat "$f"
+}
+
+pm_profile_create() {
+  local name="$1"; shift || true
+  local base="normal"; local pairs=()
+  while (( $# )); do
+    case "$1" in
+      --base=*) base="${1#--base=}" ;;
+      *=*) pairs+=("$1") ;;
+      *) adm_log_warn "Ignorando argumento: $1" ;;
+    esac
+    shift || true
+  done
+  [[ -z "$name" ]] && { adm_log_error "Uso: create <name> [--base=...] [k=v ...]"; return 2; }
+  if _pm_profile_exists "$name"; then
+    adm_log_error "Profile já existe: $name"; return 1
+  fi
+  declare -A P=()
+  _pm_profile_default_from_base "$base" "$name" P
+  [[ ${#pairs[@]} -gt 0 ]] && _pm_kv_upsert_pairs P "${pairs[@]}"
+  _pm_profile_validate P
+  _pm_profile_save "$name" P
+}
+
+pm_profile_remove() {
+  local name="$1"
+  [[ -z "$name" ]] && { adm_log_error "Uso: remove <name>"; return 2; }
+  local f="$(_pm_profile_path "$name")"
+  [[ -f "$f" ]] || { adm_log_error "Profile não encontrado: $name"; return 1; }
+  # não remover se ativo
+  if [[ -f "$ACTIVE_NAME_FILE" ]] && [[ "$(cat "$ACTIVE_NAME_FILE" 2>/dev/null || true)" == "$name" ]]; then
+    adm_log_error "Não é possível remover o profile ativo: $name"; return 1
+  fi
+  rm -f -- "$f" || { adm_log_error "Falha ao remover: $f"; return 1; }
+  adm_log_success "Profile removido: $name"
+}
+
+pm_profile_clone() {
+  local src="$1" dst="$2"
+  [[ -z "$src" || -z "$dst" ]] && { adm_log_error "Uso: clone <src> <dst>"; return 2; }
+  _pm_profile_exists "$src" || { adm_log_error "Origem não existe: $src"; return 1; }
+  _pm_profile_exists "$dst" && { adm_log_error "Destino já existe: $dst"; return 1; }
+  cp -f -- "$(_pm_profile_path "$src")" "$(_pm_profile_path "$dst")" || { adm_log_error "Falha ao clonar"; return 1; }
+  # ajustar name interno
+  declare -A P=()
+  _pm_profile_load "$dst" P
+  P[name]="$dst"
+  _pm_profile_save "$dst" P
+  adm_log_success "Clonado $src → $dst"
+}
+
+pm_profile_export() {
+  local name="$1" file="$2"
+  [[ -z "$name" || -z "$file" ]] && { adm_log_error "Uso: export <name> <file>"; return 2; }
+  _pm_profile_exists "$name" || { adm_log_error "Profile não encontrado: $name"; return 1; }
+  cp -f -- "$(_pm_profile_path "$name")" "$file" || { adm_log_error "Falha ao exportar para $file"; return 1; }
+  adm_log_success "Exportado $name → $file"
+}
+
+pm_profile_import() {
+  local file="$1"; local name="${2:-}"
+  [[ -z "$file" ]] && { adm_log_error "Uso: import <file> [name]"; return 2; }
+  [[ -f "$file" ]] || { adm_log_error "Arquivo não encontrado: $file"; return 1; }
+  declare -A P=()
+  _pm_kv_read "$file" P
+  [[ -z "$name" ]] && name="${P[name]:-}"
+  [[ -z "$name" ]] && { adm_log_error "Nome não especificado nem presente no arquivo"; return 2; }
+  _pm_profile_exists "$name" && { adm_log_error "Profile já existe: $name"; return 1; }
+  _pm_profile_validate P
+  _pm_profile_save "$name" P
+}
+
+pm_profile_set() {
+  local name="$1"
+  [[ -z "$name" ]] && { adm_log_error "Uso: set <name>"; return 2; }
+  _pm_profile_exists "$name" || { adm_log_error "Profile não encontrado: $name"; return 1; }
+
+  # Valida + gera EFFECTIVE
+  declare -A P=()
+  _pm_profile_load "$name" P
+  _pm_profile_validate P
+
+  # Atualiza EFFECTIVE + ACTIVE
+  _pm_kv_write "$ACTIVE_EFFECTIVE" P
+  printf "%s\n" "$name" > "$ACTIVE_NAME_FILE"
+  ln -sfn -- "$(_pm_profile_path "$name")" "$ACTIVE_LINK"
+  adm_log_success "Profile ativo: $name"
+}
+
+pm_profile_env() {
+  # Imprime env avaliadas do profile ativo (ou nome se fornecido)
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    [[ -f "$ACTIVE_NAME_FILE" ]] || { adm_log_error "Nenhum profile ativo."; return 1; }
+    name="$(cat "$ACTIVE_NAME_FILE" 2>/dev/null || true)"
+  fi
+  declare -A P=()
+  _pm_profile_load "$name" P
+  _pm_profile_validate P
+  # Sanitiza e imprime exportáveis
+  cat <<EOF
+export CC="${P[cc]:-cc}"
+export CXX="${P[cxx]:-c++}"
+export AR="${P[ar]:-ar}"
+export RANLIB="${P[ranlib]:-ranlib}"
+export STRIP="${P[strip]:-strip}"
+export NM="${P[nm]:-nm}"
+export OBJCOPY="${P[objcopy]:-objcopy}"
+export CFLAGS="${P[cflags]:-}"
+export CXXFLAGS="${P[cxxflags]:-}"
+export LDFLAGS="${P[ldflags]:-}"
+export CPPFLAGS="${P[cppflags]:-}"
+export PKG_CONFIG_PATH="${P[pkg_config_path]:-}"
+export MAKEFLAGS="-j${P[jobs]:-1}"
+export NINJAFLAGS="-j${P[ninja_jobs]:-1}"
+export ADM_PACKAGE_FORMAT="${P[package_format]:-zst}"
+export ADM_ZSTD_LEVEL="${P[zstd_level]:-15}"
+export ADM_XZ_OPTIONS="${P[xz_options]:--6 -T0}"
+export ADM_LIBC="${P[libc]:-glibc}"
+export ADM_STATIC="${P[static]:-false}"
+export ADM_LTO="${P[lto]:-false}"
+export ADM_PGO="${P[pgo]:-off}"
+export ADM_PREFERRED_LINKER="${P[prefer_linker]:-ld}"
+export ADM_PREFERRED_COMPILER="${P[prefer_compiler]:-gcc}"
+EOF
+}
+
+# (continuação do arquivo /usr/src/adm/scripts/12-profile-manager)
+
+pm_profile_tune() {
+  local name="$1"; shift || true
+  [[ -z "$name" ]] && { adm_log_error "Uso: tune <name> [--jobs=N] [--lto=bool] [--pgo=off|gen|use|auto] [--static=bool] [--libc=musl|glibc] [--opt=O2|O3|Ofast|O1|O0] [--linker=lld|gold|ld] [--compiler=clang|gcc] [k=v ...]"; return 2; }
+  _pm_profile_exists "$name" || { adm_log_error "Profile não encontrado: $name"; return 1; }
+  declare -A P=()
+  _pm_profile_load "$name" P
+
+  local pairs=()
+  while (( $# )); do
+    case "$1" in
+      --jobs=*)    P[jobs]="${1#--jobs=}" ;;
+      --lto=*)     P[lto]="${1#--lto=}" ;;
+      --pgo=*)     P[pgo]="${1#--pgo=}" ;;
+      --static=*)  P[static]="${1#--static=}" ;;
+      --libc=*)    P[libc]="${1#--libc=}" ;;
+      --opt=*)     P[optimize_level]="${1#--opt=}" ;;
+      --linker=*)  P[prefer_linker]="${1#--linker=}" ;;
+      --compiler=*)P[prefer_compiler]="${1#--compiler=}" ;;
+      *=*)         pairs+=("$1") ;;
+      *)           adm_log_warn "Ignorando: $1" ;;
+    esac
+    shift || true
+  done
+  [[ ${#pairs[@]} -gt 0 ]] && _pm_kv_upsert_pairs P "${pairs[@]}"
+
+  _pm_profile_validate P
+  _pm_profile_save "$name" P
+  adm_log_success "Tuned: $name"
+}
+
+pm_profile_auto() {
+  local name="${1:-auto-optimized}"
+  _pm_profile_auto_from_hw "$name"
+  adm_log_success "Perfil auto-optimized criado/atualizado: $name"
+}
+
+# =============================== Doctor/Checks ===============================
+
+pm_profiles_doctor() {
+  [[ -d "$ADM_STATE_PROFILES" ]] || { adm_log_error "Sem diretório de perfis"; return 1; }
+  local failed=0
+  local f name
+  while IFS= read -r -d '' f; do
+    name="$(basename "$f" .profile)"
+    declare -A P=()
+    _pm_kv_read "$f" P || { adm_log_error "Falha ao ler $f"; failed=$((failed+1)); continue; }
+    if _pm_profile_validate P; then
+      adm_log_success "[OK] $name"
+    else
+      adm_log_error "[ERRO] $name"
+      failed=$((failed+1))
+    fi
+  done < <(find "$ADM_STATE_PROFILES" -maxdepth 1 -type f -name "*.profile" -print0 | sort -z)
+  if (( failed>0 )); then
+    adm_log_error "Doctor encontrou $failed perfil(is) com problemas."
+    return 1
+  fi
+  adm_log_success "Todos os perfis estão válidos."
+}
+
+# ================================ CLI/Main ===================================
+
+pm_usage() {
+  cat <<'USAGE'
+Uso: 12-profile-manager <comando> [opções]
+
+Comandos:
+  init                       Cria aggressive/normal/minimal se ausentes; define 'normal' como ativo se nenhum.
+  list                       Lista perfis disponíveis; marca o ativo com '*'.
+  show <name>                Mostra conteúdo (key=value) do perfil.
+  create <name> [--base=B] [k=v ...]
+                             Cria um novo perfil a partir de B (aggressive|normal|minimal), aplicando overrides k=v.
+  set <name>                 Define perfil ativo; gera 'active.profile' efetivo.
+  remove <name>              Remove um perfil (não pode ser o ativo).
+  clone <src> <dst>          Clona perfil src em dst (ajusta 'name=dst').
+  export <name> <file>       Exporta perfil para arquivo externo.
+  import <file> [name]       Importa de arquivo; usa 'name=' do arquivo se não passado.
+  tune <name> [--jobs=N] [--lto=bool] [--pgo=off|gen|use|auto] [--static=bool]
+             [--libc=musl|glibc] [--opt=O2|O3|Ofast|O1|O0] [--linker=lld|gold|ld] [--compiler=clang|gcc] [k=v...]
+                             Ajusta campos do perfil.
+  auto [name]                Cria/atualiza perfil auto-optimized (default: auto-optimized).
+  env [name]                 Imprime exports do ambiente do perfil (ativo ou <name>).
+  doctor                     Valida todos os perfis.
+
+Exemplos:
+  12-profile-manager init
+  12-profile-manager create dev-fast --base=aggressive prefer_compiler=clang static=false
+  12-profile-manager tune dev-fast --jobs=16 --lto=true --linker=lld
+  12-profile-manager set dev-fast
+  eval "$(/usr/src/adm/scripts/12-profile-manager env)"
+USAGE
+}
+
+pm_main() {
+  local cmd="${1:-}"; shift || true
+  mkdir -p -- "$ADM_STATE_PROFILES" || { adm_log_error "Sem acesso a $ADM_STATE_PROFILES"; exit 1; }
+
+  case "$cmd" in
+    init)    pm_profiles_init ;;
+    list)    pm_profile_list ;;
+    show)    pm_profile_show "${1:-}" ;;
+    create)  pm_profile_create "${1:-}" "${@:2}" ;;
+    set)     pm_profile_set "${1:-}" ;;
+    remove)  pm_profile_remove "${1:-}" ;;
+    export)  pm_profile_export "${1:-}" "${2:-}" ;;
+    import)  pm_profile_import "${1:-}" "${2:-}" ;;
+    clone)   pm_profile_clone "${1:-}" "${2:-}" ;;
+    tune)    pm_profile_tune "${1:-}" "${@:2}" ;;
+    auto)    pm_profile_auto "${1:-}" ;;
+    env)     pm_profile_env "${1:-}" ;;
+    doctor)  pm_profiles_doctor ;;
+    ""|-h|--help|help) pm_usage ;;
+    *)       adm_log_error "Comando desconhecido: $cmd"; pm_usage; exit 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  pm_main "$@"
+fi
