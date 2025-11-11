@@ -1,0 +1,12 @@
+name=cmake
+version=3.29.0
+category=dev
+run_deps=
+build_deps=binutils-stage2,gcc-final,host-make,host-python3
+opt_deps=openssl,libarchive,expat,zlib,bzip2,xz,libuv,curl,nghttp2
+num_builds=0
+description=CMake (generator e meta-buildsystem) compilado para o target; pronto para cross
+homepage=https://cmake.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0.tar.gz
