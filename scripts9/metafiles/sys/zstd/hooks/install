@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+cd "$WORKDIR"/zstd-*
+make PREFIX=/usr DESTDIR="$DESTDIR" install
