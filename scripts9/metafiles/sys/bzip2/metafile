@@ -1,0 +1,12 @@
+name=bzip2
+version=1.0.x
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=bzip2 utilitário de compressão
+homepage=https://sourceware.org/bzip2/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://sourceware.org/pub/bzip2/
