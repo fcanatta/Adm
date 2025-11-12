@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+cd "$WORKDIR"/bzip2-*
+# Nada a configurar; Makefile cuida. Ajustes comuns:
+sed -i 's#^PREFIX=.*#PREFIX=/usr#g' Makefile 2>/dev/null || true
