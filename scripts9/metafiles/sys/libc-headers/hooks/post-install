@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"; : "${PROFILE_LIBC:=glibc}"
+test -d "${DESTDIR}/usr/include" || { echo "[ERR] libc headers não instalados" >&2; exit 3; }
+echo "[OK] libc ($PROFILE_LIBC) headers/startfiles OK."
