@@ -40,3 +40,14 @@ adm install sys/binutils-pass2
 
 # 7) gcc (passo 2, final)
 adm install sys/gcc-pass2 --with-build
+
+# Kernel padrão com config da distro (se você copiar pra config.base):
+adm install sys/linux-kernel
+
+# Kernel agressivo (Clang/LLVM, LTO):
+# (opcional) crie config.base e/ou config.aggressive ao lado do metafile para ajustar features
+adm install sys/linux-kernel-aggressive
+
+# Forçar sufixo de versão (LOCALVERSION):
+LOCALVERSION="-custom1" adm install sys/linux-kernel
+LOCALVERSION="-aggr1"  adm install sys/linux-kernel-aggressive
