@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+mkdir -p "${DESTDIR}/usr/bin"
+ln -sf pkgconf "${DESTDIR}/usr/bin/pkg-config"
