@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:=${WORKDIR}/build}"
+: "${DESTDIR:?}"
+: "${PROFILE_LIBC:=glibc}"
+mkdir -p "$BUILD_DIR"
+
+case "$PROFILE_LIBC" in
+  glibc)
+    srcdir="$(echo "$WORKDIR"/glibc-*)"
+    [[ -d "$srcdir" ]] || { echo "[ERR] fontes glibc-* não encontrados" >&2; exit 2; }
+    cd "$BUILD_DIR"
+    "$srcdir/configure" \
+      --prefix=/usr \
+      --disable-profile \
+      --enable-kernel=3.2 \
+      --with-headers="${DESTDIR}/usr/include"
+    ;;
+  musl)
+    srcdir="$(echo "$WORKDIR"/musl-*)"
+    [[ -d "$srcdir" ]] || { echo "[ERR] fontes musl-* não encontrados" >&2; exit 2; }
+    cd "$srcdir"
+    ./configure --prefix=/usr
+    ;;
+  *) echo "[ERR] PROFILE_LIBC inválido: $PROFILE_LIBC" >&2; exit 2 ;;
+esac
