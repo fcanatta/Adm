@@ -1,0 +1,12 @@
+name=npth
+version=1.7
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=New GNU Portable Threads
+homepage=https://gnupg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gnupg.org/ftp/gcrypt/npth/npth-1.7.tar.bz2
