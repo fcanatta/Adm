@@ -1,0 +1,12 @@
+name=libgcrypt
+version=1.10.3
+category=libs
+run_deps=libs/libgpg-error
+build_deps=libs/libgpg-error,dev/pkgconf
+opt_deps=
+num_builds=0
+description=General purpose crypto library
+homepage=https://gnupg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.10.3.tar.bz2
