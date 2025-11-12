@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+cd "$WORKDIR"
+t="$(ls -1 linux-*.tar.* 2>/dev/null | head -n1 || true)"
+[[ -n "$t" ]] || { echo "[ERR] Tarball linux-*.tar.* não encontrado" >&2; exit 2; }
+v="${t#linux-}"; v="${v%%.tar*}"
+echo "[ADM] Kernel versão detectada: $v"
