@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+srcdir="$(echo "$WORKDIR"/linux-*/ | awk '{print $1}' | sed 's#/$##' | head -n1)"
+cd "$srcdir"
+
+kver="$(make -s kernelrelease)"
+[[ -n "$kver" ]] || { echo "[ERR] kernelrelease vazio" >&2; exit 4; }
+
+make INSTALL_MOD_PATH="$DESTDIR" modules_install
+
+mkdir -p "${DESTDIR}/boot"
+img="$(find "arch" -type f \( -name bzImage -o -name Image -o -name zImage \) | head -n1 || true)"
+[[ -f "$img" ]] || { echo "[ERR] imagem do kernel não encontrada (bzImage/Image)" >&2; exit 5; }
+install -Dm0644 "$img"          "${DESTDIR}/boot/vmlinuz-${kver}"
+install -Dm0644 "System.map"    "${DESTDIR}/boot/System.map-${kver}"
+install -Dm0644 ".config"       "${DESTDIR}/boot/config-${kver}"
+
+ln -sf "vmlinuz-${kver}"      "${DESTDIR}/boot/vmlinuz"
+ln -sf "System.map-${kver}"   "${DESTDIR}/boot/System.map"
+ln -sf "config-${kver}"       "${DESTDIR}/boot/config"
