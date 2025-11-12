@@ -1,0 +1,12 @@
+name=networkmanager
+version=1.48.6
+category=sys
+run_deps=sys/dbus,libs/openssl,libs/libnl,libs/libndp,apps/dhcpcd
+build_deps=sys/dbus,libs/openssl,libs/libnl,libs/libndp,apps/dhcpcd,dev/meson,dev/ninja,dev/pkgconf
+opt_deps=sys/systemd,sys/elogind,man-db
+num_builds=0
+description=Network configuration and management
+homepage=https://networkmanager.dev
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.gnome.org/sources/NetworkManager/1.48/NetworkManager-1.48.6.tar.xz
