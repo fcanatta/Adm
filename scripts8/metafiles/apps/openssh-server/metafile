@@ -1,0 +1,12 @@
+name=openssh-server
+version=9.9p1
+category=apps
+run_deps=apps/openssh
+build_deps=
+opt_deps=
+num_builds=0
+description=OpenSSH server service wrapper
+homepage=https://www.openssh.com/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
