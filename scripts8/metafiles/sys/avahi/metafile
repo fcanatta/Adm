@@ -1,0 +1,12 @@
+name=avahi
+version=0.8
+category=sys
+run_deps=sys/dbus,libs/libdaemon
+build_deps=sys/dbus,libs/libdaemon,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Service discovery (mDNS/DNS-SD)
+homepage=https://avahi.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/lathiat/avahi/releases/download/v0.8/avahi-0.8.tar.gz
