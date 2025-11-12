@@ -1,0 +1,12 @@
+name=dbus
+version=1.14.10
+category=sys
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Message bus system
+homepage=https://dbus.freedesktop.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://dbus.freedesktop.org/releases/dbus/dbus-1.14.10.tar.xz,https://gitlab.freedesktop.org/dbus/dbus/-/archive/dbus-1.14.10/dbus-dbus-1.14.10.tar.gz
