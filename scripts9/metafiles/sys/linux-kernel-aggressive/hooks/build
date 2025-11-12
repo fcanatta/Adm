@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${JOBS:=4}"
+srcdir="$(echo "$WORKDIR"/linux-*/ | awk '{print $1}' | sed 's#/$##' | head -n1)"
+[[ -d "$srcdir" ]] || { echo "[ERR] srcdir do kernel não encontrado" >&2; exit 3; }
+cd "$srcdir"
+
+# Build com LLVM/Clang + ThinLTO
+export LLVM=1
+# KCFLAGS/KCPPFLAGS podem ser passados, mas o kernel já controla flags.
+# Se quiser algo extra (cuidado): export KCFLAGS="-O3 -pipe"
+make -j"$JOBS"
+make -j"$JOBS" modules
