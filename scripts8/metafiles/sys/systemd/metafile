@@ -1,0 +1,12 @@
+name=systemd
+version=256
+category=sys
+run_deps=sys/dbus,sys/kmod,sys/util-linux,libs/libcap,libs/openssl
+build_deps=sys/dbus,sys/kmod,sys/util-linux,libs/libcap,libs/openssl,dev/pkgconf,dev/meson,dev/ninja
+opt_deps=man-db
+num_builds=0
+description=system and service manager (GLIBC only)
+homepage=https://www.freedesktop.org/wiki/Software/systemd/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/systemd/systemd-stable/archive/refs/tags/v256.tar.gz,https://github.com/systemd/systemd/archive/refs/tags/v256.tar.gz
