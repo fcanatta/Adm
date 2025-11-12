@@ -1,0 +1,12 @@
+name=linux-kernel-aggressive
+version=stable
+category=sys
+run_deps=
+build_deps=bc,bison,flex,openssl,zstd,xz,clang,llvm
+opt_deps=elfutils
+num_builds=0
+description=Linux kernel otimizado agressivo (Clang/LLVM, ThinLTO, opções de performance seguras)
+homepage=https://www.kernel.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/
