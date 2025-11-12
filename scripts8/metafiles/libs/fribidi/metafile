@@ -1,0 +1,12 @@
+name=fribidi
+version=1.0.15
+category=libs
+run_deps=
+build_deps=dev/meson,dev/ninja
+opt_deps=
+num_builds=0
+description=Unicode bidirectional algorithm library
+homepage=https://github.com/fribidi/fribidi
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/fribidi/fribidi/archive/refs/tags/v1.0.15.tar.gz
