@@ -1,0 +1,12 @@
+name=file
+version=5.xx
+category=sys
+run_deps=zlib
+build_deps=zlib
+opt_deps=
+num_builds=0
+description=file(1) e libmagic
+homepage=https://astro.github.io/file/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=ftp://ftp.astron.com/pub/file/
