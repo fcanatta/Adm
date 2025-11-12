@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+test -d "${DESTDIR}/usr/include" || { echo "[ERR] Headers não encontrados em ${DESTDIR}/usr/include" >&2; exit 3; }
+echo "[OK] Linux API headers instalados em ${DESTDIR}/usr/include"
