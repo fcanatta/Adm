@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+echo "[OK] ${NAME} instalado em ${DESTDIR}/usr"
