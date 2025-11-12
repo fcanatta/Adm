@@ -1,0 +1,12 @@
+name=libffi
+version=3.4.6
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Foreign Function Interface library
+homepage=https://sourceware.org/libffi/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz
