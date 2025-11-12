@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+: "${BUILD_DIR:=${WORKDIR}/build-kernel-aggr}"
+: "${JOBS:=4}"; : "${ARCH:=$(uname -m)}"
+: "${LOCALVERSION:=-aggr}"
+
+src_tar="$(ls -1 "$WORKDIR"/linux-*.tar.* | head -n1)"
+srcdir="${src_tar##*/}"; srcdir="${srcdir%.tar.*}"
+[[ -d "$WORKDIR/$srcdir" ]] || tar -xf "$src_tar" -C "$WORKDIR"
+cd "$WORKDIR/$srcdir"
+
+# defconfig por arquitetura
+case "$ARCH" in
+  x86_64|amd64) defcfg="x86_64_defconfig" ;;
+  aarch64|arm64) defcfg="defconfig" ;;
+  riscv64) defcfg="defconfig" ;;
+  *) defcfg="defconfig" ;;
+esac
+
+# Base config:
+pkgroot="${ADM_META_DIR:-/usr/src/adm/metafiles}/sys/linux-kernel-aggressive"
+if [[ -f "${pkgroot}/config.base" ]]; then
+  cp -f "${pkgroot}/config.base" .config
+  yes "" | make olddefconfig
+else
+  make "${defcfg}"
+fi
+
+# Aplica fragmento agressivo se existir
+if [[ -f "${pkgroot}/config.aggressive" ]]; then
+  if [[ -x "scripts/kconfig/merge_config.sh" ]]; then
+    scripts/kconfig/merge_config.sh -m .config "${pkgroot}/config.aggressive"
+  else
+    # fallback bruto: concatena e resolve com olddefconfig
+    cat "${pkgroot}/config.aggressive" >> .config
+  fi
+  yes "" | make olddefconfig
+fi
+
+# Força LOCALVERSION
+if [[ -x scripts/config ]]; then
+  scripts/config --file .config --set-str LOCALVERSION "${LOCALVERSION}" || true
+fi
+yes "" | make olddefconfig
