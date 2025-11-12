@@ -1,0 +1,12 @@
+name=shadow
+version=4.15.1
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=User and group management utilities (no PAM)
+homepage=https://github.com/shadow-maint/shadow
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/shadow-maint/shadow/releases/download/v4.15.1/shadow-4.15.1.tar.xz,https://distfiles.ariadne.space/shadow/shadow-4.15.1.tar.xz
