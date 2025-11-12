@@ -1,0 +1,12 @@
+name=mdev
+version=virtual
+category=sys
+run_deps=apps/busybox
+build_deps=apps/busybox
+opt_deps=
+num_builds=0
+description=Virtual: device manager via BusyBox mdev
+homepage=https://busybox.net/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
