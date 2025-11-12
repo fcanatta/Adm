@@ -1,0 +1,12 @@
+name=elinks
+version=0.16.1.1
+category=apps
+run_deps=libs/openssl,sys/zlib
+build_deps=libs/openssl,sys/zlib,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Feature-rich text mode web browser
+homepage=https://elinks.or.cz/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/rkd77/elinks/archive/refs/tags/v0.16.1.1.tar.gz
