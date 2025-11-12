@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${BUILD_DIR:=${WORKDIR}/build}"
+: "${TARGET:=$(uname -m)-unknown-linux-gnu}"
+mkdir -p "$BUILD_DIR"
+echo "[ADM] TARGET=$TARGET"
