@@ -99,3 +99,10 @@ ADM_FS=btrfs adm-mkimage
 # Assinar com gnupg
 gpg --quick-gen-key "ADM Builder <root@localhost>"
 gpg --output adm.iso.sig --detach-sign /usr/src/adm/out/adm-*.iso
+
+# Seus hooks 020-generate-grubcfg.sh já fazem isso na instalação,
+# mas você pode rodar manualmente depois de editar /etc/default/grub:
+bash /usr/src/adm/metafiles/sys/grub-efi/hooks/post-install/020-generate-grubcfg.sh
+# ou para BIOS:
+bash /usr/src/adm/metafiles/sys/grub-pc/hooks/post-install/020-generate-grubcfg.sh
+ADM_PROFILE=aggressive adm install sys/grub-efi --with-deps
