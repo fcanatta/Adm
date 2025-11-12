@@ -1,0 +1,12 @@
+name=mpc
+version=1.3.x
+category=libs
+run_deps=gmp,mpfr
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU MPC - Complex numbers with correct rounding (dep do GCC)
+homepage=https://www.multiprecision.org/mpc/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/mpc/
