@@ -1,0 +1,12 @@
+name=zlib
+version=1.3.x
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=zlib - compressão (usado em toolchains modernos)
+homepage=https://zlib.net/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://zlib.net/
