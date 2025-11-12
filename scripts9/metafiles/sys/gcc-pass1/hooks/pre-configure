@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:=${WORKDIR}/build}"
+: "${TARGET:=$(uname -m)-unknown-linux-gnu}"
+mkdir -p "$BUILD_DIR"
+
+# GCC exige gmp, mpfr, mpc, isl — aceitamos como tarballs em ${WORKDIR} ou já instalados
+for dep in gmp mpfr mpc isl; do
+  if compgen -G "${WORKDIR}/${dep}-*.tar.*" > /dev/null; then
+    echo "[ADM] Vendor ${dep} no source tree"
+    tar xf "${WORKDIR}/${dep}-"*.tar.* -C "${WORKDIR}"
+    rm -rf "${WORKDIR}/gcc-"*/$dep || true
+    mv "${WORKDIR}/${dep}-"* "${WORKDIR}/gcc-"*/$dep
+  fi
+done
