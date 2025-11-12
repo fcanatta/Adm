@@ -1,0 +1,12 @@
+name=pcre2
+version=10.44
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Perl Compatible Regular Expressions (PCRE2)
+homepage=https://github.com/PCRE2Project/pcre2
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.44/pcre2-10.44.tar.gz
