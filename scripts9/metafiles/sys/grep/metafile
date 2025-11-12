@@ -1,0 +1,12 @@
+name=grep
+version=3.11
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=grep, egrep, fgrep
+homepage=https://www.gnu.org/software/grep/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grep/
