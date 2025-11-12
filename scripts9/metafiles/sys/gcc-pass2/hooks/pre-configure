@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:=${WORKDIR}/build}"
+mkdir -p "$BUILD_DIR"
+# Vendor novamente gmp/mpfr/mpc/isl se presentes no WORKDIR
+for dep in gmp mpfr mpc isl; do
+  if compgen -G "${WORKDIR}/${dep}-*.tar.*" > /dev/null; then
+    tar xf "${WORKDIR}/${dep}-"*.tar.* -C "${WORKDIR}"
+    rm -rf "${WORKDIR}/gcc-"*/$dep || true
+    mv "${WORKDIR}/${dep}-"* "${WORKDIR}/gcc-"*/$dep
+  fi
+done
