@@ -1,0 +1,12 @@
+name=m4
+version=1.4.x
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Macro processor (autotools base)
+homepage=https://www.gnu.org/software/m4/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/m4/
