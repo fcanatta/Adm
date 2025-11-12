@@ -1,0 +1,12 @@
+name=efivar
+version=38
+category=sys
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Tools and library to access EFI variables
+homepage=https://github.com/rhboot/efivar
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/rhboot/efivar/archive/refs/tags/38.tar.gz
