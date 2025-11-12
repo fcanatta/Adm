@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${JOBS:=4}"
+srcdir="$(echo "$WORKDIR"/linux-*/ | awk '{print $1}' | sed 's#/$##' | head -n1)"
+[[ -d "$srcdir" ]] || { echo "[ERR] srcdir do kernel não encontrado" >&2; exit 3; }
+cd "$srcdir"
+
+make -j"$JOBS"
+make -j"$JOBS" modules
