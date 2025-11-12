@@ -1,0 +1,12 @@
+name=vdpau
+version=1.5
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=VDPAU wrapper and trace libs
+homepage=https://gitlab.freedesktop.org/vdpau/libvdpau
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gitlab.freedesktop.org/vdpau/libvdpau/-/archive/1.5/libvdpau-1.5.tar.gz
