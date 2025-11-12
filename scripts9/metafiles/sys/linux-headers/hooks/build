@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+: "${JOBS:=4}"
+cd "$WORKDIR"/linux-*
+make mrproper
