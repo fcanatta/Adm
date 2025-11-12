@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:=${WORKDIR}/build-kernel}"
+: "${DESTDIR:?}"; : "${JOBS:=4}"
+: "${ARCH:=$(uname -m)}"
+
+# extrai e entra no source
+srcdir="$(basename "$(ls -1 "$WORKDIR"/linux-*.tar.* | head -n1)")"
+srcdir="${srcdir%.tar.*}"
+[[ -d "$WORKDIR/$srcdir" ]] || tar -xf "$WORKDIR"/linux-*.tar.* -C "$WORKDIR"
+cd "$WORKDIR/$srcdir"
+
+# descobre defconfig por arquitetura
+case "$ARCH" in
+  x86_64|amd64) defcfg="x86_64_defconfig" ;;
+  aarch64|arm64) defcfg="defconfig" ;;
+  riscv64) defcfg="defconfig" ;;
+  *) defcfg="defconfig" ;;
+esac
+
+# Prioridade de configuração:
+# 1) config.base no diretório do pacote (mesma pasta do metafile) → copia para .config
+# 2) .config já presente dentro do source (se você colocou) → usa
+# 3) make <defconfig>
+pkgroot="${ADM_META_DIR:-/usr/src/adm/metafiles}/sys/linux-kernel"
+if [[ -f "${pkgroot}/config.base" ]]; then
+  cp -f "${pkgroot}/config.base" .config
+  yes "" | make olddefconfig
+elif [[ -f ".config" ]]; then
+  yes "" | make olddefconfig
+else
+  make "${defcfg}"
+fi
+
+# Permite sobrescrever localversion pelo ambiente
+: "${LOCALVERSION:=}"
+[[ -n "$LOCALVERSION" ]] && scripts/config --file .config --set-str LOCALVERSION "$LOCALVERSION" || true
