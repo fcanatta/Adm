@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+# depmod se disponível
+if command -v depmod >/dev/null 2>&1; then
+  kver="$(basename "$(readlink -f "${DESTDIR}/boot/vmlinuz" 2>/dev/null || echo "")" | sed 's/^vmlinuz-//')"
+  [[ -n "$kver" ]] && depmod -b "$DESTDIR" "$kver" || true
+fi
+
+echo "[OK] Kernel padrão instalado em ${DESTDIR}/boot e módulos em ${DESTDIR}/lib/modules"
+echo "→ Gere o initramfs/bootloader conforme seu ambiente."
