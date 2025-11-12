@@ -1,8 +1,8 @@
 name=curl
 version=8.9.1
 category=apps
-run_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz
-build_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz,dev/pkgconf
+run_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz,libs/nghttp2,libs/brotli
+build_deps=libs/openssl,libs/zlib,sys/zstd,sys/xz,dev/pkgconf,libs/nghttp2,libs/brotli
 opt_deps=apps/ca-certificates
 num_builds=0
 description=Command line tool and library for transferring data with URLs
