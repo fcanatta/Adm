@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${BUILD_DIR:?}"; : "${JOBS:=4}"
+cd "$BUILD_DIR"
+make -j"$JOBS" all-gcc all-target-libgcc
