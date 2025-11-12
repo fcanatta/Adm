@@ -1,0 +1,12 @@
+name=expat
+version=2.6.3
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Fast streaming XML parser library (libexpat)
+homepage=https://libexpat.github.io/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/libexpat/libexpat/releases/download/R_2_6_3/expat-2.6.3.tar.xz,https://downloads.sourceforge.net/project/expat/expat/2.6.3/expat-2.6.3.tar.xz
