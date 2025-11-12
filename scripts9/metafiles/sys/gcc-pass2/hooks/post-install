@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+test -x "${DESTDIR}/usr/bin/g++" || { echo "[ERR] g++ não instalado" >&2; exit 3; }
+echo "[OK] gcc-pass2 completo (com libstdc++)."
