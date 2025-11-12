@@ -1,0 +1,12 @@
+name=gnupg
+version=2.4.5
+category=apps
+run_deps=libs/libgcrypt,libs/libgpg-error,libs/npth,libs/libassuan,libs/libksba
+build_deps=libs/libgcrypt,libs/libgpg-error,libs/npth,libs/libassuan,libs/libksba,dev/pkgconf
+opt_deps=
+num_builds=0
+description=The GNU Privacy Guard (gpg)
+homepage=https://gnupg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.4.5.tar.bz2
