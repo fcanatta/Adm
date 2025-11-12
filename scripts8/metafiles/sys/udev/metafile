@@ -1,0 +1,12 @@
+name=udev
+version=virtual
+category=sys
+run_deps=sys/systemd
+build_deps=sys/systemd
+opt_deps=
+num_builds=0
+description=Virtual: udev implementation provided by systemd
+homepage=https://www.freedesktop.org/wiki/Software/systemd/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
