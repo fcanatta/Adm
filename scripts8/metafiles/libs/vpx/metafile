@@ -1,0 +1,12 @@
+name=vpx
+version=1.14.1
+category=libs
+run_deps=
+build_deps=dev/cmake,dev/ninja
+opt_deps=
+num_builds=0
+description=VP8/VP9 codec library
+homepage=https://chromium.googlesource.com/webm/libvpx
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/webmproject/libvpx/archive/refs/tags/v1.14.1.tar.gz
