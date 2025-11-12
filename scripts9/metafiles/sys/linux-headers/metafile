@@ -1,0 +1,12 @@
+name=linux-headers
+version=stable
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux API headers (para toolchain)
+homepage=https://www.kernel.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/
