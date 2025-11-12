@@ -1,0 +1,12 @@
+name=opus
+version=1.5.2
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Opus audio codec
+homepage=https://opus-codec.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
