@@ -106,3 +106,11 @@ bash /usr/src/adm/metafiles/sys/grub-efi/hooks/post-install/020-generate-grubcfg
 # ou para BIOS:
 bash /usr/src/adm/metafiles/sys/grub-pc/hooks/post-install/020-generate-grubcfg.sh
 ADM_PROFILE=aggressive adm install sys/grub-efi --with-deps
+
+# Codecs mais comuns + ffmpeg “full”
+adm install libs/x264 libs/x265 libs/vpx libs/aom libs/dav1d libs/opus libs/ogg libs/vorbis libs/lame libs/ass libs/fribidi libs/webp libs/freetype sys/alsa-lib libs/sdl2 libs/vaapi libs/vdpau --with-deps
+ADM_FFMPEG_NONFREE=0 adm install apps/ffmpeg --with-deps --parallel=$(nproc)
+
+# Com libfdk-aac (nonfree)
+adm install libs/fdk-aac --with-deps
+ADM_FFMPEG_NONFREE=1 adm install apps/ffmpeg --with-deps
