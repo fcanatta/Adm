@@ -1,0 +1,12 @@
+name=gcc-pass1
+version=bootstrap
+category=sys
+run_deps=
+build_deps=gmp,mpfr,mpc,isl
+opt_deps=
+num_builds=0
+description=GCC (passo 1) sem libc, só para compilar estágio inicial
+homepage=https://gcc.gnu.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/
