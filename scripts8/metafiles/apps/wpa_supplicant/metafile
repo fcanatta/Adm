@@ -1,0 +1,12 @@
+name=wpa_supplicant
+version=2.10
+category=apps
+run_deps=libs/openssl,sys/dbus
+build_deps=libs/openssl,sys/dbus,dev/pkgconf
+opt_deps=
+num_builds=0
+description=WPA/WPA2/802.1x supplicant
+homepage=https://w1.fi/wpa_supplicant/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://w1.fi/releases/wpa_supplicant-2.10.tar.gz
