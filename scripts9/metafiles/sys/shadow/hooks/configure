@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+cd "$WORKDIR"/shadow-*
+./configure --prefix=/usr --sysconfdir=/etc --without-libpam
