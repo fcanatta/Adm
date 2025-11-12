@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CATEGORY:=sys}"; : "${NAME:=linux-kernel}"
+: "${ADM_ROOT:=/usr/src/adm}"
+TRACKER="${TRACKER:-${ADM_ROOT}/scripts/10.10-update-upstream-tracker.sh}"
+[[ -x "$TRACKER" ]] && "$TRACKER" --category "$CATEGORY" --name "$NAME" --download --apply --provider auto --parallel "${JOBS:-4}" || true
