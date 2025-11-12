@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"; : "${PROFILE_LIBC:=glibc}"
+case "$PROFILE_LIBC" in
+  glibc)
+    cd "$(echo "${DESTDIR%/*/*}"/work*/build)" 2>/dev/null || true
+    make DESTDIR="$DESTDIR" install
+    ;;
+  musl)
+    cd "$(echo "${DESTDIR%/*/*}"/work*/musl-*)" 2>/dev/null || true
+    make DESTDIR="$DESTDIR" install
+    ;;
+esac
