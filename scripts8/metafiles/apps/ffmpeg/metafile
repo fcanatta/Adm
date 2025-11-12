@@ -1,0 +1,12 @@
+name=ffmpeg
+version=7.0.2
+category=apps
+run_deps=libs/zlib,sys/xz,sys/zstd
+build_deps=libs/zlib,sys/xz,sys/zstd,dev/pkgconf,dev/nasm,dev/meson,dev/ninja
+opt_deps=libs/x264,libs/x265,libs/aom,libs/dav1d,libs/vpx,libs/opus,libs/vorbis,libs/lame,libs/fdk-aac,libs/ass,libs/fribidi,libs/webp,libs/freetype,libs/expat,libs/vaapi,libs/vdpau,libs/sdl2,sys/alsa-lib
+num_builds=0
+description=FFmpeg multimedia framework (ffmpeg/ffprobe/ffplay)
+homepage=https://ffmpeg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ffmpeg.org/releases/ffmpeg-7.0.2.tar.xz,https://github.com/FFmpeg/FFmpeg/archive/refs/tags/n7.0.2.tar.gz
