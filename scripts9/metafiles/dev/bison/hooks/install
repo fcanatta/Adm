@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"; cd "$WORKDIR"/bison-*
+make DESTDIR="$DESTDIR" install
