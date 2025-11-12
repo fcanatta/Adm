@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:?}"; : "${DESTDIR:?}"
+: "${TARGET:=$(uname -m)-unknown-linux-gnu}"
+
+cd "$BUILD_DIR"
+"${WORKDIR}/gcc-"*/configure \
+  --target="$TARGET" \
+  --prefix=/usr \
+  --with-glibc-version=2.17 \
+  --with-newlib \
+  --without-headers \
+  --enable-default-pie \
+  --enable-default-ssp \
+  --disable-nls \
+  --disable-shared \
+  --disable-multilib \
+  --disable-decimal-float \
+  --disable-threads \
+  --disable-libatomic \
+  --disable-libgomp \
+  --disable-libquadmath \
+  --disable-libssp \
+  --disable-libvtv \
+  --disable-libstdcxx \
+  --enable-languages=c
