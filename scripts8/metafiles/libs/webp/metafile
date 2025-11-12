@@ -1,0 +1,12 @@
+name=webp
+version=1.4.0
+category=libs
+run_deps=
+build_deps=dev/cmake,dev/ninja
+opt_deps=
+num_builds=0
+description=WebP image library
+homepage=https://chromium.googlesource.com/webm/libwebp
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/webmproject/libwebp/archive/refs/tags/v1.4.0.tar.gz
