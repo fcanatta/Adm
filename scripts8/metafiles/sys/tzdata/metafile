@@ -1,0 +1,12 @@
+name=tzdata
+version=2024b
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Time zone and daylight-saving time data
+homepage=https://www.iana.org/time-zones
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://data.iana.org/time-zones/releases/tzdata2024b.tar.gz,https://ftp.osuosl.org/pub/tzdb/tzdata2024b.tar.gz
