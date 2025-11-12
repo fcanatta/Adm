@@ -1,0 +1,12 @@
+name=findutils
+version=4.9.x
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=find, xargs, locate
+homepage=https://www.gnu.org/software/findutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/findutils/
