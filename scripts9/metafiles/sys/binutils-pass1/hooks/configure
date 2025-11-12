@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:?}"; : "${DESTDIR:?}"
+: "${TARGET:=$(uname -m)-unknown-linux-gnu}"
+
+cd "$BUILD_DIR"
+"${WORKDIR}"/binutils-*/configure \
+  --target="$TARGET" \
+  --prefix=/usr \
+  --with-sysroot \
+  --disable-nls \
+  --disable-werror
