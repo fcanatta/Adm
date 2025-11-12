@@ -1,0 +1,12 @@
+name=dav1d
+version=1.4.3
+category=libs
+run_deps=
+build_deps=dev/meson,dev/ninja
+opt_deps=
+num_builds=0
+description=Fast AV1 decoder
+homepage=https://code.videolan.org/videolan/dav1d
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://code.videolan.org/videolan/dav1d/-/archive/1.4.3/dav1d-1.4.3.tar.gz
