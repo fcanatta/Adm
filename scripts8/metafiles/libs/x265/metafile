@@ -1,0 +1,12 @@
+name=x265
+version=3.6
+category=libs
+run_deps=
+build_deps=dev/cmake,dev/ninja
+opt_deps=
+num_builds=0
+description=H.265/HEVC encoder
+homepage=https://bitbucket.org/multicoreware/x265_git
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/videolan/x265/archive/refs/tags/3.6.tar.gz
