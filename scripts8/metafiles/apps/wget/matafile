@@ -1,0 +1,12 @@
+name=wget
+version=1.25.1
+category=apps
+run_deps=libs/openssl,sys/zlib
+build_deps=libs/openssl,sys/zlib,dev/pkgconf
+opt_deps=apps/ca-certificates
+num_builds=0
+description=Network downloader
+homepage=https://www.gnu.org/software/wget/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/wget/wget-1.25.1.tar.gz,https://ftpmirror.gnu.org/wget/wget-1.25.1.tar.gz
