@@ -1,0 +1,12 @@
+name=vaapi
+version=2.21.0
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=libva - Video Acceleration API
+homepage=https://github.com/intel/libva
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/intel/libva/archive/refs/tags/2.21.0.tar.gz
