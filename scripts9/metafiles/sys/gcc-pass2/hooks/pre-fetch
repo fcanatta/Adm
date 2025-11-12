@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CATEGORY:=sys}"
+: "${NAME:=binutils-pass1}"
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+SCRIPTS="${SCRIPTS:-${ADM_ROOT}/scripts}"
+TRACKER="${TRACKER:-${SCRIPTS}/10.10-update-upstream-tracker.sh}"
+
+if [[ -x "$TRACKER" ]]; then
+  "$TRACKER" --category "$CATEGORY" --name "$NAME" --download --apply --provider auto --parallel "${JOBS:-4}" || true
+fi
