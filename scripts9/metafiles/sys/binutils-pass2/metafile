@@ -1,0 +1,12 @@
+name=binutils-pass2
+version=bootstrap
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU binutils (passo 2) ajustado para headers da libc
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/
