@@ -1,0 +1,12 @@
+name=openssh
+version=9.9p1
+category=apps
+run_deps=libs/openssl,zlib
+build_deps=libs/openssl,zlib,dev/pkgconf
+opt_deps=
+num_builds=0
+description=OpenSSH client/server
+homepage=https://www.openssh.com/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.tar.gz,https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-9.9p1.tar.gz
