@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if command -v depmod >/dev/null 2>&1; then
+  kver="$(basename "$(readlink -f "${DESTDIR}/boot/vmlinuz" 2>/dev/null || echo "")" | sed 's/^vmlinuz-//')"
+  [[ -n "$kver" ]] && depmod -b "$DESTDIR" "$kver" || true
+fi
+
+echo "[OK] Kernel agressivo instalado (LLVM/LTO). Gere initramfs/bootloader conforme seu ambiente."
