@@ -1,0 +1,12 @@
+name=links
+version=2.29
+category=apps
+run_deps=libs/openssl,sys/zlib,sys/bzip2,sys/xz
+build_deps=libs/openssl,sys/zlib,sys/bzip2,sys/xz,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Text and graphics mode web browser
+homepage=http://links.twibright.com/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://links.twibright.com/download/links-2.29.tar.gz,https://fossies.org/linux/www/links-2.29.tar.gz
