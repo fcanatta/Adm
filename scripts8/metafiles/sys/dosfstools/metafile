@@ -1,0 +1,12 @@
+name=dosfstools
+version=4.2
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=FAT filesystem utilities (mkfs.fat, fsck.fat)
+homepage=https://github.com/dosfstools/dosfstools
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/dosfstools/dosfstools/releases/download/v4.2/dosfstools-4.2.tar.xz
