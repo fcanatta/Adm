@@ -1,0 +1,12 @@
+name=btrfs-progs
+version=6.10.1
+category=sys
+run_deps=libs/zlib,sys/xz,sys/zstd
+build_deps=libs/zlib,sys/xz,sys/zstd,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Btrfs filesystem utilities
+homepage=https://btrfs.wiki.kernel.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-v6.10.1.tar.xz
