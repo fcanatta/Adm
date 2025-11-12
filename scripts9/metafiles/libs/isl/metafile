@@ -1,0 +1,12 @@
+name=isl
+version=0.2x
+category=libs
+run_deps=gmp
+build_deps=
+opt_deps=
+num_builds=0
+description=ISL - Integer Set Library (dep opcional/comum do GCC)
+homepage=https://libisl.sourceforge.io/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://libisl.sourceforge.io/
