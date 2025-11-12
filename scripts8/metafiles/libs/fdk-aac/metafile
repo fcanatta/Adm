@@ -1,0 +1,12 @@
+name=fdk-aac
+version=2.0.3
+category=libs
+run_deps=
+build_deps=dev/cmake,dev/ninja
+opt_deps=
+num_builds=0
+description=Fraunhofer FDK AAC (nonfree)
+homepage=https://github.com/mstorsjo/fdk-aac
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/mstorsjo/fdk-aac/archive/refs/tags/v2.0.3.tar.gz
