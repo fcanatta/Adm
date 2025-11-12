@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+: "${JOBS:=4}"
+
+cd "$WORKDIR"
+# Descobrir tarball linux-*.*.* e extrair versão
+tarball="$(ls -1 linux-*.tar.* 2>/dev/null | head -n1)"
+[[ -n "$tarball" ]] || { echo "[ERR] Não encontrei tarball linux-*.tar.*" >&2; exit 2; }
+ver="${tarball#linux-}"; ver="${ver%%.tar*}"
+echo "[ADM] linux headers versão detectada: $ver"
