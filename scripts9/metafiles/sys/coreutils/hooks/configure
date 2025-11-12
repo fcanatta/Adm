@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+cd "$WORKDIR"/coreutils-*
+./configure --prefix=/usr --enable-no-install-program=kill,uptime
