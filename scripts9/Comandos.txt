@@ -12,3 +12,31 @@
 
 # Respeitar world.lst apenas na ordem (não impede atualização, só prioriza):
 /usr/src/adm/scripts/10.20-bulk-update-planner.sh --respect-world
+
+# (opcional) escolher libc
+export PROFILE_LIBC=glibc   # ou: musl
+
+# 1) Linux API headers
+adm install sys/linux-headers
+
+# 2) binutils (passo 1)
+adm install sys/binutils-pass1
+
+# 3) libs pro GCC
+adm install libs/gmp
+adm install libs/mpfr
+adm install libs/mpc
+adm install libs/isl
+adm install libs/zlib
+
+# 4) gcc (passo 1, sem libc)
+adm install sys/gcc-pass1 --with-build
+
+# 5) libc headers/startfiles (glibc|musl)
+adm install sys/libc-headers
+
+# 6) binutils (passo 2)
+adm install sys/binutils-pass2
+
+# 7) gcc (passo 2, final)
+adm install sys/gcc-pass2 --with-build
