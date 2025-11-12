@@ -1,0 +1,12 @@
+name=sdl2
+version=2.30.7
+category=libs
+run_deps=
+build_deps=dev/meson,dev/ninja,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Simple DirectMedia Layer 2.0
+homepage=https://www.libsdl.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/libsdl-org/SDL/releases/download/release-2.30.7/SDL2-2.30.7.tar.gz
