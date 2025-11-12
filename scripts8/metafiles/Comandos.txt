@@ -1,3 +1,12 @@
+# Systemd glibc
+adm install sys/systemd sys/udev sys/dbus apps/openssh-server sys/networkmanager --with-deps
+
+# Musl ou glib sem systemd
+adm install sys/runit sys/eudev sys/elogind sys/dbus apps/openssh-server --with-deps
+
+# Sysvinit + mdev
+adm install sys/sysvinit sys/mdev sys/dbus apps/openssh-server --with-deps
+
 # Musl toolchain 
 binutils-pass1
 gcc-pass1
