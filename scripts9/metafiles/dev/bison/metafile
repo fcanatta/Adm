@@ -1,0 +1,12 @@
+name=bison
+version=3.x
+category=dev
+run_deps=m4
+build_deps=m4
+opt_deps=
+num_builds=0
+description=Parser generator (yacc-compatible)
+homepage=https://www.gnu.org/software/bison/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bison/
