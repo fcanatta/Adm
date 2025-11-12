@@ -67,4 +67,17 @@ adm install sys/gcc-pass2      --with-deps --pack --parallel="$JOBS"
 # Instalar gcc-final
 adm install sys/gcc-final --with-deps --pack --parallel=$(nproc)
 
+# Base de shell, ferramentas de usuários e rede
+adm install sys/bash sys/procps-ng sys/kmod sys/kbd sys/iproute2 apps/dhcpcd --with-deps
 
+# Usuários, FS, tempo
+adm install sys/shadow sys/e2fsprogs sys/tzdata --with-deps
+
+# Tooling restante de build
+adm install dev/perl dev/texinfo dev/gettext sys/patch --with-deps
+
+# Dependências p/ Firefox/LLVM que faltavam
+adm install libs/libevent libs/icu libs/sqlite --with-deps
+
+# (Opcional) toolchains binários para acelerar Firefox
+adm install dev/nodejs dev/rust --with-deps
