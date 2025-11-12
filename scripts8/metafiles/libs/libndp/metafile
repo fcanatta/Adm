@@ -1,0 +1,12 @@
+name=libndp
+version=1.8
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=IPv6 Neighbor Discovery library
+homepage=https://github.com/jpirko/libndp
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/jpirko/libndp/releases/download/v1.8/libndp-1.8.tar.gz
