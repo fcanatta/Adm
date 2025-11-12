@@ -1,0 +1,12 @@
+name=grub-pc
+version=2.12
+category=sys
+run_deps=apps/xorriso,apps/mtools
+build_deps=apps/xorriso,apps/mtools,dev/flex,dev/bison,dev/gettext,dev/python,dev/pkgconf
+opt_deps=libs/freetype
+num_builds=0
+description=GNU GRUB for BIOS/Legacy (i386-pc)
+homepage=https://www.gnu.org/software/grub/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grub/grub-2.12.tar.xz,https://ftpmirror.gnu.org/grub/grub-2.12.tar.xz
