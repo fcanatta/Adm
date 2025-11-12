@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${BUILD_DIR:?}"; : "${DESTDIR:?}"
+cd "$BUILD_DIR"
+"${WORKDIR}/gcc-"*/configure \
+  --prefix=/usr \
+  --disable-nls \
+  --enable-default-pie \
+  --enable-default-ssp \
+  --enable-languages=c,c++ \
+  --disable-multilib
