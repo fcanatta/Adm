@@ -1,0 +1,12 @@
+name=libnl
+version=3.9.0
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Netlink protocol library
+homepage=https://www.infradead.org/~tgr/libnl/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/thom311/libnl/releases/download/libnl3_3_9_0/libnl-3.9.0.tar.gz
