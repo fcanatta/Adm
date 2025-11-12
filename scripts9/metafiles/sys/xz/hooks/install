@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"; cd "$WORKDIR"/xz-*
+make DESTDIR="$DESTDIR" install
