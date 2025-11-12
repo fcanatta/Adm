@@ -1,0 +1,12 @@
+name=freetype
+version=2.13.3
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=FreeType font engine
+homepage=https://freetype.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz,https://sourceforge.net/projects/freetype/files/freetype2/2.13.3/freetype-2.13.3.tar.xz/download
