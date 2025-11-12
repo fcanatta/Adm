@@ -1,0 +1,12 @@
+name=aom
+version=3.9.1
+category=libs
+run_deps=
+build_deps=dev/cmake,dev/ninja
+opt_deps=
+num_builds=0
+description=Alliance for Open Media AV1 codec
+homepage=https://aomedia.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/jbeich/aom/archive/refs/tags/v3.9.1.tar.gz,https://github.com/AOMediaCodec/aom/archive/refs/tags/v3.9.1.tar.gz
