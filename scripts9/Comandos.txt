@@ -1,0 +1,14 @@
+# Escanear instalados na categoria libs e gerar plano (sem aplicar), com JSON:
+/usr/src/adm/scripts/10.20-bulk-update-planner.sh --scope installed --categories libs --json
+
+# Rodar em metafiles (cat/apps + cat/libs), permitir pré-releases, baixar fontes e calcular SHA-256, salvar metafiles e ordenar por grafo:
+/usr/src/adm/scripts/10.20-bulk-update-planner.sh \
+  --scope metafiles --categories "apps,libs" \
+  --include-prerelease --download --apply --parallel 6 --dl-parallel 8
+
+# A partir de uma lista (/tmp/alvo.lst com linhas cat/name), excluir alguns padrões e não filtrar “apenas novos”:
+/usr/src/adm/scripts/10.20-bulk-update-planner.sh \
+  --scope list --list-file /tmp/alvo.lst --exclude "apps/*-beta,libs/zz-*" --all
+
+# Respeitar world.lst apenas na ordem (não impede atualização, só prioriza):
+/usr/src/adm/scripts/10.20-bulk-update-planner.sh --respect-world
