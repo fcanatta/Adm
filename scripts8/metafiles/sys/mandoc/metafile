@@ -1,0 +1,12 @@
+name=mandoc
+version=1.14.6
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Portable mandoc (mdoc, man, roff)
+homepage=https://mandoc.bsd.lv/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://mandoc.bsd.lv/snapshots/mandoc-1.14.6.tar.gz
