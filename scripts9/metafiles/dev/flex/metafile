@@ -1,0 +1,12 @@
+name=flex
+version=2.6.x
+category=dev
+run_deps=m4
+build_deps=m4
+opt_deps=
+num_builds=0
+description=Fast lexical analyzer generator
+homepage=https://github.com/westes/flex
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/westes/flex/releases/
