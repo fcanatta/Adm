@@ -1,0 +1,12 @@
+name=ass
+version=0.17.3
+category=libs
+run_deps=libs/fribidi,libs/freetype
+build_deps=libs/fribidi,libs/freetype,dev/pkgconf
+opt_deps=
+num_builds=0
+description=SubStation Alpha subtitle renderer (libass)
+homepage=https://github.com/libass/libass
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/libass/libass/releases/download/0.17.3/libass-0.17.3.tar.xz
