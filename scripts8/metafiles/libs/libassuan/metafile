@@ -1,0 +1,12 @@
+name=libassuan
+version=2.5.7
+category=libs
+run_deps=libs/libgpg-error
+build_deps=libs/libgpg-error,dev/pkgconf
+opt_deps=
+num_builds=0
+description=IPC library for GnuPG
+homepage=https://gnupg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gnupg.org/ftp/gcrypt/libassuan/libassuan-2.5.7.tar.bz2
