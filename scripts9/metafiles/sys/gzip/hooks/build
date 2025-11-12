@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${JOBS:=4}"; cd "$WORKDIR"/gzip-*
+make -j"$JOBS"
