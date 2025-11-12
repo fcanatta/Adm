@@ -1,0 +1,12 @@
+name=texinfo
+version=7.x
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Texinfo (makeinfo, info)
+homepage=https://www.gnu.org/software/texinfo/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/texinfo/
