@@ -1,0 +1,12 @@
+name=polkit
+version=124
+category=sys
+run_deps=sys/dbus,sys/linux-pam,libs/glib
+build_deps=sys/dbus,sys/linux-pam,libs/glib,dev/meson,dev/ninja,dev/pkgconf
+opt_deps=sys/systemd,sys/elogind
+num_builds=0
+description=Authorization framework (systemd or elogind)
+homepage=https://gitlab.freedesktop.org/polkit/polkit
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gitlab.freedesktop.org/polkit/polkit/-/archive/124/polkit-124.tar.gz
