@@ -1,0 +1,12 @@
+name=libevent
+version=2.1.12
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Event notification library
+homepage=https://libevent.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz,https://distfiles.macports.org/libevent/libevent-2.1.12-stable.tar.gz
