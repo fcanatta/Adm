@@ -1,0 +1,12 @@
+name=gmp
+version=6.x
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU Multiple Precision Arithmetic Library (dep do GCC)
+homepage=https://gmplib.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gmp/,https://gmplib.org/download/gmp/
