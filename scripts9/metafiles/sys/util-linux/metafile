@@ -1,0 +1,12 @@
+name=util-linux
+version=2.40
+category=sys
+run_deps=zlib,xz
+build_deps=zlib,xz
+opt_deps=ncurses
+num_builds=0
+description=utilitários essenciais do sistema (mount, fdisk, etc.)
+homepage=https://github.com/util-linux/util-linux
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/utils/util-linux/
