@@ -1,0 +1,12 @@
+name=eudev
+version=3.2.12
+category=sys
+run_deps=sys/kmod
+build_deps=sys/kmod,dev/meson,dev/ninja,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Standalone udev fork (no systemd)
+homepage=https://github.com/eudev-project/eudev
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/eudev-project/eudev/archive/refs/tags/v3.2.12.tar.gz
