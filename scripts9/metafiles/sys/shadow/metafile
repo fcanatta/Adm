@@ -1,0 +1,12 @@
+name=shadow
+version=4.14.x
+category=sys
+run_deps=coreutils
+build_deps=coreutils
+opt_deps=
+num_builds=0
+description=User/group management (login, useradd, passwd...)
+homepage=https://shadow-maint.github.io/shadow/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/shadow-maint/shadow/releases/
