@@ -1,0 +1,12 @@
+name=nodejs
+version=22.9.0
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Node.js runtime (binary tarball)
+homepage=https://nodejs.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://nodejs.org/dist/v22.9.0/node-v22.9.0-linux-x64.tar.xz,https://nodejs.org/download/release/v22.9.0/node-v22.9.0-linux-x64.tar.xz
