@@ -1,0 +1,12 @@
+name=lame
+version=3.100
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=LAME MP3 encoder
+homepage=https://lame.sourceforge.net
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://downloads.sourceforge.net/project/lame/lame/3.100/lame-3.100.tar.gz
