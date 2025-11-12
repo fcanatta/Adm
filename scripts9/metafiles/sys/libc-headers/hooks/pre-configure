@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${PROFILE_LIBC:=glibc}"
+echo "[ADM] PROFILE_LIBC=$PROFILE_LIBC"
