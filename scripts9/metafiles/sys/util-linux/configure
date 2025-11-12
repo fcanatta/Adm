@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+cd "$WORKDIR"/util-linux-*
+./configure --prefix=/usr --bindir=/usr/bin --sbindir=/usr/sbin --disable-chfn-chsh --disable-login --disable-nologin --disable-su --without-python
