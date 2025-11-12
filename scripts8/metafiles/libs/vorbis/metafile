@@ -1,0 +1,12 @@
+name=vorbis
+version=1.3.7
+category=libs
+run_deps=libs/ogg
+build_deps=libs/ogg,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Vorbis audio codec
+homepage=https://xiph.org/vorbis/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://downloads.xiph.org/releases/vorbis/libvorbis-1.3.7.tar.xz
