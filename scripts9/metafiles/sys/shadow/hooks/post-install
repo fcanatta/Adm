@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+mkdir -p "${DESTDIR}/etc"
+for f in passwd group shadow gshadow; do
+  [[ -f "${DESTDIR}/etc/$f" ]] || touch "${DESTDIR}/etc/$f"
+done
+chmod 0644 "${DESTDIR}/etc/passwd" "${DESTDIR}/etc/group" || true
+chmod 0000 "${DESTDIR}/etc/shadow" "${DESTDIR}/etc/gshadow" || true
+echo "[OK] shadow: bases /etc inicializadas."
