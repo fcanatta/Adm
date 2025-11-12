@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+cd "$WORKDIR"/linux-*
+# Instala somente os headers de API
+make headers
+find usr/include -name '.*' -delete
+mkdir -p "${DESTDIR}/usr"
+cp -rv usr/include "${DESTDIR}/usr"
