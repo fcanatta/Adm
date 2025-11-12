@@ -1,0 +1,12 @@
+name=sed
+version=4.9
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=stream editor
+homepage=https://www.gnu.org/software/sed/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/sed/
