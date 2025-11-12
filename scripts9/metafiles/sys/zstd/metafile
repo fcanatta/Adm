@@ -1,0 +1,12 @@
+name=zstd
+version=1.5.x
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Zstandard compressor + libzstd
+homepage=https://facebook.github.io/zstd/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/facebook/zstd/releases/
