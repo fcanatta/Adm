@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" ; : "${DESTDIR:?}"
+cd "$WORKDIR"/m4-*
+make DESTDIR="$DESTDIR" install
