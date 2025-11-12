@@ -1,0 +1,12 @@
+name=runit
+version=2.1.2
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Runit init system
+homepage=http://smarden.org/runit/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=http://smarden.org/runit/runit-2.1.2.tar.gz,https://distfiles.dereferenced.org/runit/runit-2.1.2.tar.gz
