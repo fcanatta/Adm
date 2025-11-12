@@ -1,0 +1,12 @@
+name=bash
+version=5.2.x
+category=sys
+run_deps=ncurses
+build_deps=ncurses
+opt_deps=
+num_builds=0
+description=Bourne Again SHell
+homepage=https://www.gnu.org/software/bash/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bash/
