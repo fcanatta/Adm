@@ -1,0 +1,12 @@
+name=sysvinit
+version=3.08
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Traditional System V init
+homepage=https://savannah.nongnu.org/projects/sysvinit
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.nongnu.org/releases/sysvinit/sysvinit-3.08.tar.xz,https://ftpmirror.gnu.org/sysvinit/sysvinit-3.08.tar.xz
