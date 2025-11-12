@@ -1,0 +1,12 @@
+name=linux-pam
+version=1.6.1
+category=sys
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Pluggable Authentication Modules for Linux
+homepage=https://linux-pam.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/linux-pam/linux-pam/releases/download/v1.6.1/Linux-PAM-1.6.1.tar.xz,https://linux-pam.org/library/
