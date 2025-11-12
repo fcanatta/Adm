@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" ; : "${DESTDIR:?}"
+cd "$WORKDIR"/diffutils-*
+make DESTDIR="$DESTDIR" install
