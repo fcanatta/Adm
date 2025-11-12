@@ -1,0 +1,12 @@
+name=elogind
+version=252.9
+category=sys
+run_deps=sys/dbus,libs/libcap
+build_deps=sys/dbus,libs/libcap,dev/meson,dev/ninja,dev/pkgconf
+opt_deps=
+num_builds=0
+description=logind standalone for non-systemd systems
+homepage=https://github.com/elogind/elogind
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/elogind/elogind/archive/refs/tags/v252.9.tar.gz
