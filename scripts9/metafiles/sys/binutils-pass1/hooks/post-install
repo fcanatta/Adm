@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+test -x "${DESTDIR}/usr/bin/ld" || test -x "${DESTDIR}/usr/bin/${TARGET:-}-ld" || {
+  echo "[ERR] binutils-pass1 não instalou ld." >&2; exit 3; }
+echo "[OK] binutils-pass1 instalado."
