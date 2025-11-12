@@ -1,0 +1,12 @@
+name=mpfr
+version=4.x
+category=libs
+run_deps=gmp
+build_deps=
+opt_deps=
+num_builds=0
+description=MPFR - Floating-point Reliably (dep do GCC)
+homepage=https://www.mpfr.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.mpfr.org/mpfr-current/,https://ftp.gnu.org/gnu/mpfr/
