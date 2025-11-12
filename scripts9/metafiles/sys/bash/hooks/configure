@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; cd "$WORKDIR"/bash-*
+./configure --prefix=/usr
