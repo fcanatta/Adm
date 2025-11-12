@@ -1,0 +1,12 @@
+name=pkgconf
+version=1.x
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=pkgconf (implementação moderna de pkg-config)
+homepage=https://github.com/pkgconf/pkgconf
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://distfiles.dereferenced.org/pkgconf/,https://github.com/pkgconf/pkgconf/releases/
