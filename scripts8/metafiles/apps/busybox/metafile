@@ -1,0 +1,12 @@
+name=busybox
+version=1.36.1
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=BusyBox (mdev, core applets)
+homepage=https://busybox.net/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://busybox.net/downloads/busybox-1.36.1.tar.bz2,https://sources.buildroot.net/busybox/busybox-1.36.1.tar.bz2
