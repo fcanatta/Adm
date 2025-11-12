@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${BUILD_DIR:?}"; : "${PROFILE_LIBC:=glibc}"
+case "$PROFILE_LIBC" in
+  glibc)
+    cd "$BUILD_DIR"
+    make -j"${JOBS:-4}"
+    ;;
+  musl)
+    cd "$(echo "${BUILD_DIR%/build}"/musl-*)"
+    make -j"${JOBS:-4}"
+    ;;
+esac
