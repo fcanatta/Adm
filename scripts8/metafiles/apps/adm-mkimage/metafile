@@ -1,0 +1,12 @@
+name=adm-mkimage
+version=1
+category=apps
+run_deps=apps/zstd,sys/xz,sys/e2fsprogs,sys/dosfstools
+build_deps=
+opt_deps=sys/btrfs-progs,sys/grub,apps/xorriso,apps/mtools
+num_builds=0
+description=Image builder (rootfs tar.zst, ext4/btrfs .img and optional EFI ISO)
+homepage=https://example.invalid/adm-mkimage
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=
