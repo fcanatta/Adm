@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+test -x "${DESTDIR}/usr/bin/gcc" || { echo "[ERR] gcc-pass1 não instalou gcc" >&2; exit 3; }
+echo "[OK] gcc-pass1 instalado (sem libc)."
