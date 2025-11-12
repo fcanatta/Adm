@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"; cd "$WORKDIR"/make-*
+make DESTDIR="$DESTDIR" install
