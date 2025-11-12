@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${BUILD_DIR:?}"; : "${DESTDIR:?}"
+cd "$BUILD_DIR"
+make DESTDIR="$DESTDIR" install
