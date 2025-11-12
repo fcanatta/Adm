@@ -1,0 +1,12 @@
+name=bluez
+version=5.78
+category=sys
+run_deps=sys/dbus
+build_deps=sys/dbus,dev/pkgconf
+opt_deps=
+num_builds=0
+description=Bluetooth protocol stack for Linux
+homepage=http://www.bluez.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/bluetooth/bluez-5.78.tar.xz,https://mirrors.edge.kernel.org/pub/linux/bluetooth/bluez-5.78.tar.xz
