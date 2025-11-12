@@ -1,0 +1,12 @@
+name=libdaemon
+version=0.14
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Lightweight C library for daemons
+homepage=https://0pointer.de/lennart/projects/libdaemon/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://0pointer.de/lennart/projects/libdaemon/libdaemon-0.14.tar.gz,https://deb.debian.org/debian/pool/main/libd/libdaemon/libdaemon_0.14.orig.tar.gz
