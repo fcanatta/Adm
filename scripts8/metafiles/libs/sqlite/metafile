@@ -1,0 +1,12 @@
+name=sqlite
+version=3.46.0
+category=libs
+run_deps=
+build_deps=dev/pkgconf
+opt_deps=
+num_builds=0
+description=Self-contained, high-reliability, embedded SQL database engine
+homepage=https://sqlite.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://sqlite.org/2024/sqlite-autoconf-3460000.tar.gz,https://www.sqlite.org/src/tarball/sqlite.tar.gz?r=release
