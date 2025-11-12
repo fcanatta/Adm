@@ -1,0 +1,12 @@
+name=man-db
+version=2.12.1
+category=sys
+run_deps=libs/gzip,sys/bzip2,sys/xz,sys/zstd
+build_deps=dev/pkgconf
+opt_deps=libs/less
+num_builds=0
+description=Manual pager program
+homepage=https://www.nongnu.org/man-db/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.nongnu.org/releases/man-db/man-db-2.12.1.tar.xz
