@@ -90,3 +90,8 @@ adm install libs/libevent libs/icu libs/sqlite --with-deps
 
 # (Opcional) toolchains binários para acelerar Firefox
 adm install dev/nodejs dev/rust --with-deps
+
+# rootfs + ext4.img 8 GiB + ISO
+ADM_IMG_SIZE=8192 ADM_FS=ext4 ADM_ISO=1 adm-mkimage
+# btrfs em 4 GiB
+ADM_FS=btrfs adm-mkimage
