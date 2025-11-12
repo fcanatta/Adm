@@ -1,0 +1,12 @@
+name=libksba
+version=1.6.7
+category=libs
+run_deps=libs/libgpg-error
+build_deps=libs/libgpg-error,dev/pkgconf
+opt_deps=
+num_builds=0
+description=X.509 and CMS library
+homepage=https://gnupg.org
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://gnupg.org/ftp/gcrypt/libksba/libksba-1.6.7.tar.bz2
