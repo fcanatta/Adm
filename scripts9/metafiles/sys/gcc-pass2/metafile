@@ -1,0 +1,12 @@
+name=gcc-pass2
+version=bootstrap
+category=sys
+run_deps=
+build_deps=gmp,mpfr,mpc,isl,zlib
+opt_deps=
+num_builds=0
+description=GCC final (com libstdc++), usando a libc escolhida (glibc ou musl)
+homepage=https://gcc.gnu.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/
