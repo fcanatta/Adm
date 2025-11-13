@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'man-pages-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] man-pages: diretório man-pages-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+if [[ -f Makefile ]]; then
+  make DESTDIR="$DESTDIR" install
+else
+  echo "[ADM] man-pages: Makefile não encontrado, copiando diretórios man* manualmente."
+  mandir="${DESTDIR}/usr/share/man"
+  mkdir -p "$mandir"
+
+  # copia man1, man2, ... preservando estrutura
+  find . -maxdepth 1 -type d -name 'man[0-9]*' | while read -r d; do
+    base="$(basename "$d")"
+    mkdir -p "${mandir}/${base}"
+    cp -av "${d}/." "${mandir}/${base}/"
+  done
+fi
