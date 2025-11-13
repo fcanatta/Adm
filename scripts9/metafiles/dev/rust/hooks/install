@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+: "${RUST_TARGET:=x86_64-unknown-linux-gnu}"
+
+cd "$WORKDIR"
+
+tarball="$(ls -1 rust-*-${RUST_TARGET}.tar.* 2>/dev/null | head -n1 || true)"
+# Se não encontrar com target, tenta qualquer rust-*.tar.*
+if [[ -z "$tarball" ]]; then
+  tarball="$(ls -1 rust-*.tar.* 2>/dev/null | head -n1 || true)"
+fi
+
+[[ -n "$tarball" ]] || { echo "[ERR] rust: tarball rust-*.tar.* não encontrado em $WORKDIR" >&2; exit 2; }
+
+echo "[ADM] rust: usando tarball: $tarball"
+
+tmpdir="$(mktemp -d)"
+tar -xf "$tarball" -C "$tmpdir"
+rustdir="$(find "$tmpdir" -maxdepth 1 -type d -name 'rust-*' | head -n1 || true)"
+[[ -d "$rustdir" ]] || { echo "[ERR] rust: diretório interno rust-* não encontrado em $tmpdir" >&2; rm -rf "$tmpdir"; exit 3; }
+
+cd "$rustdir"
+
+# install.sh respeita DESTDIR e prefix
+DESTDIR="$DESTDIR" ./install.sh \
+  --prefix=/usr \
+  --components=rustc,cargo,rust-std || {
+    ret=$?
+    echo "[ERR] rust: install.sh falhou com código $ret" >&2
+    rm -rf "$tmpdir"
+    exit "$ret"
+  }
+
+rm -rf "$tmpdir"
