@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if ! find "${DESTDIR}/usr/lib" -name 'libgdbm.so*' | grep -q .; then
+  echo "[ERR] gdbm: libgdbm.so não instalada" >&2; exit 3;
+fi
+
+echo "[OK] gdbm instalado"
