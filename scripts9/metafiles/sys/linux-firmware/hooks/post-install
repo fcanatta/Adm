@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -d "${DESTDIR}/lib/firmware" ]]; then
+  echo "[ERR] /lib/firmware não foi criado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+cnt="$(find "${DESTDIR}/lib/firmware" -type f 2>/dev/null | wc -l || echo 0)"
+echo "[OK] linux-firmware instalado em ${DESTDIR}/lib/firmware (${cnt} arquivos)."
+
+echo "Lembre-se: depois de instalar o kernel, gere initramfs (se usar) e atualize o bootloader."
