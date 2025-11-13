@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${DESTDIR:?}"
+srcdir=$(find "$WORKDIR" -maxdepth 1 -type d -name 'curl-*' | head -n1)
+cd "$srcdir"
+make DESTDIR="$DESTDIR" install
