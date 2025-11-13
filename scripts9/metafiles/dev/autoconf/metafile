@@ -1,0 +1,12 @@
+name=autoconf
+version=2.7x.x
+category=dev
+run_deps=perl
+build_deps=m4,perl
+opt_deps=
+num_builds=0
+description=GNU autoconf - gerador de scripts configure
+homepage=https://www.gnu.org/software/autoconf/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/autoconf/
