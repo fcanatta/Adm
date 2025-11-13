@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${DESTDIR:?}"
+
+src="$(find "$WORKDIR" -maxdepth 1 -type d -name 'acl-*' | head -n1 || true)"
+cd "$src"
+make DESTDIR="$DESTDIR" install
