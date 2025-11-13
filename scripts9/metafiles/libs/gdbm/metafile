@@ -1,0 +1,12 @@
+name=gdbm
+version=1.23
+category=libs
+run_deps=
+build_deps=
+opt_deps=readline
+num_builds=0
+description=GNU gdbm - banco de dados simples baseado em hash
+homepage=https://www.gnu.org.ua/software/gdbm/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gdbm/
