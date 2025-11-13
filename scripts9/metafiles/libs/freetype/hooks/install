@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" ; : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'freetype-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] freetype: diretório freetype-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+make DESTDIR="$DESTDIR" install
