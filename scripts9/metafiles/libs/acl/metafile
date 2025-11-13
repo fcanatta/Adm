@@ -1,0 +1,12 @@
+name=acl
+version=2.3.x
+category=libs
+run_deps=attr
+build_deps=attr
+opt_deps=
+num_builds=0
+description=acl - controle de permissões POSIX ACL
+homepage=https://savannah.nongnu.org/projects/acl/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/acl/
