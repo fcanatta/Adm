@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${RUST_TARGET:=x86_64-unknown-linux-gnu}"
+
+cd "$WORKDIR"
+
+tarball="$(ls -1 rust-*-*-unknown-linux-*.tar.* 2>/dev/null | head -n1 || true)"
+if [[ -z "$tarball" ]]; then
+  echo "[ERR] rust: nenhum tarball rust-*-*-unknown-linux-*.tar.* encontrado em $WORKDIR" >&2
+  exit 2
+fi
+
+echo "[ADM] rust: tarball detectado: $tarball (TARGET esperado=${RUST_TARGET})"
