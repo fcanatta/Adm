@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'ninja-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório ninja-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+# Ninja não tem ./configure clássico; usamos configure.py no build
+echo "[ADM] ninja srcdir: $(pwd)"
