@@ -1,0 +1,12 @@
+name=openssl
+version=3.0.x
+category=libs
+run_deps=
+build_deps=
+opt_deps=zlib
+num_builds=0
+description=OpenSSL - TLS/SSL e crypto
+homepage=https://www.openssl.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.openssl.org/source/
