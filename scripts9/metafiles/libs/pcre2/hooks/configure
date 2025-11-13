@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'pcre2-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório pcre2-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+./configure \
+  --prefix=/usr \
+  --enable-pcre2-8 \
+  --enable-pcre2-16 \
+  --enable-pcre2-32 \
+  --enable-unicode \
+  --enable-pcre2grep-libz \
+  --enable-pcre2grep-libbz2 \
+  --enable-jit
