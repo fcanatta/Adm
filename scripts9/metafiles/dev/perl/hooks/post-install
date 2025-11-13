@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/perl" ]]; then
+  echo "[ERR] perl não encontrado em ${DESTDIR}/usr/bin/perl" >&2
+  exit 4
+fi
+
+echo "[OK] perl instalado em ${DESTDIR}/usr/bin/perl"
