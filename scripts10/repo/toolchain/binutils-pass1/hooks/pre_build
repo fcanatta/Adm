@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# hook: pre_build para binutils-pass1
+# Objetivo:
+#   - Configurar build como cross, instalando em /usr/src/adm/cross-tools
+#   - Não linkar contra nada do sistema alvo ainda
+
+set -eu
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
+: "${ADM_TARGET:=x86_64-linux-gnu}"
+
+# Diretórios padrão do ADM build.sh (ajuste se seu build.sh usar outros nomes)
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Variáveis consumidas pelo build.sh
+export ADM_BUILD_PREFIX="$ADM_CROSS_ROOT"
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --target=${ADM_TARGET}
+  --with-sysroot=${ADM_CROSS_ROOT}
+  --with-lib-path=${ADM_CROSS_ROOT}/lib
+  --disable-nls
+  --disable-werror
+"
+
+# Para garantir que nada de /usr/$TARGET se meta aqui
+export CC_FOR_TARGET="${ADM_TARGET}-gcc" || true
+export CFLAGS_FOR_TARGET=""
