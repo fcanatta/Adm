@@ -1,12 +1,12 @@
 name=firefox-bin
 version=latest
 category=apps
-run_deps=
+run_deps=gtk3,dbus,fontconfig,freetype,alsa-lib
 build_deps=
-opt_deps=
+opt_deps=pulseaudio,pipewire
 num_builds=0
-description=Firefox binário oficial Mozilla
-homepage=https://www.mozilla.org/
+description=Firefox binário oficial Mozilla (com integração desktop)
+homepage=https://www.mozilla.org/firefox/
 maintainer=ADM <root@localhost>
 sha256sums=
 sources=https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US
