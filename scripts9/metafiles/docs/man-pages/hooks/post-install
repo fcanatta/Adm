@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+mandir="${DESTDIR}/usr/share/man"
+if [[ ! -d "$mandir" ]]; then
+  echo "[ERR] man-pages: diretório ${mandir} não encontrado após instalação" >&2
+  exit 4
+fi
+
+# Checa se ao menos um man1 ou man2 existe
+if ! find "$mandir" -maxdepth 2 -type f -name '*.1' -o -name '*.2' 2>/dev/null | grep -q .; then
+  echo "[WAR] man-pages: nenhum arquivo .1 ou .2 encontrado em ${mandir} (verifique tarball/versão)." >&2 || true
+fi
+
+echo "[OK] man-pages: páginas instaladas em ${mandir}"
