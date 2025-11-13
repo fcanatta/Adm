@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 : "${WORKDIR:?}"
-true
+# Não há build: é binário pré-compilado.
+echo "[ADM] firefox-bin: nenhum passo de build necessário."
