@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'man-pages-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] man-pages: diretório man-pages-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+echo "[ADM] man-pages: nenhum passo de build necessário."
