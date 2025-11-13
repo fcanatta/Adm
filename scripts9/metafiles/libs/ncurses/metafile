@@ -1,0 +1,12 @@
+name=ncurses
+version=6.4.x
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=ncurses (wide-char) - terminal handling library
+homepage=https://invisible-island.net/ncurses/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://invisible-mirror.net/archives/ncurses/,https://ftp.gnu.org/pub/gnu/ncurses/
