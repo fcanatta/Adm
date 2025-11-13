@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}" : "${WORKDIR:?}"
+
+mkdir -p "${DESTDIR}/opt/firefox"
+tar -xf "$(ls "$WORKDIR"/*.tar.*)" -C "${DESTDIR}/opt/firefox" --strip 1
+
+mkdir -p "${DESTDIR}/usr/bin"
+ln -sf /opt/firefox/firefox "${DESTDIR}/usr/bin/firefox"
