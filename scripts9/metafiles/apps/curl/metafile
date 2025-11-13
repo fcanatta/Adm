@@ -1,0 +1,12 @@
+name=curl
+version=8.x.x
+category=apps
+run_deps=openssl,zlib,nghttp2,pcre2
+build_deps=openssl,zlib,nghttp2,pcre2
+opt_deps=zstd,brotli
+num_builds=0
+description=cURL - client HTTP/FTP/libcurl
+homepage=https://curl.se/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://curl.se/download/
