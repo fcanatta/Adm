@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# hook: pre_build para perl (stage temporário em chroot)
+# Perl usa 'Configure' próprio, mas aqui só ajustamos ambiente para o builder.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Queremos perl instalando em /usr dentro do chroot
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Alguns builders podem ler isso para saber que não é ./configure padrão.
+# Se o teu build.sh for inteligente, ele detecta 'Configure' sozinho; esse
+# flag é só uma dica opcional.
+export ADM_BUILD_PERL_SPECIAL=1
+
+# Deixar flags padrão razoáveis
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+
+# PATH dentro do chroot já deve estar OK; só garantimos /usr/bin
+case ":$PATH:" in
+    *":${ADM_INSTALL_ROOT}/usr/bin:"*) ;;
+    *) export PATH="${ADM_INSTALL_ROOT}/usr/bin:${PATH}" ;;
+esac
