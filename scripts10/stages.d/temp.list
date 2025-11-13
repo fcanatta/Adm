@@ -1,0 +1,7 @@
+# Stage: temporary tools (dentro do chroot) Ferramentas “temporárias” dentro do chroot (Gettext, Bison, Perl, Python, Texinfo, Util-linux):
+dev/gettext
+dev/bison
+dev/perl
+dev/python
+dev/texinfo
+sys/util-linux
