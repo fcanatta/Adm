@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# hook: pre_build para musl (toolchain)
+# Objetivo:
+#   - Construir musl libc para o alvo dentro do sysroot do cross-tools
+#   - Usar headers do Linux já instalados
+#
+# Fluxo esperado no ADM:
+#   1) binutils-pass1
+#   2) gcc-pass1
+#   3) linux-headers
+#   4) musl    <-- este aqui
+#   5) binutils-pass2 / gcc-pass2 (versão "final" usando musl)
+
+set -eu
+
+# Raiz do ADM e cross-tools
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
+
+# Target padrão para musl; se quiser outro, exporta antes de chamar o adm:
+#   ADM_TARGET=aarch64-linux-musl adm stages run cross-musl
+: "${ADM_TARGET:=x86_64-linux-musl}"
+
+# Variáveis fornecidas pelo build.sh do ADM
+: "${ADM_BUILD_SRC_DIR:?}"      # diretório com o source extraído
+: "${ADM_BUILD_BUILD_DIR:?}"    # diretório de build (separado, se quiser)
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Sysroot onde estarão libc + headers do alvo
+SYSROOT="${ADM_CROSS_ROOT}"
+
+# musl instala dentro do sysroot via DESTDIR
+# Exemplo clássico:
+#   CC="$TARGET-gcc" ./configure --prefix=/usr --target=$TARGET
+#   make
+#   make DESTDIR="$SYSROOT" install
+#
+# Aqui, só preparamos o ambiente para o build.sh fazer isso
+export ADM_BUILD_PREFIX="${SYSROOT}/${ADM_TARGET}"
+
+# musl NÃO usa autotools padrão; tem ./configure próprio.
+# detect.sh deve enxergar o script ./configure da musl e tocar.
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+  --target=${ADM_TARGET}
+  --syslibdir=/lib
+"
+
+# Garante que headers do Linux estejam no lugar esperado:
+# (linux-headers deve ter instalado em ${SYSROOT}/${ADM_TARGET}/include)
+if [ ! -d "${SYSROOT}/${ADM_TARGET}/include" ]; then
+    printf '[musl pre_build] WARNING: headers do Linux não encontrados em %s\n' \
+        "${SYSROOT}/${ADM_TARGET}/include" >&2
+fi
+
+# Compilador cross para o alvo musl
+export CC="${ADM_TARGET}-gcc"
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+
+# PATH para garantir os binutils/gcc cross
+case ":$PATH:" in
+    *":${ADM_CROSS_ROOT}/bin:"*) ;;
+    *) export PATH="${ADM_CROSS_ROOT}/bin:${PATH}" ;;
+esac
