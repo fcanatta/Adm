@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'ncurses-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório ncurses-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+make DESTDIR="$DESTDIR" install
+
+# symlinks convenientes: ncursesw -> ncurses
+# (segue prática comum em distros)
+libdir="${DESTDIR}/usr/lib"
+if [[ -d "$libdir" ]]; then
+  (
+    cd "$libdir"
+    for so in libncursesw.so libncursesw.so.*; do
+      [[ -e "$so" ]] || continue
+      base="${so//w/}"           # libncurses.so*
+      [[ -e "$base" ]] || ln -sf "$so" "$base" || true
+    done
+  )
+fi
