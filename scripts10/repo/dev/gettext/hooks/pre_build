@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# hook: pre_build para gettext (stage temporário em chroot)
+# Ajusta prefix, docdir e flags básicos.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Instalação dentro do chroot → /usr
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Versão deve bater com o metafile (0.26)
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --disable-static
+  --enable-shared
+  --docdir=/usr/share/doc/gettext-0.26
+"
+
+# Em alguns sistemas ajuda ter bash como shell de configure
+if [ -x /bin/bash ]; then
+    export CONFIG_SHELL=/bin/bash
+fi
+
+# Otimizações genéricas
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
