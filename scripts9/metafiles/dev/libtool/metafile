@@ -1,0 +1,12 @@
+name=libtool
+version=2.4.x
+category=dev
+run_deps=
+build_deps=m4,autoconf,automake
+opt_deps=
+num_builds=0
+description=GNU libtool - suporte a bibliotecas compartilhadas em builds portáveis
+homepage=https://www.gnu.org/software/libtool/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/libtool/
