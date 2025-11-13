@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CATEGORY:=dev}"; : "${NAME:=rust}"
+: "${ADM_ROOT:=/usr/src/adm}"
+TRACKER="${TRACKER:-${ADM_ROOT}/scripts/10.10-update-upstream-tracker.sh}"
+
+# Aqui o metafile/update deve definir o tarball exato (ex. rust-1.78.0-x86_64-unknown-linux-gnu.tar.xz)
+if [[ -x "$TRACKER" ]]; then
+  "$TRACKER" \
+    --category "$CATEGORY" \
+    --name "$NAME" \
+    --download \
+    --apply \
+    --provider auto \
+    --parallel "${JOBS:-4}" || true
+fi
