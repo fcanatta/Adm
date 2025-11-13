@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+bindir="${DESTDIR}/usr/bin"
+
+if [[ ! -x "${bindir}/automake" ]]; then
+  echo "[ERR] automake: /usr/bin/automake não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+# alguns projetos chamam aclocal diretamente
+if [[ ! -x "${bindir}/aclocal" ]]; then
+  echo "[WAR] automake: /usr/bin/aclocal não encontrado em ${DESTDIR}" >&2 || true
+fi
+
+echo "[OK] automake instalado em ${bindir}/automake"
