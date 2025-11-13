@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/git" ]]; then
+  echo "[ERR] git: binário /usr/bin/git não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+echo "[OK] git instalado em ${DESTDIR}/usr/bin/git"
