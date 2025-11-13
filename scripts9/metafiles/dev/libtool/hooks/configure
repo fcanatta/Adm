@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+srcdir="$(find . -maxdepth 1 -type d -name 'libtool-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] libtool: diretório libtool-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+# sanity: precisa ter autoconf/automake disponíveis
+for bin in autoconf automake aclocal; do
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "[WAR] libtool: $bin não encontrado no PATH; mas pode não ser necessário para build a partir do tarball." >&2 || true
+  fi
+done
+
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+export CFLAGS LDFLAGS
+
+./configure \
+  --prefix=/usr \
+  --sysconfdir=/etc \
+  --disable-static
