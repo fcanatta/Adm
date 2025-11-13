@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+srcdir=$(find "$WORKDIR" -maxdepth 1 -type d -name 'curl-*' | head -n1)
+cd "$srcdir"
+
+./configure \
+  --prefix=/usr \
+  --with-openssl \
+  --with-zlib \
+  --with-nghttp2 \
+  --enable-ipv6 \
+  --enable-unix-sockets
