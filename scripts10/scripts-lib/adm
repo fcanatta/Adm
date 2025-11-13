@@ -1,0 +1,1185 @@
+#!/usr/bin/env bash
+# adm - CLI principal do sistema ADM
+#
+# Objetivo:
+#   - Interface de alto nível e amigável (com cores e TUI) para todos os
+#     subsistemas em lib/adm/*.sh:
+#       * env_profiles, repo, deps, fetch, detect, chroot, build, pkg,
+#         cleanup, stages, verify, update, sync, mkinitramfs
+#
+#   - Comandos principais:
+#       adm help [comando]
+#       adm menu        (TUI simples)
+#       adm detect
+#       adm fetch      <cat> <pkg>
+#       adm build      <cat> <pkg> [--with-deps]
+#       adm install    <cat> <pkg> [--with-deps]
+#       adm uninstall  <cat> <pkg> [--autoremove]
+#       adm orphans
+#       adm stages     list|run <stage>|sequence [stages...]
+#       adm verify     [all|toolchain|rootfs|packages]
+#       adm cleanup    [all|sources|build|destdirs|logs|tmp|state|chroot]
+#       adm update     <cat> <pkg> [--with-deps]
+#       adm update-all
+#       adm sync       (sincroniza repo git → /usr/src/adm/repo se sync.sh existir ou função estiver disponível)
+#       adm mkinit     [--running|--all|<kver>]
+#       adm search     <pattern>
+#       adm info       <cat> <pkg>
+#
+#   - Global:
+#       adm -h|--help
+#       adm -V|--version
+#       adm -n|--dry-run  (NÃO executa operações destrutivas/instalações)
+#       adm --no-color
+#
+#   - Sem argumentos: mostra logo colorida e dica de uso.
+#
+# Requisitos:
+#   - Nenhum erro silencioso: qualquer problema relevante é logado.
+#   - Dry-run propagado: variáveis ADM_*_DRYRUN são ajustadas quando possível.
+#   - Saída colorida e amigável em todas as operações.
+
+###############################################################################
+# Configuração básica
+###############################################################################
+
+ADM_ROOT_DEFAULT="/usr/src/adm"
+: "${ADM_ROOT:=${ADM_ROOT_DEFAULT}}"
+: "${ADM_LIBDIR:=${ADM_LIBDIR:-$ADM_ROOT/lib/adm}}"
+
+ADM_CLI_DRYRUN=0
+ADM_CLI_COLOR=1
+ADM_CLI_VERBOSE=1
+
+ADM_VERSION="0.1.0-dev"
+
+# Evitar colateral se shell for estrito; não usamos set -e aqui
+# para não matar o CLI por pequenos erros de libs.
+
+###############################################################################
+# Cores e estilo
+###############################################################################
+
+adm_cli_init_colors() {
+    # Desativar se stdout não for terminal ou se --no-color
+    if [ "$ADM_CLI_COLOR" -ne 1 ] || ! [ -t 1 ]; then
+        ADM_COL_RESET=""
+        ADM_COL_BOLD=""
+        ADM_COL_DIM=""
+        ADM_COL_RED=""
+        ADM_COL_GREEN=""
+        ADM_COL_YELLOW=""
+        ADM_COL_BLUE=""
+        ADM_COL_MAGENTA=""
+        ADM_COL_CYAN=""
+        return 0
+    fi
+
+    # Tenta tput; fallback para sequências ANSI simples
+    if command -v tput >/dev/null 2>&1; then
+        ADM_COL_RESET="$(tput sgr0 2>/dev/null || echo '')"
+        ADM_COL_BOLD="$(tput bold 2>/dev/null || echo '')"
+        ADM_COL_DIM="$(tput dim 2>/dev/null || echo '')"
+        ADM_COL_RED="$(tput setaf 1 2>/dev/null || echo '')"
+        ADM_COL_GREEN="$(tput setaf 2 2>/dev/null || echo '')"
+        ADM_COL_YELLOW="$(tput setaf 3 2>/dev/null || echo '')"
+        ADM_COL_BLUE="$(tput setaf 4 2>/dev/null || echo '')"
+        ADM_COL_MAGENTA="$(tput setaf 5 2>/dev/null || echo '')"
+        ADM_COL_CYAN="$(tput setaf 6 2>/dev/null || echo '')"
+    else
+        ADM_COL_RESET=$'\033[0m'
+        ADM_COL_BOLD=$'\033[1m'
+        ADM_COL_DIM=$'\033[2m'
+        ADM_COL_RED=$'\033[31m'
+        ADM_COL_GREEN=$'\033[32m'
+        ADM_COL_YELLOW=$'\033[33m'
+        ADM_COL_BLUE=$'\033[34m'
+        ADM_COL_MAGENTA=$'\033[35m'
+        ADM_COL_CYAN=$'\033[36m'
+    fi
+}
+
+###############################################################################
+# Logging básico (fallback, será sobrescrito por log.sh se carregado)
+###############################################################################
+
+adm_log()        { printf '%b\n' "$*" >&2; }
+adm_log_info()   { adm_log "${ADM_COL_BLUE}[INFO]${ADM_COL_RESET}  $*"; }
+adm_log_warn()   { adm_log "${ADM_COL_YELLOW}[WARN]${ADM_COL_RESET}  $*"; }
+adm_log_error()  { adm_log "${ADM_COL_RED}[ERROR]${ADM_COL_RESET} $*"; }
+adm_log_debug()  { [ "$ADM_CLI_VERBOSE" -eq 1 ] && adm_log "${ADM_COL_DIM}[DEBUG] $*${ADM_COL_RESET}"; }
+
+adm_log_cmd()    { adm_log "${ADM_COL_CYAN}[CMD]${ADM_COL_RESET}   $*"; }
+adm_log_ok()     { adm_log "${ADM_COL_GREEN}[OK]${ADM_COL_RESET}    $*"; }
+
+###############################################################################
+# Carrega libs de baixo nível (se existirem)
+###############################################################################
+
+adm_cli_load_libs() {
+    local f
+    for f in log core env_profiles env_profiles.sh env_profiles.sh repo deps fetch detect chroot build pkg cleanup stages verify update sync mkinitramfs; do
+        case "$f" in
+            *.sh) path="$ADM_LIBDIR/$f" ;;
+            *)
+                path="$ADM_LIBDIR/$f.sh"
+                ;;
+        esac
+        if [ -f "$path" ]; then
+            # shellcheck source=/dev/null
+            . "$path"
+        fi
+    done
+}
+
+###############################################################################
+# Logo e UI
+###############################################################################
+
+adm_logo() {
+    local C1="$ADM_COL_CYAN" C2="$ADM_COL_BLUE" C3="$ADM_COL_MAGENTA" B="$ADM_COL_BOLD" R="$ADM_COL_RESET"
+    cat <<EOF
+${B}${C1}      █████╗ ██████╗ ███╗   ███╗
+     ██╔══██╗██╔══██╗████╗ ████║
+     ███████║██████╔╝██╔████╔██║
+     ██╔══██║██╔══██╗██║╚██╔╝██║
+     ██║  ██║██║  ██║██║ ╚═╝ ██║
+     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝${R}
+
+${C2}        Advanced Distro Maker${R}
+${C3}        /usr/src/adm – Linux From Scratch automation${R}
+EOF
+}
+
+adm_cli_header() {
+    adm_log "${ADM_COL_BOLD}${ADM_COL_CYAN}==>${ADM_COL_RESET} $*"
+}
+
+###############################################################################
+# Ajuda
+###############################################################################
+
+adm_help_general() {
+    local B="$ADM_COL_BOLD" R="$ADM_COL_RESET" G="$ADM_COL_GREEN" Y="$ADM_COL_YELLOW" C="$ADM_COL_CYAN"
+
+    cat <<EOF
+${B}Uso:${R} adm [opções globais] <comando> [parâmetros]
+
+${B}Opções globais:${R}
+  ${G}-h${R}, ${G}--help${R}         Mostrar ajuda geral ou de um comando
+  ${G}-V${R}, ${G}--version${R}      Mostrar versão do ADM
+  ${G}-n${R}, ${G}--dry-run${R}      Modo simulação (NÃO executa mudanças)
+  ${G}--no-color${R}        Desativar cores na saída
+
+${B}Comandos principais:${R}
+  ${C}help${R} [cmd]        Mostrar ajuda detalhada de um comando
+  ${C}menu${R}              Abrir menu TUI interativo
+  ${C}detect${R}            Detectar toolchains, libc, compiladores, etc
+  ${C}sync${R}              Sincronizar /usr/src/adm/repo com repositório git
+  ${C}fetch${R} <cat> <pkg> Baixar sources/tarballs de um pacote
+  ${C}build${R} <cat> <pkg> [--with-deps]
+                      Construir pacote (opcionalmente com dependências)
+  ${C}install${R} <cat> <pkg> [--with-deps]
+                      Construir + instalar pacote
+  ${C}uninstall${R} <cat> <pkg> [--autoremove]
+                      Remover pacote (e deps órfãos opcionalmente)
+  ${C}orphans${R}           Listar/remover pacotes órfãos
+  ${C}stages${R} ...        Orquestrar estágios cross/temp/stage2/base
+  ${C}verify${R} ...        Verificar toolchain, rootfs, pacotes
+  ${C}cleanup${R} ...       Limpar caches, destdirs, logs, tmp, etc
+  ${C}update${R} ...        Buscar nova versão em upstream e criar metafile
+  ${C}update-all${R}        Varredura de updates para todo o repo
+  ${C}mkinit${R} ...        Criar initramfs (mkinitramfs)
+  ${C}search${R} <padrao>   Procurar programa no repositório de metafiles
+  ${C}info${R} <cat> <pkg>  Mostrar informações de um programa (metafile)
+
+Para ajuda detalhada:
+  ${Y}adm help build${R}
+  ${Y}adm help stages${R}
+  ${Y}adm help mkinit${R}
+EOF
+}
+
+adm_help_build() {
+    cat <<EOF
+Comando: build
+
+Uso:
+  adm build <categoria> <pacote> [--with-deps]
+
+Descrição:
+  Constrói o pacote (e opcionalmente suas dependências) usando as
+  rotinas de baixo nível de build.sh e deps.sh.
+
+Opções:
+  --with-deps   Resolve dependências (run_deps/build_deps) e constrói
+                em ordem antes do pacote alvo.
+
+Respeita --dry-run:
+  Com --dry-run, apenas mostra o que seria construído, sem executar
+  de fato adm_build_package/adm_pkg_install_*.
+EOF
+}
+
+adm_help_install() {
+    cat <<EOF
+Comando: install
+
+Uso:
+  adm install <categoria> <pacote> [--with-deps]
+
+Descrição:
+  Constrói e instala o pacote alvo usando pkg.sh. Se --with-deps for
+  usado, resolve dependências e instala tudo em ordem.
+
+Respeita --dry-run:
+  Com --dry-run, apenas exibe a ordem de instalação, sem alterar o
+  sistema.
+EOF
+}
+
+adm_help_uninstall() {
+    cat <<EOF
+Comando: uninstall
+
+Uso:
+  adm uninstall <categoria> <pacote> [--autoremove]
+
+Descrição:
+  Desinstala um pacote utilizando pkg.sh. Se --autoremove for
+  fornecido, chama a rotina de remoção de órfãos ao final.
+
+Respeita --dry-run:
+  Com --dry-run, mostra quais arquivos seriam removidos e quais
+  pacotes seriam afetados.
+EOF
+}
+
+adm_help_stages() {
+    cat <<EOF
+Comando: stages
+
+Uso:
+  adm stages list
+  adm stages run <stage>
+  adm stages sequence [stage1 stage2 ...]
+      (sem argumentos → sequencia padrão: cross temp stage2 base)
+
+Descrição:
+  Orquestra estágios de construção do sistema (cross toolchain,
+  temporários, stage2, base) utilizando stages.sh.
+
+Respeita --dry-run:
+  Com --dry-run, lista a ordem de pacotes que seriam processados
+  em cada stage, sem chamar os builders de fato.
+EOF
+}
+
+adm_help_verify() {
+    cat <<EOF
+Comando: verify
+
+Uso:
+  adm verify                # equivalente a 'adm verify all'
+  adm verify all            # toolchain + rootfs + pacotes
+  adm verify toolchain      # cross + final
+  adm verify rootfs         # rootfs stage2/base
+  adm verify packages       # apenas pacotes/manifests
+
+Saída:
+  Mostra resultado agregado (checks, warnings, errors) utilizando
+  verify.sh.
+EOF
+}
+
+adm_help_cleanup() {
+    cat <<EOF
+Comando: cleanup
+
+Uso:
+  adm cleanup                        # igual a 'adm cleanup all'
+  adm cleanup all
+  adm cleanup sources|build|destdirs|logs|tmp|state|chroot [...]
+
+Descrição:
+  Limpa caches de fontes/build, destdirs, logs antigos, tmp, estado
+  de pacotes removidos e mounts de chroot pendurados, usando
+  cleanup.sh.
+
+Respeita --dry-run:
+  Com --dry-run, apenas exibe as remoções planejadas.
+EOF
+}
+
+adm_help_update() {
+    cat <<EOF
+Comando: update
+
+Uso:
+  adm update <categoria> <pacote> [--with-deps]
+  adm update-all
+
+Descrição:
+  Usa update.sh para buscar versões novas em upstream (GitHub/GitLab/
+  diretórios de download), filtrando estáveis, e cria metafiles em
+  /usr/src/adm/updates/<nome>/<versão>.meta.
+
+Respeita --dry-run:
+  Com --dry-run, NÃO escreve metafiles, apenas mostra o que faria.
+EOF
+}
+
+adm_help_sync() {
+    cat <<EOF
+Comando: sync
+
+Uso:
+  adm sync
+
+Descrição:
+  Sincroniza /usr/src/adm/repo com o repositório git configurado.
+  Se lib/adm/sync.sh implementar uma função adm_sync_repo, ela será
+  usada. Caso contrário, este comando tentará utilizar 'git clone' ou
+  'git pull' diretamente.
+
+Variáveis relevantes:
+  ADM_REPO_GIT_URL   URL do repositório git de metafiles
+EOF
+}
+
+adm_help_mkinit() {
+    cat <<EOF
+Comando: mkinit
+
+Uso:
+  adm mkinit --running      # initramfs para kernel em execução
+  adm mkinit --all          # initramfs para todos os /lib/modules/<kver>
+  adm mkinit <kver>         # initramfs apenas para a versão <kver>
+
+Descrição:
+  Cria imagens initramfs usando mkinitramfs.sh, com suporte a
+  compressões xz/zstd/lz4/gzip ou sem compressão.
+
+Respeita --dry-run:
+  Com --dry-run, apenas mostra diretórios de build e arquivos de
+  saída, sem gerar imagens de fato.
+EOF
+}
+
+adm_help_search() {
+    cat <<EOF
+Comando: search
+
+Uso:
+  adm search <padrão>
+
+Descrição:
+  Procura por programas (metafiles) em /usr/src/adm/repo, listando
+  categoria/nome/versão/descrição curta quando possível.
+EOF
+}
+
+adm_help_info() {
+    cat <<EOF
+Comando: info
+
+Uso:
+  adm info <categoria> <pacote>
+
+Descrição:
+  Lê o metafile em /usr/src/adm/repo/<categoria>/<pacote>/metafile
+  e mostra os campos disponíveis (name, version, deps, homepage, etc).
+EOF
+}
+
+adm_help_command() {
+    case "$1" in
+        build)    adm_help_build ;;
+        install)  adm_help_install ;;
+        uninstall)adm_help_uninstall ;;
+        stages)   adm_help_stages ;;
+        verify)   adm_help_verify ;;
+        cleanup)  adm_help_cleanup ;;
+        update)   adm_help_update ;;
+        sync)     adm_help_sync ;;
+        mkinit)   adm_help_mkinit ;;
+        search)   adm_help_search ;;
+        info)     adm_help_info ;;
+        *)
+            adm_log_error "Comando desconhecido para ajuda: $1"
+            adm_help_general
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+###############################################################################
+# Comandos de alto nível
+###############################################################################
+
+# -------- detect ------------------------------------------------------
+
+adm_cmd_detect() {
+    if ! command -v adm_detect_all >/dev/null 2>&1; then
+        adm_log_error "Função adm_detect_all não encontrada (detect.sh não carregado)."
+        return 1
+    fi
+    adm_cli_header "Detectando toolchain, libc, compiladores, linkers, linguagens..."
+    adm_detect_all
+}
+
+# -------- sync --------------------------------------------------------
+
+adm_cmd_sync() {
+    adm_cli_header "Sincronizando repositório git de metafiles..."
+
+    # Se sync.sh expõe adm_sync_repo, priorizar
+    if command -v adm_sync_repo >/dev/null 2>&1; then
+        if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+            ADM_SYNC_DRYRUN=1
+            adm_log_cmd "[DRY-RUN] Chamaria adm_sync_repo (lib/sync.sh)."
+            return 0
+        fi
+        ADM_SYNC_DRYRUN=0
+        adm_sync_repo
+        return $?
+    fi
+
+    # Caso não exista, tenta lógica simples baseada em git
+    : "${ADM_REPO_DIR:=${ADM_REPO_DIR:-$ADM_ROOT/repo}}"
+    : "${ADM_REPO_GIT_URL:=${ADM_REPO_GIT_URL:-}}"
+
+    if [ -z "$ADM_REPO_GIT_URL" ]; then
+        adm_log_error "ADM_REPO_GIT_URL não configurada e sync.sh ausente; não sei de onde sincronizar."
+        return 1
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        adm_log_error "'git' não encontrado no PATH."
+        return 1
+    fi
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        if [ -d "$ADM_REPO_DIR/.git" ]; then
+            adm_log_cmd "[DRY-RUN] Executaria: cd %s && git pull --ff-only" "$ADM_REPO_DIR"
+        else
+            adm_log_cmd "[DRY-RUN] Executaria: git clone %s %s" "$ADM_REPO_GIT_URL" "$ADM_REPO_DIR"
+        fi
+        return 0
+    fi
+
+    if [ -d "$ADM_REPO_DIR/.git" ]; then
+        adm_log_cmd "Atualizando repositório existente em %s..." "$ADM_REPO_DIR"
+        ( cd "$ADM_REPO_DIR" 2>/dev/null && git pull --ff-only ) || {
+            adm_log_error "Falha ao executar git pull em %s." "$ADM_REPO_DIR"
+            return 1
+        }
+    else
+        adm_log_cmd "Clonando repositório %s em %s..." "$ADM_REPO_GIT_URL" "$ADM_REPO_DIR"
+        git clone "$ADM_REPO_GIT_URL" "$ADM_REPO_DIR" 2>/dev/null || {
+            adm_log_error "Falha ao clonar %s em %s." "$ADM_REPO_GIT_URL" "$ADM_REPO_DIR"
+            return 1
+        }
+    fi
+
+    adm_log_ok "Repositório sincronizado em %s." "$ADM_REPO_DIR"
+    return 0
+}
+
+# -------- fetch -------------------------------------------------------
+
+adm_cmd_fetch() {
+    if [ $# -ne 2 ]; then
+        adm_log_error "Uso: adm fetch <categoria> <pacote>"
+        return 1
+    fi
+    local category="$1" pkg="$2"
+
+    if ! command -v adm_fetch_package >/dev/null 2>&1 && \
+       ! command -v adm_fetch >/dev/null 2>&1; then
+        adm_log_error "Função adm_fetch_package/adm_fetch não encontrada (fetch.sh não carregado)."
+        return 1
+    fi
+
+    adm_cli_header "Baixando fontes de ${category}/${pkg}..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_FETCH_DRYRUN=1
+        adm_log_cmd "[DRY-RUN] Chamaria rotina de fetch para %s/%s." "$category" "$pkg"
+        return 0
+    fi
+
+    ADM_FETCH_DRYRUN=0
+
+    if command -v adm_fetch_package >/dev/null 2>&1; then
+        adm_fetch_package "$category" "$pkg"
+    else
+        adm_fetch "$category" "$pkg"
+    fi
+}
+
+# -------- build -------------------------------------------------------
+
+adm_cmd_build() {
+    if [ $# -lt 2 ]; then
+        adm_log_error "Uso: adm build <categoria> <pacote> [--with-deps]"
+        return 1
+    fi
+    local category="$1" pkg="$2"; shift 2
+    local with_deps=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-deps) with_deps=1 ;;
+            *)
+                adm_log_error "Opção desconhecida para build: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if ! command -v adm_build_package >/dev/null 2>&1; then
+        adm_log_error "Função adm_build_package não encontrada (build.sh não carregado)."
+        return 1
+    fi
+
+    adm_cli_header "Build de ${category}/${pkg} (with_deps=${with_deps})..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_BUILD_DRYRUN=1
+        adm_log_cmd "[DRY-RUN] Chamaria adm_build_package (ou resolução de deps) para %s/%s." "$category" "$pkg"
+        return 0
+    fi
+
+    ADM_BUILD_DRYRUN=0
+
+    if [ "$with_deps" -eq 1 ] && command -v adm_deps_resolve_for_build >/dev/null 2>&1; then
+        adm_log_cmd "Resolvendo dependências para build..."
+        adm_deps_resolve_for_build "${category}/${pkg}" || return 1
+    fi
+
+    adm_build_package "$category" "$pkg"
+}
+
+# -------- install -----------------------------------------------------
+
+adm_cmd_install() {
+    if [ $# -lt 2 ]; then
+        adm_log_error "Uso: adm install <categoria> <pacote> [--with-deps]"
+        return 1
+    fi
+    local category="$1" pkg="$2"; shift 2
+    local with_deps=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-deps) with_deps=1 ;;
+            *)
+                adm_log_error "Opção desconhecida para install: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if ! command -v adm_pkg_install_single >/dev/null 2>&1 && \
+       ! command -v adm_pkg_install_with_deps >/dev/null 2>&1; then
+        adm_log_error "Funções de pkg.sh (adm_pkg_install_*) não encontradas."
+        return 1
+    fi
+
+    adm_cli_header "Instalação de ${category}/${pkg} (with_deps=${with_deps})..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_BUILD_DRYRUN=1
+        ADM_PKG_DRYRUN=1
+        adm_log_cmd "[DRY-RUN] Resolveria deps e chamaria rotinas de build/install para %s/%s." "$category" "$pkg"
+        return 0
+    fi
+
+    ADM_BUILD_DRYRUN=0
+    ADM_PKG_DRYRUN=0
+
+    if [ "$with_deps" -eq 1 ] && command -v adm_pkg_install_with_deps >/dev/null 2>&1; then
+        adm_pkg_install_with_deps "$category" "$pkg"
+    else
+        adm_pkg_install_single "$category" "$pkg" "explicit"
+    fi
+}
+
+# -------- uninstall / orphans ----------------------------------------
+
+adm_cmd_uninstall() {
+    if [ $# -lt 2 ]; then
+        adm_log_error "Uso: adm uninstall <categoria> <pacote> [--autoremove]"
+        return 1
+    fi
+    local category="$1" pkg="$2"; shift 2
+    local autoremove=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --autoremove) autoremove=1 ;;
+            *)
+                adm_log_error "Opção desconhecida para uninstall: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if ! command -v adm_pkg_uninstall_single >/dev/null 2>&1; then
+        adm_log_error "Função adm_pkg_uninstall_single não encontrada (pkg.sh não carregado)."
+        return 1
+    fi
+
+    adm_cli_header "Desinstalação de ${category}/${pkg} (autoremove=${autoremove})..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_PKG_DRYRUN=1
+        adm_log_cmd "[DRY-RUN] Removeria %s/%s e, se solicitado, órfãos." "$category" "$pkg"
+        return 0
+    fi
+
+    ADM_PKG_DRYRUN=0
+
+    adm_pkg_uninstall_single "$category" "$pkg" || return 1
+
+    if [ "$autoremove" -eq 1 ] && command -v adm_pkg_autoremove_orphans >/dev/null 2>&1; then
+        adm_pkg_autoremove_orphans
+    fi
+}
+
+adm_cmd_orphans() {
+    if ! command -v adm_deps_list_orphans >/dev/null 2>&1; then
+        adm_log_error "Função adm_deps_list_orphans não encontrada (deps.sh não carregado)."
+        return 1
+    fi
+
+    local list
+    list="$(adm_deps_list_orphans 2>/dev/null || true)"
+    if [ -z "$list" ]; then
+        adm_log_ok "Nenhum pacote órfão detectado."
+        return 0
+    fi
+
+    adm_cli_header "Pacotes órfãos detectados:"
+    printf '%s\n' "$list"
+}
+
+# -------- stages ------------------------------------------------------
+
+adm_cmd_stages() {
+    if [ $# -lt 1 ]; then
+        adm_log_error "Uso: adm stages list|run <stage>|sequence [stages...]"
+        return 1
+    fi
+    local sub="$1"; shift
+
+    if ! command -v adm_stages_list >/dev/null 2>&1 && \
+       ! command -v adm_stage_run >/dev/null 2>&1 && \
+       ! command -v adm_stages_run_sequence >/dev/null 2>&1; then
+        adm_log_error "Funções de stages.sh não encontradas."
+        return 1
+    fi
+
+    case "$sub" in
+        list)
+            adm_cli_header "Stages disponíveis:"
+            adm_stages_list
+            ;;
+        run)
+            if [ $# -ne 1 ]; then
+                adm_log_error "Uso: adm stages run <stage>"
+                return 1
+            fi
+            local stage="$1"
+            adm_cli_header "Executando stage: ${stage}"
+            [ "$ADM_CLI_DRYRUN" -eq 1 ] && ADM_STAGE_FORCE=0 && ADM_STAGE_RESUME=1 && ADM_STAGE_DRYRUN=1
+            adm_stage_run "$stage"
+            ;;
+        sequence)
+            adm_cli_header "Executando sequência de stages..."
+            [ "$ADM_CLI_DRYRUN" -eq 1 ] && ADM_STAGE_FORCE=0 && ADM_STAGE_RESUME=1 && ADM_STAGE_DRYRUN=1
+            if [ $# -eq 0 ]; then
+                adm_stages_run_sequence
+            else
+                adm_stages_run_sequence "$@"
+            fi
+            ;;
+        *)
+            adm_log_error "Subcomando desconhecido para stages: %s" "$sub"
+            return 1
+            ;;
+    esac
+}
+
+# -------- verify ------------------------------------------------------
+
+adm_cmd_verify() {
+    local mode="${1:-all}"
+
+    if ! command -v adm_verify_all >/dev/null 2>&1 && \
+       ! command -v adm_verify_toolchain_cross >/dev/null 2>&1; then
+        adm_log_error "Funções de verify.sh não encontradas."
+        return 1
+    fi
+
+    case "$mode" in
+        ""|all)
+            adm_cli_header "Verificando tudo (toolchain, rootfs, pacotes)..."
+            adm_verify_all
+            ;;
+        toolchain)
+            adm_cli_header "Verificando toolchain (cross + final)..."
+            adm_verify_toolchain_cross
+            adm_verify_toolchain_final
+            ;;
+        rootfs)
+            adm_cli_header "Verificando rootfs stage2..."
+            adm_verify_rootfs_stage2
+            ;;
+        packages)
+            adm_cli_header "Verificando pacotes e manifests..."
+            adm_verify_packages_all
+            ;;
+        *)
+            adm_log_error "Modo desconhecido para verify: %s" "$mode"
+            return 1
+            ;;
+    esac
+}
+
+# -------- cleanup -----------------------------------------------------
+
+adm_cmd_cleanup() {
+    if ! command -v adm_cleanup_all >/dev/null 2>&1; then
+        adm_log_error "Função adm_cleanup_all não encontrada (cleanup.sh não carregado)."
+        return 1
+    fi
+
+    local args=("$@")
+    adm_cli_header "Limpeza (cleanup): ${args[*]:-all}"
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_CLEANUP_DRYRUN=1
+    else
+        ADM_CLEANUP_DRYRUN=0
+    fi
+
+    if [ "${#args[@]}" -eq 0 ]; then
+        adm_cleanup_all
+    else
+        adm_cleanup_all "${args[@]}"
+    fi
+}
+
+# -------- update ------------------------------------------------------
+
+adm_cmd_update() {
+    if [ $# -lt 1 ]; then
+        adm_log_error "Uso: adm update <cat> <pkg> [--with-deps]  OU  adm update-all"
+        return 1
+    fi
+
+    if [ "$1" = "all" ] || [ "$1" = "update-all" ]; then
+        adm_cmd_update_all
+        return $?
+    fi
+
+    if [ $# -lt 2 ]; then
+        adm_log_error "Uso: adm update <categoria> <pacote> [--with-deps]"
+        return 1
+    fi
+    local category="$1" pkg="$2"; shift 2
+    local with_deps=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-deps) with_deps=1 ;;
+            *)
+                adm_log_error "Opção desconhecida para update: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+
+    if ! command -v adm_update_pkg_with_deps >/dev/null 2>&1 && \
+       ! command -v adm_update_package >/dev/null 2>&1; then
+        adm_log_error "Funções de update.sh não encontradas."
+        return 1
+    fi
+
+    adm_cli_header "Update de ${category}/${pkg} (with_deps=${with_deps})..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_UPDATE_DRYRUN=1
+    else
+        ADM_UPDATE_DRYRUN=0
+    fi
+
+    if [ "$with_deps" -eq 1 ] && command -v adm_update_pkg_with_deps >/dev/null 2>&1; then
+        adm_update_pkg_with_deps "$category" "$pkg"
+    else
+        adm_update_package "$category" "$pkg" 0
+    fi
+}
+
+adm_cmd_update_all() {
+    if ! command -v adm_update_all_repo >/dev/null 2>&1; then
+        adm_log_error "Função adm_update_all_repo não encontrada (update.sh não carregado)."
+        return 1
+    fi
+
+    adm_cli_header "Varredura de updates para todo o repositório..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_UPDATE_DRYRUN=1
+        adm_log_cmd "[DRY-RUN] Chamaria adm_update_all_repo (sem escrever metafiles)."
+    else
+        ADM_UPDATE_DRYRUN=0
+        adm_update_all_repo
+    fi
+}
+
+# -------- mkinit ------------------------------------------------------
+
+adm_cmd_mkinit() {
+    if ! command -v adm_mkinit_generate >/dev/null 2>&1; then
+        adm_log_error "Funções de mkinitramfs.sh não encontradas."
+        return 1
+    fi
+
+    local mode="${1:---running}"
+
+    adm_cli_header "mkinitramfs (modo=${mode})..."
+
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        ADM_MKINIT_KEEP_TREE=1
+        adm_log_cmd "[DRY-RUN] Não serão criadas imagens reais; apenas mostraria operações."
+    fi
+
+    case "$mode" in
+        --running)
+            if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+                local k
+                k="$(uname -r 2>/dev/null || echo 'desconhecido')"
+                adm_log_cmd "[DRY-RUN] Geraria initramfs para kernel em execução: %s" "$k"
+                return 0
+            fi
+            adm_mkinit_generate_for_running
+            ;;
+        --all)
+            if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+                adm_log_cmd "[DRY-RUN] Percorreria /lib/modules e geraria initramfs para todos os kernels."
+                return 0
+            fi
+            adm_mkinit_generate_for_all
+            ;;
+        *)
+            # assume kver
+            if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+                adm_log_cmd "[DRY-RUN] Geraria initramfs para kver=%s" "$mode"
+                return 0
+            fi
+            adm_mkinit_generate "$mode"
+            ;;
+    esac
+}
+
+# -------- search / info -----------------------------------------------
+
+adm_cmd_search() {
+    if [ $# -ne 1 ]; then
+        adm_log_error "Uso: adm search <padrão>"
+        return 1
+    fi
+    local pattern="$1"
+    local base="$ADM_ROOT/repo"
+
+    if [ ! -d "$base" ]; then
+        adm_log_error "Diretório de repo não existe: %s" "$base"
+        return 1
+    fi
+
+    adm_cli_header "Procurando programas que combinem com: ${pattern}"
+
+    local mf
+    local count=0
+    while IFS= read -r mf || [ -n "$mf" ]; do
+        [ -f "$mf" ] || continue
+        local rel
+        rel="${mf#$base/}" # cat/name/metafile
+        local cat name
+        cat="${rel%%/*}"
+        name="$(printf '%s\n' "$rel" | cut -d'/' -f2)"
+
+        # Carrega descrição e versão rudimentar
+        local desc ver
+        desc="$(sed -n 's/^description=//p' "$mf" | head -n1)"
+        ver="$(sed -n 's/^version=//p' "$mf" | head -n1)"
+
+        printf "%b- %s/%s%b  %b(%s)%b  %s\n" \
+            "$ADM_COL_CYAN" "$cat" "$name" "$ADM_COL_RESET" \
+            "$ADM_COL_YELLOW" "${ver:-?}" "$ADM_COL_RESET" \
+            "${desc:-}"
+        count=$((count+1))
+    done <<EOF
+$(find "$base" -mindepth 3 -maxdepth 3 -type f -name 'metafile' -print 2>/dev/null | grep -i "$pattern" || true)
+EOF
+
+    if [ "$count" -eq 0 ]; then
+        adm_log_warn "Nenhum programa encontrado para padrão: %s" "$pattern"
+    else
+        adm_log_ok "Encontrados %d programas." "$count"
+    fi
+}
+
+adm_cmd_info() {
+    if [ $# -ne 2 ]; then
+        adm_log_error "Uso: adm info <categoria> <pacote>"
+        return 1
+    fi
+    local category="$1" pkg="$2"
+    local mf="$ADM_ROOT/repo/$category/$pkg/metafile"
+
+    if [ ! -f "$mf" ]; then
+        adm_log_error "Metafile não encontrado: %s" "$mf"
+        return 1
+    fi
+
+    adm_cli_header "Informações de ${category}/${pkg}:"
+
+    # Imprime chave=valor com colorização leve
+    while IFS='=' read -r k v || [ -n "$k" ]; do
+        [ -z "$k" ] && continue
+        printf "%b%-12s%b = %s\n" "$ADM_COL_GREEN" "$k" "$ADM_COL_RESET" "$v"
+    done <"$mf"
+}
+
+###############################################################################
+# TUI (menu simples)
+###############################################################################
+
+adm_menu() {
+    local opt
+    while :; do
+        clear 2>/dev/null || :
+        adm_logo
+        echo
+        echo "${ADM_COL_BOLD}${ADM_COL_CYAN}Menu TUI do ADM${ADM_COL_RESET}  (dry-run=${ADM_CLI_DRYRUN})"
+        echo
+        cat <<EOF
+  ${ADM_COL_GREEN}1${ADM_COL_RESET}  Detectar sistema (detect)
+  ${ADM_COL_GREEN}2${ADM_COL_RESET}  Sincronizar repo (sync)
+  ${ADM_COL_GREEN}3${ADM_COL_RESET}  Buscar programa (search)
+  ${ADM_COL_GREEN}4${ADM_COL_RESET}  Info de programa (info)
+  ${ADM_COL_GREEN}5${ADM_COL_RESET}  Construir pacote (build)
+  ${ADM_COL_GREEN}6${ADM_COL_RESET}  Instalar pacote (install)
+  ${ADM_COL_GREEN}7${ADM_COL_RESET}  Desinstalar pacote (uninstall)
+  ${ADM_COL_GREEN}8${ADM_COL_RESET}  Stages (sequência padrão)
+  ${ADM_COL_GREEN}9${ADM_COL_RESET}  Verificar sistema (verify all)
+  ${ADM_COL_GREEN}10${ADM_COL_RESET} Limpar caches (cleanup all)
+  ${ADM_COL_GREEN}11${ADM_COL_RESET} Update pacote (update)
+  ${ADM_COL_GREEN}12${ADM_COL_RESET} mkinitramfs para kernel atual
+  ${ADM_COL_GREEN}0${ADM_COL_RESET}  Sair
+EOF
+        echo
+        printf "%bEscolha uma opção:%b " "$ADM_COL_YELLOW" "$ADM_COL_RESET"
+        read -r opt || return 0
+        case "$opt" in
+            1) adm_cmd_detect; read -r -p "Pressione ENTER para continuar..." _ ;;
+            2) adm_cmd_sync; read -r -p "Pressione ENTER para continuar..." _ ;;
+            3)
+                printf "Padrão de busca: "
+                read -r p
+                [ -n "$p" ] && adm_cmd_search "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            4)
+                printf "Categoria: "
+                read -r c
+                printf "Pacote: "
+                read -r p
+                [ -n "$c" ] && [ -n "$p" ] && adm_cmd_info "$c" "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            5)
+                printf "Categoria: "
+                read -r c
+                printf "Pacote: "
+                read -r p
+                [ -n "$c" ] && [ -n "$p" ] && adm_cmd_build "$c" "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            6)
+                printf "Categoria: "
+                read -r c
+                printf "Pacote: "
+                read -r p
+                [ -n "$c" ] && [ -n "$p" ] && adm_cmd_install "$c" "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            7)
+                printf "Categoria: "
+                read -r c
+                printf "Pacote: "
+                read -r p
+                [ -n "$c" ] && [ -n "$p" ] && adm_cmd_uninstall "$c" "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            8)
+                adm_cmd_stages sequence
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            9)
+                adm_cmd_verify all
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            10)
+                adm_cmd_cleanup all
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            11)
+                printf "Categoria: "
+                read -r c
+                printf "Pacote: "
+                read -r p
+                [ -n "$c" ] && [ -n "$p" ] && adm_cmd_update "$c" "$p"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            12)
+                adm_cmd_mkinit --running
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            0) break ;;
+            *) echo "Opção inválida."; sleep 1 ;;
+        esac
+    done
+}
+
+###############################################################################
+# Parsing de argumentos e dispatch
+###############################################################################
+
+adm_main() {
+    adm_cli_init_colors
+    adm_cli_load_libs
+
+    local args=()
+
+    # Global options
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                adm_help_general
+                return 0
+                ;;
+            -V|--version)
+                echo "adm ${ADM_VERSION}"
+                return 0
+                ;;
+            -n|--dry-run)
+                ADM_CLI_DRYRUN=1
+                ;;
+            --no-color)
+                ADM_CLI_COLOR=0
+                adm_cli_init_colors
+                ;;
+            --verbose)
+                ADM_CLI_VERBOSE=1
+                ;;
+            --quiet)
+                ADM_CLI_VERBOSE=0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                adm_log_error "Opção global desconhecida: %s" "$1"
+                return 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+        shift
+    done
+
+    # Dry-run visível
+    if [ "$ADM_CLI_DRYRUN" -eq 1 ]; then
+        adm_log_warn "Modo DRY-RUN ATIVADO: nenhuma modificação persistente será feita."
+    fi
+
+    # Sem comando → mostrar logo
+    if [ $# -eq 0 ]; then
+        adm_logo
+        echo
+        echo "Use '${ADM_COL_YELLOW}adm help${ADM_COL_RESET}' para ver os comandos disponíveis,"
+        echo "ou '${ADM_COL_YELLOW}adm menu${ADM_COL_RESET}' para abrir o menu interativo."
+        return 0
+    fi
+
+    local cmd="$1"; shift
+
+    case "$cmd" in
+        help)
+            if [ $# -eq 0 ]; then
+                adm_help_general
+            else
+                adm_help_command "$1"
+            fi
+            ;;
+        menu|tui)
+            adm_menu
+            ;;
+        detect)
+            adm_cmd_detect "$@"
+            ;;
+        sync)
+            adm_cmd_sync "$@"
+            ;;
+        fetch)
+            adm_cmd_fetch "$@"
+            ;;
+        build)
+            adm_cmd_build "$@"
+            ;;
+        install)
+            adm_cmd_install "$@"
+            ;;
+        uninstall)
+            adm_cmd_uninstall "$@"
+            ;;
+        orphans)
+            adm_cmd_orphans "$@"
+            ;;
+        stages)
+            adm_cmd_stages "$@"
+            ;;
+        verify)
+            adm_cmd_verify "$@"
+            ;;
+        cleanup)
+            adm_cmd_cleanup "$@"
+            ;;
+        update)
+            adm_cmd_update "$@"
+            ;;
+        update-all)
+            adm_cmd_update_all "$@"
+            ;;
+        mkinit|mkinitramfs)
+            adm_cmd_mkinit "$@"
+            ;;
+        search)
+            adm_cmd_search "$@"
+            ;;
+        info)
+            adm_cmd_info "$@"
+            ;;
+        logo)
+            adm_logo
+            ;;
+        *)
+            adm_log_error "Comando desconhecido: %s" "$cmd"
+            adm_help_general
+            return 1
+            ;;
+    esac
+}
+
+adm_main "$@"
