@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# hook: pre_build para linux-headers
+# Objetivo:
+#   - Instalar headers em ${ADM_CROSS_ROOT}/${ADM_TARGET}/include
+
+set -eu
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
+: "${ADM_TARGET:=x86_64-linux-gnu}"
+
+: "${ADM_BUILD_SRC_DIR:?}"
+
+DEST="${ADM_CROSS_ROOT}/${ADM_TARGET}/include"
+
+export ADM_BUILD_CUSTOM_BUILD=1  # dica pro build.sh: não rodar ./configure;make padrão
+
+adm_linux_headers_build() {
+    cd "$ADM_BUILD_SRC_DIR"
+    make mrproper || true
+    make headers_install \
+        ARCH="${ADM_TARGET%%-*}" \
+        INSTALL_HDR_PATH="${DEST}"
+}
+
+# build.sh deve checar ADM_BUILD_CUSTOM_BUILD e chamar adm_linux_headers_build
