@@ -1,0 +1,12 @@
+name=binutils-pass1
+version=2.43
+category=toolchain
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Binutils cross (pass 1) para toolchain inicial
+homepage=https://www.gnu.org/software/binutils/
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.43.tar.xz
