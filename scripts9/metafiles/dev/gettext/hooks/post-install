@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/msgfmt" ]]; then
+  echo "[ERR] gettext: msgfmt não encontrado em ${DESTDIR}/usr/bin" >&2
+  exit 4
+fi
+
+echo "[OK] gettext instalado em ${DESTDIR} (/usr/bin/msgfmt, xgettext, etc.)"
