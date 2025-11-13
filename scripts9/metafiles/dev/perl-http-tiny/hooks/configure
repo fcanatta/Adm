@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d \( -name 'HTTP-Tiny-*' -o -name 'HTTP-Tiny-*.*' \) | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório HTTP-Tiny-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+if [[ -f Makefile.PL ]]; then
+  perl Makefile.PL PREFIX=/usr
+elif [[ -f Build.PL ]]; then
+  perl Build.PL --prefix /usr
+else
+  echo "[ERR] nem Makefile.PL nem Build.PL encontrados em $(pwd)" >&2
+  exit 3
+fi
