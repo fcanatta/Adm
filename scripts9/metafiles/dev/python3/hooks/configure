@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'Python-3*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório Python-3* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+# Flags razoavelmente agressivas mas ainda seguras
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+
+export CFLAGS LDFLAGS
+
+./configure \
+  --prefix=/usr \
+  --enable-optimizations \
+  --with-ensurepip=install \
+  --enable-ipv6 \
+  --enable-shared
