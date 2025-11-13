@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+[[ -x "${DESTDIR}/usr/bin/elinks" ]] || { echo "[ERR] elinks não encontrado"; exit 3; }
+
+echo "[OK] elinks instalado"
