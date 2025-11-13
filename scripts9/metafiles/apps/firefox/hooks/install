@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${DESTDIR:?}"
+
+src=$(find "$WORKDIR" -maxdepth 1 -type d -name 'firefox-*' | head -n1)
+cd "$src"
+
+./mach install --destdir "$DESTDIR"
