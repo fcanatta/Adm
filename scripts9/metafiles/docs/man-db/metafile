@@ -1,0 +1,12 @@
+name=man-db
+version=2.12.x
+category=docs
+run_deps=gdbm,less
+build_deps=gdbm
+opt_deps=zlib
+num_builds=0
+description=man-db - sistema de manpages (pager, apropos, whatis)
+homepage=https://www.nongnu.org/man-db/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/man-db/
