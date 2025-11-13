@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${JOBS:=4}"
+
+builddir="${WORKDIR}/llvm-build"
+[[ -d "$builddir" ]] || { echo "[ERR] llvm: builddir ${builddir} não existe (configure não rodou?)" >&2; exit 4; }
+
+cd "$builddir"
+ninja -j"$JOBS"
