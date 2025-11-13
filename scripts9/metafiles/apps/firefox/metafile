@@ -1,0 +1,12 @@
+name=firefox
+version=latest
+category=apps
+run_deps=python3,rust,clang,gtk3,dbus,icu,libffi,pango,cairo,glib,libvpx,libwebp,pulseaudio,pipewire,mesa
+build_deps=python3,rust,clang,nodejs,cargo,gtk3,dbus,icu,libffi,pango,cairo,glib,yasm,nasm,pkgconf
+opt_deps=
+num_builds=0
+description=Firefox browser (source build)
+homepage=https://firefox-source-docs.mozilla.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://archive.mozilla.org/pub/firefox/releases/
