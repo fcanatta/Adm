@@ -1,0 +1,12 @@
+name=man-pages
+version=6.x
+category=docs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux man-pages - páginas de manual padrão do sistema
+homepage=https://www.kernel.org/doc/man-pages/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/linux/docs/man-pages/
