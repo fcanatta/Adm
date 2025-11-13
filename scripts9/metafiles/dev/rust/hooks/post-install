@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+bindir="${DESTDIR}/usr/bin"
+
+if [[ ! -x "${bindir}/rustc" ]]; then
+  echo "[ERR] rust: rustc não encontrado em ${bindir}" >&2
+  exit 4
+fi
+if [[ ! -x "${bindir}/cargo" ]]; then
+  echo "[WAR] rust: cargo não encontrado em ${bindir}" >&2
+else
+  echo "[OK] rust: rustc e cargo disponíveis em ${bindir}"
+fi
