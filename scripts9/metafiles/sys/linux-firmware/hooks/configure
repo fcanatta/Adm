@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+# Tenta achar diretório linux-firmware (git) ou linux-firmware-<versão> (tarball)
+srcdir="$(find "$WORKDIR" -maxdepth 1 -type d \( -name 'linux-firmware' -o -name 'linux-firmware-*' \) | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] Diretório linux-firmware não encontrado em $WORKDIR" >&2; exit 2; }
+
+echo "[ADM] linux-firmware srcdir: $srcdir"
