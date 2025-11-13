@@ -1,0 +1,12 @@
+name=patch
+version=2.7.x
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU patch - aplica differenças em arquivos
+homepage=https://www.gnu.org/software/patch/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/patch/
