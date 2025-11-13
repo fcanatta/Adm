@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+libdir="${DESTDIR}/usr/lib"
+if [[ ! -d "$libdir" ]]; then
+  echo "[ERR] libffi: ${libdir} não existe em ${DESTDIR}" >&2
+  exit 4
+fi
+
+if ! find "$libdir" -maxdepth 1 -name 'libffi.so*' 2>/dev/null | grep -q .; then
+  echo "[ERR] libffi: libffi.so* não encontrada em ${libdir}" >&2
+  exit 5
+fi
+
+echo "[OK] libffi instalada em ${libdir}"
