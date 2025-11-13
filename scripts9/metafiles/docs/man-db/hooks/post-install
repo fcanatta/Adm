@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+for bin in man apropos whatis; do
+  if [[ ! -x "${DESTDIR}/usr/bin/${bin}" ]]; then
+    echo "[ERR] man-db: ${bin} não encontrado em ${DESTDIR}/usr/bin" >&2
+    exit 4
+  fi
+done
+
+# Banco de dados de whatis/apropos geralmente em /var/cache/man
+mkdir -p "${DESTDIR}/var/cache/man" || true
+
+echo "[OK] man-db instalado (man/apropos/whatis)."
