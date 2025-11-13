@@ -1,0 +1,12 @@
+name=wget
+version=1.21.x
+category=apps
+run_deps=openssl,zlib,pcre2
+build_deps=openssl,zlib,pcre2
+opt_deps=
+num_builds=0
+description=GNU wget - downloader
+homepage=https://www.gnu.org/software/wget/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/wget/
