@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+srcdir="$(find . -maxdepth 1 -type d -name 'autoconf-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] autoconf: diretório autoconf-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+export CFLAGS LDFLAGS
+
+./configure \
+  --prefix=/usr \
+  --sysconfdir=/etc \
+  --disable-static
