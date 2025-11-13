@@ -1,0 +1,12 @@
+name=less
+version=6xx
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=less - pager de texto interativo
+homepage=https://www.greenwoodsoftware.com/less/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.greenwoodsoftware.com/less/,https://ftp.gnu.org/gnu/less/
