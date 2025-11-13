@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+echo "[ADM] rust: build nulo (toolchain já compilado no tarball)."
