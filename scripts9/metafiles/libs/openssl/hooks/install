@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir=$(find . -maxdepth 1 -type d -name 'openssl-*' | head -n1 || exit 3)
+cd "$srcdir"
+
+make DESTDIR="$DESTDIR" install_sw
