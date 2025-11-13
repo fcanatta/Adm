@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/firefox" ]]; then
+  echo "[ERR] firefox: /usr/bin/firefox não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+# Atualiza caches só se for instalação em / (sem DESTDIR de empacotamento)
+if [[ "$DESTDIR" = "/" || "$DESTDIR" = "" ]]; then
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+  fi
+  if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database -q /usr/share/mime || true
+  fi
+fi
+
+echo "[OK] firefox (source) instalado e integrado ao desktop."
