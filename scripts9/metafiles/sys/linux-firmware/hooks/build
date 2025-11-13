@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${FIRMWARE_MODE:=full}"
+: "${JOBS:=4}"
+
+cd "$WORKDIR"
+srcdir="$(find "$WORKDIR" -maxdepth 1 -type d \( -name 'linux-firmware' -o -name 'linux-firmware-*' \) | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] linux-firmware srcdir não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+# Gerar lista base de arquivos de firmware (ignora .git, docs, textos)
+tmp_list="$(mktemp)"
+find . -type f \
+  ! -path './.git/*' \
+  ! -name 'LICENSE*' \
+  ! -name 'COPYING*' \
+  ! -name 'README*' \
+  ! -name 'WHENCE*' \
+  ! -name 'Makefile*' \
+  > "$tmp_list"
+
+# Aplica filtros se FIRMWARE_MODE=minimal
+tmp_filtered="$(mktemp)"
+cp "$tmp_list" "$tmp_filtered"
+
+if [[ "$FIRMWARE_MODE" = "minimal" ]]; then
+  # Se tiver FIRMWARE_INCLUDE, mantém só os que casarem com algum padrão
+  if [[ -n "${FIRMWARE_INCLUDE:-}" ]]; then
+    inc_tmp="$(mktemp)"
+    : > "$inc_tmp"
+    while read -r f; do
+      keep=0
+      for pat in $FIRMWARE_INCLUDE; do
+        if [[ "$f" =~ $pat ]]; then
+          keep=1; break
+        fi
+      done
+      (( keep )) && echo "$f" >> "$inc_tmp"
+    done < "$tmp_filtered"
+    mv -f "$inc_tmp" "$tmp_filtered"
+  fi
+fi
+
+# Aplica exclusões (sempre opcionais)
+if [[ -n "${FIRMWARE_EXCLUDE:-}" ]]; then
+  exc_tmp="$(mktemp)"
+  : > "$exc_tmp"
+  while read -r f; do
+    drop=0
+    for pat in $FIRMWARE_EXCLUDE; do
+      if [[ "$f" =~ $pat ]]; then
+        drop=1; break
+      fi
+    done
+    (( drop )) || echo "$f" >> "$exc_tmp"
+  done < "$tmp_filtered"
+  mv -f "$exc_tmp" "$tmp_filtered"
+fi
+
+mv -f "$tmp_filtered" "$tmp_list"
+
+echo "[ADM] linux-firmware: $(wc -l < "$tmp_list") arquivos selecionados (mode=$FIRMWARE_MODE)"
+
+# Salva a lista para o hook install usar
+mkdir -p "${WORKDIR}/.adm-state"
+mv -f "$tmp_list" "${WORKDIR}/.adm-state/linux-firmware.files"
