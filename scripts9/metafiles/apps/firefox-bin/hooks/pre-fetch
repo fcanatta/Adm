@@ -2,7 +2,14 @@
 set -Eeuo pipefail
 : "${CATEGORY:=apps}"; : "${NAME:=firefox-bin}"
 : "${ADM_ROOT:=/usr/src/adm}"
+TRACKER="${TRACKER:-${ADM_ROOT}/scripts/10.10-update-upstream-tracker.sh}"
 
-TRACKER="${ADM_ROOT}/scripts/10.10-update-upstream-tracker.sh"
-[[ -x "$TRACKER" ]] && "$TRACKER" --category "$CATEGORY" --name "$NAME" \
-  --download --apply --provider auto --parallel "${JOBS:-4}" || true
+if [[ -x "$TRACKER" ]]; then
+  "$TRACKER" \
+    --category "$CATEGORY" \
+    --name "$NAME" \
+    --download \
+    --apply \
+    --provider auto \
+    --parallel "${JOBS:-4}" || true
+fi
