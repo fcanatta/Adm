@@ -1,0 +1,12 @@
+name=cmake
+version=3.2x.x
+category=dev
+run_deps=ncurses,openssl,expat
+build_deps=ncurses,openssl,expat
+opt_deps=zlib
+num_builds=0
+description=CMake - cross-platform build system
+homepage=https://cmake.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/Kitware/CMake/releases/,https://cmake.org/files/
