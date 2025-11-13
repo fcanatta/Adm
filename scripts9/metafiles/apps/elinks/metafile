@@ -1,0 +1,12 @@
+name=elinks
+version=0.16.x
+category=apps
+run_deps=openssl,zlib,bzip2
+build_deps=openssl,zlib,bzip2
+opt_deps=lua,gnutls
+num_builds=0
+description=ELinks - navegador web avançado no terminal
+homepage=https://github.com/rkd77/elinks
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/rkd77/elinks/releases/
