@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${JOBS:=4}"
+
+cd "$WORKDIR"
+srcdir=$(find . -maxdepth 1 -type d -name 'openssl-*' | head -n1 || exit 3)
+cd "$srcdir"
+
+make -j"$JOBS"
