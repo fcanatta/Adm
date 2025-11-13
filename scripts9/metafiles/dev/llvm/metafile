@@ -1,0 +1,12 @@
+name=llvm
+version=18.x.x
+category=dev
+run_deps=zlib,ncurses,libffi,libxml2
+build_deps=cmake,ninja,python3,zlib,ncurses,libffi,libxml2
+opt_deps=binutils
+num_builds=0
+description=LLVM toolchain (LLVM + Clang + LLD)
+homepage=https://llvm.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://github.com/llvm/llvm-project/releases/
