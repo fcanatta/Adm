@@ -1,26 +1,53 @@
 #!/usr/bin/env bash
 # hook: pre_build para linux-headers
+#
 # Objetivo:
-#   - Instalar headers em ${ADM_CROSS_ROOT}/${ADM_TARGET}/include
+#   - Rodar o build REAL dos headers do kernel aqui dentro:
+#       make mrproper
+#       make headers_install
+#   - Instalar em:
+#       ${ADM_CROSS_ROOT}/${ADM_TARGET}/include
+#   - Avisar ao build.sh que NÃO deve rodar o fluxo padrão
+#     (configure/make/install) para este pacote.
+#
+# Requisitos:
+#   - ADM_BUILD_SRC_DIR e ADM_BUILD_DIR_HOST definidos pelo build.sh
+#   - ADM_ROOT, ADM_CROSS_ROOT, ADM_TARGET definidos pelo env/core
 
 set -eu
 
+# Raiz do ADM e cross-tools
 : "${ADM_ROOT:=/usr/src/adm}"
 : "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
+
+# Target padrão, se não tiver vindo de fora
 : "${ADM_TARGET:=x86_64-linux-gnu}"
 
+# Variáveis que o build.sh exporta
 : "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_DIR_HOST:?}"
 
-DEST="${ADM_CROSS_ROOT}/${ADM_TARGET}/include"
+# Destino dos headers dentro do sysroot
+DESTDIR="${ADM_CROSS_ROOT}/${ADM_TARGET}/include"
 
-export ADM_BUILD_CUSTOM_BUILD=1  # dica pro build.sh: não rodar ./configure;make padrão
+# Cria diretório de destino se não existir
+mkdir -p "${DESTDIR}"
 
-adm_linux_headers_build() {
-    cd "$ADM_BUILD_SRC_DIR"
-    make mrproper || true
-    make headers_install \
-        ARCH="${ADM_TARGET%%-*}" \
-        INSTALL_HDR_PATH="${DEST}"
-}
+# Faz o build REAL dos headers
+cd "${ADM_BUILD_SRC_DIR}"
 
-# build.sh deve checar ADM_BUILD_CUSTOM_BUILD e chamar adm_linux_headers_build
+# Limpa árvore (ignora erro se não suportar)
+make mrproper >/dev/null 2>&1 || true
+
+# Cabeçalhos do kernel. ARCH é aproximado a partir do target:
+ARCH="${ADM_TARGET%%-*}"
+
+echo "[linux-headers hook] Instalando headers em ${DESTDIR} (ARCH=${ARCH})"
+
+make headers_install \
+    ARCH="${ARCH}" \
+    INSTALL_HDR_PATH="${DESTDIR}"
+
+# Marca para o build.sh que ele deve pular o fluxo padrão
+# (configure/make/install) para este pacote.
+export ADM_BUILD_SKIP_DEFAULT=1
