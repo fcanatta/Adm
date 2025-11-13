@@ -1,0 +1,12 @@
+name=git
+version=2.4x.x
+category=dev
+run_deps=openssl,zlib,curl,expat,gettext,perl,python3
+build_deps=openssl,zlib,curl,expat,gettext,perl,python3
+opt_deps=
+num_builds=0
+description=Git - sistema de controle de versão distribuído
+homepage=https://git-scm.com/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.kernel.org/pub/software/scm/git/,https://github.com/git/git/releases/
