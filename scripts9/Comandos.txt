@@ -76,3 +76,10 @@ export MUSL_PREFIX=/usr/musl
 export MUSL_SYSLIBDIR=/usr/musl/lib
 adm install musl
 # Depois você consegue fazer toolchains específicos apontando para esse prefixo.
+
+# via variável genérica da tua infra:
+export ADM_PROFILE=aggressive
+adm install firefox
+
+# ou só para esse build:
+BUILD_PROFILE=aggressive adm install firefox
