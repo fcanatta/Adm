@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+# se estiver instalando direto em /, tenta atualizar caches
+if [[ "$DESTDIR" = "/" || "$DESTDIR" = "" ]]; then
+  if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q /usr/share/icons/hicolor || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+  fi
+  if command -v update-mime-database >/dev/null 2>&1; then
+    update-mime-database -q /usr/share/mime || true
+  fi
+fi
+
+[[ -x "${DESTDIR}/usr/bin/firefox" ]] || {
+  echo "[ERR] firefox-bin: /usr/bin/firefox não encontrado" >&2
+  exit 4
+}
+
+echo "[OK] firefox-bin integrado ao desktop (ícones + .desktop)."
