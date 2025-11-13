@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+libdir="${DESTDIR}/usr/lib"
+if [[ ! -d "$libdir" ]]; then
+  echo "[ERR] freetype: ${libdir} não existe" >&2
+  exit 4
+fi
+
+if ! find "$libdir" -maxdepth 1 -name 'libfreetype.so*' 2>/dev/null | grep -q .; then
+  echo "[ERR] freetype: libfreetype.so* não encontrada em $libdir" >&2
+  exit 5
+fi
+
+echo "[OK] freetype instalada em ${libdir}."
