@@ -67,3 +67,12 @@ export FIRMWARE_INCLUDE="iwlwifi amdgpu"
 export FIRMWARE_EXCLUDE="brcm nvidia"
 adm install sys/linux-firmware
 
+# Instalar musl como libc (perfil padrão LFS-like)
+# raiz do sistema being built
+adm install musl
+
+# Instalar musl em prefixo separado (ex.: /usr/musl)
+export MUSL_PREFIX=/usr/musl
+export MUSL_SYSLIBDIR=/usr/musl/lib
+adm install musl
+# Depois você consegue fazer toolchains específicos apontando para esse prefixo.
