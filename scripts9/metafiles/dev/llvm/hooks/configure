@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${JOBS:=4}"
+: "${BUILD_PROFILE:=normal}"
+: "${ADM_PROFILE:=}"
+
+cd "$WORKDIR"
+
+# tarball típico: llvm-project-<versão>.src
+srcroot="$(find "$WORKDIR" -maxdepth 1 -type d -name 'llvm-project-*' | head -n1 || true)"
+[[ -d "$srcroot" ]] || { echo "[ERR] llvm: diretório llvm-project-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+llvm_src="${srcroot}/llvm"
+[[ -d "$llvm_src" ]] || { echo "[ERR] llvm: subdiretório llvm não encontrado em $srcroot" >&2; exit 3; }
+
+builddir="${WORKDIR}/llvm-build"
+mkdir -p "$builddir"
+cd "$builddir"
+
+profile="${BUILD_PROFILE:-normal}"
+[[ -n "$ADM_PROFILE" ]] && profile="$ADM_PROFILE"
+
+if [[ "$profile" = "aggressive" ]]; then
+  : "${CFLAGS:=-O3 -pipe}"
+  : "${CXXFLAGS:=-O3 -pipe}"
+else
+  : "${CFLAGS:=-O2 -pipe}"
+  : "${CXXFLAGS:=-O2 -pipe}"
+fi
+: "${LDFLAGS:=}"
+
+export CFLAGS CXXFLAGS LDFLAGS
+
+cmake -G Ninja "$llvm_src" \
+  -DCMAKE_INSTALL_PREFIX=/usr \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra;lld" \
+  -DLLVM_TARGETS_TO_BUILD="X86;AArch64;RISCV" \
+  -DLLVM_ENABLE_TERMINFO=ON \
+  -DLLVM_ENABLE_ZLIB=ON \
+  -DLLVM_ENABLE_LIBXML2=ON
