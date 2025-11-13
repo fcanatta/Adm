@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/patch" ]]; then
+  echo "[ERR] patch: /usr/bin/patch não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+echo "[OK] patch instalado em ${DESTDIR}/usr/bin/patch"
