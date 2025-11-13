@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/pip3" ]]; then
+  echo "[WAR] pip3 não encontrado em ${DESTDIR}/usr/bin; verifique configure/ensurepip." >&2
+else
+  echo "[OK] python3 + pip3 instalados em ${DESTDIR}/usr/bin"
+fi
