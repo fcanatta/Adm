@@ -1,0 +1,12 @@
+name=libffi
+version=3.4.x
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=libffi - Foreign Function Interface
+homepage=https://sourceware.org/libffi/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=ftp://sourceware.org/pub/libffi/,https://github.com/libffi/libffi/releases/
