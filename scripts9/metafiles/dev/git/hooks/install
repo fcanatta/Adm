@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'git-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório git-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+make DESTDIR="$DESTDIR" install
+
+# Instalar bash completion se existir
+if [[ -f contrib/completion/git-completion.bash ]]; then
+  mkdir -p "${DESTDIR}/usr/share/bash-completion/completions"
+  install -m 0644 contrib/completion/git-completion.bash \
+    "${DESTDIR}/usr/share/bash-completion/completions/git"
+fi
+
+# Instalar git-prompt opcional
+if [[ -f contrib/completion/git-prompt.sh ]]; then
+  mkdir -p "${DESTDIR}/usr/share/git"
+  install -m 0644 contrib/completion/git-prompt.sh \
+    "${DESTDIR}/usr/share/git/git-prompt.sh"
+fi
