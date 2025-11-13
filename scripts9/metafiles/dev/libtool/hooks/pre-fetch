@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${CATEGORY:=dev}"; : "${NAME:=libtool}"
+: "${ADM_ROOT:=/usr/src/adm}"
+TRACKER="${TRACKER:-${ADM_ROOT}/scripts/10.10-update-upstream-tracker.sh}"
+
+if [[ -x "$TRACKER" ]]; then
+  "$TRACKER" \
+    --category "$CATEGORY" \
+    --name "$NAME" \
+    --download \
+    --apply \
+    --provider auto \
+    --parallel "${JOBS:-4}" || true
+fi
