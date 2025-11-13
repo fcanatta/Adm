@@ -1,0 +1,12 @@
+name=bison
+version=3.8.2
+category=dev
+run_deps=
+build_deps=dev/gcc,dev/gettext
+opt_deps=
+num_builds=0
+description=GNU Bison - gerador de parsers
+homepage=https://www.gnu.org/software/bison/
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bison/bison-3.8.2.tar.xz
