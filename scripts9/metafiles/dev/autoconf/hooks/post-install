@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/autoconf" ]]; then
+  echo "[ERR] autoconf: /usr/bin/autoconf não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+# alguns projetos chamam autom4te e autoheader; vamos só avisar se não tiver
+for bin in autoheader autom4te autoreconf; do
+  if [[ ! -x "${DESTDIR}/usr/bin/${bin}" ]]; then
+    echo "[WAR] autoconf: ${bin} não encontrado em ${DESTDIR}/usr/bin (pode ser normal dependendo da versão)" >&2 || true
+  fi
+done
+
+echo "[OK] autoconf instalado em ${DESTDIR}/usr/bin/autoconf"
