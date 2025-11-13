@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d \( -name 'HTTP-Tiny-*' -o -name 'HTTP-Tiny-*.*' \) | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório HTTP-Tiny-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+if [[ -f Makefile.PL ]]; then
+  make DESTDIR="$DESTDIR" install
+elif [[ -f Build.PL ]]; then
+  ./Build install --destdir "$DESTDIR"
+else
+  echo "[ERR] nem Makefile.PL nem Build.PL encontrados em $(pwd)" >&2
+  exit 4
+fi
