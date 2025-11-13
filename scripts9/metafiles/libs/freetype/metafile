@@ -1,0 +1,12 @@
+name=freetype
+version=2.13.x
+category=libs
+run_deps=zlib,bzip2,libpng
+build_deps=zlib,bzip2,libpng
+opt_deps=harfbuzz
+num_builds=0
+description=FreeType - engine de fontes vetoriais
+homepage=https://freetype.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.savannah.gnu.org/releases/freetype/,https://sourceforge.net/projects/freetype/files/
