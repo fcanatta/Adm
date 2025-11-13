@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+: "${MUSL_PREFIX:=/usr}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'musl-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório musl-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+make DESTDIR="$DESTDIR" install
