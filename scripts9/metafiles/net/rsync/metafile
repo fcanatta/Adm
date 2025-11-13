@@ -1,0 +1,12 @@
+name=rsync
+version=3.3.x
+category=net
+run_deps=openssl,zlib
+build_deps=openssl,zlib
+opt_deps=acl,attr
+num_builds=0
+description=rsync - sincronização rápida de arquivos via rede
+homepage=https://rsync.samba.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://rsync.samba.org/ftp/rsync/
