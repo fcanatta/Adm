@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+
+builddir="${WORKDIR}/llvm-build"
+[[ -d "$builddir" ]] || { echo "[ERR] llvm: builddir ${builddir} não existe (configure/build não rodaram?)" >&2; exit 4; }
+
+cd "$builddir"
+
+DESTDIR="$DESTDIR" ninja install
