@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'git-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório git-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+
+export CFLAGS LDFLAGS
+
+# Desativar GUI/Tcl/Tk, habilitar https, gettext, etc.
+./configure \
+  --prefix=/usr \
+  --with-openssl \
+  --with-libpcre2 \
+  --with-curl \
+  --with-expat \
+  --with-iconv \
+  --with-zlib \
+  --with-gettext \
+  --without-tcltk
