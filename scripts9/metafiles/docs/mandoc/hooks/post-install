@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+# Não assume que substitui man(1); só checa mandoc
+if [[ ! -x "${DESTDIR}/usr/bin/mandoc" ]]; then
+  echo "[ERR] mandoc: /usr/bin/mandoc não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+echo "[OK] mandoc instalado em ${DESTDIR}/usr/bin/mandoc"
