@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if command -v perl >/dev/null 2>&1; then
+  perl -I"${DESTDIR}/usr/lib/perl5" -MHTTP::Tiny -e 'print HTTP::Tiny->VERSION,"\n"' >/dev/null 2>&1 || {
+    echo "[WAR] perl-http-tiny instalado, mas não consegui carregar HTTP::Tiny via perl (verifique @INC)" >&2
+    exit 0
+  }
+fi
+
+echo "[OK] perl-http-tiny instalado em ${DESTDIR} (módulo HTTP::Tiny)."
