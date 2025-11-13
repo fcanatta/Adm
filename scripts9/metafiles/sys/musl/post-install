@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+: "${MUSL_SYSLIBDIR:=/lib}"
+
+root="${DESTDIR%/}"
+
+# Procura loader ld-musl-*.so.1
+ldfile="$(find "${root}${MUSL_SYSLIBDIR}" -maxdepth 1 -name 'ld-musl-*.so.1' 2>/dev/null | head -n1 || true)"
+if [[ -z "$ldfile" ]]; then
+  echo "[ERR] musl: loader ld-musl-*.so.1 não encontrado em ${root}${MUSL_SYSLIBDIR}" >&2
+  exit 4
+fi
+
+# Headers
+if [[ ! -d "${root}/usr/include" && ! -d "${root}/usr/include/musl" ]]; then
+  echo "[WAR] musl: /usr/include não encontrado; verifique instalação de headers." >&2
+fi
+
+echo "[OK] musl instalada em ${root}${MUSL_PREFIX} (loader: ${ldfile#${root}})"
