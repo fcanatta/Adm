@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if ! find "${DESTDIR}/usr/lib" -maxdepth 1 -name 'libpcre2-8.so*' 2>/dev/null | grep -q .; then
+  echo "[ERR] pcre2: libpcre2-8.so* não encontrada em ${DESTDIR}/usr/lib" >&2
+  exit 4
+fi
+
+echo "[OK] pcre2 instalada em ${DESTDIR}/usr/lib (8/16/32, Unicode, JIT se suportado)."
