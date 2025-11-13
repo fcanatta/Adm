@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+libdir="${DESTDIR}/usr/lib"
+
+if ! find "$libdir" -name 'libattr.so*' | grep -q .; then
+  echo "[ERR] attr: libattr.so não encontrada" >&2
+  exit 3
+fi
+
+echo "[OK] attr instalado (biblioteca e ferramentas setfattr/getfattr)."
