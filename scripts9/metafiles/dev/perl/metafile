@@ -1,0 +1,12 @@
+name=perl
+version=5.3x.x
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Perl 5 - linguagem de script e runtime
+homepage=https://www.perl.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.cpan.org/src/5.0/
