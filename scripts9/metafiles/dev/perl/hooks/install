@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'perl-5*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório perl-5* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+make DESTDIR="$DESTDIR" install
+
+# Symlinks convenientes
+mkdir -p "${DESTDIR}/usr/bin"
+if [[ -x "${DESTDIR}/usr/bin/perl" ]]; then
+  ln -sf perl "${DESTDIR}/usr/bin/perl5"
+fi
