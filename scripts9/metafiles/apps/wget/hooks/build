@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}" : "${JOBS:=4}"
+cd "$WORKDIR/$(find . -maxdepth 1 -type d -name wget-* | head -n1)"
+make -j"$JOBS"
