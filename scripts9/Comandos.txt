@@ -51,3 +51,19 @@ adm install sys/linux-kernel-aggressive
 # Forçar sufixo de versão (LOCALVERSION):
 LOCALVERSION="-custom1" adm install sys/linux-kernel
 LOCALVERSION="-aggr1"  adm install sys/linux-kernel-aggressive
+
+# Instalar tudo (full)
+adm install sys/linux-firmware
+
+# Instalar só alguns firmwares (minimal)
+# Exemplo: só placas Intel (iwlwifi) + AMDGPU:
+export FIRMWARE_MODE=minimal
+export FIRMWARE_INCLUDE="iwlwifi amdgpu radeon"
+adm install sys/linux-firmware
+
+# Excluir coisas muito grandes (ex.: DSP de som que você não usa):
+export FIRMWARE_MODE=minimal
+export FIRMWARE_INCLUDE="iwlwifi amdgpu"
+export FIRMWARE_EXCLUDE="brcm nvidia"
+adm install sys/linux-firmware
+
