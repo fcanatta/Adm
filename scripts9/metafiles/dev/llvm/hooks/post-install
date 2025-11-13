@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+bindir="${DESTDIR}/usr/bin"
+
+if [[ ! -x "${bindir}/clang" ]]; then
+  echo "[ERR] llvm: clang não encontrado em ${bindir}" >&2
+  exit 5
+fi
+
+if [[ ! -x "${bindir}/llvm-config" ]]; then
+  echo "[WAR] llvm: llvm-config não encontrado em ${bindir}" >&2
+fi
+
+echo "[OK] llvm toolchain instalado em ${bindir} (inclui clang, clang++ e lld)."
