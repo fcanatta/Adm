@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'gettext-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório gettext-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+# Configuração enxuta, só C/C++ e binários principais
+./configure \
+  --prefix=/usr \
+  --disable-static \
+  --enable-shared \
+  --without-emacs \
+  --disable-java \
+  --disable-csharp \
+  --disable-openmp
