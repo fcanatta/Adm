@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# hook: pre_build para gcc-pass1
+# Objetivo:
+#   - GCC mínimo para compilar glibc
+#   - Sem libstdc++ ainda, sem libgcc full
+
+set -eu
+
+: "${ADM_ROOT:=/usr/src/adm}"
+: "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
+: "${ADM_TARGET:=x86_64-linux-gnu}"
+
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+export ADM_BUILD_PREFIX="$ADM_CROSS_ROOT"
+
+# GCC pass1: sem libs de runtime ainda
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --target=${ADM_TARGET}
+  --prefix=${ADM_CROSS_ROOT}
+  --with-sysroot=${ADM_CROSS_ROOT}
+  --with-newlib
+  --without-headers
+  --disable-nls
+  --disable-shared
+  --disable-multilib
+  --disable-decimal-float
+  --disable-libatomic
+  --disable-libgomp
+  --disable-libquadmath
+  --disable-libssp
+  --disable-libvtv
+  --disable-libstdcxx
+  --enable-languages=c
+"
+
+# Ajuste de PATH para pegar o cross-binutils recém-instalado
+export PATH="${ADM_CROSS_ROOT}/bin:${PATH}"
