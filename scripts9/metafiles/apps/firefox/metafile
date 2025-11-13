@@ -1,11 +1,11 @@
 name=firefox
 version=latest
 category=apps
-run_deps=python3,rust,clang,gtk3,dbus,icu,libffi,pango,cairo,glib,libvpx,libwebp,pulseaudio,pipewire,mesa
-build_deps=python3,rust,clang,nodejs,cargo,gtk3,dbus,icu,libffi,pango,cairo,glib,yasm,nasm,pkgconf
-opt_deps=
+run_deps=gtk3,dbus,fontconfig,freetype,alsa-lib,openssl,zlib
+build_deps=python3,perl,git,curl,cmake,ninja,rust,clang,llvm,nodejs,gtk3,dbus,fontconfig,freetype,zlib,openssl
+opt_deps=pulseaudio,pipewire,libvpx,libwebp,icu
 num_builds=0
-description=Firefox browser (source build)
+description=Firefox (build from source, perfil aggressive-aware)
 homepage=https://firefox-source-docs.mozilla.org/
 maintainer=ADM <root@localhost>
 sha256sums=
