@@ -1,0 +1,12 @@
+name=automake
+version=1.16.x
+category=dev
+run_deps=perl,autoconf
+build_deps=perl,autoconf
+opt_deps=
+num_builds=0
+description=GNU automake - gerador de Makefile.in
+homepage=https://www.gnu.org/software/automake/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/automake/
