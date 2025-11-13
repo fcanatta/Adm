@@ -1,0 +1,12 @@
+name=musl
+version=1.2.x
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=musl libc (implementação de libc minimalista e compatível POSIX)
+homepage=https://musl.libc.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://musl.libc.org/releases/
