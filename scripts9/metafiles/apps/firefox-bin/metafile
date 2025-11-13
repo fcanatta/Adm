@@ -1,0 +1,12 @@
+name=firefox-bin
+version=latest
+category=apps
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Firefox binário oficial Mozilla
+homepage=https://www.mozilla.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://download.mozilla.org/?product=firefox-latest&os=linux64&lang=en-US
