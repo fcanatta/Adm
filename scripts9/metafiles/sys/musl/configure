@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+# Onde instalar musl:
+: "${MUSL_PREFIX:=/usr}"
+: "${MUSL_SYSLIBDIR:=/lib}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'musl-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório musl-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+./configure \
+  --prefix="${MUSL_PREFIX}" \
+  --syslibdir="${MUSL_SYSLIBDIR}"
