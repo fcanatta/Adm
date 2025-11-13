@@ -1,17 +1,56 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 : "${WORKDIR:?}"
+: "${BUILD_PROFILE:=normal}"   # se quiser, exporta BUILD_PROFILE=aggressive
+: "${ADM_PROFILE:=}"           # ou usa ADM_PROFILE do teu sistema
 
-src=$(find "$WORKDIR" -maxdepth 1 -type d -name 'firefox-*' | head -n1)
-cd "$src"
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'firefox-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] firefox: diretório firefox-* não encontrado em $WORKDIR" >&2; exit 2; }
 
-# Gerar mozconfig
-cat > .mozconfig << 'EOF'
+cd "$srcdir"
+
+profile="${BUILD_PROFILE:-normal}"
+[[ -n "$ADM_PROFILE" ]] && profile="$ADM_PROFILE"
+
+echo "[ADM] firefox: BUILD_PROFILE=${BUILD_PROFILE}, ADM_PROFILE=${ADM_PROFILE}, efetivo=${profile}"
+
+# CFLAGS/CXXFLAGS padrão
+if [[ "$profile" = "aggressive" ]]; then
+  : "${CFLAGS:=-O3 -pipe}"
+  : "${CXXFLAGS:=-O3 -pipe}"
+else
+  : "${CFLAGS:=-O2 -pipe}"
+  : "${CXXFLAGS:=-O2 -pipe}"
+fi
+: "${LDFLAGS:=}"
+
+export CFLAGS CXXFLAGS LDFLAGS
+
+# Gera .mozconfig se não existir
+if [[ ! -f .mozconfig ]]; then
+  cat > .mozconfig <<EOF
 ac_add_options --prefix=/usr
 ac_add_options --enable-release
-ac_add_options --enable-optimize
+ac_add_options --disable-debug
+ac_add_options --disable-tests
+ac_add_options --enable-default-toolkit=cairo-gtk3
+ac_add_options --enable-system-ffi
+ac_add_options --enable-system-pixman
+ac_add_options --with-system-zlib
+ac_add_options --with-system-bz2
+ac_add_options --enable-official-branding
+mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj-adm
+EOF
+
+  if [[ "$profile" = "aggressive" ]]; then
+    cat >> .mozconfig <<EOF
 ac_add_options --enable-linker=lld
 ac_add_options --enable-lto
-ac_add_options --disable-debug
-mk_add_options MOZ_OBJDIR=@TOPSRCDIR@/obj
+ac_add_options --enable-rust-simd
 EOF
+  fi
+fi
+
+echo "[ADM] firefox: usando .mozconfig:"
+sed 's/^/  /' .mozconfig || true
