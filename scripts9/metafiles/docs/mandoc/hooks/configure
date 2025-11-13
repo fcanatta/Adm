@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'mandoc-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] mandoc: diretório mandoc-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+: "${PREFIX:=/usr}"
+: "${MANPATH:=/usr/share/man}"
+: "${BINM_MAN:=mandoc}"  # não sobrescrever man(1) do man-db por padrão
+
+./configure \
+  PREFIX="$PREFIX" \
+  MANPATH="$MANPATH" \
+  BINM_MAN="$BINM_MAN"
