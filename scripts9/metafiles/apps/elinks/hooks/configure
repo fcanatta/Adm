@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+src="$(find "$WORKDIR" -maxdepth 1 -type d -name 'elinks-*' | head -n1 || true)"
+[[ -n "$src" ]] || { echo "[ERR] elinks: directory not found"; exit 2; }
+
+cd "$src"
+
+./configure \
+  --prefix=/usr \
+  --with-ssl=openssl \
+  --enable-256-colors \
+  --enable-html5 \
+  --without-gui
