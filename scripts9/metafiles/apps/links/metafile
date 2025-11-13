@@ -1,0 +1,12 @@
+name=links
+version=2.29
+category=apps
+run_deps=openssl
+build_deps=openssl
+opt_deps=zlib,bzip2
+num_builds=0
+description=Links - navegador web modo texto/frames
+homepage=https://links.twibright.com/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://links.twibright.com/download/
