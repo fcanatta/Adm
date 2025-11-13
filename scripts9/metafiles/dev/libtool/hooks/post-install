@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+bindir="${DESTDIR}/usr/bin"
+
+if [[ ! -x "${bindir}/libtool" ]]; then
+  echo "[ERR] libtool: /usr/bin/libtool não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+# libtoolize é muito usado em autoprojetos
+if [[ ! -x "${bindir}/libtoolize" ]]; then
+  echo "[WAR] libtool: /usr/bin/libtoolize não encontrado em ${DESTDIR}" >&2 || true
+fi
+
+echo "[OK] libtool instalado em ${bindir}/libtool"
