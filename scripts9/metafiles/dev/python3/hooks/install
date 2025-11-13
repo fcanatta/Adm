@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'Python-3*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório Python-3* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+make DESTDIR="$DESTDIR" install
+
+# Symlinks convenientes
+mkdir -p "${DESTDIR}/usr/bin"
+
+if [[ -x "${DESTDIR}/usr/bin/python3" ]]; then
+  ln -sf python3 "${DESTDIR}/usr/bin/python"
+fi
+
+if [[ -x "${DESTDIR}/usr/bin/pip3" ]]; then
+  ln -sf pip3 "${DESTDIR}/usr/bin/pip"
+fi
