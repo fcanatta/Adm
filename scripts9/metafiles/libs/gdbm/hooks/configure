@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+src="$(find . -maxdepth 1 -type d -name 'gdbm-*' | head -n1 || true)"
+[[ -n "$src" ]] || { echo "[ERR] gdbm: não encontrado"; exit 2; }
+cd "$src"
+
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+export CFLAGS LDFLAGS
+
+./configure \
+  --prefix=/usr \
+  --disable-static \
+  --enable-libgdbm-compat
