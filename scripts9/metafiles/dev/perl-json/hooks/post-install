@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+# Teste simples: tentar carregar JSON com perl
+if command -v perl >/dev/null 2>&1; then
+  perl -I"${DESTDIR}/usr/lib/perl5" -MJSON -e 'print $JSON::VERSION,"\n"' >/dev/null 2>&1 || {
+    echo "[WAR] perl-json instalado, mas não consegui carregar JSON via perl (verifique @INC)" >&2
+    exit 0
+  }
+fi
+
+echo "[OK] perl-json instalado em ${DESTDIR} (módulo JSON)."
