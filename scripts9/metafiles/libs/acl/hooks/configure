@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+src="$(find . -maxdepth 1 -type d -name 'acl-*' | head -n1 || true)"
+[[ -n "$src" ]] || { echo "[ERR] acl: diretório acl-* não encontrado"; exit 2; }
+cd "$src"
+
+./configure \
+  --prefix=/usr \
+  --libdir=/usr/lib \
+  --sysconfdir=/etc \
+  --disable-static
