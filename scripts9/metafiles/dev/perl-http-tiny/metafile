@@ -1,0 +1,12 @@
+name=perl-http-tiny
+version=latest
+category=dev
+run_deps=perl
+build_deps=perl
+opt_deps=
+num_builds=0
+description=Perl HTTP::Tiny - cliente HTTP minimalista
+homepage=https://metacpan.org/release/HTTP-Tiny
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.cpan.org/modules/by-module/HTTP/
