@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${JOBS:=4}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'mandoc-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] mandoc: diretório mandoc-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+make -j"$JOBS"
