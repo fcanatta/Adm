@@ -1,9 +1,75 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-: "${DESTDIR:?}" : "${WORKDIR:?}"
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
 
-mkdir -p "${DESTDIR}/opt/firefox"
-tar -xf "$(ls "$WORKDIR"/*.tar.*)" -C "${DESTDIR}/opt/firefox" --strip 1
+# 1) encontrar tarball
+cd "$WORKDIR"
+tarball="$(ls -1 firefox-*.tar.* 2>/dev/null | head -n1 || true)"
+[[ -n "$tarball" ]] || { echo "[ERR] firefox-bin: tarball firefox-*.tar.* não encontrado em $WORKDIR" >&2; exit 2; }
 
+# 2) extrair para /opt/firefox
+appdir="${DESTDIR}/opt/firefox"
+mkdir -p "$appdir"
+tar -xf "$tarball" -C "$appdir" --strip-components=1
+
+# 3) launcher em /usr/bin
 mkdir -p "${DESTDIR}/usr/bin"
-ln -sf /opt/firefox/firefox "${DESTDIR}/usr/bin/firefox"
+cat > "${DESTDIR}/usr/bin/firefox" <<'EOF'
+#!/usr/bin/env sh
+exec /opt/firefox/firefox "$@"
+EOF
+chmod 0755 "${DESTDIR}/usr/bin/firefox"
+
+# 4) ícones + pixmaps
+# procura ícones padrão dentro da árvore do firefox
+cd "$appdir"
+icon_src_dir="browser/chrome/icons/default"
+# tamanhos que queremos popular
+sizes="16 22 24 32 48 64 128 256"
+
+for sz in $sizes; do
+  # tenta pegar default<sz>.png, cai para default.png
+  src_png=""
+  if [[ -f "${icon_src_dir}/default${sz}.png" ]]; then
+    src_png="${icon_src_dir}/default${sz}.png"
+  elif [[ -f "${icon_src_dir}/default.png" ]]; then
+    src_png="${icon_src_dir}/default.png"
+  fi
+  [[ -n "$src_png" ]] || continue
+
+  dest_dir="${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps"
+  mkdir -p "$dest_dir"
+  install -m 0644 "$src_png" "${dest_dir}/firefox.png"
+done
+
+# fallback: se não tiver nenhum ícone, tenta pelo menos um 48x48
+if ! find "${DESTDIR}/usr/share/icons/hicolor" -type f -name 'firefox.png' 2>/dev/null | grep -q .; then
+  if [[ -f "${icon_src_dir}/default48.png" ]]; then
+    mkdir -p "${DESTDIR}/usr/share/icons/hicolor/48x48/apps"
+    install -m 0644 "${icon_src_dir}/default48.png" \
+      "${DESTDIR}/usr/share/icons/hicolor/48x48/apps/firefox.png"
+  fi
+fi
+
+# /usr/share/pixmaps/firefox.png (usa 48x48 se disponível)
+if [[ -f "${icon_src_dir}/default48.png" ]]; then
+  mkdir -p "${DESTDIR}/usr/share/pixmaps"
+  install -m 0644 "${icon_src_dir}/default48.png" \
+    "${DESTDIR}/usr/share/pixmaps/firefox.png"
+fi
+
+# 5) desktop file
+mkdir -p "${DESTDIR}/usr/share/applications"
+cat > "${DESTDIR}/usr/share/applications/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the Web
+Exec=firefox %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+EOF
