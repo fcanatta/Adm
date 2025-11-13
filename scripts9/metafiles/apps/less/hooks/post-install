@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/less" ]]; then
+  echo "[ERR] less: /usr/bin/less não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+echo "[OK] less instalado em ${DESTDIR}/usr/bin/less"
