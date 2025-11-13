@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-: "${WORKDIR:?}" : "${JOBS:=4}"
+: "${WORKDIR:?}"; : "${JOBS:=4}"
 
-src=$(find "$WORKDIR" -maxdepth 1 -type d -name 'firefox-*' | head -n1)
-cd "$src"
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'firefox-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] firefox: diretório firefox-* não encontrado" >&2; exit 3; }
 
-./mach build -j"$JOBS"
+cd "$srcdir"
+
+if [[ ! -x "./mach" ]]; then
+  echo "[ERR] firefox: ./mach não encontrado; confira a árvore de fontes" >&2
+  exit 4
+fi
+
+./mach build -j"${JOBS}"
