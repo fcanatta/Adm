@@ -1,0 +1,9 @@
+# Comando para instalar toolchain musl
+# adm stages run cross-musl
+# Stage: cross toolchain baseado em musl
+toolchain/binutils-pass1
+toolchain/gcc-pass1
+toolchain/linux-headers
+toolchain/musl
+toolchain/binutils-pass2
+toolchain/gcc-pass2
