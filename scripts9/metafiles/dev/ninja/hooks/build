@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+: "${JOBS:=4}"
+
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'ninja-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] diretório ninja-* não encontrado em $WORKDIR" >&2; exit 3; }
+
+cd "$srcdir"
+
+: "${PYTHON:=python3}"
+
+if [[ ! -x "$(command -v "$PYTHON" || true)" ]]; then
+  echo "[ERR] python3 não encontrado para bootstrap do ninja" >&2
+  exit 4
+fi
+
+# Bootstrap direto (gera o binário ./ninja)
+"$PYTHON" configure.py --bootstrap
+[[ -x "./ninja" ]] || { echo "[ERR] bootstrap ninja falhou; binário não gerado" >&2; exit 5; }
+
+echo "[OK] ninja bootstrap concluído."
