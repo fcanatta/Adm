@@ -1,0 +1,12 @@
+name=perl-json
+version=latest
+category=dev
+run_deps=perl
+build_deps=perl
+opt_deps=
+num_builds=0
+description=Perl JSON module (encode/decode)
+homepage=https://metacpan.org/release/JSON
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.cpan.org/modules/by-module/JSON/
