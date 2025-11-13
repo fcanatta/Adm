@@ -1,8 +1,87 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-: "${WORKDIR:?}" : "${DESTDIR:?}"
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
 
-src=$(find "$WORKDIR" -maxdepth 1 -type d -name 'firefox-*' | head -n1)
-cd "$src"
+cd "$WORKDIR"
+srcdir="$(find . -maxdepth 1 -type d -name 'firefox-*' | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] firefox: diretório firefox-* não encontrado" >&2; exit 3; }
 
+cd "$srcdir"
+
+if [[ ! -x "./mach" ]]; then
+  echo "[ERR] firefox: ./mach não encontrado" >&2
+  exit 4
+fi
+
+# instala sob /usr (usa mozconfig/obj-adm)
 ./mach install --destdir "$DESTDIR"
+
+# Em muitas configs, o app acaba em /usr/lib/firefox
+appdir="${DESTDIR}/usr/lib/firefox"
+if [[ ! -d "$appdir" ]]; then
+  # fallback: tenta encontrar dir com firefox binário
+  appdir="$(find "${DESTDIR}/usr/lib" -maxdepth 2 -type f -name firefox 2>/dev/null | head -n1 || true)"
+  if [[ -n "$appdir" ]]; then
+    appdir="$(dirname "$appdir")"
+  else
+    echo "[ERR] firefox: diretório de app não encontrado em ${DESTDIR}/usr/lib" >&2
+    exit 5
+  fi
+fi
+
+# garante launcher em /usr/bin
+mkdir -p "${DESTDIR}/usr/bin"
+cat > "${DESTDIR}/usr/bin/firefox" <<'EOF'
+#!/usr/bin/env sh
+exec /usr/lib/firefox/firefox "$@"
+EOF
+chmod 0755 "${DESTDIR}/usr/bin/firefox"
+
+# Ícones (mesma lógica do firefox-bin, mas a partir de appdir)
+cd "$appdir"
+icon_src_dir="browser/chrome/icons/default"
+sizes="16 22 24 32 48 64 128 256"
+
+for sz in $sizes; do
+  src_png=""
+  if [[ -f "${icon_src_dir}/default${sz}.png" ]]; then
+    src_png="${icon_src_dir}/default${sz}.png"
+  elif [[ -f "${icon_src_dir}/default.png" ]]; then
+    src_png="${icon_src_dir}/default.png"
+  fi
+  [[ -n "$src_png" ]] || continue
+
+  dest_dir="${DESTDIR}/usr/share/icons/hicolor/${sz}x${sz}/apps"
+  mkdir -p "$dest_dir"
+  install -m 0644 "$src_png" "${dest_dir}/firefox.png"
+done
+
+if ! find "${DESTDIR}/usr/share/icons/hicolor" -type f -name 'firefox.png' 2>/dev/null | grep -q .; then
+  if [[ -f "${icon_src_dir}/default48.png" ]]; then
+    mkdir -p "${DESTDIR}/usr/share/icons/hicolor/48x48/apps"
+    install -m 0644 "${icon_src_dir}/default48.png" \
+      "${DESTDIR}/usr/share/icons/hicolor/48x48/apps/firefox.png"
+  fi
+fi
+
+if [[ -f "${icon_src_dir}/default48.png" ]]; then
+  mkdir -p "${DESTDIR}/usr/share/pixmaps"
+  install -m 0644 "${icon_src_dir}/default48.png" \
+    "${DESTDIR}/usr/share/pixmaps/firefox.png"
+fi
+
+# Desktop file
+mkdir -p "${DESTDIR}/usr/share/applications"
+cat > "${DESTDIR}/usr/share/applications/firefox.desktop" <<'EOF'
+[Desktop Entry]
+Name=Firefox
+GenericName=Web Browser
+Comment=Browse the Web
+Exec=firefox %u
+Terminal=false
+Type=Application
+Icon=firefox
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=true
+EOF
