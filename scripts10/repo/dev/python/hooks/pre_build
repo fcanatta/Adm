@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# hook: pre_build para python (stage temporário em chroot)
+# Versão 3.13.7 (metafile: Python-3.13.7).
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Evitar teste interativo e coisas estranhas durante configure
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --enable-shared
+  --enable-optimizations
+  --with-system-ffi
+  --with-ensurepip=install
+"
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+
+# Python costuma gerar .so em lib; garante lib e lib64 existirem
+mkdir -p "${ADM_INSTALL_ROOT}/usr/lib" "${ADM_INSTALL_ROOT}/usr/lib64" 2>/dev/null || :
