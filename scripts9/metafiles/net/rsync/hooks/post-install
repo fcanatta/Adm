@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/rsync" ]]; then
+  echo "[ERR] rsync: /usr/bin/rsync não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+# cria diretório padrão de config se for install direto em /
+if [[ "$DESTDIR" = "/" || "$DESTDIR" = "" ]]; then
+  mkdir -p /etc || true
+  [[ -f /etc/rsyncd.conf ]] || {
+    cat > /etc/rsyncd.conf <<'EOF'
+# rsyncd.conf gerado pelo ADM - ajuste conforme necessidade
+#log file = /var/log/rsyncd.log
+#pid file = /var/run/rsyncd.pid
+EOF
+  }
+fi
+
+echo "[OK] rsync instalado em ${DESTDIR}/usr/bin/rsync"
