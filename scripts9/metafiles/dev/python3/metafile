@@ -1,0 +1,12 @@
+name=python3
+version=3.12.x
+category=dev
+run_deps=openssl,zlib,xz,bzip2,readline,ncurses,sqlite3,libffi
+build_deps=openssl,zlib,xz,bzip2,readline,ncurses,sqlite3,libffi
+opt_deps=
+num_builds=0
+description=Python 3 com ensurepip/pip
+homepage=https://www.python.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://www.python.org/ftp/python/
