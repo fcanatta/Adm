@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+srcdir="$(find . -maxdepth 1 -type d -name 'automake-*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] automake: diretório automake-* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+if ! command -v perl >/dev/null 2>&1; then
+  echo "[ERR] automake: perl não encontrado no PATH (run_dep obrigatório)" >&2
+  exit 3
+fi
+
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+export CFLAGS LDFLAGS
+
+./configure \
+  --prefix=/usr \
+  --sysconfdir=/etc \
+  --disable-static
