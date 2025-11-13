@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"; : "${DESTDIR:?}"
+
+cd "$WORKDIR"
+srcdir="$(find "$WORKDIR" -maxdepth 1 -type d \( -name 'linux-firmware' -o -name 'linux-firmware-*' \) | head -n1 || true)"
+[[ -d "$srcdir" ]] || { echo "[ERR] linux-firmware srcdir não encontrado" >&2; exit 3; }
+
+list="${WORKDIR}/.adm-state/linux-firmware.files"
+if [[ ! -f "$list" ]]; then
+  echo "[WAR] Lista de firmware não encontrada, regenerando (modo full)..."
+  "$WORKDIR/../metafiles/sys/linux-firmware/hooks/build" 2>/dev/null || true
+  list="${WORKDIR}/.adm-state/linux-firmware.files"
+fi
+
+mkdir -p "${DESTDIR}/lib/firmware"
+
+cd "$srcdir"
+
+if command -v rsync >/dev/null 2>&1; then
+  # copia preservando estrutura
+  rsync -a \
+    --files-from="$list" \
+    ./ \
+    "${DESTDIR}/lib/firmware/"
+else
+  # fallback genérico usando tar
+  tmp_tar="$(mktemp)"
+  tar -cf "$tmp_tar" --files-from "$list"
+  ( cd "${DESTDIR}/lib/firmware" && tar -xf "$tmp_tar" )
+  rm -f "$tmp_tar"
+fi
