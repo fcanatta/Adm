@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+
+srcdir="$(find . -maxdepth 1 -type d -name 'perl-5*' | head -n1 || true)"
+[[ -n "$srcdir" ]] || { echo "[ERR] diretório perl-5* não encontrado em $WORKDIR" >&2; exit 2; }
+
+cd "$srcdir"
+
+# Flags razoáveis e portáveis
+: "${CFLAGS:=-O2 -pipe}"
+: "${LDFLAGS:=}"
+
+export CFLAGS LDFLAGS
+
+# -des = usar defaults, não interativo
+sh Configure \
+  -des \
+  -Dprefix=/usr \
+  -Dvendorprefix=/usr \
+  -Dman1dir=/usr/share/man/man1 \
+  -Dman3dir=/usr/share/man/man3 \
+  -Dpager='/usr/bin/less -isR' \
+  -Duseshrplib \
+  -Dusethreads
