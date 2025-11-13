@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -x "${DESTDIR}/usr/bin/cmake" ]]; then
+  echo "[ERR] cmake: binário /usr/bin/cmake não encontrado em ${DESTDIR}" >&2
+  exit 4
+fi
+
+echo "[OK] cmake instalado em ${DESTDIR}/usr/bin/cmake"
