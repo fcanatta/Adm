@@ -1,0 +1,8 @@
+# Colocar em /usr/src/adm/stages.d/cross.list
+# Stage: cross toolchain (binutils/gcc/glibc/sysroot)
+toolchain/binutils-pass1
+toolchain/gcc-pass1
+toolchain/linux-headers
+toolchain/glibc
+toolchain/binutils-pass2
+toolchain/gcc-pass2
