@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+libdir="${DESTDIR}/usr/lib"
+
+if ! find "$libdir" -name 'libacl.so*' | grep -q .; then
+  echo "[ERR] acl: libacl.so não encontrada" >&2
+  exit 3
+fi
+
+echo "[OK] acl instalado (suporte a permissões POSIX ACL)."
