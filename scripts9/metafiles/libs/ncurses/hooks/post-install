@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+if [[ ! -d "${DESTDIR}/usr/lib" ]]; then
+  echo "[ERR] ncurses: /usr/lib não existe em ${DESTDIR}" >&2
+  exit 4
+fi
+
+if ! find "${DESTDIR}/usr/lib" -maxdepth 1 -name 'libncursesw.so*' | grep -q .; then
+  echo "[ERR] ncurses: libncursesw.so* não encontrada em ${DESTDIR}/usr/lib" >&2
+  exit 5
+fi
+
+echo "[OK] ncurses (wide-char) instalada em ${DESTDIR}/usr/lib"
