@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${DESTDIR:?}"
+
+[[ -x "${DESTDIR}/usr/bin/openssl" ]] || {
+  echo "[ERR] openssl não instalado" >&2
+  exit 4
+}
+
+echo "[OK] openssl instalado."
