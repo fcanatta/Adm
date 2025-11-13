@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+: "${WORKDIR:?}"
+
+cd "$WORKDIR"
+srcdir=$(find . -maxdepth 1 -type d -name 'openssl-*' | head -n1 || exit 2)
+cd "$srcdir"
+
+./Configure \
+  --prefix=/usr \
+  --openssldir=/etc/ssl \
+  enable-ec_nistp_64_gcc_128 \
+  shared \
+  zlib
