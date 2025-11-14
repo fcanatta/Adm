@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# hook: post_install para linux
+# Gera/atualiza initramfs após instalar ou atualizar o kernel.
+
+set -eu
+
+: "${ADM_ROOT:=/usr/src/adm}"
+
+MKINIT="${ADM_ROOT}/mkinitramfs.sh"
+
+echo "[linux/post_install] Chamando mkinitramfs.sh..."
+
+if [ -x "${MKINIT}" ]; then
+    "${MKINIT}" || echo "[linux/post_install] mkinitramfs.sh retornou erro." >&2
+elif command -v mkinitramfs-adm >/dev/null 2>&1; then
+    mkinitramfs-adm || echo "[linux/post_install] mkinitramfs-adm retornou erro." >&2
+else
+    echo "[linux/post_install] mkinitramfs não encontrado, ignorando." >&2
+fi
