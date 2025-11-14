@@ -1,0 +1,6 @@
+# adm stages run base        # ou o nome do stage onde você colocou
+# ou adm build dev m4,adm build libs ncurses
+dev/m4
+libs/ncurses
+net/wget
+net/curl
