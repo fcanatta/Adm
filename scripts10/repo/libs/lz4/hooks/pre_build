@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# hook: pre_build para lz4
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Instala em /usr
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# lz4 usa Makefile/CMake; detect.sh escolhe.
+# Aqui só garantimos flags decentes.
+export ADM_BUILD_CONFIGURE_EXTRA=""
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
