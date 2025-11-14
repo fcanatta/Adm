@@ -1,15 +1,40 @@
 # adm stages run base        # ou o nome do stage onde você colocou
 # ou adm build dev m4,adm build libs ncurses
+# Stage: base system (dentro do chroot, instalando em /)
+
+# toolchain helpers / linguagem
 dev/m4
+dev/gawk
+dev/diffutils
+dev/make
+dev/patch
+dev/sed
+
+# libs básicas de compressão e terminal
+libs/zlib
+libs/xz
 libs/ncurses
-apps/wget
-apps/curl
-dev/m4
-libs/openssl
+
+# utils de sistema básicos
+sys/file
+sys/findutils
+sys/grep
+sys/gzip
+sys/tar
 sys/coreutils
 sys/bash
-libs/zlib
-dev/diffutils
+sys/util-linux
+
+# ferramentas de desenvolvimento extra
+dev/gettext
+dev/bison
+dev/perl
+dev/python
+dev/texinfo
+
+# stack de rede / crypto
+libs/openssl
 libs/nghttp2
 libs/brotli
-sys/file
+apps/wget
+apps/curl
