@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# hook: pre_build para glibc (base, não cross)
+# Ajusta prefix, headers e flags; o fluxo configure/make/install é feito
+# pelos drivers padrão do ADM.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "${ADM_BUILD_BUILD_DIR}"
+
+# Para glibc do sistema, prefixo normal é /usr
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Local onde os headers do kernel foram instalados no sistema final.
+# Ajuste se você usar outro path.
+: "${ADM_SYSROOT_HEADERS:=${ADM_INSTALL_ROOT}/usr/include}"
+
+# Define opções principais de configure
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+  --sysconfdir=/etc
+  --enable-kernel=6.1.0
+  --with-headers=${ADM_SYSROOT_HEADERS}
+  --disable-werror
+"
+
+# Build type razoável
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
