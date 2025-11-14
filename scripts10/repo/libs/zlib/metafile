@@ -1,0 +1,12 @@
+name=zlib
+version=1.3.1
+category=libs
+run_deps=
+build_deps=dev/gcc
+opt_deps=
+num_builds=0
+description=Zlib - biblioteca de compressão
+homepage=https://zlib.net/
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://zlib.net/zlib-1.3.1.tar.xz
