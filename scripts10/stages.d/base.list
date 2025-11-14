@@ -5,9 +5,11 @@ libs/ncurses
 apps/wget
 apps/curl
 dev/m4
-libs/ncurses
 libs/openssl
 sys/coreutils
 sys/bash
-net/wget
-net/curl
+libs/zlib
+dev/diffutils
+libs/nghttp2
+libs/brotli
+sys/file
