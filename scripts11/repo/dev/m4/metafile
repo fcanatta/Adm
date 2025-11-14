@@ -1,0 +1,16 @@
+name=m4
+version=1.4.19
+category=dev
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU m4 – macro processor
+homepage=https://www.gnu.org/software/m4/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.xz
+sha256sums=
