@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# hook: pre_build para iana-etc
+# Só copia protocols/services para /etc e pula fluxo padrão.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+mkdir -p "${ADM_INSTALL_ROOT}/etc"
+
+# Alguns tarballs chamam os arquivos de 'services' e 'protocols' diretamente
+# outros vêm em subdir; ajuste se necessário.
+if [ -f services ] && [ -f protocols ]; then
+    install -m 0644 services   "${ADM_INSTALL_ROOT}/etc/services"
+    install -m 0644 protocols  "${ADM_INSTALL_ROOT}/etc/protocols"
+else
+    # fallback genérico: tenta achar
+    srv="$(find . -maxdepth 3 -name 'services'  | head -n1 || true)"
+    prt="$(find . -maxdepth 3 -name 'protocols' | head -n1 || true)"
+    [ -n "$srv" ] && install -m 0644 "$srv" "${ADM_INSTALL_ROOT}/etc/services"
+    [ -n "$prt" ] && install -m 0644 "$prt" "${ADM_INSTALL_ROOT}/etc/protocols"
+fi
+
+export ADM_BUILD_SKIP_DEFAULT=1
