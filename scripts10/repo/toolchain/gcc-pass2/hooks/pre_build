@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # hook: pre_build para gcc-pass2
-# Objetivo:
-#   - GCC final para o alvo, com libstdc++ e demais libs padrão
-#   - Usa glibc em ${ADM_CROSS_ROOT}/${ADM_TARGET}
+# GCC final usando o sysroot em ${ADM_CROSS_ROOT}/${ADM_TARGET}
 
 set -eu
 
@@ -29,5 +27,5 @@ export ADM_BUILD_CONFIGURE_EXTRA="
 "
 
 export PATH="${ADM_CROSS_ROOT}/bin:${PATH}"
-export CFLAGS="-O2 -pipe"
-export CXXFLAGS="-O2 -pipe"
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
