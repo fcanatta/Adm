@@ -1,0 +1,16 @@
+name=mpfr
+version=4.2.1
+category=libs
+
+build_deps=libs/gmp
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=MPFR – Multi-Precision Floating-Point
+homepage=https://www.mpfr.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
+sha256sums=277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2
