@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# hook: pre_build para kernel-zen (flavor Zen-like)
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+KVER="${KVER:-6.13.2}"
+ARCH="${ADM_KERNEL_ARCH:-$(uname -m)}"
+FLAVOR_SUFFIX="${ADM_KERNEL_FLAVOR_SUFFIX:-zen}"
+
+if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "${ADM_KERNEL_CONFIG}" ]; then
+    printf '[kernel-zen] usando ADM_KERNEL_CONFIG=%s\n' "${ADM_KERNEL_CONFIG}" >&2
+    cp -v "${ADM_KERNEL_CONFIG}" .config
+elif [ -f .config ]; then
+    printf '[kernel-zen] usando .config já presente no source\n' >&2
+else
+    printf '[kernel-zen] ERRO: nenhum .config encontrado.\n' >&2
+    exit 1
+fi
+
+JOBS="${ADM_MAKE_JOBS:-$(nproc 2>/dev/null || echo 1)}"
+
+make -j"${JOBS}"
+make -j"${JOBS}" modules_install INSTALL_MOD_PATH="${ADM_INSTALL_ROOT}"
+
+case "${ARCH}" in
+    x86_64|i?86)
+        IMG="arch/x86/boot/bzImage"
+        ;;
+    aarch64)
+        IMG="arch/arm64/boot/Image"
+        ;;
+    *)
+        printf '[kernel-zen] WARNING: arquitetura %s não tratada.\n' "${ARCH}" >&2
+        IMG=""
+        ;;
+esac
+
+if [ -n "${IMG}" ] && [ -f "${IMG}" ]; then
+    install -Dm644 "${IMG}" "${ADM_INSTALL_ROOT}/boot/vmlinuz-${KVER}-${FLAVOR_SUFFIX}"
+    install -Dm644 System.map "${ADM_INSTALL_ROOT}/boot/System.map-${KVER}-${FLAVOR_SUFFIX}"
+    install -Dm644 .config "${ADM_INSTALL_ROOT}/boot/config-${KVER}-${FLAVOR_SUFFIX}"
+else
+    printf '[kernel-zen] WARNING: imagem %s não encontrada, copie manualmente.\n' "${IMG:-<desconhecida>}" >&2
+fi
+
+export ADM_BUILD_SKIP_DEFAULT=1
