@@ -1,0 +1,16 @@
+name=diffutils
+version=3.10
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU diffutils – compare files
+homepage=https://www.gnu.org/software/diffutils/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/diffutils/diffutils-3.10.tar.xz
+sha256sums=
