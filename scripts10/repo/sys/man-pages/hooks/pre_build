@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# hook: pre_build para man-pages
+# Usa o 'make install' do pacote e pula o fluxo padrão (ADM_BUILD_SKIP_DEFAULT=1)
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+# Instala diretamente as manpages em /usr/share/man do root/chroot
+make prefix="${ADM_INSTALL_ROOT}/usr" install
+
+# Evita que o build.sh tente rodar drivers padrão (configure/make de novo)
+export ADM_BUILD_SKIP_DEFAULT=1
