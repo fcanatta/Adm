@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# hook: pre_build para openssl
+# Ajusta prefix/dir padrão; build real fica a cargo do detect/build.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# OpenSSL instala em /usr
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# OpenSSL usa ./Configure próprio, mas seu detect.sh trata isso;
+# aqui só ajustamos diretórios.
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+  --openssldir=/etc/ssl
+  shared
+  zlib
+"
+
+# Flags seguros
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
