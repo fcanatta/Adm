@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Hook: sys/cross-toolchain
+# Faz o ADM construir o cross-toolchain real usando os scripts stage1 e stage2.
+
+set -euo pipefail
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_SCRIPTS="${ADM_SCRIPTS:-$ADM_ROOT/scripts}"
+
+# Fallback de log
+if ! declare -F adm_info >/dev/null 2>&1; then
+    adm_info(){ echo "[INFO] $*"; }
+    adm_error(){ echo "[ERRO] $*" >&2; }
+    adm_die(){ adm_error "$*"; exit 1; }
+fi
+
+# Garantir scripts obrigatórios
+toolchain_stage1="$ADM_SCRIPTS/20-toolchain-stage1.sh"
+stage2_rootfs="$ADM_SCRIPTS/22-rootfs-stage2.sh"
+
+[ -x "$toolchain_stage1" ] || adm_die "20-toolchain-stage1.sh não encontrado!"
+[ -x "$stage2_rootfs" ] || adm_die "22-rootfs-stage2.sh não encontrado!"
+
+# ADM chama isso ANTES do build normal
+adm_hook_pre_build() {
+    export ADM_SKIP_DEFAULT_BUILD=1
+    adm_info "sys/cross-toolchain: build padrão desativado (usando fluxo ADM)."
+}
+
+# Core: constroi o cross-toolchain real
+adm_hook_build() {
+    adm_info "[CROSS-TOOLCHAIN] Iniciando stage1 (binutils + gcc-p1 + headers + glibc + gcc-p2 + temp tools)."
+    "$toolchain_stage1" \
+        --profile "${ADM_PROFILE:-normal}" \
+        --log "${ADM_CURRENT_LOG:-}"
+
+    adm_info "[CROSS-TOOLCHAIN] Construção do stage1 concluída."
+
+    adm_info "[CROSS-TOOLCHAIN] Iniciando stage2 (rootfs + temp tools 2)."
+    "$stage2_rootfs" \
+        --profile "${ADM_PROFILE:-normal}" \
+        --log "${ADM_CURRENT_LOG:-}"
+
+    adm_info "[CROSS-TOOLCHAIN] Stage2 concluído."
+}
+
+# Instalação lógica — já foi instalado pelo stage1/stage2
+adm_hook_install() {
+    adm_info "sys/cross-toolchain: Toolchain já instalado nos prefixos do ADM."
+}
