@@ -1,0 +1,16 @@
+name=binutils
+version=2.43.1
+category=dev
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU Binutils – assemblers e linkers
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz
+sha256sums=13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd
