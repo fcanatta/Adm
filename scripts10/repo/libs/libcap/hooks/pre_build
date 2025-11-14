@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# hook: pre_build para libcap
+# libcap usa Makefile próprio; deixamos o driver 'make' do ADM rodar.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "${ADM_BUILD_BUILD_DIR}"
+
+# libcap instala em /usr
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Alguns builds usam 'make prefix=...'; o driver make-only deve respeitar PREFIX.
+export ADM_BUILD_CONFIGURE_EXTRA=""
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
