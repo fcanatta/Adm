@@ -1,0 +1,16 @@
+name=xz
+version=5.6.2
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=xz – LZMA compression utilities
+homepage=https://tukaani.org/xz/
+maintainer=ADM System <adm@example.local>
+
+sources=https://tukaani.org/xz/xz-5.6.2.tar.xz
+sha256sums=
