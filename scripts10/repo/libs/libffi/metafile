@@ -1,0 +1,12 @@
+name=libffi
+version=3.4.7
+category=libs
+run_deps=
+build_deps=dev/gcc
+opt_deps=
+num_builds=0
+description=libffi - interface de função estrangeira portátil
+homepage=https://sourceware.org/libffi/
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://github.com/libffi/libffi/releases/download/v3.4.7/libffi-3.4.7.tar.gz
