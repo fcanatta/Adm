@@ -1,0 +1,16 @@
+name=coreutils
+version=9.5
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU coreutils – basic file, shell and text utilities
+homepage=https://www.gnu.org/software/coreutils/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/coreutils/coreutils-9.5.tar.xz
+sha256sums=
