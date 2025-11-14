@@ -1,0 +1,16 @@
+name=make
+version=4.4.1
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU make – build automation tool
+homepage=https://www.gnu.org/software/make/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
+sha256sums=
