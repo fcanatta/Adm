@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# hook: pre_build para nghttp2
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# nghttp2 pode usar OpenSSL para ALPN, etc.
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+  --enable-lib-only
+  --with-openssl
+  --disable-static
+"
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
