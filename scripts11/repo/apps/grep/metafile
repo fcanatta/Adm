@@ -1,0 +1,16 @@
+name=grep
+version=3.11
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU grep – text search utility
+homepage=https://www.gnu.org/software/grep/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/grep/grep-3.11.tar.xz
+sha256sums=
