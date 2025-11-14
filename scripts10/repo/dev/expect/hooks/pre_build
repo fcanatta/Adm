@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# hook: pre_build para expect
+# Build REAL usando Tcl em /usr, depois pula fluxo padrão.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+./configure \
+  --prefix=/usr \
+  --exec-prefix=/usr \
+  --with-tcl=/usr/lib \
+  --with-tclinclude=/usr/include \
+  --mandir=/usr/share/man
+
+make
+make install
+
+export ADM_BUILD_SKIP_DEFAULT=1
