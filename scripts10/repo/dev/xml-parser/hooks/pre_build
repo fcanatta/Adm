@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# hook: pre_build para XML::Parser (Perl)
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+perl Makefile.PL \
+  EXPATLIBPATH=/usr/lib \
+  EXPATINCPATH=/usr/include
+
+make
+# Testes podem ser demorados; se quiser, comente a linha abaixo
+make test || printf '[xml-parser] WARNING: testes falharam, continuando...\n' >&2
+make install
+
+export ADM_BUILD_SKIP_DEFAULT=1
