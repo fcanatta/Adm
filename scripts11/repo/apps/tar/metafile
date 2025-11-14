@@ -1,0 +1,16 @@
+name=tar
+version=1.35
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU tar – tape archiver
+homepage=https://www.gnu.org/software/tar/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz
+sha256sums=
