@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# hook: pre_build para Linux kernel
+# Build REAL do kernel. Requer um .config fornecido por você.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+KVER="${KVER:-6.13.2}"
+ARCH="${ADM_KERNEL_ARCH:-$(uname -m)}"
+
+# Configuração
+if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "${ADM_KERNEL_CONFIG}" ]; then
+    printf '[linux] usando ADM_KERNEL_CONFIG=%s\n' "${ADM_KERNEL_CONFIG}" >&2
+    cp -v "${ADM_KERNEL_CONFIG}" .config
+elif [ -f .config ]; then
+    printf '[linux] usando .config já presente no source\n' >&2
+else
+    printf '[linux] ERRO: nenhum .config encontrado.\n' >&2
+    printf '        defina ADM_KERNEL_CONFIG ou gere .config manualmente (menuconfig).\n' >&2
+    exit 1
+fi
+
+# Build
+JOBS="${ADM_MAKE_JOBS:-$(nproc 2>/dev/null || echo 1)}"
+
+make -j"${JOBS}"
+make -j"${JOBS}" modules_install INSTALL_MOD_PATH="${ADM_INSTALL_ROOT}"
+
+# Instala imagem do kernel (x86_64 e arm64 tratados; outros só avisam)
+case "${ARCH}" in
+    x86_64|i?86)
+        IMG="arch/x86/boot/bzImage"
+        ;;
+    aarch64)
+        # pode ajustar conforme config (Image, Image.gz, etc)
+        IMG="arch/arm64/boot/Image"
+        ;;
+    *)
+        printf '[linux] WARNING: arquitetura %s não tratada, não copiando imagem automaticamente.\n' "${ARCH}" >&2
+        IMG=""
+        ;;
+esac
+
+if [ -n "${IMG}" ] && [ -f "${IMG}" ]; then
+    install -Dm644 "${IMG}" "${ADM_INSTALL_ROOT}/boot/vmlinuz-${KVER}-adm"
+    install -Dm644 System.map "${ADM_INSTALL_ROOT}/boot/System.map-${KVER}"
+    install -Dm644 .config "${ADM_INSTALL_ROOT}/boot/config-${KVER}"
+else
+    printf '[linux] WARNING: imagem de kernel %s não encontrada, copie manualmente.\n' "${IMG:-<desconhecida>}" >&2
+fi
+
+# Não deixe o build.sh rodar configure/make genérico
+export ADM_BUILD_SKIP_DEFAULT=1
