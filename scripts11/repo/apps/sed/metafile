@@ -1,0 +1,16 @@
+name=sed
+version=4.9
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU sed – stream editor
+homepage=https://www.gnu.org/software/sed/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/sed/sed-4.9.tar.xz
+sha256sums=
