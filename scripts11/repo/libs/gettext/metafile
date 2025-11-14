@@ -1,0 +1,16 @@
+name=gettext
+version=0.22.5
+category=libs
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=gettext – internationalization library and tools
+homepage=https://www.gnu.org/software/gettext/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gettext/gettext-0.22.5.tar.xz
+sha256sums=
