@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# hook: pre_build para bash
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Bash em /bin é padrão em várias distros, mas aqui deixo /usr/bin
+# (se quiser /bin, muda --bindir).
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+  --bindir=/usr/bin
+  --sysconfdir=/etc
+  --without-bash-malloc
+"
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
