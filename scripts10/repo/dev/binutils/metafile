@@ -1,0 +1,12 @@
+name=binutils
+version=2.45.1
+category=dev
+run_deps=libs/zlib,libs/zstd
+build_deps=dev/gcc,libs/zlib,libs/zstd,libs/bzip2,libs/xz
+opt_deps=
+num_builds=0
+description=GNU Binutils - assembler, linker e ferramentas de objetos
+homepage=https://www.gnu.org/software/binutils/
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.45.1.tar.xz
