@@ -1,0 +1,16 @@
+name=linux-headers
+version=6.10.5
+category=sys
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Kernel headers para toolchain
+homepage=https://www.kernel.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz
+sha256sums=3f6690efe8dc49751e33fbcc45d35fa9048f75e03bfeaaa2a28e1037ca8d85cf
