@@ -1,0 +1,16 @@
+name=patch
+version=2.7.6
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU patch – apply diffs to files
+homepage=https://www.gnu.org/software/patch/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/patch/patch-2.7.6.tar.xz
+sha256sums=
