@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# hook: pre_build para linux-firmware
+# Instala firmware em /lib/firmware a partir da árvore clonada (sem build).
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+DEST="${ADM_INSTALL_ROOT}/lib/firmware"
+mkdir -p "${DEST}"
+
+# Copia tudo, exceto .git, preservando attrs
+find "${ADM_BUILD_SRC_DIR}" -mindepth 1 -maxdepth 1 ! -name '.git' -print0 \
+  | while IFS= read -r -d '' entry; do
+        cp -a "${entry}" "${DEST}/"
+    done
+
+export ADM_BUILD_SKIP_DEFAULT=1
