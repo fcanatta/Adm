@@ -1,0 +1,16 @@
+name=file
+version=5.45
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=file – determine file type
+homepage=https://www.darwinsys.com/file/
+maintainer=ADM System <adm@example.local>
+
+sources=ftp://ftp.astron.com/pub/file/file-5.45.tar.gz
+sha256sums=
