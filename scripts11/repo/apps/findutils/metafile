@@ -1,0 +1,16 @@
+name=findutils
+version=4.10.0
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU findutils – find, locate, updatedb
+homepage=https://www.gnu.org/software/findutils/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz
+sha256sums=
