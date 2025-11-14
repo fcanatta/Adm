@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# hook: pre_build para zlib
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+# Zlib instala em /usr dentro do root/chroot
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+# Zlib tem build meio próprio, mas costuma respeitar prefix:
+# detect.sh/build.sh se viram; aqui só flags e docdir.
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --prefix=/usr
+"
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
