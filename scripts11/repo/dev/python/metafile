@@ -1,0 +1,16 @@
+name=python
+version=3.12.3
+category=dev
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Python – high-level scripting language
+homepage=https://www.python.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.python.org/ftp/python/3.12.3/Python-3.12.3.tar.xz
+sha256sums=
