@@ -1,0 +1,16 @@
+name=gcc
+version=14.2.0
+category=dev
+
+build_deps=libs/gmp,libs/mpfr,libs/mpc,libs/isl
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU Compiler Collection – C, C++, Fortran...
+homepage=https://gcc.gnu.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+sha256sums=a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9
