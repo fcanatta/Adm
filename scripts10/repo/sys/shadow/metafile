@@ -1,0 +1,12 @@
+name=shadow
+version=4.18.0
+category=sys
+run_deps=libs/libxcrypt
+build_deps=dev/gcc,libs/libxcrypt
+opt_deps=sys/attr,sys/acl
+num_builds=0
+description=Shadow - ferramentas de contas de usuário/grupo com senhas shadow
+homepage=https://github.com/shadow-maint/shadow
+maintainer=Fernando Canatta <you@example.com>
+sha256sums=
+sources=https://github.com/shadow-maint/shadow/releases/download/4.18.0/shadow-4.18.0.tar.xz
