@@ -1,0 +1,16 @@
+name=ncurses
+version=6.5
+category=libs
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=ncurses – text UI library
+homepage=https://invisible-island.net/ncurses/
+maintainer=ADM System <adm@example.local>
+
+sources=https://invisible-mirror.net/archives/ncurses/ncurses-6.5.tar.gz
+sha256sums=
