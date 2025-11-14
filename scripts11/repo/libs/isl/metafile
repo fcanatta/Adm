@@ -1,0 +1,16 @@
+name=isl
+version=0.27
+category=libs
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=ISL – Integer Set Library (usada pelo GCC)
+homepage=http://isl.gforge.inria.fr/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gcc/infrastructure/isl-0.27.tar.xz
+sha256sums=6d8babb59e7b672e8cb7870e874f3f7b813b6e00e6af3f8b04f7579965643d5c
