@@ -1,0 +1,16 @@
+name=musl
+version=1.2.5
+category=libs
+
+build_deps=sys/linux-headers
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=musl libc – alternativa minimalista, rápida e segura à glibc
+homepage=https://musl.libc.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz
+sha256sums=83e5d8052c2d3bb30bfac8c3b7646cd917c2376fa0ed3a884bf9ff5bc9d1e46e
