@@ -131,7 +131,7 @@ fi
 : "${ADM_BUILD_LOG_DIR:=$ADM_LOG_DIR/build}"
 : "${ADM_BUILD_USE_CHROOT:=0}"      # 0 = desativado, 1 = usar chroot
 : "${ADM_CHROOT_ROOT:=}"           # path do rootfs quando usar chroot (obrigatório se ADM_BUILD_USE_CHROOT=1)
-
+: "${ADM_BUILD_SKIP_DEFAULT:=0}"   # 1 = hook assume o build e pula drivers padrão
 # Garante diretórios principais
 adm_mkdir_p "$ADM_BUILD_CACHE_DIR"   || adm_log_error "Falha ao criar ADM_BUILD_CACHE_DIR: %s" "$ADM_BUILD_CACHE_DIR"
 adm_mkdir_p "$ADM_DESTDIR_DIR"       || adm_log_error "Falha ao criar ADM_DESTDIR_DIR: %s"     "$ADM_DESTDIR_DIR"
@@ -992,13 +992,23 @@ adm_build_package() {
     # Hooks de configure
     adm_build__run_hook "$category" "$pkg" "pre_configure" "$ADM_BUILD_SRC_DIR" || return 1
 
+    # Hook de build custom (opcional). Se ele definir ADM_BUILD_SKIP_DEFAULT=1,
+    # o fluxo padrão (drivers por tipo) será pulado.
+    adm_build__run_hook "$category" "$pkg" "pre_build" "$ADM_BUILD_SRC_DIR" || return 1
+
+    if [ "${ADM_BUILD_SKIP_DEFAULT:-0}" -eq 1 ]; then
+        adm_log_build "ADM_BUILD_SKIP_DEFAULT=1: hook 'pre_build' assumiu o build de %s; pulando drivers padrão." "$pkg_id"
+        ADM_BUILD_SKIP_DEFAULT=0
+        adm_log_pkg "=== BUILD de %s concluído via hook custom (sem drivers padrão). DESTDIR=%s ===" "$pkg_id" "$ADM_DESTDIR_PKG"
+        return 0
+    fi
+
     local rc=0
     case "$build_system" in
         autotools)
             adm_build__driver_autotools "$ADM_BUILD_SRC_DIR" "$ADM_DESTDIR_CHROOT" || rc=$?
             ;;
         cmake)
-            adm_build__driver_cmake "$ADM_BUILD_SRC_DIR" "$ADM_DESTDIR_CHROOT" || rc=$?
             ;;
         meson)
             adm_build__driver_meson "$ADM_BUILD_SRC_DIR" "$ADM_DESTDIR_CHROOT" || rc=$?
