@@ -2,17 +2,13 @@
 # hook: pre_build para linux-headers
 #
 # Objetivo:
-#   - Rodar o build REAL dos headers do kernel aqui dentro:
+#   - Rodar o build REAL dos headers do kernel:
 #       make mrproper
 #       make headers_install
 #   - Instalar em:
 #       ${ADM_CROSS_ROOT}/${ADM_TARGET}/include
 #   - Avisar ao build.sh que NÃO deve rodar o fluxo padrão
 #     (configure/make/install) para este pacote.
-#
-# Requisitos:
-#   - ADM_BUILD_SRC_DIR e ADM_BUILD_DIR_HOST definidos pelo build.sh
-#   - ADM_ROOT, ADM_CROSS_ROOT, ADM_TARGET definidos pelo env/core
 
 set -eu
 
@@ -20,26 +16,23 @@ set -eu
 : "${ADM_ROOT:=/usr/src/adm}"
 : "${ADM_CROSS_ROOT:=$ADM_ROOT/cross-tools}"
 
-# Target padrão, se não tiver vindo de fora
+# Target padrão, se não vier de fora
 : "${ADM_TARGET:=x86_64-linux-gnu}"
 
-# Variáveis que o build.sh exporta
+# Variáveis fornecidas pelo build.sh
 : "${ADM_BUILD_SRC_DIR:?}"
-: "${ADM_BUILD_DIR_HOST:?}"
 
 # Destino dos headers dentro do sysroot
 DESTDIR="${ADM_CROSS_ROOT}/${ADM_TARGET}/include"
 
-# Cria diretório de destino se não existir
 mkdir -p "${DESTDIR}"
 
-# Faz o build REAL dos headers
 cd "${ADM_BUILD_SRC_DIR}"
 
 # Limpa árvore (ignora erro se não suportar)
 make mrproper >/dev/null 2>&1 || true
 
-# Cabeçalhos do kernel. ARCH é aproximado a partir do target:
+# ARCH aproximado a partir do target (x86_64-linux-gnu → x86_64)
 ARCH="${ADM_TARGET%%-*}"
 
 echo "[linux-headers hook] Instalando headers em ${DESTDIR} (ARCH=${ARCH})"
@@ -48,6 +41,5 @@ make headers_install \
     ARCH="${ARCH}" \
     INSTALL_HDR_PATH="${DESTDIR}"
 
-# Marca para o build.sh que ele deve pular o fluxo padrão
-# (configure/make/install) para este pacote.
+# Diz pro build.sh que não deve rodar os drivers padrão
 export ADM_BUILD_SKIP_DEFAULT=1
