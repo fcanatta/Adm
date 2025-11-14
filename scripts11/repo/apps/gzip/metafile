@@ -1,0 +1,16 @@
+name=gzip
+version=1.13
+category=apps
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU gzip – compression utility
+homepage=https://www.gnu.org/software/gzip/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gzip/gzip-1.13.tar.xz
+sha256sums=
