@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# hook: pre_build para flit-core (Python)
+# Instala via pip/PEP 517 e pula o fluxo padrão do build.sh.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+cd "${ADM_BUILD_SRC_DIR}"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "[flit-core] ERRO: python3 não encontrado" >&2
+    exit 1
+fi
+
+if python3 -m pip --version >/dev/null 2>&1; then
+    python3 -m pip install . \
+        --no-deps \
+        --prefix=/usr \
+        --root="${ADM_INSTALL_ROOT}" || {
+        echo "[flit-core] pip install falhou" >&2
+        exit 1
+    }
+else
+    echo "[flit-core] ERRO: pip não encontrado (precisa de pip para instalar)" >&2
+    exit 1
+fi
+
+export ADM_BUILD_SKIP_DEFAULT=1
