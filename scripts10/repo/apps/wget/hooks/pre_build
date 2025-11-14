@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# hook: pre_build para wget
+# Configura SSL, sysconfdir e docdir. Build padrão via autotools.
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+: "${ADM_BUILD_BUILD_DIR:?}"
+
+mkdir -p "$ADM_BUILD_BUILD_DIR"
+
+export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+
+export ADM_BUILD_CONFIGURE_EXTRA="
+  --sysconfdir=/etc
+  --with-ssl=openssl
+  --disable-static
+  --enable-shared
+  --docdir=/usr/share/doc/wget-1.25.0
+"
+
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
