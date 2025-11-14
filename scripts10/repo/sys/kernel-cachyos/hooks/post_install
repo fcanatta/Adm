@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# hook: post_install para kernel-cachyos
+
+set -eu
+
+: "${ADM_ROOT:=/usr/src/adm}"
+
+MKINIT="${ADM_ROOT}/mkinitramfs.sh"
+
+echo "[kernel-cachyos/post_install] Chamando mkinitramfs.sh..."
+
+if [ -x "${MKINIT}" ]; then
+    "${MKINIT}" || echo "[kernel-cachyos/post_install] mkinitramfs.sh retornou erro." >&2
+elif command -v mkinitramfs-adm >/dev/null 2>&1; then
+    mkinitramfs-adm || echo "[kernel-cachyos/post_install] mkinitramfs-adm retornou erro." >&2
+else
+    echo "[kernel-cachyos/post_install] mkinitramfs não encontrado, ignorando." >&2
+fi
