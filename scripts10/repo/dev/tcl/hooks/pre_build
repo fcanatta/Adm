@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# hook: pre_build para tcl
+# Faz o build REAL dentro de unix/ e pula fluxo padrão (ADM_BUILD_SKIP_DEFAULT=1).
+
+set -eu
+
+: "${ADM_INSTALL_ROOT:=/}"
+: "${ADM_BUILD_SRC_DIR:?}"
+
+# Diretório unix do tcl
+cd "${ADM_BUILD_SRC_DIR}/unix"
+
+# Configura e constrói
+./configure \
+  --prefix=/usr \
+  --libdir=/usr/lib \
+  --mandir=/usr/share/man
+
+make
+make install
+
+# Instala headers privados usados por expect
+make install-private-headers || true
+
+# tclConfig.sh fica em /usr/lib
+# (normalmente já instalado, mas garantimos path final correto)
+[ -f tclConfig.sh ] && install -m 0644 tclConfig.sh "${ADM_INSTALL_ROOT}/usr/lib/" || true
+
+# Não deixar o build.sh rodar drivers padrão
+export ADM_BUILD_SKIP_DEFAULT=1
