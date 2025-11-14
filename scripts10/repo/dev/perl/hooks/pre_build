@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# hook: pre_build para perl (stage temporário em chroot)
-# Perl usa 'Configure' próprio, mas aqui só ajustamos ambiente para o builder.
+# hook: pre_build para perl (build REAL com Configure + make + make install)
+# Usa ADM_BUILD_SKIP_DEFAULT=1 para pular drivers padrão do build.sh.
 
 set -eu
 
 : "${ADM_INSTALL_ROOT:=/}"
 : "${ADM_BUILD_SRC_DIR:?}"
-: "${ADM_BUILD_BUILD_DIR:?}"
 
-mkdir -p "$ADM_BUILD_BUILD_DIR"
+cd "${ADM_BUILD_SRC_DIR}"
 
-# Queremos perl instalando em /usr dentro do chroot
-export ADM_BUILD_PREFIX="${ADM_INSTALL_ROOT}/usr"
+# Configure do Perl é diferente de autotools, então fazemos aqui.
+sh Configure -des \
+  -Dprefix=/usr \
+  -Dvendorprefix=/usr \
+  -Dprivlib=/usr/lib/perl5/5.42/core_perl \
+  -Darchlib=/usr/lib/perl5/5.42/core_perl \
+  -Dsitelib=/usr/lib/perl5/5.42/site_perl \
+  -Dsitearch=/usr/lib/perl5/5.42/site_perl \
+  -Dvendorlib=/usr/lib/perl5/5.42/vendor_perl \
+  -Dvendorarch=/usr/lib/perl5/5.42/vendor_perl \
+  -Dman1dir=/usr/share/man/man1 \
+  -Dman3dir=/usr/share/man/man3 \
+  -Dpager="/usr/bin/less -isR" \
+  -Duseshrplib \
+  -Dusethreads
 
-# Alguns builders podem ler isso para saber que não é ./configure padrão.
-# Se o teu build.sh for inteligente, ele detecta 'Configure' sozinho; esse
-# flag é só uma dica opcional.
-export ADM_BUILD_PERL_SPECIAL=1
+make
+make install
 
-# Deixar flags padrão razoáveis
-export CFLAGS="${CFLAGS:--O2 -pipe}"
-export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
-
-# PATH dentro do chroot já deve estar OK; só garantimos /usr/bin
-case ":$PATH:" in
-    *":${ADM_INSTALL_ROOT}/usr/bin:"*) ;;
-    *) export PATH="${ADM_INSTALL_ROOT}/usr/bin:${PATH}" ;;
-esac
+# Não deixa o build.sh tentar rodar configure/make de novo
+export ADM_BUILD_SKIP_DEFAULT=1
