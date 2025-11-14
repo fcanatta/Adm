@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # hook: pre_build para binutils-pass2
-# Objetivo:
-#   - Rebuild de binutils, agora ligado contra glibc no sysroot
+# Usa o sysroot de ${ADM_CROSS_ROOT} com libc já instalada (glibc ou musl).
 
 set -eu
 
@@ -15,12 +14,17 @@ set -eu
 mkdir -p "$ADM_BUILD_BUILD_DIR"
 
 export ADM_BUILD_PREFIX="${ADM_CROSS_ROOT}"
+
 export ADM_BUILD_CONFIGURE_EXTRA="
   --target=${ADM_TARGET}
+  --prefix=${ADM_CROSS_ROOT}
   --with-sysroot=${ADM_CROSS_ROOT}
   --with-lib-path=${ADM_CROSS_ROOT}/lib
   --disable-nls
   --enable-gold
   --enable-ld=default
 "
+
 export PATH="${ADM_CROSS_ROOT}/bin:${PATH}"
+export CFLAGS="${CFLAGS:--O2 -pipe}"
+export CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
