@@ -1,0 +1,16 @@
+name=gnu-freefont
+version=1.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU FreeFont – família de fontes livres (FreeSerif, FreeSans, FreeMono)
+homepage=https://www.gnu.org/software/freefont/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
