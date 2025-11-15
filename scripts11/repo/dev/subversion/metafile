@@ -1,0 +1,16 @@
+name=subversion
+version=1.14.2
+category=dev
+
+build_deps=dev/gcc,dev/apr,dev/apr-util
+run_deps=dev/apr,dev/apr-util
+opt_deps=
+
+num_builds=0
+
+description=Subversion – sistema de controle de versão
+homepage=https://subversion.apache.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.apache.org/subversion/subversion-1.14.2.tar.bz2
+sha256sums=
