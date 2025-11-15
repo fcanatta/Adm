@@ -1,0 +1,16 @@
+name=libXft
+version=2.3.8
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11,x11/libXrender,libs/freetype
+run_deps=x11/libX11,x11/libXrender,libs/freetype
+opt_deps=x11/fontconfig
+
+num_builds=0
+
+description=libXft – renderização de fontes anti-aliased via Xft
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXft-2.3.8.tar.xz
+sha256sums=
