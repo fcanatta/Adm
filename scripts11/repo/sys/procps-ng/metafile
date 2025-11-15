@@ -1,0 +1,16 @@
+name=procps-ng
+version=4.0.4
+category=sys
+
+build_deps=dev/gcc,libs/ncurses
+run_deps=libs/ncurses
+opt_deps=
+
+num_builds=0
+
+description=procps-ng – utilitários como ps, top, vmstat
+homepage=https://gitlab.com/procps-ng/procps
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceforge.net/projects/procps-ng/files/procps-ng-4.0.4.tar.xz
+sha256sums=
