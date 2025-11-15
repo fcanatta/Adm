@@ -1,0 +1,16 @@
+name=udev
+version=256
+category=sys
+
+build_deps=dev/gcc,libs/libcap,libs/libffi,libs/zlib
+run_deps=libs/libcap
+opt_deps=
+
+num_builds=0
+
+description=systemd-udev – gerenciamento de dispositivos
+homepage=https://systemd.io/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/systemd/systemd/archive/refs/tags/v256.tar.gz
+sha256sums=
