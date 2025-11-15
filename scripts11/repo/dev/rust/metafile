@@ -1,0 +1,16 @@
+name=rust
+version=1.78.0
+category=dev
+
+build_deps=dev/gcc,dev/python,libs/openssl,libs/zlib,dev/cmake,dev/ninja
+run_deps=
+opt_deps=dev/cargo
+
+num_builds=0
+
+description=Rust – compilador e toolchain da linguagem Rust
+homepage=https://www.rust-lang.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://static.rust-lang.org/dist/rustc-1.78.0-src.tar.gz
+sha256sums=
