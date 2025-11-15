@@ -1,0 +1,16 @@
+name=libcap
+version=2.70
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Libcap – POSIX capabilities para processos
+homepage=https://sites.google.com/site/fullycapable/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.70.tar.xz
+sha256sums=
