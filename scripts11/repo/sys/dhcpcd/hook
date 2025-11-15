@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Hook avançado para sys/dhcpcd
+# - Controla configure/make/make install
+# - Cria /etc/dhcpcd.conf básico se não existir
+# - Pensado para ser neutro (sem sobrescrever configs do usuário)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_dc() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_dc)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_dc)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_dc)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+dc_jobs() { nproc 2>/dev/null || echo 1; }
+
+dc_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+dc_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "sys/dhcpcd: instalar diretamente em '/' requer root."
+  fi
+}
+
+dc_detect_srctree() {
+  if [ -n "${ADM_DHCPCD_SRCDIR:-}" ] && [ -f "$ADM_DHCPCD_SRCDIR/configure" -o -f "$ADM_DHCPCD_SRCDIR/Makefile" ]; then
+    printf '%s\n' "$ADM_DHCPCD_SRCDIR"; return 0
+  fi
+  if [ -f "configure" -o -f "Makefile" ] && [ -f "src/dhcpcd.c" ] 2>/dev/null; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/dhcpcd-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" -o -f "$d/Makefile" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "sys/dhcpcd: não foi possível detectar diretório de fonte."
+}
+
+dc_init_config() {
+  local root="$1"
+  local etc="$root/etc"
+  local conf="$etc/dhcpcd.conf"
+
+  mkdir -p "$etc"
+
+  if [ -f "$conf" ]; then
+    local backup="${conf}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "sys/dhcpcd: '$conf' já existe; backup em '$backup'."
+    cp -f "$conf" "$backup"
+    return 0
+  fi
+
+  adm_info "sys/dhcpcd: criando dhcpcd.conf padrão."
+  cat >"$conf" <<'EOF'
+# dhcpcd.conf gerado pelo ADM
+# Ajuste interfaces conforme sua máquina.
+
+hostname
+clientid
+persistent
+option rapid_commit
+option domain_name_servers, domain_name, domain_search, host_name
+option classless_static_routes
+option interface_mtu
+
+# Exemplo: use DHCP para todas as interfaces:
+interface *
+
+# Ou configure especificamente:
+# interface eth0
+#   static ip_address=192.168.1.10/24
+#   static routers=192.168.1.1
+#   static domain_name_servers=1.1.1.1 8.8.8.8
+EOF
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "sys/dhcpcd: build padrão desativado; usando hook."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(dc_detect_srctree)"
+  jobs="$(dc_jobs)"
+
+  adm_info "sys/dhcpcd: src=$src jobs=$jobs"
+
+  if [ -f "$src/configure" ]; then
+    (
+      cd "$src"
+      ./configure --prefix=/usr --sysconfdir=/etc
+      make -j"$jobs"
+    )
+  else
+    (
+      cd "$src"
+      make -j"$jobs"
+    )
+  fi
+}
+
+adm_hook_install() {
+  local src root
+  src="$(dc_detect_srctree)"
+  root="$(dc_install_root)"
+
+  dc_require_root_if_needed "$root"
+
+  adm_info "sys/dhcpcd: instalando em '$root'..."
+  (
+    cd "$src"
+    make install DESTDIR="$root"
+  )
+
+  dc_init_config "$root"
+
+  adm_info "sys/dhcpcd: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "sys/dhcpcd: post-install – habilite o serviço de dhcpcd no seu init (sysvinit, runit ou systemd)."
+}
