@@ -1,0 +1,16 @@
+name=xcb-proto
+version=1.17.0
+category=x11
+
+build_deps=dev/python
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=xcb-proto – descrições XML dos protocolos XCB
+homepage=https://xcb.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://xcb.freedesktop.org/dist/xcb-proto-1.17.0.tar.xz
+sha256sums=
