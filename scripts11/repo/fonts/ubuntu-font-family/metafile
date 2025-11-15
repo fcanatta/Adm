@@ -1,0 +1,16 @@
+name=ubuntu-font-family
+version=0.83
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ubuntu Font Family – fontes oficiais do Ubuntu (Ubuntu, Ubuntu Mono, etc.)
+homepage=https://design.ubuntu.com/font/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
