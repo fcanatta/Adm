@@ -1,0 +1,16 @@
+name=rsync
+version=3.3.0
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=rsync – sincronização de arquivos rápida e incremental
+homepage=https://rsync.samba.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.samba.org/pub/rsync/src/rsync-3.3.0.tar.gz
+sha256sums=
