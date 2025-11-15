@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# Hook avançado para apps/man-db
+# - configure/make/make install
+# - atualiza cache de manpages (mandb) quando for seguro
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_mdb() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_mdb)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_mdb)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_mdb)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+mdb_jobs() { nproc 2>/dev/null || echo 1; }
+
+mdb_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+mdb_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "apps/man-db: instalar em '/' requer root."
+  fi
+}
+
+mdb_detect_srctree() {
+  if [ -n "${ADM_MANDB_SRCDIR:-}" ] && [ -f "$ADM_MANDB_SRCDIR/configure" ]; then
+    printf '%s\n' "$ADM_MANDB_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ] && [ -d "src" ] && [ -d "man" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/man-db-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ] && [ -d "$d/src" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "apps/man-db: não encontrei diretório de fonte."
+}
+
+mdb_maybe_update_cache() {
+  local root="$1"
+
+  # só atualiza cache quando root real e usuário root
+  if [ "$root" != "/" ]; then
+    adm_info "apps/man-db: root='$root' (não é '/'); não atualizando cache mandb."
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_warn "apps/man-db: não é root; não executando mandb."
+    return 0
+  fi
+  if [ "${ADM_MANDB_UPDATE:-1}" = "0" ]; then
+    adm_info "apps/man-db: ADM_MANDB_UPDATE=0; cache não será atualizado."
+    return 0
+  fi
+  if ! command -v mandb >/dev/null 2>&1; then
+    adm_warn "apps/man-db: mandb não encontrado no PATH; pulando atualização de cache."
+    return 0
+  fi
+
+  adm_info "apps/man-db: atualizando cache de manpages (mandb -q)..."
+  mandb -q || adm_warn "apps/man-db: mandb retornou erro (ignorado)."
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "apps/man-db: build padrão desativado; usando hook."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(mdb_detect_srctree)"
+  jobs="$(mdb_jobs)"
+
+  adm_info "apps/man-db: src=$src jobs=$jobs"
+
+  (
+    cd "$src"
+    ./configure \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --localstatedir=/var \
+      --disable-setuid
+    make -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(mdb_detect_srctree)"
+  root="$(mdb_install_root)"
+
+  mdb_require_root_if_needed "$root"
+
+  adm_info "apps/man-db: instalando em '$root'..."
+  (
+    cd "$src"
+    make install DESTDIR="$root"
+  )
+
+  mdb_maybe_update_cache "$root"
+
+  adm_info "apps/man-db: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "apps/man-db: post-install – verifique MANPATH e permissões de /var/cache/man se necessário."
+}
