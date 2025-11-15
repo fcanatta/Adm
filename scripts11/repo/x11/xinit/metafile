@@ -1,0 +1,16 @@
+name=xinit
+version=1.4.2
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11
+run_deps=x11/libX11
+opt_deps=x11/xterm
+
+num_builds=0
+
+description=xinit – inicializador de sessão X (startx, xinit)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/app/xinit-1.4.2.tar.xz
+sha256sums=
