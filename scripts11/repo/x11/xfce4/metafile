@@ -1,0 +1,23 @@
+name=xfce4
+version=4.18.0
+category=x11
+
+build_deps=
+run_deps=\
+x11/xfwm4,\
+x11/xfce4-panel,\
+x11/xfce4-session,\
+x11/xfdesktop,\
+x11/thunar,\
+x11/xfce4-settings
+
+opt_deps=apps/network-manager-applet,apps/xfce4-terminal
+
+num_builds=0
+
+description=XFCE4 – ambiente gráfico leve completo (meta-pacote)
+homepage=https://xfce.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
