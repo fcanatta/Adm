@@ -1,0 +1,16 @@
+name=libpipeline
+version=1.5.7
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libpipeline – abstração de pipelines
+homepage=https://libpipeline.nongnu.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.nongnu.org/releases/libpipeline/libpipeline-1.5.7.tar.gz
+sha256sums=
