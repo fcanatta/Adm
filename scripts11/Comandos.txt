@@ -1,0 +1,3 @@
+# Para baixar as fontes reais e gerar sha256sums corretos, se você quiser preencher automaticamente.
+40-update-manager.sh update-meta-token apps/bash
+
