@@ -1,0 +1,16 @@
+name=sshfs
+version=3.7.3
+category=apps
+
+build_deps=dev/gcc,sys/fuse,apps/ssh
+run_deps=sys/fuse,apps/ssh
+opt_deps=
+
+num_builds=0
+
+description=SSHFS – monta sistemas de arquivos via SSH
+homepage=https://github.com/libfuse/sshfs
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/libfuse/sshfs/releases/download/sshfs-3.7.3/sshfs-3.7.3.tar.xz
+sha256sums=
