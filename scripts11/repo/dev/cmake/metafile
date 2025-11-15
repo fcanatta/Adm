@@ -1,0 +1,16 @@
+name=cmake
+version=3.29.0
+category=dev
+
+build_deps=dev/gcc,dev/python
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=CMake – sistema de build multi-plataforma
+homepage=https://cmake.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/Kitware/CMake/releases/download/v3.29.0/cmake-3.29.0.tar.gz
+sha256sums=
