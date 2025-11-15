@@ -1,0 +1,16 @@
+name=xfce4-panel
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=x11/xfwm4
+opt_deps=apps/network-manager-applet
+
+num_builds=0
+
+description=xfce4-panel – painel principal do XFCE
+homepage=https://docs.xfce.org/xfce/xfce4-panel/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfce4-panel/1.0/xfce4-panel-1.0.0.tar.bz2
+sha256sums=
