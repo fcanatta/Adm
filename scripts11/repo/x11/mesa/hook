@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Hook avançado para x11/mesa
+# - Build via meson+ninja com perfis de otimização configuráveis
+# - Respeita ADM_MESA_BUILD_TYPE, ADM_MESA_USE_NATIVE, ADM_MESA_EXTRA_CFLAGS
+# - Permite ajustar gallium-drivers e vulkan-drivers via env
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ms() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ms)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ms)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ms)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+ms_jobs() { nproc 2>/dev/null || echo 1; }
+
+ms_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+ms_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "x11/mesa: instalar diretamente em '/' requer root."
+  fi
+}
+
+ms_detect_srctree() {
+  if [ -n "${ADM_MESA_SRCDIR:-}" ] && [ -f "$ADM_MESA_SRCDIR/meson.build" ]; then
+    printf '%s\n' "$ADM_MESA_SRCDIR"; return 0
+  fi
+  if [ -f "meson.build" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/mesa-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/meson.build" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "x11/mesa: não foi possível detectar diretório de fonte."
+}
+
+ms_buildtype() {
+  case "${ADM_MESA_BUILD_TYPE:-release}" in
+    release|debug|debugoptimized)
+      printf '%s\n' "$ADM_MESA_BUILD_TYPE"
+      ;;
+    *)
+      adm_warn "x11/mesa: ADM_MESA_BUILD_TYPE inválido, usando 'release'."
+      printf 'release\n'
+      ;;
+  esac
+}
+
+ms_cflags() {
+  local cflags="-O2"
+  # ativa -march=native só se explicitamente pedido (evita ferrar cross-build)
+  if [ "${ADM_MESA_USE_NATIVE:-0}" = "1" ]; then
+    cflags="$cflags -march=native"
+  fi
+  if [ -n "${ADM_MESA_EXTRA_CFLAGS:-}" ]; then
+    cflags="$cflags ${ADM_MESA_EXTRA_CFLAGS}"
+  fi
+  printf '%s\n' "$cflags"
+}
+
+ms_gallium_drivers() {
+  if [ -n "${ADM_MESA_GALLIUM_DRIVERS:-}" ]; then
+    printf '%s\n' "$ADM_MESA_GALLIUM_DRIVERS"
+  else
+    # conjunto razoável de drivers gallium
+    printf 'r300,r600,radeonsi,nouveau,svga,swrast\n'
+  fi
+}
+
+ms_vk_drivers() {
+  if [ -n "${ADM_MESA_VK_DRIVERS:-}" ]; then
+    printf '%s\n' "$ADM_MESA_VK_DRIVERS"
+  else
+    # conjunto moderado
+    printf 'intel,amd\n'
+  fi
+}
+
+ms_use_llvm() {
+  # se LLVM estiver instalado, podemos ativar
+  if command -v llvm-config >/dev/null 2>&1; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "x11/mesa: build padrão desativado; usando hook customizado."
+}
+
+adm_hook_build() {
+  local src jobs bt gallium vk llvm_flag cflags
+  src="$(ms_detect_srctree)"
+  jobs="$(ms_jobs)"
+  bt="$(ms_buildtype)"
+  gallium="$(ms_gallium_drivers)"
+  vk="$(ms_vk_drivers)"
+  llvm_flag="$(ms_use_llvm)"
+  cflags="$(ms_cflags)"
+
+  adm_info "x11/mesa: src=$src jobs=$jobs buildtype=$bt gallium=$gallium vk=$vk llvm=$llvm_flag"
+  adm_info "x11/mesa: CFLAGS='${cflags}'"
+
+  if ! command -v meson >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+    adm_die "x11/mesa: meson/ninja não encontrados; instale dev/meson e dev/ninja antes."
+  fi
+
+  (
+    cd "$src"
+    rm -rf build
+    CFLAGS="$cflags" meson setup build \
+      --prefix=/usr \
+      --buildtype="$bt" \
+      -Dgallium-drivers="$gallium" \
+      -Dvulkan-drivers="$vk" \
+      -Dllvm="$llvm_flag" \
+      -Dshared-llvm="$llvm_flag" \
+      -Dplatforms=x11,drm,wayland \
+      -Degl=enabled \
+      -Dglx=dri \
+      -Dgles1=disabled \
+      -Dgles2=enabled
+
+    ninja -C build -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(ms_detect_srctree)"
+  root="$(ms_install_root)"
+
+  ms_require_root_if_needed "$root"
+
+  adm_info "x11/mesa: instalando em '$root'..."
+  (
+    cd "$src/build"
+    DESTDIR="$root" ninja install
+  )
+
+  adm_info "x11/mesa: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "x11/mesa: post-install – verifique se os drivers Gallium/Vulkan desejados foram habilitados (ADM_MESA_GALLIUM_DRIVERS / ADM_MESA_VK_DRIVERS)."
+}
