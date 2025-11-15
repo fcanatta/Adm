@@ -1,0 +1,16 @@
+name=libXrender
+version=0.9.11
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11
+run_deps=x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=libXrender – suporte à extensão Render do X11
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXrender-0.9.11.tar.xz
+sha256sums=
