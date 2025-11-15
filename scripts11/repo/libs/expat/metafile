@@ -1,0 +1,16 @@
+name=expat
+version=2.6.2
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Expat – biblioteca de parser XML baseada em eventos
+homepage=https://libexpat.github.io/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.xz
+sha256sums=
