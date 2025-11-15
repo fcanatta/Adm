@@ -1,0 +1,16 @@
+name=btrfs-progs
+version=6.9
+category=sys
+
+build_deps=dev/gcc,libs/zstd,libs/lz4
+run_deps=libs/zstd,libs/lz4
+opt_deps=
+
+num_builds=0
+
+description=btrfs-progs – ferramentas para o sistema de arquivos Btrfs
+homepage=https://btrfs.wiki.kernel.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://mirrors.edge.kernel.org/pub/linux/kernel/people/kdave/btrfs-progs/btrfs-progs-6.9.tar.xz
+sha256sums=
