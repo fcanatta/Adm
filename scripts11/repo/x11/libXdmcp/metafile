@@ -1,0 +1,16 @@
+name=libXdmcp
+version=1.1.5
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libXdmcp – biblioteca de suporte ao protocolo XDMCP
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXdmcp-1.1.5.tar.xz
+sha256sums=
