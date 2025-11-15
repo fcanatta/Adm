@@ -1,0 +1,16 @@
+name=kbd
+version=2.6.4
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=KBD – keymaps e consoletools
+homepage=https://kbd-project.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://kbd-project.org/download/kbd-2.6.4.tar.xz
+sha256sums=
