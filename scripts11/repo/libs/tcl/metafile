@@ -1,0 +1,16 @@
+name=tcl
+version=8.6.14
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Tcl – linguagem de script para automação
+homepage=https://www.tcl-lang.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/tcl/tcl8.6.14-src.tar.gz
+sha256sums=
