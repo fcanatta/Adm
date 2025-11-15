@@ -62,4 +62,7 @@ adm install sys/cross-toolchain-pass2
 # Quando pronto:
 adm install sys/base-system
 
-
+# Variáveis para instalar xf86-input-libinput
+ADM_LIBINPUT_TAP_DEFAULT=1            # 1 = tap-to-click ligado
+ADM_LIBINPUT_NATURAL_SCROLL=1         # 1 = rolagem natural
+ADM_LIBINPUT_DISABLE_WHILE_TYPING=1   # 1 = desativar touchpad enquanto digita
