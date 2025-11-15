@@ -1,0 +1,16 @@
+name=zlib
+version=1.3.1
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Zlib – biblioteca de compressão DEFLATE
+homepage=https://zlib.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://zlib.net/zlib-1.3.1.tar.xz
+sha256sums=
