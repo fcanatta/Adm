@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Hook avançado para x11/xorg-server
+# - Controla configure/make/make install
+# - Cria /etc/X11/xorg.conf.d com configs básicas (teclado + libinput)
+# - Não sobrescreve configs existentes sem backup
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_xs() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_xs)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_xs)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_xs)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+xs_jobs() { nproc 2>/dev/null || echo 1; }
+
+xs_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+xs_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "x11/xorg-server: instalar diretamente em '/' requer root."
+  fi
+}
+
+xs_detect_srctree() {
+  if [ -n "${ADM_XORG_SERVER_SRCDIR:-}" ] && [ -f "$ADM_XORG_SERVER_SRCDIR/configure" ]; then
+    printf '%s\n' "$ADM_XORG_SERVER_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ] && [ -d "hw" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/xorg-server-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ] && [ -d "$d/hw" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "x11/xorg-server: não foi possível detectar diretório de fonte."
+}
+
+xs_backup_if_exists() {
+  local path="$1"
+  if [ -f "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "x11/xorg-server: '$path' já existe; backup em '$backup'."
+    cp -f "$path" "$backup"
+  fi
+}
+
+xs_init_xorg_conf_d() {
+  local root="$1"
+  local etc="$root/etc"
+  local xdir="$etc/X11/xorg.conf.d"
+
+  mkdir -p "$xdir"
+
+  local kb="$xdir/00-keyboard.conf"
+  if [ ! -f "$kb" ]; then
+    adm_info "x11/xorg-server: criando '$kb' (configuração básica de teclado)."
+    cat >"$kb" <<'EOF'
+Section "InputClass"
+    Identifier "system-keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "us"
+    # Ajuste para "br" ou outro layout conforme necessidade
+    # Option "XkbLayout" "br"
+EndSection
+EOF
+  else
+    xs_backup_if_exists "$kb"
+  fi
+
+  local li="$xdir/40-libinput.conf"
+  if [ ! -f "$li" ]; then
+    adm_info "x11/xorg-server: criando '$li' (driver libinput para teclado/mouse/touchpad)."
+    cat >"$li" <<'EOF'
+Section "InputClass"
+    Identifier "libinput pointer catchall"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput keyboard catchall"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput touchpad catchall"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+EOF
+  else
+    xs_backup_if_exists "$li"
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "x11/xorg-server: build padrão desativado; usando hook customizado."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(xs_detect_srctree)"
+  jobs="$(xs_jobs)"
+
+  adm_info "x11/xorg-server: src=$src jobs=$jobs"
+
+  (
+    cd "$src"
+    ./configure \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --localstatedir=/var \
+      --disable-static
+    make -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(xs_detect_srctree)"
+  root="$(xs_install_root)"
+
+  xs_require_root_if_needed "$root"
+
+  adm_info "x11/xorg-server: instalando em '$root'..."
+  (
+    cd "$src"
+    make install DESTDIR="$root"
+  )
+
+  xs_init_xorg_conf_d "$root"
+
+  adm_info "x11/xorg-server: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "x11/xorg-server: post-install – ajuste layouts de teclado e drivers conforme sua máquina."
+}
