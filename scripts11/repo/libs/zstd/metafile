@@ -1,0 +1,16 @@
+name=zstd
+version=1.5.6
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Zstandard – compressão rápida e eficiente
+homepage=https://facebook.github.io/zstd/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/facebook/zstd/archive/refs/tags/v1.5.6.tar.gz
+sha256sums=
