@@ -1,0 +1,16 @@
+name=lua
+version=5.4.6
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Lua – linguagem de script leve
+homepage=https://www.lua.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.lua.org/ftp/lua-5.4.6.tar.gz
+sha256sums=
