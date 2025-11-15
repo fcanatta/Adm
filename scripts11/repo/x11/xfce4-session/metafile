@@ -1,0 +1,16 @@
+name=xfce4-session
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=x11/xfwm4,x11/xfce4-panel
+opt_deps=sys/elogind,sys/dbus
+
+num_builds=0
+
+description=xfce4-session – gerenciador de sessão do XFCE
+homepage=https://docs.xfce.org/xfce/xfce4-session/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfce4-session/1.0/xfce4-session-1.0.0.tar.bz2
+sha256sums=
