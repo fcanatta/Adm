@@ -1,0 +1,16 @@
+name=network-manager-applet
+version=1.36.0
+category=apps
+
+build_deps=dev/gcc,sys/networkmanager
+run_deps=sys/networkmanager
+opt_deps=
+
+num_builds=0
+
+description=network-manager-applet – applet de bandeja para NetworkManager (GTK)
+homepage=https://wiki.gnome.org/Projects/NetworkManager
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/network-manager-applet/1.36/network-manager-applet-1.36.0.tar.xz
+sha256sums=
