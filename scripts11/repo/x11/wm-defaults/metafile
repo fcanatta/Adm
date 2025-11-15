@@ -1,0 +1,16 @@
+name=wm-defaults
+version=1.0.0
+category=x11
+
+build_deps=
+run_deps=
+opt_deps=x11/i3,x11/openbox,x11/bspwm,x11/dwm,x11/dk,x11/qtile,x11/spectrwm,x11/awesome,x11/xfce4-session,x11/twm,x11/cwm
+
+num_builds=0
+
+description=Configurações padrão de WM: /etc/skel, .xinitrc, /usr/share/xsessions e tema XFCE base
+homepage=https://example.local/adm
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
