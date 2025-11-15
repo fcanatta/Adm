@@ -43,3 +43,33 @@ ADM_GRUB_INSTALL_BOOTLOADER=1 ADM_GRUB_DEVICE=/dev/sda adm install sys/grub
 
 # Comando para instalar cross-toolchain
 adm install sys/cross-toolchain-pass1 --root=/usr/src/adm/cross-toolchain
+
+# Já dentro do chroot seguro:
+adm install sys/cross-toolchain-pass2
+
+# já dentro do chroot, libc instalada (glibc OU musl):
+adm install sys/base-system
+
+# Fluxo geral sugerido (bem resumido)
+
+1. Fora do chroot (host):
+
+adm install sys/cross-toolchain-pass1 --root=/usr/src/adm/cross-toolchain
+
+
+2. Cria rootfs, entra no chroot, constrói PASS2:
+
+# dentro do chroot
+adm install sys/cross-toolchain-pass2
+
+
+3. Constrói adicionais temporary tools e depois a base:
+
+(se quiser, você pode ter temp-tools-stage1 / temp-tools-stage2 como já geramos antes)
+
+Quando pronto:
+
+
+adm install sys/base-system
+
+
