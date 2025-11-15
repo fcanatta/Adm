@@ -1,0 +1,18 @@
+name=linux-firmware
+version=20240513
+category=sys
+
+# Só precisa de ferramenta de descompressão e copiar arquivos
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Conjunto oficial de firmwares para o kernel Linux (Wi-Fi, GPU, microcodes etc.)
+homepage=https://git.kernel.org/?p=linux/kernel/git/firmware/linux-firmware.git
+maintainer=ADM System <adm@example.local>
+
+# Ajuste a versão/URL conforme o snapshot que você escolher
+sources=https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/snapshot/linux-firmware-20240513.tar.gz
+sha256sums=
