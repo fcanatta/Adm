@@ -1,0 +1,16 @@
+name=dosfstools
+version=4.2
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=dosfstools – mkfs.fat e fsck.fat (FAT/FAT32)
+homepage=https://github.com/dosfstools/dosfstools
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/dosfstools/dosfstools/releases/download/v4.2/dosfstools-4.2.tar.gz
+sha256sums=
