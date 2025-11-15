@@ -1,0 +1,16 @@
+name=libtool
+version=2.4.7
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU libtool – suporte a bibliotecas compartilhadas portáveis
+homepage=https://www.gnu.org/software/libtool/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/libtool/libtool-2.4.7.tar.xz
+sha256sums=
