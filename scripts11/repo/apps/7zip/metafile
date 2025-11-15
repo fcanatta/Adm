@@ -1,0 +1,16 @@
+name=7zip
+version=23.01
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=7-Zip – compactador de arquivos de alta taxa
+homepage=https://www.7-zip.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.7-zip.org/a/7z2301-linux.tar.xz
+sha256sums=
