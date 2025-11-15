@@ -1,0 +1,16 @@
+name=libxcrypt
+version=4.4.36
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libxcrypt – biblioteca moderna de criptografia de senhas
+homepage=https://github.com/besser82/libxcrypt
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/besser82/libxcrypt/releases/download/v4.4.36/libxcrypt-4.4.36.tar.xz
+sha256sums=
