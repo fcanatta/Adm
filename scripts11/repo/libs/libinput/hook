@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Hook avançado para libs/libinput
+# - Build via meson+ninja
+# - Instalação respeitando ADM_INSTALL_ROOT/DESTDIR
+# - Tunagem opcional global de libinput para Xorg:
+#   * /etc/X11/xorg.conf.d/35-libinput-global-tuning.conf
+#   * controlado por ADM_LIBINPUT_TUNING e outras variáveis ADM_LIBINPUT_*
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_li() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_li)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_li)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_li)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+li_jobs() { nproc 2>/dev/null || echo 1; }
+
+li_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+li_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "libs/libinput: instalar diretamente em '/' requer root."
+  fi
+}
+
+li_detect_srctree() {
+  if [ -n "${ADM_LIBINPUT_SRCDIR:-}" ] && [ -f "$ADM_LIBINPUT_SRCDIR/meson.build" ]; then
+    printf '%s\n' "$ADM_LIBINPUT_SRCDIR"; return 0
+  fi
+  if [ -f "meson.build" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/libinput-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/meson.build" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "libs/libinput: não foi possível detectar diretório de fonte (meson.build)."
+}
+
+li_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "libs/libinput: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+li_write_xorg_tuning() {
+  local root="$1"
+
+  if [ "${ADM_LIBINPUT_TUNING:-1}" = "0" ]; then
+    adm_info "libs/libinput: ADM_LIBINPUT_TUNING=0; não gerando tunagem Xorg."
+    return 0
+  fi
+
+  local xdir="$root/etc/X11/xorg.conf.d"
+  local conf="$xdir/35-libinput-global-tuning.conf"
+
+  mkdir -p "$xdir"
+  li_backup_if_exists "$conf"
+
+  local tap="${ADM_LIBINPUT_TAP_DEFAULT:-1}"
+  local nat="${ADM_LIBINPUT_NATURAL_SCROLL:-1}"
+  local dwt="${ADM_LIBINPUT_DISABLE_WHILE_TYPING:-1}"
+  local prof="${ADM_LIBINPUT_ACCEL_PROFILE:-adaptive}"
+  local speed="${ADM_LIBINPUT_ACCEL_SPEED:-0.0}"
+
+  adm_info "libs/libinput: criando '$conf' (tap=$tap, natural=$nat, dwt=$dwt, profile=$prof, speed=$speed)."
+
+  cat >"$conf" <<EOF
+Section "InputClass"
+    Identifier "libinput global pointer defaults"
+    MatchIsPointer "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+    Option "AccelProfile" "${prof}"
+    Option "AccelSpeed"   "${speed}"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput global keyboard defaults"
+    MatchIsKeyboard "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+EndSection
+
+Section "InputClass"
+    Identifier "libinput global touchpad defaults"
+    MatchIsTouchpad "on"
+    MatchDevicePath "/dev/input/event*"
+    Driver "libinput"
+    Option "Tapping"            "${tap}"
+    Option "NaturalScrolling"   "${nat}"
+    Option "DisableWhileTyping" "${dwt}"
+EndSection
+EOF
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "libs/libinput: build padrão desativado; usando hook customizado (meson+ninja)."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(li_detect_srctree)"
+  jobs="$(li_jobs)"
+
+  adm_info "libs/libinput: src=$src jobs=$jobs"
+
+  if ! command -v meson >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+    adm_die "libs/libinput: meson/ninja não encontrados; instale dev/meson e dev/ninja."
+  fi
+
+  (
+    cd "$src"
+    rm -rf build
+    meson setup build \
+      --prefix=/usr \
+      --buildtype=release \
+      -Dudev=true \
+      -Ddebug-gui=false
+
+    ninja -C build -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(li_detect_srctree)"
+  root="$(li_install_root)"
+
+  li_require_root_if_needed "$root"
+
+  adm_info "libs/libinput: instalando em '$root'..."
+  (
+    cd "$src/build"
+    DESTDIR="$root" ninja install
+  )
+
+  li_write_xorg_tuning "$root"
+
+  adm_info "libs/libinput: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "libs/libinput: post-install – se necessário, ajuste 35-libinput-global-tuning.conf para a sua máquina."
+}
