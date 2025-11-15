@@ -1,0 +1,16 @@
+name=libXrandr
+version=1.5.4
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11
+run_deps=x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=libXrandr – biblioteca da extensão RandR do X11 (resize/rotate)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXrandr-1.5.4.tar.xz
+sha256sums=
