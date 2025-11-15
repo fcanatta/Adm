@@ -1,0 +1,16 @@
+name=xf86-video-intel
+version=2.99.917
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/xorg-server,x11/mesa
+run_deps=x11/xorg-server,x11/mesa
+opt_deps=
+
+num_builds=0
+
+description=xf86-video-intel – driver para GPUs Intel (Xorg)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/driver/xf86-video-intel-2.99.917.tar.xz
+sha256sums=
