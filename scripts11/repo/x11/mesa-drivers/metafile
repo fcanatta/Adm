@@ -1,0 +1,23 @@
+name=mesa-drivers
+version=1.0.0
+category=x11
+
+build_deps=
+run_deps=\
+x11/mesa,\
+x11/xf86-video-vesa,\
+x11/xf86-video-fbdev,\
+x11/xf86-video-nouveau,\
+x11/xf86-video-intel,\
+x11/xf86-video-amdgpu
+
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote Mesa + drivers de vídeo (VESA, fbdev, Intel, AMD, Nouveau) para Xorg
+homepage=https://www.mesa3d.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
