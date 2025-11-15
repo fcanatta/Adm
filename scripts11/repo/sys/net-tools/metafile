@@ -1,0 +1,16 @@
+name=net-tools
+version=2.10
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=net-tools – ifconfig, route, netstat e outros utilitários de rede clássicos
+homepage=http://net-tools.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/project/net-tools/net-tools-2.10.tar.xz
+sha256sums=
