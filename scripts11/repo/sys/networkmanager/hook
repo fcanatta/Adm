@@ -1,0 +1,317 @@
+#!/usr/bin/env bash
+# Hook inteligente para sys/networkmanager
+# - Build via meson+ninja (ou autotools como fallback)
+# - Cria /etc/NetworkManager/NetworkManager.conf inicial
+# - Integra com systemd, runit, sysvinit habilitando o serviço
+# - Integra com wpa_supplicant (assume controle do Wi-Fi)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_nm() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_nm)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_nm)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_nm)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+nm_jobs() { nproc 2>/dev/null || echo 1; }
+
+nm_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+nm_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "sys/networkmanager: instalar diretamente em '/' requer root."
+  fi
+}
+
+nm_detect_srctree() {
+  if [ -n "${ADM_NM_SRCDIR:-}" ] && { [ -f "$ADM_NM_SRCDIR/meson.build" ] || [ -f "$ADM_NM_SRCDIR/configure" ]; }; then
+    printf '%s\n' "$ADM_NM_SRCDIR"; return 0
+  fi
+  if [ -f "meson.build" ] || [ -f "configure" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/NetworkManager-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/meson.build" ] || [ -f "$d/configure" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "sys/networkmanager: não foi possível detectar diretório de fonte."
+}
+
+nm_detect_init_system() {
+  if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1; then
+    printf 'systemd\n'; return 0
+  fi
+  if [ -d /etc/runit ] || [ -d /run/runit ] || command -v runit >/dev/null 2>&1; then
+    printf 'runit\n'; return 0
+  fi
+  if [ -f /etc/inittab ] || [ -d /etc/rc.d ] || [ -d /etc/init.d ]; then
+    printf 'sysvinit\n'; return 0
+  fi
+  printf 'unknown\n'
+}
+
+# -------------------------------------------------------------
+# Configuração inicial NetworkManager
+# -------------------------------------------------------------
+nm_init_config() {
+  local root="$1"
+  local etc="$root/etc"
+  local nmdir="$etc/NetworkManager"
+  local conf="$nmdir/NetworkManager.conf"
+
+  mkdir -p "$nmdir/conf.d" "$root/var/lib/NetworkManager"
+
+  if [ -f "$conf" ]; then
+    local backup="${conf}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "sys/networkmanager: '$conf' já existe; backup em '$backup'."
+    cp -f "$conf" "$backup"
+    return 0
+  fi
+
+  adm_info "sys/networkmanager: criando NetworkManager.conf padrão em '$conf'."
+  cat >"$conf" <<'EOF'
+[main]
+plugins=keyfile
+dns=auto
+
+[ifupdown]
+managed=true
+
+[logging]
+level=WARN
+domains=ALL
+
+# Ajuste conforme sua política de rede.
+EOF
+}
+
+# -------------------------------------------------------------
+# Integração com init systems
+# -------------------------------------------------------------
+nm_enable_systemd_service() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    adm_warn "sys/networkmanager: systemctl não encontrado; não posso habilitar serviço systemd."
+    return 1
+  fi
+
+  local unit="NetworkManager.service"
+  if systemctl list-unit-files | grep -q "^${unit}"; then
+    adm_info "sys/networkmanager: habilitando unidade systemd '$unit'."
+    systemctl enable "$unit" || adm_warn "sys/networkmanager: falha ao habilitar '$unit'."
+    systemctl daemon-reload || true
+  else
+    adm_warn "sys/networkmanager: '$unit' não encontrado; ajuste manualmente."
+  fi
+}
+
+nm_setup_runit_service() {
+  local root="$1"
+  local svdir=/etc/sv
+  local servicedir=/service
+  local svc="$svdir/NetworkManager"
+
+  mkdir -p "$root$svdir" "$root$servicedir"
+
+  if [ ! -d "$root$svc" ]; then
+    adm_info "sys/networkmanager: criando serviço runit em '$root$svc'."
+    mkdir -p "$root$svc"
+    cat >"$root$svc/run" <<'EOF'
+#!/bin/sh
+# Serviço runit para NetworkManager
+exec NetworkManager --no-daemon
+EOF
+    chmod +x "$root$svc/run"
+  fi
+
+  if [ -d "$root$servicedir" ] && [ ! -e "$root$servicedir/NetworkManager" ]; then
+    adm_info "sys/networkmanager: habilitando serviço runit (link em /service)."
+    ln -s "$svc" "$root$servicedir/NetworkManager"
+  fi
+}
+
+nm_setup_sysvinit_service() {
+  local root="$1"
+  local initd="$root/etc/init.d"
+  local script="$initd/NetworkManager"
+
+  mkdir -p "$initd"
+
+  if [ ! -f "$script" ]; then
+    adm_info "sys/networkmanager: criando script SysVinit em '$script'."
+    cat >"$script" <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          NetworkManager
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     3 4 5
+# Default-Stop:      0 1 2 6
+# Short-Description: NetworkManager service
+### END INIT INFO
+
+DAEMON=/usr/sbin/NetworkManager
+PIDFILE=/run/NetworkManager/NetworkManager.pid
+
+case "$1" in
+  start)
+    echo "Starting NetworkManager..."
+    start-stop-daemon --start --quiet --pidfile "$PIDFILE" --exec "$DAEMON" -- --no-daemon --pid-file="$PIDFILE" &
+    ;;
+  stop)
+    echo "Stopping NetworkManager..."
+    start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --retry 5
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  status)
+    if [ -f "$PIDFILE" ]; then
+      echo "NetworkManager is running (pid $(cat "$PIDFILE"))."
+    else
+      echo "NetworkManager is not running."
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|reload|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+EOF
+    chmod +x "$script"
+  fi
+
+  local rc
+  for rc in "$root"/etc/rc?.d "$root"/etc/rc.d/rc?.d; do
+    [ -d "$rc" ] || continue
+    case "$rc" in
+      *rc3.d|*rc4.d|*rc5.d)
+        if [ ! -e "$rc/S20NetworkManager" ]; then
+          ln -s ../init.d/NetworkManager "$rc/S20NetworkManager"
+        fi
+        ;;
+    esac
+  done
+}
+
+nm_enable_service_auto() {
+  local root="$1"
+
+  if [ "$root" != "/" ]; then
+    adm_info "sys/networkmanager: root='$root' (não é '/'); não habilitando serviços automaticamente."
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_warn "sys/networkmanager: não é root; não habilitando serviços automaticamente."
+    return 0
+  fi
+  if [ "${ADM_AUTO_ENABLE_SERVICES:-1}" = "0" ]; then
+    adm_info "sys/networkmanager: ADM_AUTO_ENABLE_SERVICES=0; serviços não serão habilitados automaticamente."
+    return 0
+  fi
+
+  local init_sys
+  init_sys="$(nm_detect_init_system)"
+  adm_info "sys/networkmanager: init system detectado: $init_sys"
+
+  case "$init_sys" in
+    systemd)
+      nm_enable_systemd_service
+      ;;
+    runit)
+      nm_setup_runit_service "$root"
+      ;;
+    sysvinit)
+      nm_setup_sysvinit_service "$root"
+      ;;
+    *)
+      adm_warn "sys/networkmanager: init system desconhecido; configure o serviço manualmente."
+      ;;
+  esac
+}
+
+# -------------------------------------------------------------
+# Hooks (build-engine)
+# -------------------------------------------------------------
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "sys/networkmanager: build padrão desativado; usando hook customizado."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(nm_detect_srctree)"
+  jobs="$(nm_jobs)"
+
+  adm_info "sys/networkmanager: src=$src jobs=$jobs"
+
+  if command -v meson >/dev/null 2>&1; then
+    adm_info "sys/networkmanager: usando meson+ninja."
+    (
+      cd "$src"
+      meson setup build \
+        --prefix=/usr \
+        --sysconfdir=/etc \
+        --localstatedir=/var
+      ninja -C build -j"$jobs"
+    )
+  else
+    adm_info "sys/networkmanager: meson não encontrado; tentando autotools."
+    (
+      cd "$src"
+      ./configure \
+        --prefix=/usr \
+        --sysconfdir=/etc \
+        --localstatedir=/var
+      make -j"$jobs"
+    )
+  fi
+}
+
+adm_hook_install() {
+  local src root
+  src="$(nm_detect_srctree)"
+  root="$(nm_install_root)"
+
+  nm_require_root_if_needed "$root"
+
+  adm_info "sys/networkmanager: instalando em '$root'..."
+
+  if [ -d "$src/build" ]; then
+    (
+      cd "$src/build"
+      DESTDIR="$root" ninja install
+    )
+  else
+    (
+      cd "$src"
+      make install DESTDIR="$root"
+    )
+  fi
+
+  nm_init_config "$root"
+  nm_enable_service_auto "$root"
+
+  adm_info "sys/networkmanager: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "sys/networkmanager: post-install – configure conexões (nmcli/nmtui) e verifique integração com wpa_supplicant."
+}
