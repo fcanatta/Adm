@@ -1,0 +1,16 @@
+name=xorgproto
+version=2024.1
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Conjunto de cabeçalhos de protocolo do Xorg (X11, Xext, RandR etc.)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/proto/xorgproto-2024.1.tar.xz
+sha256sums=
