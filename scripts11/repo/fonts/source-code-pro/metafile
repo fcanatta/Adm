@@ -1,0 +1,16 @@
+name=source-code-pro
+version=2.038
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Source Code Pro – fonte monoespaçada da Adobe para programação
+homepage=https://github.com/adobe-fonts/source-code-pro
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
