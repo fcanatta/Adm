@@ -1,0 +1,16 @@
+name=libXau
+version=1.0.11
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libXau – biblioteca de autenticação simples para X11
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXau-1.0.11.tar.xz
+sha256sums=
