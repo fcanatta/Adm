@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Hook global para fonts/font-defaults
+# - Não compila nada: apenas configura Fontconfig no sistema alvo.
+# - Cria:
+#   * /etc/fonts/local.conf             (global)
+#   * /etc/skel/.config/fontconfig/fonts.conf (por-usuário padrão)
+#   * diretórios /etc/skel/.config/fontconfig
+# - Define:
+#   * fonte padrão "sans-serif"
+#   * fonte padrão "monospace"
+#   * fallback chain para várias famílias
+#   * ligaduras lig/clig para fontes monospace de programação
+#
+# Variáveis opcionais:
+#   ADM_FONT_SANS_DEFAULT      -> família principal para "sans-serif" (ex: "DejaVu Sans")
+#   ADM_FONT_MONO_DEFAULT      -> família principal para "monospace"  (ex: "JetBrains Mono")
+#   ADM_FONT_ENABLE_LIGATURES  -> 1 (default) para habilitar ligaduras; 0 para desabilitar
+#
+# Obs: o hook respeita ADM_INSTALL_ROOT/DESTDIR e só exige root quando root="/".
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Logging mínimo (caso 01-log-ui.sh não esteja carregado)
+# ---------------------------------------------------------------------------
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_fonts() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_fonts)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_fonts)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_fonts)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+font_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+font_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "fonts/font-defaults: instalar diretamente em '/' requer root."
+  fi
+}
+
+font_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "fonts/font-defaults: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Definição de defaults e fallback via Fontconfig
+# ---------------------------------------------------------------------------
+font_sans_default() {
+  if [ -n "${ADM_FONT_SANS_DEFAULT:-}" ]; then
+    printf '%s\n' "$ADM_FONT_SANS_DEFAULT"
+  else
+    # Escolha segura e comum
+    printf 'DejaVu Sans\n'
+  fi
+}
+
+font_mono_default() {
+  if [ -n "${ADM_FONT_MONO_DEFAULT:-}" ]; then
+    printf '%s\n' "$ADM_FONT_MONO_DEFAULT"
+  else
+    # Preferência: JetBrains Mono -> Fira Code -> Iosevka -> DejaVu Sans Mono
+    printf 'JetBrains Mono\n'
+  fi
+}
+
+font_enable_ligatures() {
+  if [ "${ADM_FONT_ENABLE_LIGATURES:-1}" = "0" ]; then
+    printf 'false\n'
+  else
+    printf 'true\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Conteúdo do local.conf (global)
+# ---------------------------------------------------------------------------
+font_write_local_conf() {
+  local root="$1"
+  local etc_fonts="$root/etc/fonts"
+  local local_conf="$etc_fonts/local.conf"
+
+  mkdir -p "$etc_fonts"
+
+  font_backup_if_exists "$local_conf"
+
+  local sans mono lig
+  sans="$(font_sans_default)"
+  mono="$(font_mono_default)"
+  lig="$(font_enable_ligatures)"
+
+  adm_info "fonts/font-defaults: gerando $local_conf (sans='$sans', mono='$mono', ligatures=$lig)."
+
+  cat >"$local_conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+
+  <!-- Família padrão SANS-SERIF -->
+  <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>${sans}</family>
+      <family>Roboto</family>
+      <family>Ubuntu</family>
+      <family>Noto Sans</family>
+      <family>DejaVu Sans</family>
+      <family>Liberation Sans</family>
+    </prefer>
+  </alias>
+
+  <!-- Família padrão MONOSPACE -->
+  <alias>
+    <family>monospace</family>
+    <prefer>
+      <family>${mono}</family>
+      <family>JetBrains Mono</family>
+      <family>Fira Code</family>
+      <family>Hack Nerd Font</family>
+      <family>Source Code Pro</family>
+      <family>Iosevka</family>
+      <family>DejaVu Sans Mono</family>
+      <family>Ubuntu Mono</family>
+      <family>Roboto Mono</family>
+    </prefer>
+  </alias>
+
+  <!-- Fallback geral para serif -->
+  <alias>
+    <family>serif</family>
+    <prefer>
+      <family>DejaVu Serif</family>
+      <family>Noto Serif</family>
+      <family>Liberation Serif</family>
+      <family>FreeSerif</family>
+    </prefer>
+  </alias>
+
+  <!-- Fallback para UI: caso fonte não exista, use sans-serif -->
+  <match target="pattern">
+    <test name="family" qual="any">
+      <string>UI</string>
+    </test>
+    <edit name="family" mode="append">
+      <string>sans-serif</string>
+    </edit>
+  </match>
+
+EOF
+
+  # Ligaduras: aplica para fontes de programação, se habilitado
+  if [ "$lig" = "true" ]; then
+    cat >>"$local_conf" <<'EOF'
+  <!-- Habilitar ligaduras para fontes de programação -->
+  <match target="pattern">
+    <test name="family" qual="any">
+      <string>JetBrains Mono</string>
+      <string>Fira Code</string>
+      <string>Iosevka</string>
+      <string>Source Code Pro</string>
+      <string>Hack</string>
+      <string>Hack Nerd Font</string>
+      <string>Roboto Mono</string>
+    </test>
+    <edit name="fontfeatures" mode="append">
+      <string>liga 1</string>
+      <string>clig 1</string>
+    </edit>
+  </match>
+EOF
+  fi
+
+  # Fecha fontconfig
+  cat >>"$local_conf" <<'EOF'
+
+</fontconfig>
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Conteúdo do fonts.conf em /etc/skel/.config/fontconfig
+# (por-usuário, mas alinhado com local.conf)
+# ---------------------------------------------------------------------------
+font_write_skel_fonts_conf() {
+  local root="$1"
+  local skel="$root/etc/skel"
+  local cfgdir="$skel/.config/fontconfig"
+  local fonts_conf="$cfgdir/fonts.conf"
+
+  mkdir -p "$cfgdir"
+
+  font_backup_if_exists "$fonts_conf"
+
+  local sans mono lig
+  sans="$(font_sans_default)"
+  mono="$(font_mono_default)"
+  lig="$(font_enable_ligatures)"
+
+  adm_info "fonts/font-defaults: gerando $fonts_conf (sans='$sans', mono='$mono', ligatures=$lig)."
+
+  cat >"$fonts_conf" <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+
+  <!-- Preferências por-usuário (espelho do local.conf) -->
+  <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>${sans}</family>
+      <family>Roboto</family>
+      <family>Ubuntu</family>
+      <family>Noto Sans</family>
+      <family>DejaVu Sans</family>
+      <family>Liberation Sans</family>
+    </prefer>
+  </alias>
+
+  <alias>
+    <family>monospace</family>
+    <prefer>
+      <family>${mono}</family>
+      <family>JetBrains Mono</family>
+      <family>Fira Code</family>
+      <family>Hack Nerd Font</family>
+      <family>Source Code Pro</family>
+      <family>Iosevka</family>
+      <family>DejaVu Sans Mono</family>
+      <family>Ubuntu Mono</family>
+      <family>Roboto Mono</family>
+    </prefer>
+  </alias>
+
+EOF
+
+  if [ "$lig" = "true" ]; then
+    cat >>"$fonts_conf" <<'EOF'
+  <match target="pattern">
+    <test name="family" qual="any">
+      <string>JetBrains Mono</string>
+      <string>Fira Code</string>
+      <string>Iosevka</string>
+      <string>Source Code Pro</string>
+      <string>Hack</string>
+      <string>Hack Nerd Font</string>
+      <string>Roboto Mono</string>
+    </test>
+    <edit name="fontfeatures" mode="append">
+      <string>liga 1</string>
+      <string>clig 1</string>
+    </edit>
+  </match>
+EOF
+  fi
+
+  cat >>"$fonts_conf" <<'EOF'
+
+</fontconfig>
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Hooks do ADM
+# ---------------------------------------------------------------------------
+adm_hook_pre_build() {
+  # Pacote puramente de configuração global de fontes
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "fonts/font-defaults: não há build; apenas configuração de Fontconfig."
+}
+
+adm_hook_build() {
+  # nada a compilar
+  :
+}
+
+adm_hook_install() {
+  local root
+  root="$(font_root)"
+
+  font_require_root_if_needed "$root"
+
+  adm_info "fonts/font-defaults: configurando fontes em root='$root'."
+
+  font_write_local_conf "$root"
+  font_write_skel_fonts_conf "$root"
+
+  adm_info "fonts/font-defaults: configuração concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "fonts/font-defaults: post-install – novos usuários herdarão fonts.conf via /etc/skel; rode 'fc-cache -f' se necessário."
+}
