@@ -1,0 +1,16 @@
+name=alsa-utils
+version=1.2.11
+category=apps
+
+build_deps=dev/gcc,libs/alsa-lib,libs/ncurses
+run_deps=libs/alsa-lib,libs/ncurses
+opt_deps=
+
+num_builds=0
+
+description=ALSA utils – alsamixer, aplay, arecord e outras ferramentas de som
+homepage=https://www.alsa-project.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.alsa-project.org/files/pub/utils/alsa-utils-1.2.11.tar.bz2
+sha256sums=
