@@ -1,0 +1,16 @@
+name=elogind
+version=255.4.1
+category=sys
+
+build_deps=dev/gcc,sys/dbus,libs/libcap
+run_deps=sys/dbus,libs/libcap
+opt_deps=
+
+num_builds=0
+
+description=elogind – gerenciador de sessões/logind para sistemas sem systemd
+homepage=https://github.com/elogind/elogind
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/elogind/elogind/archive/refs/tags/v255.4.1.tar.gz
+sha256sums=
