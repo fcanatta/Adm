@@ -62,7 +62,29 @@ adm install sys/cross-toolchain-pass2
 # Quando pronto:
 adm install sys/base-system
 
+# Você pode editar:
+/usr/src/adm/profiles/aggressive.profile
+/usr/src/adm/profiles/normal.profile
+/usr/src/adm/profiles/minimal.profile
+/usr/src/adm/profiles/custom.profile
+
+# Depois, sempre que você fizer:
+adm profile aggressive Ou: adm build x11/mesa
+
+# Todas essas otimizações já estarão ativas automaticamente.
 # Variáveis para instalar xf86-input-libinput
-ADM_LIBINPUT_TAP_DEFAULT=1            # 1 = tap-to-click ligado
-ADM_LIBINPUT_NATURAL_SCROLL=1         # 1 = rolagem natural
-ADM_LIBINPUT_DISABLE_WHILE_TYPING=1   # 1 = desativar touchpad enquanto digita
+
+# otimizações Mesa
+export ADM_MESA_USE_NATIVE=1
+export ADM_MESA_BUILD_TYPE=release
+export ADM_MESA_GALLIUM_DRIVERS="radeonsi,nouveau,swrast"
+export ADM_MESA_VK_DRIVERS="intel,amd"
+
+# otimizações Intel
+export ADM_INTEL_TEARFREE=1
+export ADM_INTEL_ACCEL_METHOD=sna
+
+# libinput tuning
+export ADM_LIBINPUT_TAP_DEFAULT=1
+export ADM_LIBINPUT_NATURAL_SCROLL=1
+export ADM_LIBINPUT_DISABLE_WHILE_TYPING=1
