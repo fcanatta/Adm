@@ -1,0 +1,16 @@
+name=intltool
+version=0.51.0
+category=dev
+
+build_deps=dev/perl
+run_deps=dev/perl
+opt_deps=
+
+num_builds=0
+
+description=Intltool – ferramentas para internacionalização de arquivos .desktop, .xml etc.
+homepage=https://launchpad.net/intltool
+maintainer=ADM System <adm@example.local>
+
+sources=https://launchpad.net/intltool/trunk/0.51.0/+download/intltool-0.51.0.tar.gz
+sha256sums=
