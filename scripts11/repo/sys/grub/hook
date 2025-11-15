@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Hook avançado para sys/grub
-# - Controla configure/make/make install
-# - Instala em root custom
-# - Opcionalmente roda grub-install + grub-mkconfig se autorizado por env
+# Hook avançado para sys/grub com suporte a microcode Intel/AMD
+# - Controla configure/make/make install do GRUB
+# - Instala em root custom (ADM_INSTALL_ROOT/DESTDIR)
+# - Opcionalmente roda grub-install + grub-mkconfig
+# - Integra intel-ucode.img / amd-ucode.img via /etc/grub.d/06_adm_microcode
 
 set -euo pipefail
 IFS=$'\n\t'
 
+# -------------------------------------------------------------
+# Logging mínimo caso 01-log-ui.sh não esteja carregado
+# -------------------------------------------------------------
 if ! declare -F adm_info >/dev/null 2>&1; then
   _ts_g() { date +"%Y-%m-%d %H:%M:%S"; }
   adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_g)" "$*" >&2; }
@@ -14,6 +18,10 @@ if ! declare -F adm_info >/dev/null 2>&1; then
   adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_g)" "$*" >&2; }
   adm_die()   { adm_error "$*"; exit 1; }
 fi
+
+# -------------------------------------------------------------
+# Helpers genéricos
+# -------------------------------------------------------------
 
 grub_jobs() { nproc 2>/dev/null || echo 1; }
 
@@ -31,6 +39,15 @@ grub_require_root_if_needed() {
   local root="$1"
   if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
     adm_die "sys/grub: instalar diretamente em '/' requer root."
+  fi
+}
+
+grub_boot_dir() {
+  local root="$1"
+  if [ -n "${ADM_BOOT_DIR:-}" ]; then
+    printf '%s\n' "$root${ADM_BOOT_DIR}"
+  else
+    printf '%s\n' "$root/boot"
   fi
 }
 
@@ -52,40 +69,127 @@ grub_detect_srctree() {
 }
 
 grub_configure_flags() {
-  local plat="${ADM_GRUB_PLATFORM:-pc}"   # pc, efi etc.
+  local plat="${ADM_GRUB_PLATFORM:-pc}"   # pc, efi, etc.
   local extra="${ADM_GRUB_CONFIGURE_FLAGS:-}"
   printf -- '--prefix=/usr --sysconfdir=/etc --sbindir=/usr/sbin --with-platform=%s %s\n' "$plat" "$extra"
+}
+
+# -------------------------------------------------------------
+# Integração com microcode Intel/AMD
+# -------------------------------------------------------------
+
+grub_setup_microcode_snippet() {
+  local root="$1"
+  local bootdir etcdir snippet
+
+  # pode desativar integração via env
+  if [ "${ADM_GRUB_ENABLE_MICROCODE:-1}" = "0" ]; then
+    adm_info "sys/grub: ADM_GRUB_ENABLE_MICROCODE=0; não criando snippet de microcode."
+    return 0
+  fi
+
+  # só faz sentido em root real e como root
+  if [ "$root" != "/" ]; then
+    adm_info "sys/grub: root='$root' (não é '/'); não configurando microcode no GRUB agora."
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_warn "sys/grub: não é root; não será criado snippet de microcode."
+    return 0
+  fi
+
+  bootdir="$(grub_boot_dir "$root")"
+  etcdir="$root/etc"
+  snippet="$etcdir/grub.d/06_adm_microcode"
+
+  mkdir -p "$etcdir/grub.d"
+
+  # Apenas cria se não existir; se já existe, não sobrescreve
+  if [ -f "$snippet" ]; then
+    adm_info "sys/grub: snippet de microcode '$snippet' já existe, não alterando."
+    return 0
+  fi
+
+  adm_info "sys/grub: criando snippet de microcode em '$snippet'."
+
+  cat >"$snippet" <<'EOF'
+#!/bin/sh
+# 06_adm_microcode – integra microcode Intel/AMD nas entradas do GRUB
+# Este script é executado pelo grub-mkconfig.
+# Ele assume que variáveis como $initrd já foram definidas pelos outros scripts.
+
+# Fechar stdin (bom hábito em scripts do grub.d)
+exec 0</dev/null
+
+MICROCODE_IMAGES=""
+
+if [ -f /boot/intel-ucode.img ]; then
+    MICROCODE_IMAGES="$MICROCODE_IMAGES /boot/intel-ucode.img"
+fi
+
+if [ -f /boot/amd-ucode.img ]; then
+    MICROCODE_IMAGES="$MICROCODE_IMAGES /boot/amd-ucode.img"
+fi
+
+# Se não houver microcode, não faz nada
+if [ -z "$MICROCODE_IMAGES" ]; then
+    exit 0
+fi
+
+# A ideia é: se $initrd já tiver sido definido por outro script (p.ex. 10_linux),
+# nós o reescrevemos para colocar o microcode antes.
+if [ "x${initrd}" != "x" ]; then
+    initrd="${MICROCODE_IMAGES} ${initrd}"
+fi
+
+# Nada é impresso aqui diretamente; outros scripts usam $initrd
+# quando geram as linhas 'initrd' finais.
+EOF
+
+  chmod +x "$snippet"
+
+  adm_info "sys/grub: snippet de microcode criado. grub-mkconfig irá usar /boot/intel-ucode.img e /boot/amd-ucode.img automaticamente se existirem."
 }
 
 grub_maybe_install_bootloader() {
   local root="$1"
   local dev="${ADM_GRUB_DEVICE:-/dev/sda}"
 
-  # só se tudo for explícito
+  # Apenas se explicitamente autorizado
   if [ "${ADM_GRUB_INSTALL_BOOTLOADER:-0}" != "1" ]; then
-    adm_info "sys/grub: ADM_GRUB_INSTALL_BOOTLOADER!=1, não executando grub-install."
+    adm_info "sys/grub: ADM_GRUB_INSTALL_BOOTLOADER!=1; não executando grub-install nem configurando microcode."
     return 0
   fi
   if [ "$root" != "/" ]; then
-    adm_warn "sys/grub: root='$root' (não é '/'), não vou instalar bootloader no disco."
+    adm_warn "sys/grub: root='$root' (não é '/'); não vou instalar bootloader em disco nem gerar grub.cfg."
     return 0
   fi
   if [ "$(id -u)" -ne 0 ]; then
-    adm_warn "sys/grub: não é root, não vou rodar grub-install."
+    adm_warn "sys/grub: não é root; não vou rodar grub-install nem grub-mkconfig."
     return 0
   fi
 
+  # Instala bootloader
   adm_info "sys/grub: executando grub-install em '$dev'..."
   grub-install "$dev"
 
+  # Cria snippet de microcode antes de gerar grub.cfg
+  grub_setup_microcode_snippet "$root"
+
   local cfg=/boot/grub/grub.cfg
-  adm_info "sys/grub: gerando '$cfg'..."
+  adm_info "sys/grub: gerando '$cfg' com grub-mkconfig..."
   grub-mkconfig -o "$cfg"
+
+  adm_info "sys/grub: grub.cfg gerado. Se microcode .img existir, ele será carregado antes do initrd."
 }
+
+# -------------------------------------------------------------
+# Hooks chamados pelo build-engine
+# -------------------------------------------------------------
 
 adm_hook_pre_build() {
   export ADM_SKIP_DEFAULT_BUILD=1
-  adm_info "sys/grub: build padrão desativado; usando hook."
+  adm_info "sys/grub: build padrão desativado; usando hook customizado."
 }
 
 adm_hook_build() {
@@ -120,11 +224,12 @@ adm_hook_install() {
     make install DESTDIR="$root"
   )
 
+  # Integra bootloader + microcode (se autorizado)
   grub_maybe_install_bootloader "$root"
 
   adm_info "sys/grub: instalação concluída."
 }
 
 adm_hook_post_install() {
-  adm_info "sys/grub: post-install – verifique /boot/grub/grub.cfg e entradas do bootloader."
+  adm_info "sys/grub: post-install – verifique /boot, /etc/grub.d/06_adm_microcode e o grub.cfg conforme sua política."
 }
