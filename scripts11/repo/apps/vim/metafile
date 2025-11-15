@@ -1,0 +1,16 @@
+name=vim
+version=9.1.0000
+category=apps
+
+build_deps=dev/gcc,libs/ncurses
+run_deps=libs/ncurses
+opt_deps=
+
+num_builds=0
+
+description=Vim – editor avançado
+homepage=https://www.vim.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/vim/vim/archive/refs/tags/v9.1.0000.tar.gz
+sha256sums=
