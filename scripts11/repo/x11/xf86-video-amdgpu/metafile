@@ -1,0 +1,16 @@
+name=xf86-video-amdgpu
+version=23.0.0
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/xorg-server,x11/mesa
+run_deps=x11/xorg-server,x11/mesa
+opt_deps=
+
+num_builds=0
+
+description=xf86-video-amdgpu – driver para GPUs AMD modernas (Xorg)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/driver/xf86-video-amdgpu-23.0.0.tar.xz
+sha256sums=
