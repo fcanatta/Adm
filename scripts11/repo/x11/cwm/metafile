@@ -1,0 +1,16 @@
+name=cwm
+version=7.1
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/libX11,x11/libXft,x11/xorgproto
+run_deps=x11/xorg-server,x11/xinit,x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=cwm – calm window manager minimalista (port do OpenBSD)
+homepage=https://github.com/leahneukirchen/cwm
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/leahneukirchen/cwm/archive/refs/tags/v7.1.tar.gz
+sha256sums=
