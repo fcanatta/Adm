@@ -15,3 +15,12 @@ ADM_PROFILE=normal-system ADM_KERNEL_CONFIG_DIR=/usr/src/adm/kconfig adm install
 ADM_PROFILE=normal-system adm install sys/linux
 ADM_PROFILE=aggressive-system adm install sys/linux-liquorix
 
+# Instalar firmware completo
+adm install sys/linux-firmware
+
+# Em máquina Intel (com imagem de microcode):
+ADM_INTEL_UCODE_CREATE_IMAGE=1 adm install sys/intel-microcode
+
+# Em máquina AMD:
+ADM_AMD_UCODE_CREATE_IMAGE=1 adm install sys/amd-microcode
+
