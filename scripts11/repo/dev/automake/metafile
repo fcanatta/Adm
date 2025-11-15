@@ -1,0 +1,16 @@
+name=automake
+version=1.16.5
+category=dev
+
+build_deps=dev/autoconf
+run_deps=dev/autoconf
+opt_deps=
+
+num_builds=0
+
+description=GNU Automake – gera Makefiles portáveis
+homepage=https://www.gnu.org/software/automake/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.xz
+sha256sums=
