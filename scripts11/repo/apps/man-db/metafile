@@ -1,0 +1,16 @@
+name=man-db
+version=2.12.1
+category=apps
+
+build_deps=dev/gcc,libs/gdbm,libs/libpipeline
+run_deps=libs/gdbm,libs/libpipeline
+opt_deps=
+
+num_builds=0
+
+description=man-db – pager de manpages com caching
+homepage=https://www.nongnu.org/man-db/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.gnu.org/releases/man-db/man-db-2.12.1.tar.xz
+sha256sums=
