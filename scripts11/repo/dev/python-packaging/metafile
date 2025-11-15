@@ -1,0 +1,16 @@
+name=python-packaging
+version=24.0
+category=dev
+
+build_deps=dev/python
+run_deps=dev/python
+opt_deps=
+
+num_builds=0
+
+description=packaging – utilidades para versionamento e requisitos em Python
+homepage=https://github.com/pypa/packaging
+maintainer=ADM System <adm@example.local>
+
+sources=https://files.pythonhosted.org/packages/source/p/packaging/packaging-24.0.tar.gz
+sha256sums=
