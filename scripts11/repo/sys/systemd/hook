@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Hook avançado para sys/systemd
+# - Usa meson+ninja (sem build padrão)
+# - Instala em root custom
+# - Opcionalmente configura machine-id e default target
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_sd() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+sd_jobs() { nproc 2>/dev/null || echo 1; }
+
+sd_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+sd_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "sys/systemd: instalar diretamente em '/' requer root."
+  fi
+}
+
+sd_detect_srctree() {
+  if [ -n "${ADM_SYSTEMD_SRCDIR:-}" ] && [ -f "$ADM_SYSTEMD_SRCDIR/meson.build" ]; then
+    printf '%s\n' "$ADM_SYSTEMD_SRCDIR"; return 0
+  fi
+  if [ -f "meson.build" ] && [ -d "src/core" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/systemd-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/meson.build" ] && [ -d "$d/src/core" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "sys/systemd: não foi possível detectar diretório de fonte."
+}
+
+sd_build_dir() {
+  local src="$1"
+  printf '%s\n' "$src/build"
+}
+
+sd_meson_setup() {
+  local src="$1" build="$2" root="$3"
+  local extra="${ADM_SYSTEMD_MESON_FLAGS:-}"
+
+  mkdir -p "$build"
+  adm_info "sys/systemd: rodando meson setup..."
+
+  (
+    cd "$src"
+    meson setup "$build" \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --localstatedir=/var \
+      --libdir=/usr/lib \
+      --libexecdir=/usr/lib \
+      --buildtype=release \
+      -Ddefault-hierarchy=unified \
+      -Dsplit-usr=false \
+      -Dfirstboot=false \
+      -Dsysusers=false \
+      -Dhomed=false \
+      -Dnetworkd=true \
+      -Dtimesyncd=true \
+      $extra
+  )
+}
+
+sd_maybe_machine_id() {
+  local root="$1"
+  local etc="$root/etc"
+
+  [ "$root" = "/" ] || return 0
+  [ "$(id -u)" -eq 0 ] || return 0
+
+  mkdir -p "$etc"
+  if [ ! -s "$etc/machine-id" ] && command -v systemd-machine-id-setup >/dev/null 2>&1; then
+    adm_info "sys/systemd: gerando /etc/machine-id..."
+    systemd-machine-id-setup
+  fi
+}
+
+sd_maybe_default_target() {
+  local root="$1"
+  local target="${ADM_SYSTEMD_DEFAULT_TARGET:-multi-user.target}"
+  local dir="$root/etc/systemd/system"
+  local link="$dir/default.target"
+
+  [ "$root" = "/" ] || return 0
+  [ "$(id -u)" -eq 0 ] || return 0
+
+  mkdir -p "$dir"
+
+  if [ ! -e "$link" ]; then
+    adm_info "sys/systemd: configurando default.target -> $target"
+    ln -s "/usr/lib/systemd/system/$target" "$link" || adm_warn "sys/systemd: não foi possível criar symlink default.target."
+  else
+    adm_info "sys/systemd: default.target já existe, não alterando."
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "sys/systemd: build padrão desativado; usando meson+ninja."
+}
+
+adm_hook_build() {
+  local src root build jobs
+  src="$(sd_detect_srctree)"
+  root="$(sd_install_root)"
+  build="$(sd_build_dir "$src")"
+  jobs="$(sd_jobs)"
+
+  sd_require_root_if_needed "$root"
+
+  if [ ! -f "$build/build.ninja" ]; then
+    sd_meson_setup "$src" "$build" "$root"
+  else
+    adm_info "sys/systemd: build dir já configurado, reutilizando."
+  fi
+
+  adm_info "sys/systemd: compilando (ninja -C build)..."
+  (
+    cd "$build"
+    ninja -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root build
+  src="$(sd_detect_srctree)"
+  root="$(sd_install_root)"
+  build="$(sd_build_dir "$src")"
+
+  sd_require_root_if_needed "$root"
+
+  adm_info "sys/systemd: instalando em '$root'..."
+  (
+    cd "$build"
+    DESTDIR="$root" ninja install
+  )
+
+  sd_maybe_machine_id "$root"
+  sd_maybe_default_target "$root"
+
+  adm_info "sys/systemd: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "sys/systemd: post-install – ajuste serviços, fstab e bootloader para usar systemd como PID 1."
+}
