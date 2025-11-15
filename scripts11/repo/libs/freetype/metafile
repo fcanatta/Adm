@@ -1,0 +1,16 @@
+name=freetype
+version=2.13.2
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=FreeType – engine de fontes vetoriais (TrueType/OpenType)
+homepage=https://www.freetype.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.gnu.org/releases/freetype/freetype-2.13.2.tar.xz
+sha256sums=
