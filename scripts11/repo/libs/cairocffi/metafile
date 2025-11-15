@@ -1,0 +1,16 @@
+name=cairocffi
+version=1.7.0
+category=libs
+
+build_deps=dev/python,dev/python-modules,dev/python-modules-dependencies
+run_deps=dev/python
+opt_deps=
+
+num_builds=0
+
+description=cairocffi – binding Python para cairo, usado em Qtile e outros
+homepage=https://github.com/Kozea/cairocffi
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/Kozea/cairocffi/archive/refs/tags/v1.7.0.tar.gz
+sha256sums=
