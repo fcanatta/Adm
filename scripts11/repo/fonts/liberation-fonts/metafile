@@ -1,0 +1,16 @@
+name=liberation-fonts
+version=2.1.5
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Liberation Fonts – substitutos livres para Arial, Times New Roman e Courier New
+homepage=https://github.com/liberationfonts
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
