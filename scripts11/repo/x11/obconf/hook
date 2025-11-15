@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Hook avançado para x11/obconf
+# - Não interfere no build: só configuração para Openbox em /etc/skel
+# - Cria ~/.config/openbox/rc.xml padrão para novos usuários (se ainda não existir)
+# - Integra com obconf sem sobrescrever configs existentes
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ob() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ob)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ob)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ob)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+ob_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+ob_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "x11/obconf: instalar diretamente em '/' requer root."
+  fi
+}
+
+ob_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "x11/obconf: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+ob_theme() {
+  if [ -n "${ADM_OPENBOX_THEME:-}" ]; then
+    printf '%s\n' "$ADM_OPENBOX_THEME"
+  else
+    printf 'Clearlooks\n'
+  fi
+}
+
+ob_num_desktops() {
+  if [ -n "${ADM_OPENBOX_NUM_DESKTOPS:-}" ]; then
+    printf '%s\n' "$ADM_OPENBOX_NUM_DESKTOPS"
+  else
+    printf '4\n'
+  fi
+}
+
+ob_create_openbox_config() {
+  local root="$1"
+  local skel="$root/etc/skel"
+  local cfgdir="$skel/.config/openbox"
+  local rc="$cfgdir/rc.xml"
+
+  mkdir -p "$cfgdir"
+
+  if [ -f "$rc" ]; then
+    adm_info "x11/obconf: rc.xml já existe em /etc/skel; não sobrescrevendo."
+    return 0
+  fi
+
+  local theme desktops
+  theme="$(ob_theme)"
+  desktops="$(ob_num_desktops)"
+
+  adm_info "x11/obconf: criando rc.xml padrão (theme='$theme', desktops=$desktops) em '$rc'."
+
+  cat >"$rc" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <name>${theme}</name>
+    <titleLayout>NLIMC</titleLayout>
+    <keepBorder>yes</keepBorder>
+  </theme>
+
+  <desktops>
+    <number>${desktops}</number>
+    <firstdesk>1</firstdesk>
+  </desktops>
+
+  <mouse>
+    <dragThreshold>1</dragThreshold>
+    <doubleClickTime>200</doubleClickTime>
+  </mouse>
+
+  <keyboard>
+    <chainQuitKey>C-g</chainQuitKey>
+  </keyboard>
+
+  <keybind key="A-Return">
+    <action name="Execute">
+      <command>xterm</command>
+    </action>
+  </keybind>
+
+  <keybind key="A-F4">
+    <action name="Close"/>
+  </keybind>
+
+  <keybind key="A-Tab">
+    <action name="NextWindow"/>
+  </keybind>
+</openbox_config>
+EOF
+}
+
+adm_hook_pre_build() {
+  adm_info "x11/obconf: build padrão será usado; hook cuidará apenas da configuração de /etc/skel."
+}
+
+adm_hook_build() {
+  :
+}
+
+adm_hook_install() {
+  local root
+  root="$(ob_root)"
+  ob_require_root_if_needed "$root"
+
+  ob_create_openbox_config "$root"
+
+  adm_info "x11/obconf: instalação/configuração concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "x11/obconf: novos usuários terão um rc.xml inicial pronto para o Openbox."
+}
