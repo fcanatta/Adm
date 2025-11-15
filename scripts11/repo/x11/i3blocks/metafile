@@ -1,0 +1,16 @@
+name=i3blocks
+version=1.5
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=i3blocks – status bar modular para i3 baseado em blocos
+homepage=https://github.com/vivien/i3blocks
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/vivien/i3blocks/archive/refs/tags/1.5.tar.gz
+sha256sums=
