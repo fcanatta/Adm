@@ -3,7 +3,7 @@ version=1.0.0
 category=sys
 
 # Pacotes que precisam ser construídos para compor o stage1 de temporary tools
-build_deps=dev/m4,libs/ncurses,apps/bash,apps/coreutils,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz,binutils-pass2,gcc-pass2
+build_deps=dev/m4,libs/ncurses,apps/bash,apps/coreutils,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz,dev/binutils-pass2,dev/gcc-pass2
 
 run_deps=
 opt_deps=
