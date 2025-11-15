@@ -1,0 +1,16 @@
+name=wpa_supplicant
+version=2.10
+category=sys
+
+build_deps=dev/gcc,libs/openssl
+run_deps=libs/openssl
+opt_deps=sys/dbus
+
+num_builds=0
+
+description=wpa_supplicant – autenticação WPA/WPA2/WPA3 para redes Wi-Fi
+homepage=https://w1.fi/wpa_supplicant/
+maintainer=ADM System <adm@example.local>
+
+sources=https://w1.fi/releases/wpa_supplicant-2.10.tar.gz
+sha256sums=
