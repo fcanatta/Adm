@@ -1,0 +1,16 @@
+name=cargo
+version=1.78.0
+category=dev
+
+build_deps=dev/rust
+run_deps=dev/rust
+opt_deps=
+
+num_builds=0
+
+description=Cargo – gerenciador de pacotes e build do Rust (meta-pacote, usa distribuição do Rust)
+homepage=https://doc.rust-lang.org/cargo/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
