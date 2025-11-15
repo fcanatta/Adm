@@ -1,0 +1,26 @@
+name=xorg-meta
+version=1.0.0
+category=x11
+
+build_deps=
+run_deps=\
+x11/xorg-server,\
+x11/mesa,\
+x11/xinit,\
+x11/xkeyboard-config,\
+x11/fontconfig,\
+x11/libX11,\
+x11/libXext,\
+x11/libXrender,\
+x11/libXft
+
+opt_deps=apps/network-manager-applet
+
+num_builds=0
+
+description=Meta-pacote Xorg completo (servidor + libs básicas + utilitários) para ambiente gráfico
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
