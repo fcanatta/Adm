@@ -1,0 +1,16 @@
+name=networkmanager
+version=1.46.0
+category=sys
+
+build_deps=dev/gcc,sys/dbus,libs/openssl,dev/ninja,dev/meson,dev/cmake,dev/python
+run_deps=sys/dbus,libs/openssl
+opt_deps=sys/wpa_supplicant,sys/dhcpcd
+
+num_builds=0
+
+description=NetworkManager – gerenciador de rede dinâmico para desktops e servidores
+homepage=https://networkmanager.dev/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/NetworkManager/1.46/NetworkManager-1.46.0.tar.xz
+sha256sums=
