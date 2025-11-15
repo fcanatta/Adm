@@ -1,4 +1,18 @@
 name=temp-tools-stage1
+version=1.0.0
 category=sys
+
+# Pacotes que precisam ser construídos para compor o stage1 de temporary tools
+build_deps=dev/m4,libs/ncurses,apps/bash,apps/coreutils,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz,binutils-pass2,gcc-pass2
+
 run_deps=
-build_deps=dev/m4,libs/ncurses,apps/bash,apps/coreutils,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote ADM para Temporary Tools Stage 1 (fora do chroot)
+homepage=https://linuxfromscratch.org/
+maintainer=ADM System <adm@example.local>
+
+sha256sums=
+sources=
