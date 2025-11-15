@@ -1,0 +1,16 @@
+name=gdbm
+version=1.24
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GDBM – GNU Database Manager (banco de dados chave/valor)
+homepage=https://www.gnu.org/software/gdbm/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gdbm/gdbm-1.24.tar.gz
+sha256sums=
