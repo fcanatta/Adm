@@ -1,0 +1,16 @@
+name=jetbrains-mono
+version=2.304
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=JetBrains Mono – fonte monoespaçada otimizada para IDEs
+homepage=https://www.jetbrains.com/lp/mono/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
