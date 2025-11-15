@@ -7,4 +7,7 @@ adm install sys/cross-toolchain
 # Somente o stage1
 ADM_PROFILE=minimal-toolchain $ADM_SCRIPTS/20-toolchain-stage1.sh
 
+# Para instalar tudo de uma vez
+ADM_PROFILE=minimal-toolchain adm install sys/temp-tools-stage1
+
 
