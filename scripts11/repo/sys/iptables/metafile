@@ -1,0 +1,16 @@
+name=iptables
+version=1.8.10
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=iptables – ferramentas de firewall para netfilter
+homepage=https://www.netfilter.org/projects/iptables/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.netfilter.org/projects/iptables/files/iptables-1.8.10.tar.xz
+sha256sums=
