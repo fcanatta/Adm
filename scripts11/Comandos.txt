@@ -24,3 +24,20 @@ ADM_INTEL_UCODE_CREATE_IMAGE=1 adm install sys/intel-microcode
 # Em máquina AMD:
 ADM_AMD_UCODE_CREATE_IMAGE=1 adm install sys/amd-microcode
 
+# Passos pra instalar grub com firmware e microcodes
+adm install sys/linux-firmware
+
+# Intel:
+ADM_INTEL_UCODE_CREATE_IMAGE=1 adm install sys/intel-microcode
+
+# AMD:
+ADM_AMD_UCODE_CREATE_IMAGE=1 adm install sys/amd-microcode
+
+# Isso cria, por exemplo: /boot/intel-ucode.img ou /boot/amd-ucode.img
+
+# Depois instala e integra o GRUB:
+ADM_GRUB_INSTALL_BOOTLOADER=1 ADM_GRUB_DEVICE=/dev/sda adm install sys/grub
+
+# O hook vai: criar /etc/grub.d/06_adm_microcode; rodar grub-mkconfig já sabendo que tem aquelas imagens;
+
+
