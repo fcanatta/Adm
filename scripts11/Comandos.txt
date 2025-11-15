@@ -1,3 +1,10 @@
 # Para baixar as fontes reais e gerar sha256sums corretos, se você quiser preencher automaticamente.
 40-update-manager.sh update-meta-token apps/bash
 
+# Instalsr o cross-tollchain 
+adm install sys/cross-toolchain
+
+# Somente o stage1
+ADM_PROFILE=minimal-toolchain $ADM_SCRIPTS/20-toolchain-stage1.sh
+
+
