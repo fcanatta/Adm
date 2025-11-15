@@ -1,0 +1,16 @@
+name=man-pages
+version=6.10
+category=sys
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Manuais do sistema (POSIX e Linux)
+homepage=https://www.kernel.org/doc/man-pages/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/docs/man-pages/man-pages-6.10.tar.xz
+sha256sums=
