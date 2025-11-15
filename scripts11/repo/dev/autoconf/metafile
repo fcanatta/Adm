@@ -1,0 +1,16 @@
+name=autoconf
+version=2.72
+category=dev
+
+build_deps=dev/m4
+run_deps=dev/m4
+opt_deps=
+
+num_builds=0
+
+description=GNU Autoconf – gerador de scripts configure
+homepage=https://www.gnu.org/software/autoconf/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz
+sha256sums=
