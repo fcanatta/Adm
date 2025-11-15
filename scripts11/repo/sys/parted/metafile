@@ -1,0 +1,16 @@
+name=parted
+version=3.6
+category=sys
+
+build_deps=dev/gcc,libs/readline
+run_deps=libs/readline
+opt_deps=
+
+num_builds=0
+
+description=GNU Parted – particionador de discos
+homepage=https://www.gnu.org/software/parted/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/parted/parted-3.6.tar.xz
+sha256sums=
