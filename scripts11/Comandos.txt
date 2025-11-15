@@ -41,3 +41,5 @@ ADM_GRUB_INSTALL_BOOTLOADER=1 ADM_GRUB_DEVICE=/dev/sda adm install sys/grub
 # O hook vai: criar /etc/grub.d/06_adm_microcode; rodar grub-mkconfig já sabendo que tem aquelas imagens;
 
 
+# Comando para instalar cross-toolchain
+adm install sys/cross-toolchain-pass1 --root=/usr/src/adm/cross-toolchain
