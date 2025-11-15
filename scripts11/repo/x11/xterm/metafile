@@ -1,0 +1,16 @@
+name=xterm
+version=390
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/libX11,x11/libXft,x11/libXext,x11/xorgproto,libs/ncurses
+run_deps=x11/libX11,x11/libXft,x11/libXext,libs/ncurses
+opt_deps=x11/fontconfig
+
+num_builds=0
+
+description=xterm – terminal clássico para Xorg
+homepage=https://invisible-island.net/xterm/
+maintainer=ADM System <adm@example.local>
+
+sources=https://invisible-mirror.net/archives/xterm/xterm-390.tgz
+sha256sums=
