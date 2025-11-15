@@ -1,0 +1,16 @@
+name=e2fsprogs
+version=1.47.0
+category=sys
+
+build_deps=dev/gcc,libs/util-linux
+run_deps=libs/util-linux
+opt_deps=
+
+num_builds=0
+
+description=e2fsprogs – ferramentas para EXT2/3/4
+homepage=https://e2fsprogs.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v1.47.0/e2fsprogs-1.47.0.tar.xz
+sha256sums=
