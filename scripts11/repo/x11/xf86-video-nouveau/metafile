@@ -1,0 +1,16 @@
+name=xf86-video-nouveau
+version=1.0.17
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/xorg-server,x11/mesa
+run_deps=x11/xorg-server,x11/mesa
+opt_deps=
+
+num_builds=0
+
+description=xf86-video-nouveau – driver open source para GPUs NVIDIA
+homepage=https://nouveau.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/driver/xf86-video-nouveau-1.0.17.tar.xz
+sha256sums=
