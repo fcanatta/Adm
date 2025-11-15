@@ -1,0 +1,16 @@
+name=lynx
+version=2.9.0
+category=apps
+
+build_deps=dev/gcc,libs/ncurses
+run_deps=libs/ncurses
+opt_deps=
+
+num_builds=0
+
+description=Lynx – navegador web em modo texto clássico
+homepage=https://lynx.invisible-island.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://invisible-mirror.net/archives/lynx/tarballs/lynx2.9.0.tar.bz2
+sha256sums=
