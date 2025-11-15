@@ -1,0 +1,16 @@
+name=fontconfig
+version=2.15.0
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,libs/freetype,libs/expat,libs/zlib
+run_deps=libs/freetype,libs/expat,libs/zlib
+opt_deps=
+
+num_builds=0
+
+description=fontconfig – descoberta e configuração de fontes para X e outros
+homepage=https://www.freedesktop.org/wiki/Software/fontconfig/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.15.0.tar.xz
+sha256sums=
