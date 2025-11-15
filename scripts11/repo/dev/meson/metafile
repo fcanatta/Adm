@@ -1,0 +1,16 @@
+name=meson
+version=1.4.0
+category=dev
+
+build_deps=dev/python
+run_deps=dev/python
+opt_deps=dev/ninja
+
+num_builds=0
+
+description=Meson – sistema de build moderno, focado em velocidade e ergonomia
+homepage=https://mesonbuild.com/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/mesonbuild/meson/releases/download/1.4.0/meson-1.4.0.tar.gz
+sha256sums=
