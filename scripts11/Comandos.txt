@@ -97,3 +97,15 @@ export ADM_DEFAULT_WM=i3
 
 # E depois instalar
 adm install x11/wm-defaults
+
+# Fonte sans padrão = Noto Sans
+export ADM_FONT_SANS_DEFAULT="Noto Sans"
+
+# Fonte monospace padrão = JetBrains Mono
+export ADM_FONT_MONO_DEFAULT="JetBrains Mono"
+
+# Desligar ligaduras globalmente, se quiser
+# export ADM_FONT_ENABLE_LIGATURES=0
+
+# Instalar
+adm install fonts/font-defaults
