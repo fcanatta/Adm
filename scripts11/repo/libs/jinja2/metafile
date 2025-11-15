@@ -1,0 +1,16 @@
+name=jinja2
+version=3.1.3
+category=libs
+
+build_deps=dev/python,libs/markupsafe
+run_deps=dev/python,libs/markupsafe
+opt_deps=
+
+num_builds=0
+
+description=Jinja2 – template engine para Python
+homepage=https://palletsprojects.com/p/jinja/
+maintainer=ADM System <adm@example.local>
+
+sources=https://files.pythonhosted.org/packages/source/J/Jinja2/Jinja2-3.1.3.tar.gz
+sha256sums=
