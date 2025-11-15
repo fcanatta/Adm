@@ -1,0 +1,16 @@
+name=efibootmgr
+version=18
+category=sys
+
+build_deps=dev/gcc,sys/efivar
+run_deps=sys/efivar
+opt_deps=
+
+num_builds=0
+
+description=efibootmgr – gerencia entradas de boot EFI
+homepage=https://github.com/rhboot/efibootmgr
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/rhboot/efibootmgr/releases/download/18/efibootmgr-18.tar.bz2
+sha256sums=
