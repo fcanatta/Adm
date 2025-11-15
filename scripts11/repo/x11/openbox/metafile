@@ -1,0 +1,16 @@
+name=openbox
+version=3.6.1
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/libX11,x11/libXext,x11/libXrandr,x11/libXinerama,x11/libXcursor
+run_deps=x11/xorg-server,x11/xinit,x11/xterm,x11/libX11
+opt_deps=x11/obconf
+
+num_builds=0
+
+description=Openbox – window manager leve, altamente configurável
+homepage=https://openbox.org/
+maintainer=ADM System <adm@example.local>
+
+sources=http://openbox.org/dist/openbox/openbox-3.6.1.tar.gz
+sha256sums=
