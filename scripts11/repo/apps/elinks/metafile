@@ -1,0 +1,16 @@
+name=elinks
+version=0.16.1
+category=apps
+
+build_deps=dev/gcc,libs/openssl,libs/zlib
+run_deps=libs/openssl,libs/zlib
+opt_deps=
+
+num_builds=0
+
+description=ELinks – navegador web avançado em modo texto
+homepage=http://elinks.or.cz/
+maintainer=ADM System <adm@example.local>
+
+sources=http://elinks.or.cz/download/elinks-0.16.1.tar.bz2
+sha256sums=
