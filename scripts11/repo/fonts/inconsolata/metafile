@@ -1,0 +1,16 @@
+name=inconsolata
+version=1.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Inconsolata – fonte monoespaçada limpa para programação
+homepage=https://fonts.google.com/specimen/Inconsolata
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
