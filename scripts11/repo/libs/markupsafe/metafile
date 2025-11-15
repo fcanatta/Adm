@@ -1,0 +1,16 @@
+name=markupsafe
+version=2.1.5
+category=libs
+
+build_deps=dev/python
+run_deps=dev/python
+opt_deps=
+
+num_builds=0
+
+description=MarkupSafe – templates seguros para Python/Jinja
+homepage=https://palletsprojects.com/p/markupsafe/
+maintainer=ADM System <adm@example.local>
+
+sources=https://files.pythonhosted.org/packages/source/M/MarkupSafe/MarkupSafe-2.1.5.tar.gz
+sha256sums=
