@@ -88,3 +88,12 @@ export ADM_INTEL_ACCEL_METHOD=sna
 export ADM_LIBINPUT_TAP_DEFAULT=1
 export ADM_LIBINPUT_NATURAL_SCROLL=1
 export ADM_LIBINPUT_DISABLE_WHILE_TYPING=1
+
+# Instalar wm
+# Exemplo: padrão = xfce4
+export ADM_DEFAULT_WM=xfce4
+# ou:
+export ADM_DEFAULT_WM=i3
+
+# E depois instalar
+adm install x11/wm-defaults
