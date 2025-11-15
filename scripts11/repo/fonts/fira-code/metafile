@@ -1,0 +1,16 @@
+name=fira-code
+version=6.2
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Fira Code – fonte monoespaçada para programação com ligatures
+homepage=https://github.com/tonsky/FiraCode
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
