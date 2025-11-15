@@ -1,0 +1,16 @@
+name=perl-modules
+version=1.0.0
+category=dev
+
+build_deps=dev/perl
+run_deps=dev/perl
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote ADM para módulos Perl padrão
+homepage=https://www.perl.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
