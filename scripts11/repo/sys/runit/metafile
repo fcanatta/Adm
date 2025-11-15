@@ -1,0 +1,16 @@
+name=runit
+version=2.1.2
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Runit – sistema de inicialização simples e rápido
+homepage=http://smarden.org/runit/
+maintainer=ADM System <adm@example.local>
+
+sources=http://smarden.org/runit/runit-2.1.2.tar.gz
+sha256sums=
