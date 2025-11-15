@@ -1,0 +1,16 @@
+name=yajl
+version=1.0.0
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=YAJL – Yet Another JSON Library, usada por i3 e outros programas
+homepage=https://github.com/lloyd/yajl
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/lloyd/yajl/archive/refs/tags/1.0.0.tar.gz
+sha256sums=
