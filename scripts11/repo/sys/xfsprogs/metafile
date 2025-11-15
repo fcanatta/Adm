@@ -1,0 +1,16 @@
+name=xfsprogs
+version=6.5.0
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=xfsprogs – ferramentas do sistema de arquivos XFS
+homepage=https://xfs.wiki.kernel.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://mirrors.edge.kernel.org/pub/linux/utils/fs/xfs/xfsprogs/xfsprogs-6.5.0.tar.xz
+sha256sums=
