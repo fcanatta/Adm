@@ -1,0 +1,16 @@
+name=libX11
+version=1.8.9
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libXau,x11/libXdmcp,x11/libxcb
+run_deps=x11/libXau,x11/libXdmcp,x11/libxcb
+opt_deps=
+
+num_builds=0
+
+description=libX11 – biblioteca cliente principal do X11
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libX11-1.8.9.tar.xz
+sha256sums=
