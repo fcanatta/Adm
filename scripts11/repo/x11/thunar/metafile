@@ -1,0 +1,16 @@
+name=thunar
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Thunar – gerenciador de arquivos leve do XFCE
+homepage=https://docs.xfce.org/xfce/thunar/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/thunar/1.0/thunar-1.0.0.tar.bz2
+sha256sums=
