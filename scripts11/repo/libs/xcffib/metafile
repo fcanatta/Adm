@@ -1,0 +1,16 @@
+name=xcffib
+version=1.0.0
+category=libs
+
+build_deps=dev/python,dev/python-modules,dev/python-modules-dependencies
+run_deps=dev/python
+opt_deps=
+
+num_builds=0
+
+description=xcffib – binding Python para XCB usado por Qtile
+homepage=https://github.com/tych0/xcffib
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/tych0/xcffib/archive/refs/tags/v1.0.0.tar.gz
+sha256sums=
