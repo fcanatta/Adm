@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Hook avançado para sys/runit
+# - Compila e instala binários do runit
+# - Cria skeleton básico de /etc/runit e diretórios de serviços
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ru() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ru)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ru)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ru)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+ru_jobs() { nproc 2>/dev/null || echo 1; }
+
+ru_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+ru_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "sys/runit: instalar em '/' requer root."
+  fi
+}
+
+ru_detect_srctree() {
+  if [ -n "${ADM_RUNIT_SRCDIR:-}" ] && [ -d "$ADM_RUNIT_SRCDIR/src" ]; then
+    printf '%s\n' "$ADM_RUNIT_SRCDIR"; return 0
+  fi
+  if [ -d "src" ] && [ -f "src/runit.c" ] 2>/dev/null; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/runit-* "$PWD"/*; do
+    [ -d "$d/src" ] || continue
+    if ls "$d"/src/runit* >/dev/null 2>&1; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "sys/runit: não encontrei diretório de fonte."
+}
+
+ru_init_skeleton() {
+  local root="$1"
+  local etc="$root/etc"
+  local rdir="$etc/runit"
+  local sv="$etc/sv"
+  local srv="$root/service"
+
+  mkdir -p "$rdir" "$sv" "$srv"
+
+  # scripts básicos de stage 1/2/3 se não existirem
+  [ -f "$rdir/1" ] || cat >"$rdir/1" <<'EOF'
+#!/bin/sh
+# runit stage 1 – early boot
+exec /bin/sh -c 'echo "runit stage 1 (inicialização)"; exit 0'
+EOF
+  [ -f "$rdir/2" ] || cat >"$rdir/2" <<'EOF'
+#!/bin/sh
+# runit stage 2 – serviços
+exec /bin/sh -c 'echo "runit stage 2 (serviços)"; exit 0'
+EOF
+  [ -f "$rdir/3" ] || cat >"$rdir/3" <<'EOF'
+#!/bin/sh
+# runit stage 3 – shutdown
+exec /bin/sh -c 'echo "runit stage 3 (shutdown)"; exit 0'
+EOF
+
+  chmod +x "$rdir/1" "$rdir/2" "$rdir/3"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "sys/runit: build padrão desativado; usando hook."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(ru_detect_srctree)"
+  jobs="$(ru_jobs)"
+
+  adm_info "sys/runit: src=$src jobs=$jobs"
+
+  if [ -x "$src/package/compile" ]; then
+    (
+      cd "$src"
+      package/compile
+    )
+  else
+    (
+      cd "$src/src"
+      make -j"$jobs"
+    )
+  fi
+}
+
+adm_hook_install() {
+  local src root
+  src="$(ru_detect_srctree)"
+  root="$(ru_install_root)"
+
+  ru_require_root_if_needed "$root"
+
+  adm_info "sys/runit: instalando em '$root'..."
+
+  # instalar binários principais de forma genérica
+  mkdir -p "$root/sbin" "$root/bin"
+  if [ -d "$src/src" ]; then
+    for b in runit runsv runsvdir sv; do
+      if [ -f "$src/src/$b" ]; then
+        cp -f "$src/src/$b" "$root/sbin/$b"
+      fi
+    done
+  fi
+
+  ru_init_skeleton "$root"
+
+  adm_info "sys/runit: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "sys/runit: post-install – configure seu bootloader para usar runit como init, se for o init principal."
+}
