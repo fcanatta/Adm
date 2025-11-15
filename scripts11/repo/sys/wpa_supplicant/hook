@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# Hook inteligente para sys/wpa_supplicant
+# - Build e instalação controlados
+# - Cria /etc/wpa_supplicant/wpa_supplicant.conf inicial
+# - Detecta NetworkManager e evita conflito
+# - Integra com systemd, runit, sysvinit para habilitar serviço automaticamente
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -------------------------------------------------------------
+# Logging mínimo (caso 01-log-ui.sh não esteja carregado)
+# -------------------------------------------------------------
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_wpa() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_wpa)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_wpa)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_wpa)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+# -------------------------------------------------------------
+# Helpers genéricos
+# -------------------------------------------------------------
+wpa_jobs() { nproc 2>/dev/null || echo 1; }
+
+wpa_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+wpa_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "sys/wpa_supplicant: instalar diretamente em '/' requer root."
+  fi
+}
+
+wpa_detect_srctree() {
+  if [ -n "${ADM_WPA_SRCDIR:-}" ] && [ -f "$ADM_WPA_SRCDIR/configure" -o -f "$ADM_WPA_SRCDIR/wpa_supplicant/Makefile" ]; then
+    printf '%s\n' "$ADM_WPA_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ] || [ -d "wpa_supplicant" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/wpa_supplicant-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ] || [ -d "$d/wpa_supplicant" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "sys/wpa_supplicant: não foi possível detectar diretório de fonte."
+}
+
+# -------------------------------------------------------------
+# Detecção de init system + NetworkManager
+# -------------------------------------------------------------
+wpa_detect_init_system() {
+  if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1; then
+    printf 'systemd\n'; return 0
+  fi
+  if [ -d /etc/runit ] || [ -d /run/runit ] || command -v runit >/dev/null 2>&1; then
+    printf 'runit\n'; return 0
+  fi
+  if [ -f /etc/inittab ] || [ -d /etc/rc.d ] || [ -d /etc/init.d ]; then
+    printf 'sysvinit\n'; return 0
+  fi
+  printf 'unknown\n'
+}
+
+wpa_networkmanager_present() {
+  # Detecta NetworkManager pelo binário ou serviço systemd
+  if command -v NetworkManager >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -f /usr/sbin/NetworkManager ] || [ -f /usr/bin/NetworkManager ]; then
+    return 0
+  fi
+  if [ -f /lib/systemd/system/NetworkManager.service ] || [ -f /usr/lib/systemd/system/NetworkManager.service ]; then
+    return 0
+  fi
+  return 1
+}
+
+# -------------------------------------------------------------
+# Configuração inicial: wpa_supplicant.conf
+# -------------------------------------------------------------
+wpa_init_config() {
+  local root="$1"
+  local etc="$root/etc"
+  local dir="$etc/wpa_supplicant"
+  local conf="$dir/wpa_supplicant.conf"
+
+  mkdir -p "$dir"
+
+  if [ -f "$conf" ]; then
+    local backup="${conf}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "sys/wpa_supplicant: '$conf' já existe; backup em '$backup'."
+    cp -f "$conf" "$backup"
+    return 0
+  fi
+
+  adm_info "sys/wpa_supplicant: criando wpa_supplicant.conf padrão em '$conf'."
+  cat >"$conf" <<'EOF'
+# wpa_supplicant.conf gerado pelo ADM
+# Exemplo básico de rede WPA-PSK. Ajuste ssid, psk e interface.
+
+ctrl_interface=/run/wpa_supplicant
+update_config=1
+country=BR
+
+network={
+    ssid="SUA-REDE-WIFI"
+    psk="SENHA-DA-REDE"
+    key_mgmt=WPA-PSK
+}
+EOF
+
+  # segurança se for root e root=/:
+  if [ "$root" = "/" ] && [ "$(id -u)" -eq 0 ]; then
+    chmod 600 "$conf" || adm_warn "sys/wpa_supplicant: não foi possível aplicar chmod 600 em $conf."
+    chown root:root "$conf" || adm_warn "sys/wpa_supplicant: não foi possível aplicar chown root:root em $conf."
+  fi
+}
+
+# -------------------------------------------------------------
+# Integração com init systems
+# -------------------------------------------------------------
+wpa_enable_systemd_service() {
+  local unit
+  # ordem de preferência: serviço "global" ou @-template
+  for unit in wpa_supplicant.service wpa_supplicant@.service; do
+    if systemctl list-unit-files | grep -q "^${unit}"; then
+      adm_info "sys/wpa_supplicant: habilitando unidade systemd '$unit'."
+      systemctl enable "$unit" || adm_warn "sys/wpa_supplicant: falha ao habilitar '$unit'."
+      systemctl daemon-reload || true
+      return 0
+    fi
+  done
+  adm_warn "sys/wpa_supplicant: nenhuma unidade systemd wpa_supplicant encontrada; ajuste manualmente."
+}
+
+wpa_setup_runit_service() {
+  local root="$1"
+  local svdir=/etc/sv
+  local servicedir=/service
+  local svc="$svdir/wpa_supplicant"
+
+  mkdir -p "$root$svdir" "$root$servicedir"
+
+  if [ ! -d "$root$svc" ]; then
+    adm_info "sys/wpa_supplicant: criando serviço runit em '$root$svc'."
+    mkdir -p "$root$svc"
+    cat >"$root$svc/run" <<'EOF'
+#!/bin/sh
+# Serviço runit para wpa_supplicant
+# Ajuste WPA_IFACE conforme sua interface (ex: wlan0).
+: "${WPA_IFACE:=wlan0}"
+exec wpa_supplicant -B -i "$WPA_IFACE" -c /etc/wpa_supplicant/wpa_supplicant.conf -f /var/log/wpa_supplicant.log
+EOF
+    chmod +x "$root$svc/run"
+  fi
+
+  # Habilita ligando em /service
+  if [ -d "$root$servicedir" ] && [ ! -e "$root$servicedir/wpa_supplicant" ]; then
+    adm_info "sys/wpa_supplicant: habilitando serviço runit (link em /service)."
+    ln -s "$svc" "$root$servicedir/wpa_supplicant"
+  fi
+}
+
+wpa_setup_sysvinit_service() {
+  local root="$1"
+  local initd="$root/etc/init.d"
+  local script="$initd/wpa_supplicant"
+
+  mkdir -p "$initd"
+
+  if [ ! -f "$script" ]; then
+    adm_info "sys/wpa_supplicant: criando script SysVinit em '$script'."
+    cat >"$script" <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          wpa_supplicant
+# Required-Start:    $network
+# Required-Stop:     $network
+# Default-Start:     3 4 5
+# Default-Stop:      0 1 2 6
+# Short-Description: WPA Supplicant
+### END INIT INFO
+
+DAEMON=/sbin/wpa_supplicant
+CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+IFACE=${WPA_IFACE:-wlan0}
+PIDFILE=/run/wpa_supplicant.pid
+
+case "$1" in
+  start)
+    echo "Starting wpa_supplicant on $IFACE..."
+    start-stop-daemon --start --quiet --pidfile "$PIDFILE" --exec "$DAEMON" -- \
+      -B -i "$IFACE" -c "$CONF" -P "$PIDFILE"
+    ;;
+  stop)
+    echo "Stopping wpa_supplicant..."
+    start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --retry 5
+    ;;
+  restart|reload)
+    "$0" stop
+    "$0" start
+    ;;
+  status)
+    if [ -f "$PIDFILE" ]; then
+      echo "wpa_supplicant is running (pid $(cat "$PIDFILE"))."
+    else
+      echo "wpa_supplicant is not running."
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|reload|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+EOF
+    chmod +x "$script"
+  fi
+
+  # Cria links padrão em rc?.d (somente se diretórios existirem)
+  local rc
+  for rc in "$root"/etc/rc?.d "$root"/etc/rc.d/rc?.d; do
+    [ -d "$rc" ] || continue
+    # S20wpa_supplicant nos runlevels multi-user
+    case "$rc" in
+      *rc3.d|*rc4.d|*rc5.d)
+        if [ ! -e "$rc/S20wpa_supplicant" ]; then
+          ln -s ../init.d/wpa_supplicant "$rc/S20wpa_supplicant"
+        fi
+        ;;
+    esac
+  done
+}
+
+wpa_enable_service_auto() {
+  local root="$1"
+
+  # Se NetworkManager está presente, não habilita serviço stand-alone
+  if wpa_networkmanager_present; then
+    adm_info "sys/wpa_supplicant: NetworkManager detectado, não habilitando serviço próprio (NM controla o wpa_supplicant)."
+    return 0
+  fi
+
+  # só habilita serviços diretamente em '/' e com root
+  if [ "$root" != "/" ]; then
+    adm_info "sys/wpa_supplicant: root='$root' (não é '/'); não habilitando serviços automaticamente."
+    return 0
+  fi
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_warn "sys/wpa_supplicant: não é root; não habilitando serviços automaticamente."
+    return 0
+  fi
+  if [ "${ADM_AUTO_ENABLE_SERVICES:-1}" = "0" ]; then
+    adm_info "sys/wpa_supplicant: ADM_AUTO_ENABLE_SERVICES=0; serviços não serão habilitados automaticamente."
+    return 0
+  fi
+
+  local init_sys
+  init_sys="$(wpa_detect_init_system)"
+  adm_info "sys/wpa_supplicant: init system detectado: $init_sys"
+
+  case "$init_sys" in
+    systemd)
+      wpa_enable_systemd_service
+      ;;
+    runit)
+      wpa_setup_runit_service "$root"
+      ;;
+    sysvinit)
+      wpa_setup_sysvinit_service "$root"
+      ;;
+    *)
+      adm_warn "sys/wpa_supplicant: init system desconhecido; configure o serviço manualmente."
+      ;;
+  esac
+}
+
+# -------------------------------------------------------------
+# Hooks chamados pelo build-engine
+# -------------------------------------------------------------
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "sys/wpa_supplicant: build padrão desativado; usando hook customizado."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(wpa_detect_srctree)"
+  jobs="$(wpa_jobs)"
+
+  adm_info "sys/wpa_supplicant: src=$src jobs=$jobs"
+
+  if [ -f "$src/configure" ]; then
+    (
+      cd "$src"
+      ./configure --prefix=/usr --sysconfdir=/etc
+      make -j"$jobs"
+    )
+  else
+    (
+      cd "$src"
+      make -C "$src" -j"$jobs"
+    )
+  fi
+}
+
+adm_hook_install() {
+  local src root
+  src="$(wpa_detect_srctree)"
+  root="$(wpa_install_root)"
+
+  wpa_require_root_if_needed "$root"
+
+  adm_info "sys/wpa_supplicant: instalando em '$root'..."
+  if [ -f "$src/Makefile" ]; then
+    (
+      cd "$src"
+      make install DESTDIR="$root"
+    )
+  else
+    # fallback genérico
+    adm_warn "sys/wpa_supplicant: Makefile não encontrado; ajuste o hook se necessário."
+  fi
+
+  wpa_init_config "$root"
+  wpa_enable_service_auto "$root"
+
+  adm_info "sys/wpa_supplicant: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "sys/wpa_supplicant: post-install – ajuste SSID, senha e interface em /etc/wpa_supplicant/wpa_supplicant.conf."
+}
