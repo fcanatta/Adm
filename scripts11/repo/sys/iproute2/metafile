@@ -1,0 +1,16 @@
+name=iproute2
+version=6.9.0
+category=sys
+
+build_deps=dev/gcc,libs/libelf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ferramentas modernas de rede (ip, ss, bridge…)
+homepage=https://wiki.linuxfoundation.org/networking/iproute2
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/utils/net/iproute2/iproute2-6.9.0.tar.xz
+sha256sums=
