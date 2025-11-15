@@ -1,0 +1,16 @@
+name=amd-microcode
+version=1.0.0
+category=sys
+
+build_deps=sys/linux-firmware
+run_deps=sys/linux-firmware
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote ADM para microcode AMD – usa blobs do linux-firmware
+homepage=https://www.amd.com/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
