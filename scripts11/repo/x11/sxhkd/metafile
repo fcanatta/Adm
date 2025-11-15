@@ -1,0 +1,16 @@
+name=sxhkd
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=sxhkd – Simple X HotKey Daemon, usado com bspwm e outros WMs
+homepage=https://github.com/baskerville/sxhkd
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/baskerville/sxhkd/archive/refs/tags/1.0.0.tar.gz
+sha256sums=
