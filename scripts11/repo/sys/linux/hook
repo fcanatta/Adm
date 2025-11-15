@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+# Hook inteligente para o pacote sys/linux
+# Faz:
+#   - Desabilita build padrão do build-engine para este pacote
+#   - Detecta diretório do código-fonte do kernel
+#   - Escolhe config com base no profile
+#   - Compila kernel + módulos
+#   - Instala em root configurável com nomes amigáveis
+#
+# Compatível com:
+#   ADM_ROOT, ADM_PROFILE, ADM_KERNEL_CONFIG_DIR,
+#   ADM_KERNEL_INSTALL_ROOT, ADM_INSTALL_ROOT, DESTDIR, ADM_JOBS
+
+set -euo pipefail
+IFS=$'\n\t'
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+ADM_KERNEL_CONFIG_DIR="${ADM_KERNEL_CONFIG_DIR:-$ADM_ROOT/kconfig}"
+
+# Logging mínimo caso 01-log-ui.sh não esteja carregado
+if ! declare -F adm_info >/dev/null 2>&1; then
+    _k_ts() { date +"%Y-%m-%d %H:%M:%S"; }
+    adm_info()  { printf '[%s] [INFO] %s\n'  "$(_k_ts)" "$*" >&2; }
+    adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_k_ts)" "$*" >&2; }
+    adm_error() { printf '[%s] [ERRO] %s\n'  "$(_k_ts)" "$*" >&2; }
+    adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+# ----------------- Helpers genéricos -----------------
+
+linux_hook_jobs() {
+    if [ -n "${ADM_JOBS:-}" ]; then
+        printf '%s\n' "$ADM_JOBS"
+    else
+        nproc 2>/dev/null || echo 1
+    fi
+}
+
+linux_hook_detect_srctree() {
+    # 1) se ADM_KERNEL_SRCDIR estiver setado, usa
+    if [ -n "${ADM_KERNEL_SRCDIR:-}" ] && [ -f "$ADM_KERNEL_SRCDIR/Makefile" ]; then
+        printf '%s\n' "$ADM_KERNEL_SRCDIR"
+        return 0
+    fi
+    # 2) se o diretório atual parece um source de kernel, usa
+    if [ -f "Makefile" ] && grep -q "Linux kernel" Makefile 2>/dev/null || grep -q "^VERSION =" Makefile 2>/dev/null; then
+        printf '%s\n' "$PWD"
+        return 0
+    fi
+    # 3) procurar linux-* com Makefile
+    local d
+    for d in "$PWD"/linux-* "$PWD"/*; do
+        [ -d "$d" ] || continue
+        if [ -f "$d/Makefile" ] && grep -q "^VERSION =" "$d/Makefile" 2>/dev/null; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
+    adm_die "sys/linux: não foi possível detectar diretório do código-fonte do kernel."
+}
+
+linux_hook_detect_arch() {
+    if [ -n "${ADM_KERNEL_ARCH:-}" ]; then
+        printf '%s\n' "$ADM_KERNEL_ARCH"
+        return 0
+    fi
+    local u
+    u="$(uname -m)"
+    case "$u" in
+        x86_64) printf 'x86_64\n' ;;
+        i?86)   printf 'i386\n' ;;
+        aarch64)printf 'arm64\n' ;;
+        arm*)   printf 'arm\n' ;;
+        *)      printf '%s\n' "$u" ;;
+    esac
+}
+
+linux_hook_install_root() {
+    if [ -n "${ADM_KERNEL_INSTALL_ROOT:-}" ]; then
+        printf '%s\n' "$ADM_KERNEL_INSTALL_ROOT"
+    elif [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+        printf '%s\n' "$ADM_INSTALL_ROOT"
+    elif [ -n "${DESTDIR:-}" ]; then
+        printf '%s\n' "$DESTDIR"
+    else
+        printf '/\n'
+    fi
+}
+
+linux_hook_require_root_if_needed() {
+    local root="$1"
+    # se for instalar diretamente em /, exige root
+    if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+        adm_die "Instalação de kernel em '/' requer root. Use ADM_KERNEL_INSTALL_ROOT/DESTDIR ou rode como root."
+    fi
+}
+
+linux_hook_choose_config() {
+    # Prioridade:
+    #   1) ADM_KERNEL_CONFIG (arquivo direto)
+    #   2) ADM_KERNEL_CONFIG_DIR/linux-${ADM_PROFILE}.config
+    #   3) ADM_KERNEL_CONFIG_DIR/linux-default.config
+    #   4) deixar make defconfig resolver
+    local prof="${ADM_PROFILE:-normal-system}"
+    local src="$1"
+    local cfg=""
+
+    if [ -n "${ADM_KERNEL_CONFIG:-}" ] && [ -f "$ADM_KERNEL_CONFIG" ]; then
+        cfg="$ADM_KERNEL_CONFIG"
+    elif [ -f "$ADM_KERNEL_CONFIG_DIR/linux-${prof}.config" ]; then
+        cfg="$ADM_KERNEL_CONFIG_DIR/linux-${prof}.config"
+    elif [ -f "$ADM_KERNEL_CONFIG_DIR/linux-default.config" ]; then
+        cfg="$ADM_KERNEL_CONFIG_DIR/linux-default.config"
+    fi
+
+    if [ -n "$cfg" ]; then
+        adm_info "sys/linux: usando config '$cfg'"
+        cp -f "$cfg" "$src/.config"
+        ( cd "$src" && make olddefconfig )
+    else
+        adm_warn "sys/linux: nenhum config específico encontrado; usando 'make defconfig'."
+        ( cd "$src" && make defconfig )
+    fi
+}
+
+linux_hook_kernelrelease() {
+    ( cd "$1" && make -s kernelrelease )
+}
+
+# ----------------- Hooks chamados pelo ADM -----------------
+
+adm_hook_pre_build() {
+    # avisa o build-engine para não fazer ./configure && make padrão
+    export ADM_SKIP_DEFAULT_BUILD=1
+    adm_info "sys/linux: build padrão desativado; usando fluxo de hook."
+}
+
+adm_hook_build() {
+    local src arch jobs
+    src="$(linux_hook_detect_srctree)"
+    arch="$(linux_hook_detect_arch)"
+    jobs="$(linux_hook_jobs)"
+
+    adm_info "sys/linux: diretório de fonte: $src"
+    adm_info "sys/linux: arch=$arch jobs=$jobs"
+
+    linux_hook_choose_config "$src"
+
+    adm_info "sys/linux: compilando kernel + módulos..."
+    ( cd "$src" && make -j"$jobs" all )
+}
+
+adm_hook_install() {
+    local src arch root krel kimg bootdir
+    src="$(linux_hook_detect_srctree)"
+    arch="$(linux_hook_detect_arch)"
+    root="$(linux_hook_install_root)"
+    linux_hook_require_root_if_needed "$root"
+
+    krel="$(linux_hook_kernelrelease "$src")" || krel="unknown"
+    bootdir="$root/boot"
+
+    adm_info "sys/linux: instalando em root='$root' (release=$krel)"
+
+    mkdir -p "$bootdir"
+
+    # detectar imagem do kernel
+    local img=""
+    if [ -f "$src/arch/$arch/boot/bzImage" ]; then
+        img="$src/arch/$arch/boot/bzImage"
+    elif [ -f "$src/arch/x86/boot/bzImage" ]; then
+        img="$src/arch/x86/boot/bzImage"
+    else
+        adm_die "sys/linux: não encontrei bzImage em arch/$arch."
+    fi
+
+    local name="vmlinuz-$krel"
+    cp -f "$img" "$bootdir/$name"
+
+    # System.map e config
+    [ -f "$src/System.map" ] && cp -f "$src/System.map" "$bootdir/System.map-$krel"
+    [ -f "$src/.config" ]    && cp -f "$src/.config"    "$bootdir/config-$krel"
+
+    # módulos
+    adm_info "sys/linux: instalando módulos..."
+    ( cd "$src" && make modules_install INSTALL_MOD_PATH="$root" )
+
+    adm_info "sys/linux: instalado kernel vanilla como $bootdir/$name"
+}
+
+adm_hook_post_install() {
+    adm_info "sys/linux: post-install; configure seu bootloader para usar o novo vmlinuz-* se necessário."
+}
