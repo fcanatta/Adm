@@ -1,0 +1,16 @@
+name=libinput
+version=1.25.0
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=sys/udev
+
+num_builds=0
+
+description=libinput – biblioteca de entrada genérica usada por Wayland/Xorg (mouse, teclado, touchpad)
+homepage=https://www.freedesktop.org/wiki/Software/libinput/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.freedesktop.org/software/libinput/libinput-1.25.0.tar.xz
+sha256sums=
