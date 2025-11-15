@@ -1,0 +1,18 @@
+name=base-system
+version=1.0.0
+category=sys
+
+# Sistema base final (toolchain definitivo + userland essencial)
+build_deps=dev/binutils-pass2,dev/gcc-pass2,libs/glibc,apps/coreutils,apps/bash,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz,sys/util-linux,libs/gettext,dev/bison,dev/perl,dev/python,dev/texinfo
+
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote ADM para o sistema base final (toolchain e userland)
+homepage=https://linuxfromscratch.org/
+maintainer=ADM System <adm@example.local>
+
+sha256sums=
+sources=
