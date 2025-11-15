@@ -1,0 +1,16 @@
+name=acl
+version=2.3.2
+category=libs
+
+build_deps=libs/attr,dev/gcc
+run_deps=libs/attr
+opt_deps=
+
+num_builds=0
+
+description=ACL – listas de controle de acesso para o sistema de arquivos
+homepage=https://savannah.nongnu.org/projects/acl/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.nongnu.org/releases/acl/acl-2.3.2.tar.gz
+sha256sums=
