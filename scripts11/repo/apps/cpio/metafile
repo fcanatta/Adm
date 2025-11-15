@@ -1,0 +1,16 @@
+name=cpio
+version=2.14
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=cpio – utilitário para arquivos cpio
+homepage=https://www.gnu.org/software/cpio/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/cpio/cpio-2.14.tar.bz2
+sha256sums=
