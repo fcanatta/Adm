@@ -1,0 +1,16 @@
+name=nasm
+version=2.16.01
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=NASM – Netwide Assembler
+homepage=https://www.nasm.us/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.nasm.us/pub/nasm/releasebuilds/2.16.01/nasm-2.16.01.tar.xz
+sha256sums=
