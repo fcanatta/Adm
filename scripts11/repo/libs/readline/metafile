@@ -1,0 +1,16 @@
+name=readline
+version=8.2
+category=libs
+
+build_deps=dev/gcc,libs/ncurses
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU Readline – edição interativa de linha de comando
+homepage=https://tiswww.case.edu/php/chet/readline/rltop.html
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/readline/readline-8.2.tar.gz
+sha256sums=
