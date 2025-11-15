@@ -1,0 +1,16 @@
+name=i3
+version=4.23
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,dev/flex,dev/bison,x11/libX11,x11/libXinerama,x11/libXrandr,x11/libXcursor,libs/yajl
+run_deps=x11/xorg-server,x11/xinit,x11/xterm,x11/libX11
+opt_deps=x11/i3status,x11/i3blocks
+
+num_builds=0
+
+description=i3 – window manager tiling leve e scriptável
+homepage=https://i3wm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://i3wm.org/downloads/i3-4.23.tar.xz
+sha256sums=
