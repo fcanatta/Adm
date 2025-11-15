@@ -1,0 +1,16 @@
+name=sysvinit
+version=3.10
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=SysVinit – sistema de inicialização clássico UNIX
+homepage=https://savannah.nongnu.org/projects/sysvinit
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.nongnu.org/releases/sysvinit/sysvinit-3.10.tar.xz
+sha256sums=
