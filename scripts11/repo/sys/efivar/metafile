@@ -1,0 +1,16 @@
+name=efivar
+version=38
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=efivar – manipulação de variáveis EFI
+homepage=https://github.com/rhinstaller/efivar
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/rhinstaller/efivar/releases/download/38/efivar-38.tar.bz2
+sha256sums=
