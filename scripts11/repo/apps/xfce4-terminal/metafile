@@ -1,0 +1,16 @@
+name=xfce4-terminal
+version=1.0.0
+category=apps
+
+build_deps=dev/gcc
+run_deps=x11/xorg-server,x11/xinit
+opt_deps=
+
+num_builds=0
+
+description=xfce4-terminal – terminal emulador oficial do XFCE
+homepage=https://docs.xfce.org/apps/xfce4-terminal/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/apps/xfce4-terminal/1.0/xfce4-terminal-1.0.0.tar.bz2
+sha256sums=
