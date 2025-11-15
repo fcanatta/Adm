@@ -1,0 +1,16 @@
+name=terminus
+version=4.49.1
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Terminus – fonte monoespaçada bitmap para console e X
+homepage=http://terminus-font.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=http://downloads.sourceforge.net/terminus-font/terminus-font-4.49.1.tar.gz
+sha256sums=
