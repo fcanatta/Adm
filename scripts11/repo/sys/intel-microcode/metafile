@@ -1,0 +1,18 @@
+name=intel-microcode
+version=1.0.0
+category=sys
+
+# Meta-pacote: delega para linux-firmware
+build_deps=sys/linux-firmware
+run_deps=sys/linux-firmware
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote ADM para microcode Intel – usa blobs do linux-firmware
+homepage=https://www.intel.com/
+maintainer=ADM System <adm@example.local>
+
+# Não precisa baixar nada por aqui; tudo vem do linux-firmware
+sources=
+sha256sums=
