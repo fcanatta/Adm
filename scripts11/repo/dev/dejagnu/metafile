@@ -1,0 +1,16 @@
+name=dejagnu
+version=1.6.3
+category=dev
+
+build_deps=apps/expect,libs/tcl,dev/gcc
+run_deps=apps/expect,libs/tcl
+opt_deps=
+
+num_builds=0
+
+description=DejaGnu – framework de testes para GCC e outros
+homepage=https://www.gnu.org/software/dejagnu/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/dejagnu/dejagnu-1.6.3.tar.gz
+sha256sums=
