@@ -1,0 +1,16 @@
+name=kmod
+version=33
+category=sys
+
+build_deps=dev/gcc,libs/zlib,libs/xz,libs/zstd
+run_deps=libs/zlib,libs/xz,libs/zstd
+opt_deps=
+
+num_builds=0
+
+description=kmod – ferramentas para gerenciamento de módulos do kernel
+homepage=https://www.kernel.org/pub/linux/utils/kernel/kmod/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.kernel.org/pub/linux/utils/kernel/kmod/kmod-33.tar.xz
+sha256sums=
