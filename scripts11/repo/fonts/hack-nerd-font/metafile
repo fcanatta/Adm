@@ -1,0 +1,16 @@
+name=hack-nerd-font
+version=3.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Hack Nerd Font – Hack com patches Nerd Font (ícones para terminals e IDEs)
+homepage=https://www.nerdfonts.com/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
