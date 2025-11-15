@@ -1,0 +1,16 @@
+name=ruby
+version=3.3.0
+category=dev
+
+build_deps=dev/gcc,libs/openssl,libs/zlib,libs/readline
+run_deps=libs/openssl,libs/zlib,libs/readline
+opt_deps=
+
+num_builds=0
+
+description=Ruby – linguagem de programação dinâmica
+homepage=https://www.ruby-lang.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://cache.ruby-lang.org/pub/ruby/3.3/ruby-3.3.0.tar.xz
+sha256sums=
