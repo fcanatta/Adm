@@ -1,0 +1,16 @@
+name=setuptools
+version=69.0.0
+category=dev
+
+build_deps=dev/python
+run_deps=dev/python
+opt_deps=
+
+num_builds=0
+
+description=setuptools – ferramenta clássica de build e instalação de pacotes Python
+homepage=https://setuptools.pypa.io/
+maintainer=ADM System <adm@example.local>
+
+sources=https://files.pythonhosted.org/packages/source/s/setuptools/setuptools-69.0.0.tar.gz
+sha256sums=
