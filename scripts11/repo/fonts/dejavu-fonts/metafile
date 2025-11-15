@@ -1,0 +1,16 @@
+name=dejavu-fonts
+version=2.37
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=DejaVu Fonts – extensão das Bitstream Vera com mais glifos
+homepage=https://dejavu-fonts.github.io/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
