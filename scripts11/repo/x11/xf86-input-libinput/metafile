@@ -1,0 +1,16 @@
+name=xf86-input-libinput
+version=1.4.0
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/xorg-server,libs/libinput
+run_deps=x11/xorg-server,libs/libinput
+opt_deps=
+
+num_builds=0
+
+description=xf86-input-libinput – driver genérico de input para Xorg usando libinput
+homepage=https://www.freedesktop.org/wiki/Software/libinput/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/driver/xf86-input-libinput-1.4.0.tar.xz
+sha256sums=
