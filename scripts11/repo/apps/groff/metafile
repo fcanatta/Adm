@@ -1,0 +1,16 @@
+name=groff
+version=1.23.0
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Groff – sistema de formatação de documentos
+homepage=https://www.gnu.org/software/groff/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/groff/groff-1.23.0.tar.gz
+sha256sums=
