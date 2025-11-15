@@ -1,0 +1,16 @@
+name=ninja
+version=1.11.1
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ninja – sistema de build pequeno e rápido
+homepage=https://ninja-build.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/ninja-build/ninja/archive/refs/tags/v1.11.1.tar.gz
+sha256sums=
