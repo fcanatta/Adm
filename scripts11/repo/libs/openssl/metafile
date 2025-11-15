@@ -1,0 +1,16 @@
+name=openssl
+version=3.2.1
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=OpenSSL – TLS/SSL e biblioteca criptográfica
+homepage=https://www.openssl.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.openssl.org/source/openssl-3.2.1.tar.gz
+sha256sums=
