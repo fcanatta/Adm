@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Hook inteligente para libs/glibc (glibc final do sistema)
+# Controla:
+#   - diretório de build separado (build-glibc)
+#   - configure com opções seguras
+#   - make / make install com DESTDIR
+#
+# Este hook NÃO é para a glibc do cross-toolchain (essa fica em 20-toolchain-stage1.sh).
+
+set -euo pipefail
+IFS=$'\n\t'
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+
+# Logging mínimo caso 01-log-ui.sh não esteja carregado
+if ! declare -F adm_info >/dev/null 2>&1; then
+    _ts_g() { date +"%Y-%m-%d %H:%M:%S"; }
+    adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_g)" "$*" >&2; }
+    adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_g)" "$*" >&2; }
+    adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_g)" "$*" >&2; }
+    adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+glibc_jobs() { nproc 2>/dev/null || echo 1; }
+
+glibc_install_root() {
+    if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+        printf '%s\n' "$ADM_INSTALL_ROOT"
+    elif [ -n "${DESTDIR:-}" ]; then
+        printf '%s\n' "$DESTDIR"
+    else
+        printf '/\n'
+    fi
+}
+
+glibc_require_root_if_needed() {
+    local root="$1"
+    if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+        adm_die "libs/glibc: instalar diretamente em '/' requer root (ou defina ADM_INSTALL_ROOT/DESTDIR)."
+    fi
+}
+
+glibc_detect_srctree() {
+    # 1) variável explícita
+    if [ -n "${ADM_GLIBC_SRCDIR:-}" ] && [ -f "$ADM_GLIBC_SRCDIR/configure" ]; then
+        printf '%s\n' "$ADM_GLIBC_SRCDIR"; return 0
+    fi
+    # 2) diretório atual: tem configure e diretórios típicos da glibc?
+    if [ -f "configure" ] && [ -d "stdlib" ] && [ -d "sysdeps" ]; then
+        printf '%s\n' "$PWD"; return 0
+    fi
+    # 3) procurar glibc-* no diretório atual
+    local d
+    for d in "$PWD"/glibc-* "$PWD"/*; do
+        [ -d "$d" ] || continue
+        if [ -f "$d/configure" ] && [ -d "$d/stdlib" ] && [ -d "$d/sysdeps" ]; then
+            printf '%s\n' "$d"; return 0
+        fi
+    done
+    adm_die "libs/glibc: não foi possível detectar diretório de fonte da glibc."
+}
+
+glibc_build_dir() {
+    local src="$1"
+    local parent
+    parent="$(cd "$src/.." && pwd)"
+    printf '%s\n' "$parent/build-glibc"
+}
+
+# -------------------------------------------------------
+# Hooks chamados pelo build-engine
+# -------------------------------------------------------
+
+adm_hook_pre_build() {
+    export ADM_SKIP_DEFAULT_BUILD=1
+    adm_info "libs/glibc: build padrão desativado; usando fluxo do hook."
+}
+
+adm_hook_build() {
+    local src build root headers jobs
+    src="$(glibc_detect_srctree)"
+    build="$(glibc_build_dir "$src")"
+    root="$(glibc_install_root)"
+    jobs="$(glibc_jobs)"
+
+    adm_info "libs/glibc: src=$src build=$build root=$root jobs=$jobs"
+
+    glibc_require_root_if_needed "$root"
+
+    rm -rf "$build"
+    mkdir -p "$build"
+
+    # diretório de headers para o configure
+    headers="$root/usr/include"
+    if [ ! -d "$headers" ]; then
+        adm_warn "libs/glibc: headers não encontrados em '$headers', usando padrão do configure."
+        headers=""
+    fi
+
+    adm_info "libs/glibc: configurando..."
+    (
+        cd "$build"
+        if [ -n "$headers" ]; then
+            "$src/configure" \
+                --prefix=/usr \
+                --disable-werror \
+                --enable-kernel=4.14 \
+                --with-headers="$headers" \
+                libc_cv_slibdir=/usr/lib
+        else
+            "$src/configure" \
+                --prefix=/usr \
+                --disable-werror \
+                --enable-kernel=4.14 \
+                libc_cv_slibdir=/usr/lib
+        fi
+    )
+
+    adm_info "libs/glibc: compilando..."
+    (
+        cd "$build"
+        make -j"$jobs"
+    )
+}
+
+adm_hook_install() {
+    local src build root
+    src="$(glibc_detect_srctree)"
+    build="$(glibc_build_dir "$src")"
+    root="$(glibc_install_root)"
+
+    glibc_require_root_if_needed "$root"
+
+    adm_info "libs/glibc: instalando em root='$root'..."
+    (
+        cd "$build"
+        make install DESTDIR="$root"
+    )
+
+    adm_info "libs/glibc: instalação concluída em '$root'."
+}
+
+adm_hook_post_install() {
+    adm_info "libs/glibc: post-install – caso necessário, gere locales e ajuste /etc/nsswitch.conf, /etc/ld.so.conf etc."
+}
