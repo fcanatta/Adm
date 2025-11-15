@@ -1,0 +1,16 @@
+name=linux-pam
+version=1.5.3
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Linux-PAM – Pluggable Authentication Modules
+homepage=https://github.com/linux-pam/linux-pam
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/linux-pam/linux-pam/releases/download/v1.5.3/Linux-PAM-1.5.3.tar.xz
+sha256sums=
