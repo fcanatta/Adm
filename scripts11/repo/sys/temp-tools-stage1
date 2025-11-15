@@ -1,0 +1,4 @@
+name=temp-tools-stage1
+category=sys
+run_deps=
+build_deps=dev/m4,libs/ncurses,apps/bash,apps/coreutils,apps/diffutils,apps/file,apps/findutils,apps/gawk,apps/grep,apps/gzip,apps/make,apps/patch,apps/sed,apps/tar,apps/xz
