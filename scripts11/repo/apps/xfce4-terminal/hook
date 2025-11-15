@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Hook avançado para apps/xfce4-terminal
+# - Não altera o build (ADM_SKIP_DEFAULT_BUILD não é usado aqui)
+# - Cria config padrão em /etc/skel/.config/xfce4/terminal/terminalrc:
+#   * fonte monoespaçada preferida
+#   * tema escuro padrão
+#   * scrollback ampliado
+# - Seguro: faz backup se já existir.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_xt() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_xt)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_xt)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_xt)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+xt_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+xt_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "apps/xfce4-terminal: instalar diretamente em '/' requer root."
+  fi
+}
+
+xt_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "apps/xfce4-terminal: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+xt_font_name() {
+  if [ -n "${ADM_XFCE4_TERM_FONT_NAME:-}" ]; then
+    printf '%s\n' "$ADM_XFCE4_TERM_FONT_NAME"
+  else
+    printf 'JetBrains Mono\n'
+  fi
+}
+
+xt_font_size() {
+  if [ -n "${ADM_XFCE4_TERM_FONT_SIZE:-}" ]; then
+    printf '%s\n' "$ADM_XFCE4_TERM_FONT_SIZE"
+  else
+    printf '10\n'
+  fi
+}
+
+xt_create_skel_config() {
+  local root="$1"
+  local skel="$root/etc/skel"
+  local cfgdir="$skel/.config/xfce4/terminal"
+  local rc="$cfgdir/terminalrc"
+
+  mkdir -p "$cfgdir"
+
+  xt_backup_if_exists "$rc"
+
+  local font_name font_size
+  font_name="$(xt_font_name)"
+  font_size="$(xt_font_size)"
+
+  adm_info "apps/xfce4-terminal: criando config padrão em '$rc' (font='${font_name} ${font_size}')."
+
+  cat >"$rc" <<EOF
+[Configuration]
+FontName=${font_name} ${font_size}
+ColorForeground=#d0d0d0
+ColorBackground=#1e1e1e
+ColorCursor=#ffffff
+ColorPalette=#1e1e1e;#ff5f5f;#5fd700;#ffd75f;#5fafff;#af5fff;#5fd7ff;#d0d0d0;#808080;#ff8787;#87d75f;#ffd787;#87afff;#d787ff;#87d7ff;#ffffff
+ScrollingLines=10000
+ScrollingUnlimited=TRUE
+MiscAlwaysShowTabs=FALSE
+MiscBell=FALSE
+MiscMenubarDefault=FALSE
+MiscBordersDefault=TRUE
+EOF
+}
+
+adm_hook_pre_build() {
+  adm_info "apps/xfce4-terminal: usando build padrão do ADM; hook será aplicado na instalação."
+}
+
+adm_hook_build() {
+  # não interfere no build padrão
+  :
+}
+
+adm_hook_install() {
+  local root
+  root="$(xt_root)"
+  xt_require_root_if_needed "$root"
+
+  # Não mexe em como o binário é instalado; apenas configura /etc/skel
+  xt_create_skel_config "$root"
+
+  adm_info "apps/xfce4-terminal: instalação/configuração de /etc/skel concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "apps/xfce4-terminal: novos usuários herdarão o terminalrc padrão via /etc/skel."
+}
