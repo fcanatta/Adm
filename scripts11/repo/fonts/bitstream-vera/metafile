@@ -1,0 +1,16 @@
+name=bitstream-vera
+version=1.10
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Bitstream Vera – família de fontes TrueType clássica
+homepage=https://www.gnome.org/fonts/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
