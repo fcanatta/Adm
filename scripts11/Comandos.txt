@@ -10,4 +10,8 @@ ADM_PROFILE=minimal-toolchain $ADM_SCRIPTS/20-toolchain-stage1.sh
 # Para instalar tudo de uma vez
 ADM_PROFILE=minimal-toolchain adm install sys/temp-tools-stage1
 
+# kernels
+ADM_PROFILE=normal-system ADM_KERNEL_CONFIG_DIR=/usr/src/adm/kconfig adm install sys/linux-xanmod
+ADM_PROFILE=normal-system adm install sys/linux
+ADM_PROFILE=aggressive-system adm install sys/linux-liquorix
 
