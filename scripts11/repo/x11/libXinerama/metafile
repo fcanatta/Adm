@@ -1,0 +1,16 @@
+name=libXinerama
+version=1.1.5
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11
+run_deps=x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=libXinerama – suporte Xinerama para multi-monitor em X11
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXinerama-1.1.5.tar.xz
+sha256sums=
