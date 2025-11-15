@@ -1,0 +1,16 @@
+name=libffi
+version=3.4.6
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libffi – Foreign Function Interface
+homepage=https://sourceware.org/libffi/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/libffi/libffi/releases/download/v3.4.6/libffi-3.4.6.tar.gz
+sha256sums=
