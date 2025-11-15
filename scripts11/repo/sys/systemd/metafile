@@ -1,0 +1,16 @@
+name=systemd
+version=256
+category=sys
+
+build_deps=dev/gcc,libs/libcap,libs/libffi,libs/zlib,libs/xz,libs/zstd,sys/kmod,dev/python
+run_deps=libs/libcap,libs/zlib,libs/xz
+opt_deps=
+
+num_builds=0
+
+description=systemd – sistema moderno de inicialização e gerenciamento
+homepage=https://systemd.io/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/systemd/systemd/archive/refs/tags/v256.tar.gz
+sha256sums=
