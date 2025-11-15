@@ -1,0 +1,16 @@
+name=liboauth
+version=1.0.3
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=liboauth – biblioteca para OAuth 1.0
+homepage=https://github.com/x42/liboauth
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/x42/liboauth/releases/download/liboauth-1.0.3/liboauth-1.0.3.tar.gz
+sha256sums=
