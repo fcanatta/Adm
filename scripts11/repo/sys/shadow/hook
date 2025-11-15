@@ -1,0 +1,221 @@
+#!/usr/bin/env bash
+# Hook avançado para sys/shadow
+# - Toma controle da compilação/instalação do shadow
+# - Inicializa /etc/passwd, /etc/group, /etc/shadow, /etc/login.defs quando não existem
+# - Faz backup de arquivos existentes
+# - Não define senha de root (fica bloqueada até o admin rodar passwd)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+ADM_ROOT="${ADM_ROOT:-/usr/src/adm}"
+
+# Logging mínimo
+if ! declare -F adm_info >/dev/null 2>&1; then
+    _ts_s() { date +"%Y-%m-%d %H:%M:%S"; }
+    adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_s)" "$*" >&2; }
+    adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_s)" "$*" >&2; }
+    adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_s)" "$*" >&2; }
+    adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+shadow_jobs() { nproc 2>/dev/null || echo 1; }
+
+shadow_install_root() {
+    if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+        printf '%s\n' "$ADM_INSTALL_ROOT"
+    elif [ -n "${DESTDIR:-}" ]; then
+        printf '%s\n' "$DESTDIR"
+    else
+        printf '/\n'
+    fi
+}
+
+shadow_require_root_if_needed() {
+    local root="$1"
+    if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+        adm_die "sys/shadow: instalar diretamente em '/' requer root (ou use ADM_INSTALL_ROOT/DESTDIR)."
+    fi
+}
+
+shadow_detect_srctree() {
+    # 1) explícito
+    if [ -n "${ADM_SHADOW_SRCDIR:-}" ] && [ -f "$ADM_SHADOW_SRCDIR/configure" ]; then
+        printf '%s\n' "$ADM_SHADOW_SRCDIR"; return 0
+    fi
+    # 2) diretório atual
+    if [ -f "configure" ] && [ -f "src/useradd.c" ] 2>/dev/null; then
+        printf '%s\n' "$PWD"; return 0
+    fi
+    # 3) procurar shadow-* no diretório atual
+    local d
+    for d in "$PWD"/shadow-* "$PWD"/*; do
+        [ -d "$d" ] || continue
+        if [ -f "$d/configure" ] && ls "$d"/src/*shadow* >/dev/null 2>&1; then
+            printf '%s\n' "$d"; return 0
+        fi
+    done
+    adm_die "sys/shadow: não foi possível detectar diretório de fonte."
+}
+
+shadow_backup_file() {
+    local path="$1"
+    if [ -f "$path" ]; then
+        local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+        adm_warn "sys/shadow: '$path' já existe; criando backup em '$backup'."
+        cp -f "$path" "$backup"
+    fi
+}
+
+shadow_init_etc_files() {
+    local root="$1"
+    local etcdir="$root/etc"
+    mkdir -p "$etcdir"
+
+    local passwd="$etcdir/passwd"
+    local group="$etcdir/group"
+    local shadow="$etcdir/shadow"
+    local gshadow="$etcdir/gshadow"
+    local login_defs="$etcdir/login.defs"
+
+    # passwd básico
+    if [ ! -f "$passwd" ]; then
+        adm_info "sys/shadow: criando /etc/passwd inicial."
+        cat >"$passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/bash
+bin:x:1:1:bin:/bin:/usr/bin/false
+daemon:x:6:6:Daemon User:/sbin:/usr/bin/false
+nobody:x:65534:65534:Unprivileged User:/nonexistent:/usr/bin/false
+EOF
+    else
+        shadow_backup_file "$passwd"
+    fi
+
+    # group básico
+    if [ ! -f "$group" ]; then
+        adm_info "sys/shadow: criando /etc/group inicial."
+        cat >"$group" <<'EOF'
+root:x:0:
+bin:x:1:
+daemon:x:6:
+sys:x:3:
+adm:x:4:
+tty:x:5:
+disk:x:8:
+lp:x:7:
+wheel:x:10:
+users:x:100:
+nogroup:x:65534:
+EOF
+    else
+        shadow_backup_file "$group"
+    fi
+
+    # shadow com root bloqueado (sem senha até admin definir)
+    if [ ! -f "$shadow" ]; then
+        adm_info "sys/shadow: criando /etc/shadow inicial (root bloqueado)."
+        umask 077
+        cat >"$shadow" <<'EOF'
+root:!:19700:0:99999:7:::
+bin:!*:19700:0:99999:7:::
+daemon:!*:19700:0:99999:7:::
+nobody:!*:19700:0:99999:7:::
+EOF
+    else
+        shadow_backup_file "$shadow"
+    fi
+
+    # gshadow opcional
+    if [ ! -f "$gshadow" ]; then
+        adm_info "sys/shadow: criando /etc/gshadow inicial."
+        umask 077
+        cat >"$gshadow" <<'EOF'
+root::: 
+bin::: 
+daemon::: 
+sys::: 
+adm::: 
+tty::: 
+disk::: 
+lp::: 
+wheel::: 
+users::: 
+nogroup::: 
+EOF
+    else
+        shadow_backup_file "$gshadow"
+    fi
+
+    # login.defs básico, se não existir
+    if [ ! -f "$login_defs" ]; then
+        adm_info "sys/shadow: criando /etc/login.defs simples."
+        cat >"$login_defs" <<'EOF'
+MAIL_DIR        /var/mail
+PASS_MAX_DAYS   99999
+PASS_MIN_DAYS   0
+PASS_WARN_AGE   7
+UID_MIN         1000
+UID_MAX         60000
+GID_MIN         1000
+GID_MAX         60000
+CREATE_HOME     yes
+ENCRYPT_METHOD  SHA512
+EOF
+    else
+        shadow_backup_file "$login_defs"
+    fi
+}
+
+# ---------------- HOOKS ----------------
+
+adm_hook_pre_build() {
+    export ADM_SKIP_DEFAULT_BUILD=1
+    adm_info "sys/shadow: build padrão desativado; usando fluxo do hook."
+}
+
+adm_hook_build() {
+    local src jobs root
+    src="$(shadow_detect_srctree)"
+    jobs="$(shadow_jobs)"
+    root="$(shadow_install_root)"
+
+    shadow_require_root_if_needed "$root"
+
+    adm_info "sys/shadow: src=$src jobs=$jobs root=$root"
+
+    # diretório de build separado é opcional; shadow costuma buildar no topo mesmo.
+    (
+        cd "$src"
+        adm_info "sys/shadow: configurando..."
+        ./configure \
+            --prefix=/usr \
+            --sysconfdir=/etc \
+            --with-libxcrypt-prefix=/usr \
+            --with-group-name-max-length=32
+
+        adm_info "sys/shadow: compilando..."
+        make -j"$jobs"
+    )
+}
+
+adm_hook_install() {
+    local src root
+    src="$(shadow_detect_srctree)"
+    root="$(shadow_install_root)"
+
+    shadow_require_root_if_needed "$root"
+
+    adm_info "sys/shadow: instalando em '$root'..."
+    (
+        cd "$src"
+        make install DESTDIR="$root"
+    )
+
+    shadow_init_etc_files "$root"
+
+    adm_info "sys/shadow: instalação concluída em '$root'."
+}
+
+adm_hook_post_install() {
+    adm_info "sys/shadow: post-install – use 'passwd' para definir senha do root. Arquivos /etc/* foram inicializados com backups se já existiam."
+}
