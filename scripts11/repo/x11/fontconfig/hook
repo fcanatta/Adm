@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# Hook avançado para x11/fontconfig
+# - Controla configure/make/make install
+# - Rebuild do cache de fontes (fc-cache -f) de forma segura e opcional
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_fc() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_fc)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_fc)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_fc)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+fc_jobs() { nproc 2>/dev/null || echo 1; }
+
+fc_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+fc_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "x11/fontconfig: instalar diretamente em '/' requer root."
+  fi
+}
+
+fc_detect_srctree() {
+  if [ -n "${ADM_FONTCONFIG_SRCDIR:-}" ] && [ -f "$ADM_FONTCONFIG_SRCDIR/configure" ]; then
+    printf '%s\n' "$ADM_FONTCONFIG_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ] && [ -f "fontconfig/fontconfig.h" ] 2>/dev/null; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/fontconfig-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "x11/fontconfig: não foi possível detectar diretório de fonte."
+}
+
+fc_rebuild_cache() {
+  local root="$1"
+
+  if [ "${ADM_FC_CACHE_AUTO:-1}" = "0" ]; then
+    adm_info "x11/fontconfig: ADM_FC_CACHE_AUTO=0; não executando fc-cache automaticamente."
+    return 0
+  fi
+
+  if [ "$root" != "/" ]; then
+    adm_info "x11/fontconfig: root='$root' (não é '/'); rode 'fc-cache -f' dentro do chroot/target quando finalizar."
+    return 0
+  fi
+
+  if [ "$(id -u)" -ne 0 ]; then
+    adm_warn "x11/fontconfig: não é root; não vou executar fc-cache automaticamente."
+    return 0
+  fi
+
+  if ! command -v fc-cache >/dev/null 2>&1; then
+    adm_warn "x11/fontconfig: 'fc-cache' não encontrado; instale fontconfig/bin e rode manualmente."
+    return 0
+  fi
+
+  adm_info "x11/fontconfig: executando 'fc-cache -f' para atualizar cache de fontes..."
+  fc-cache -f || adm_warn "x11/fontconfig: falha ao executar fc-cache (ignorado)."
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "x11/fontconfig: build padrão desativado; usando hook customizado."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(fc_detect_srctree)"
+  jobs="$(fc_jobs)"
+
+  adm_info "x11/fontconfig: src=$src jobs=$jobs"
+
+  (
+    cd "$src"
+    ./configure \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --localstatedir=/var
+    make -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(fc_detect_srctree)"
+  root="$(fc_install_root)"
+
+  fc_require_root_if_needed "$root"
+
+  adm_info "x11/fontconfig: instalando em '$root'..."
+  (
+    cd "$src"
+    make install DESTDIR="$root"
+  )
+
+  fc_rebuild_cache "$root"
+
+  adm_info "x11/fontconfig: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "x11/fontconfig: post-install – verifique se novas fontes foram detectadas corretamente."
+}
