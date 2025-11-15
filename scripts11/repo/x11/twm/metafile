@@ -1,0 +1,16 @@
+name=twm
+version=1.0.12
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11,x11/libXext
+run_deps=x11/xorg-server,x11/xinit,x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=twm – Tab Window Manager clássico do Xorg
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/app/twm-1.0.12.tar.xz
+sha256sums=
