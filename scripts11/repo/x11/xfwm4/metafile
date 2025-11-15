@@ -1,0 +1,16 @@
+name=xfwm4
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=x11/xorg-server,x11/xinit
+opt_deps=x11/xfce4-settings
+
+num_builds=0
+
+description=xfwm4 – window manager do ambiente XFCE
+homepage=https://docs.xfce.org/xfce/xfwm4/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfwm4/1.0/xfwm4-1.0.0.tar.bz2
+sha256sums=
