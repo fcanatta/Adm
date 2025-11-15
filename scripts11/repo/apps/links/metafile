@@ -1,0 +1,16 @@
+name=links
+version=2.29
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Links – navegador web em modo texto e gráfico leve
+homepage=http://links.twibright.com/
+maintainer=ADM System <adm@example.local>
+
+sources=http://links.twibright.com/download/links-2.29.tar.bz2
+sha256sums=
