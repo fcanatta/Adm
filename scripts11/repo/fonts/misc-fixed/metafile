@@ -1,0 +1,16 @@
+name=misc-fixed
+version=1.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Misc Fixed – fontes bitmap clássicas do X (fixed, 6x13, etc.)
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
