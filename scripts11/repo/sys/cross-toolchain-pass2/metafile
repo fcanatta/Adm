@@ -1,0 +1,16 @@
+name=cross-toolchain-pass2
+version=1.0.0
+category=sys
+
+build_deps=
+run_deps=dev/binutils-pass2,dev/gcc-pass2
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote PASS2 do toolchain final (binutils-pass2, gcc-pass2) construído dentro do chroot
+homepage=https://example.local/adm
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
