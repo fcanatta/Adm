@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Hook avançado para apps/sudo
+# - Controla configure/make/make install
+# - Cria /etc/sudoers seguro se não existir
+# - Garante permissões 0440 quando possível
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_sd() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_sd)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+sd_jobs() { nproc 2>/dev/null || echo 1; }
+
+sd_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+sd_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "apps/sudo: instalar diretamente em '/' requer root."
+  fi
+}
+
+sd_detect_srctree() {
+  if [ -n "${ADM_SUDO_SRCDIR:-}" ] && [ -f "$ADM_SUDO_SRCDIR/configure" ]; then
+    printf '%s\n' "$ADM_SUDO_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ] && [ -f "src/sudo.c" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/sudo-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ] && [ -d "$d/src" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "apps/sudo: não foi possível detectar diretório de fonte."
+}
+
+sd_init_sudoers() {
+  local root="$1"
+  local etc="$root/etc"
+  local sudoers="$etc/sudoers"
+
+  mkdir -p "$etc"
+
+  if [ -f "$sudoers" ]; then
+    local backup="${sudoers}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "apps/sudo: '$sudoers' já existe; backup em '$backup'."
+    cp -f "$sudoers" "$backup"
+    return 0
+  fi
+
+  adm_info "apps/sudo: criando /etc/sudoers padrão."
+  cat >"$sudoers" <<'EOF'
+#
+# /etc/sudoers - arquivo gerado pelo ADM
+#
+# Use 'visudo' para editar este arquivo com checagem de sintaxe.
+#
+
+Defaults        env_reset
+Defaults        mail_badpass
+Defaults        secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+root    ALL=(ALL)       ALL
+
+%wheel  ALL=(ALL)       ALL
+EOF
+
+  # ajusta permissões se possível
+  if [ "$root" = "/" ] && [ "$(id -u)" -eq 0 ]; then
+    chmod 0440 "$sudoers" || adm_warn "apps/sudo: não foi possível aplicar chmod 0440 em /etc/sudoers."
+    chown root:root "$sudoers" || adm_warn "apps/sudo: não foi possível aplicar chown root:root em /etc/sudoers."
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "apps/sudo: build padrão desativado; usando hook."
+}
+
+adm_hook_build() {
+  local src jobs
+  src="$(sd_detect_srctree)"
+  jobs="$(sd_jobs)"
+
+  adm_info "apps/sudo: src=$src jobs=$jobs"
+
+  (
+    cd "$src"
+    ./configure \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --libdir=/usr/lib \
+      --with-pam \
+      --with-env-editor
+    make -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(sd_detect_srctree)"
+  root="$(sd_install_root)"
+
+  sd_require_root_if_needed "$root"
+
+  adm_info "apps/sudo: instalando em '$root'..."
+  (
+    cd "$src"
+    make install DESTDIR="$root"
+  )
+
+  sd_init_sudoers "$root"
+
+  adm_info "apps/sudo: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "apps/sudo: post-install – use 'visudo' para ajustar /etc/sudoers conforme sua política."
+}
