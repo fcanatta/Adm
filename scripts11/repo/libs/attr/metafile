@@ -1,0 +1,16 @@
+name=attr
+version=2.5.2
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Manipulação de atributos estendidos em sistemas de arquivos
+homepage=https://savannah.nongnu.org/projects/attr/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.savannah.nongnu.org/releases/attr/attr-2.5.2.tar.gz
+sha256sums=
