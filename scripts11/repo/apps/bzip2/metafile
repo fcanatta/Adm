@@ -1,0 +1,16 @@
+name=bzip2
+version=1.0.8
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Bzip2 – compressão de dados de alta taxa
+homepage=https://sourceware.org/bzip2/
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
+sha256sums=
