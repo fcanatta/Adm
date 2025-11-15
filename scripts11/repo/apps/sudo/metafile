@@ -1,0 +1,16 @@
+name=sudo
+version=1.9.15
+category=apps
+
+build_deps=dev/gcc,libs/linux-pam
+run_deps=libs/linux-pam
+opt_deps=
+
+num_builds=0
+
+description=sudo – executa comandos como outro usuário (geralmente root)
+homepage=https://www.sudo.ws/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.sudo.ws/dist/sudo-1.9.15.tar.gz
+sha256sums=
