@@ -1,0 +1,16 @@
+name=sysklogd
+version=1.5.1
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Sysklogd – sistema clássico de logs UNIX
+homepage=https://www.infod-rom.org/sysklogd/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/troglobit/sysklogd/releases/download/v1.5.1/sysklogd-1.5.1.tar.gz
+sha256sums=
