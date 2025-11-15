@@ -1,0 +1,16 @@
+name=obconf
+version=2.0.4
+category=x11
+
+build_deps=dev/gcc
+run_deps=x11/openbox
+opt_deps=
+
+num_builds=0
+
+description=obconf – ferramenta gráfica de configuração do Openbox
+homepage=http://openbox.org/wiki/ObConf
+maintainer=ADM System <adm@example.local>
+
+sources=http://openbox.org/dist/obconf/obconf-2.0.4.tar.gz
+sha256sums=
