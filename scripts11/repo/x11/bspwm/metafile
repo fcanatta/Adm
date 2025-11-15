@@ -1,0 +1,16 @@
+name=bspwm
+version=0.9.10
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/libX11,x11/xcb-proto,x11/libxcb
+run_deps=x11/xorg-server,x11/xinit,x11/libxcb
+opt_deps=apps/sxhkd
+
+num_builds=0
+
+description=bspwm – window manager tiling baseado em árvore binária
+homepage=https://github.com/baskerville/bspwm
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/baskerville/bspwm/archive/0.9.10.tar.gz
+sha256sums=
