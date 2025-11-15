@@ -1,0 +1,21 @@
+name=linux-liquorix
+version=6.10.5-liquorix
+category=sys
+
+build_deps=dev/gcc,apps/make,apps/bash,apps/coreutils,apps/diffutils,apps/findutils,apps/grep,apps/sed,apps/tar,apps/xz,sys/util-linux
+run_deps=sys/util-linux
+opt_deps=
+
+num_builds=0
+
+description=Kernel Linux otimizado Liquorix (desktop/gaming) com tweaks de baixa latência
+homepage=https://liquorix.net/
+maintainer=ADM System <adm@example.local>
+
+# Mesmo esquema:
+# 1) tarball completo:
+#    sources=URL_DO_TARBALL_LIQUORIX
+# 2) vanilla + patch:
+#    sources=https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz,URL_DO_PATCH_LIQUORIX
+sources=
+sha256sums=
