@@ -1,0 +1,16 @@
+name=gperf
+version=3.1
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GPerf – gerador de funções hash perfeitas
+homepage=https://www.gnu.org/software/gperf/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/gperf/gperf-3.1.tar.gz
+sha256sums=
