@@ -1,0 +1,16 @@
+name=dbus
+version=1.14.10
+category=sys
+
+build_deps=dev/gcc,libs/expat
+run_deps=libs/expat
+opt_deps=
+
+num_builds=0
+
+description=D-Bus – sistema de mensagens entre processos
+homepage=https://www.freedesktop.org/wiki/Software/dbus/
+maintainer=ADM System <adm@example.local>
+
+sources=https://dbus.freedesktop.org/releases/dbus/dbus-1.14.10.tar.xz
+sha256sums=
