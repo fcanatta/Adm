@@ -1,0 +1,16 @@
+name=xfdesktop
+version=1.0.0
+category=x11
+
+build_deps=dev/gcc
+run_deps=x11/xfce4-session
+opt_deps=
+
+num_builds=0
+
+description=xfdesktop – gerenciador de área de trabalho do XFCE
+homepage=https://docs.xfce.org/xfce/xfdesktop/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfdesktop/1.0/xfdesktop-1.0.0.tar.bz2
+sha256sums=
