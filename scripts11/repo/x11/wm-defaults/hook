@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# Hook avançado para x11/wm-defaults
+# - Não compila nada: apenas configura /etc/skel e /usr/share/xsessions
+# - Cria:
+#   * /etc/skel/.xinitrc com WM padrão
+#   * /usr/share/xsessions/*.desktop para vários WMs
+#   * /etc/skel/.config/<wm>/configs básicas
+#   * /etc/skel/.config/xfce4/... com tema padrão
+# - Seleção automática do WM:
+#   ADM_DEFAULT_WM=xfce4|i3|openbox|bspwm|dwm|dk|qtile|spectrwm|awesome|twm|cwm
+#   (default: tenta xfce4 -> i3 -> openbox -> bspwm -> dwm -> dk -> qtile -> spectrwm -> awesome -> twm -> cwm)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_wm() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_wm)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_wm)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_wm)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+wm_install_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+wm_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "x11/wm-defaults: instalar diretamente em '/' requer root."
+  fi
+}
+
+wm_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "x11/wm-defaults: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+# -------------------------------------------------------------
+# Seleção automática do WM padrão
+# -------------------------------------------------------------
+wm_command_for() {
+  case "$1" in
+    xfce4)    printf 'startxfce4\n' ;;
+    i3)       printf 'i3\n' ;;
+    openbox)  printf 'openbox-session\n' ;;
+    bspwm)    printf 'bspwm\n' ;;
+    dwm)      printf 'dwm\n' ;;
+    dk)       printf 'dk\n' ;;
+    qtile)    printf 'qtile start\n' ;;
+    spectrwm) printf 'spectrwm\n' ;;
+    awesome)  printf 'awesome\n' ;;
+    twm)      printf 'twm\n' ;;
+    cwm)      printf 'cwm\n' ;;
+    *)        printf 'i3\n' ;;
+  esac
+}
+
+wm_guess_default() {
+  # Preferência: xfce4 -> i3 -> openbox -> bspwm -> dwm -> dk -> qtile -> spectrwm -> awesome -> twm -> cwm
+  local root="$1"
+  local path="$root/usr/bin"
+
+  # Se ADM_DEFAULT_WM foi setado, usa ele (validação básica)
+  if [ -n "${ADM_DEFAULT_WM:-}" ]; then
+    adm_info "x11/wm-defaults: ADM_DEFAULT_WM definido como '$ADM_DEFAULT_WM'."
+    printf '%s\n' "$ADM_DEFAULT_WM"
+    return 0
+  fi
+
+  local cand
+  for cand in xfce4 i3 openbox bspwm dwm dk qtile spectrwm awesome twm cwm; do
+    case "$cand" in
+      xfce4)
+        if [ -x "$path/startxfce4" ]; then printf 'xfce4\n'; return 0; fi
+        ;;
+      i3)
+        if [ -x "$path/i3" ]; then printf 'i3\n'; return 0; fi
+        ;;
+      openbox)
+        if [ -x "$path/openbox-session" ] || [ -x "$path/openbox" ]; then printf 'openbox\n'; return 0; fi
+        ;;
+      bspwm)
+        if [ -x "$path/bspwm" ]; then printf 'bspwm\n'; return 0; fi
+        ;;
+      dwm)
+        if [ -x "$path/dwm" ]; then printf 'dwm\n'; return 0; fi
+        ;;
+      dk)
+        if [ -x "$path/dk" ]; then printf 'dk\n'; return 0; fi
+        ;;
+      qtile)
+        if [ -x "$path/qtile" ]; then printf 'qtile\n'; return 0; fi
+        ;;
+      spectrwm)
+        if [ -x "$path/spectrwm" ]; then printf 'spectrwm\n'; return 0; fi
+        ;;
+      awesome)
+        if [ -x "$path/awesome" ]; then printf 'awesome\n'; return 0; fi
+        ;;
+      twm)
+        if [ -x "$path/twm" ]; then printf 'twm\n'; return 0; fi
+        ;;
+      cwm)
+        if [ -x "$path/cwm" ]; then printf 'cwm\n'; return 0; fi
+        ;;
+    esac
+  done
+
+  adm_warn "x11/wm-defaults: nenhum WM detectado; usando 'i3' como fallback."
+  printf 'i3\n'
+}
+
+# -------------------------------------------------------------
+# .xinitrc em /etc/skel
+# -------------------------------------------------------------
+wm_create_xinitrc_skel() {
+  local root="$1"
+  local skel="$root/etc/skel"
+
+  mkdir -p "$skel"
+  local xinit="$skel/.xinitrc"
+
+  wm_backup_if_exists "$xinit"
+
+  local default_wm
+  default_wm="$(wm_guess_default "$root")"
+  local cmd
+  cmd="$(wm_command_for "$default_wm")"
+
+  adm_info "x11/wm-defaults: gerando .xinitrc em /etc/skel com WM padrão '$default_wm' (cmd='$cmd')."
+
+  cat >"$xinit" <<EOF
+#!/bin/sh
+# .xinitrc gerado pelo ADM (wm-defaults)
+# WM padrão: $default_wm
+
+exec $cmd
+EOF
+
+  chmod +x "$xinit" || adm_warn "x11/wm-defaults: não foi possível aplicar chmod +x em $xinit."
+}
+
+# -------------------------------------------------------------
+# /usr/share/xsessions/*.desktop
+# -------------------------------------------------------------
+wm_create_xsession() {
+  local root="$1" wm_id="$2" name="$3" comment="$4"
+  local exec_cmd
+  exec_cmd="$(wm_command_for "$wm_id")"
+  # pega só o primeiro token como comando
+  exec_cmd="${exec_cmd%% *}"
+
+  local dir="$root/usr/share/xsessions"
+  mkdir -p "$dir"
+
+  local desktop="$dir/${wm_id}.desktop"
+  wm_backup_if_exists "$desktop"
+
+  adm_info "x11/wm-defaults: criando sessão X para '$wm_id' em '$desktop'."
+
+  cat >"$desktop" <<EOF
+[Desktop Entry]
+Name=$name
+Comment=$comment
+Exec=$exec_cmd
+TryExec=$exec_cmd
+Type=Application
+DesktopNames=$wm_id
+EOF
+}
+
+wm_create_all_xsessions() {
+  local root="$1"
+  wm_create_xsession "$root" xfce4    "XFCE4"      "XFCE Desktop Environment"
+  wm_create_xsession "$root" i3       "i3"         "i3 Tiling Window Manager"
+  wm_create_xsession "$root" openbox  "Openbox"    "Openbox Window Manager"
+  wm_create_xsession "$root" bspwm    "bspwm"      "bspwm Tiling Window Manager"
+  wm_create_xsession "$root" dwm      "dwm"        "dwm Dynamic Window Manager"
+  wm_create_xsession "$root" dk       "dk"         "dk Tiling Window Manager"
+  wm_create_xsession "$root" qtile    "Qtile"      "Qtile Tiling Window Manager"
+  wm_create_xsession "$root" spectrwm "spectrwm"   "spectrwm Tiling Window Manager"
+  wm_create_xsession "$root" awesome  "awesome"    "awesome Window Manager"
+  wm_create_xsession "$root" twm      "twm"        "Tab Window Manager"
+  wm_create_xsession "$root" cwm      "cwm"        "Calm Window Manager"
+}
+
+# -------------------------------------------------------------
+# Configs padrão em /etc/skel/.config/<wm>
+# -------------------------------------------------------------
+wm_create_dir_and_skeleton() {
+  local root="$1" wm_id="$2"
+  local skel="$root/etc/skel"
+  local cfg="$skel/.config/$wm_id"
+
+  mkdir -p "$cfg"
+
+  case "$wm_id" in
+    i3)
+      local conf="$cfg/config"
+      [ -f "$conf" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de i3 em $conf."
+      cat >"$conf" <<'EOF'
+# i3 config básico gerado pelo ADM
+set $mod Mod4
+font pango:monospace 10
+
+bindsym $mod+Return exec xterm
+bindsym $mod+d exec dmenu_run
+bindsym $mod+Shift+e exec "i3-msg exit"
+
+bindsym $mod+h focus left
+bindsym $mod+j focus down
+bindsym $mod+k focus up
+bindsym $mod+l focus right
+
+bar {
+  status_command i3status
+}
+EOF
+      ;;
+    openbox)
+      local obcfg="$cfg/rc.xml"
+      [ -f "$obcfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de Openbox em $obcfg."
+      cat >"$obcfg" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<openbox_config xmlns="http://openbox.org/3.4/rc">
+  <theme>
+    <name>Clearlooks</name>
+  </theme>
+  <desktops>
+    <number>4</number>
+  </desktops>
+</openbox_config>
+EOF
+      ;;
+    bspwm)
+      local bcfg="$cfg/bspwmrc"
+      [ -f "$bcfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de bspwm em $bcfg."
+      cat >"$bcfg" <<'EOF'
+#!/bin/sh
+bspc monitor -d I II III IV
+EOF
+      chmod +x "$bcfg" || true
+      ;;
+    dwm)
+      # dwm normalmente configura via config.h em compile-time; aqui só placeholder
+      local dfile="$cfg/README.adm"
+      [ -f "$dfile" ] && return 0
+      echo "Configure o dwm editando config.h e recompilando." >"$dfile"
+      ;;
+    dk)
+      local dkcfg="$cfg/dkrc"
+      [ -f "$dkcfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de dk em $dkcfg."
+      cat >"$dkcfg" <<'EOF'
+# dk config gerado pelo ADM
+super = Mod4
+term = xterm
+EOF
+      ;;
+    qtile)
+      local qcfg="$cfg/config.py"
+      [ -f "$qcfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de qtile em $qcfg."
+      cat >"$qcfg" <<'EOF'
+# config.py básico do qtile gerado pelo ADM
+from libqtile import layout, hook
+from libqtile.config import Key
+from libqtile.lazy import lazy
+
+mod = "mod4"
+keys = [Key([mod], "Return", lazy.spawn("xterm"))]
+layouts = [layout.Max(), layout.Stack(num_stacks=2)]
+EOF
+      ;;
+    spectrwm)
+      local scfg="$cfg/spectrwm.conf"
+      [ -f "$scfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de spectrwm em $scfg."
+      echo "# spectrwm.conf básico gerado pelo ADM" >"$scfg"
+      ;;
+    awesome)
+      local acfg="$cfg/rc.lua"
+      [ -f "$acfg" ] && return 0
+      adm_info "x11/wm-defaults: criando config básico de awesome em $acfg."
+      echo "-- rc.lua básico gerado pelo ADM" >"$acfg"
+      ;;
+    xfce4)
+      # tratado em função separada para tema/painel
+      ;;
+    twm|cwm)
+      # minimalistas; nada para fazer por padrão
+      ;;
+  esac
+}
+
+wm_create_all_wm_configs() {
+  local root="$1"
+  local skel="$root/etc/skel"
+  mkdir -p "$skel/.config"
+
+  local wm
+  for wm in i3 openbox bspwm dwm dk qtile spectrwm awesome twm cwm; do
+    wm_create_dir_and_skeleton "$root" "$wm"
+  done
+}
+
+# -------------------------------------------------------------
+# Tema XFCE padrão minimalista
+# -------------------------------------------------------------
+wm_create_xfce_theme_defaults() {
+  local root="$1"
+  local skel="$root/etc/skel"
+  local xdir="$skel/.config/xfce4/xfconf/xfce-perchannel-xml"
+
+  mkdir -p "$xdir"
+
+  local xset="$xdir/xsettings.xml"
+  if [ ! -f "$xset" ]; then
+    adm_info "x11/wm-defaults: criando tema XFCE padrão em $xset."
+    cat >"$xset" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+
+<channel name="xsettings" version="1.0">
+  <property name="Net/ThemeName" type="string" value="Adwaita"/>
+  <property name="Net/IconThemeName" type="string" value="Adwaita"/>
+  <property name="Gtk/FontName" type="string" value="Sans 10"/>
+</channel>
+EOF
+  fi
+}
+
+# -------------------------------------------------------------
+# Hooks do ADM
+# -------------------------------------------------------------
+adm_hook_pre_build() {
+  # Não há build; é um pacote puramente de configuração
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "x11/wm-defaults: não há build; apenas configurando /etc/skel e xsessions."
+}
+
+adm_hook_build() {
+  # no-op
+  :
+}
+
+adm_hook_install() {
+  local root
+  root="$(wm_install_root)"
+
+  wm_require_root_if_needed "$root"
+
+  adm_info "x11/wm-defaults: iniciando configuração em root='$root'."
+
+  wm_create_xinitrc_skel "$root"
+  wm_create_all_xsessions "$root"
+  wm_create_all_wm_configs "$root"
+  wm_create_xfce_theme_defaults "$root"
+
+  adm_info "x11/wm-defaults: configuração concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "x11/wm-defaults: post-install – novos usuários herdarão as configs de /etc/skel."
+}
