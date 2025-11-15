@@ -1,0 +1,16 @@
+name=psmisc
+version=23.7
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=psmisc – ferramentas para processos (pstree, killall, fuser)
+homepage=https://psmisc.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceforge.net/projects/psmisc/files/psmisc/psmisc-23.7.tar.xz
+sha256sums=
