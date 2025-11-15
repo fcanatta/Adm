@@ -1,0 +1,16 @@
+name=libelf
+version=0.191
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Libelf (elfutils) – manipulação de arquivos ELF
+homepage=https://sourceware.org/elfutils/
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceware.org/elfutils/ftp/0.191/elfutils-0.191.tar.bz2
+sha256sums=
