@@ -1,0 +1,20 @@
+name=binutils-pass2
+version=2.43.1
+category=dev
+
+# Pass2 normalmente é a fase onde o binutils é recompilado
+# já com o toolchain mais completo (por exemplo em chroot).
+# Ajuste esses deps conforme seu fluxo real (stage2, rootfs, etc.).
+build_deps=dev/binutils,sys/linux-headers
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GNU Binutils (Pass 2) – fase final do linkador/assembler no fluxo de toolchain
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM System <adm@example.local>
+
+# Usa o mesmo tarball do binutils "normal"
+sources=https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz
+sha256sums=13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd
