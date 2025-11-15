@@ -1,0 +1,16 @@
+name=wget
+version=1.24.4
+category=apps
+
+build_deps=dev/gcc,libs/openssl
+run_deps=libs/openssl
+opt_deps=
+
+num_builds=0
+
+description=Wget – downloader de arquivos HTTP/FTP
+homepage=https://www.gnu.org/software/wget/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/wget/wget-1.24.4.tar.gz
+sha256sums=
