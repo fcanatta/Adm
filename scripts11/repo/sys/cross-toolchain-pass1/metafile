@@ -1,0 +1,17 @@
+name=cross-toolchain-pass1
+version=1.0.0
+category=sys
+
+# Tudo instalado em /usr/src/adm/cross-toolchain via 20-toolchain-stage1.sh
+build_deps=
+run_deps=dev/binutils-pass1,dev/gcc-pass1,sys/linux-headers
+opt_deps=
+
+num_builds=0
+
+description=Meta-pacote PASS1 do cross-toolchain (binutils-pass1, gcc-pass1, linux-headers) para /usr/src/adm/cross-toolchain
+homepage=https://example.local/adm
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
