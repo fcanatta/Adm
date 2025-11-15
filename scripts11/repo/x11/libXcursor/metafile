@@ -1,0 +1,16 @@
+name=libXcursor
+version=1.2.1
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf,x11/xorgproto,x11/libX11,x11/libXrender
+run_deps=x11/libX11,x11/libXrender
+opt_deps=
+
+num_builds=0
+
+description=libXcursor – API avançada de cursores para X11
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/libXcursor-1.2.1.tar.xz
+sha256sums=
