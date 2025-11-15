@@ -1,0 +1,16 @@
+name=grub
+version=2.12
+category=sys
+
+build_deps=dev/gcc,libs/libffi,libs/zlib
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GRUB – bootloader GNU
+homepage=https://www.gnu.org/software/grub/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/grub/grub-2.12.tar.xz
+sha256sums=
