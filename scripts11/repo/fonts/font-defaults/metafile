@@ -1,0 +1,16 @@
+name=font-defaults
+version=1.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=fonts/dejavu-fonts,fonts/roboto,fonts/ubuntu-font-family,fonts/iosevka,fonts/fira-code,fonts/hack-nerd-font,fonts/jetbrains-mono,fonts/source-code-pro
+
+num_builds=0
+
+description=Configurações globais de fontes: local.conf, fonts.conf, ligaduras, fallback e defaults sans/monospace
+homepage=https://example.local/adm
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
