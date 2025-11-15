@@ -1,0 +1,16 @@
+name=expect
+version=5.45.4
+category=apps
+
+build_deps=libs/tcl
+run_deps=libs/tcl
+opt_deps=
+
+num_builds=0
+
+description=Expect – automação de programas interativos
+homepage=https://core.tcl-lang.org/expect/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/expect/expect5.45.4.tar.gz
+sha256sums=
