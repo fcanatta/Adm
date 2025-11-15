@@ -34,7 +34,6 @@ ADM_INTEL_UCODE_CREATE_IMAGE=1 adm install sys/intel-microcode
 ADM_AMD_UCODE_CREATE_IMAGE=1 adm install sys/amd-microcode
 
 # Isso cria, por exemplo: /boot/intel-ucode.img ou /boot/amd-ucode.img
-
 # Depois instala e integra o GRUB:
 ADM_GRUB_INSTALL_BOOTLOADER=1 ADM_GRUB_DEVICE=/dev/sda adm install sys/grub
 
@@ -50,26 +49,17 @@ adm install sys/cross-toolchain-pass2
 # já dentro do chroot, libc instalada (glibc OU musl):
 adm install sys/base-system
 
-# Fluxo geral sugerido (bem resumido)
-
-1. Fora do chroot (host):
-
+# Fluxo geral sugerido (bem resumido)# Fora do chroot (host):
 adm install sys/cross-toolchain-pass1 --root=/usr/src/adm/cross-toolchain
 
-
-2. Cria rootfs, entra no chroot, constrói PASS2:
-
+# Cria rootfs, entra no chroot, constrói PASS2:
 # dentro do chroot
 adm install sys/cross-toolchain-pass2
 
 
-3. Constrói adicionais temporary tools e depois a base:
+# Constrói adicionais temporary tools e depois a base:(se quiser, você pode ter temp-tools-stage1 / temp-tools-stage2 como já geramos antes)
 
-(se quiser, você pode ter temp-tools-stage1 / temp-tools-stage2 como já geramos antes)
-
-Quando pronto:
-
-
+# Quando pronto:
 adm install sys/base-system
 
 
