@@ -1,0 +1,16 @@
+name=curl
+version=8.7.1
+category=apps
+
+build_deps=dev/gcc,libs/openssl,zlib
+run_deps=libs/openssl,zlib
+opt_deps=
+
+num_builds=0
+
+description=Curl – ferramenta de transferência HTTP/FTP/etc.
+homepage=https://curl.se/
+maintainer=ADM System <adm@example.local>
+
+sources=https://curl.se/download/curl-8.7.1.tar.xz
+sha256sums=
