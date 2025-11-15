@@ -1,0 +1,16 @@
+name=less
+version=661
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=less – pager avançado para texto
+homepage=https://www.greenwoodsoftware.com/less/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.greenwoodsoftware.com/less/less-661.tar.gz
+sha256sums=
