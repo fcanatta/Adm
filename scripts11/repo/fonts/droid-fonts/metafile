@@ -1,0 +1,16 @@
+name=droid-fonts
+version=1.0.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Droid Fonts – fontes Droid (Sans, Serif, Mono) do Android antigo
+homepage=https://android.googleblog.com/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
