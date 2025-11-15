@@ -1,0 +1,22 @@
+name=linux-xanmod
+version=6.10.5-xanmod
+category=sys
+
+# Kernel XANMOD também precisa de toolchain e utilitários básicos
+build_deps=dev/gcc,apps/make,apps/bash,apps/coreutils,apps/diffutils,apps/findutils,apps/grep,apps/sed,apps/tar,apps/xz,sys/util-linux
+run_deps=sys/util-linux
+opt_deps=
+
+num_builds=0
+
+description=Kernel Linux com patches XanMod voltado a baixa latência e performance
+homepage=https://xanmod.org/
+maintainer=ADM System <adm@example.local>
+
+# Preencha de acordo com a forma que preferir:
+# 1) tarball já com xanmod aplicado
+#    sources=URL_DO_TARBALL_XANMOD
+# 2) kernel vanilla + patch xanmod:
+#    sources=https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.10.5.tar.xz,URL_DO_PATCH_XANMOD
+sources=
+sha256sums=
