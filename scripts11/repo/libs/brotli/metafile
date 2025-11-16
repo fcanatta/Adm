@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/brotli/metafile
+name=brotli
+version=1.1.0
+category=libs
+
+build_deps=dev/cmake,dev/ninja,dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Brotli – compression library.
+homepage=https://github.com/google/brotli
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz
+sha256sums=
