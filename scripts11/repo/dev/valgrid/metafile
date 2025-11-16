@@ -1,0 +1,16 @@
+name=valgrind
+version=3.22.0
+category=dev
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Valgrind – framework para profiling e detecção de memória.
+homepage=https://valgrind.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://sourceware.org/pub/valgrind/valgrind-3.22.0.tar.bz2
+sha256sums=
