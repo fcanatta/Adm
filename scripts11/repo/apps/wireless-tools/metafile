@@ -1,0 +1,16 @@
+name=wireless-tools
+version=30.pre9
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ferramentas legadas de WiFi (iwconfig, iwlist).
+homepage=https://hewlettpackard.github.io/wireless-tools/
+maintainer=ADM System <adm@example.local>
+
+sources=https://hewlettpackard.github.io/wireless-tools/wireless_tools.30.pre9.tar.gz
+sha256sums=
