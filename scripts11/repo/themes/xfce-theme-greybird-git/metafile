@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/themes/xfce-theme-greybird-git/metafile
+name=xfce-theme-greybird-git
+version=2024.01
+category=themes
+
+build_deps=x11/gtk-3,themes/gtk-engines
+run_deps=x11/gtk-3,themes/gtk-engines
+opt_deps=themes/hicolor-icon-theme
+
+num_builds=0
+
+description=Greybird – tema GTK padrão do Xubuntu/XFCE (git snapshot).
+homepage=https://github.com/shimmerproject/Greybird
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/shimmerproject/Greybird.git
+sha256sums=
