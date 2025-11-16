@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/conky-colors-git/metafile
+name=conky-colors-git
+version=2024.01
+category=apps
+
+build_deps=apps/conky
+run_deps=apps/conky
+opt_deps=fonts/ttf-conkyweather,fonts/nerd-fonts
+
+num_builds=0
+
+description=Conky Colors – coleção de temas para Conky.
+homepage=https://github.com/helmuthdu/conky_colors
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/helmuthdu/conky_colors.git
+sha256sums=
