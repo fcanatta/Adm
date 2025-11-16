@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_zen(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_zen)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_zen)" "$*" >&2; }
+fi
+
+zen_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "zen-browser: usando reempacote de tarball binário."
+}
+
+adm_hook_build() {
+  : # nada a compilar, só desempacotar no install
+}
+
+adm_hook_install() {
+  local root optdir tarball
+  root="$(zen_root)"
+  optdir="$root/opt/zen-browser"
+
+  mkdir -p "$optdir"
+
+  tarball="$(ls zen-*.tar.* zen-linux-*.tar.* 2>/dev/null | head -n1 || true)"
+  if [ -z "$tarball" ]; then
+    adm_warn "zen-browser: não encontrei tarball zen-*.tar.* no diretório de build."
+    return 1
+  fi
+
+  adm_info "zen-browser: extraindo $tarball para $optdir."
+  tar xf "$tarball" -C "$optdir" --strip-components=1
+
+  mkdir -p "$root/usr/bin"
+  cat >"$root/usr/bin/zen-browser" <<'EOF'
+#!/bin/sh
+exec /opt/zen-browser/zen "$@"
+EOF
+  chmod +x "$root/usr/bin/zen-browser"
+
+  mkdir -p "$root/usr/share/applications"
+  cat >"$root/usr/share/applications/zen-browser.desktop" <<'EOF'
+[Desktop Entry]
+Name=Zen Browser
+Comment=Navigate the web with Zen
+Exec=zen-browser %U
+Terminal=false
+Type=Application
+Icon=zen-browser
+Categories=Network;WebBrowser;
+EOF
+}
+
+adm_hook_post_install() {
+  adm_info "zen-browser: instalado em /opt/zen-browser com wrapper /usr/bin/zen-browser."
+}
