@@ -1,0 +1,32 @@
+name=firefox-bin
+version=133.0
+category=apps
+
+build_deps=
+
+run_deps=\
+sys/dbus,\
+x11/xorg-server,\
+x11/libX11,\
+x11/libXext,\
+x11/libXrender,\
+x11/libXrandr,\
+x11/fontconfig,\
+libs/freetype,\
+libs/zlib
+
+opt_deps=\
+fonts/dejavu-fonts,\
+fonts/noto-fonts,\
+fonts/ubuntu-font-family,\
+fonts/roboto
+
+num_builds=0
+
+description=Mozilla Firefox (binário) – pacote pré-compilado oficial, extraído e integrado pelo ADM
+homepage=https://www.mozilla.org/firefox/
+maintainer=ADM System <adm@example.local>
+
+# tarball binário para Linux 64 bits (exemplo, en-US)
+sources=https://download-installer.cdn.mozilla.net/pub/firefox/releases/133.0/linux-x86_64/en-US/firefox-133.0.tar.bz2
+sha256sums=
