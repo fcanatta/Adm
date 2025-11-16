@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_cd() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_cd)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_cd)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_cd)" "$*" >&2; }
+fi
+
+adm_hook_pre_build() { adm_info "sys/colord: build padrão."; }
+adm_hook_build() { :; }
+adm_hook_install() { :; }
+
+adm_hook_post_install() {
+  if [ "${ADM_ENABLE_SERVICES:-0}" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+    adm_info "sys/colord: habilitando colord.service (se possível)."
+    systemctl enable colord.service 2>/dev/null || adm_warn "sys/colord: habilite manualmente."
+  else
+    adm_info "sys/colord: serviço não habilitado automaticamente; faça conforme seu init."
+  fi
+}
