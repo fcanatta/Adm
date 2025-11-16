@@ -1,0 +1,16 @@
+name=which
+version=2.21
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ferramenta para localizar executáveis no PATH.
+homepage=https://www.gnu.org/software/which/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/which/which-2.21.tar.gz
+sha256sums=
