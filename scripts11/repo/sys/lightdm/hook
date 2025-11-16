@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ldm(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_ldm)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_ldm)" "$*" >&2; }
+fi
+
+ldm_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/'
+}
+
+ldm_init() {
+  if [ -n "${ADM_TARGET_INIT:-}" ]; then
+    printf '%s\n' "$ADM_TARGET_INIT"; return
+  fi
+  if [ -d /run/systemd/system ]; then
+    echo systemd
+  elif [ -d /etc/runit ]; then
+    echo runit
+  else
+    echo sysv
+  fi
+}
+
+adm_hook_post_install() {
+  local root init
+  root="$(ldm_root)"
+  init="$(ldm_init)"
+
+  adm_info "lightdm: init alvo = $init"
+
+  case "$init" in
+    runit)
+      local dir="$root/etc/runit/sv/lightdm"
+      mkdir -p "$dir"
+      if [ ! -f "$dir/run" ]; then
+        cat >"$dir/run" <<'EOF'
+#!/bin/sh
+exec /usr/sbin/lightdm
+EOF
+        chmod +x "$dir/run"
+      fi
+      ;;
+    sysv)
+      local initd="$root/etc/init.d/lightdm"
+      mkdir -p "$(dirname "$initd")"
+      if [ ! -f "$initd" ]; then
+        cat >"$initd" <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          lightdm
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     5
+# Default-Stop:      0 1 2 3 4 6
+# Short-Description: LightDM Display Manager
+### END INIT INFO
+
+case "$1" in
+  start)   /usr/sbin/lightdm ;;
+  stop)    killall lightdm 2>/dev/null || true ;;
+  restart) killall lightdm 2>/dev/null || true; /usr/sbin/lightdm ;;
+  *) echo "Uso: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0
+EOF
+        chmod +x "$initd"
+      fi
+      ;;
+    systemd)
+      adm_info "lightdm: unidades systemd já incluídas pelo upstream."
+      ;;
+  esac
+
+  adm_info "lightdm: hook finalizado (não habilitamos o serviço automaticamente)."
+}
