@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/dockbarx/metafile
+name=dockbarx
+version=1.0.0
+category=apps
+
+build_deps=sys/python3,dev/python-modules
+run_deps=sys/python3
+opt_deps=apps/xfce4-dockbarx-plugin
+
+num_builds=0
+
+description=DockbarX – dock/taskbar com agrupar ícones, integrável com XFCE e outros.
+homepage=https://github.com/M7S/dockbarx
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/M7S/dockbarx.git
+sha256sums=
