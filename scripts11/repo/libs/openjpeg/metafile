@@ -1,0 +1,16 @@
+name=openjpeg
+version=2.5.2
+category=libs
+
+build_deps=dev/gcc,dev/cmake
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=OpenJPEG – implementação open source do JPEG 2000
+homepage=https://github.com/uclouvain/openjpeg
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
