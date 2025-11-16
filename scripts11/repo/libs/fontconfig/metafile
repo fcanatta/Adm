@@ -1,0 +1,16 @@
+name=fontconfig
+version=2.15.0
+category=libs
+
+build_deps=libs/freetype,libs/expat,dev/meson,dev/ninja
+run_deps=libs/freetype
+opt_deps=
+
+num_builds=0
+
+description=Font configuration and customization library.
+homepage=https://www.freedesktop.org/wiki/Software/fontconfig/
+maintainer=ADM <adm@example.local>
+
+sources=https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.15.0.tar.xz
+sha256sums=
