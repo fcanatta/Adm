@@ -1,0 +1,16 @@
+name=colord
+version=1.4.7
+category=sys
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=colord – gerenciador de perfis de cor e calibração
+homepage=https://www.freedesktop.org/software/colord/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
