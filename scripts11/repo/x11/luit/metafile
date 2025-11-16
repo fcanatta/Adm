@@ -1,0 +1,16 @@
+name=luit
+version=20240101
+category=x11
+
+build_deps=dev/gcc,dev/util-macros
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Luit – charset conversion for terminal emulator under X11.
+homepage=https://www.x.org/
+maintainer=ADM <adm@example.local>
+
+sources=https://www.x.org/releases/individual/app/luit-20240101.tar.xz
+sha256sums=
