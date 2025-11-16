@@ -1,0 +1,16 @@
+name=asciidoc
+version=10.2.0
+category=dev
+
+build_deps=sys/python3,dev/docbook-xml,dev/docbook-xsl
+run_deps=sys/python3
+opt_deps=
+
+num_builds=0
+
+description=Ferramenta para geração de documentação a partir de texto marcado.
+homepage=https://asciidoc.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/asciidoc/asciidoc-py3/releases/download/10.2.0/asciidoc-10.2.0.tar.gz
+sha256sums=
