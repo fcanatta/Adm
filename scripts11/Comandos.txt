@@ -109,3 +109,22 @@ export ADM_FONT_MONO_DEFAULT="JetBrains Mono"
 
 # Instalar
 adm install fonts/font-defaults
+
+# libinput agressivo pra laptop
+ADM_LIBINPUT_TUNING=1 \
+ADM_LIBINPUT_TAP_DEFAULT=1 \
+ADM_LIBINPUT_NATURAL_SCROLL=1 \
+ADM_LIBINPUT_DISABLE_WHILE_TYPING=1 \
+ADM_LIBINPUT_ACCEL_PROFILE=adaptive \
+ADM_LIBINPUT_ACCEL_SPEED=0.3 \
+adm install libs/libinput
+
+# xfce4-terminal com JetBrains Mono 11
+ADM_XFCE4_TERM_FONT_NAME="JetBrains Mono" \
+ADM_XFCE4_TERM_FONT_SIZE=11 \
+adm install apps/xfce4-terminal
+
+# Openbox com tema custom e 6 desktops
+ADM_OPENBOX_THEME="Clearlooks" \
+ADM_OPENBOX_NUM_DESKTOPS=6 \
+adm install x11/obconf
