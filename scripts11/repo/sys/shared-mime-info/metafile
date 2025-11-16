@@ -1,0 +1,16 @@
+name=shared-mime-info
+version=2.4
+category=sys
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=shared-mime-info – base de dados de tipos MIME do freedesktop
+homepage=https://gitlab.freedesktop.org/xdg/shared-mime-info
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
