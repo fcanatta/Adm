@@ -1,0 +1,17 @@
+name=adwaita-gtk-theme
+version=48.0
+category=themes
+
+build_deps=x11/gtk-3,x11/gtk-4
+run_deps=x11/gtk-3,x11/gtk-4
+opt_deps=libs/libadwaita
+
+num_builds=0
+
+description=Tema GTK oficial Adwaita para GTK3 e GTK4.
+homepage=https://gitlab.gnome.org/GNOME/gtk
+maintainer=ADM System <adm@example.local>
+
+# Ajuste para o seu tarball real ou módulo git empacotado
+sources=
+sha256sums=
