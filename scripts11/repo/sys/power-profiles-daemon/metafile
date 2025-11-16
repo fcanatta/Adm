@@ -1,0 +1,16 @@
+name=power-profiles-daemon
+version=0.21
+category=sys
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=power-profiles-daemon – daemon moderno de perfis de energia
+homepage=https://gitlab.freedesktop.org/hadess/power-profiles-daemon
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
