@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_sddm(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_sddm)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_sddm)" "$*" >&2; }
+fi
+
+sddm_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/'
+}
+
+sddm_init() {
+  if [ -n "${ADM_TARGET_INIT:-}" ]; then
+    printf '%s\n' "$ADM_TARGET_INIT"; return
+  fi
+  if [ -d /run/systemd/system ]; then
+    echo systemd
+  elif [ -d /etc/runit ]; then
+    echo runit
+  else
+    echo sysv
+  fi
+}
+
+adm_hook_pre_build() { :; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  : # cmake + make install via ADM
+}
+
+adm_hook_post_install() {
+  local root init
+  root="$(sddm_root)"
+  init="$(sddm_init)"
+
+  adm_info "sddm: init detectado/alvo = $init"
+
+  case "$init" in
+    runit)
+      local dir="$root/etc/runit/sv/sddm"
+      mkdir -p "$dir"
+      if [ ! -f "$dir/run" ]; then
+        cat >"$dir/run" <<'EOF'
+#!/bin/sh
+exec /usr/bin/sddm -nodaemon
+EOF
+        chmod +x "$dir/run"
+      fi
+      ;;
+    sysv)
+      local initd="$root/etc/init.d/sddm"
+      mkdir -p "$(dirname "$initd")"
+      if [ ! -f "$initd" ]; then
+        cat >"$initd" <<'EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          sddm
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     5
+# Default-Stop:      0 1 2 3 4 6
+# Short-Description: Simple Desktop Display Manager
+### END INIT INFO
+
+case "$1" in
+  start)   /usr/bin/sddm ;; 
+  stop)    killall sddm 2>/dev/null || true ;;
+  restart) killall sddm 2>/dev/null || true; /usr/bin/sddm ;;
+  *) echo "Uso: $0 {start|stop|restart}"; exit 1 ;;
+esac
+
+exit 0
+EOF
+        chmod +x "$initd"
+      fi
+      ;;
+    systemd)
+      adm_info "sddm: unidades systemd já vêm do upstream; nada extra a criar."
+      ;;
+  esac
+
+  adm_info "sddm: hook concluído. Não habilitamos o serviço automaticamente."
+}
