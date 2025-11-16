@@ -1,0 +1,16 @@
+name=clang
+version=18.1.0
+category=dev
+
+build_deps=dev/llvm,dev/cmake,dev/ninja,dev/python3
+run_deps=dev/llvm
+opt_deps=
+
+num_builds=0
+
+description=Clang – frontend C/C++/Objective-C para LLVM
+homepage=https://clang.llvm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.0/clang-18.1.0.src.tar.xz
+sha256sums=
