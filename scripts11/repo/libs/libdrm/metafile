@@ -1,0 +1,16 @@
+name=libdrm
+version=2.4.120
+category=libs
+
+build_deps=dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Direct Rendering Manager library.
+homepage=https://dri.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://dri.freedesktop.org/libdrm/libdrm-2.4.120.tar.xz
+sha256sums=
