@@ -1,0 +1,16 @@
+name=wayland-protocols
+version=1.36
+category=wayland
+
+build_deps=dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Collection of Wayland protocols that add functionality over the core protocol.
+homepage=https://wayland.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gitlab.freedesktop.org/wayland/wayland-protocols/-/archive/1.36/wayland-protocols-1.36.tar.gz
+sha256sums=
