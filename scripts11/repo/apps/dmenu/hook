@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Hook para apps/dmenu
+# - Cria script helper em /usr/local/bin/dm-run (root alvo) para chamar dmenu_run
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_dm() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_dm)" "$*" >&2; }
+fi
+
+dm_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+adm_hook_pre_build() { adm_info "apps/dmenu: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root bindir helper
+  root="$(dm_root)"
+  bindir="$root/usr/local/bin"
+  helper="$bindir/dm-run"
+
+  mkdir -p "$bindir"
+  if [ -x "$helper" ]; then
+    adm_info "apps/dmenu: helper dm-run já existe; não sobrescrevendo."
+    return 0
+  fi
+
+  cat >"$helper" <<'EOF'
+#!/bin/sh
+# dm-run – helper simples para dmenu_run
+dmenu_run -fn "monospace-10"
+EOF
+  chmod +x "$helper"
+  adm_info "apps/dmenu: helper dm-run criado em /usr/local/bin."
+}
+
+adm_hook_post_install() { adm_info "apps/dmenu: hook concluído."; }
