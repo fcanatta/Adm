@@ -1,0 +1,16 @@
+name=lightdm
+version=1.32.0
+category=sys
+
+build_deps=dev/cmake,dev/ninja,sys/pam,sys/systemd
+run_deps=sys/pam
+opt_deps=themes/hicolor-icon-theme,themes/adwaita-icon-theme
+
+num_builds=0
+
+description=LightDM – Display Manager leve e flexível.
+homepage=https://github.com/canonical/lightdm
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/canonical/lightdm/archive/refs/tags/1.32.0.tar.gz
+sha256sums=
