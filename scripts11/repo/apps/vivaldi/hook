@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_viv(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_viv)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_viv)" "$*" >&2; }
+fi
+
+viv_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "vivaldi: reempacotando .deb oficial."
+}
+
+adm_hook_build() {
+  : # nada a compilar
+}
+
+adm_hook_install() {
+  local root work deb
+  root="$(viv_root)"
+  work="$PWD"
+
+  deb="$(ls vivaldi-stable_*_amd64.deb vivaldi-*.deb 2>/dev/null | head -n1 || true)"
+  if [ -z "$deb" ]; then
+    adm_warn "vivaldi: .deb não encontrado no diretório de build."
+    return 1
+  fi
+
+  mkdir -p "$work/_deb"
+  cd "$work/_deb"
+
+  ar x "../$deb"
+  tar xf data.tar.* 2>/dev/null || true
+
+  adm_info "vivaldi: copiando árvore do .deb para root."
+  cp -a usr opt "$root/" 2>/dev/null || true
+}
+
+adm_hook_post_install() {
+  adm_info "vivaldi: instalado a partir do .deb oficial (reempacote ADM)."
+}
