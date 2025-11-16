@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Hook para x11/notification-daemon
+# - Cria /etc/xdg/autostart/notification-daemon.desktop para iniciar junto do desktop
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_nd() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_nd)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_nd)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_nd)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+nd_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+nd_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local b="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "x11/notification-daemon: '$path' já existe; backup em '$b'."
+    cp -a "$path" "$b"
+  fi
+}
+
+adm_hook_pre_build() { adm_info "x11/notification-daemon: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root dir file
+  root="$(nd_root)"
+  dir="$root/etc/xdg/autostart"
+  file="$dir/notification-daemon.desktop"
+
+  mkdir -p "$dir"
+  nd_backup_if_exists "$file"
+
+  adm_info "x11/notification-daemon: criando autostart em '$file'."
+  cat >"$file" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Notification Daemon
+Exec=notification-daemon
+OnlyShowIn=GNOME;XFCE;LXDE;LXQt;MATE;X-Generic;
+NoDisplay=true
+EOF
+}
+
+adm_hook_post_install() {
+  adm_info "x11/notification-daemon: autostart configurado em /etc/xdg/autostart."
+}
