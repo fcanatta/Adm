@@ -1,0 +1,16 @@
+name=thunar
+version=4.18.9
+category=apps
+
+build_deps=x11/gtk-3,x11/xfconf,x11/exo,libs/glib,dev/meson,dev/ninja
+run_deps=x11/gtk-3,x11/xfconf,x11/exo
+opt_deps=apps/thunar-volman,sys/udisks,sys/gvfs
+
+num_builds=0
+
+description=Thunar – gerenciador de arquivos do XFCE.
+homepage=https://docs.xfce.org/xfce/thunar/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/thunar/4.18/thunar-4.18.9.tar.bz2
+sha256sums=
