@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Hook para sys/shared-mime-info
+# - Após instalação, roda update-mime-database no root alvo (se disponível)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_mime() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_mime)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_mime)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_mime)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+mime_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() { adm_info "sys/shared-mime-info: build padrão."; }
+adm_hook_build() { :; }
+adm_hook_install() { :; }
+
+adm_hook_post_install() {
+  local root mime_dir
+  root="$(mime_root)"
+  mime_dir="$root/usr/share/mime"
+
+  if command -v update-mime-database >/dev/null 2>&1; then
+    adm_info "sys/shared-mime-info: atualizando base MIME em '$mime_dir'."
+    update-mime-database "$mime_dir" || adm_warn "update-mime-database falhou."
+  else
+    adm_warn "sys/shared-mime-info: update-mime-database não encontrado; pulei."
+  fi
+}
