@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null; then
+  adm_info(){ echo "[w3m] $*"; }
+fi
+
+root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s' "$DESTDIR" ||
+  printf '/'
+}
+
+cflags_opt() {
+  local f="-O3 -fPIC -fstack-protector-strong"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="$f -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+}
+
+adm_hook_build() {
+  CFLAGS="$(cflags_opt)" ./configure \
+      --prefix=/usr \
+      --enable-ssl \
+      --with-gc \
+      --enable-image=no
+
+  make -j"$(nproc)"
+}
+
+adm_hook_install() {
+  make DESTDIR="$(root)" install
+}
+
+adm_hook_post_install() {
+  adm_info "w3m instalado com tunagem agressiva."
+}
