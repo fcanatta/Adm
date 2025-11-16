@@ -1,0 +1,16 @@
+name=mpv
+version=0.38.0
+category=media
+
+build_deps=dev/meson,dev/ninja,media/ffmpeg,libs/libdrm,libs/libX11
+run_deps=media/ffmpeg,libs/libdrm,libs/libX11
+opt_deps=gstreamer,libs/pulseaudio,libs/alsa-lib
+
+num_builds=0
+
+description=MPV – player de vídeo moderno baseado em MPlayer/mplayer2.
+homepage=https://mpv.io/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/mpv-player/mpv/archive/refs/tags/v0.38.0.tar.gz
+sha256sums=
