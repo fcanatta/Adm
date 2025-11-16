@@ -1,0 +1,16 @@
+name=fop
+version=2.9
+category=dev
+
+build_deps=sys/java,dev/xmlto
+run_deps=sys/java
+opt_deps=
+
+num_builds=0
+
+description=Apache FOP – processador XSL-FO para gerar arquivos PDF.
+homepage=https://xmlgraphics.apache.org/fop/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.apache.org/xmlgraphics/fop/binaries/fop-2.9-bin.tar.gz
+sha256sums=
