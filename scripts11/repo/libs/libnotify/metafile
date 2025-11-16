@@ -1,0 +1,16 @@
+name=libnotify
+version=0.8.3
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=libnotify – biblioteca para notificações desktop (freedesktop.org)
+homepage=https://gitlab.gnome.org/GNOME/libnotify
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
