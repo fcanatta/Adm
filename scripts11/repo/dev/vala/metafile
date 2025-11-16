@@ -1,0 +1,16 @@
+name=vala
+version=0.56.7
+category=dev
+
+build_deps=dev/gcc,dev/meson,dev/ninja,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Compilador e frontend para linguagem Vala (GObject).
+homepage=https://wiki.gnome.org/Projects/Vala
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/vala/0.56/vala-0.56.7.tar.xz
+sha256sums=
