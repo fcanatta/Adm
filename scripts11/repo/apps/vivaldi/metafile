@@ -1,0 +1,17 @@
+name=vivaldi
+version=6.9.3447.54
+category=apps
+
+build_deps=sys/ar,sys/tar,sys/xz
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Vivaldi – navegador baseado em Chromium com interface avançada.
+homepage=https://vivaldi.com/
+maintainer=ADM System <adm@example.local>
+
+# Ajuste esta URL para a versão/arquitetura que você quiser
+sources=https://downloads.vivaldi.com/stable/vivaldi-stable_6.9.3447.54-1_amd64.deb
+sha256sums=
