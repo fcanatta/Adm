@@ -1,0 +1,16 @@
+name=libxcvt
+version=0.1.2
+category=x11
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=VESA CVT modeline generation library.
+homepage=https://gitlab.freedesktop.org/xorg/lib/libxcvt
+maintainer=ADM <adm@example.local>
+
+sources=https://gitlab.freedesktop.org/xorg/lib/libxcvt/-/archive/xorg-libxcvt-0.1.2.tar.gz
+sha256sums=
