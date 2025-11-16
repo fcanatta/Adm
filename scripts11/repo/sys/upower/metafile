@@ -1,0 +1,16 @@
+name=upower
+version=1.90.0
+category=sys
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=upower – daemon para gerenciamento de energia/baterias
+homepage=https://upower.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
