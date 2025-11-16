@@ -1,0 +1,17 @@
+name=adwaita-fonts
+version=1.0
+category=fonts
+
+build_deps=libs/fontconfig
+run_deps=libs/fontconfig
+opt_deps=
+
+num_builds=0
+
+description=Conjunto de fontes Adwaita (família padrão do stack GNOME/Adwaita).
+homepage=https://gitlab.gnome.org/
+maintainer=ADM System <adm@example.local>
+
+# Ajuste a URL real conforme o seu tarball local ou upstream
+sources=
+sha256sums=
