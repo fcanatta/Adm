@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_gn(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_gn)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_gn)" "$*" >&2; }
+fi
+
+gn_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/\n'
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "gn: bootstrap do binário gn."
+}
+
+adm_hook_build() {
+  # Script oficial bootstrap (repo de gn)
+  if [ -x "./build/gen.py" ]; then
+    python3 ./build/gen.py
+    ninja -C out
+  else
+    adm_warn "gn: build/gen.py não encontrado; repo pode ter mudado estrutura."
+  fi
+}
+
+adm_hook_install() {
+  local root
+  root="$(gn_root)"
+
+  mkdir -p "$root/usr/bin"
+  if [ -x "./out/gn" ]; then
+    cp -a ./out/gn "$root/usr/bin/gn"
+  else
+    adm_warn "gn: ./out/gn não encontrado; nada instalado."
+  fi
+}
+
+adm_hook_post_install() { :; }
