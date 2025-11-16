@@ -1,0 +1,16 @@
+name=xorg-fonts
+version=20220830
+category=fonts
+
+build_deps=dev/util-macros,fontconfig
+run_deps=fontconfig
+opt_deps=
+
+num_builds=0
+
+description=Legacy X11 bitmap fonts.
+homepage=https://www.x.org/
+maintainer=ADM <adm@example.local>
+
+sources=https://www.x.org/releases/individual/font/font-misc-misc-1.1.3.tar.xz
+sha256sums=
