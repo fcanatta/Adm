@@ -1,0 +1,16 @@
+name=nodejs
+version=22.0.0
+category=dev
+
+build_deps=dev/gcc,dev/python3
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Node.js – runtime JavaScript baseado em V8
+homepage=https://nodejs.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://nodejs.org/dist/v22.0.0/node-v22.0.0.tar.xz
+sha256sums=
