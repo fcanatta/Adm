@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ibus() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ibus)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ibus)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ibus)" "$*" >&2; }
+fi
+
+ibus_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() { adm_info "sys/ibus: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root skel envfile
+  root="$(ibus_root)"
+  skel="$root/etc/skel"
+  envfile="$skel/.xprofile"
+
+  mkdir -p "$skel"
+
+  if ! grep -q "IBUS_ENABLE" "${envfile:-/dev/null}" 2>/dev/null; then
+    adm_info "sys/ibus: adicionando configuração básica de IBUS em /etc/skel/.xprofile."
+    cat >>"$envfile" <<'EOF'
+# Configuração básica de método de entrada IBUS (gerado pelo ADM)
+export GTK_IM_MODULE=ibus
+export QT_IM_MODULE=ibus
+export XMODIFIERS=@im=ibus
+EOF
+  fi
+}
+
+adm_hook_post_install() {
+  adm_info "sys/ibus: novos usuários terão variáveis IBUS em /etc/skel/.xprofile."
+}
