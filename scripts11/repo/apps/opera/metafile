@@ -1,0 +1,17 @@
+name=opera
+version=stable_amd64
+category=apps
+
+build_deps=sys/ar,sys/tar,sys/xz
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Opera – navegador baseado em Chromium com interface própria.
+homepage=https://www.opera.com/
+maintainer=ADM System <adm@example.local>
+
+# Ajuste para a versão desejada; exemplo de padrão (substitua pela release real se precisar)
+sources=https://download.opera.com/ftp/pub/opera/desktop/108.0.5067.29/linux/opera-stable_108.0.5067.29_amd64.deb
+sha256sums=
