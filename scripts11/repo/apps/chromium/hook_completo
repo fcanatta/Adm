@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# hook do ADM para construção completa do Chromium from source
+# E só mudar para hook para usar esse hook completo 
+set -euo pipefail
+IFS=$'\n\t'
+
+########################################
+# Logging (fallback, caso 01-log-ui.sh
+# ainda não esteja disponível)
+########################################
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_chr() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n' "$(_ts_chr)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n' "$(_ts_chr)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n' "$(_ts_chr)" "$*" >&2; }
+fi
+
+########################################
+# Helpers de ambiente
+########################################
+
+chr_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+chr_jobs() {
+  if [ -n "${ADM_JOBS:-}" ]; then
+    printf '%s\n' "$ADM_JOBS"
+  elif command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    echo 4
+  fi
+}
+
+chr_cflags() {
+  local f="-O2 -fPIC"
+  case "${ADM_PROFILE:-normal}" in
+    aggressive)
+      f="-O3 -fPIC -march=native -mtune=native -flto"
+      ;;
+    minimal)
+      f="-O2 -fPIC"
+      ;;
+    *)
+      f="-O2 -fPIC"
+      ;;
+  esac
+  printf '%s\n' "$f"
+}
+
+chr_ldflags() {
+  local f=""
+  case "${ADM_PROFILE:-normal}" in
+    aggressive)
+      f="-Wl,-O1"
+      ;;
+    *)
+      f=""
+      ;;
+  esac
+  printf '%s\n' "$f"
+}
+
+# Proprietary codecs / Chrome branding (opcional)
+chr_use_proprietary_codecs() {
+  if [ "${ADM_CHROMIUM_PROPRIETARY_CODECS:-0}" = "1" ]; then
+    echo "true"
+  else
+    echo "false"
+  fi
+}
+
+chr_ffmpeg_branding() {
+  if [ "${ADM_CHROMIUM_PROPRIETARY_CODECS:-0}" = "1" ]; then
+    echo "Chrome"
+  else
+    echo "Chromium"
+  fi
+}
+
+########################################
+# PRE_BUILD: avisar o ADM que esse
+# hook vai controlar TODO o build
+########################################
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+
+  adm_info "chromium: hook de build completo ativado."
+  adm_info "chromium: profile='${ADM_PROFILE:-normal}', jobs=$(chr_jobs), proprietary_codecs=$(chr_use_proprietary_codecs), ffmpeg_branding=$(chr_ffmpeg_branding)"
+}
+
+########################################
+# BUILD: bootstrap do GN, args.gn,
+# gn gen, ninja build
+########################################
+
+chr_bootstrap_gn() {
+  local srcdir="$1"
+
+  # Já existe gn em out/Release?
+  if [ -x "$srcdir/out/Release/gn" ]; then
+    adm_info "chromium: gn já existe em out/Release/gn – pulando bootstrap."
+    return 0
+  fi
+
+  # Tenta bootstrap a partir do script do source
+  if [ -x "$srcdir/tools/gn/bootstrap/bootstrap.py" ]; then
+    adm_info "chromium: executando tools/gn/bootstrap/bootstrap.py."
+    python3 "$srcdir/tools/gn/bootstrap/bootstrap.py" -s
+    return 0
+  fi
+
+  adm_warn "chromium: bootstrap.py não encontrado; assumindo 'gn' disponível no PATH."
+  return 0
+}
+
+chr_write_args_gn() {
+  local srcdir="$1"
+  local args="$srcdir/out/Release/args.gn"
+  local ff_brand proprietary cflags ldflags
+
+  ff_brand="$(chr_ffmpeg_branding)"
+  proprietary="$(chr_use_proprietary_codecs)"
+  cflags="$(chr_cflags)"
+  ldflags="$(chr_ldflags)"
+
+  adm_info "chromium: gerando args.gn (ffmpeg_branding=\"$ff_brand\", proprietary_codecs=$proprietary)."
+
+  mkdir -p "$srcdir/out/Release"
+
+  cat >"$args" <<EOF
+is_debug = false
+is_official_build = true
+symbol_level = 0
+
+is_clang = true
+use_lld = true
+
+enable_nacl = false
+use_sysroot = false
+
+ffmpeg_branding = "$ff_brand"
+proprietary_codecs = $proprietary
+
+is_component_build = false
+use_gtk = true
+
+use_custom_libcxx = false
+
+# Flags de otimização vinda do ADM
+cflags_c = "$cflags"
+cflags_cc = "$cflags"
+cflags_objc = "$cflags"
+cflags_objcc = "$cflags"
+ldflags = "$ldflags"
+EOF
+}
+
+chr_run_gn_gen() {
+  local srcdir="$1"
+
+  if command -v gn >/dev/null 2>&1; then
+    adm_info "chromium: usando 'gn' do sistema para gen."
+    gn gen "$srcdir/out/Release"
+  elif [ -x "$srcdir/out/Release/gn" ]; then
+    adm_info "chromium: usando 'out/Release/gn' para gen."
+    "$srcdir/out/Release/gn" gen "$srcdir/out/Release"
+  else
+    adm_error "chromium: 'gn' não encontrado nem no PATH, nem em out/Release/gn."
+    return 1
+  fi
+}
+
+chr_run_ninja() {
+  local srcdir="$1"
+  local jobs
+  jobs="$(chr_jobs)"
+
+  adm_info "chromium: iniciando build ninja (jobs=$jobs)."
+
+  if ! command -v ninja >/dev/null 2>&1; then
+    adm_error "chromium: 'ninja' não encontrado no PATH."
+    return 1
+  fi
+
+  # Tenta alvo chrome, depois chromium
+  if ninja -C "$srcdir/out/Release" -j"$jobs" chrome; then
+    adm_info "chromium: alvo 'chrome' compilado com sucesso."
+    return 0
+  fi
+
+  if ninja -C "$srcdir/out/Release" -j"$jobs" chromium; then
+    adm_info "chromium: alvo 'chromium' compilado com sucesso."
+    return 0
+  fi
+
+  adm_error "chromium: falha ao compilar 'chrome' e 'chromium'; verifique os logs em out/Release/."
+  return 1
+}
+
+adm_hook_build() {
+  local srcdir
+  srcdir="$PWD"
+
+  adm_info "chromium: iniciando build from source em '$srcdir'."
+
+  chr_bootstrap_gn "$srcdir"
+  chr_write_args_gn "$srcdir"
+  chr_run_gn_gen "$srcdir"
+  chr_run_ninja "$srcdir"
+
+  adm_info "chromium: build concluído com sucesso."
+}
+
+########################################
+# INSTALL: /usr/lib/chromium + wrapper
+########################################
+
+adm_hook_install() {
+  local root libdir bindir outdir bin
+
+  root="$(chr_root)"
+  outdir="$PWD/out/Release"
+  libdir="$root/usr/lib/chromium"
+  bindir="$root/usr/bin"
+
+  if [ -x "$outdir/chrome" ]; then
+    bin="chrome"
+  elif [ -x "$outdir/chromium" ]; then
+    bin="chromium"
+  else
+    adm_error "chromium: binário 'chrome' ou 'chromium' não encontrado em $outdir."
+    return 1
+  fi
+
+  adm_info "chromium: instalando build (bin=$bin) em '$libdir'."
+
+  mkdir -p "$libdir"
+  # Copia tudo do out/Release (pode ser refinado depois para algo mais enxuto)
+  cp -a "$outdir"/. "$libdir/"
+
+  mkdir -p "$bindir"
+  cat >"$bindir/chromium" <<EOF
+#!/bin/sh
+exec /usr/lib/chromium/$bin "\$@"
+EOF
+  chmod +x "$bindir/chromium"
+}
+
+########################################
+# POST_INSTALL: .desktop e ajustes
+########################################
+
+adm_hook_post_install() {
+  local root desktop_dir
+
+  root="$(chr_root)"
+  desktop_dir="$root/usr/share/applications"
+
+  adm_info "chromium: criando arquivo .desktop em '$desktop_dir'."
+
+  mkdir -p "$desktop_dir"
+  cat >"$desktop_dir/chromium.desktop" <<'EOF'
+[Desktop Entry]
+Version=1.0
+Name=Chromium
+Comment=Browse the Web
+Exec=chromium %U
+Terminal=false
+X-MultipleArgs=false
+Type=Application
+Icon=chromium
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+EOF
+
+  adm_info "chromium: hook pós-instalação concluído."
+}
