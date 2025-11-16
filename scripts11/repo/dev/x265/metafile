@@ -1,0 +1,16 @@
+name=x265
+version=3.5
+category=dev
+
+build_deps=dev/gcc,dev/cmake,dev/ninja,dev/yasm
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Encoder HEVC/H.265 altamente otimizado.
+homepage=https://x265.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://bitbucket.org/multicoreware/x265_git/get/3.5.tar.gz
+sha256sums=
