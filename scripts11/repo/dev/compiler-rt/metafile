@@ -1,0 +1,16 @@
+name=compiler-rt
+version=18.1.0
+category=dev
+
+build_deps=dev/llvm,dev/cmake,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=compiler-rt – runtimes de baixo nível para LLVM/Clang (builtins, sanitizers)
+homepage=https://compiler-rt.llvm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.0/compiler-rt-18.1.0.src.tar.xz
+sha256sums=
