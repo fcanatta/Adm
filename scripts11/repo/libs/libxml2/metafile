@@ -1,0 +1,16 @@
+name=libxml2
+version=2.12.7
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libxml2 – biblioteca para parsing de XML
+homepage=https://gitlab.gnome.org/GNOME/libxml2
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
