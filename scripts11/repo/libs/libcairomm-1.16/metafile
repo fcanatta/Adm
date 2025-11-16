@@ -1,0 +1,16 @@
+name=libcairomm-1.16
+version=1.18.0
+category=libs
+
+build_deps=libs/cairo-5c,dev/meson,dev/ninja
+run_deps=libs/cairo-5c
+opt_deps=
+
+num_builds=0
+
+description=C++ bindings para Cairo (API 1.16, série 1.18.x).
+homepage=https://www.cairographics.org/cairomm/
+maintainer=ADM System <adm@example.local>
+
+sources=https://cairographics.org/releases/cairomm-1.18.0.tar.xz
+sha256sums=
