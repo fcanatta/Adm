@@ -1,0 +1,16 @@
+name=conky-git
+version=0_git
+category=apps
+
+build_deps=dev/cmake,dev/ninja,dev/pkgconf,libs/libX11,libs/imlib2,dev/lua,libs/libXdamage,libs/libXinerama,libs/libXft
+run_deps=libs/libX11,libs/imlib2,dev/lua,libs/libXdamage,libs/libXinerama,libs/libXft
+opt_deps=fonts/ttf-conkyweather,fonts/nerd-fonts
+
+num_builds=0
+
+description=Conky – monitor de sistema altamente configurável (git).
+homepage=https://github.com/brndnmtthws/conky
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/brndnmtthws/conky.git
+sha256sums=
