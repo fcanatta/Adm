@@ -1,0 +1,16 @@
+name=gtk-3
+version=3.24.41
+category=x11
+
+build_deps=libs/pango,libs/atk,libs/cairo-5c,libs/gdk-pixbuf,libs/graphene,libs/libepoxy,dev/meson,dev/ninja
+run_deps=libs/pango,libs/atk,libs/cairo-5c,libs/gdk-pixbuf,libs/libepoxy
+opt_deps=
+
+num_builds=0
+
+description=GTK 3 – toolkit gráfico para X11/Wayland.
+homepage=https://www.gtk.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/gtk+/3.24/gtk+-3.24.41.tar.xz
+sha256sums=
