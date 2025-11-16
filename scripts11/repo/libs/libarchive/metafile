@@ -1,0 +1,16 @@
+name=libarchive
+version=3.7.2
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libarchive – leitura/escrita de vários formatos de arquivos e compressão
+homepage=https://www.libarchive.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.libarchive.org/downloads/libarchive-3.7.2.tar.xz
+sha256sums=
