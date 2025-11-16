@@ -1,0 +1,16 @@
+name=xfconf
+version=4.18.0
+category=x11
+
+build_deps=dev/meson,dev/ninja,x11/gtk-3,libs/glib
+run_deps=libs/glib
+opt_deps=
+
+num_builds=0
+
+description=xfconf – sistema de configuração do XFCE baseado em D-Bus.
+homepage=https://docs.xfce.org/xfce/xfconf/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfconf/4.18/xfconf-4.18.0.tar.bz2
+sha256sums=
