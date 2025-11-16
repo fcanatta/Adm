@@ -1,0 +1,16 @@
+name=libjpeg-turbo
+version=3.0.0
+category=libs
+
+build_deps=dev/gcc,dev/cmake
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libjpeg-turbo – implementação rápida de JPEG (SIMD)
+homepage=https://libjpeg-turbo.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/libjpeg-turbo/libjpeg-turbo-3.0.0.tar.gz
+sha256sums=
