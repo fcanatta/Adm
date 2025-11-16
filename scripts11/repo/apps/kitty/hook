@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Hook para apps/kitty
+# - Cria config base em /etc/skel/.config/kitty/kitty.conf
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_kt() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_kt)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_kt)" "$*" >&2; }
+fi
+
+kt_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+adm_hook_pre_build() { adm_info "apps/kitty: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root skel cfgdir cfg
+  root="$(kt_root)"
+  skel="$root/etc/skel"
+  cfgdir="$skel/.config/kitty"
+  cfg="$cfgdir/kitty.conf"
+
+  mkdir -p "$cfgdir"
+
+  if [ -e "$cfg" ]; then
+    adm_info "apps/kitty: config já existente em /etc/skel; não sobrescrevendo."
+    return 0
+  fi
+
+  adm_info "apps/kitty: criando kitty.conf base em '$cfg'."
+  cat >"$cfg" <<'EOF'
+font_family JetBrains Mono
+font_size 11.0
+enable_audio_bell no
+cursor_shape block
+background #1e1e1e
+foreground #d0d0d0
+EOF
+}
+
+adm_hook_post_install() {
+  adm_info "apps/kitty: config skel criada."
+}
