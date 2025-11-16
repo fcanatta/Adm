@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_x265() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info() { printf '[%s] [INFO] %s\n' "$(_ts_x265)" "$*" >&2; }
+fi
+
+root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ] && printf '%s\n' "$DESTDIR" ||
+  printf '/'
+}
+
+cflags_opt() {
+  local f="-O3 -fPIC"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="$f -march=native -mtune=native -flto -ffast-math"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+}
+
+adm_hook_build() {
+  local src="$PWD"
+
+  build_x265() {
+    local depth="$1"
+    local out="build_${depth}"
+
+    mkdir -p "$out"
+    cd "$out"
+
+    CFLAGS="$(cflags_opt)" cmake ../source \
+        -G Ninja \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DENABLE_SHARED=ON \
+        -DHIGH_BIT_DEPTH=ON \
+        -DEXPORT_C_API=ON \
+        -DENABLE_CLI=ON \
+        -DMAIN${depth}=ON
+
+    ninja -j"$(nproc)"
+    cd "$src"
+  }
+
+  build_x265 "8"
+  build_x265 "10"
+  build_x265 "12"
+}
+
+adm_hook_install() {
+  for d in build_*; do
+    [ -d "$d" ] && DESTDIR="$(root)" ninja -C "$d" install
+  done
+}
+
+adm_hook_post_install() {
+  adm_info "x265 multi-depth instalado com tunagem agressiva."
+}
