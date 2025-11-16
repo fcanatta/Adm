@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/media/gstreamer-plugins-bad/metafile
+name=gstreamer-plugins-bad
+version=1.24.6
+category=media
+
+build_deps=media/gstreamer-plugins-base,dev/meson,dev/ninja,dev/pkgconf
+run_deps=media/gstreamer-plugins-base
+opt_deps=
+
+num_builds=0
+
+description=GStreamer bad plugins – elementos experimentais.
+homepage=https://gstreamer.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gstreamer.freedesktop.org/src/gst-plugins-bad/gst-plugins-bad-1.24.6.tar.xz
+sha256sums=
