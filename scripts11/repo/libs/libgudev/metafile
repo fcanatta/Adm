@@ -1,0 +1,16 @@
+name=libgudev
+version=238
+category=libs
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=sys/udev
+opt_deps=
+
+num_builds=0
+
+description=libgudev – wrapper GObject para libudev
+homepage=https://gitlab.gnome.org/GNOME/libgudev
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
