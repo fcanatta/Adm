@@ -2,15 +2,15 @@ name=llvm
 version=18.1.0
 category=dev
 
-build_deps=dev/gcc,dev/cmake,dev/ninja,dev/python
+build_deps=dev/gcc,dev/cmake,dev/ninja,dev/python3
 run_deps=
 opt_deps=
 
 num_builds=0
 
-description=LLVM – infraestrutura de compiladores modular
+description=LLVM – infraestrutura de compilação modular (llc, opt, etc.)
 homepage=https://llvm.org/
 maintainer=ADM System <adm@example.local>
 
-sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.0/llvm-project-18.1.0.src.tar.xz
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.0/llvm-18.1.0.src.tar.xz
 sha256sums=
