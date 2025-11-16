@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/dev/gn/metafile
+name=gn
+version=0.0.0_git
+category=dev
+
+build_deps=dev/python3,dev/ninja,dev/gcc
+run_deps=dev/python3
+opt_deps=
+
+num_builds=0
+
+description=GN – meta-build system used by Chromium.
+homepage=https://gn.googlesource.com/gn/
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://gn.googlesource.com/gn
+sha256sums=
