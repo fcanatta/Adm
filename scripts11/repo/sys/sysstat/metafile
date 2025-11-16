@@ -1,0 +1,16 @@
+name=sysstat
+version=12.7.0
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=sysstat – coleções de ferramentas de monitoramento de performance (sar, iostat…)
+homepage=https://github.com/sysstat/sysstat
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
