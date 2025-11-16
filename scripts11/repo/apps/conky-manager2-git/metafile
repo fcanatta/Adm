@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/conky-manager2-git/metafile
+name=conky-manager2-git
+version=2024.01
+category=apps
+
+build_deps=apps/conky,x11/gtk-3,dev/gcc,dev/pkgconf
+run_deps=apps/conky,x11/gtk-3
+opt_deps=apps/conky-colors-git
+
+num_builds=0
+
+description=Conky Manager 2 – gerenciador gráfico de temas Conky.
+homepage=https://github.com/zcot/conky-manager2
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/zcot/conky-manager2.git
+sha256sums=
