@@ -1,0 +1,22 @@
+name=libwebp
+version=1.4.0
+category=libs
+
+build_deps=\
+dev/gcc,\
+dev/cmake,\
+dev/ninja,\
+dev/pkgconf
+
+run_deps=
+
+opt_deps=
+
+num_builds=0
+
+description=libwebp – Biblioteca do Google para codificar e decodificar imagens WebP.
+homepage=https://developers.google.com/speed/webp
+maintainer=ADM System <adm@example.local>
+
+sources=https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.4.0.tar.gz
+sha256sums=
