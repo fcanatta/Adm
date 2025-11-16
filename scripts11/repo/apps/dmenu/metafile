@@ -1,0 +1,16 @@
+name=dmenu
+version=5.2
+category=apps
+
+build_deps=dev/gcc
+run_deps=x11/xorg-server,x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=dmenu – dynamic menu para X da suckless
+homepage=https://tools.suckless.org/dmenu/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
