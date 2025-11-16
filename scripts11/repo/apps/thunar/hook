@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_th(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_th)" "$*" >&2; }
+fi
+
+th_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  adm_info "thunar: build padrão (meson) é suficiente."
+}
+
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  : # deixamos o ADM realizar o install normal
+}
+
+adm_hook_post_install() {
+  local root skel tdir
+  root="$(th_root)"
+  skel="$root/etc/skel"
+  tdir="$skel/.config/Thunar"
+
+  adm_info "thunar: criando configuração padrão em /etc/skel."
+
+  mkdir -p "$tdir"
+
+  # Aceleradores padrão (exemplo simples)
+  if [ ! -f "$tdir/accels.scm" ]; then
+    cat >"$tdir/accels.scm" <<'EOF'
+; Thunar default accels (gerado pelo ADM)
+(gtk_accel_path "<Actions>/ThunarWindow/open-home" "primary+h")
+(gtk_accel_path "<Actions>/ThunarWindow/open-root" "<Shift>primary+r")
+EOF
+  fi
+
+  # Ações personalizadas (uca.xml) – só stub
+  if [ ! -f "$tdir/uca.xml" ]; then
+    cat >"$tdir/uca.xml" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+  <!-- Exemplo: abrir terminal aqui -->
+  <action>
+    <icon>utilities-terminal</icon>
+    <name>Terminal aqui</name>
+    <command>xfce4-terminal --working-directory=%f</command>
+    <description>Abrir terminal na pasta atual</description>
+    <patterns>*</patterns>
+    <startup-notify/>
+    <directories/>
+  </action>
+</actions>
+EOF
+  fi
+
+  adm_info "thunar: configuração padrão aplicada em /etc/skel (não alteramos usuários existentes)."
+}
