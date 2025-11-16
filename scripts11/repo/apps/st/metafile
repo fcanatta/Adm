@@ -1,0 +1,16 @@
+name=st
+version=0.9
+category=apps
+
+build_deps=dev/gcc
+run_deps=x11/xorg-server,x11/libX11
+opt_deps=
+
+num_builds=0
+
+description=st – simple terminal da suckless
+homepage=https://st.suckless.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
