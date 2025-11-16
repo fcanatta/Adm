@@ -1,0 +1,16 @@
+name=alacritty
+version=0.13.0
+category=apps
+
+build_deps=dev/rust,dev/cargo
+run_deps=x11/xorg-server
+opt_deps=
+
+num_builds=0
+
+description=Alacritty – emulador de terminal rápido usando GPU (Rust)
+homepage=https://github.com/alacritty/alacritty
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
