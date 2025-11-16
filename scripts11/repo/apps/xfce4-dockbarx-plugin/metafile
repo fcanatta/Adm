@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/xfce4-dockbarx-plugin/metafile
+name=xfce4-dockbarx-plugin
+version=1.0.0
+category=apps
+
+build_deps=apps/dockbarx,x11/xfce4-panel,dev/gcc,dev/pkgconf
+run_deps=apps/dockbarx,x11/xfce4-panel
+opt_deps=
+
+num_builds=0
+
+description=Plugin DockbarX para o painel XFCE.
+homepage=https://github.com/M7S/dockbarx
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/M7S/dockbarx.git
+sha256sums=
