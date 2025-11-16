@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/media/gstreamer-plugins-base/metafile
+name=gstreamer-plugins-base
+version=1.24.6
+category=media
+
+build_deps=media/gstreamer,dev/meson,dev/ninja,dev/pkgconf
+run_deps=media/gstreamer
+opt_deps=
+
+num_builds=0
+
+description=GStreamer base plugins – elementos básicos (audioconvert, videoscale, etc).
+homepage=https://gstreamer.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gstreamer.freedesktop.org/src/gst-plugins-base/gst-plugins-base-1.24.6.tar.xz
+sha256sums=
