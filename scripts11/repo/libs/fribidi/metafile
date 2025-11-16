@@ -1,0 +1,16 @@
+name=fribidi
+version=1.0.13
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=FriBidi – implementação do algoritmo bidirecional Unicode
+homepage=https://github.com/fribidi/fribidi
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
