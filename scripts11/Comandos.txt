@@ -141,3 +141,11 @@ ADM_FFMPEG_JOBS=8 \
 ADM_FFMPEG_BUILD_TYPE=release \
 ADM_FFMPEG_FORCE_ENABLE="libwebp,libjpeg" \
 adm install media/ffmpeg
+
+# Se estiver em chroot ou rootfs
+export ADM_INSTALL_ROOT=/mnt/rootfs
+export ADM_TARGET_INIT=systemd    # ou runit / sysv / openrc
+adm install sys/udisks
+adm install sys/upower
+adm install sys/power-profiles-daemon
+adm install sys/colord
