@@ -1,0 +1,16 @@
+name=hicolor-icon-theme
+version=0.17
+category=themes
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Tema base Hicolor para ícones, requerido por quase todos os desktops.
+homepage=https://icon-theme.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://icon-theme.freedesktop.org/releases/hicolor-icon-theme-0.17.tar.xz
+sha256sums=
