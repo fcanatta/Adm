@@ -1,0 +1,16 @@
+name=unrar
+version=6.2.10
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=unrar – extrator de arquivos RAR (código fonte não livre)
+homepage=https://www.rarlab.com/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
