@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libconfig/metafile
+name=libconfig
+version=1.7.3
+category=libs
+
+build_deps=dev/gcc,dev/make
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Library for processing structured configuration files.
+homepage=https://hyperrealm.github.io/libconfig/
+maintainer=ADM System <adm@example.local>
+
+sources=https://hyperrealm.github.io/libconfig/dist/libconfig-1.7.3.tar.gz
+sha256sums=
