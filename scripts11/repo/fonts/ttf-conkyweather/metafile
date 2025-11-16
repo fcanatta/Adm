@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/fonts/ttf-conkyweather/metafile
+name=ttf-conkyweather
+version=1.0
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=libs/fontconfig
+
+num_builds=0
+
+description=ConkyWeather – fonte de ícones de clima para Conky.
+homepage=https://github.com/duckquack/conkyweather-font
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/duckquack/conkyweather-font.git
+sha256sums=
