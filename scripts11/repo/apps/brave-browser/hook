@@ -1,0 +1,67 @@
+# /usr/src/adm/repo/apps/brave-browser/hook
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+bb_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+}
+
+adm_hook_build() {
+  : # nada; vamos só reempacotar o .deb/.tar baixado pelo source-manager
+}
+
+adm_hook_install() {
+  local root work deb optdir
+  root="$(bb_root)"
+  work="$PWD"
+  optdir="$root/opt/brave"
+
+  mkdir -p "$optdir"
+
+  # Se for .deb
+  if ls *.deb >/dev/null 2>&1; then
+    deb="$(ls *.deb | head -n1)"
+    mkdir -p "$work/_deb"
+    cd "$work/_deb"
+    ar x "../$deb"
+    tar xf data.tar.* 2>/dev/null || true
+    # Copia toda árvore do .deb para root
+    cp -a usr opt "$root/" 2>/dev/null || true
+  elif ls brave*.tar.* >/dev/null 2>&1; then
+    # Tarball genérico
+    tar xf brave*.tar.* -C "$optdir" --strip-components=1
+  fi
+
+  mkdir -p "$root/usr/bin"
+  cat >"$root/usr/bin/brave" <<'EOF'
+#!/bin/sh
+exec /opt/brave/brave-browser "$@"
+EOF
+  chmod +x "$root/usr/bin/brave"
+
+  # .desktop básico
+  mkdir -p "$root/usr/share/applications"
+  cat >"$root/usr/share/applications/brave-browser.desktop" <<'EOF'
+[Desktop Entry]
+Name=Brave Browser
+Comment=Navigate the web
+Exec=brave %U
+Terminal=false
+Type=Application
+Icon=brave-browser
+Categories=Network;WebBrowser;
+EOF
+}
+
+adm_hook_post_install() { :; }
