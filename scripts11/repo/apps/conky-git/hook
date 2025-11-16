@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ck(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_ck)" "$*" >&2; }
+fi
+
+ck_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+ck_cflags() {
+  local f="-O2 -fPIC"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="-O3 -fPIC -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "conky-git: usando CMake com suporte X11+Lua."
+}
+
+adm_hook_build() {
+  rm -rf build
+  mkdir -p build
+  cd build
+
+  CFLAGS="$(ck_cflags)" CXXFLAGS="$(ck_cflags)" \
+  cmake .. \
+      -G Ninja \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DBUILD_X11=yes \
+      -DBUILD_WAYLAND=no \
+      -DBUILD_IMLIB2=yes \
+      -DBUILD_LUA_CAIRO=yes \
+      -DBUILD_LUA_IMLIB2=yes
+
+  ninja -j"$(nproc)"
+}
+
+adm_hook_install() {
+  cd build
+  DESTDIR="$(ck_root)" ninja install
+}
+
+adm_hook_post_install() {
+  local root skel confdir
+  root="$(ck_root)"
+  skel="$root/etc/skel"
+  confdir="$skel/.config/conky"
+
+  mkdir -p "$confdir"
+  if [ ! -f "$confdir/conky.conf" ]; then
+    adm_info "conky-git: criando config padrão em /etc/skel."
+    cat >"$confdir/conky.conf" <<'EOF'
+conky.config = {
+    update_interval = 1,
+    own_window = true,
+    own_window_type = 'dock',
+    own_window_hints = 'undecorated,below,sticky,skip_taskbar,skip_pager',
+    double_buffer = true,
+    use_xft = true,
+    alignment = 'top_right',
+    gap_x = 20,
+    gap_y = 40,
+    minimum_width = 260,
+    minimum_height = 5,
+};
+
+conky.text = [[
+${time %H:%M:%S}  ${time %d/%m/%Y}
+CPU: ${cpu}%  RAM: ${mem}/${memmax}
+Disk: ${fs_used /}/${fs_size /}
+]];
+EOF
+  fi
+}
