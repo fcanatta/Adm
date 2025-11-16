@@ -1,0 +1,16 @@
+name=udisks
+version=2.10.0
+category=sys
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=udisks – daemon para gerenciamento de discos/removíveis
+homepage=https://www.freedesktop.org/wiki/Software/udisks/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
