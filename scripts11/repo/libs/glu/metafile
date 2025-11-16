@@ -1,0 +1,16 @@
+name=glu
+version=9.0.3
+category=libs
+
+build_deps=dev/gcc,libs/mesa
+run_deps=libs/mesa
+opt_deps=
+
+num_builds=0
+
+description=GLU – OpenGL Utility Library.
+homepage=https://mesa3d.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.mesa3d.org/glu/glu-9.0.3.tar.xz
+sha256sums=
