@@ -1,0 +1,20 @@
+name=chromium
+version=123.0.6312.122
+category=apps
+
+# Principais dependências de BUILD (aproximate, mas reais)
+build_deps=dev/clang,dev/python3,dev/ninja,dev/gn,dev/nodejs,dev/pkgconf,dev/cmake,libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/libXrender,libs/libXi,libs/libXtst,libs/libXScrnSaver,libs/libXext,libs/libxkbcommon,libs/alsa-lib,libs/libdrm,libs/fontconfig,libs/freetype,libs/libjpeg-turbo,libs/libpng,libs/zlib,libs/snappy,libs/expat,libs/libevent
+
+# Principais deps de RUNTIME
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/libXrender,libs/libXi,libs/libXtst,libs/libXScrnSaver,libs/libXext,libs/libxkbcommon,libs/alsa-lib,libs/libdrm,libs/fontconfig,libs/freetype,libs/zlib
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Chromium – navegador open source baseado em Chromium, compilado do código-fonte.
+homepage=https://www.chromium.org/
+maintainer=ADM System <adm@example.local>
+
+# Tarball oficial com o código-fonte completo
+sources=https://commondatastorage.googleapis.com/chromium-browser-official/chromium-123.0.6312.122.tar.xz
+sha256sums=
