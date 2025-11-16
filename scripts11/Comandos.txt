@@ -135,3 +135,9 @@ ADM_FIREFOX_BUILD_PROFILE=release \
 ADM_FIREFOX_JOBS=8 \
 ADM_FIREFOX_INSTALL_DIR=/opt/firefox \
 adm install apps/firefox
+
+# Para sdicionar codecs ao ffmep
+ADM_FFMPEG_JOBS=8 \
+ADM_FFMPEG_BUILD_TYPE=release \
+ADM_FFMPEG_FORCE_ENABLE="libwebp,libjpeg" \
+adm install media/ffmpeg
