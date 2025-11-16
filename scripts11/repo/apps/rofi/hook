@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Hook para apps/rofi
+# - Cria /etc/skel/.config/rofi/config.rasi com tema simples
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_rf() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_rf)" "$*" >&2; }
+fi
+
+rf_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+adm_hook_pre_build() { adm_info "apps/rofi: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root skel dir cfg
+  root="$(rf_root)"
+  skel="$root/etc/skel"
+  dir="$skel/.config/rofi"
+  cfg="$dir/config.rasi"
+
+  mkdir -p "$dir"
+
+  if [ -f "$cfg" ]; then
+    adm_info "apps/rofi: config existente; não sobrescrevendo."
+    return 0
+  fi
+
+  cat >"$cfg" <<'EOF'
+configuration {
+    modi: "drun,run";
+    font: "JetBrains Mono 11";
+    theme: "Arc-Dark";
+}
+EOF
+  adm_info "apps/rofi: config.rasi criado em /etc/skel."
+}
+
+adm_hook_post_install() { adm_info "apps/rofi: hook concluído."; }
