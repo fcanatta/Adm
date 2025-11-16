@@ -1,0 +1,16 @@
+name=aalib
+version=1.4rc5
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=AAlib – biblioteca para saída gráfica em modo texto (ASCII art)
+homepage=http://aa-project.sourceforge.net/aalib/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
