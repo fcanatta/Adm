@@ -1,0 +1,16 @@
+name=sddm
+version=0.21.0
+category=sys
+
+build_deps=dev/cmake,dev/ninja,qt,sys/pam,sys/systemd
+run_deps=qt,sys/pam
+opt_deps=themes/hicolor-icon-theme,themes/adwaita-icon-theme
+
+num_builds=0
+
+description=SDDM – Simple Desktop Display Manager.
+homepage=https://github.com/sddm/sddm
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/sddm/sddm/archive/refs/tags/v0.21.0.tar.gz
+sha256sums=
