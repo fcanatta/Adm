@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/minizip/metafile
+name=minizip
+version=4.0.7
+category=libs
+
+build_deps=dev/cmake,dev/ninja,dev/gcc,zlib
+run_deps=zlib
+opt_deps=
+
+num_builds=0
+
+description=Minizip-ng – zip manipulation library (fork of minizip).
+homepage=https://github.com/zlib-ng/minizip-ng
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/zlib-ng/minizip-ng/archive/refs/tags/4.0.7.tar.gz
+sha256sums=
