@@ -1,0 +1,16 @@
+name=libcxxabi
+version=18.1.0
+category=dev
+
+build_deps=dev/llvm,dev/clang,dev/cmake,dev/ninja
+run_deps=
+opt_deps=dev/libcxx
+
+num_builds=0
+
+description=libc++abi – implementação de ABI C++ para libc++
+homepage=https://libcxxabi.llvm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.0/libcxxabi-18.1.0.src.tar.xz
+sha256sums=
