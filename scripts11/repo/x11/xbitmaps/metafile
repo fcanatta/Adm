@@ -1,0 +1,16 @@
+name=xbitmaps
+version=1.1.2
+category=x11
+
+build_deps=dev/util-macros
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Bitmap images used by multiple Xorg utilities.
+homepage=https://www.x.org/
+maintainer=ADM <adm@example.local>
+
+sources=https://www.x.org/pub/individual/data/xbitmaps/xbitmaps-1.1.2.tar.xz
+sha256sums=
