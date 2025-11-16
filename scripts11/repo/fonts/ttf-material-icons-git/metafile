@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/fonts/ttf-material-icons-git/metafile
+name=ttf-material-icons-git
+version=2024.01
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=libs/fontconfig
+
+num_builds=0
+
+description=Google Material Icons em TTF (git snapshot).
+homepage=https://github.com/google/material-design-icons
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/google/material-design-icons.git
+sha256sums=
