@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Hook para sys/desktop-file-utils
+# - Após instalação, roda update-desktop-database no root alvo (se disponível)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_df() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_df)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_df)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_df)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+df_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() { adm_info "sys/desktop-file-utils: build padrão."; }
+adm_hook_build() { :; }
+adm_hook_install() { :; }
+
+adm_hook_post_install() {
+  local root apps_dir
+  root="$(df_root)"
+  apps_dir="$root/usr/share/applications"
+
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    if [ -d "$apps_dir" ]; then
+      adm_info "sys/desktop-file-utils: atualizando desktop database em '$apps_dir'."
+      update-desktop-database "$apps_dir" || adm_warn "update-desktop-database falhou."
+    fi
+  else
+    adm_warn "sys/desktop-file-utils: update-desktop-database não encontrado; pulei."
+  fi
+}
