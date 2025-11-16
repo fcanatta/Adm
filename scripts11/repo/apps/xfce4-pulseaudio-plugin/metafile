@@ -1,0 +1,16 @@
+name=xfce4-pulseaudio-plugin
+version=0.4.8
+category=apps
+
+build_deps=x11/gtk-3,x11/xfconf,apps/pavucontrol,libs/pulseaudio,dev/meson,dev/ninja
+run_deps=libs/pulseaudio,x11/xfconf,x11/gtk-3
+opt_deps=apps/pavucontrol
+
+num_builds=0
+
+description=Plugin de controle de áudio Pulseaudio para o painel do XFCE.
+homepage=https://docs.xfce.org/apps/pulseaudio-plugin/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/apps/xfce4-pulseaudio-plugin/0.4/xfce4-pulseaudio-plugin-0.4.8.tar.bz2
+sha256sums=
