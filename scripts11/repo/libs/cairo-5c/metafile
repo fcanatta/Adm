@@ -1,0 +1,16 @@
+name=cairo-5c
+version=1.18.0
+category=libs
+
+build_deps=dev/meson,dev/ninja,libs/pixman,libs/fontconfig,libs/freetype
+run_deps=libs/pixman,libs/fontconfig,libs/freetype
+opt_deps=
+
+num_builds=0
+
+description=Cairo 2D graphics library com tunagem agressiva (perfil 5c).
+homepage=https://cairographics.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://cairographics.org/releases/cairo-1.18.0.tar.xz
+sha256sums=
