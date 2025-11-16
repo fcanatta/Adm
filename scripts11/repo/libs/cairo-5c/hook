@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_cairo5c(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_cairo5c)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_cairo5c)" "$*" >&2; }
+  adm_error(){ printf '[%s] [ERRO] %s\n' "$(_ts_cairo5c)" "$*" >&2; }
+fi
+
+cairo5c_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s' "$DESTDIR"          ||
+  printf '/'
+}
+
+cairo5c_jobs() { nproc 2>/dev/null || echo 1; }
+
+cairo5c_cflags() {
+  local f="-O2 -fPIC -fstack-protector-strong"
+  case "${ADM_PROFILE:-normal}" in
+    aggressive)
+      f="-O3 -fPIC -fstack-protector-strong -ffast-math -march=native -mtune=native -flto"
+      ;;
+    minimal)
+      f="-O2 -fPIC"
+      ;;
+  esac
+  printf '%s\n' "$f"
+}
+
+cairo5c_buildtype() {
+  case "${ADM_PROFILE:-normal}" in
+    aggressive) printf 'release' ;; # com LTO
+    normal)     printf 'release' ;;
+    minimal)    printf 'debugoptimized' ;;
+  esac
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "cairo-5c: build padrão desativado; usando Meson tunado."
+}
+
+adm_hook_build() {
+  local bdir="build"
+  rm -rf "$bdir"
+  mkdir -p "$bdir"
+
+  CFLAGS="$(cairo5c_cflags)" \
+  meson setup "$bdir" \
+      --prefix=/usr \
+      --buildtype="$(cairo5c_buildtype)" \
+      -Doptimization=3 \
+      -Ddefault_library=shared \
+      -Dtests=false \
+      -Dgtk_doc=false
+
+  ninja -C "$bdir" -j"$(cairo5c_jobs)"
+}
+
+adm_hook_install() {
+  local r; r="$(cairo5c_root)"
+  ninja -C build install DESTDIR="$r"
+}
+
+adm_hook_post_install() {
+  adm_info "cairo-5c: instalado com CFLAGS tunados para perfil '${ADM_PROFILE:-normal}'."
+}
