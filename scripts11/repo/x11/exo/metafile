@@ -1,0 +1,16 @@
+name=exo
+version=4.18.0
+category=x11
+
+build_deps=x11/gtk-3,libs/glib,dev/meson,dev/ninja
+run_deps=x11/gtk-3,libs/glib
+opt_deps=
+
+num_builds=0
+
+description=Exo – biblioteca de utilidades e widgets do XFCE.
+homepage=https://docs.xfce.org/xfce/exo/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/exo/4.18/exo-4.18.0.tar.bz2
+sha256sums=
