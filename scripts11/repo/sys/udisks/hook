@@ -1,0 +1,209 @@
+#!/usr/bin/env bash
+# Hook inteligente para sys/udisks
+# - Detecta init (systemd/runit/openrc/sysv)
+# - Cria serviço adequado no root alvo (ADM_INSTALL_ROOT/DESTDIR)
+# - NÃO chama systemctl/sv/etc – só gera os arquivos
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ud() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ud)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ud)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ud)" "$*" >&2; }
+fi
+
+svc_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+svc_detect_init() {
+  if [ -n "${ADM_TARGET_INIT:-}" ]; then
+    printf '%s\n' "$ADM_TARGET_INIT"
+    return 0
+  fi
+
+  local comm
+  comm="$(ps -p 1 -o comm= 2>/dev/null || echo "")"
+
+  if [ -d /run/systemd/system ]; then
+    printf 'systemd\n'
+  elif [ "$comm" = "runit" ] || [ -d /etc/runit ]; then
+    printf 'runit\n'
+  elif [ "$comm" = "openrc-init" ] || [ -x /sbin/openrc ] || [ -x /sbin/openrc-init ]; then
+    printf 'openrc\n'
+  else
+    printf 'sysv\n'
+  fi
+}
+
+svc_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local b="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "sys/udisks: '$path' já existe; backup em '$b'."
+    cp -a "$path" "$b"
+  fi
+}
+
+svc_find_daemon_path() {
+  # $1=root, $2=daemon name, $3... extra guesses
+  local root="$1" daemon="$2"; shift 2
+  local cand
+
+  # Se root for "/", tenta achar no host
+  if [ "$root" = "/" ]; then
+    if cand="$(command -v "$daemon" 2>/dev/null)"; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  fi
+
+  # Palpites padrão no root alvo
+  for cand in \
+    "$root/usr/lib/udisks2/$daemon" \
+    "$root/usr/libexec/$daemon" \
+    "$root/usr/bin/$daemon" \
+    "$root/usr/sbin/$daemon"
+  do
+    [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+
+  # Fallback: só o nome
+  printf '%s\n' "$daemon"
+}
+
+svc_create_systemd_unit() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local dir="$root/etc/systemd/system"
+  local unit="$dir/$service"
+
+  mkdir -p "$dir"
+  if [ -e "$unit" ]; then
+    adm_info "sys/udisks: unit systemd '$unit' já existe; não sobrescrevendo."
+    return 0
+  fi
+
+  local dpath
+  dpath="$(svc_find_daemon_path "$root" "$daemon")"
+
+  adm_info "sys/udisks: criando unit systemd '$unit' (ExecStart=$dpath)."
+  cat >"$unit" <<EOF
+[Unit]
+Description=$desc
+After=network.target dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=$dpath
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+svc_create_runit_service() {
+  local root="$1" service="$2" daemon="$3"
+  local dir="$root/etc/runit/sv/$service"
+  local run="$dir/run"
+
+  mkdir -p "$dir"
+  if [ -e "$run" ]; then
+    adm_info "sys/udisks: serviço runit '$run' já existe; não sobrescrevendo."
+    return 0
+  fi
+
+  local dpath
+  dpath="$(svc_find_daemon_path "$root" "$daemon")"
+
+  adm_info "sys/udisks: criando serviço runit em '$run'."
+  cat >"$run" <<EOF
+#!/bin/sh
+exec $dpath
+EOF
+  chmod +x "$run"
+  adm_info "sys/udisks: para habilitar, crie link para este serviço na árvore runsvdir (ex: /etc/runit/runsvdir/default/$service)."
+}
+
+svc_create_sysv_init() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local init="$root/etc/init.d/$service"
+
+  mkdir -p "$root/etc/init.d"
+  if [ -e "$init" ]; then
+    adm_info "sys/udisks: script init '$init' já existe; não sobrescrevendo."
+    return 0
+  fi
+
+  local dpath
+  dpath="$(svc_find_daemon_path "$root" "$daemon")"
+
+  adm_info "sys/udisks: criando script init SYSV '$init'."
+  cat >"$init" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $service
+# Required-Start:    \$remote_fs \$syslog dbus
+# Required-Stop:     \$remote_fs \$syslog dbus
+# Default-Start:     3 5
+# Default-Stop:      0 1 2 6
+# Short-Description: $desc
+### END INIT INFO
+
+case "\$1" in
+  start)
+    echo "Iniciando $service..."
+    $dpath &
+    ;;
+  stop)
+    echo "Parando $service..."
+    killall $(basename "$dpath") 2>/dev/null || true
+    ;;
+  restart)
+    "\$0" stop
+    "\$0" start
+    ;;
+  status)
+    pgrep -x "$(basename "$dpath")" >/dev/null && echo "$service está rodando" || echo "$service parado"
+    ;;
+  *)
+    echo "Uso: \$0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+
+exit 0
+EOF
+  chmod +x "$init"
+}
+
+adm_hook_pre_build() { adm_info "sys/udisks: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root init
+  root="$(svc_root)"
+  init="$(svc_detect_init)"
+
+  adm_info "sys/udisks: root='$root' init='$init'."
+
+  case "$init" in
+    systemd)
+      svc_create_systemd_unit "$root" "udisks2.service" "udisksd" "UDisks2 disk management daemon"
+      ;;
+    runit)
+      svc_create_runit_service "$root" "udisks2" "udisksd"
+      ;;
+    openrc|sysv)
+      svc_create_sysv_init "$root" "udisks2" "udisksd" "UDisks2 disk management daemon"
+      ;;
+  esac
+}
+
+adm_hook_post_install() {
+  adm_info "sys/udisks: serviço criado conforme init detectado; habilite via systemctl/sv/update-rc.d conforme o caso."
+}
