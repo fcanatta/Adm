@@ -1,0 +1,16 @@
+name=libadwaita
+version=1.6.0
+category=libs
+
+build_deps=x11/gtk-4,libs/pango,libs/graphene,dev/meson,dev/ninja
+run_deps=x11/gtk-4,libs/pango,libs/graphene
+opt_deps=
+
+num_builds=0
+
+description=libadwaita – widgets GNOME modernos baseados em GTK4.
+homepage=https://gnome.pages.gitlab.gnome.org/libadwaita/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/libadwaita/1.6/libadwaita-1.6.0.tar.xz
+sha256sums=
