@@ -1,0 +1,16 @@
+name=parole
+version=4.18.0
+category=apps
+
+build_deps=x11/gtk-3,x11/xfconf,media/gstreamer,dev/meson,dev/ninja
+run_deps=x11/gtk-3,x11/xfconf,media/gstreamer
+opt_deps=media/gstreamer-plugins-good,media/gstreamer-plugins-bad,media/gstreamer-plugins-ugly
+
+num_builds=0
+
+description=Parole – player multimídia leve para XFCE baseado em GStreamer.
+homepage=https://docs.xfce.org/apps/parole/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/apps/parole/4.18/parole-4.18.0.tar.bz2
+sha256sums=
