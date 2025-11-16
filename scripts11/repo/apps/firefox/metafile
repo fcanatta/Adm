@@ -1,0 +1,58 @@
+name=firefox
+version=133.0
+category=apps
+
+# Só usei deps que você já tem (ou já geramos) pra não abrir buracos.
+build_deps=\
+dev/gcc,\
+dev/llvm,\
+dev/rust,\
+dev/cargo,\
+dev/python3,\
+dev/python-modules,\
+dev/python-modules-dependencies,\
+dev/pkgconf,\
+dev/nasm,\
+dev/cmake,\
+dev/meson,\
+dev/ninja,\
+libs/zlib,\
+libs/ncurses,\
+libs/expat,\
+libs/libffi,\
+x11/libX11,\
+x11/libXext,\
+x11/libXrender,\
+x11/libXrandr,\
+x11/libXcursor,\
+x11/libXinerama,\
+x11/mesa,\
+sys/dbus
+
+run_deps=\
+sys/dbus,\
+x11/xorg-server,\
+x11/libX11,\
+x11/libXext,\
+x11/libXrender,\
+x11/libXrandr,\
+x11/fontconfig,\
+libs/freetype,\
+libs/zlib
+
+# opcional: para melhor integração visual
+opt_deps=\
+fonts/dejavu-fonts,\
+fonts/noto-fonts,\
+fonts/ubuntu-font-family,\
+fonts/roboto
+
+num_builds=0
+
+description=Mozilla Firefox – navegador web construído a partir do código-fonte com toolchain do ADM
+homepage=https://www.mozilla.org/firefox/
+maintainer=ADM System <adm@example.local>
+
+# exemplo de source; ajuste conforme versão/idioma que quiser
+sources=https://ftp.mozilla.org/pub/firefox/releases/133.0/source/firefox-133.0.source.tar.xz
+sha256sums=
