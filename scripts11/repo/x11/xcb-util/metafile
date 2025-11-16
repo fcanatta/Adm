@@ -1,0 +1,16 @@
+name=xcb-util
+version=0.4.1
+category=x11
+
+build_deps=libs/libxcb,dev/util-macros
+run_deps=libs/libxcb
+opt_deps=
+
+num_builds=0
+
+description=Additional extensions for XCB.
+homepage=https://xcb.freedesktop.org/
+maintainer=ADM <adm@example.local>
+
+sources=https://xcb.freedesktop.org/dist/xcb-util-0.4.1.tar.xz
+sha256sums=
