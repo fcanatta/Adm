@@ -1,0 +1,16 @@
+name=gparted
+version=1.6.0
+category=apps
+
+build_deps=x11/gtk-3,libs/libparted,dev/meson,dev/ninja
+run_deps=x11/gtk-3,libs/libparted
+opt_deps=sys/polkit,sys/udisks
+
+num_builds=0
+
+description=GParted – editor de partições gráfico.
+homepage=https://gparted.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/gparted/gparted-1.6.0.tar.gz
+sha256sums=
