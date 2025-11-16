@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libepoxy/metafile
+name=libepoxy
+version=1.5.14
+category=libs
+
+build_deps=dev/meson,dev/ninja,dev/pkgconf,libs/libX11,libs/libXext,libs/libXdamage,libs/libXfixes
+run_deps=libs/libX11,libs/libXext,libs/libXdamage,libs/libXfixes
+opt_deps=
+
+num_builds=0
+
+description=libepoxy – OpenGL function pointer management library.
+homepage=https://github.com/anholt/libepoxy
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/anholt/libepoxy/archive/refs/tags/1.5.14.tar.gz
+sha256sums=
