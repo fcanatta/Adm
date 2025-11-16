@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Hook para media/imagemagick
+# - Não controla build; só faz um teste simples após instalar (convert -version)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_im() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_im)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_im)" "$*" >&2; }
+fi
+
+adm_hook_pre_build() { adm_info "media/imagemagick: build padrão."; }
+adm_hook_build() { :; }
+adm_hook_install() { :; }
+
+adm_hook_post_install() {
+  if command -v convert >/dev/null 2>&1; then
+    adm_info "media/imagemagick: convert -version:"
+    convert -version || adm_warn "media/imagemagick: convert falhou; verifique instalação."
+  else
+    adm_warn "media/imagemagick: binário 'convert' não encontrado no PATH atual."
+  fi
+}
