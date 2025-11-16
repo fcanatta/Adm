@@ -1,0 +1,16 @@
+name=dos2unix
+version=7.5.2
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=dos2unix – conversor de final de linha DOS <-> Unix
+homepage=https://waterlan.home.xs4all.nl/dos2unix.html
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
