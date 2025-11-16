@@ -1,0 +1,16 @@
+name=ffmpeg
+version=7.0
+category=media
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=libs/libjpeg-turbo,libs/libwebp,libs/libpng
+
+num_builds=0
+
+description=FFmpeg – suíte de ferramentas para áudio/vídeo (ffmpeg, ffplay, ffprobe)
+homepage=https://ffmpeg.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ffmpeg.org/releases/ffmpeg-7.0.tar.xz
+sha256sums=
