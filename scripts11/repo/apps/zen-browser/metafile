@@ -1,0 +1,17 @@
+name=zen-browser
+version=1.0.0
+category=apps
+
+build_deps=sys/tar,sys/xz
+run_deps=libs/libX11,libs/libXrandr,libs/libXcursor,libs/libXdamage,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Zen Browser – fork do Firefox com interface Zen.
+homepage=https://github.com/zen-browser/desktop
+maintainer=ADM System <adm@example.local>
+
+# Ajuste esta URL para o tarball exato do release que você usar
+sources=https://github.com/zen-browser/desktop/releases/latest/download/zen-linux-x86_64.tar.xz
+sha256sums=
