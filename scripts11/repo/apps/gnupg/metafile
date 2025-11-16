@@ -1,0 +1,16 @@
+name=gnupg
+version=2.4.4
+category=apps
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GnuPG – suíte completa de criptografia OpenPGP
+homepage=https://gnupg.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gnupg.org/ftp/gcrypt/gnupg/gnupg-2.4.4.tar.bz2
+sha256sums=
