@@ -1,0 +1,16 @@
+name=feh
+version=3.10.1
+category=apps
+
+build_deps=libs/imlib2,dev/gcc
+run_deps=libs/imlib2
+opt_deps=
+
+num_builds=0
+
+description=Feh – visualizador de imagens leve para X11, útil para wallpapers.
+homepage=https://feh.finalrewind.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://feh.finalrewind.org/feh-3.10.1.tar.bz2
+sha256sums=
