@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Hook para apps/alacritty
+# - Cria /etc/skel/.config/alacritty/alacritty.yml com tema escuro e fonte monoespaçada
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_al() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_al)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_al)" "$*" >&2; }
+fi
+
+al_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+adm_hook_pre_build() { adm_info "apps/alacritty: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root skel dir cfg
+  root="$(al_root)"
+  skel="$root/etc/skel"
+  dir="$skel/.config/alacritty"
+  cfg="$dir/alacritty.yml"
+
+  mkdir -p "$dir"
+
+  if [ -e "$cfg" ]; then
+    adm_info "apps/alacritty: config já existente; não sobrescrevendo."
+    return 0
+  fi
+
+  adm_info "apps/alacritty: criando alacritty.yml em '$cfg'."
+  cat >"$cfg" <<'EOF'
+font:
+  normal:
+    family: JetBrains Mono
+    style: Regular
+  size: 11.0
+
+colors:
+  primary:
+    background: '0x1e1e1e'
+    foreground: '0xd0d0d0'
+EOF
+}
+
+adm_hook_post_install() {
+  adm_info "apps/alacritty: config skel criada."
+}
