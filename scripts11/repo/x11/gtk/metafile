@@ -1,0 +1,16 @@
+name=gtk
+version=1.0
+category=x11
+
+build_deps=
+run_deps=x11/gtk-2,x11/gtk-3,x11/gtk-4
+opt_deps=libs/pango,libs/pangomm,libs/cairo-5c
+
+num_builds=0
+
+description=Meta pacote que agrupa GTK-2, GTK-3 e GTK-4.
+homepage=https://www.gtk.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
