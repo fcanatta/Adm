@@ -1,0 +1,16 @@
+name=rofi
+version=1.7.6
+category=apps
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=x11/xorg-server
+opt_deps=
+
+num_builds=0
+
+description=rofi – launcher/modo dmenu para WMs e desktop
+homepage=https://github.com/davatorium/rofi
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
