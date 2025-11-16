@@ -1,0 +1,16 @@
+name=libdaemon
+version=0.14
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libdaemon – helpers para escrever daemons simples e portáveis
+homepage=https://0pointer.de/lennart/projects/libdaemon/
+maintainer=ADM System <adm@example.local>
+
+sources=https://0pointer.de/lennart/projects/libdaemon/libdaemon-0.14.tar.gz
+sha256sums=
