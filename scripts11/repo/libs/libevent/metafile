@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libevent/metafile
+name=libevent
+version=2.1.12
+category=libs
+
+build_deps=dev/gcc,dev/make
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Event notification library.
+homepage=https://libevent.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz
+sha256sums=
