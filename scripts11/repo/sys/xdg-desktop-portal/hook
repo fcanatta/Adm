@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Fallback de log
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_xdp(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_xdp)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_xdp)" "$*" >&2; }
+fi
+
+xdp_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+# Detecta portal back-end “provável” (gtk/xfce/kde) só para default
+xdp_guess_backend() {
+  # Se tiver xdg-desktop-portal-gtk instalado
+  if [ -e "$(xdp_root)/usr/share/xdg-desktop-portal/portals/gtk.portal" ]; then
+    printf 'gtk'
+  elif [ -e "$(xdp_root)/usr/share/xdg-desktop-portal/portals/xfce.portal" ]; then
+    printf 'xfce'
+  elif [ -e "$(xdp_root)/usr/share/xdg-desktop-portal/portals/kde.portal" ]; then
+    printf 'kde'
+  else
+    printf 'generic'
+  fi
+}
+
+adm_hook_pre_build() {
+  adm_info "xdg-desktop-portal: build padrão (meson) é suficiente."
+}
+
+adm_hook_build() {
+  : # Deixa o build-engine fazer o trabalho normal
+}
+
+adm_hook_install() {
+  : # Install padrão
+}
+
+adm_hook_post_install() {
+  local root portals cfg backend
+  root="$(xdp_root)"
+  portals="$root/usr/share/xdg-desktop-portal/portals"
+  cfg="$root/etc/xdg-desktop-portal/portals.conf"
+
+  adm_info "xdg-desktop-portal: pós-instalação iniciada."
+
+  mkdir -p "$portals" "$root/etc/xdg-desktop-portal"
+
+  backend="$(xdp_guess_backend)"
+
+  if [ ! -f "$cfg" ]; then
+    adm_info "xdg-desktop-portal: gerando portals.conf padrão (backend=$backend)."
+    cat >"$cfg" <<EOF
+# Gerado pelo ADM – configuração padrão do xdg-desktop-portal
+[portal]
+backend=$backend
+EOF
+  else
+    adm_warn "xdg-desktop-portal: $cfg já existe; não sobrescrevendo."
+  fi
+
+  adm_info "xdg-desktop-portal: finalizado (não habilitamos serviços automaticamente)."
+}
