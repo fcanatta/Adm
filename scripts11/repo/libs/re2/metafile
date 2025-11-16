@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/re2/metafile
+name=re2
+version=2024.05.01
+category=libs
+
+build_deps=dev/cmake,dev/ninja,dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=RE2 – fast, safe regular expression engine.
+homepage=https://github.com/google/re2
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/google/re2/archive/refs/tags/2024-05-01.tar.gz
+sha256sums=
