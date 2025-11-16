@@ -1,0 +1,16 @@
+name=harfbuzz
+version=9.0.0
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=libs/fribidi
+opt_deps=
+
+num_builds=0
+
+description=Harfbuzz – engine de shaping de fontes OpenType
+homepage=https://harfbuzz.github.io/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
