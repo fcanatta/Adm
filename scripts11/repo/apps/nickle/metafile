@@ -1,0 +1,16 @@
+name=nickle
+version=2.92
+category=apps
+
+build_deps=dev/gcc,dev/autoconf,dev/automake,dev/libtool
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Linguagem de programação matemática tipo calculadora extensível.
+homepage=https://nickle.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://nickle.org/release/nickle-2.92.tar.gz
+sha256sums=
