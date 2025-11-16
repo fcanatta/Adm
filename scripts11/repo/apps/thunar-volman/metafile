@@ -1,0 +1,16 @@
+name=thunar-volman
+version=4.18.0
+category=apps
+
+build_deps=apps/thunar,sys/udisks,x11/xfconf,dev/meson,dev/ninja
+run_deps=apps/thunar,sys/udisks
+opt_deps=sys/gvfs
+
+num_builds=0
+
+description=Plugin Thunar para gerenciamento automático de mídias removíveis.
+homepage=https://docs.xfce.org/xfce/thunar/thunar-volman
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/thunar-volman/4.18/thunar-volman-4.18.0.tar.bz2
+sha256sums=
