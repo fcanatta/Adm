@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_git(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_git)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_git)" "$*" >&2; }
+fi
+
+git_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/\n'
+}
+
+git_update_cache() {
+  local root="$1" dir="$2"
+  local bin="$root/usr/bin/gtk-update-icon-cache"
+
+  [ -d "$root$dir" ] || return 0
+
+  if [ -x "$bin" ]; then
+    adm_info "gnome-icon-theme: atualizando cache em '$dir'."
+    chroot "$root" gtk-update-icon-cache -f -q "$dir" 2>/dev/null || true
+  else
+    adm_warn "gnome-icon-theme: gtk-update-icon-cache não encontrado; pulando."
+  fi
+}
+
+adm_hook_post_install() {
+  local root; root="$(git_root)"
+  git_update_cache "$root" "/usr/share/icons/gnome"
+}
