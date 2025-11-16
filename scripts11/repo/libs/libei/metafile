@@ -1,0 +1,16 @@
+name=libei
+version=1.5.0
+category=libs
+
+build_deps=dev/meson,dev/ninja,libs/libevdev,libs/libxkbcommon,libs/wayland-protocols
+run_deps=libs/libevdev,libs/libxkbcommon,libs/wayland-protocols
+opt_deps=
+
+num_builds=0
+
+description=libei – Emulated input client and server library (Wayland-oriented).
+homepage=https://gitlab.freedesktop.org/libinput/libei
+maintainer=ADM System <adm@example.local>
+
+sources=https://gitlab.freedesktop.org/libinput/libei/-/archive/1.5.0/libei-1.5.0.tar.gz
+sha256sums=
