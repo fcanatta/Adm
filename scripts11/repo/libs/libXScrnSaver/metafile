@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libXScrnSaver/metafile
+name=libXScrnSaver
+version=1.2.4
+category=libs
+
+build_deps=dev/gcc,dev/util-macros,libs/libX11
+run_deps=libs/libX11
+opt_deps=
+
+num_builds=0
+
+description=X11 Screen Saver extension library.
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/pub/individual/lib/libXScrnSaver-1.2.4.tar.xz
+sha256sums=
