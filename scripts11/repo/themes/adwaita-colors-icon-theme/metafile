@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/themes/adwaita-colors-icon-theme/metafile
+name=adwaita-colors-icon-theme
+version=2024.01
+category=themes
+
+build_deps=themes/adwaita-icon-theme
+run_deps=themes/adwaita-icon-theme
+opt_deps=
+
+num_builds=0
+
+description=Adwaita Colors – variantes coloridas do tema de ícones Adwaita.
+homepage=https://github.com/lassekongo83/adwaita-colors
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/lassekongo83/adwaita-colors.git
+sha256sums=
