@@ -1,0 +1,16 @@
+name=xwayland
+version=23.2.4
+category=x11
+
+build_deps=x11/libepoxy,x11/pixman,x11/libxcvt,dev/meson,dev/ninja,libs/wayland
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Xwayland server for Wayland compositors.
+homepage=https://gitlab.freedesktop.org/xorg/xserver
+maintainer=ADM <adm@example.local>
+
+sources=https://www.x.org/releases/individual/xserver/xwayland-23.2.4.tar.xz
+sha256sums=
