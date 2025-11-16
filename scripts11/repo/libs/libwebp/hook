@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# Hook avançado para libs/libwebp
+# - Controla o build via CMake + Ninja
+# - Respeita ADM_INSTALL_ROOT/DESTDIR
+# - Permite tunagem via variáveis de ambiente:
+#
+#   ADM_WEBP_USE_NATIVE=1          -> adiciona -march=native (default: 0)
+#   ADM_WEBP_EXTRA_CFLAGS="..."    -> flags extras de C
+#   ADM_WEBP_BUILD_TYPE=release    -> release|debug|relwithdebinfo (default: release)
+#   ADM_WEBP_RUN_TESTS=1           -> roda ctest após build (default: 0)
+#
+# - Não modifica configs do sistema; apenas compila e instala a lib e ferramentas
+#   (cwebp, dwebp etc.) no prefixo /usr do root alvo.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Logging básico, caso 01-log-ui.sh não tenha sido carregado
+# ---------------------------------------------------------------------------
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_webp() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_webp)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_webp)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_webp)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers de ambiente
+# ---------------------------------------------------------------------------
+webp_jobs() {
+  if [ -n "${ADM_WEBP_JOBS:-}" ]; then
+    printf '%s\n' "$ADM_WEBP_JOBS"
+  else
+    nproc 2>/dev/null || echo 1
+  fi
+}
+
+webp_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+webp_require_root_if_needed() {
+  local root="$1"
+  if [ "$root" = "/" ] && [ "$(id -u)" -ne 0 ]; then
+    adm_die "libs/libwebp: instalar diretamente em '/' requer root."
+  fi
+}
+
+webp_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "libs/libwebp: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+webp_build_type() {
+  case "${ADM_WEBP_BUILD_TYPE:-release}" in
+    release|debug|relwithdebinfo|minsizerel)
+      printf '%s\n' "$ADM_WEBP_BUILD_TYPE"
+      ;;
+    *)
+      adm_warn "libs/libwebp: ADM_WEBP_BUILD_TYPE inválido, usando 'release'."
+      printf 'release\n'
+      ;;
+  esac
+}
+
+webp_cflags() {
+  local cflags="-O2"
+  if [ "${ADM_WEBP_USE_NATIVE:-0}" = "1" ]; then
+    cflags="$cflags -march=native"
+  fi
+  if [ -n "${ADM_WEBP_EXTRA_CFLAGS:-}" ]; then
+    cflags="$cflags ${ADM_WEBP_EXTRA_CFLAGS}"
+  fi
+  printf '%s\n' "$cflags"
+}
+
+webp_run_tests() {
+  if [ "${ADM_WEBP_RUN_TESTS:-0}" = "1" ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Descoberta do source
+# ---------------------------------------------------------------------------
+webp_detect_srctree() {
+  if [ -n "${ADM_WEBP_SRCDIR:-}" ] && [ -f "$ADM_WEBP_SRCDIR/CMakeLists.txt" ]; then
+    printf '%s\n' "$ADM_WEBP_SRCDIR"
+    return 0
+  fi
+  if [ -f "CMakeLists.txt" ]; then
+    printf '%s\n' "$PWD"
+    return 0
+  fi
+  local d
+  for d in "$PWD"/libwebp-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/CMakeLists.txt" ]; then
+      printf '%s\n' "$d"
+      return 0
+    fi
+  done
+  adm_die "libs/libwebp: não foi possível detectar diretório de fonte (CMakeLists.txt)."
+}
+
+# ---------------------------------------------------------------------------
+# Hooks ADM
+# ---------------------------------------------------------------------------
+adm_hook_pre_build() {
+  # Vamos controlar o build via hook
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "libs/libwebp: build padrão desativado; usando hook customizado (CMake+Ninja)."
+}
+
+adm_hook_build() {
+  local src jobs bt cflags
+  src="$(webp_detect_srctree)"
+  jobs="$(webp_jobs)"
+  bt="$(webp_build_type)"
+  cflags="$(webp_cflags)"
+
+  adm_info "libs/libwebp: src=$src jobs=$jobs buildtype=$bt"
+  adm_info "libs/libwebp: CFLAGS='${cflags}'"
+
+  if ! command -v cmake >/dev/null 2>&1 || ! command -v ninja >/dev/null 2>&1; then
+    adm_die "libs/libwebp: cmake/ninja não encontrados; instale dev/cmake e dev/ninja."
+  fi
+
+  (
+    cd "$src"
+    rm -rf build
+    mkdir -p build
+    cd build
+
+    CFLAGS="$cflags" cmake .. \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE="$bt" \
+      -DCMAKE_INSTALL_PREFIX=/usr \
+      -DBUILD_SHARED_LIBS=ON \
+      -DWEBP_BUILD_CWEBP=ON \
+      -DWEBP_BUILD_DWEBP=ON \
+      -DWEBP_BUILD_GIF2WEBP=ON \
+      -DWEBP_BUILD_IMG2WEBP=ON \
+      -DWEBP_BUILD_VWEBP=ON
+
+    ninja -j"$jobs"
+
+    if [ "$(webp_run_tests)" = "true" ]; then
+      adm_info "libs/libwebp: executando ctest..."
+      ctest --output-on-failure || adm_warn "libs/libwebp: alguns testes falharam; verifique logs."
+    fi
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(webp_detect_srctree)"
+  root="$(webp_root)"
+
+  webp_require_root_if_needed "$root"
+
+  adm_info "libs/libwebp: instalando em '$root'..."
+  (
+    cd "$src/build"
+    DESTDIR="$root" ninja install
+  )
+
+  adm_info "libs/libwebp: instalação concluída."
+}
+
+adm_hook_post_install() {
+  adm_info "libs/libwebp: post-install – biblioteca e ferramentas WebP instaladas."
+}
