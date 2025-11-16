@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/brave-browser/metafile
+name=brave-browser
+version=1.69.0
+category=apps
+
+build_deps=sys/cpio,sys/tar,sys/xz
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXfixes,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Brave Browser – navegador baseado em Chromium com bloqueio de anúncios.
+homepage=https://brave.com/
+maintainer=ADM System <adm@example.local>
+
+sources=https://laptop-updates.brave.com/latest/linux64
+sha256sums=
