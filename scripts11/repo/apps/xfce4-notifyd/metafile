@@ -1,0 +1,16 @@
+name=xfce4-notifyd
+version=0.9.3
+category=apps
+
+build_deps=x11/gtk-3,x11/xfconf,dev/meson,dev/ninja
+run_deps=x11/gtk-3,x11/xfconf
+opt_deps=
+
+num_builds=0
+
+description=Demon de notificações do XFCE (freedesktop.org notifications).
+homepage=https://docs.xfce.org/apps/notifyd/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/apps/xfce4-notifyd/0.9/xfce4-notifyd-0.9.3.tar.bz2
+sha256sums=
