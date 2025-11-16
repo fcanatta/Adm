@@ -1,0 +1,17 @@
+name=xcursor-themes
+version=1.0
+category=x11
+
+build_deps=
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Tema(s) de cursor Xcursor (Adwaita, DMZ, etc) para X11/Wayland.
+homepage=https://www.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+# Apontar para o tarball com os temas de cursor (pode ser seu bundle)
+sources=
+sha256sums=
