@@ -1,0 +1,16 @@
+name=cairo
+version=1.18.0
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=libs/pixman,libs/libpng
+opt_deps=
+
+num_builds=0
+
+description=Cairo – biblioteca de renderização 2D vetorial
+homepage=https://cairographics.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
