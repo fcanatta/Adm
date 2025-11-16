@@ -1,0 +1,16 @@
+name=libpng
+version=1.6.43
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libpng – biblioteca para imagens PNG
+homepage=http://www.libpng.org/pub/png/libpng.html
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
