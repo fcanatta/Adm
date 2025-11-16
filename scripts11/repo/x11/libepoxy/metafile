@@ -1,0 +1,16 @@
+name=libepoxy
+version=1.5.10
+category=x11
+
+build_deps=dev/meson,dev/ninja,libs/libxcb,libs/wayland
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GL dispatch library used by Xorg and Wayland compositors.
+homepage=https://github.com/anholt/libepoxy
+maintainer=ADM <adm@example.local>
+
+sources=https://github.com/anholt/libepoxy/releases/download/v1.5.10/libepoxy-1.5.10.tar.xz
+sha256sums=
