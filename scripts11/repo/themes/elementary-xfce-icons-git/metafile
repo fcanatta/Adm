@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/themes/elementary-xfce-icons-git/metafile
+name=elementary-xfce-icons-git
+version=2024.01
+category=themes
+
+build_deps=
+run_deps=themes/hicolor-icon-theme
+opt_deps=
+
+num_builds=0
+
+description=Tema de ícones Elementary para XFCE (git snapshot).
+homepage=https://github.com/shimmerproject/elementary-xfce
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/shimmerproject/elementary-xfce.git
+sha256sums=
