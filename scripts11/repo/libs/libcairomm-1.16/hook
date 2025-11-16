@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_cmm116(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_cmm116)" "$*" >&2; }
+fi
+
+cmm116_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s' "$DESTDIR"          ||
+  printf '/'
+}
+
+cmm116_cxxflags() {
+  local f="-O2 -fPIC"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="-O3 -fPIC -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "libcairomm-1.16: Meson build tunado."
+}
+
+adm_hook_build() {
+  local bdir="build"
+  rm -rf "$bdir"
+  CXXFLAGS="$(cmm116_cxxflags)" \
+  meson setup "$bdir" \
+      --prefix=/usr \
+      --buildtype=release \
+      -Ddefault_library=shared \
+      -Dtests=false
+  ninja -C "$bdir" -j"$(nproc)"
+}
+
+adm_hook_install() {
+  ninja -C build install DESTDIR="$(cmm116_root)"
+}
+
+adm_hook_post_install() {
+  adm_info "libcairomm-1.16: instalado (API moderna)."
+}
