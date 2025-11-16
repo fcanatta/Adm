@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_gite(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_gite)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_gite)" "$*" >&2; }
+fi
+
+gite_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/\n'
+}
+
+gite_update_cache() {
+  local root="$1" dir="$2"
+  local bin="$root/usr/bin/gtk-update-icon-cache"
+  [ -d "$root$dir" ] || return 0
+  [ -x "$bin" ] || { adm_warn "gnome-icon-theme-extras: gtk-update-icon-cache ausente; pulando."; return 0; }
+  chroot "$root" gtk-update-icon-cache -f -q "$dir" 2>/dev/null || true
+}
+
+adm_hook_post_install() {
+  local root; root="$(gite_root)"
+  gite_update_cache "$root" "/usr/share/icons/gnome"
+}
