@@ -1,0 +1,16 @@
+name=libssh2
+version=1.11.0
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libssh2 – implementação cliente da biblioteca SSH2
+homepage=https://www.libssh2.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.libssh2.org/download/libssh2-1.11.0.tar.gz
+sha256sums=
