@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libXi/metafile
+name=libXi
+version=1.8.1
+category=libs
+
+build_deps=dev/gcc,dev/util-macros,libs/libX11,libs/libXext
+run_deps=libs/libX11,libs/libXext
+opt_deps=
+
+num_builds=0
+
+description=XInput extension library.
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/pub/individual/lib/libXi-1.8.1.tar.xz
+sha256sums=
