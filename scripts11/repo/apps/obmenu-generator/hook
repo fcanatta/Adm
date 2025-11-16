@@ -1,0 +1,42 @@
+# /usr/src/adm/repo/apps/obmenu-generator/hook
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+og_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() { :; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root; root="$(og_root)"
+  mkdir -p "$root/usr/bin" "$root/usr/share/obmenu-generator"
+  cp -a obmenu-generator "$root/usr/bin/obmenu-generator"
+  chmod +x "$root/usr/bin/obmenu-generator"
+  cp -a schema.pl files/* "$root/usr/share/obmenu-generator/" 2>/dev/null || true
+}
+
+adm_hook_post_install() {
+  local root skel confdir
+  root="$(og_root)"
+  skel="$root/etc/skel"
+  confdir="$skel/.config/obmenu-generator"
+  mkdir -p "$confdir"
+  if [ ! -f "$confdir/schema.pl" ]; then
+    cat >"$confdir/schema.pl" <<'EOF'
+# schema.pl gerado pelo ADM – ajuste conforme seu ambiente.
+our $SCHEMA = [
+  { item => ['xterm', 'Terminal', 'utilities-terminal'] },
+  { item => ['pcmanfm', 'Arquivos', 'system-file-manager'] },
+];
+EOF
+  fi
+}
