@@ -1,0 +1,16 @@
+name=picom-pijulius-next-git
+version=0_git
+category=x11
+
+build_deps=dev/meson,dev/ninja,dev/pkgconf,libs/libX11,libs/libXcomposite,libs/libXdamage,libs/libXfixes,libs/libXrandr,libs/libXinerama,libs/libconfig,libs/pixman
+run_deps=libs/libX11,libs/libXcomposite,libs/libXdamage,libs/libXfixes,libs/libXrandr,libs/libXinerama,libs/libconfig,libs/pixman
+opt_deps=libs/libdrm
+
+num_builds=0
+
+description=Picom compositor (fork pijulius, branch next) com efeitos avançados.
+homepage=https://github.com/pijulius/picom
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/pijulius/picom.git#branch=next
+sha256sums=
