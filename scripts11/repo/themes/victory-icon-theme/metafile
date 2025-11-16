@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/themes/victory-icon-theme/metafile
+name=victory-icon-theme
+version=2024.01
+category=themes
+
+build_deps=
+run_deps=themes/hicolor-icon-theme
+opt_deps=
+
+num_builds=0
+
+description=Victory icon theme – tema de ícones colorido.
+homepage=https://github.com/rtzuu/victory-icon-theme
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/rtzuu/victory-icon-theme.git
+sha256sums=
