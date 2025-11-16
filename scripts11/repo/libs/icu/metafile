@@ -1,0 +1,16 @@
+name=icu
+version=75.1
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=ICU – International Components for Unicode (suporte Unicode avançado)
+homepage=https://icu.unicode.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/unicode-org/icu/releases/download/release-75-1/icu4c-75_1-src.tgz
+sha256sums=
