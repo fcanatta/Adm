@@ -1,0 +1,16 @@
+name=desktop-file-utils
+version=0.27
+category=sys
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=desktop-file-utils – tools para desktop entries (.desktop)
+homepage=https://freedesktop.org/wiki/Software/desktop-file-utils/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
