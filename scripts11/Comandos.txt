@@ -128,3 +128,10 @@ adm install apps/xfce4-terminal
 ADM_OPENBOX_THEME="Clearlooks" \
 ADM_OPENBOX_NUM_DESKTOPS=6 \
 adm install x11/obconf
+
+# Firefox
+# build release com 8 jobs instalando em /opt/firefox
+ADM_FIREFOX_BUILD_PROFILE=release \
+ADM_FIREFOX_JOBS=8 \
+ADM_FIREFOX_INSTALL_DIR=/opt/firefox \
+adm install apps/firefox
