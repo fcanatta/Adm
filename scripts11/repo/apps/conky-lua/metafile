@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/conky-lua/metafile
+name=conky-lua
+version=1.0
+category=apps
+
+build_deps=apps/conky,dev/lua
+run_deps=apps/conky,dev/lua
+opt_deps=fonts/ttf-conkyweather,fonts/nerd-fonts
+
+num_builds=0
+
+description=Extensões Lua para Conky (scripts e exemplos).
+homepage=https://github.com/brndnmtthws/conky
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
