@@ -1,0 +1,16 @@
+name=zip
+version=3.0
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=zip – utilitário para criar arquivos ZIP
+homepage=https://infozip.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
