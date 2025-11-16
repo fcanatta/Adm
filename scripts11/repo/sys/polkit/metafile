@@ -1,0 +1,16 @@
+name=polkit
+version=123
+category=sys
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=polkit – framework de políticas para controle de privilégios
+homepage=https://gitlab.freedesktop.org/polkit/polkit
+maintainer=ADM System <adm@example.local>
+
+sources=https://gitlab.freedesktop.org/polkit/polkit/-/archive/123/polkit-123.tar.gz
+sha256sums=
