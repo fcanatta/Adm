@@ -1,0 +1,16 @@
+name=mpg123
+version=1.32.6
+category=media
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=libs/alsa-lib,libs/pulseaudio
+
+num_builds=0
+
+description=mpg123 – player rápido de MP3 em linha de comando.
+homepage=https://www.mpg123.de/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/mpg123/mpg123-1.32.6.tar.bz2
+sha256sums=
