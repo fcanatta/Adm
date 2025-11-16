@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Hook inteligente para sys/colord
+# - Cria serviço para colord conforme init detectado
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -9,15 +12,137 @@ if ! declare -F adm_info >/dev/null 2>&1; then
   adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_cd)" "$*" >&2; }
 fi
 
+svc_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+svc_detect_init() {
+  if [ -n "${ADM_TARGET_INIT:-}" ]; then
+    printf '%s\n' "$ADM_TARGET_INIT"
+    return 0
+  fi
+  local comm
+  comm="$(ps -p 1 -o comm= 2>/dev/null || echo "")"
+  if [ -d /run/systemd/system ]; then
+    printf 'systemd\n'
+  elif [ "$comm" = "runit" ] || [ -d /etc/runit ]; then
+    printf 'runit\n'
+  elif [ "$comm" = "openrc-init" ] || [ -x /sbin/openrc ] || [ -x /sbin/openrc-init ]; then
+    printf 'openrc\n'
+  else
+    printf 'sysv\n'
+  fi
+}
+
+svc_find_daemon_path() {
+  local root="$1" daemon="$2"; shift 2
+  local cand
+  if [ "$root" = "/" ]; then
+    if cand="$(command -v "$daemon" 2>/dev/null)"; then printf '%s\n' "$cand"; return 0; fi
+  fi
+  for cand in \
+    "$root/usr/libexec/$daemon" \
+    "$root/usr/lib/$daemon" \
+    "$root/usr/bin/$daemon" \
+    "$root/usr/sbin/$daemon"
+  do
+    [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  printf '%s\n' "$daemon"
+}
+
+svc_create_systemd_unit() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local dir="$root/etc/systemd/system"
+  local unit="$dir/$service"
+  mkdir -p "$dir"
+  [ -e "$unit" ] && { adm_info "sys/colord: unit '$unit' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  adm_info "sys/colord: criando unit '$unit'."
+  cat >"$unit" <<EOF
+[Unit]
+Description=$desc
+After=network.target dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=$dpath
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+svc_create_runit_service() {
+  local root="$1" service="$2" daemon="$3"
+  local dir="$root/etc/runit/sv/$service"
+  local run="$dir/run"
+  mkdir -p "$dir"
+  [ -e "$run" ] && { adm_info "sys/colord: serviço runit '$run' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  cat >"$run" <<EOF
+#!/bin/sh
+exec $dpath
+EOF
+  chmod +x "$run"
+  adm_info "sys/colord: serviço runit criado em '$run'."
+}
+
+svc_create_sysv_init() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local init="$root/etc/init.d/$service"
+  mkdir -p "$root/etc/init.d"
+  [ -e "$init" ] && { adm_info "sys/colord: script '$init' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  cat >"$init" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $service
+# Required-Start:    \$remote_fs \$syslog dbus
+# Required-Stop:     \$remote_fs \$syslog dbus
+# Default-Start:     3 5
+# Default-Stop:      0 1 2 6
+# Short-Description: $desc
+### END INIT INFO
+
+case "\$1" in
+  start)   $dpath & ;;
+  stop)    killall $(basename "$dpath") 2>/dev/null || true ;;
+  restart) "\$0" stop; "\$0" start ;;
+  status)  pgrep -x "$(basename "$dpath")" >/dev/null && echo "$service rodando" || echo "$service parado" ;;
+  *) echo "Uso: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "$init"
+}
+
 adm_hook_pre_build() { adm_info "sys/colord: build padrão."; }
 adm_hook_build() { :; }
-adm_hook_install() { :; }
+
+adm_hook_install() {
+  local root init
+  root="$(svc_root)"
+  init="$(svc_detect_init)"
+
+  adm_info "sys/colord: root='$root' init='$init'."
+
+  case "$init" in
+    systemd)
+      svc_create_systemd_unit "$root" "colord.service" "colord" "Color management daemon"
+      ;;
+    runit)
+      svc_create_runit_service "$root" "colord" "colord"
+      ;;
+    openrc|sysv)
+      svc_create_sysv_init "$root" "colord" "colord" "Color management daemon"
+      ;;
+  esac
+}
 
 adm_hook_post_install() {
-  if [ "${ADM_ENABLE_SERVICES:-0}" = "1" ] && command -v systemctl >/dev/null 2>&1; then
-    adm_info "sys/colord: habilitando colord.service (se possível)."
-    systemctl enable colord.service 2>/dev/null || adm_warn "sys/colord: habilite manualmente."
-  else
-    adm_info "sys/colord: serviço não habilitado automaticamente; faça conforme seu init."
-  fi
+  adm_info "sys/colord: serviço criado; habilite conforme systemd/runit/sysv/openrc."
 }
