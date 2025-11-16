@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Hook para apps/st
+# - Coloca README em /etc/skel/.config/st explicando que o st é configurado via config.h
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_st() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_st)" "$*" >&2; }
+fi
+
+st_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+adm_hook_pre_build() { adm_info "apps/st: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root dir readme
+  root="$(st_root)"
+  dir="$root/etc/skel/.config/st"
+  readme="$dir/README.adm"
+
+  mkdir -p "$dir"
+  if [ -f "$readme" ]; then
+    adm_info "apps/st: README já existente; não sobrescrevendo."
+    return 0
+  fi
+
+  cat >"$readme" <<'EOF'
+st (simple terminal) é configurado editando o arquivo config.h e recompilando.
+Este arquivo foi criado pelo ADM para lembrar disso.
+EOF
+  adm_info "apps/st: README.adm criado em /etc/skel/.config/st."
+}
+
+adm_hook_post_install() { adm_info "apps/st: hook concluído."; }
