@@ -1,0 +1,16 @@
+name=json
+version=0.17
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=json-c – biblioteca em C para manipular JSON
+homepage=https://github.com/json-c/json-c
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/json-c/json-c/archive/refs/tags/json-c-0.17.tar.gz
+sha256sums=
