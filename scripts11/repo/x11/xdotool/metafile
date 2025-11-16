@@ -1,0 +1,16 @@
+name=xdotool
+version=3.20211022.1
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=x11/xorg-server
+opt_deps=
+
+num_builds=0
+
+description=xdotool – simula entradas de teclado/mouse para X11 via XTest
+homepage=https://www.semicomplete.com/projects/xdotool/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
