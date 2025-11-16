@@ -1,0 +1,16 @@
+name=gtksourceview-3
+version=3.24.11
+category=x11
+
+build_deps=x11/gtk-3,libs/pango,dev/meson,dev/ninja
+run_deps=x11/gtk-3,libs/pango
+opt_deps=
+
+num_builds=0
+
+description=Widget de edição de código (GTK3).
+homepage=https://wiki.gnome.org/Projects/GtkSourceView
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/gtksourceview/3.24/gtksourceview-3.24.11.tar.xz
+sha256sums=
