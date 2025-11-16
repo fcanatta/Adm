@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Hook inteligente para sys/upower
+# - Detecta init e cria serviço correspondente (systemd/runit/sysv/openrc)
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_up() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_up)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_up)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_up)" "$*" >&2; }
+fi
+
+svc_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+svc_detect_init() {
+  if [ -n "${ADM_TARGET_INIT:-}" ]; then
+    printf '%s\n' "$ADM_TARGET_INIT"
+    return 0
+  fi
+  local comm
+  comm="$(ps -p 1 -o comm= 2>/dev/null || echo "")"
+  if [ -d /run/systemd/system ]; then
+    printf 'systemd\n'
+  elif [ "$comm" = "runit" ] || [ -d /etc/runit ]; then
+    printf 'runit\n'
+  elif [ "$comm" = "openrc-init" ] || [ -x /sbin/openrc ] || [ -x /sbin/openrc-init ]; then
+    printf 'openrc\n'
+  else
+    printf 'sysv\n'
+  fi
+}
+
+svc_find_daemon_path() {
+  local root="$1" daemon="$2"; shift 2
+  local cand
+  if [ "$root" = "/" ]; then
+    if cand="$(command -v "$daemon" 2>/dev/null)"; then
+      printf '%s\n' "$cand"; return 0
+    fi
+  fi
+  for cand in \
+    "$root/usr/libexec/$daemon" \
+    "$root/usr/lib/$daemon" \
+    "$root/usr/bin/$daemon" \
+    "$root/usr/sbin/$daemon"
+  do
+    [ -x "$cand" ] && { printf '%s\n' "$cand"; return 0; }
+  done
+  printf '%s\n' "$daemon"
+}
+
+svc_create_systemd_unit() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local dir="$root/etc/systemd/system"
+  local unit="$dir/$service"
+  mkdir -p "$dir"
+  [ -e "$unit" ] && { adm_info "sys/upower: unit '$unit' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  adm_info "sys/upower: criando unit '$unit'."
+  cat >"$unit" <<EOF
+[Unit]
+Description=$desc
+After=network.target dbus.service
+Requires=dbus.service
+
+[Service]
+Type=simple
+ExecStart=$dpath
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+svc_create_runit_service() {
+  local root="$1" service="$2" daemon="$3"
+  local dir="$root/etc/runit/sv/$service"
+  local run="$dir/run"
+  mkdir -p "$dir"
+  [ -e "$run" ] && { adm_info "sys/upower: serviço runit '$run' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  cat >"$run" <<EOF
+#!/bin/sh
+exec $dpath
+EOF
+  chmod +x "$run"
+  adm_info "sys/upower: serviço runit criado em '$run' (crie link em runsvdir para habilitar)."
+}
+
+svc_create_sysv_init() {
+  local root="$1" service="$2" daemon="$3" desc="$4"
+  local init="$root/etc/init.d/$service"
+  mkdir -p "$root/etc/init.d"
+  [ -e "$init" ] && { adm_info "sys/upower: script init '$init' já existe."; return 0; }
+  local dpath; dpath="$(svc_find_daemon_path "$root" "$daemon")"
+  cat >"$init" <<EOF
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          $service
+# Required-Start:    \$remote_fs \$syslog dbus
+# Required-Stop:     \$remote_fs \$syslog dbus
+# Default-Start:     3 5
+# Default-Stop:      0 1 2 6
+# Short-Description: $desc
+### END INIT INFO
+
+case "\$1" in
+  start)   $dpath & ;;
+  stop)    killall $(basename "$dpath") 2>/dev/null || true ;;
+  restart) "\$0" stop; "\$0" start ;;
+  status)  pgrep -x "$(basename "$dpath")" >/dev/null && echo "$service rodando" || echo "$service parado" ;;
+  *) echo "Uso: \$0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit 0
+EOF
+  chmod +x "$init"
+  adm_info "sys/upower: script init criado em '$init'."
+}
+
+adm_hook_pre_build() { adm_info "sys/upower: build padrão."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root init
+  root="$(svc_root)"
+  init="$(svc_detect_init)"
+
+  adm_info "sys/upower: root='$root' init='$init'."
+
+  case "$init" in
+    systemd) svc_create_systemd_unit "$root" "upower.service" "upowerd" "UPower power management daemon" ;;
+    runit)   svc_create_runit_service "$root" "upower" "upowerd" ;;
+    openrc|sysv)
+      svc_create_sysv_init "$root" "upower" "upowerd" "UPower power management daemon"
+      ;;
+  esac
+}
+
+adm_hook_post_install() {
+  adm_info "sys/upower: serviço criado conforme init; habilite conforme seu sistema."
+}
