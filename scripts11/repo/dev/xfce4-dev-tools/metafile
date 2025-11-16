@@ -1,0 +1,16 @@
+name=xfce4-dev-tools
+version=4.18.0
+category=dev
+
+build_deps=dev/autoconf,dev/automake,dev/libtool,dev/pkgconf
+run_deps=dev/autoconf,dev/automake,dev/libtool
+opt_deps=
+
+num_builds=0
+
+description=Macros e helpers para desenvolvimento de módulos XFCE.
+homepage=https://docs.xfce.org/xfce/xfce4-dev-tools/start
+maintainer=ADM System <adm@example.local>
+
+sources=https://archive.xfce.org/src/xfce/xfce4-dev-tools/4.18/xfce4-dev-tools-4.18.0.tar.bz2
+sha256sums=
