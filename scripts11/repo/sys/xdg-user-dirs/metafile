@@ -1,0 +1,16 @@
+name=xdg-user-dirs
+version=0.18
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=xdg-user-dirs – gerencia diretórios padrão do usuário (Desktop, Downloads…)
+homepage=https://www.freedesktop.org/wiki/Software/xdg-user-dirs/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
