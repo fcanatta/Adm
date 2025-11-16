@@ -1,0 +1,16 @@
+name=ibus
+version=1.5.29
+category=sys
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=IBus – sistema de método de entrada (IM) para múltiplos idiomas
+homepage=https://github.com/ibus/ibus
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
