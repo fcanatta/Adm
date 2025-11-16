@@ -1,0 +1,18 @@
+name=chromium-widevine
+version=123.0.6312.122
+category=apps
+
+build_deps=dev/clang,dev/python3,dev/ninja,dev/nodejs,dev/gn,dev/pkgconf,libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Chromium compilado do código-fonte com Widevine integrado a partir do Chrome estável.
+homepage=https://www.chromium.org/
+maintainer=ADM System <adm@example.local>
+
+# 1) Chromium fonte
+# 2) Chrome .deb para extrair Widevine (libwidevinecdm.so)
+sources=https://commondatastorage.googleapis.com/chromium-browser-official/chromium-123.0.6312.122.tar.xz,https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sha256sums=
