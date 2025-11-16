@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/obmenu-generator/metafile
+name=obmenu-generator
+version=0.88
+category=apps
+
+build_deps=sys/perl
+run_deps=sys/perl,apps/openbox
+opt_deps=
+
+num_builds=0
+
+description=Gerador de menu automático para Openbox em Perl.
+homepage=https://github.com/trizen/obmenu-generator
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/trizen/obmenu-generator.git
+sha256sums=
