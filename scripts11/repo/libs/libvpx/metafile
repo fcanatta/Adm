@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libvpx/metafile
+name=libvpx
+version=1.13.1
+category=libs
+
+build_deps=dev/gcc,dev/make
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=WebM VP8/VP9 video codec library.
+homepage=https://github.com/webmproject/libvpx
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/webmproject/libvpx/archive/refs/tags/v1.13.1.tar.gz
+sha256sums=
