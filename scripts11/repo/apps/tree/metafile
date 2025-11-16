@@ -1,0 +1,16 @@
+name=tree
+version=2.2.1
+category=apps
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=tree – exibe diretórios em forma de árvore
+homepage=https://oldmanprogrammer.net/source.php?dir=projects/tree
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
