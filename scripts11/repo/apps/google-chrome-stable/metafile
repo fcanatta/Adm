@@ -1,0 +1,17 @@
+name=google-chrome-stable
+version=stable_current
+category=apps
+
+build_deps=sys/ar,sys/tar,sys/xz
+run_deps=libs/libX11,libs/libXcursor,libs/libXdamage,libs/libXrandr,libs/libXcomposite,libs/alsa-lib,libs/libdrm
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Google Chrome – navegador oficial do Google baseado em Chromium.
+homepage=https://www.google.com/chrome/
+maintainer=ADM System <adm@example.local>
+
+# URL "current" que sempre aponta para o .deb estável mais recente (amd64)
+sources=https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sha256sums=
