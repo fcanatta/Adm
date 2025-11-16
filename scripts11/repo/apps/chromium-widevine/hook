@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_chw(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_chw)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_chw)" "$*" >&2; }
+  adm_error(){ printf '[%s] [ERRO] %s\n' "$(_ts_chw)" "$*" >&2; }
+fi
+
+chw_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  # NÃO tentamos montar todo o build do Chromium aqui.
+  # Assumimos que o build-engine do ADM foi configurado para:
+  #   gn gen out/Release ...
+  #   ninja -C out/Release chrome
+  adm_info "chromium-widevine: hook não controla o build, apenas install + Widevine."
+}
+
+adm_hook_build() {
+  : # build é responsabilidade do build-engine/adm, não do hook
+}
+
+adm_hook_install() {
+  local root outdir libdir bindir
+  root="$(chw_root)"
+  outdir="$PWD/out/Release"
+  libdir="$root/usr/lib/chromium"
+  bindir="$root/usr/bin"
+
+  if [ ! -x "$outdir/chrome" ] && [ ! -x "$outdir/chromium" ]; then
+    adm_error "chromium-widevine: binário 'chrome/chromium' não encontrado em $outdir. Verifique o build."
+    return 1
+  fi
+
+  adm_info "chromium-widevine: copiando build de $outdir para $libdir."
+  mkdir -p "$libdir"
+  cp -a "$outdir"/. "$libdir/"
+
+  mkdir -p "$bindir"
+  cat >"$bindir/chromium" <<'EOF'
+#!/bin/sh
+exec /usr/lib/chromium/chrome "$@"
+EOF
+  chmod +x "$bindir/chromium"
+}
+
+extract_widevine_from_chrome_deb() {
+  local root="$1" work deb wd
+  work="$PWD"
+  wd="$root/usr/lib/chromium/WidevineCdm"
+
+  deb="$(ls google-chrome-stable_*_amd64.deb google-chrome-stable_current_amd64.deb 2>/dev/null | head -n1 || true)"
+  if [ -z "$deb" ]; then
+    adm_warn "chromium-widevine: .deb do Chrome não encontrado para extrair Widevine."
+    return 1
+  fi
+
+  adm_info "chromium-widevine: extraindo Widevine de $deb."
+  mkdir -p "$work/_chrome_deb"
+  cd "$work/_chrome_deb"
+  ar x "../$deb"
+  tar xf data.tar.* 2>/dev/null || true
+
+  # Caminhos típicos (podem variar com versões):
+  # /opt/google/chrome/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so
+  local wbase="opt/google/chrome/WidevineCdm"
+  local wlib="$wbase/_platform_specific/linux_x64/libwidevinecdm.so"
+
+  if [ ! -f "$wlib" ]; then
+    adm_warn "chromium-widevine: libwidevinecdm.so não encontrada em $wlib."
+    return 1
+  fi
+
+  mkdir -p "$wd/_platform_specific/linux_x64"
+  cp -a "$wbase/manifest.json" "$wd/" 2>/dev/null || true
+  cp -a "$wlib" "$wd/_platform_specific/linux_x64/"
+
+  adm_info "chromium-widevine: Widevine copiado para $wd."
+  return 0
+}
+
+adm_hook_post_install() {
+  local root
+  root="$(chw_root)"
+
+  # Extração do Widevine a partir do Chrome .deb baixado como fonte secundária
+  if ! extract_widevine_from_chrome_deb "$root"; then
+    adm_warn "chromium-widevine: não foi possível integrar Widevine automaticamente. O Chromium ainda funciona sem Widevine."
+  fi
+}
