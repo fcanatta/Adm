@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------
+# Logging fallback
+# ---------------------
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_x264() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n' "$(_ts_x264)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n' "$(_ts_x264)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n' "$(_ts_x264)" "$*" >&2; }
+fi
+
+root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ] && printf '%s\n' "$DESTDIR" ||
+  printf '/\n'
+}
+
+jobs() { nproc 2>/dev/null || echo 1; }
+
+cflags_opt() {
+  local f="-O3 -ffast-math -fPIC -fstack-protector-strong"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="$f -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "x264: build personalizado habilitado."
+}
+
+adm_hook_build() {
+  local src="$PWD"
+  cd "$src"
+
+  CFLAGS="$(cflags_opt)" \
+  ./configure \
+      --prefix=/usr \
+      --enable-pic \
+      --enable-static \
+      --enable-shared \
+      --enable-lto \
+      --enable-strip \
+      --enable-highbitdepth \
+      --enable-asm \
+      --enable-pic
+
+  make -j"$(jobs)"
+}
+
+adm_hook_install() {
+  make DESTDIR="$(root)" install
+}
+
+adm_hook_post_install() {
+  adm_info "x264 instalado com tunagem agressiva."
+}
