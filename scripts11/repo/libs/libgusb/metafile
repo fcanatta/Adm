@@ -1,0 +1,16 @@
+name=libgusb
+version=0.4.9
+category=libs
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=libgusb – biblioteca GObject para acesso a dispositivos USB via libusb
+homepage=https://github.com/hughsie/libgusb
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
