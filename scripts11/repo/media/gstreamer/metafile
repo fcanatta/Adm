@@ -1,0 +1,16 @@
+name=gstreamer
+version=1.24.6
+category=media
+
+build_deps=dev/meson,dev/ninja,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=GStreamer – framework de multimídia.
+homepage=https://gstreamer.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gstreamer.freedesktop.org/src/gstreamer/gstreamer-1.24.6.tar.xz
+sha256sums=
