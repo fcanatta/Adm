@@ -1,0 +1,16 @@
+name=notify-send
+version=0.8.3
+category=apps
+
+build_deps=
+run_deps=libs/libnotify
+opt_deps=
+
+num_builds=0
+
+description=notify-send – utilitário de linha de comando para notificações
+homepage=https://gitlab.gnome.org/GNOME/libnotify
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
