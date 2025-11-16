@@ -1,0 +1,16 @@
+name=w3m
+version=0.5.3
+category=apps
+
+build_deps=dev/gcc,libs/openssl,libs/boehm-gc
+run_deps=libs/openssl
+opt_deps=libs/gc
+
+num_builds=0
+
+description=Navegador web baseado em texto com suporte a SSL.
+homepage=http://w3m.sourceforge.net/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/w3m/w3m-0.5.3.tar.gz
+sha256sums=
