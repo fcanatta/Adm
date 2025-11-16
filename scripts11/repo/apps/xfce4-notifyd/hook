@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_xn(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_xn)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_xn)" "$*" >&2; }
+fi
+
+xn_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() { adm_info "xfce4-notifyd: build padrão meson é suficiente."; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  : # install padrão
+}
+
+adm_hook_post_install() {
+  local root autostart skel cfgdir cfg
+
+  root="$(xn_root)"
+  autostart="$root/etc/xdg/autostart"
+  skel="$root/etc/skel"
+  cfgdir="$skel/.config/xfce4/xfconf/xfce-perchannel-xml"
+  cfg="$cfgdir/xfce4-notifyd.xml"
+
+  adm_info "xfce4-notifyd: garantindo autostart global e config básica em /etc/skel."
+
+  mkdir -p "$autostart"
+  if [ ! -f "$autostart/xfce4-notifyd.desktop" ]; then
+    cat >"$autostart/xfce4-notifyd.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=XFCE Notifications
+Exec=xfce4-notifyd
+OnlyShowIn=XFCE;
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+EOF
+  else
+    adm_warn "xfce4-notifyd: /etc/xdg/autostart/xfce4-notifyd.desktop já existe; não sobrescrevendo."
+  fi
+
+  mkdir -p "$cfgdir"
+  if [ ! -f "$cfg" ]; then
+    cat >"$cfg" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+
+<channel name="xfce4-notifyd" version="1.0">
+  <property name="applications" type="empty">
+  </property>
+  <property name="notifyd" type="empty">
+    <property name="do-slideout" type="bool" value="true"/>
+    <property name="initial-opacity" type="int" value="100"/>
+    <property name="expire-timeout" type="int" value="5000"/>
+  </property>
+</channel>
+EOF
+  fi
+
+  adm_info "xfce4-notifyd: autostart + config padrão aplicados."
+}
