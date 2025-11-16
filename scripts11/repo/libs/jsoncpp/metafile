@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/jsoncpp/metafile
+name=jsoncpp
+version=1.9.5
+category=libs
+
+build_deps=dev/cmake,dev/ninja,dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=JSON C++ library (jsoncpp).
+homepage=https://github.com/open-source-parsers/jsoncpp
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/open-source-parsers/jsoncpp/archive/refs/tags/1.9.5.tar.gz
+sha256sums=
