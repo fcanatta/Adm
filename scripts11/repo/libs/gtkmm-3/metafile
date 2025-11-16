@@ -1,0 +1,16 @@
+name=gtkmm-3
+version=3.24.8
+category=libs
+
+build_deps=x11/gtk-3,libs/pangomm,libs/libcairomm-1.0,dev/meson,dev/ninja
+run_deps=x11/gtk-3,libs/pangomm,libs/libcairomm-1.0
+opt_deps=
+
+num_builds=0
+
+description=GTKmm 3 – bindings C++ para GTK3.
+homepage=https://www.gtkmm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/gtkmm/3.24/gtkmm-3.24.8.tar.xz
+sha256sums=
