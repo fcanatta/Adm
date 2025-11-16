@@ -1,0 +1,45 @@
+# /usr/src/adm/repo/apps/qutebrowser/hook
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_qb(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_qb)" "$*" >&2; }
+  adm_error(){ printf '[%s] [ERRO] %s\n' "$(_ts_qb)" "$*" >&2; }
+fi
+
+qb_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "qutebrowser: usando instalação via pip (source) para /usr."
+}
+
+adm_hook_build() {
+  : # nada, o 'pip install' é feito no install
+}
+
+adm_hook_install() {
+  local root; root="$(qb_root)"
+  # pip install no chroot de destino, se possível
+  if [ -x "$root/usr/bin/python3" ]; then
+    adm_info "qutebrowser: instalando via pip dentro do root."
+    chroot "$root" python3 -m pip install --no-deps --no-build-isolation \
+        --prefix=/usr /usr/src/adm/work/qutebrowser || adm_error "pip install falhou"
+  else
+    adm_error "python3 não encontrado em $root/usr/bin/python3; instale python3 no root antes."
+  fi
+}
+
+adm_hook_post_install() {
+  adm_info "qutebrowser: instalado."
+}
