@@ -1,0 +1,16 @@
+name=pixman
+version=0.42.2
+category=x11
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Pixel manipulation library used by Xorg and Cairo.
+homepage=https://www.pixman.org/
+maintainer=ADM <adm@example.local>
+
+sources=https://www.x.org/releases/individual/lib/pixman-0.42.2.tar.xz
+sha256sums=
