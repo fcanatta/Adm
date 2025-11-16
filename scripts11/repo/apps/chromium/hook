@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Fallback simples de log, caso 01-log-ui.sh ainda não esteja carregado
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_chr(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n' "$(_ts_chr)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n' "$(_ts_chr)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n' "$(_ts_chr)" "$*" >&2; }
+fi
+
+chr_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+chr_cflags() {
+  local f="-O2 -fPIC"
+  case "${ADM_PROFILE:-normal}" in
+    aggressive) f="-O3 -fPIC -march=native -mtune=native -flto" ;;
+    minimal)    f="-O2 -fPIC" ;;
+  esac
+  printf '%s\n' "$f"
+}
+
+chr_jobs() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  else
+    echo 4
+  fi
+}
+
+adm_hook_pre_build() {
+  # Vamos controlar TODO o processo via hook
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "chromium: build from source via hook (gn+ninja)."
+}
+
+adm_hook_build() {
+  # Diretório do source (ADM normalmente extrai aqui)
+  local srcdir="$PWD"
+  local jobs
+  jobs="$(chr_jobs)"
+
+  adm_info "chromium: source em '$srcdir', jobs=$jobs."
+
+  # 1) Bootstrap do GN (gera tools/gn/out/gn ou similar)
+  if [ ! -x "$srcdir/out/Release/gn" ] && [ ! -x "$srcdir/gn" ]; then
+    adm_info "chromium: bootstrap do GN."
+    if [ -x "$srcdir/tools/gn/bootstrap/bootstrap.py" ]; then
+      python3 "$srcdir/tools/gn/bootstrap/bootstrap.py" -s
+    else
+      adm_warn "chromium: bootstrap.py não encontrado; assumindo que 'gn' já existe no PATH."
+    fi
+  fi
+
+  # 2) Gera args.gn
+  mkdir -p "$srcdir/out/Release"
+
+  cat >"$srcdir/out/Release/args.gn" <<EOF
+is_debug = false
+is_official_build = true
+symbol_level = 0
+use_lld = true
+is_clang = true
+enable_nacl = false
+use_sysroot = false
+ffmpeg_branding = "Chromium"
+proprietary_codecs = false
+is_component_build = false
+use_gtk = true
+EOF
+
+  adm_info "chromium: args.gn gerado em out/Release/args.gn."
+
+  # 3) Executa gn gen
+  if command -v gn >/dev/null 2>&1; then
+    adm_info "chromium: usando 'gn' do sistema."
+    gn gen out/Release
+  elif [ -x "$srcdir/out/Release/gn" ]; then
+    adm_info "chromium: usando 'out/Release/gn'."
+    "$srcdir/out/Release/gn" gen out/Release
+  else
+    adm_error "chromium: 'gn' não encontrado (nem no PATH, nem em out/Release/gn)."
+    return 1
+  fi
+
+  # 4) Ninja build – alvo 'chrome' (ou 'chromium' dependendo do tree)
+  adm_info "chromium: iniciando build com ninja."
+  if command -v ninja >/dev/null 2>&1; then
+    if ninja -C out/Release -j"$jobs" chrome; then
+      adm_info "chromium: alvo 'chrome' compilado com sucesso."
+    elif ninja -C out/Release -j"$jobs" chromium; then
+      adm_info "chromium: alvo 'chromium' compilado com sucesso."
+    else
+      adm_error "chromium: nem 'chrome' nem 'chromium' buildaram; veja os logs."
+      return 1
+    fi
+  else
+    adm_error "chromium: 'ninja' não encontrado no PATH."
+    return 1
+  fi
+}
+
+adm_hook_install() {
+  local root libdir bindir outdir bin
+
+  root="$(chr_root)"
+  outdir="$PWD/out/Release"
+  libdir="$root/usr/lib/chromium"
+  bindir="$root/usr/bin"
+
+  if [ -x "$outdir/chrome" ]; then
+    bin="chrome"
+  elif [ -x "$outdir/chromium" ]; then
+    bin="chromium"
+  else
+    adm_error "chromium: binário 'chrome/chromium' não encontrado em $outdir."
+    return 1
+  fi
+
+  adm_info "chromium: instalando build de $outdir para $libdir (bin=$bin)."
+
+  mkdir -p "$libdir"
+  # Copia tudo do Release (pode ser ajustado se quiser instalar só o mínimo)
+  cp -a "$outdir"/. "$libdir/"
+
+  mkdir -p "$bindir"
+  cat >"$bindir/chromium" <<EOF
+#!/bin/sh
+exec /usr/lib/chromium/$bin "\$@"
+EOF
+  chmod +x "$bindir/chromium"
+}
+
+adm_hook_post_install() {
+  local root
+  root="$(chr_root)"
+
+  adm_info "chromium: criando .desktop padrão."
+
+  mkdir -p "$root/usr/share/applications"
+  cat >"$root/usr/share/applications/chromium.desktop" <<'EOF'
+[Desktop Entry]
+Version=1.0
+Name=Chromium
+Comment=Browse the Web
+Exec=chromium %U
+Terminal=false
+X-MultipleArgs=false
+Type=Application
+Icon=chromium
+Categories=Network;WebBrowser;
+MimeType=text/html;text/xml;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+EOF
+}
