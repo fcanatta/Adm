@@ -1,0 +1,16 @@
+name=imagemagick
+version=7.1.1
+category=media
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=libs/libjpeg-turbo,libs/libpng,libs/libwebp
+
+num_builds=0
+
+description=ImageMagick – suíte de processamento de imagens (convert, mogrify…)
+homepage=https://imagemagick.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
