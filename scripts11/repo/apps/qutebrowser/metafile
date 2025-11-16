@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/apps/qutebrowser/metafile
+name=qutebrowser
+version=3.2.0
+category=apps
+
+build_deps=sys/python3,dev/python-modules,libs/qt5-webengine,dev/pyqt5
+run_deps=sys/python3,libs/qt5-webengine
+opt_deps=media/ffmpeg
+
+num_builds=0
+
+description=Qutebrowser – navegador keyboard-driven baseado em QtWebEngine.
+homepage=https://qutebrowser.org/
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/qutebrowser/qutebrowser.git
+sha256sums=
