@@ -1,0 +1,16 @@
+name=libtirpc
+version=1.3.4
+category=libs
+
+build_deps=dev/gcc,dev/autoconf,dev/automake,dev/libtool
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Transport-Independent RPC library, replacement for SunRPC.
+homepage=https://sourceforge.net/projects/libtirpc/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/libtirpc/libtirpc-1.3.4.tar.bz2
+sha256sums=
