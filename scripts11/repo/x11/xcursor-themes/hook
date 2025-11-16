@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Fallback de log, caso 01-log-ui.sh não esteja carregado
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_xc(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n' "$(_ts_xc)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n' "$(_ts_xc)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n' "$(_ts_xc)" "$*" >&2; }
+fi
+
+xc_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+xc_default_theme_for_profile() {
+  case "${ADM_PROFILE:-normal}" in
+    aggressive) printf 'Adwaita' ;;
+    normal)     printf 'Adwaita' ;;
+    minimal)    printf 'core' ;;   # ajuste para o tema minimal que você tiver
+    *)          printf 'Adwaita' ;;
+  esac
+}
+
+xc_backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local backup="${path}.adm-backup-$(date +%Y%m%d%H%M%S)"
+    adm_warn "xcursor-themes: '$path' já existe; backup em '$backup'."
+    cp -a "$path" "$backup"
+  fi
+}
+
+adm_hook_pre_build() {
+  adm_info "xcursor-themes: build padrão do ADM é suficiente (apenas install de arquivos)."
+}
+
+adm_hook_build() {
+  : # Nada a fazer, apenas copiar os temas no install
+}
+
+adm_hook_install() {
+  local root icons_dir default_dir index_file theme
+  root="$(xc_root)"
+  icons_dir="$root/usr/share/icons"
+  default_dir="$icons_dir/default"
+  index_file="$default_dir/index.theme"
+  theme="$(xc_default_theme_for_profile)"
+
+  mkdir -p "$default_dir"
+
+  # Se o tema sugerido não existe, apenas loga e não falha
+  if [ ! -d "$icons_dir/$theme" ]; then
+    adm_warn "xcursor-themes: tema '$theme' não encontrado em '$icons_dir'; não forçando tema padrão."
+    return 0
+  fi
+
+  xc_backup_if_exists "$index_file"
+
+  adm_info "xcursor-themes: definindo tema padrão para '$theme' em '$index_file'."
+  cat >"$index_file" <<EOF
+[Icon Theme]
+Name=Default
+Inherits=$theme
+EOF
+}
+
+adm_hook_post_install() {
+  adm_info "xcursor-themes: tema padrão configurado conforme profile '${ADM_PROFILE:-normal}'."
+}
