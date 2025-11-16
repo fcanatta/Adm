@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/fonts/nerd-fonts/metafile
+name=nerd-fonts
+version=3.2.1
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=libs/fontconfig
+
+num_builds=0
+
+description=Nerd Fonts – fontes patchadas com ligaduras e ícones.
+homepage=https://www.nerdfonts.com/
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/ryanoasis/nerd-fonts.git
+sha256sums=
