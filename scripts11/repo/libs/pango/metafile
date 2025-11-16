@@ -1,0 +1,16 @@
+name=pango
+version=1.54.0
+category=libs
+
+build_deps=libs/harfbuzz,libs/fontconfig,libs/freetype,dev/meson,dev/ninja
+run_deps=libs/harfbuzz,libs/fontconfig,libs/freetype
+opt_deps=
+
+num_builds=0
+
+description=Pango – biblioteca de layout de texto usada por GTK.
+homepage=https://pango.gnome.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/pango/1.54/pango-1.54.0.tar.xz
+sha256sums=
