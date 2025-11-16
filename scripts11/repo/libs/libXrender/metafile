@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/libs/libXrender/metafile
+name=libXrender
+version=0.9.11
+category=libs
+
+build_deps=dev/gcc,dev/util-macros,libs/libX11
+run_deps=libs/libX11
+opt_deps=
+
+num_builds=0
+
+description=X Rendering Extension library.
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.x.org/pub/individual/lib/libXrender-0.9.11.tar.xz
+sha256sums=
