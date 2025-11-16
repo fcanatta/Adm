@@ -1,0 +1,16 @@
+name=wayland
+version=1.23.0
+category=libs
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Wayland – protocolo e biblioteca de composição gráfica moderna
+homepage=https://wayland.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
