@@ -1,0 +1,33 @@
+# /usr/src/adm/repo/apps/dockbarx/hook
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+dx_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s\n' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s\n' "$DESTDIR"          ||
+  printf '/'
+}
+
+adm_hook_pre_build() { :; }
+adm_hook_build() { :; }
+
+adm_hook_install() {
+  local root; root="$(dx_root)"
+  mkdir -p "$root/usr/share/dockbarx" "$root/usr/bin"
+  cp -a . "$root/usr/share/dockbarx/src"
+  # wrapper principal (ajuste conforme a estrutura do repo se precisar)
+  cat >"$root/usr/bin/dockbarx" <<'EOF'
+#!/usr/bin/env python3
+import sys, os
+base = "/usr/share/dockbarx/src"
+os.chdir(base)
+sys.path.insert(0, base)
+from dockbarx.main import main
+if __name__ == "__main__":
+    main()
+EOF
+  chmod +x "$root/usr/bin/dockbarx"
+}
+
+adm_hook_post_install() { :; }
