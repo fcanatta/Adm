@@ -1,0 +1,16 @@
+name=enchant
+version=2.6.0
+category=libs
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Enchant – camada abstrata para corretores ortográficos (aspell, hunspell…)
+homepage=https://github.com/AbiWord/enchant
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/AbiWord/enchant/releases/download/v2.6.0/enchant-2.6.0.tar.gz
+sha256sums=
