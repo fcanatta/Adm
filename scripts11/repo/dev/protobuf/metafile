@@ -1,0 +1,16 @@
+name=protobuf
+version=28.0
+category=dev
+
+build_deps=dev/gcc,dev/cmake
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Protocol Buffers – serialização de dados estruturados
+homepage=https://developers.google.com/protocol-buffers
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/protocolbuffers/protobuf/archive/refs/tags/v28.0.tar.gz
+sha256sums=
