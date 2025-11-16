@@ -1,0 +1,16 @@
+name=gtkmm-4
+version=4.12.0
+category=libs
+
+build_deps=x11/gtk-4,libs/pangomm,libs/libcairomm-1.16,dev/meson,dev/ninja
+run_deps=x11/gtk-4,libs/pangomm,libs/libcairomm-1.16
+opt_deps=
+
+num_builds=0
+
+description=GTKmm 4 – bindings C++ para GTK4.
+homepage=https://www.gtkmm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/gtkmm/4.12/gtkmm-4.12.0.tar.xz
+sha256sums=
