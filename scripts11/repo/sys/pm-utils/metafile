@@ -1,0 +1,16 @@
+name=pm-utils
+version=1.4.1
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=pm-utils – scripts antigos de gerenciamento de energia (suspend/hibernate)
+homepage=https://pm-utils.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
