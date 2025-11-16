@@ -1,0 +1,16 @@
+name=xmlto
+version=0.0.28
+category=dev
+
+build_deps=dev/asciidoc,dev/docbook-xsl,dev/libxslt
+run_deps=dev/libxslt
+opt_deps=
+
+num_builds=0
+
+description=Ferramenta que converte XML para múltiplos formatos (pdf, html, txt).
+homepage=https://pagure.io/xmlto
+maintainer=ADM System <adm@example.local>
+
+sources=https://releases.pagure.org/xmlto/xmlto-0.0.28.tar.gz
+sha256sums=
