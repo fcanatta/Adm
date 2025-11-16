@@ -1,0 +1,16 @@
+name=graphviz
+version=10.0.1
+category=apps
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Graphviz – ferramentas para geração de grafos (dot, neato…)
+homepage=https://graphviz.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
