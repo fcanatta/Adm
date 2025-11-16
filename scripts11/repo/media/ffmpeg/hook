@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Hook avançado para media/ffmpeg
+# - Controla build via ./configure && make
+# - Auto-detecta codecs/libs via pkg-config e ajusta flags
+# - Evita habilitar codecs inexistentes (salvo FORCE_ENABLE)
+#
+# Variáveis:
+#   ADM_FFMPEG_JOBS           -> número de jobs (default: nproc)
+#   ADM_FFMPEG_BUILD_TYPE     -> release|debug (default: release)
+#   ADM_FFMPEG_EXTRA_FLAGS    -> flags extras para ./configure
+#   ADM_FFMPEG_FORCE_ENABLE   -> lista separada por vírgula de codecs p/ forçar (ex: "libx264,libx265")
+#   ADM_FFMPEG_FORCE_DISABLE  -> lista separada por vírgula de codecs p/ desabilitar
+
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_ffm() { date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info()  { printf '[%s] [INFO] %s\n'  "$(_ts_ffm)" "$*" >&2; }
+  adm_warn()  { printf '[%s] [WARN] %s\n'  "$(_ts_ffm)" "$*" >&2; }
+  adm_error() { printf '[%s] [ERRO] %s\n'  "$(_ts_ffm)" "$*" >&2; }
+  adm_die()   { adm_error "$*"; exit 1; }
+fi
+
+ffm_jobs() {
+  if [ -n "${ADM_FFMPEG_JOBS:-}" ]; then
+    printf '%s\n' "$ADM_FFMPEG_JOBS"
+  else
+    nproc 2>/dev/null || echo 1
+  fi
+}
+
+ffm_build_type() {
+  case "${ADM_FFMPEG_BUILD_TYPE:-release}" in
+    release|debug) printf '%s\n' "$ADM_FFMPEG_BUILD_TYPE" ;;
+    *) adm_warn "media/ffmpeg: ADM_FFMPEG_BUILD_TYPE inválido, usando 'release'."; printf 'release\n' ;;
+  esac
+}
+
+ffm_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then printf '%s\n' "$DESTDIR"
+  else printf '/\n'; fi
+}
+
+ffm_detect_srctree() {
+  if [ -n "${ADM_FFMPEG_SRCDIR:-}" ] && [ -f "$ADM_FFMPEG_SRCDIR/configure" ]; then
+    printf '%s\n' "$ADM_FFMPEG_SRCDIR"; return 0
+  fi
+  if [ -f "configure" ]; then
+    printf '%s\n' "$PWD"; return 0
+  fi
+  local d
+  for d in "$PWD"/ffmpeg-* "$PWD"/*; do
+    [ -d "$d" ] || continue
+    if [ -f "$d/configure" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  adm_die "media/ffmpeg: não foi possível encontrar diretório de fonte (configure)."
+}
+
+ffm_list_contains() {
+  # $1 = lista "a,b,c", $2 = item
+  local list="$1" item="$2"
+  IFS=',' read -r -a arr <<<"$list"
+  for e in "${arr[@]}"; do
+    [ -z "$e" ] && continue
+    if [ "$e" = "$item" ]; then return 0; fi
+  done
+  return 1
+}
+
+ffm_should_enable() {
+  # $1 = nome lógico (libx264,libwebp,libjpeg etc.)
+  local name="$1"
+  local force_en="${ADM_FFMPEG_FORCE_ENABLE:-}"
+  local force_dis="${ADM_FFMPEG_FORCE_DISABLE:-}"
+
+  if [ -n "$force_dis" ] && ffm_list_contains "$force_dis" "$name"; then
+    adm_info "media/ffmpeg: codec '$name' forçado como DESABILITADO."
+    return 1
+  fi
+  if [ -n "$force_en" ] && ffm_list_contains "$force_en" "$name"; then
+    adm_info "media/ffmpeg: codec '$name' forçado como HABILITADO."
+    return 0
+  fi
+
+  # Caso normal: depende de pkg-config
+  case "$name" in
+    libx264) pkg-config --exists x264 && return 0 || return 1 ;;
+    libx265) pkg-config --exists x265 && return 0 || return 1 ;;
+    libvpx)  pkg-config --exists vpx  && return 0 || return 1 ;;
+    libopus) pkg-config --exists opus && return 0 || return 1 ;;
+    libwebp) pkg-config --exists libwebp && return 0 || return 1 ;;
+    libjpeg) pkg-config --exists libjpeg || pkg-config --exists libturbojpeg && return 0 || return 1 ;;
+    libpng)  pkg-config --exists libpng && return 0 || return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+ffm_configure_flags() {
+  local flags=()
+  local bt
+  bt="$(ffm_build_type)"
+
+  flags+=(--prefix=/usr --enable-gpl --enable-version3 --enable-shared --disable-debug)
+
+  [ "$bt" = "debug" ] && flags+=(--disable-optimizations --enable-debug=3)
+
+  # codecs comuns
+  if ffm_should_enable libjpeg; then
+    flags+=(--enable-libjpeg)
+  fi
+
+  if ffm_should_enable libpng; then
+    flags+=(--enable-libpng)
+  fi
+
+  if ffm_should_enable libwebp; then
+    flags+=(--enable-libwebp)
+  fi
+
+  if ffm_should_enable libx264; then
+    flags+=(--enable-libx264)
+  fi
+
+  if ffm_should_enable libx265; then
+    flags+=(--enable-libx265)
+  fi
+
+  if ffm_should_enable libvpx; then
+    flags+=(--enable-libvpx)
+  fi
+
+  if ffm_should_enable libopus; then
+    flags+=(--enable-libopus)
+  fi
+
+  if [ -n "${ADM_FFMPEG_EXTRA_FLAGS:-}" ]; then
+    # shellcheck disable=SC2206
+    extra=( ${ADM_FFMPEG_EXTRA_FLAGS} )
+    flags+=("${extra[@]}")
+  fi
+
+  printf '%s\n' "${flags[*]}"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "media/ffmpeg: build padrão desativado; usando hook ./configure + make."
+}
+
+adm_hook_build() {
+  local src jobs cfg_flags
+  src="$(ffm_detect_srctree)"
+  jobs="$(ffm_jobs)"
+  cfg_flags="$(ffm_configure_flags)"
+
+  adm_info "media/ffmpeg: src=$src jobs=$jobs"
+  adm_info "media/ffmpeg: flags de configure: $cfg_flags"
+
+  (
+    cd "$src"
+    ./configure $cfg_flags
+    make -j"$jobs"
+  )
+}
+
+adm_hook_install() {
+  local src root
+  src="$(ffm_detect_srctree)"
+  root="$(ffm_root)"
+
+  adm_info "media/ffmpeg: instalando em root='$root'."
+  (
+    cd "$src"
+    make DESTDIR="$root" install
+  )
+}
+
+adm_hook_post_install() {
+  adm_info "media/ffmpeg: instalação concluída; verifique 'ffmpeg -codecs' para conferir codecs habilitados."
+}
