@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/media/gstreamer-plugins-ugly/metafile
+name=gstreamer-plugins-ugly
+version=1.24.6
+category=media
+
+build_deps=media/gstreamer-plugins-base,dev/meson,dev/ninja,dev/pkgconf
+run_deps=media/gstreamer-plugins-base
+opt_deps=
+
+num_builds=0
+
+description=GStreamer ugly plugins – codecs com possíveis issues legais (MP3, etc).
+homepage=https://gstreamer.freedesktop.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gstreamer.freedesktop.org/src/gst-plugins-ugly/gst-plugins-ugly-1.24.6.tar.xz
+sha256sums=
