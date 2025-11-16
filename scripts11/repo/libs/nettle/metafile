@@ -1,0 +1,16 @@
+name=nettle
+version=3.9.1
+category=libs
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Nettle – low-level cryptographic library.
+homepage=https://www.lysator.liu.se/~nisse/nettle/
+maintainer=ADM System <adm@example.local>
+
+sources=https://ftp.gnu.org/gnu/nettle/nettle-3.9.1.tar.gz
+sha256sums=
