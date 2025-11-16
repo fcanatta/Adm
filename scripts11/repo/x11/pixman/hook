@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ] && printf '%s' "$DESTDIR" ||
+  printf '/'
+}
+
+cflags_pix() {
+  local f="-O3 -fPIC -fstack-protector-strong"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="$f -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() { export ADM_SKIP_DEFAULT_BUILD=1; }
+
+adm_hook_build() {
+  CFLAGS="$(cflags_pix)" meson setup build \
+      --prefix=/usr \
+      --buildtype=release \
+      -Dcpu=auto \
+      -Doptimization=3 \
+      -Dsse2=enabled \
+      -Dneon=enabled \
+      -Dgnu-inline-asm=true
+
+  ninja -C build -j"$(nproc)"
+}
+
+adm_hook_install() {
+  ninja -C build install DESTDIR="$(root)"
+}
+
+adm_hook_post_install() {
+  adm_info "Pixman instalado com SIMD otimizado."
+}
