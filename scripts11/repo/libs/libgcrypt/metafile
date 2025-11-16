@@ -1,0 +1,16 @@
+name=libgcrypt
+version=1.10.3
+category=libs
+
+build_deps=libs/nettle,libs/libgpg-error,dev/gcc
+run_deps=libs/libgpg-error
+opt_deps=
+
+num_builds=0
+
+description=General purpose cryptographic library based on GnuPG.
+homepage=https://gnupg.org/software/libgcrypt/
+maintainer=ADM System <adm@example.local>
+
+sources=https://gnupg.org/ftp/gcrypt/libgcrypt/libgcrypt-1.10.3.tar.bz2
+sha256sums=
