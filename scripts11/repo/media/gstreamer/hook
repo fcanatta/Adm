@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_gst(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_gst)" "$*" >&2; }
+fi
+
+gst_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s' "$DESTDIR"          ||
+  printf '/'
+}
+
+gst_cflags() {
+  local f="-O2 -fPIC"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="-O3 -fPIC -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() { export ADM_SKIP_DEFAULT_BUILD=1; }
+
+adm_hook_build() {
+  rm -rf build
+  CFLAGS="$(gst_cflags)" meson setup build \
+      --prefix=/usr \
+      --buildtype=release \
+      -Ddefault_library=shared \
+      -Dtests=disabled \
+      -Dexamples=disabled
+
+  ninja -C build -j"$(nproc)"
+}
+
+adm_hook_install() {
+  ninja -C build install DESTDIR="$(gst_root)"
+}
+
+adm_hook_post_install() {
+  adm_info "gstreamer: core instalado."
+}
