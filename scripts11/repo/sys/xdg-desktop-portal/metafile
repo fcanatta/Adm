@@ -1,0 +1,16 @@
+name=xdg-desktop-portal
+version=1.18.4
+category=sys
+
+build_deps=dev/meson,dev/ninja,libs/glib,sys/dbus
+run_deps=libs/glib,sys/dbus
+opt_deps=gtk,qt
+
+num_builds=0
+
+description=Portal de desktop (sanduíche entre apps sandbox e o desktop real).
+homepage=https://flatpak.github.io/xdg-desktop-portal/
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/flatpak/xdg-desktop-portal/archive/refs/tags/1.18.4.tar.gz
+sha256sums=
