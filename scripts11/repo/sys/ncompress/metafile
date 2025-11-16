@@ -1,0 +1,16 @@
+name=ncompress
+version=5.0
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Compactador clássico (compress/uncompress).
+homepage=https://github.com/vapier/ncompress
+maintainer=ADM System <adm@example.local>
+
+sources=https://github.com/vapier/ncompress/archive/refs/tags/v5.0.tar.gz
+sha256sums=
