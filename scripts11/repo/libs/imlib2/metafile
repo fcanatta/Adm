@@ -1,0 +1,16 @@
+name=imlib2
+version=1.12.0
+category=libs
+
+build_deps=dev/gcc,dev/autoconf,dev/automake,dev/libtool
+run_deps=
+opt_deps=libs/libjpeg-turbo,libs/libpng,libs/libtiff
+
+num_builds=0
+
+description=Imlib2 – biblioteca leve para manipulação e renderização de imagens.
+homepage=https://docs.enlightenment.org/api/imlib2/
+maintainer=ADM System <adm@example.local>
+
+sources=https://downloads.sourceforge.net/enlightenment/imlib2-1.12.0.tar.xz
+sha256sums=
