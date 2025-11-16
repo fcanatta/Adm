@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/fonts/vim-devicons-git/metafile
+name=vim-devicons-git
+version=2024.01
+category=fonts
+
+build_deps=
+run_deps=
+opt_deps=fonts/nerd-fonts
+
+num_builds=0
+
+description=Fontes/ícones para Vim/Neovim Devicons (git snapshot).
+homepage=https://github.com/ryanoasis/vim-devicons
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/ryanoasis/vim-devicons.git
+sha256sums=
