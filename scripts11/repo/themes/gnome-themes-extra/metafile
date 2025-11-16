@@ -1,0 +1,16 @@
+name=gnome-themes-extra
+version=3.28
+category=themes
+
+build_deps=x11/gtk-3
+run_deps=x11/gtk-3,themes/hicolor-icon-theme
+opt_deps=themes/adwaita-icon-theme
+
+num_builds=0
+
+description=Temas GNOME adicionais (HighContrast, etc).
+homepage=https://gitlab.gnome.org/GNOME/gnome-themes-extra
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/gnome-themes-extra/3.28/gnome-themes-extra-3.28.tar.xz
+sha256sums=
