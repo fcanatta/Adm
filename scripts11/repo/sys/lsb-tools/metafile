@@ -1,0 +1,16 @@
+name=lsb-tools
+version=1.0.0
+category=sys
+
+build_deps=dev/gcc
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Ferramentas básicas relacionadas ao LSB (scripts utilitários)
+homepage=https://example.local/lsb-tools
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
