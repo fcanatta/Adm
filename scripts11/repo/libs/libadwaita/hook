@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_liba(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_liba)" "$*" >&2; }
+fi
+
+liba_root() {
+  [ -n "${ADM_INSTALL_ROOT:-}" ] && printf '%s' "$ADM_INSTALL_ROOT" ||
+  [ -n "${DESTDIR:-}" ]          && printf '%s' "$DESTDIR"          ||
+  printf '/'
+}
+
+liba_cflags() {
+  local f="-O2 -fPIC"
+  [ "${ADM_PROFILE:-normal}" = "aggressive" ] && f="-O3 -fPIC -march=native -mtune=native -flto"
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "libadwaita: build meson tunado por profile."
+}
+
+adm_hook_build() {
+  rm -rf build
+  CFLAGS="$(liba_cflags)" meson setup build \
+      --prefix=/usr \
+      --buildtype=release \
+      -Ddefault_library=shared \
+      -Dtests=false \
+      -Dexamples=false
+
+  ninja -C build -j"$(nproc)"
+}
+
+adm_hook_install() {
+  ninja -C build install DESTDIR="$(liba_root)"
+}
+
+adm_hook_post_install() {
+  adm_info "libadwaita: instalado com otimização '${ADM_PROFILE:-normal}'."
+}
