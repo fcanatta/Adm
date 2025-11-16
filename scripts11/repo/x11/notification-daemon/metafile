@@ -1,0 +1,16 @@
+name=notification-daemon
+version=3.20.0
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=sys/dbus,x11/xorg-server
+opt_deps=libs/libnotify
+
+num_builds=0
+
+description=notification-daemon – daemon para notificações desktop (freedesktop)
+homepage=https://git.gnome.org/browse/notification-daemon
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
