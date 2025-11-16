@@ -1,0 +1,16 @@
+name=webkitgtk
+version=2.46.0
+category=x11
+
+build_deps=x11/gtk-3,libs/libepoxy,libs/libgcrypt,libs/libdrm,media/gstreamer,dev/cmake,dev/ninja,dev/gcc
+run_deps=x11/gtk-3,media/gstreamer
+opt_deps=
+
+num_builds=0
+
+description=WebKitGTK – engine web para aplicações GTK.
+homepage=https://webkitgtk.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://webkitgtk.org/releases/webkitgtk-2.46.0.tar.xz
+sha256sums=
