@@ -1,0 +1,16 @@
+name=mencoder
+version=1.5
+category=media
+
+build_deps=dev/gcc,media/ffmpeg
+run_deps=media/ffmpeg
+opt_deps=
+
+num_builds=0
+
+description=MEncoder – encoder de vídeo da família MPlayer (legado).
+homepage=https://www.mplayerhq.hu/
+maintainer=ADM System <adm@example.local>
+
+sources=https://www.mplayerhq.hu/MPlayer/releases/MPlayer-1.5.tar.xz
+sha256sums=
