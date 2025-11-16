@@ -1,0 +1,16 @@
+name=xorg-legacy-fonts
+version=1.0
+category=fonts
+
+build_deps=fonts/xorg-fonts,libs/fontconfig
+run_deps=libs/fontconfig
+opt_deps=
+
+num_builds=0
+
+description=Conjunto de fontes bitmap legadas do Xorg (misc, cursor, 75dpi, 100dpi).
+homepage=https://www.x.org/
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
