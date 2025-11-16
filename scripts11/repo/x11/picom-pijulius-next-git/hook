@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_pij(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_pij)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_pij)" "$*" >&2; }
+fi
+
+pij_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+pij_cflags() {
+  local f="-O2 -fPIC"
+  case "${ADM_PROFILE:-normal}" in
+    aggressive) f="-O3 -fPIC -march=native -mtune=native -flto" ;;
+    minimal)    f="-O2 -fPIC" ;;
+  esac
+  printf '%s\n' "$f"
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "picom-pijulius-next-git: usando meson tunado."
+}
+
+adm_hook_build() {
+  rm -rf build
+  CFLAGS="$(pij_cflags)" meson setup build \
+      --prefix=/usr \
+      --buildtype=release \
+      -Dwith_docs=false \
+      -Dwith_xres=true \
+      -Dwith_xsync=true \
+      -Dwith_opengl=true \
+      -Dwith_glx=true
+
+  ninja -C build -j"$(nproc)"
+}
+
+adm_hook_install() {
+  ninja -C build install DESTDIR="$(pij_root)"
+}
+
+adm_hook_post_install() {
+  local root skel confdir
+  root="$(pij_root)"
+  skel="$root/etc/skel"
+  confdir="$skel/.config/picom"
+
+  mkdir -p "$confdir"
+  if [ ! -f "$confdir/picom.conf" ]; then
+    adm_info "picom: gerando config padrão em /etc/skel."
+    cat >"$confdir/picom.conf" <<'EOF'
+########################################
+# picom (pijulius-next) configuration
+########################################
+
+backend = "glx";
+vsync = true;
+shadow = true;
+fading = true;
+
+corner-radius = 12.0;
+rounded-corners-exclude = [
+  "class_g = 'Conky'",
+  "class_g = 'XTerm'"
+];
+
+blur: {
+  method = "dual_kawase";
+  strength = 5;
+};
+
+inactive-opacity = 0.9;
+frame-opacity = 0.9;
+EOF
+  fi
+}
