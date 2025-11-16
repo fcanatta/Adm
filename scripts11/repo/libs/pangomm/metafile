@@ -1,0 +1,16 @@
+name=pangomm
+version=2.54.0
+category=libs
+
+build_deps=libs/pango,dev/meson,dev/ninja
+run_deps=libs/pango
+opt_deps=
+
+num_builds=0
+
+description=Bindings C++ para Pango.
+homepage=https://www.gtkmm.org/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/pangomm/2.54/pangomm-2.54.0.tar.xz
+sha256sums=
