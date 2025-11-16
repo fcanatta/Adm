@@ -1,0 +1,16 @@
+name=polkit-gnome
+version=0.105
+category=x11
+
+build_deps=dev/gcc,dev/pkgconf
+run_deps=sys/polkit,sys/dbus
+opt_deps=
+
+num_builds=0
+
+description=polkit-gnome – agente gráfico de autenticação para polkit em ambientes GTK
+homepage=https://gitlab.freedesktop.org/polkit/polkit-gnome
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
