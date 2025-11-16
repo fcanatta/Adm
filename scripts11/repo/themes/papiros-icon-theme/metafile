@@ -1,0 +1,17 @@
+# /usr/src/adm/repo/themes/papiros-icon-theme/metafile
+name=papiros-icon-theme
+version=2024.01
+category=themes
+
+build_deps=
+run_deps=themes/hicolor-icon-theme
+opt_deps=
+
+num_builds=0
+
+description=Papiros icon theme.
+homepage=https://github.com/matiasdelellis/papirus-icon-theme
+maintainer=ADM System <adm@example.local>
+
+sources=git+https://github.com/PapirusDevelopmentTeam/papirus-icon-theme.git
+sha256sums=
