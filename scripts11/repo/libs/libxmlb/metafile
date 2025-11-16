@@ -1,0 +1,16 @@
+name=libxmlb
+version=0.3.16
+category=libs
+
+build_deps=dev/gcc,dev/meson,dev/ninja
+run_deps=libs/libxml2
+opt_deps=
+
+num_builds=0
+
+description=libxmlb – representação binária eficiente de XML
+homepage=https://github.com/hughsie/libxmlb
+maintainer=ADM System <adm@example.local>
+
+sources=
+sha256sums=
