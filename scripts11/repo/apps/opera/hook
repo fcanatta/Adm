@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+if ! declare -F adm_info >/dev/null 2>&1; then
+  _ts_op(){ date +"%Y-%m-%d %H:%M:%S"; }
+  adm_info(){ printf '[%s] [INFO] %s\n' "$(_ts_op)" "$*" >&2; }
+  adm_warn(){ printf '[%s] [WARN] %s\n' "$(_ts_op)" "$*" >&2; }
+  adm_error(){ printf '[%s] [ERRO] %s\n' "$(_ts_op)" "$*" >&2; }
+fi
+
+op_root() {
+  if [ -n "${ADM_INSTALL_ROOT:-}" ]; then
+    printf '%s\n' "$ADM_INSTALL_ROOT"
+  elif [ -n "${DESTDIR:-}" ]; then
+    printf '%s\n' "$DESTDIR"
+  else
+    printf '/\n'
+  fi
+}
+
+adm_hook_pre_build() {
+  export ADM_SKIP_DEFAULT_BUILD=1
+  adm_info "opera: reempacotando .deb oficial."
+}
+
+adm_hook_build() {
+  : # nada pra compilar
+}
+
+adm_hook_install() {
+  local root work deb
+  root="$(op_root)"
+  work="$PWD"
+
+  deb="$(ls opera-stable_*_amd64.deb opera_*_amd64.deb 2>/dev/null | head -n1 || true)"
+  if [ -z "$deb" ]; then
+    adm_error "opera: .deb não encontrado no diretório de build."
+    return 1
+  fi
+
+  mkdir -p "$work/_deb"
+  cd "$work/_deb"
+
+  adm_info "opera: extraindo $deb."
+  ar x "../$deb"
+  tar xf data.tar.* 2>/dev/null || true
+
+  adm_info "opera: copiando usr/ e opt/ do .deb para o root."
+  cp -a usr opt "$root/" 2>/dev/null || true
+
+  # Wrapper previsível
+  mkdir -p "$root/usr/bin"
+  if [ ! -x "$root/usr/bin/opera" ] && [ -x "$root/opt/opera/opera" ]; then
+    cat >"$root/usr/bin/opera" <<'EOF'
+#!/bin/sh
+exec /opt/opera/opera "$@"
+EOF
+    chmod +x "$root/usr/bin/opera"
+  fi
+}
+
+adm_hook_post_install() {
+  adm_info "opera: instalado a partir do .deb oficial (reempacotado pelo ADM)."
+}
