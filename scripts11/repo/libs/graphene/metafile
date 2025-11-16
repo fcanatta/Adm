@@ -1,0 +1,16 @@
+name=graphene
+version=1.10.8
+category=libs
+
+build_deps=dev/meson,dev/ninja
+run_deps=
+opt_deps=
+
+num_builds=0
+
+description=Graphene – biblioteca de vetores/matrizes para gráficos modernos.
+homepage=https://ebassi.github.io/graphene/
+maintainer=ADM System <adm@example.local>
+
+sources=https://download.gnome.org/sources/graphene/1.10/graphene-1.10.8.tar.xz
+sha256sums=
