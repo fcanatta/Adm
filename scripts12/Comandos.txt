@@ -129,3 +129,32 @@ PARA CRIAR O CROSS-TOOLCHAIN NO ADM:
 
 5. Usar adm install normalmente
 
+# Como usar isso no adm para o cross-toolchain
+
+Com esses metafiles salvos, a sequência típica do adm pra criar o cross-toolchain (do jeito que você desenhou) seria algo assim, em alto nível:
+
+1. Instalar headers do kernel:
+adm install linux --profile minimal --stage cross
+
+
+2. Construir as libs de suporte do GCC:
+adm install gmp mpfr mpc isl --profile minimal --stage cross
+
+
+3. Construir binutils para o target:
+adm install binutils --profile minimal --stage cross --target <triplet>
+
+
+4. Construir gcc (fase 1 – sem libs completas):
+adm install gcc --profile minimal --stage cross-bootstrap --languages=c
+
+
+5. Construir glibc para o target (usando o cross-gcc):
+adm install glibc --profile minimal --stage cross
+
+
+6. Construir gcc final (com C, C++, etc.):
+adm install gcc --profile aggressive --stage final --languages=c,c++,fortran
+
+
+O teu runtime.sh, build_core.sh, source.sh e profile.sh já estão prontos para interpretar esse metafile (deps, categorias, etc.) e montar o grafo de dependências.
