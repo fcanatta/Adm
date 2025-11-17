@@ -1,0 +1,906 @@
+#!/usr/bin/env bash
+# adm-meta - utilitário para metafiles (ler, validar, deps, version, etc.)
+
+set -o pipefail
+set -o nounset
+
+# =========[ CONFIG BÁSICA ]================================================
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+ADM_REPO="${ADM_ROOT}/repo"
+ADM_UPDATES="${ADM_ROOT}/updates"
+ADM_LOG_DIR="${ADM_ROOT}/logs"
+
+DRY_RUN=0
+QUIET=0
+USE_UPDATES=0   # 0 = repo, 1 = updates
+
+# =========[ CORES / LOG ]==================================================
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+
+C_MAGENTA='\033[35;1m'
+C_GREEN='\033[32;1m'
+C_YELLOW='\033[33;1m'
+C_RED='\033[31;1m'
+C_CYAN='\033[36;1m'
+
+CHECK_MARK="✔"
+
+supports_color() {
+    [[ -t 1 ]] && tput colors &>/dev/null
+}
+
+colorize() {
+    local color="$1"; shift
+    if supports_color; then
+        printf "%b%s%b" "${color}" "$*" "${C_RESET}"
+    else
+        printf "%s" "$*"
+    fi
+}
+
+timestamp() {
+    date +%H:%M:%S
+}
+
+log_header() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %b%s%b\n" \
+        "$(colorize "${C_MAGENTA}" "==")" \
+        "$(timestamp)" \
+        "$(colorize "${C_MAGENTA}" "[META]")" \
+        " ${msg}" \
+        "${C_RESET}"
+}
+
+log_arrow() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_GREEN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_info() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_CYAN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_warn() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_YELLOW}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+log_error() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_RED}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# =========[ SPINNER ]======================================================
+
+_spinner_pid=""
+
+spinner_start() {
+    local msg="$1"
+    (( QUIET )) && return 0
+
+    local spin='|/-\'
+    local i=0
+
+    printf "%s %s %s " "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
+
+    (
+        tput civis 2>/dev/null || true
+        while :; do
+            printf "\r%s %s %s %b%c%b" \
+                "$(colorize "${C_GREEN}" "->")" \
+                "$(timestamp)" \
+                "${msg}" \
+                "${C_CYAN}" "${spin:i++%${#spin}:1}" "${C_RESET}"
+            sleep 0.1
+        done
+    ) &
+    _spinner_pid=$!
+    disown "$_spinner_pid" 2>/dev/null || true
+}
+
+spinner_stop() {
+    local status=${1:-0}
+    (( QUIET )) && return "${status}"
+
+    if [[ -n "${_spinner_pid}" ]] && kill -0 "${_spinner_pid}" &>/dev/null; then
+        kill "${_spinner_pid}" &>/dev/null || true
+        wait "${_spinner_pid}" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+
+    tput cnorm 2>/dev/null || true
+
+    local symbol msg_color
+    if (( status == 0 )); then
+        symbol="${CHECK_MARK}"
+        msg_color="${C_GREEN}"
+    else
+        symbol="✖"
+        msg_color="${C_RED}"
+    fi
+
+    printf "\r%b %s %b%s%b\n" \
+        "$(colorize "${msg_color}" "->")" \
+        "$(timestamp)" \
+        "${msg_color}" "[${symbol}]" "${C_RESET}"
+
+    return "${status}"
+}
+
+run_with_spinner() {
+    local msg="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] ${msg}: $*"
+        return 0
+    fi
+
+    spinner_start "${msg}"
+    "$@" &
+    local pid=$!
+
+    wait "${pid}"
+    local status=$?
+
+    spinner_stop "${status}"
+    return "${status}"
+}
+
+# =========[ DIRETÓRIOS / LOG ]=============================================
+
+ensure_dirs() {
+    [[ -d "${ADM_LOG_DIR}" ]] || mkdir -p "${ADM_LOG_DIR}" 2>/dev/null || true
+}
+
+log_file_for() {
+    local action="$1" target="$2"
+    printf "%s/meta-%s-%s.%s.log" \
+        "${ADM_LOG_DIR}" "${action}" "${target}" "$(date +%Y%m%d-%H%M%S)"
+}
+
+# =========[ LOCALIZAÇÃO DE METAFILE ]======================================
+
+meta_path_repo() {
+    local category="$1" pkg="$2"
+    printf "%s/%s/%s/metafile" "${ADM_REPO}" "${category}" "${pkg}"
+}
+
+meta_path_updates() {
+    local pkg="$1"
+    printf "%s/%s/metafile" "${ADM_UPDATES}" "${pkg}"
+}
+
+meta_path() {
+    local category="$1" pkg="$2"
+    if (( USE_UPDATES )); then
+        meta_path_updates "${pkg}"
+    else
+        meta_path_repo "${category}" "${pkg}"
+    fi
+}
+
+meta_get_rawfile() {
+    local category="$1" pkg="$2"
+    local file
+    file="$(meta_path "${category}" "${pkg}")"
+    [[ -f "${file}" ]] || die "Metafile não encontrado: ${file}"
+    echo "${file}"
+}
+
+meta_get() {
+    local category="$1" pkg="$2" key="$3"
+    local file
+    file="$(meta_get_rawfile "${category}" "${pkg}")"
+
+    local line
+    line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+meta_name()        { meta_get "$1" "$2" "name";        }
+meta_version()     { meta_get "$1" "$2" "version";     }
+meta_category()    { meta_get "$1" "$2" "category";    }
+meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
+meta_build_deps()  { meta_get "$1" "$2" "build_deps";  }
+meta_opt_deps()    { meta_get "$1" "$2" "opt_deps";    }
+meta_num_builds()  { meta_get "$1" "$2" "num_builds";  }
+meta_description() { meta_get "$1" "$2" "description"; }
+meta_homepage()    { meta_get "$1" "$2" "homepage";    }
+meta_sha256sums()  { meta_get "$1" "$2" "sha256sums";  }
+meta_md5sum()      { meta_get "$1" "$2" "md5sum";      }
+meta_sources()     { meta_get "$1" "$2" "sources";     }
+
+# =========[ LOCALIZAR CATEGORIA ]==========================================
+
+find_category_for_pkg() {
+    local pkg="$1"
+    [[ -d "${ADM_REPO}" ]] || die "Repositório não encontrado em ${ADM_REPO}"
+
+    local matches=()
+    local f
+    while IFS= read -r -d '' f; do
+        # .../repo/<category>/<pkg>/metafile
+        local cat dirpkg
+        cat="$(basename "$(dirname "${f}")")"
+        dirpkg="$(basename "$(dirname "$(dirname "${f}")")")"
+        if [[ "${dirpkg}" == "${pkg}" ]]; then
+            matches+=("${cat}")
+        fi
+    done < <(find "${ADM_REPO}" -mindepth 3 -maxdepth 5 -type f -name 'metafile' -print0 2>/dev/null || true)
+
+    if (( ${#matches[@]} == 0 )); then
+        die "Nenhum metafile encontrado para programa '${pkg}'."
+    elif (( ${#matches[@]} > 1 )); then
+        log_error "Metafiles múltiplos encontrados para '${pkg}':"
+        local m
+        for m in "${matches[@]}"; do
+            echo "  - ${m}/${pkg}"
+        done
+        die "Especifique a categoria explicitamente."
+    else
+        echo "${matches[0]}"
+    fi
+}
+
+split_cat_pkg_arg() {
+    local arg="$1"
+    local category pkg
+
+    if [[ "${arg}" == *"/"* && ${USE_UPDATES} -eq 0 ]]; then
+        category="${arg%%/*}"
+        pkg="${arg#*/}"
+        [[ -z "${category}" || -z "${pkg}" ]] && die "Formato inválido: '${arg}' (use categoria/programa ou programa)"
+    else
+        pkg="${arg}"
+        if (( USE_UPDATES )); then
+            category="$(meta_category "dummy" "${pkg}" 2>/dev/null || echo "unknown")"
+        else
+            category="$(find_category_for_pkg "${pkg}")"
+        fi
+    fi
+
+    printf "%s %s\n" "${category}" "${pkg}"
+}
+
+split_list() {
+    local s="$1"
+    [[ -z "${s}" ]] && return 0
+    echo "${s}" | tr ',' '\n' | sed '/^[[:space:]]*$/d'
+}
+
+join_list() {
+    # recebe itens na stdin, devolve separados por vírgula
+    paste -sd',' -
+}
+
+# =========[ VALIDAÇÃO DE METAFILE ]========================================
+
+validate_metafile() {
+    local category="$1" pkg="$2"
+
+    local file
+    file="$(meta_get_rawfile "${category}" "${pkg}")"
+    log_header "Validando metafile: ${file}"
+
+    local required=(
+        "name"
+        "version"
+        "category"
+        "run_deps"
+        "build_deps"
+        "opt_deps"
+        "num_builds"
+        "description"
+        "homepage"
+        "sources"
+    )
+
+    local missing=()
+    local key
+    for key in "${required[@]}"; do
+        if ! grep -qE "^${key}=" "${file}" 2>/dev/null; then
+            missing+=("${key}")
+        fi
+    done
+
+    if (( ${#missing[@]} > 0 )); then
+        log_error "Campos obrigatórios ausentes: ${missing[*]}"
+        return 1
+    fi
+
+    # checar se tem duas linhas para a mesma chave
+    local dup_keys=()
+    while IFS='=' read -r k _; do
+        [[ -z "${k}" ]] && continue
+        local count
+        count="$(grep -cE "^${k}=" "${file}" 2>/dev/null || echo 0)"
+        if (( count > 1 )); then
+            dup_keys+=("${k}")
+        fi
+    done < <(cut -d'=' -f1 "${file}" | sed '/^[[:space:]]*$/d' | sort -u)
+
+    if (( ${#dup_keys[@]} > 0 )); then
+        log_error "Chaves duplicadas no metafile: ${dup_keys[*]}"
+        return 1
+    fi
+
+    # valida alguns campos rapidamente
+    local version num_builds
+    version="$(meta_version "${category}" "${pkg}" 2>/dev/null || echo "")"
+    num_builds="$(meta_num_builds "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    [[ -z "${version}" ]] && { log_error "version= vazio."; return 1; }
+    [[ "${num_builds}" =~ ^[0-9]+$ ]] || { log_error "num_builds=${num_builds} inválido (não numérico)."; return 1; }
+
+    log_arrow "Metafile OK: ${file}"
+    return 0
+}
+
+# =========[ MOSTRAR METAFILE ]=============================================
+
+cmd_show() {
+    local arg="$1"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    local file
+    file="$(meta_get_rawfile "${category}" "${pkg}")"
+
+    log_header "Metafile (${category}/${pkg})"
+    cat "${file}"
+}
+
+cmd_info() {
+    local arg="$1"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    local name ver catg run build opt nb desc home sha md5 src
+    name="$(meta_name        "${category}" "${pkg}" 2>/dev/null || echo "")"
+    ver="$(meta_version      "${category}" "${pkg}" 2>/dev/null || echo "")"
+    catg="$(meta_category    "${category}" "${pkg}" 2>/dev/null || echo "")"
+    run="$(meta_run_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
+    build="$(meta_build_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    opt="$(meta_opt_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
+    nb="$(meta_num_builds    "${category}" "${pkg}" 2>/dev/null || echo "")"
+    desc="$(meta_description "${category}" "${pkg}" 2>/dev/null || echo "")"
+    home="$(meta_homepage    "${category}" "${pkg}" 2>/dev/null || echo "")"
+    sha="$(meta_sha256sums   "${category}" "${pkg}" 2>/dev/null || echo "")"
+    md5="$(meta_md5sum       "${category}" "${pkg}" 2>/dev/null || echo "")"
+    src="$(meta_sources      "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    log_header "Informações de metafile (${category}/${pkg})"
+    cat <<EOF
+name        = ${name}
+version     = ${ver}
+category    = ${catg}
+run_deps    = ${run}
+build_deps  = ${build}
+opt_deps    = ${opt}
+num_builds  = ${nb}
+description = ${desc}
+homepage    = ${home}
+sha256sums  = ${sha}
+md5sum      = ${md5}
+sources     = ${src}
+EOF
+}
+
+# =========[ DEPENDÊNCIAS ]=================================================
+
+cmd_deps() {
+    local type="all"
+    local arg=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)
+                type="$2"; shift 2 ;;
+            *)
+                arg="$1"; shift ;;
+        esac
+    done
+
+    [[ -n "${arg}" ]] || die "Uso: adm-meta deps [--type run|build|opt|all] <categoria/programa | programa>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    local run build opt
+    run="$(meta_run_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
+    build="$(meta_build_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    opt="$(meta_opt_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    log_header "Dependências de ${category}/${pkg} (type=${type})"
+
+    if [[ "${type}" == "run" || "${type}" == "all" ]]; then
+        echo "== Runtime =="
+        split_list "${run}" | sed 's/^/  - /'
+        echo
+    fi
+
+    if [[ "${type}" == "build" || "${type}" == "all" ]]; then
+        echo "== Build =="
+        split_list "${build}" | sed 's/^/  - /'
+        echo
+    fi
+
+    if [[ "${type}" == "opt" || "${type}" == "all" ]]; then
+        echo "== Opcionais =="
+        split_list "${opt}" | sed 's/^/  - /'
+        echo
+    fi
+}
+
+# =========[ UPDATE DE CAMPOS ]=============================================
+
+allowed_field() {
+    case "$1" in
+        name|version|category|run_deps|build_deps|opt_deps|num_builds|description|homepage|sha256sums|md5sum|sources)
+            return 0 ;;
+        *)
+            return 1 ;;
+    esac
+}
+
+set_field() {
+    local category="$1" pkg="$2" key="$3" value="$4"
+
+    allowed_field "${key}" || die "Campo não permitido em metafile: ${key}"
+
+    local file
+    file="$(meta_get_rawfile "${category}" "${pkg}")"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] setaria ${key}=${value} em ${file}"
+        return 0
+    fi
+
+    if grep -qE "^${key}=" "${file}" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "${file}" || die "Falha ao atualizar ${key} em ${file}"
+    else
+        # adiciona no final (caso raro, melhor manter formato)
+        echo "${key}=${value}" >> "${file}" || die "Falha ao adicionar ${key} em ${file}"
+    fi
+}
+
+cmd_set_field() {
+    local key value arg=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            *)
+                if [[ -z "${arg}" ]]; then
+                    arg="$1"; shift
+                elif [[ -z "${key}" ]]; then
+                    key="$1"; shift
+                elif [[ -z "${value}" ]]; then
+                    value="$1"; shift
+                else
+                    die "Argumento inesperado em set-field: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -n "${arg}" && -n "${key}" && -n "${value}" ]] || die "Uso: adm-meta set-field <cat/prog|prog> <campo> <valor>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    log_header "Setando campo ${key} para ${category}/${pkg}"
+    set_field "${category}" "${pkg}" "${key}" "${value}"
+}
+
+update_dep_list() {
+    local op="$1"         # add|remove
+    local which="$2"      # run|build|opt
+    local category="$3"
+    local pkg="$4"
+    local dep="$5"
+
+    local field
+    case "${which}" in
+        run)   field="run_deps" ;;
+        build) field="build_deps" ;;
+        opt)   field="opt_deps" ;;
+        *)     die "Tipo de deps inválido: ${which}" ;;
+    esac
+
+    local current
+    current="$(meta_get "${category}" "${pkg}" "${field}" 2>/dev/null || echo "")"
+
+    # normaliza em lista
+    local arr=()
+    local x
+    while IFS= read -r x; do
+        [[ -z "${x}" ]] && continue
+        arr+=("${x}")
+    done < <(split_list "${current}")
+
+    if [[ "${op}" == "add" ]]; then
+        local found=0
+        for x in "${arr[@]}"; do
+            [[ "${x}" == "${dep}" ]] && found=1
+        done
+        if (( found == 0 )); then
+            arr+=("${dep}")
+        fi
+    else
+        local new=()
+        for x in "${arr[@]}"; do
+            [[ "${x}" == "${dep}" ]] && continue
+            new+=("${x}")
+        done
+        arr=("${new[@]}")
+    fi
+
+    local new_val
+    if (( ${#arr[@]} == 0 )); then
+        new_val=""
+    else
+        new_val="$(printf "%s\n" "${arr[@]}" | join_list)"
+    fi
+
+    set_field "${category}" "${pkg}" "${field}" "${new_val}"
+}
+
+cmd_add_dep() {
+    local which="" dep="" arg=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            run|build|opt)
+                which="$1"; shift ;;
+            *)
+                if [[ -z "${arg}" ]]; then
+                    arg="$1"; shift
+                elif [[ -z "${dep}" ]]; then
+                    dep="$1"; shift
+                else
+                    die "Argumento inesperado em add-dep: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -n "${arg}" && -n "${which}" && -n "${dep}" ]] || die "Uso: adm-meta add-dep <cat/prog|prog> <run|build|opt> <dep>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    log_header "Adicionando dep (${which}) ${dep} em ${category}/${pkg}"
+    update_dep_list "add" "${which}" "${category}" "${pkg}" "${dep}"
+}
+
+cmd_remove_dep() {
+    local which="" dep="" arg=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            run|build|opt)
+                which="$1"; shift ;;
+            *)
+                if [[ -z "${arg}" ]]; then
+                    arg="$1"; shift
+                elif [[ -z "${dep}" ]]; then
+                    dep="$1"; shift
+                else
+                    die "Argumento inesperado em remove-dep: $1"
+                fi
+                ;;
+        esac
+    done
+
+    [[ -n "${arg}" && -n "${which}" && -n "${dep}" ]] || die "Uso: adm-meta remove-dep <cat/prog|prog> <run|build|opt> <dep>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    log_header "Removendo dep (${which}) ${dep} de ${category}/${pkg}"
+    update_dep_list "remove" "${which}" "${category}" "${pkg}" "${dep}"
+}
+
+# =========[ VERSION BUMP ]=================================================
+
+version_bump() {
+    local ver="$1" mode="$2"
+
+    if [[ "${mode}" == "set" ]]; then
+        echo "$3"
+        return 0
+    fi
+
+    IFS='.' read -r major minor patch <<<"${ver}"
+    major=${major:-0}
+    minor=${minor:-0}
+    patch=${patch:-0}
+
+    case "${mode}" in
+        major)
+            major=$(( major + 1 ))
+            minor=0
+            patch=0
+            ;;
+        minor)
+            minor=$(( minor + 1 ))
+            patch=0
+            ;;
+        patch)
+            patch=$(( patch + 1 ))
+            ;;
+        *)
+            die "Modo de bump inválido: ${mode}"
+            ;;
+    esac
+
+    echo "${major}.${minor}.${patch}"
+}
+
+cmd_bump_version() {
+    local arg="" mode="patch" new=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --major) mode="major"; shift ;;
+            --minor) mode="minor"; shift ;;
+            --patch) mode="patch"; shift ;;
+            --set)   mode="set"; new="$2"; shift 2 ;;
+            *)
+                arg="$1"; shift ;;
+        esac
+    done
+
+    [[ -n "${arg}" ]] || die "Uso: adm-meta bump-version [--major|--minor|--patch|--set X] <cat/prog|prog>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    local old
+    old="$(meta_version "${category}" "${pkg}" 2>/dev/null || echo "0.0.0")"
+    local newv
+    if [[ "${mode}" == "set" ]]; then
+        [[ -n "${new}" ]] || die "--set requer um valor de versão"
+        newv="${new}"
+    else
+        newv="$(version_bump "${old}" "${mode}")"
+    fi
+
+    log_header "Bump de versão (${mode}) para ${category}/${pkg}"
+    log_info "Antiga: ${old}"
+    log_info "Nova:   ${newv}"
+
+    set_field "${category}" "${pkg}" "version" "${newv}"
+}
+
+# =========[ CHECKSUMS ]====================================================
+
+cmd_set_checksum() {
+    local arg="" sha="" md5=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --sha256)
+                sha="$2"; shift 2 ;;
+            --md5)
+                md5="$2"; shift 2 ;;
+            *)
+                arg="$1"; shift ;;
+        esac
+    done
+
+    [[ -n "${arg}" ]] || die "Uso: adm-meta set-checksum [--sha256 \"s1,s2\"] [--md5 \"m1,m2\"] <cat/prog|prog>"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+
+    log_header "Atualizando checksum(s) de ${category}/${pkg}"
+
+    if [[ -n "${sha}" ]]; then
+        set_field "${category}" "${pkg}" "sha256sums" "${sha}"
+    fi
+    if [[ -n "${md5}" ]]; then
+        set_field "${category}" "${pkg}" "md5sum" "${md5}"
+    fi
+}
+
+# =========[ NOVO METAFILE (ESQUELETO) ]====================================
+
+cmd_new() {
+    local category="" pkg=""
+
+    [[ $# -eq 2 ]] || die "Uso: adm-meta new <categoria> <programa>"
+
+    category="$1"
+    pkg="$2"
+
+    if (( USE_UPDATES )); then
+        # em updates, o path é diferente
+        local file="${ADM_UPDATES}/${pkg}/metafile"
+        if (( DRY_RUN )); then
+            log_info "[dry-run] criaria esqueleto de update em ${file}"
+            return 0
+        fi
+        mkdir -p "$(dirname "${file}")" || die "Falha ao criar diretório para ${file}"
+        cat > "${file}" <<EOF
+name=${pkg}
+version=0.0.1
+category=${category}
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Descrição do programa
+homepage=https://example.com/${pkg}
+sha256sums=
+sources=
+EOF
+        log_arrow "Esqueleto de metafile de update criado em ${file}"
+    else
+        local file="${ADM_REPO}/${category}/${pkg}/metafile"
+        if (( DRY_RUN )); then
+            log_info "[dry-run] criaria esqueleto de repo em ${file}"
+            return 0
+        fi
+        mkdir -p "$(dirname "${file}")" || die "Falha ao criar diretório para ${file}"
+        cat > "${file}" <<EOF
+name=${pkg}
+version=0.0.1
+category=${category}
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Descrição do programa
+homepage=https://example.com/${pkg}
+sha256sums=
+sources=
+EOF
+        log_arrow "Esqueleto de metafile criado em ${file}"
+    fi
+}
+
+# =========[ HELP / GLOBAL / MAIN ]=========================================
+
+cmd_validate() {
+    local arg="$1"
+    local category pkg
+    read -r category pkg < <(split_cat_pkg_arg "${arg}")
+    validate_metafile "${category}" "${pkg}"
+}
+
+cmd_help() {
+    cat <<EOF
+Uso: adm-meta [OPÇÕES] <comando> [args]
+
+OPÇÕES:
+  -n, --dry-run      Não modifica nada, apenas mostra o que faria
+  -q, --quiet        Menos saída (apenas erros)
+  --updates          Trabalhar nos metafiles de /usr/src/adm/updates em vez do repo
+  -h, --help         Mostra esta ajuda
+
+COMANDOS:
+  show <cat/prog | prog>
+      Mostra o conteúdo bruto do metafile.
+
+  info <cat/prog | prog>
+      Mostra os campos do metafile de forma amigável.
+
+  validate <cat/prog | prog>
+      Verifica se o metafile tem todas as chaves obrigatórias, sem duplicadas.
+
+  deps [--type run|build|opt|all] <cat/prog | prog>
+      Lista as dependências (run_deps, build_deps, opt_deps).
+
+  set-field <cat/prog | prog> <campo> <valor>
+      Atualiza um campo (apenas: name, version, category, run_deps, build_deps,
+      opt_deps, num_builds, description, homepage, sha256sums, md5sum, sources).
+
+  add-dep <cat/prog | prog> <run|build|opt> <dep>
+      Adiciona uma dependência na lista correspondente.
+
+  remove-dep <cat/prog | prog> <run|build|opt> <dep>
+      Remove uma dependência.
+
+  bump-version [--major|--minor|--patch|--set X] <cat/prog | prog>
+      Faz bump de versão (padrão: --patch) ou define explicitamente (--set).
+
+  set-checksum [--sha256 "sum1,sum2"] [--md5 "m1,m2"] <cat/prog | prog>
+      Atualiza sha256sums= e/ou md5sum= no metafile.
+
+  new <categoria> <programa>
+      Cria um metafile "esqueleto" no repo (ou em updates se --updates).
+
+  help
+      Esta ajuda.
+EOF
+}
+
+parse_global_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -q|--quiet)
+                QUIET=1; shift ;;
+            --updates)
+                USE_UPDATES=1; shift ;;
+            -h|--help)
+                cmd_help; exit 0 ;;
+            --)
+                shift; break ;;
+            -*)
+                die "Opção desconhecida: $1" ;;
+            *)
+                break ;;
+        esac
+    done
+
+    echo "$#"
+}
+
+main() {
+    ensure_dirs
+
+    local argc
+    argc=$(parse_global_opts "$@")
+    local args=("$@")
+    local consumed=$(( ${#args[@]} - argc ))
+    args=("${args[@]:${consumed}}")
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        cmd_help
+        exit 1
+    fi
+
+    local cmd="${args[0]}"
+    shift || true
+
+    case "${cmd}" in
+        show)        [[ $# -ge 1 ]] || die "Uso: adm-meta show <cat/prog|prog>"; cmd_show "$1" ;;
+        info)        [[ $# -ge 1 ]] || die "Uso: adm-meta info <cat/prog|prog>"; cmd_info "$1" ;;
+        validate)    [[ $# -ge 1 ]] || die "Uso: adm-meta validate <cat/prog|prog>"; cmd_validate "$1" ;;
+        deps)        cmd_deps "$@" ;;
+        set-field)   cmd_set_field "$@" ;;
+        add-dep)     cmd_add_dep "$@" ;;
+        remove-dep)  cmd_remove_dep "$@" ;;
+        bump-version) cmd_bump_version "$@" ;;
+        set-checksum) cmd_set_checksum "$@" ;;
+        new)         cmd_new "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            die "Comando desconhecido: ${cmd}"
+            ;;
+    esac
+}
+
+trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
+
+main "$@"
