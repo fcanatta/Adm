@@ -180,6 +180,11 @@ adm_run_db() {
     "$f" "$@"
 }
 
+adm_run_toolchain() {
+    local f="$ADM_SCRIPTS/toolchain.sh"
+    [ -x "$f" ] || adm_die "toolchain.sh não encontrado em $f"
+    "$f" "$@"
+}
 # --------------------------------
 # Localizar metafile de um pacote
 # --------------------------------
@@ -604,6 +609,9 @@ adm_main() {
             ;;
         db)
             adm_run_db "$@"
+            ;;
+        toolchain)
+            adm_run_toolchain "$@"
             ;;
         *)
             adm_log_error "Comando desconhecido: $cmd"
