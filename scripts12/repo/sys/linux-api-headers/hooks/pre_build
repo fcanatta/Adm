@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[linux-api-headers] Limpando árvore..."
+make mrproper
