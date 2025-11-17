@@ -1,0 +1,12 @@
+name=mpc
+version=1.3.1
+category=libs
+run_deps=gmp,mpfr
+build_deps=gmp,mpfr
+opt_deps=
+num_builds=0
+description=Biblioteca de aritmética complexa de precisão múltipla (MPC)
+homepage=http://www.multiprecision.org/mpc/
+maintainer=ADM System <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
