@@ -1,0 +1,12 @@
+name=glibc
+version=2.40
+category=libs
+run_deps=linux
+build_deps=linux,binutils,gcc
+opt_deps=
+num_builds=0
+description=GNU C Library (biblioteca C principal)
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM System <root@localhost>
+sha256sums=19a890175e9263d748f627993de6f4b1af9cd21e03f080e4bfb3a1fac10205a2
+sources=https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.xz
