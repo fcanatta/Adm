@@ -1,0 +1,10 @@
+name=gawk-temp
+version=5.3.2
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Gawk - temporary tool
+homepage=https://www.gnu.org/software/gawk/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gawk/gawk-5.3.2.tar.xz
