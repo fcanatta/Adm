@@ -1,0 +1,10 @@
+name=gcc-pass2
+version=15.2.0
+category=dev
+run_deps=glibc-cross,libstdcxx-pass1
+build_deps=glibc-cross,binutils-pass2,gmp,mpfr,mpc,isl
+opt_deps=
+description=GCC Pass 2 (cross final)
+homepage=https://gcc.gnu.org/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
