@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[glibc-cross] Aplicando patch FHS..."
+patch -p1 < "$ADM_PACKAGE_PATCHES/glibc-2.42-fhs-1.patch"
+
+echo "[glibc-cross] Removendo pontos de build antigos..."
+rm -rf build || true
+mkdir build
