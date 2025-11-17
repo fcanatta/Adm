@@ -1,0 +1,10 @@
+name=gzip-temp
+version=1.14
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Gzip - temporary tool
+homepage=https://www.gnu.org/software/gzip/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gzip/gzip-1.14.tar.xz
