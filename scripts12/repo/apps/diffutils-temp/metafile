@@ -1,0 +1,10 @@
+name=diffutils-temp
+version=3.12
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Diffutils - temporary tool
+homepage=https://www.gnu.org/software/diffutils/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/diffutils/diffutils-3.12.tar.xz
