@@ -1,0 +1,10 @@
+name=xz-temp
+version=5.8.1
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=XZ Utils - temporary tool
+homepage=https://tukaani.org/xz/
+sha256sums=
+sources=https://tukaani.org/xz/xz-5.8.1.tar.xz
