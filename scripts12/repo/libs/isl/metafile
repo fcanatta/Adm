@@ -1,0 +1,12 @@
+name=isl
+version=0.27
+category=libs
+run_deps=gmp
+build_deps=gmp
+opt_deps=
+num_builds=0
+description=Biblioteca de conjuntos inteiros (ISL) usada por GCC
+homepage=https://libisl.sourceforge.io/
+maintainer=ADM System <root@localhost>
+sha256sums=
+sources=https://libisl.sourceforge.io/isl-0.27.tar.xz
