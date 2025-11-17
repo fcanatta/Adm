@@ -1,0 +1,12 @@
+name=mpfr
+version=4.2.1
+category=libs
+run_deps=gmp
+build_deps=gmp
+opt_deps=
+num_builds=0
+description=Biblioteca para aritmética de precisão múltipla (MPFR)
+homepage=https://www.mpfr.org/
+maintainer=ADM System <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
