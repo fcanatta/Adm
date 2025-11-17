@@ -1,0 +1,827 @@
+#!/usr/bin/env bash
+# adm-clean - limpeza avançada, órfãos, busca e info de programas
+
+set -o pipefail
+set -o nounset
+
+# =========[ CONFIG BÁSICA ]================================================
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+ADM_WORK_BASE="${ADM_ROOT}/work"
+ADM_CACHE_SRC="${ADM_ROOT}/cache"
+ADM_CACHE_BIN="${ADM_ROOT}/packages"
+ADM_LOG_DIR="${ADM_ROOT}/logs"
+ADM_DB_DIR="${ADM_ROOT}/db"
+ADM_REPO="${ADM_ROOT}/repo"
+ADM_CHROOT_BASE="${ADM_ROOT}/chroots"   # ajuste se quiser outro caminho
+ADM_INSTALL_CMD="${ADM_ROOT}/scripts/adm-install"
+
+DRY_RUN=0
+QUIET=0
+
+# Lista de pacotes protegidos contra remoção de órfãos (nomes simples, não categoria)
+# Pode ser sobrescrita via variável de ambiente ADM_PROTECT_PKGS="bash coreutils ..."
+ADM_PROTECT_PKGS="${ADM_PROTECT_PKGS:-bash coreutils gcc glibc musl linux-base}"
+
+# =========[ CORES / LOG ]==================================================
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+
+C_MAGENTA='\033[35;1m'
+C_GREEN='\033[32;1m'
+C_YELLOW='\033[33;1m'
+C_RED='\033[31;1m'
+C_CYAN='\033[36;1m'
+
+CHECK_MARK="✔"
+
+supports_color() {
+    [[ -t 1 ]] && tput colors &>/dev/null
+}
+
+colorize() {
+    local color="$1"; shift
+    if supports_color; then
+        printf "%b%s%b" "${color}" "$*" "${C_RESET}"
+    else
+        printf "%s" "$*"
+    fi
+}
+
+timestamp() {
+    date +%H:%M:%S
+}
+
+log_header() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %b%s%b\n" \
+        "$(colorize "${C_MAGENTA}" "==")" \
+        "$(timestamp)" \
+        "$(colorize "${C_MAGENTA}" "[CLEAN]")" \
+        " ${msg}" \
+        "${C_RESET}"
+}
+
+log_arrow() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_GREEN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_info() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_CYAN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_warn() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_YELLOW}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+log_error() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_RED}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# =========[ SPINNER ]======================================================
+
+_spinner_pid=""
+
+spinner_start() {
+    local msg="$1"
+    (( QUIET )) && return 0
+
+    local spin='|/-\'
+    local i=0
+
+    printf "%s %s %s " "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
+
+    (
+        tput civis 2>/dev/null || true
+        while :; do
+            printf "\r%s %s %s %b%c%b" \
+                "$(colorize "${C_GREEN}" "->")" \
+                "$(timestamp)" \
+                "${msg}" \
+                "${C_CYAN}" "${spin:i++%${#spin}:1}" "${C_RESET}"
+            sleep 0.1
+        done
+    ) &
+    _spinner_pid=$!
+    disown "$_spinner_pid" 2>/dev/null || true
+}
+
+spinner_stop() {
+    local status=${1:-0}
+    (( QUIET )) && return "${status}"
+
+    if [[ -n "${_spinner_pid}" ]] && kill -0 "${_spinner_pid}" &>/dev/null; then
+        kill "${_spinner_pid}" &>/dev/null || true
+        wait "${_spinner_pid}" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+
+    tput cnorm 2>/dev/null || true
+
+    local symbol msg_color
+    if (( status == 0 )); then
+        symbol="${CHECK_MARK}"
+        msg_color="${C_GREEN}"
+    else
+        symbol="✖"
+        msg_color="${C_RED}"
+    fi
+
+    printf "\r%b %s %b%s%b\n" \
+        "$(colorize "${msg_color}" "->")" \
+        "$(timestamp)" \
+        "${msg_color}" "[${symbol}]" "${C_RESET}"
+
+    return "${status}"
+}
+
+run_with_spinner() {
+    local msg="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] ${msg}: $*"
+        return 0
+    fi
+
+    spinner_start "${msg}"
+    "$@" &
+    local pid=$!
+
+    wait "${pid}"
+    local status=$?
+
+    spinner_stop "${status}"
+    return "${status}"
+}
+
+# =========[ DIRETÓRIOS / DB ]==============================================
+
+PKG_DB_DIR() { printf "%s/packages" "${ADM_DB_DIR}"; }
+FILE_DB_DIR() { printf "%s/files"    "${ADM_DB_DIR}"; }
+
+ensure_dirs() {
+    local d
+    for d in "${ADM_WORK_BASE}" "${ADM_CACHE_SRC}" "${ADM_CACHE_BIN}" \
+             "${ADM_LOG_DIR}" "${ADM_DB_DIR}" "$(PKG_DB_DIR)" "$(FILE_DB_DIR)"; do
+        if [[ ! -d "${d}" ]]; then
+            if (( DRY_RUN )); then
+                log_arrow "[dry-run] mkdir -p ${d}"
+            else
+                mkdir -p "${d}" || die "Falha ao criar diretório ${d}"
+            fi
+        fi
+    done
+}
+
+pkg_db_file() {
+    local category="$1" name="$2"
+    printf "%s/%s.%s.pkg" "$(PKG_DB_DIR)" "${category}" "${name}"
+}
+
+file_db_file() {
+    local category="$1" name="$2"
+    printf "%s/%s.%s.files" "$(FILE_DB_DIR)" "${category}" "${name}"
+}
+
+# =========[ METAFILE / REPO ]=============================================
+
+meta_path() {
+    local category="$1" pkg="$2"
+    printf "%s/%s/%s/metafile" "${ADM_REPO}" "${category}" "${pkg}"
+}
+
+meta_get() {
+    local category="$1" pkg="$2" key="$3"
+    local file
+    file="$(meta_path "${category}" "${pkg}")"
+    [[ -f "${file}" ]] || return 1
+
+    local line
+    line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+meta_name()        { meta_get "$1" "$2" "name";        }
+meta_version()     { meta_get "$1" "$2" "version";     }
+meta_description() { meta_get "$1" "$2" "description"; }
+meta_homepage()    { meta_get "$1" "$2" "homepage";    }
+meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
+meta_build_deps()  { meta_get "$1" "$2" "build_deps";  }
+meta_opt_deps()    { meta_get "$1" "$2" "opt_deps";    }
+
+# =========[ DB DE PACOTES ]===============================================
+
+load_pkg_db_var() {
+    local pdb="$1" key="$2"
+    [[ -f "${pdb}" ]] || return 1
+    local line
+    line="$(grep -E "^${key}=" "${pdb}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+list_installed_packages() {
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || return 0
+
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        basename "${f}" .pkg
+    done
+    shopt -u nullglob
+}
+
+is_installed() {
+    local category="$1" name="$2"
+    [[ -f "$(pkg_db_file "${category}" "${name}")" ]]
+}
+
+reverse_deps_for() {
+    local target_name="$1"
+
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || return 0
+
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        local run
+        run="$(load_pkg_db_var "${f}" "RUN_DEPS" 2>/dev/null || echo "")"
+        [[ -z "${run}" ]] && continue
+        if echo "${run}" | tr ',' ' ' | grep -wq "${target_name}"; then
+            basename "${f}" .pkg
+        fi
+    done
+    shopt -u nullglob
+}
+
+# =========[ ÓRFÃOS ]======================================================
+
+is_protected_pkg() {
+    local name="$1"
+    for p in ${ADM_PROTECT_PKGS}; do
+        [[ "${p}" == "${name}" ]] && return 0
+    done
+    return 1
+}
+
+list_orphan_packages() {
+    # Retorna linhas no formato "categoria nome"
+    ensure_dirs
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || return 0
+
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        local base category name
+        base="$(basename "${f}" .pkg)"
+        category="${base%%.*}"
+        name="${base#*.}"
+
+        # pular protegidos
+        if is_protected_pkg "${name}"; then
+            continue
+        fi
+
+        local rev
+        mapfile -t rev < <(reverse_deps_for "${name}")
+        if (( ${#rev[@]} == 0 )); then
+            echo "${category} ${name}"
+        fi
+    done
+    shopt -u nullglob
+}
+
+# =========[ BUSCA / INFO ]=================================================
+
+split_cat_pkg() {
+    local arg="$1"
+    if [[ "${arg}" == *"/"* ]]; then
+        local category="${arg%%/*}"
+        local name="${arg#*/}"
+        [[ -z "${category}" || -z "${name}" ]] && return 1
+        echo "${category} ${name}"
+    else
+        # só nome, tenta achar categoria no DB
+        local match=""
+        local f
+        shopt -s nullglob
+        for f in "$(PKG_DB_DIR)"/*.pkg; do
+            local base category n
+            base="$(basename "${f}" .pkg)"
+            category="${base%%.*}"
+            n="${base#*.}"
+            if [[ "${n}" == "${arg}" ]]; then
+                match="${category} ${n}"
+                break
+            fi
+        done
+        shopt -u nullglob
+
+        if [[ -n "${match}" ]]; then
+            echo "${match}"
+        else
+            # fallback: categoria desconhecida
+            echo "unknown ${arg}"
+        fi
+    fi
+}
+# =========[ LIMPEZA: WORK / CACHE / LOGS / CHROOTS ]=======================
+
+clean_work() {
+    local days="$1" all="$2"
+
+    ensure_dirs
+    log_header "Limpando diretórios de trabalho (work)"
+
+    if (( all == 1 )); then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] rm -rf ${ADM_WORK_BASE}/*"
+            return 0
+        fi
+        rm -rf "${ADM_WORK_BASE}/"* 2>/dev/null || true
+        log_arrow "Workdirs limpos (todos)."
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] find ${ADM_WORK_BASE} -mindepth 1 -maxdepth 1 -type d -mtime +${days} -exec rm -rf {} +"
+        return 0
+    fi
+
+    find "${ADM_WORK_BASE}" -mindepth 1 -maxdepth 1 -type d -mtime +"${days}" -print -exec rm -rf {} + 2>/dev/null || true
+    log_arrow "Workdirs antigos removidos (>${days} dias)."
+}
+
+clean_cache() {
+    local days="$1" all="$2"
+
+    ensure_dirs
+    log_header "Limpando caches de sources e binários"
+
+    if (( all == 1 )); then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] rm -rf ${ADM_CACHE_SRC}/* ${ADM_CACHE_BIN}/*"
+            return 0
+        fi
+        rm -rf "${ADM_CACHE_SRC}/"* "${ADM_CACHE_BIN}/"* 2>/dev/null || true
+        log_arrow "Caches limpos (todos)."
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] find ${ADM_CACHE_SRC} -type f -mtime +${days} -delete"
+        log_info "[dry-run] find ${ADM_CACHE_BIN} -type f -mtime +${days} -delete"
+        return 0
+    fi
+
+    find "${ADM_CACHE_SRC}" -type f -mtime +"${days}" -delete 2>/dev/null || true
+    find "${ADM_CACHE_BIN}" -type f -mtime +"${days}" -delete 2>/dev/null || true
+    log_arrow "Caches antigos removidos (>${days} dias)."
+}
+
+clean_logs() {
+    local days="$1" all="$2"
+
+    ensure_dirs
+    log_header "Limpando logs"
+
+    if (( all == 1 )); then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] rm -rf ${ADM_LOG_DIR}/*"
+            return 0
+        fi
+        rm -rf "${ADM_LOG_DIR}/"* 2>/dev/null || true
+        log_arrow "Logs removidos (todos)."
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] find ${ADM_LOG_DIR} -type f -mtime +${days} -delete"
+        return 0
+    fi
+
+    find "${ADM_LOG_DIR}" -type f -mtime +"${days}" -delete 2>/dev/null || true
+    log_arrow "Logs antigos removidos (>${days} dias)."
+}
+
+clean_chroots() {
+    local days="$1" all="$2"
+
+    [[ -d "${ADM_CHROOT_BASE}" ]] || { log_info "Nenhum chroot em ${ADM_CHROOT_BASE}."; return 0; }
+
+    log_header "Limpando chroots temporários"
+
+    if (( all == 1 )); then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] rm -rf ${ADM_CHROOT_BASE}/*"
+            return 0
+        fi
+        rm -rf "${ADM_CHROOT_BASE}/"* 2>/dev/null || true
+        log_arrow "Chroots removidos (todos)."
+        return 0
+    fi
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] find ${ADM_CHROOT_BASE} -mindepth 1 -maxdepth 1 -type d -mtime +${days} -exec rm -rf {} +"
+        return 0
+    fi
+
+    find "${ADM_CHROOT_BASE}" -mindepth 1 -maxdepth 1 -type d -mtime +"${days}" -print -exec rm -rf {} + 2>/dev/null || true
+    log_arrow "Chroots antigos removidos (>${days} dias)."
+}
+
+clean_all() {
+    local days="$1" all="$2"
+    # se all=1, ignora days e limpa tudo; se all=0, usa days
+    if (( all == 1 )); then
+        days=0
+    fi
+
+    run_with_spinner "Limpando workdirs"   clean_work   "${days}" "${all}"
+    run_with_spinner "Limpando cache"      clean_cache  "${days}" "${all}"
+    run_with_spinner "Limpando logs"       clean_logs   "${days}" "${all}"
+    run_with_spinner "Limpando chroots"    clean_chroots "${days}" "${all}"
+}
+
+# =========[ LIMPEZA DE ÓRFÃOS ]===========================================
+
+clean_orphans() {
+    local root="$1" yes="$2" list_only="$3"
+
+    ensure_dirs
+
+    log_header "Procurando pacotes órfãos"
+
+    local orphans
+    mapfile -t orphans < <(list_orphan_packages)
+
+    if (( ${#orphans[@]} == 0 )); then
+        log_arrow "Nenhum órfão encontrado."
+        return 0
+    fi
+
+    log_arrow "Órfãos encontrados:"
+    local o
+    for o in "${orphans[@]}"; do
+        local category name
+        category="${o%% *}"
+        name="${o#* }"
+        printf "  - %s/%s\n" "${category}" "${name}"
+    done
+
+    if (( list_only == 1 )); then
+        log_arrow "Listagem apenas (--list-only). Nenhuma remoção feita."
+        return 0
+    fi
+
+    if (( yes == 0 )); then
+        log_warn "Remoção de órfãos não confirmada. Use --yes para remover."
+        return 1
+    fi
+
+    # remover órfãos chamando adm-install se existir
+    if [[ ! -x "${ADM_INSTALL_CMD}" ]]; then
+        log_warn "adm-install não encontrado em ${ADM_INSTALL_CMD}, remoção de órfãos abortada."
+        return 1
+    fi
+
+    local arglist=()
+    for o in "${orphans[@]}"; do
+        local category name
+        category="${o%% *}"
+        name="${o#* }"
+        arglist+=( "${category}/${name}" )
+    done
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] chamaria adm-install remove ${arglist[*]}"
+        return 0
+    fi
+
+    log_header "Removendo pacotes órfãos"
+    "${ADM_INSTALL_CMD}" remove --root "${root}" "${arglist[@]}"
+}
+
+# =========[ BUSCA / INFO ]=================================================
+
+cmd_search() {
+    local pattern="$1"
+
+    ensure_dirs
+    log_header "Procurando programas que correspondam a '${pattern}'"
+
+    local lower pat
+    pat="$(echo "${pattern}" | tr '[:upper:]' '[:lower:]')"
+
+    echo "== Repositório =="
+    if [[ -d "${ADM_REPO}" ]]; then
+        local f
+        while IFS= read -r -d '' f; do
+            local cat pkg name version
+            cat="$(basename "$(dirname "${f}")")"
+            pkg="$(basename "$(dirname "$(dirname "${f}")")")"
+            name="$(meta_name "${cat}" "${pkg}" 2>/dev/null || echo "${pkg}")"
+            version="$(meta_version "${cat}" "${pkg}" 2>/dev/null || echo "?")"
+            lower="$(echo "${name}" | tr '[:upper:]' '[:lower:]')"
+
+            if [[ "${lower}" == *"${pat}"* || "${pkg}" == *"${pattern}"* ]]; then
+                printf "  - %s/%s (%s)\n" "${cat}" "${name}" "${version}"
+            fi
+        done < <(find "${ADM_REPO}" -type f -name 'metafile' -print0 2>/dev/null || true)
+    else
+        echo "  (repo não encontrado em ${ADM_REPO})"
+    fi
+
+    echo
+    echo "== Instalados =="
+    local dir
+    dir="$(PKG_DB_DIR)"
+    if [[ -d "${dir}" ]]; then
+        local f base category name version
+        shopt -s nullglob
+        for f in "${dir}"/*.pkg; do
+            base="$(basename "${f}" .pkg)"
+            category="${base%%.*}"
+            name="${base#*.}"
+            version="$(load_pkg_db_var "${f}" "VERSION" 2>/dev/null || echo "?")"
+            lower="$(echo "${name}" | tr '[:upper:]' '[:lower:]')"
+            if [[ "${lower}" == *"${pat}"* ]]; then
+                printf "  - %s/%s (%s)\n" "${category}" "${name}" "${version}"
+            fi
+        done
+        shopt -u nullglob
+    else
+        echo "  (nenhum DB de pacotes instalado)"
+    fi
+}
+
+cmd_info() {
+    local arg="$1"
+
+    ensure_dirs
+
+    local category name
+    read -r category name < <(split_cat_pkg "${arg}") || die "Formato inválido: use categoria/programa ou nome"
+
+    log_header "Informações sobre ${category}/${name}"
+
+    local meta_file
+    meta_file="$(meta_path "${category}" "${name}")"
+    if [[ -f "${meta_file}" ]]; then
+        local version desc home run build opt
+        version="$(meta_version "${category}" "${name}" 2>/dev/null || echo "?")"
+        desc="$(meta_description "${category}" "${name}" 2>/dev/null || echo "")"
+        home="$(meta_homepage "${category}" "${name}" 2>/dev/null || echo "")"
+        run="$(meta_run_deps "${category}" "${name}" 2>/dev/null || echo "")"
+        build="$(meta_build_deps "${category}" "${name}" 2>/dev/null || echo "")"
+        opt="$(meta_opt_deps "${category}" "${name}" 2>/dev/null || echo "")"
+
+        echo "== Metafile =="
+        echo "  Categoria : ${category}"
+        echo "  Nome      : ${name}"
+        echo "  Versão    : ${version}"
+        echo "  Descrição : ${desc}"
+        echo "  Homepage  : ${home}"
+        echo "  Run deps  : ${run}"
+        echo "  Build deps: ${build}"
+        echo "  Opt deps  : ${opt}"
+    else
+        echo "Metafile não encontrado para ${category}/${name}."
+    fi
+
+    local pdb
+    pdb="$(pkg_db_file "${category}" "${name}")"
+    echo
+    echo "== Estado de instalação =="
+    if [[ -f "${pdb}" ]]; then
+        echo "Instalado:"
+        cat "${pdb}"
+    else
+        echo "Não instalado (sem entrada no DB)."
+    fi
+}
+
+# =========[ COMANDOS / HELP ]=============================================
+
+cmd_clean_all() {
+    local days=7 all=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            --all)  all=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-all: $1"
+                ;;
+        esac
+    done
+
+    clean_all "${days}" "${all}"
+}
+
+cmd_clean_work() {
+    local days=7 all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            --all)  all=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-work: $1"
+                ;;
+        esac
+    done
+    run_with_spinner "Limpando workdirs" clean_work "${days}" "${all}"
+}
+
+cmd_clean_cache() {
+    local days=30 all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            --all)  all=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-cache: $1"
+                ;;
+        esac
+    done
+    run_with_spinner "Limpando cache" clean_cache "${days}" "${all}"
+}
+
+cmd_clean_logs() {
+    local days=30 all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            --all)  all=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-logs: $1"
+                ;;
+        esac
+    done
+    run_with_spinner "Limpando logs" clean_logs "${days}" "${all}"
+}
+
+cmd_clean_chroots() {
+    local days=7 all=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --days) days="$2"; shift 2 ;;
+            --all)  all=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-chroots: $1"
+                ;;
+        esac
+    done
+    run_with_spinner "Limpando chroots" clean_chroots "${days}" "${all}"
+}
+
+cmd_clean_orphans() {
+    local root="/" yes=0 list_only=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --root)      root="$2"; shift 2 ;;
+            --yes)       yes=1; shift ;;
+            --list-only) list_only=1; shift ;;
+            *)
+                die "Parâmetro desconhecido em clean-orphans: $1"
+                ;;
+        esac
+    done
+
+    clean_orphans "${root}" "${yes}" "${list_only}"
+}
+
+cmd_help() {
+    cat <<EOF
+Uso: adm-clean [OPÇÕES] <comando> [args]
+
+OPÇÕES:
+  -n, --dry-run      Não executa, apenas mostra o que faria
+  -q, --quiet        Menos saída (apenas erros)
+  -h, --help         Mostra esta ajuda
+
+COMANDOS DE LIMPEZA:
+  clean-all [--days N] [--all]
+      Limpa workdirs, caches, logs e chroots.
+      --days N  : remove apenas mais antigos que N dias (padrão: 7)
+      --all     : remove tudo, ignorando idade.
+
+  clean-work [--days N] [--all]
+      Limpa apenas workdirs.
+
+  clean-cache [--days N] [--all]
+      Limpa apenas caches de sources e binários.
+
+  clean-logs [--days N] [--all]
+      Limpa apenas logs.
+
+  clean-chroots [--days N] [--all]
+      Limpa apenas chroots temporários.
+
+  clean-orphans [--root PATH] [--yes] [--list-only]
+      Lista pacotes órfãos (sem dependentes) e opcionalmente remove.
+      --list-only : apenas lista os órfãos, não remove.
+      --yes       : confirma remoção chamando adm-install remove.
+
+COMANDOS DE CONSULTA:
+  search <termo>
+      Procura programas no repositório e entre os instalados.
+
+  info <categoria/programa | nome>
+      Mostra informações do metafile (se existir) e o estado de instalação.
+
+  help
+      Esta ajuda.
+EOF
+}
+
+# =========[ PARSE GLOBAL / MAIN ]=========================================
+
+parse_global_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -q|--quiet)
+                QUIET=1; shift ;;
+            -h|--help)
+                cmd_help; exit 0 ;;
+            --)
+                shift; break ;;
+            -*)
+                die "Opção desconhecida: $1" ;;
+            *)
+                break ;;
+        esac
+    done
+
+    echo "$#"
+}
+
+main() {
+    local argc
+    argc=$(parse_global_opts "$@")
+    local args=("$@")
+    local consumed=$(( ${#args[@]} - argc ))
+    args=("${args[@]:${consumed}}")
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        cmd_help
+        exit 1
+    fi
+
+    local cmd="${args[0]}"
+    shift || true
+
+    case "${cmd}" in
+        clean-all)       cmd_clean_all "$@" ;;
+        clean-work)      cmd_clean_work "$@" ;;
+        clean-cache)     cmd_clean_cache "$@" ;;
+        clean-logs)      cmd_clean_logs "$@" ;;
+        clean-chroots)   cmd_clean_chroots "$@" ;;
+        clean-orphans)   cmd_clean_orphans "$@" ;;
+        search)          [[ $# -ge 1 ]] || die "Uso: adm-clean search <termo>"; cmd_search "$1" ;;
+        info)            [[ $# -ge 1 ]] || die "Uso: adm-clean info <categoria/programa|nome>"; cmd_info "$1" ;;
+        help|-h|--help)  cmd_help ;;
+        *)
+            die "Comando desconhecido: ${cmd}"
+            ;;
+    esac
+}
+
+trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
+
+main "$@"
