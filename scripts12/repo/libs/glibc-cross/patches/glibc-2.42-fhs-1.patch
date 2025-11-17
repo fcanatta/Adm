@@ -1,0 +1,10 @@
+--- a/sysdeps/unix/sysv/linux/paths.h
++++ b/sysdeps/unix/sysv/linux/paths.h
+@@ -24,7 +24,7 @@
+ #define _PATH_MOUNTED     "/proc/mounts"
+ #define _PATH_PROCNET_DEV "/proc/net/dev"
+ #define _PATH_MISC        "/etc"
+-#define _PATH_VARDB       "/var/db"
++#define _PATH_VARDB       "/var/lib"
+ #define _PATH_TMP         "/tmp"
+ #define _PATH_DEV         "/dev"
