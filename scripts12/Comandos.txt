@@ -158,3 +158,18 @@ adm install gcc --profile aggressive --stage final --languages=c,c++,fortran
 
 
 O teu runtime.sh, build_core.sh, source.sh e profile.sh já estão prontos para interpretar esse metafile (deps, categorias, etc.) e montar o grafo de dependências.
+
+# Como usar dentro do ADM
+# /usr/src/adm/scripts/toolchain.sh
+chmod +x /usr/src/adm/scripts/toolchain.sh
+
+2. Rodar direto:
+/usr/src/adm/scripts/toolchain.sh full
+
+ou com outro target:
+/usr/src/adm/scripts/toolchain.sh full --target aarch64-linux-gnu
+
+# Ou direto pelo adm
+adm toolchain full
+adm toolchain status
+adm toolchain bootstrap --target riscv64-linux-gnu
