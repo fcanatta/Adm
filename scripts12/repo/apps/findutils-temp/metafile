@@ -1,0 +1,10 @@
+name=findutils-temp
+version=4.10.0
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Findutils - temporary tool
+homepage=https://www.gnu.org/software/findutils/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz
