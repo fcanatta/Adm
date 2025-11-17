@@ -1,0 +1,12 @@
+name=linux
+version=6.17.8
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux kernel source (headers e kernel)
+homepage=https://www.kernel.org/
+maintainer=ADM System <root@localhost>
+sha256sums=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz
