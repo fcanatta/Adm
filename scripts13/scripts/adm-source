@@ -1,0 +1,759 @@
+#!/usr/bin/env bash
+# adm-source - preparar source, extrair e detectar características do pacote
+# Caminho sugerido: /usr/src/adm/scripts/adm-source
+
+set -o pipefail
+set -o nounset
+
+# =========[ CONFIG BÁSICA ]================================================
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+ADM_REPO="${ADM_ROOT}/repo"
+ADM_WORK_BASE="${ADM_ROOT}/work"
+ADM_CACHE="${ADM_ROOT}/cache"
+ADM_LOG_DIR="${ADM_ROOT}/logs"
+ADM_PROFILE_CMD="${ADM_ROOT}/scripts/adm-profile"
+
+DRY_RUN=0
+QUIET=0
+
+# =========[ CORES / LOG ]==================================================
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+
+C_MAGENTA='\033[35;1m'
+C_GREEN='\033[32;1m'
+C_YELLOW='\033[33;1m'
+C_RED='\033[31;1m'
+C_CYAN='\033[36;1m'
+
+CHECK_MARK="✔"
+
+supports_color() {
+    [[ -t 1 ]] && tput colors &>/dev/null
+}
+
+colorize() {
+    local color="$1"; shift
+    if supports_color; then
+        printf "%b%s%b" "${color}" "$*" "${C_RESET}"
+    else
+        printf "%s" "$*"
+    fi
+}
+
+timestamp() {
+    date +%H:%M:%S
+}
+
+log_header() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %b%s%b\n" \
+        "$(colorize "${C_MAGENTA}" "==")" \
+        "$(timestamp)" \
+        "$(colorize "${C_MAGENTA}" "[SOURCE]")" \
+        " ${msg}" \
+        "${C_RESET}"
+}
+
+log_arrow() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_GREEN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_info() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_CYAN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_warn() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_YELLOW}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+log_error() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_RED}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# =========[ SPINNER ]======================================================
+
+_spinner_pid=""
+
+spinner_start() {
+    local msg="$1"
+    (( QUIET )) && return 0
+
+    local spin='|/-\'
+    local i=0
+
+    printf "%s %s %s " "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
+
+    (
+        tput civis 2>/dev/null || true
+        while :; do
+            printf "\r%s %s %s %b%c%b" \
+                "$(colorize "${C_GREEN}" "->")" \
+                "$(timestamp)" \
+                "${msg}" \
+                "${C_CYAN}" "${spin:i++%${#spin}:1}" "${C_RESET}"
+            sleep 0.1
+        done
+    ) &
+    _spinner_pid=$!
+    disown "$_spinner_pid" 2>/dev/null || true
+}
+
+spinner_stop() {
+    local status=${1:-0}
+    (( QUIET )) && return "${status}"
+
+    if [[ -n "${_spinner_pid}" ]] && kill -0 "${_spinner_pid}" &>/dev/null; then
+        kill "${_spinner_pid}" &>/dev/null || true
+        wait "${_spinner_pid}" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+
+    tput cnorm 2>/dev/null || true
+
+    local symbol msg_color
+    if (( status == 0 )); then
+        symbol="${CHECK_MARK}"
+        msg_color="${C_GREEN}"
+    else
+        symbol="✖"
+        msg_color="${C_RED}"
+    fi
+
+    printf "\r%b %s %b%s%b\n" \
+        "$(colorize "${msg_color}" "->")" \
+        "$(timestamp)" \
+        "${msg_color}" "[${symbol}]" "${C_RESET}"
+
+    return "${status}"
+}
+
+run_with_spinner() {
+    local msg="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] ${msg}: $*"
+        return 0
+    fi
+
+    spinner_start "${msg}"
+    "$@" &
+    local pid=$!
+
+    wait "${pid}"
+    local status=$?
+
+    spinner_stop "${status}"
+    return "${status}"
+}
+
+# =========[ DIRETÓRIOS / LOG ]=============================================
+
+ensure_dirs() {
+    local d
+    for d in "${ADM_WORK_BASE}" "${ADM_CACHE}" "${ADM_LOG_DIR}"; do
+        if [[ ! -d "${d}" ]]; then
+            if (( DRY_RUN )); then
+                log_arrow "[dry-run] mkdir -p ${d}"
+            else
+                mkdir -p "${d}" || die "Falha ao criar diretório ${d}"
+            fi
+        fi
+    done
+}
+
+log_file_for() {
+    local category="$1" pkg="$2"
+    printf "%s/source-%s-%s.%s.log" "${ADM_LOG_DIR}" "${category}" "${pkg}" "$(date +%Y%m%d-%H%M%S)"
+}
+
+# =========[ METAFILE ]=====================================================
+
+meta_path() {
+    local category="$1" pkg="$2"
+    printf "%s/%s/%s/metafile" "${ADM_REPO}" "${category}" "${pkg}"
+}
+
+meta_get() {
+    local category="$1" pkg="$2" key="$3"
+    local file
+    file="$(meta_path "${category}" "${pkg}")"
+    [[ -f "${file}" ]] || die "Metafile não encontrado: ${file}"
+
+    local line
+    line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+meta_name()        { meta_get "$1" "$2" "name";        }
+meta_version()     { meta_get "$1" "$2" "version";     }
+meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
+meta_build_deps()  { meta_get "$1" "$2" "build_deps";  }
+meta_opt_deps()    { meta_get "$1" "$2" "opt_deps";    }
+meta_sources()     { meta_get "$1" "$2" "sources";     }
+
+# =========[ PROFILE ]======================================================
+
+apply_profile_env() {
+    local profile="$1"
+
+    [[ -x "${ADM_PROFILE_CMD}" ]] || die "adm-profile não encontrado em ${ADM_PROFILE_CMD}"
+
+    # shellcheck disable=SC2046
+    eval "$("${ADM_PROFILE_CMD}" apply "${profile}")" || die "Falha ao aplicar profile '${profile}'"
+}
+
+# =========[ CACHE / SOURCES ]=============================================
+
+guess_tar_pattern() {
+    local name="$1" version="$2"
+    echo "${name}-${version}"
+}
+
+find_cached_tarballs() {
+    local name="$1" version="$2"
+    local base pattern
+    base="$(guess_tar_pattern "${name}" "${version}")"
+    pattern="${ADM_CACHE}/${base}.tar.*"
+
+    # primeiro tenta padrão nome-versao.*; se não achar, lista todos do pacote
+    local files
+    files=$(ls ${pattern} 2>/dev/null || true)
+    if [[ -n "${files}" ]]; then
+        printf "%s\n" ${files}
+        return 0
+    fi
+
+    # fallback: qualquer coisa contendo name-version no cache
+    files=$(find "${ADM_CACHE}" -maxdepth 1 -type f -name "*${name}*${version}*" 2>/dev/null || true)
+    [[ -n "${files}" ]] && printf "%s\n" ${files}
+}
+
+ensure_sources_cached() {
+    local category="$1" pkg="$2"
+    local name version
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+
+    local cached
+    cached="$(find_cached_tarballs "${name}" "${version}" || true)"
+
+    if [[ -n "${cached}" ]]; then
+        log_arrow "Sources de ${pkg} já no cache."
+        printf "%s\n" ${cached}
+        return 0
+    fi
+
+    local sources
+    sources="$(meta_sources "${category}" "${pkg}")" || die "Metafile não contém 'sources=' para ${category}/${pkg}"
+
+    if [[ -x "${ADM_ROOT}/scripts/adm-fetch" ]]; then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] chamaria adm-fetch fetch ${category} ${pkg} (${sources})"
+        else
+            log_header "Baixando sources de ${category}/${pkg}"
+            # adm-fetch deve aceitar 'fetch <categoria> <programa>' e/ou 'fetch <programa>'
+            "${ADM_ROOT}/scripts/adm-fetch" fetch "${category}" "${pkg}" || \
+            "${ADM_ROOT}/scripts/adm-fetch" fetch "${pkg}" || \
+                die "Falha no download de ${category}/${pkg}"
+        fi
+    else
+        die "Sources de ${category}/${pkg} não estão no cache e adm-fetch não foi encontrado."
+    fi
+
+    cached="$(find_cached_tarballs "${name}" "${version}" || true)"
+    [[ -n "${cached}" ]] || die "Depois do download, nenhum tarball foi encontrado no cache para ${name}-${version}."
+    printf "%s\n" ${cached}
+}
+
+extract_tarballs() {
+    local builddir="$1"; shift
+    local tarballs=("$@")
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] mkdir -p ${builddir}"
+        for t in "${tarballs[@]}"; do
+            log_info "[dry-run] tar -xf ${t} -C ${builddir}"
+        done
+        return 0
+    fi
+
+    mkdir -p "${builddir}" || die "Falha ao criar ${builddir}"
+
+    local t
+    for t in "${tarballs[@]}"; do
+        [[ -f "${t}" ]] || die "Tarball não encontrado: ${t}"
+        tar -xf "${t}" -C "${builddir}" || die "Falha ao extrair ${t} em ${builddir}"
+    done
+}
+
+guess_source_root() {
+    # Recebe builddir e tenta adivinhar o diretório raiz do source
+    local builddir="$1"
+    local entries
+    entries=()
+
+    local f
+    while IFS= read -r -d '' f; do
+        entries+=("$(basename "$f")")
+    done < <(find "${builddir}" -mindepth 1 -maxdepth 1 ! -name '.*' -print0 2>/dev/null || true)
+
+    if (( ${#entries[@]} == 1 )) && [[ -d "${builddir}/${entries[0]}" ]]; then
+        printf "%s/%s\n" "${builddir}" "${entries[0]}"
+    else
+        printf "%s\n" "${builddir}"
+    fi
+}
+
+# =========[ RUN LOGGED ]===================================================
+
+run_logged() {
+    local log_file="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] $*"
+        return 0
+    fi
+
+    {
+        echo "=== $(date) ==="
+        echo "CMD: $*"
+    } >> "${log_file}"
+
+    "$@" >> "${log_file}" 2>&1
+}
+# =========[ DETECÇÃO: BUILD SYSTEM ]=======================================
+
+detect_build_system() {
+    local srcdir="$1"
+    local systems=()
+
+    [[ -d "${srcdir}" ]] || { echo ""; return 0; }
+
+    if find "${srcdir}" -maxdepth 1 -name 'configure' -type f | grep -q .; then
+        systems+=("autotools")
+    fi
+    if find "${srcdir}" -name 'CMakeLists.txt' -type f | grep -q .; then
+        systems+=("cmake")
+    fi
+    if find "${srcdir}" -name 'meson.build' -type f | grep -q .; then
+        systems+=("meson")
+    fi
+    if find "${srcdir}" -maxdepth 1 -name 'Makefile' -o -name 'makefile' -o -name 'GNUmakefile' | grep -q .; then
+        systems+=("make")
+    fi
+    if find "${srcdir}" -maxdepth 1 -name 'setup.py' -o -name 'pyproject.toml' | grep -q .; then
+        systems+=("python")
+    fi
+    if find "${srcdir}" -name 'Cargo.toml' -type f | grep -q .; then
+        systems+=("cargo")
+    fi
+    if find "${srcdir}" -name 'configure.ac' -o -name 'configure.in' | grep -q .; then
+        systems+=("autoconf")
+    fi
+
+    # remover duplicatas
+    printf "%s\n" "${systems[@]}" | awk '!x[$0]++' | paste -sd',' -
+}
+
+# =========[ DETECÇÃO: LINGUAGENS / COMPILADORES / LINKERS ]===============
+
+detect_languages() {
+    local srcdir="$1"
+    local langs=()
+
+    [[ -d "${srcdir}" ]] || { echo ""; return 0; }
+
+    find "${srcdir}" -name '*.c'      -print -quit 2>/dev/null | grep -q . && langs+=("c")
+    find "${srcdir}" -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -print -quit 2>/dev/null | grep -q . && langs+=("c++")
+    find "${srcdir}" -name '*.rs'     -print -quit 2>/dev/null | grep -q . && langs+=("rust")
+    find "${srcdir}" -name '*.go'     -print -quit 2>/dev/null | grep -q . && langs+=("go")
+    find "${srcdir}" -name '*.java'   -print -quit 2>/dev/null | grep -q . && langs+=("java")
+    find "${srcdir}" -name '*.f' -o -name '*.f90' -o -name '*.f95' -print -quit 2>/dev/null | grep -q . && langs+=("fortran")
+    find "${srcdir}" -name '*.py'     -print -quit 2>/dev/null | grep -q . && langs+=("python")
+    find "${srcdir}" -name '*.cs'     -print -quit 2>/dev/null | grep -q . && langs+=("csharp")
+    find "${srcdir}" -name '*.js' -o -name '*.ts' -print -quit 2>/dev/null | grep -q . && langs+=("js-ts")
+
+    printf "%s\n" "${langs[@]}" | awk '!x[$0]++' | paste -sd',' -
+}
+
+detect_compilers_needed() {
+    local langs="$1"
+    local compilers=()
+
+    [[ -n "${langs}" ]] || { echo ""; return 0; }
+
+    [[ "${langs}" == *"c"*      ]] && compilers+=("cc")
+    [[ "${langs}" == *"c++"*    ]] && compilers+=("cxx")
+    [[ "${langs}" == *"fortran"* ]] && compilers+=("fortran")
+    [[ "${langs}" == *"rust"*   ]] && compilers+=("rustc")
+    [[ "${langs}" == *"go"*     ]] && compilers+=("go")
+    [[ "${langs}" == *"java"*   ]] && compilers+=("javac")
+    [[ "${langs}" == *"csharp"* ]] && compilers+=("mcs")
+    [[ "${langs}" == *"js-ts"*  ]] && compilers+=("node")
+
+    printf "%s\n" "${compilers[@]}" | awk '!x[$0]++' | paste -sd',' -
+}
+
+detect_linkers_needed() {
+    local srcdir="$1"
+    local linkers=()
+
+    [[ -d "${srcdir}" ]] || { echo ""; return 0; }
+
+    # heurísticas bem simples
+    if grep -R "ld.lld" "${srcdir}" 2>/dev/null | head -n1 | grep -q .; then
+        linkers+=("lld")
+    fi
+    if grep -R "gold" "${srcdir}" 2>/dev/null | head -n1 | grep -q .; then
+        linkers+=("gold")
+    fi
+
+    # padrão
+    linkers+=("bfd")
+
+    printf "%s\n" "${linkers[@]}" | awk '!x[$0]++' | paste -sd',' -
+}
+
+# =========[ DETECÇÃO: DOCS / KERNEL / INIT / DEPS ]=======================
+
+detect_docs() {
+    local srcdir="$1"
+    local docs=()
+
+    [[ -d "${srcdir}" ]] || { echo ""; return 0; }
+
+    find "${srcdir}" -maxdepth 3 -type d \( -name doc -o -name docs \) -print -quit 2>/dev/null | grep -q . && docs+=("docs-dir")
+    find "${srcdir}" -name 'Doxyfile' -print -quit 2>/dev/null | grep -q . && docs+=("doxygen")
+    find "${srcdir}" -name 'conf.py' -path '*docs*' -print -quit 2>/dev/null | grep -q . && docs+=("sphinx")
+    find "${srcdir}" -name '*.1' -o -name '*.8' -print -quit 2>/dev/null | grep -q . && docs+=("manpages")
+    find "${srcdir}" -name 'info.texi' -o -name '*.texi' -print -quit 2>/dev/null | grep -q . && docs+=("texinfo")
+
+    printf "%s\n" "${docs[@]}" | awk '!x[$0]++' | paste -sd',' -
+}
+
+detect_kernel_related() {
+    local srcdir="$1"
+    local flags=()
+
+    [[ -d "${srcdir}" ]] || { echo "IS_KERNEL=0;IS_DRIVER=0;HAS_FIRMWARE=0;HAS_INIT=0;HAS_INITRAMFS=0"; return 0; }
+
+    if find "${srcdir}" -name 'Kconfig' -o -path '*/kernel/*' -o -path '*/drivers/*' | grep -q . 2>/dev/null; then
+        flags+=("IS_KERNEL=1")
+    else
+        flags+=("IS_KERNEL=0")
+    fi
+
+    if find "${srcdir}" -path '*/drivers/*' -name 'Makefile' -o -name '*.ko' | grep -q . 2>/dev/null; then
+        flags+=("IS_DRIVER=1")
+    else
+        flags+=("IS_DRIVER=0")
+    fi
+
+    if find "${srcdir}" -path '*firmware*' -name '*.bin' | grep -q . 2>/dev/null; then
+        flags+=("HAS_FIRMWARE=1")
+    else
+        flags+=("HAS_FIRMWARE=0")
+    fi
+
+    if find "${srcdir}" -maxdepth 2 -name 'init.c' -o -name 'init.cpp' -o -name 'init.sh' | grep -q . 2>/dev/null; then
+        flags+=("HAS_INIT=1")
+    else
+        flags+=("HAS_INIT=0")
+    fi
+
+    if find "${srcdir}" -name 'initramfs*' -o -name 'dracut.conf' | grep -q . 2>/dev/null; then
+        flags+=("HAS_INITRAMFS=1")
+    else
+        flags+=("HAS_INITRAMFS=0")
+    fi
+
+    printf "%s;" "${flags[@]}"
+}
+
+detect_deps_from_project_files() {
+    local srcdir="$1"
+    local deps=()
+
+    [[ -d "${srcdir}" ]] || { echo ""; return 0; }
+
+    # pkg-config .pc
+    while IFS= read -r line; do
+        while read -r word; do
+            deps+=("${word}")
+        done < <(echo "${line}" | sed 's/Requires:\s*//;s/,/ /g')
+    done < <(grep -R "Requires:" "${srcdir}"/*.pc 2>/dev/null || true)
+
+    # CMake find_package
+    while IFS= read -r line; do
+        local pkg
+        pkg="$(echo "${line}" | sed -E 's/.*find_package\(([A-Za-z0-9_+-]+).*/\1/')" || true
+        [[ -n "${pkg}" ]] && deps+=("${pkg}")
+    done < <(grep -R "find_package(" "${srcdir}" 2>/dev/null || true)
+
+    printf "%s\n" "${deps[@]}" | awk 'NF{gsub(/ +/,"_");print}' | awk '!x[$0]++' | paste -sd',' -
+}
+
+# =========[ RESUMO / DETECTION FILE ]=====================================
+
+write_detection_file() {
+    local outfile="$1"
+    local category="$2"
+    local pkg="$3"
+    local srcdir="$4"
+    local build_system="$5"
+    local languages="$6"
+    local compilers="$7"
+    local linkers="$8"
+    local docs="$9"
+    local kernel_flags="${10}"
+    local run_deps="${11}"
+    local build_deps="${12}"
+    local opt_deps="${13}"
+    local extra_deps="${14}"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] escrever arquivo de detecção em ${outfile}"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${outfile}")" || die "Falha ao criar diretório de detecção."
+
+    cat > "${outfile}" <<EOF
+# Arquivo gerado por adm-source
+CATEGORY="${category}"
+NAME="${pkg}"
+SOURCE_DIR="${srcdir}"
+
+BUILD_SYSTEM="${build_system}"
+LANGUAGES="${languages}"
+COMPILERS_NEEDED="${compilers}"
+LINKERS_NEEDED="${linkers}"
+DOCS_TYPES="${docs}"
+
+RUN_DEPS="${run_deps}"
+BUILD_DEPS="${build_deps}"
+OPT_DEPS="${opt_deps}"
+EXTRA_DEPS_DETECTED="${extra_deps}"
+
+${kernel_flags}
+EOF
+}
+
+# =========[ PREPARE ]======================================================
+
+prepare_source() {
+    local category="$1"
+    local pkg="$2"
+    local profile="$3"
+
+    ensure_dirs
+
+    apply_profile_env "${profile}"
+
+    local name version
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+
+    local workdir="${ADM_WORK_BASE}/${category}/${name}-${version}"
+    local log_file
+    log_file="$(log_file_for "${category}" "${pkg}")"
+
+    log_header "Preparando source de ${category}/${pkg}"
+    log_info "Name:    ${name}"
+    log_info "Version: ${version}"
+    log_info "Workdir: ${workdir}"
+    log_info "Log:     ${log_file}"
+    log_info "Profile: ${profile}"
+
+    local tarballs
+    mapfile -t tarballs < <(ensure_sources_cached "${category}" "${pkg}")
+
+    run_with_spinner "Extraindo sources" extract_tarballs "${workdir}" "${tarballs[@]}"
+
+    local srcroot
+    srcroot="$(guess_source_root "${workdir}")"
+    log_arrow "Source root detectado: ${srcroot}"
+
+    # -------- DETECÇÕES --------
+    local build_system languages compilers linkers docs kernel_flags extra_deps
+    build_system="$(detect_build_system "${srcroot}")"
+    languages="$(detect_languages "${srcroot}")"
+    compilers="$(detect_compilers_needed "${languages}")"
+    linkers="$(detect_linkers_needed "${srcroot}")"
+    docs="$(detect_docs "${srcroot}")"
+    kernel_flags="$(detect_kernel_related "${srcroot}")"
+    extra_deps="$(detect_deps_from_project_files "${srcroot}")"
+
+    local run_deps build_deps opt_deps
+    run_deps="$(meta_run_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    build_deps="$(meta_build_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    opt_deps="$(meta_opt_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    log_arrow "BUILD_SYSTEM:   ${build_system:-<none>}"
+    log_arrow "LANGUAGES:      ${languages:-<none>}"
+    log_arrow "COMPILERS:      ${compilers:-<none>}"
+    log_arrow "LINKERS:        ${linkers:-<none>}"
+    log_arrow "DOCS:           ${docs:-<none>}"
+    log_arrow "EXTRA_DEPS:     ${extra_deps:-<none>}"
+    log_arrow "RUN_DEPS(meta): ${run_deps:-<none>}"
+    log_arrow "BUILD_DEPS(meta): ${build_deps:-<none>}"
+
+    local detect_file="${workdir}/.adm-detect.env"
+    write_detection_file "${detect_file}" "${category}" "${pkg}" "${srcroot}" \
+        "${build_system}" "${languages}" "${compilers}" "${linkers}" "${docs}" \
+        "${kernel_flags}" "${run_deps}" "${build_deps}" "${opt_deps}" "${extra_deps}"
+
+    log_arrow "Arquivo de detecção criado em: ${detect_file}"
+    echo "${detect_file}"
+}
+
+show_detect() {
+    local category="$1"
+    local pkg="$2"
+
+    local name version workdir detect_file
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+    workdir="${ADM_WORK_BASE}/${category}/${name}-${version}"
+    detect_file="${workdir}/.adm-detect.env"
+
+    [[ -f "${detect_file}" ]] || die "Arquivo de detecção não encontrado: ${detect_file}"
+
+    cat "${detect_file}"
+}
+
+# =========[ COMANDOS / HELP ]=============================================
+
+cmd_prepare() {
+    local category="$1"; shift || true
+    local pkg="$1"; shift || true
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-source prepare <categoria> <programa> [--profile NOME]"
+
+    local profile="normal"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                profile="$2"; shift 2 ;;
+            *)
+                die "Parâmetro desconhecido em prepare: $1"
+                ;;
+        esac
+    done
+
+    prepare_source "${category}" "${pkg}" "${profile}"
+}
+
+cmd_show_detect() {
+    local category="$1"; shift || true
+    local pkg="$1"; shift || true
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-source show-detect <categoria> <programa>"
+
+    show_detect "${category}" "${pkg}"
+}
+
+cmd_help() {
+    cat <<EOF
+Uso: adm-source [OPÇÕES] <comando> [args]
+
+OPÇÕES:
+  -n, --dry-run     Não executa, apenas mostra o que faria
+  -q, --quiet       Menos saída (apenas erros)
+  -h, --help        Mostra esta ajuda
+
+COMANDOS:
+  prepare <categoria> <programa> [--profile NOME]
+      - Garante sources no cache (chama adm-fetch se preciso)
+      - Extrai para /usr/src/adm/work/<categoria>/<nome>-<versao>
+      - Detecta build system, linguagens, compiladores, linkers, docs, kernel/init/firmware
+      - Detecta dependências extras (pkg-config, find_package etc.)
+      - Cria arquivo .adm-detect.env para o adm-construct
+      - Imprime na saída o caminho do arquivo de detecção
+
+  show-detect <categoria> <programa>
+      Mostra o conteúdo do .adm-detect.env gerado anteriormente.
+
+  help
+      Esta ajuda.
+EOF
+}
+
+# =========[ PARSE GLOBAL / MAIN ]=========================================
+
+parse_global_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -q|--quiet)
+                QUIET=1; shift ;;
+            -h|--help)
+                cmd_help; exit 0 ;;
+            --)
+                shift; break ;;
+            -*)
+                die "Opção desconhecida: $1" ;;
+            *)
+                break ;;
+        esac
+    done
+
+    echo "$#"
+}
+
+main() {
+    local argc
+    argc=$(parse_global_opts "$@")
+    local args=("$@")
+    local consumed=$(( ${#args[@]} - argc ))
+    args=("${args[@]:${consumed}}")
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        cmd_help
+        exit 1
+    fi
+
+    local cmd="${args[0]}"
+    shift || true
+
+    case "${cmd}" in
+        prepare)      cmd_prepare "$@" ;;
+        show-detect)  cmd_show_detect "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            die "Comando desconhecido: ${cmd}"
+            ;;
+    esac
+}
+
+trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
+
+main "$@"
