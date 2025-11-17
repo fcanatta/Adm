@@ -1,0 +1,973 @@
+#!/usr/bin/env bash
+# adm-install - empacota DESTDIR, instala binários e remove pacotes
+
+set -o pipefail
+set -o nounset
+
+# =========[ CONFIG BÁSICA ]================================================
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+ADM_REPO="${ADM_ROOT}/repo"
+ADM_DESTDIR_BASE="${ADM_ROOT}/destdir"
+ADM_LOG_DIR="${ADM_ROOT}/logs"
+ADM_DB_DIR="${ADM_ROOT}/db"
+ADM_PKG_CACHE="${ADM_ROOT}/packages"      # binários cacheados
+
+DRY_RUN=0
+QUIET=0
+INSTALL_ROOT="/"                           # raiz real (normalmente /)
+DEFAULT_COMP="auto"                        # auto|zst|xz
+
+# =========[ CORES / LOG ]==================================================
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+
+C_MAGENTA='\033[35;1m'
+C_GREEN='\033[32;1m'
+C_YELLOW='\033[33;1m'
+C_RED='\033[31;1m'
+C_CYAN='\033[36;1m'
+
+CHECK_MARK="✔"
+
+supports_color() {
+    [[ -t 1 ]] && tput colors &>/dev/null
+}
+
+colorize() {
+    local color="$1"; shift
+    if supports_color; then
+        printf "%b%s%b" "${color}" "$*" "${C_RESET}"
+    else
+        printf "%s" "$*"
+    fi
+}
+
+timestamp() {
+    date +%H:%M:%S
+}
+
+log_header() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %b%s%b\n" \
+        "$(colorize "${C_MAGENTA}" "==")" \
+        "$(timestamp)" \
+        "$(colorize "${C_MAGENTA}" "[INSTALL]")" \
+        " ${msg}" \
+        "${C_RESET}"
+}
+
+log_arrow() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_GREEN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_info() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_CYAN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_warn() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_YELLOW}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+log_error() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_RED}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# =========[ SPINNER ]======================================================
+
+_spinner_pid=""
+
+spinner_start() {
+    local msg="$1"
+    (( QUIET )) && return 0
+
+    local spin='|/-\'
+    local i=0
+
+    printf "%s %s %s " "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
+
+    (
+        tput civis 2>/dev/null || true
+        while :; do
+            printf "\r%s %s %s %b%c%b" \
+                "$(colorize "${C_GREEN}" "->")" \
+                "$(timestamp)" \
+                "${msg}" \
+                "${C_CYAN}" "${spin:i++%${#spin}:1}" "${C_RESET}"
+            sleep 0.1
+        done
+    ) &
+    _spinner_pid=$!
+    disown "$_spinner_pid" 2>/dev/null || true
+}
+
+spinner_stop() {
+    local status=${1:-0}
+    (( QUIET )) && return "${status}"
+
+    if [[ -n "${_spinner_pid}" ]] && kill -0 "${_spinner_pid}" &>/dev/null; then
+        kill "${_spinner_pid}" &>/dev/null || true
+        wait "${_spinner_pid}" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+
+    tput cnorm 2>/dev/null || true
+
+    local symbol msg_color
+    if (( status == 0 )); then
+        symbol="${CHECK_MARK}"
+        msg_color="${C_GREEN}"
+    else
+        symbol="✖"
+        msg_color="${C_RED}"
+    fi
+
+    printf "\r%b %s %b%s%b\n" \
+        "$(colorize "${msg_color}" "->")" \
+        "$(timestamp)" \
+        "${msg_color}" "[${symbol}]" "${C_RESET}"
+
+    return "${status}"
+}
+
+run_with_spinner() {
+    local msg="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] ${msg}: $*"
+        return 0
+    fi
+
+    spinner_start "${msg}"
+    "$@" &
+    local pid=$!
+
+    wait "${pid}"
+    local status=$?
+
+    spinner_stop "${status}"
+    return "${status}"
+}
+
+# =========[ DIRETÓRIOS / DB / LOG ]========================================
+
+ensure_dirs() {
+    local d
+    for d in "${ADM_DESTDIR_BASE}" "${ADM_LOG_DIR}" "${ADM_DB_DIR}" "${ADM_PKG_CACHE}"; do
+        if [[ ! -d "${d}" ]]; then
+            if (( DRY_RUN )); then
+                log_arrow "[dry-run] mkdir -p ${d}"
+            else
+                mkdir -p "${d}" || die "Falha ao criar diretório ${d}"
+            fi
+        fi
+    done
+}
+
+log_file_for() {
+    local category="$1" pkg="$2" action="$3"
+    printf "%s/install-%s-%s-%s.%s.log" \
+        "${ADM_LOG_DIR}" "${category}" "${pkg}" "${action}" "$(date +%Y%m%d-%H%M%S)"
+}
+
+PKG_DB_DIR() { printf "%s/packages" "${ADM_DB_DIR}"; }
+FILE_DB_DIR() { printf "%s/files"    "${ADM_DB_DIR}"; }
+
+pkg_db_file() {
+    local category="$1" name="$2"
+    printf "%s/%s.%s.pkg" "$(PKG_DB_DIR)" "${category}" "${name}"
+}
+
+file_db_file() {
+    local category="$1" name="$2"
+    printf "%s/%s.%s.files" "$(FILE_DB_DIR)" "${category}" "${name}"
+}
+
+# =========[ METAFILE / REPO ]=============================================
+
+meta_path() {
+    local category="$1" pkg="$2"
+    printf "%s/%s/%s/metafile" "${ADM_REPO}" "${category}" "${pkg}"
+}
+
+meta_get() {
+    local category="$1" pkg="$2" key="$3"
+    local file
+    file="$(meta_path "${category}" "${pkg}")"
+    [[ -f "${file}" ]] || die "Metafile não encontrado: ${file}"
+
+    local line
+    line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+meta_name()        { meta_get "$1" "$2" "name";        }
+meta_version()     { meta_get "$1" "$2" "version";     }
+meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
+
+# =========[ BINÁRIOS / COMPRESSÃO ]=======================================
+
+detect_comp() {
+    local fmt="$1"
+    case "${fmt}" in
+        auto)
+            if command -v zstd &>/dev/null; then
+                echo "zst"
+            elif command -v xz &>/dev/null; then
+                echo "xz"
+            else
+                log_warn "Nem zstd nem xz encontrados, usando tar sem compressão."
+                echo "tar"
+            fi
+            ;;
+        zst) echo "zst" ;;
+        xz)  echo "xz"  ;;
+        tar) echo "tar" ;;
+        *)
+            die "Formato de compressão inválido: ${fmt} (use auto|zst|xz|tar)"
+            ;;
+    esac
+}
+
+pkg_archive_name() {
+    local category="$1" name="$2" version="$3" comp="$4"
+    case "${comp}" in
+        zst) printf "%s-%s-%s.tar.zst" "${category}" "${name}" "${version}" ;;
+        xz)  printf "%s-%s-%s.tar.xz"  "${category}" "${name}" "${version}" ;;
+        tar) printf "%s-%s-%s.tar"     "${category}" "${name}" "${version}" ;;
+    esac
+}
+
+pkg_archive_path() {
+    local category="$1" name="$2" version="$3" comp="$4"
+    printf "%s/%s" "${ADM_PKG_CACHE}" "$(pkg_archive_name "${category}" "${name}" "${version}" "${comp}")"
+}
+
+# =========[ HOOKS ]========================================================
+
+hook_dir_for() {
+    local category="$1" pkg="$2"
+    printf "%s/%s/%s/hook" "${ADM_REPO}" "${category}" "${pkg}"
+}
+
+run_hooks() {
+    local stage="$1" category="$2" pkg="$3" root="$4" log_file="$5"
+
+    local dir
+    dir="$(hook_dir_for "${category}" "${pkg}")"
+    [[ -d "${dir}" ]] || return 0
+
+    local hook
+    shopt -s nullglob
+    for hook in "${dir}/${stage}"*; do
+        [[ -x "${hook}" ]] || continue
+        if (( DRY_RUN )); then
+            log_info "[dry-run] HOOK(${stage}): ${hook}"
+            continue
+        fi
+        log_arrow "Executando hook ${stage}: $(basename "${hook}")"
+        {
+            echo "=== $(date) ==="
+            echo "HOOK ${stage}: ${hook}"
+        } >> "${log_file}"
+        ROOT="${root}" "${hook}" >> "${log_file}" 2>&1 || die "Hook ${hook} falhou."
+    done
+    shopt -u nullglob
+}
+
+# =========[ COPY / INSTALL / REMOVE ]======================================
+
+copy_destdir_to_root() {
+    local destdir="$1" root="$2" log_file="$3"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] cp -a ${destdir}/. ${root}/"
+        return 0
+    fi
+
+    [[ -d "${destdir}" ]] || die "DESTDIR não existe: ${destdir}"
+
+    {
+        echo "=== $(date) ==="
+        echo "COPY DESTDIR ${destdir} -> ${root}"
+    } >> "${log_file}"
+
+    # copiar tudo preservando atributos
+    cp -a "${destdir}/." "${root}/" >> "${log_file}" 2>&1 || die "Falha ao copiar DESTDIR para ${root}"
+}
+
+record_file_list() {
+    local category="$1" name="$2" destdir="$3" root="$4"
+
+    local fdb
+    fdb="$(file_db_file "${category}" "${name}")"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] registraria arquivos em ${fdb}"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "${fdb}")" || die "Falha ao criar diretório de files DB."
+
+    # gera lista de caminhos finais (root)
+    : > "${fdb}"
+    (
+        cd "${destdir}" || exit 1
+        find . -mindepth 1 -print
+    ) | while read -r p; do
+        # remove ./ do início
+        p="${p#./}"
+        printf "%s/%s\n" "${root%/}" "${p}" >> "${fdb}"
+    done
+}
+
+remove_files_from_root() {
+    local category="$1" name="$2" root="$3" log_file="$4"
+
+    local fdb
+    fdb="$(file_db_file "${category}" "${name}")"
+    [[ -f "${fdb}" ]] || { log_warn "Nenhuma lista de arquivos para ${category}/${name}, remoção best-effort."; return 0; }
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] removeria arquivos listados em ${fdb}"
+        return 0
+    fi
+
+    {
+        echo "=== $(date) ==="
+        echo "REMOVE FILES ${category}/${name}"
+    } >> "${log_file}"
+
+    tac "${fdb}" | while read -r path; do
+        [[ -e "${path}" || -L "${path}" ]] || continue
+        rm -f "${path}" >> "${log_file}" 2>&1 || log_warn "Falha ao remover ${path}"
+        # tentativa de remover diretório pai se vazio
+        local dir
+        dir="$(dirname "${path}")"
+        rmdir "${dir}" >> "${log_file}" 2>&1 || true
+    done
+}
+
+# =========[ REGISTRO DE PACOTES ]=========================================
+
+register_package() {
+    local category="$1" name="$2" version="$3" archive="$4" root="$5" run_deps="$6"
+
+    local pdb
+    pdb="$(pkg_db_file "${category}" "${name}")"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] registraria pacote em ${pdb}"
+        return 0
+    fi
+
+    mkdir -p "$(PKG_DB_DIR)" || die "Falha ao criar PKG_DB_DIR."
+
+    cat > "${pdb}" <<EOF
+NAME=${name}
+CATEGORY=${category}
+VERSION=${version}
+ARCHIVE=${archive}
+ROOT=${root}
+RUN_DEPS=${run_deps}
+INSTALLED_AT=$(date +%Y-%m-%dT%H:%M:%S)
+EOF
+}
+
+unregister_package() {
+    local category="$1" name="$2"
+
+    local pdb fdb
+    pdb="$(pkg_db_file "${category}" "${name}")"
+    fdb="$(file_db_file "${category}" "${name}")"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] removeria DB ${pdb} e ${fdb}"
+        return 0
+    fi
+
+    rm -f "${pdb}" "${fdb}" 2>/dev/null || true
+}
+
+is_installed() {
+    local category="$1" name="$2"
+    [[ -f "$(pkg_db_file "${category}" "${name}")" ]]
+}
+
+# =========[ DEPENDÊNCIAS / REVERSAS ]=====================================
+
+list_installed_packages() {
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || return 0
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        basename "${f}" .pkg
+    done
+    shopt -u nullglob
+}
+
+load_pkg_db_var() {
+    local pdb="$1" key="$2"
+    [[ -f "${pdb}" ]] || return 1
+    local line
+    line="$(grep -E "^${key}=" "${pdb}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+reverse_deps_for() {
+    local target_name="$1"
+
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || return 0
+
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        local run
+        run="$(load_pkg_db_var "${f}" "RUN_DEPS" 2>/dev/null || echo "")"
+        [[ -z "${run}" ]] && continue
+        if echo "${run}" | tr ',' ' ' | grep -wq "${target_name}"; then
+            basename "${f}" .pkg
+        fi
+    done
+    shopt -u nullglob
+}
+# =========[ EMPACOTAR DESTDIR ]============================================
+
+pack_destdir() {
+    local category="$1" pkg="$2" destdir="$3" comp_fmt="$4"
+
+    ensure_dirs
+
+    local name version
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+
+    [[ -d "${destdir}" ]] || die "DESTDIR não existe: ${destdir}"
+
+    local comp
+    comp="$(detect_comp "${comp_fmt}")"
+    local archive
+    archive="$(pkg_archive_path "${category}" "${name}" "${version}" "${comp}")"
+
+    log_header "Empacotando ${category}/${pkg} (${name}-${version}) em ${archive}"
+
+    if (( DRY_RUN )); then
+        case "${comp}" in
+            zst) log_info "[dry-run] tar -cf - -C ${destdir} . | zstd -19 -o ${archive}" ;;
+            xz)  log_info "[dry-run] tar -cf - -C ${destdir} . | xz -9 -T0 -c > ${archive}" ;;
+            tar) log_info "[dry-run] tar -cf ${archive} -C ${destdir} ." ;;
+        esac
+        echo "${archive}"
+        return 0
+    fi
+
+    mkdir -p "${ADM_PKG_CACHE}" || die "Falha ao criar cache de pacotes."
+
+    case "${comp}" in
+        zst)
+            command -v zstd &>/dev/null || die "zstd não encontrado."
+            tar -cf - -C "${destdir}" . | zstd -19 -o "${archive}" || die "Falha ao criar ${archive}"
+            ;;
+        xz)
+            command -v xz &>/dev/null || die "xz não encontrado."
+            tar -cf - -C "${destdir}" . | xz -9 -T0 -c > "${archive}" || die "Falha ao criar ${archive}"
+            ;;
+        tar)
+            tar -cf "${archive}" -C "${destdir}" . || die "Falha ao criar ${archive}"
+            ;;
+    esac
+
+    log_arrow "Pacote criado: ${archive}"
+    echo "${archive}"
+}
+
+# =========[ INSTALAR DE DESTDIR ]=========================================
+
+install_from_destdir() {
+    local category="$1" pkg="$2" destdir="$3" comp_fmt="$4" root="$5"
+
+    ensure_dirs
+
+    local name version run_deps
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+    run_deps="$(meta_run_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    local log_file
+    log_file="$(log_file_for "${category}" "${pkg}" "destdir")"
+
+    log_header "Instalando ${category}/${pkg} a partir de DESTDIR"
+    log_info "Name:    ${name}"
+    log_info "Version: ${version}"
+    log_info "DESTDIR: ${destdir}"
+    log_info "Root:    ${root}"
+    log_info "Log:     ${log_file}"
+
+    run_hooks "pre-install" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    run_with_spinner "Copiando arquivos para o sistema" copy_destdir_to_root "${destdir}" "${root}" "${log_file}"
+
+    run_with_spinner "Registrando arquivos instalados" record_file_list "${category}" "${name}" "${destdir}" "${root}"
+
+    local archive
+    archive="$(pack_destdir "${category}" "${pkg}" "${destdir}" "${comp_fmt}")"
+
+    register_package "${category}" "${name}" "${version}" "${archive}" "${root}" "${run_deps}"
+
+    run_hooks "post-install" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    log_arrow "Instalação de ${category}/${pkg} concluída."
+}
+
+# =========[ INSTALAR DE ARQUIVO BINÁRIO ]=================================
+
+extract_package_to_temp_destdir() {
+    local archive="$1" tempdest="$2"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] extrairia ${archive} em ${tempdest}"
+        return 0
+    fi
+
+    mkdir -p "${tempdest}" || die "Falha ao criar ${tempdest}"
+
+    case "${archive}" in
+        *.tar.zst)
+            command -v zstd &>/dev/null || die "zstd não encontrado."
+            zstd -d -c "${archive}" | tar -xf - -C "${tempdest}" || die "Falha ao extrair ${archive}"
+            ;;
+        *.tar.xz)
+            command -v xz &>/dev/null || die "xz não encontrado."
+            xz -d -c "${archive}" | tar -xf - -C "${tempdest}" || die "Falha ao extrair ${archive}"
+            ;;
+        *.tar)
+            tar -xf "${archive}" -C "${tempdest}" || die "Falha ao extrair ${archive}"
+            ;;
+        *)
+            die "Formato desconhecido: ${archive}"
+            ;;
+    esac
+}
+
+find_binary_archive() {
+    local category="$1" name="$2" version="$3"
+
+    local pattern
+    pattern="${ADM_PKG_CACHE}/${category}-${name}-${version}.tar*"
+    local f
+    f=$(ls ${pattern} 2>/dev/null | head -n1 || true)
+    [[ -n "${f}" ]] || die "Nenhum pacote binário encontrado para ${category}/${name}-${version} em ${ADM_PKG_CACHE}."
+    echo "${f}"
+}
+
+install_binary_package() {
+    local category="$1" pkg="$2" root="$3"
+
+    ensure_dirs
+
+    local name version run_deps
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+    run_deps="$(meta_run_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    local archive
+    archive="$(find_binary_archive "${category}" "${name}" "${version}")"
+
+    local log_file
+    log_file="$(log_file_for "${category}" "${pkg}" "bin")"
+    local tempdest="${ADM_DESTDIR_BASE}/_bininstall_${category}_${name}_$$"
+
+    log_header "Instalando binário ${category}/${pkg} (${archive})"
+    log_info "Tempdest: ${tempdest}"
+    log_info "Root:     ${root}"
+    log_info "Log:      ${log_file}"
+
+    run_with_spinner "Extraindo pacote binário" extract_package_to_temp_destdir "${archive}" "${tempdest}"
+
+    run_hooks "pre-install" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    run_with_spinner "Copiando arquivos para o sistema" copy_destdir_to_root "${tempdest}" "${root}" "${log_file}"
+    run_with_spinner "Registrando arquivos instalados" record_file_list "${category}" "${name}" "${tempdest}" "${root}"
+
+    register_package "${category}" "${name}" "${version}" "${archive}" "${root}" "${run_deps}"
+
+    run_hooks "post-install" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] rm -rf ${tempdest}"
+    else
+        rm -rf "${tempdest}" || log_warn "Falha ao remover tempdest ${tempdest}"
+    fi
+
+    log_arrow "Instalação binária de ${category}/${pkg} concluída."
+}
+
+# =========[ REMOÇÃO DE PACOTES ]==========================================
+
+remove_package() {
+    local category="$1" pkg="$2" recursive="$3" root="$4"
+
+    ensure_dirs
+
+    local name version
+    name="$(meta_name "${category}" "${pkg}")"
+    version="$(meta_version "${category}" "${pkg}")"
+
+    if ! is_installed "${category}" "${name}"; then
+        log_warn "Pacote ${category}/${name} não está instalado."
+        return 0
+    fi
+
+    local rev
+    mapfile -t rev < <(reverse_deps_for "${name}")
+
+    if (( ${#rev[@]} > 0 && recursive == 0 )); then
+        log_error "Existem pacotes que dependem de ${name}:"
+        local r
+        for r in "${rev[@]}"; do
+            echo "  - ${r}"
+        done
+        echo "Use --recursive para remover também os dependentes."
+        return 1
+    fi
+
+    local log_file
+    log_file="$(log_file_for "${category}" "${pkg}" "remove")"
+
+    log_header "Removendo ${category}/${pkg}"
+    log_info "Name:    ${name}"
+    log_info "Version: ${version}"
+    log_info "Root:    ${root}"
+    log_info "Log:     ${log_file}"
+
+    # remover dependentes primeiro se recursive
+    if (( recursive == 1 && ${#rev[@]} > 0 )); then
+        local r
+        for r in "${rev[@]}"; do
+            local rcat rname
+            rcat="${r%%.*}"
+            rname="${r#*.}"
+            log_header "Removendo dependente: ${rcat}/${rname}"
+            remove_package "${rcat}" "${rname}" 1 "${root}" || die "Falha ao remover dependente ${r}"
+        done
+    fi
+
+    run_hooks "pre-remove" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    run_with_spinner "Removendo arquivos" remove_files_from_root "${category}" "${name}" "${root}" "${log_file}"
+
+    unregister_package "${category}" "${name}"
+
+    run_hooks "post-remove" "${category}" "${pkg}" "${root}" "${log_file}"
+
+    log_arrow "Remoção de ${category}/${pkg} concluída."
+}
+
+# =========[ INFO / LIST ]==================================================
+
+cmd_info_pkg() {
+    local category="$1" pkg="$2"
+
+    ensure_dirs
+
+    local name
+    name="$(meta_name "${category}" "${pkg}")"
+
+    local pdb
+    pdb="$(pkg_db_file "${category}" "${name}")"
+    if [[ ! -f "${pdb}" ]]; then
+        echo "Pacote ${category}/${name} não está instalado."
+        return 1
+    fi
+
+    echo "== ${category}/${name} =="
+    cat "${pdb}"
+}
+
+cmd_list_installed() {
+    ensure_dirs
+    local dir
+    dir="$(PKG_DB_DIR)"
+    [[ -d "${dir}" ]] || { echo "Nenhum pacote instalado."; return 0; }
+
+    local f
+    shopt -s nullglob
+    for f in "${dir}"/*.pkg; do
+        local base name category version
+        base="$(basename "${f}" .pkg)"
+        category="${base%%.*}"
+        name="${base#*.}"
+        version="$(load_pkg_db_var "${f}" "VERSION" 2>/dev/null || echo "?")"
+        printf "%s/%s %s\n" "${category}" "${name}" "${version}"
+    done
+    shopt -u nullglob
+}
+
+# =========[ PARSE DE ARGUMENTOS DE PACOTE ]===============================
+
+# Entrada tipo "categoria/programa" -> categoria,programa
+split_cat_pkg() {
+    local arg="$1"
+    local category="${arg%%/*}"
+    local pkg="${arg#*/}"
+    [[ -z "${category}" || -z "${pkg}" || "${category}" == "${pkg}" ]] && \
+        die "Formato inválido de pacote: '${arg}'. Use categoria/programa."
+    echo "${category} ${pkg}"
+}
+
+# =========[ COMANDOS ]=====================================================
+
+cmd_pack() {
+    local category="$1"; shift || true
+    local pkg="$1"; shift || true
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz]"
+
+    local destdir="" fmt="${DEFAULT_COMP}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --destdir) destdir="$2"; shift 2 ;;
+            --format)  fmt="$2"; shift 2 ;;
+            *)
+                die "Parâmetro desconhecido em pack: $1"
+                ;;
+        esac
+    done
+
+    if [[ -z "${destdir}" ]]; then
+        destdir="$(ADM_DESTDIR_BASE)/${category}/$(meta_name "${category}" "${pkg}")-$(meta_version "${category}" "${pkg}")"
+    fi
+
+    pack_destdir "${category}" "${pkg}" "${destdir}" "${fmt}" >/dev/null
+}
+
+cmd_install_destdir() {
+    local category="$1"; shift || true
+    local pkg="$1"; shift || true
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz] [--root PATH]"
+
+    local destdir="" fmt="${DEFAULT_COMP}" root="${INSTALL_ROOT}"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --destdir) destdir="$2"; shift 2 ;;
+            --format)  fmt="$2"; shift 2 ;;
+            --root)    root="$2"; shift 2 ;;
+            *)
+                die "Parâmetro desconhecido em install-destdir: $1"
+                ;;
+        esac
+    done
+
+    if [[ -z "${destdir}" ]]; then
+        destdir="${ADM_DESTDIR_BASE}/${category}/$(meta_name "${category}" "${pkg}")-$(meta_version "${category}" "${pkg}")"
+    fi
+
+    install_from_destdir "${category}" "${pkg}" "${destdir}" "${fmt}" "${root}"
+}
+
+cmd_install_bin() {
+    local root="${INSTALL_ROOT}"
+    local pkgs=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --root) root="$2"; shift 2 ;;
+            *)
+                pkgs+=("$1"); shift ;;
+        esac
+    done
+
+    [[ ${#pkgs[@]} -ge 1 ]] || die "Uso: adm-install install-bin [--root PATH] categoria/programa ..."
+
+    local arg category pkg
+    for arg in "${pkgs[@]}"; do
+        read -r category pkg < <(split_cat_pkg "${arg}")
+        install_binary_package "${category}" "${pkg}" "${root}"
+    done
+}
+
+cmd_install_many_destdir() {
+    local fmt="${DEFAULT_COMP}" root="${INSTALL_ROOT}"
+    local listfile=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --format) fmt="$2"; shift 2 ;;
+            --root)   root="$2"; shift 2 ;;
+            --file)   listfile="$2"; shift 2 ;;
+            *)
+                die "Parâmetro desconhecido em install-many-destdir: $1"
+                ;;
+        esac
+    done
+
+    [[ -n "${listfile}" ]] || die "Uso: adm-install install-many-destdir --file lista.txt [--format ...] [--root ...]"
+    [[ -f "${listfile}" ]] || die "Arquivo de lista não encontrado: ${listfile}"
+
+    local line
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%%#*}"
+        line="$(echo "${line}" | tr -s ' ' )"
+        [[ -z "${line}" ]] && continue
+        local category pkg
+        read -r category pkg < <(split_cat_pkg "${line}")
+        cmd_install_destdir "${category}" "${pkg}" --format "${fmt}" --root "${root}"
+    done < "${listfile}"
+}
+
+cmd_remove() {
+    local recursive=0 root="${INSTALL_ROOT}"
+    local pkgs=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --recursive|-r) recursive=1; shift ;;
+            --root) root="$2"; shift 2 ;;
+            *)
+                pkgs+=("$1"); shift ;;
+        esac
+    done
+
+    [[ ${#pkgs[@]} -ge 1 ]] || die "Uso: adm-install remove [--recursive] [--root PATH] categoria/programa ..."
+
+    local arg category pkg
+    for arg in "${pkgs[@]}"; do
+        read -r category pkg < <(split_cat_pkg "${arg}")
+        remove_package "${category}" "${pkg}" "${recursive}" "${root}"
+    done
+}
+
+cmd_info() {
+    local arg="$1"; shift || true
+    [[ -z "${arg}" ]] && die "Uso: adm-install info categoria/programa"
+
+    local category pkg
+    read -r category pkg < <(split_cat_pkg "${arg}")
+    cmd_info_pkg "${category}" "${pkg}"
+}
+
+cmd_help() {
+    cat <<EOF
+Uso: adm-install [OPÇÕES] <comando> [args]
+
+OPÇÕES:
+  -n, --dry-run      Não executa, apenas mostra o que faria
+  -q, --quiet        Menos saída (apenas erros)
+  -h, --help         Mostra esta ajuda
+
+COMANDOS:
+  pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz]
+      Empacota o DESTDIR em um tar.zst/tar.xz no cache.
+
+  install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz] [--root PATH]
+      Instala a partir de DESTDIR, registra arquivos e cria pacote no cache.
+
+  install-bin [--root PATH] categoria/programa ...
+      Instala um ou mais pacotes a partir dos binários no cache.
+
+  install-many-destdir --file lista.txt [--format auto|zst|xz] [--root PATH]
+      Instala vários pacotes listados em um arquivo (um categoria/programa por linha).
+
+  remove [--recursive] [--root PATH] categoria/programa ...
+      Remove pacotes instalados, checando dependências reversas. Se houver
+      dependentes, exige --recursive para removê-los também.
+
+  list-installed
+      Lista todos os pacotes instalados conforme o banco de dados.
+
+  info categoria/programa
+      Mostra informações sobre um pacote instalado.
+
+  help
+      Esta ajuda.
+EOF
+}
+
+# =========[ PARSE GLOBAL / MAIN ]=========================================
+
+parse_global_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -q|--quiet)
+                QUIET=1; shift ;;
+            -h|--help)
+                cmd_help; exit 0 ;;
+            --)
+                shift; break ;;
+            -*)
+                die "Opção desconhecida: $1" ;;
+            *)
+                break ;;
+        esac
+    done
+
+    echo "$#"
+}
+
+main() {
+    local argc
+    argc=$(parse_global_opts "$@")
+    local args=("$@")
+    local consumed=$(( ${#args[@]} - argc ))
+    args=("${args[@]:${consumed}}")
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        cmd_help
+        exit 1
+    fi
+
+    local cmd="${args[0]}"
+    shift || true
+
+    case "${cmd}" in
+        pack)               cmd_pack "$@" ;;
+        install-destdir)    cmd_install_destdir "$@" ;;
+        install-bin)        cmd_install_bin "$@" ;;
+        install-many-destdir) cmd_install_many_destdir "$@" ;;
+        remove)             cmd_remove "$@" ;;
+        list-installed)     cmd_list_installed "$@" ;;
+        info)               cmd_info "$@" ;;
+        help|-h|--help)     cmd_help ;;
+        *)
+            die "Comando desconhecido: ${cmd}"
+            ;;
+    esac
+}
+
+trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
+
+main "$@"
