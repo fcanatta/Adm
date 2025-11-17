@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[coreutils-temp] Aplicando patches..."
+
+patch -p1 < "$ADM_PACKAGE_PATCHES/coreutils-9.7-upstream_fix-1.patch"
+patch -p1 < "$ADM_PACKAGE_PATCHES/coreutils-9.7-i18n-1.patch"
+
+rm -rf build || true
+mkdir build
