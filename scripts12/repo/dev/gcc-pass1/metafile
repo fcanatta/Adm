@@ -1,0 +1,12 @@
+name=gcc-pass1
+version=15.2.0
+category=dev
+run_deps=
+build_deps=binutils-pass1,gmp,mpfr,mpc,isl
+opt_deps=
+num_builds=0
+description=GCC Pass 1 (cross-compiler, C only)
+homepage=https://gcc.gnu.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
