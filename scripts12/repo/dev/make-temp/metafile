@@ -1,0 +1,10 @@
+name=make-temp
+version=4.4.1
+category=dev
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=GNU Make - temporary tool
+homepage=https://www.gnu.org/software/make/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
