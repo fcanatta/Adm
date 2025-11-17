@@ -1,0 +1,10 @@
+name=bash-temp
+version=5.3
+category=apps
+run_deps=glibc-cross,ncurses-temp
+build_deps=gcc-pass1,binutils-pass1,glibc-cross,ncurses-temp
+opt_deps=
+description=Bash - temporary tool
+homepage=https://www.gnu.org/software/bash/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
