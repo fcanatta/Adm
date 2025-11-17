@@ -9,6 +9,7 @@ set -o nounset
 ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
 ADM_REPO="${ADM_ROOT}/repo"
 ADM_LOG_DIR="${ADM_ROOT}/logs"
+ADM_DB_DIR="${ADM_ROOT}/db"
 
 ADM_PROFILE_CMD="${ADM_ROOT}/scripts/adm-profile"
 ADM_CROSS_CMD="${ADM_ROOT}/scripts/adm-cross-toolchain"
@@ -17,20 +18,20 @@ ADM_CONSTRUCT_CMD="${ADM_ROOT}/scripts/adm-construct"
 ADM_INSTALL_CMD="${ADM_ROOT}/scripts/adm-install"
 ADM_CLEAN_CMD="${ADM_ROOT}/scripts/adm-clean"
 ADM_FETCH_CMD="${ADM_ROOT}/scripts/adm-fetch"
+ADM_UPDATE_CMD="${ADM_ROOT}/scripts/adm-update"
+ADM_META_CMD="${ADM_ROOT}/scripts/adm-meta"
 
 DRY_RUN=0
 QUIET=0
 
 DEFAULT_PROFILE="normal"
 DEFAULT_ROOT="/"
-DEFAULT_FORMAT="auto"   # auto|zst|xz
+DEFAULT_FORMAT="auto"   # auto|zst|xz|tar
 DEFAULT_CHROOT=""
 
 # =========[ CORES / LOG ]==================================================
 
 C_RESET='\033[0m'
-C_BOLD='\033[1m'
-
 C_MAGENTA='\033[35;1m'
 C_GREEN='\033[32;1m'
 C_YELLOW='\033[33;1m'
@@ -39,9 +40,7 @@ C_CYAN='\033[36;1m'
 
 CHECK_MARK="✔"
 
-supports_color() {
-    [[ -t 1 ]] && tput colors &>/dev/null
-}
+supports_color() { [[ -t 1 ]] && tput colors &>/dev/null; }
 
 colorize() {
     local color="$1"; shift
@@ -52,9 +51,7 @@ colorize() {
     fi
 }
 
-timestamp() {
-    date +%H:%M:%S
-}
+timestamp() { date +%H:%M:%S; }
 
 log_header() {
     local msg="$*"
@@ -70,43 +67,28 @@ log_header() {
 log_arrow() {
     local msg="$*"
     (( QUIET )) && return 0
-    printf "%b %s %s\n" \
-        "$(colorize "${C_GREEN}" "->")" \
-        "$(timestamp)" \
-        "${msg}"
+    printf "%b %s %s\n" "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
 }
 
 log_info() {
     local msg="$*"
     (( QUIET )) && return 0
-    printf "%b %s %s\n" \
-        "$(colorize "${C_CYAN}" "->")" \
-        "$(timestamp)" \
-        "${msg}"
+    printf "%b %s %s\n" "$(colorize "${C_CYAN}" "->")" "$(timestamp)" "${msg}"
 }
 
 log_warn() {
     local msg="$*"
-    printf "%b %s %s\n" \
-        "$(colorize "${C_YELLOW}" "!!")" \
-        "$(timestamp)" \
-        "${msg}" 1>&2
+    printf "%b %s %s\n" "$(colorize "${C_YELLOW}" "!!")" "$(timestamp)" "${msg}" 1>&2
 }
 
 log_error() {
     local msg="$*"
-    printf "%b %s %s\n" \
-        "$(colorize "${C_RED}" "!!")" \
-        "$(timestamp)" \
-        "${msg}" 1>&2
+    printf "%b %s %s\n" "$(colorize "${C_RED}" "!!")" "$(timestamp)" "${msg}" 1>&2
 }
 
-die() {
-    log_error "$*"
-    exit 1
-}
+die() { log_error "$*"; exit 1; }
 
-# =========[ SPINNER (para tarefas internas do adm) ]======================
+# =========[ SPINNER ]======================================================
 
 _spinner_pid=""
 
@@ -165,28 +147,22 @@ spinner_stop() {
 
 run_with_spinner() {
     local msg="$1"; shift
-
     if (( DRY_RUN )); then
         log_info "[dry-run] ${msg}: $*"
         return 0
     fi
-
     spinner_start "${msg}"
     "$@" &
     local pid=$!
-
     wait "${pid}"
     local status=$?
-
     spinner_stop "${status}"
     return "${status}"
 }
 
 # =========[ DIRETÓRIOS / LOG ]=============================================
 
-ensure_dirs() {
-    [[ -d "${ADM_LOG_DIR}" ]] || mkdir -p "${ADM_LOG_DIR}" 2>/dev/null || true
-}
+ensure_dirs() { [[ -d "${ADM_LOG_DIR}" ]] || mkdir -p "${ADM_LOG_DIR}" 2>/dev/null || true; }
 
 log_file_for() {
     local action="$1" category="$2" pkg="$3"
@@ -202,16 +178,11 @@ ensure_script() {
 }
 
 run_sub() {
-    # adiciona -n/-q automaticamente nos subcomandos
     local cmd_path="$1"; shift
-    local args=("$@")
     local full=("${cmd_path}")
-
     (( DRY_RUN )) && full+=("-n")
     (( QUIET )) && full+=("-q")
-
-    full+=("${args[@]}")
-
+    full+=("$@")
     log_info "EXEC: ${full[*]}"
     "${full[@]}"
 }
@@ -228,7 +199,6 @@ meta_get() {
     local file
     file="$(meta_path "${category}" "${pkg}")"
     [[ -f "${file}" ]] || return 1
-
     local line
     line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
     [[ -z "${line}" ]] && return 1
@@ -238,8 +208,10 @@ meta_get() {
 meta_name()        { meta_get "$1" "$2" "name";        }
 meta_version()     { meta_get "$1" "$2" "version";     }
 meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
+meta_build_deps()  { meta_get "$1" "$2" "build_deps";  }
+meta_opt_deps()    { meta_get "$1" "$2" "opt_deps";    }
 
-# =========[ LOCALIZAR CATEGORIA PELO NOME DO PROGRAMA ]====================
+# =========[ LOCALIZAR CATEGORIA ]==========================================
 
 find_category_for_pkg() {
     local pkg="$1"
@@ -249,7 +221,6 @@ find_category_for_pkg() {
     local f
     while IFS= read -r -d '' f; do
         local cat dirpkg
-        # .../repo/<category>/<pkg>/metafile
         cat="$(basename "$(dirname "${f}")")"
         dirpkg="$(basename "$(dirname "$(dirname "${f}")")")"
         if [[ "${dirpkg}" == "${pkg}" ]]; then
@@ -272,10 +243,7 @@ find_category_for_pkg() {
 }
 
 split_cat_pkg_arg() {
-    # entrada: "categoria/prog" ou "prog"
-    local arg="$1"
-    local category pkg
-
+    local arg="$1" category pkg
     if [[ "${arg}" == *"/"* ]]; then
         category="${arg%%/*}"
         pkg="${arg#*/}"
@@ -284,38 +252,53 @@ split_cat_pkg_arg() {
         pkg="${arg}"
         category="$(find_category_for_pkg "${pkg}")"
     fi
-
     printf "%s %s\n" "${category}" "${pkg}"
 }
 
-split_list() {
-    local s="$1"
-    [[ -z "${s}" ]] && return 0
-    echo "${s}" | tr ',' '\n' | sed '/^[[:space:]]*$/d'
+# =========[ DB DE PACOTES (adm-install) ]==================================
+
+PKG_DB_DIR() { printf "%s/packages" "${ADM_DB_DIR}"; }
+
+pkg_db_file() {
+    local category="$1" name="$2"
+    printf "%s/%s.%s.pkg" "$(PKG_DB_DIR)" "${category}" "${name}"
 }
 
-# =========[ RESOLUÇÃO DE DEPENDÊNCIAS PARA install-bin ]===================
+is_installed() {
+    local category="$1" name="$2"
+    [[ -f "$(pkg_db_file "${category}" "${name}")" ]]
+}
 
-declare -A ADM_VISITED
-ADM_ORDERED_PKGS=()
+# =========[ RESOLUÇÃO DE DEPENDÊNCIAS (SOURCE) ]===========================
 
-dfs_resolve_pkg() {
+declare -A SRC_DEP_VISITED
+SRC_DEP_ORDERED_PKGS=()
+
+resolve_deps_src_dfs() {
     local category="$1" pkg="$2"
     local key="${category}/${pkg}"
 
-    if [[ -n "${ADM_VISITED[${key}]:-}" ]]; then
+    # evita loop
+    if [[ -n "${SRC_DEP_VISITED[${key}]:-}" ]]; then
         return 0
     fi
-    ADM_VISITED["${key}"]=1
+    SRC_DEP_VISITED["${key}"]=1
 
-    local run_deps
-    run_deps="$(meta_run_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    local run build opt combined
+    run="$(meta_run_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
+    build="$(meta_build_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+    opt="$(meta_opt_deps     "${category}" "${pkg}" 2>/dev/null || echo "")"
 
-    local dep
-    while IFS= read -r dep; do
+    combined="${run},${build},${opt}"
+
+    local dep dcat dpkg
+    IFS=',' read -r -a deps_array <<< "${combined}"
+    for dep in "${deps_array[@]}"; do
+        # trim
+        dep="${dep#"${dep%%[![:space:]]*}"}"
+        dep="${dep%"${dep##*[![:space:]]}"}"
         [[ -z "${dep}" ]] && continue
 
-        local dcat dpkg
         if [[ "${dep}" == */* ]]; then
             dcat="${dep%%/*}"
             dpkg="${dep#*/}"
@@ -324,13 +307,13 @@ dfs_resolve_pkg() {
             dcat="$(find_category_for_pkg "${dpkg}")"
         fi
 
-        dfs_resolve_pkg "${dcat}" "${dpkg}"
-    done < <(split_list "${run_deps}")
+        resolve_deps_src_dfs "${dcat}" "${dpkg}"
+    done
 
-    ADM_ORDERED_PKGS+=("${category}/${pkg}")
+    SRC_DEP_ORDERED_PKGS+=("${category}/${pkg}")
 }
 
-# =========[ PIPELINES: BUILD/INSTALL COMPLETO ]============================
+# =========[ PIPELINES ]====================================================
 
 pipeline_build_only() {
     local category="$1" pkg="$2" profile="$3" chroot="$4"
@@ -340,30 +323,24 @@ pipeline_build_only() {
     ensure_script "${ADM_CONSTRUCT_CMD}" "adm-construct"
     ensure_script "${ADM_CLEAN_CMD}"     "adm-clean"
 
-    log_header "Build completo (sem instalar) de ${category}/${pkg} (profile=${profile})"
+    log_header "Build (sem instalar) de ${category}/${pkg} (profile=${profile})"
 
-    # limpeza leve antes
     run_sub "${ADM_CLEAN_CMD}" clean-work --days 7
     run_sub "${ADM_CLEAN_CMD}" clean-chroots --days 7
 
-    # fetch
-    run_sub "${ADM_FETCH_CMD}" fetch "${category}" "${pkg}"
+    run_sub "${ADM_FETCH_CMD}"   fetch   "${category}" "${pkg}"
+    run_sub "${ADM_SOURCE_CMD}"  prepare "${category}" "${pkg}" --profile "${profile}"
 
-    # prepare (detecção)
-    run_sub "${ADM_SOURCE_CMD}" prepare "${category}" "${pkg}" --profile "${profile}"
-
-    # build (adm-construct já usa .adm-detect.env)
     if [[ -n "${chroot}" ]]; then
         run_sub "${ADM_CONSTRUCT_CMD}" build "${category}" "${pkg}" --profile "${profile}" --chroot "${chroot}"
     else
         run_sub "${ADM_CONSTRUCT_CMD}" build "${category}" "${pkg}" --profile "${profile}"
     fi
 
-    # limpeza leve depois
     run_sub "${ADM_CLEAN_CMD}" clean-work --days 7
     run_sub "${ADM_CLEAN_CMD}" clean-chroots --days 7
 
-    log_arrow "Build de ${category}/${pkg} finalizado (DESTDIR pronto, não instalado no sistema)."
+    log_arrow "Build de ${category}/${pkg} finalizado (DESTDIR pronto)."
 }
 
 pipeline_install_full() {
@@ -375,38 +352,32 @@ pipeline_install_full() {
     ensure_script "${ADM_INSTALL_CMD}"   "adm-install"
     ensure_script "${ADM_CLEAN_CMD}"     "adm-clean"
 
-    log_header "Instalação completa de ${category}/${pkg}"
+    log_header "Instalação de ${category}/${pkg}"
     log_info  "Profile: ${profile}"
     log_info  "Root:    ${root}"
     log_info  "Formato: ${fmt}"
     [[ -n "${chroot}" ]] && log_info "Chroot:  ${chroot}"
 
-    # limpeza leve antes
     run_sub "${ADM_CLEAN_CMD}" clean-work --days 7
     run_sub "${ADM_CLEAN_CMD}" clean-chroots --days 7
 
-    # fetch
-    run_sub "${ADM_FETCH_CMD}" fetch "${category}" "${pkg}"
+    run_sub "${ADM_FETCH_CMD}"   fetch   "${category}" "${pkg}"
+    run_sub "${ADM_SOURCE_CMD}"  prepare "${category}" "${pkg}" --profile "${profile}"
 
-    # prepare / detection
-    run_sub "${ADM_SOURCE_CMD}" prepare "${category}" "${pkg}" --profile "${profile}"
-
-    # build
     if [[ -n "${chroot}" ]]; then
         run_sub "${ADM_CONSTRUCT_CMD}" build "${category}" "${pkg}" --profile "${profile}" --chroot "${chroot}"
     else
         run_sub "${ADM_CONSTRUCT_CMD}" build "${category}" "${pkg}" --profile "${profile}"
     fi
 
-    # install a partir de DESTDIR (empacota e registra)
     run_sub "${ADM_INSTALL_CMD}" install-destdir "${category}" "${pkg}" --format "${fmt}" --root "${root}"
 
-    # limpeza leve depois
     run_sub "${ADM_CLEAN_CMD}" clean-work --days 7
     run_sub "${ADM_CLEAN_CMD}" clean-chroots --days 7
 
     log_arrow "Instalação de ${category}/${pkg} concluída."
 }
+
 # =========[ COMANDOS ]=====================================================
 
 cmd_build() {
@@ -419,11 +390,8 @@ cmd_build() {
             --profile) profile="$2"; shift 2 ;;
             --chroot)  chroot="$2"; shift 2 ;;
             *)
-                if [[ -z "${pkg_arg}" ]]; then
-                    pkg_arg="$1"; shift
-                else
-                    die "Argumento inesperado em build: $1"
-                fi
+                [[ -z "${pkg_arg}" ]] && pkg_arg="$1" || die "Argumento inesperado em build: $1"
+                shift
                 ;;
         esac
     done
@@ -441,117 +409,151 @@ cmd_install() {
     local root="${DEFAULT_ROOT}"
     local fmt="${DEFAULT_FORMAT}"
     local pkg_arg=""
+    local with_deps=1
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --profile) profile="$2"; shift 2 ;;
-            --chroot)  chroot="$2"; shift 2 ;;
-            --root)    root="$2"; shift 2 ;;
-            --format)  fmt="$2"; shift 2 ;;
+            --profile)   profile="$2"; shift 2 ;;
+            --chroot)    chroot="$2"; shift 2 ;;
+            --root)      root="$2"; shift 2 ;;
+            --format)    fmt="$2"; shift 2 ;;
+            --with-deps) with_deps=1; shift ;;
+            --no-deps)   with_deps=0; shift ;;
             *)
-                if [[ -z "${pkg_arg}" ]]; then
-                    pkg_arg="$1"; shift
-                else
-                    die "Argumento inesperado em install: $1"
-                fi
+                [[ -z "${pkg_arg}" ]] && pkg_arg="$1" || die "Argumento inesperado em install: $1"
+                shift
                 ;;
         esac
     done
 
-    [[ -n "${pkg_arg}" ]] || die "Uso: adm install [--profile NOME] [--root PATH] [--format auto|zst|xz] [--chroot DIR] categoria/programa | programa"
+    [[ -n "${pkg_arg}" ]] || die "Uso: adm install [--profile NOME] [--root PATH] [--format auto|zst|xz] [--chroot DIR] [--with-deps|--no-deps] categoria/programa | programa"
 
     local category pkg
     read -r category pkg < <(split_cat_pkg_arg "${pkg_arg}")
-    pipeline_install_full "${category}" "${pkg}" "${profile}" "${root}" "${fmt}" "${chroot}"
+
+    # modo simples: só o alvo
+    if (( with_deps == 0 )); then
+        pipeline_install_full "${category}" "${pkg}" "${profile}" "${root}" "${fmt}" "${chroot}"
+        return 0
+    fi
+
+    # modo completo: lê TODAS as deps do metafile (run+build+opt)
+    log_header "Instalação com resolução de dependências (source)"
+    log_info "Alvo:   ${category}/${pkg}"
+    log_info "Root:   ${root}"
+    log_info "Perfil: ${profile}"
+
+    SRC_DEP_VISITED=()
+    SRC_DEP_ORDERED_PKGS=()
+
+    resolve_deps_src_dfs "${category}" "${pkg}"
+
+    # remover duplicados preservando ordem
+    local -a ordered=()
+    declare -A seen
+    local k
+    for k in "${SRC_DEP_ORDERED_PKGS[@]}"; do
+        if [[ -z "${seen[${k}]:-}" ]]; then
+            seen["${k}"]=1
+            ordered+=("${k}")
+        fi
+    done
+
+    log_arrow "Ordem de construção/instalação (deps -> alvo):"
+    for k in "${ordered[@]}"; do
+        echo "  - ${k}"
+    done
+
+    # para cada pacote na ordem, pula se já instalado
+    local entry c n name
+    for entry in "${ordered[@]}"; do
+        c="${entry%%/*}"
+        n="${entry#*/}"
+        name="$(meta_name "${c}" "${n}" 2>/dev/null || echo "${n}")"
+
+        if is_installed "${c}" "${name}"; then
+            log_info "Pulando ${c}/${name} (já instalado)."
+            continue
+        fi
+
+        pipeline_install_full "${c}" "${n}" "${profile}" "${root}" "${fmt}" "${chroot}"
+    done
 }
 
 cmd_install_bin() {
     local root="${DEFAULT_ROOT}"
+    local no_deps=0
     local -a pkg_args=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --root) root="$2"; shift 2 ;;
+            --root)      root="$2"; shift 2 ;;
+            --no-deps)   no_deps=1; shift ;;
+            --with-deps) no_deps=0; shift ;;
             *)
                 pkg_args+=("$1"); shift ;;
         esac
     done
 
-    [[ ${#pkg_args[@]} -ge 1 ]] || die "Uso: adm install-bin [--root PATH] programa1 [categoria/programa2 ...]"
+    [[ ${#pkg_args[@]} -ge 1 ]] || die "Uso: adm install-bin [--root PATH] [--no-deps] programa1 [categoria/programa2 ...]"
 
     ensure_script "${ADM_INSTALL_CMD}" "adm-install"
 
-    log_header "Instalação binária (com resolução de dependências)"
+    log_header "Instalação binária via adm-install"
     log_info "Root: ${root}"
 
-    # resolve dependências em ordem topológica
-    ADM_VISITED=()
-    ADM_ORDERED_PKGS=()
+    local args=( "install-bin" "--root" "${root}" )
+    (( no_deps == 0 )) && args+=( "--with-deps" ) || args+=( "--no-deps" )
 
-    local arg category pkg
-    for arg in "${pkg_args[@]}"; do
-        read -r category pkg < <(split_cat_pkg_arg "${arg}")
-        dfs_resolve_pkg "${category}" "${pkg}"
+    local a c p
+    for a in "${pkg_args[@]}"; do
+        read -r c p < <(split_cat_pkg_arg "${a}")
+        args+=( "${c}/${p}" )
     done
 
-    # remove duplicados preservando ordem (DFS já cuida, mas garantimos)
-    local -a final_list=()
-    declare -A seen
-    local k
-    for k in "${ADM_ORDERED_PKGS[@]}"; do
-        if [[ -z "${seen[${k}]:-}" ]]; then
-            seen["${k}"]=1
-            final_list+=("${k}")
-        fi
-    done
-
-    log_arrow "Ordem de instalação (deps -> dependentes):"
-    for k in "${final_list[@]}"; do
-        echo "  - ${k}"
-    done
-
-    if (( DRY_RUN )); then
-        log_info "[dry-run] chamaria adm-install install-bin --root ${root} ${final_list[*]}"
-        return 0
-    fi
-
-    # chama adm-install install-bin com tudo na ordem certa
-    run_sub "${ADM_INSTALL_CMD}" install-bin --root "${root}" "${final_list[@]}"
+    run_sub "${ADM_INSTALL_CMD}" "${args[@]}"
 }
 
 cmd_clean() {
     ensure_script "${ADM_CLEAN_CMD}" "adm-clean"
-    [[ $# -ge 1 ]] || die "Uso: adm clean <subcomando> [args] (ex.: clean-all --all)"
-
+    [[ $# -ge 1 ]] || die "Uso: adm clean <subcomando> [args]"
     run_sub "${ADM_CLEAN_CMD}" "$@"
 }
 
 cmd_search() {
     ensure_script "${ADM_CLEAN_CMD}" "adm-clean"
     [[ $# -ge 1 ]] || die "Uso: adm search <termo>"
-
     run_sub "${ADM_CLEAN_CMD}" search "$1"
 }
 
 cmd_info() {
     ensure_script "${ADM_CLEAN_CMD}" "adm-clean"
     [[ $# -ge 1 ]] || die "Uso: adm info <categoria/programa|nome>"
-
     run_sub "${ADM_CLEAN_CMD}" info "$1"
 }
 
 cmd_fetch() {
     ensure_script "${ADM_FETCH_CMD}" "adm-fetch"
     [[ $# -ge 1 ]] || die "Uso: adm fetch <programa> OU adm fetch <categoria> <programa>"
-
     run_sub "${ADM_FETCH_CMD}" fetch "$@"
 }
 
 cmd_cross() {
     ensure_script "${ADM_CROSS_CMD}" "adm-cross-toolchain"
-    [[ $# -ge 1 ]] || die "Uso: adm cross <subcomando> [args] (ex.: build --arch x86_64 --libc glibc)"
-
+    [[ $# -ge 1 ]] || die "Uso: adm cross <subcomando> [args]"
     run_sub "${ADM_CROSS_CMD}" "$@"
+}
+
+cmd_update() {
+    ensure_script "${ADM_UPDATE_CMD}" "adm-update"
+    [[ $# -ge 1 ]] || die "Uso: adm update <check|update|show> ..."
+    run_sub "${ADM_UPDATE_CMD}" "$@"
+}
+
+cmd_meta() {
+    ensure_script "${ADM_META_CMD}" "adm-meta"
+    [[ $# -ge 1 ]] || die "Uso: adm meta <subcomando> ..."
+    run_sub "${ADM_META_CMD}" "$@"
 }
 
 cmd_help() {
@@ -563,64 +565,47 @@ OPÇÕES:
   -q, --quiet        Menos saída (apenas erros)
   -h, --help         Mostra esta ajuda
 
-COMANDOS PRINCIPAIS:
-  install [--profile NOME] [--root PATH] [--format auto|zst|xz] [--chroot DIR] <categoria/programa | programa>
-      - Limpa work/chroots (leve)
-      - Fetch de sources (adm-fetch)
-      - Prepare/detecção (adm-source)
-      - Build (adm-construct)
-      - Instala a partir de DESTDIR no sistema (adm-install install-destdir)
-      - Limpa novamente work/chroots (leve)
+COMANDOS:
+  install [--profile NOME] [--root PATH] [--format auto|zst|xz] [--chroot DIR] [--with-deps|--no-deps] <cat/prog | prog>
+      Lê TODAS as dependências do metafile (run_deps, build_deps, opt_deps),
+      resolve a ordem deps -> alvo, pula pacotes já instalados, e para cada
+      pacote faz:
+        adm-fetch   fetch
+        adm-source  prepare
+        adm-construct build
+        adm-install install-destdir
 
-  build [--profile NOME] [--chroot DIR] <categoria/programa | programa>
-      Igual ao install, mas para no DESTDIR (não instala no sistema).
+  build [--profile NOME] [--chroot DIR] <cat/prog | prog>
+      Build completo até DESTDIR, sem instalar no sistema.
 
-  install-bin [--root PATH] programa1 [categoria/programa2 ...]
-      - Resolve dependências recursivas via metafiles (run_deps)
-      - Calcula ordem deps -> dependentes
-      - Chama adm-install install-bin na ordem correta.
+  install-bin [--root PATH] [--no-deps] prog1 [cat/prog2 ...]
+      Frontend para adm-install install-bin (por padrão com deps).
 
-COMANDOS DE APOIO:
-  fetch <programa> | fetch <categoria> <programa>
-      Encaminha para adm-fetch fetch ...
+  clean  <...>       Proxy para adm-clean
+  search <termo>     Proxy para adm-clean search
+  info   <...>       Proxy para adm-clean info
+  fetch  <...>       Proxy para adm-fetch
+  cross  <...>       Proxy para adm-cross-toolchain
+  update <...>       Proxy para adm-update
+  meta   <...>       Proxy para adm-meta
 
-  clean <subcomando> [args]
-      Proxy para adm-clean (ex.: adm clean clean-all --all).
-
-  search <termo>
-      Proxy para adm-clean search <termo>.
-
-  info <categoria/programa|nome>
-      Proxy para adm-clean info ...
-
-  cross <subcomando> [args]
-      Proxy para adm-cross-toolchain (ex.: adm cross build --arch x86_64 --libc glibc).
-
-  help
-      Esta ajuda.
+  help               Esta ajuda.
 EOF
 }
 
-# =========[ PARSE GLOBAL / MAIN ]=========================================
+# =========[ GLOBAL / MAIN ]===============================================
 
 parse_global_opts() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -n|--dry-run)
-                DRY_RUN=1; shift ;;
-            -q|--quiet)
-                QUIET=1; shift ;;
-            -h|--help)
-                cmd_help; exit 0 ;;
-            --)
-                shift; break ;;
-            -*)
-                die "Opção desconhecida: $1" ;;
-            *)
-                break ;;
+            -n|--dry-run) DRY_RUN=1; shift ;;
+            -q|--quiet)   QUIET=1; shift ;;
+            -h|--help)    cmd_help; exit 0 ;;
+            --)           shift; break ;;
+            -*)           die "Opção desconhecida: $1" ;;
+            *)            break ;;
         esac
     done
-
     echo "$#"
 }
 
@@ -650,13 +635,12 @@ main() {
         info)         cmd_info "$@" ;;
         fetch)        cmd_fetch "$@" ;;
         cross)        cmd_cross "$@" ;;
+        update)       cmd_update "$@" ;;
+        meta)         cmd_meta "$@" ;;
         help|-h|--help) cmd_help ;;
-        *)
-            die "Comando desconhecido: ${cmd}"
-            ;;
+        *)            die "Comando desconhecido: ${cmd}" ;;
     esac
 }
 
 trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
-
 main "$@"
