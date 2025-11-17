@@ -1,0 +1,12 @@
+name=binutils
+version=2.45
+category=dev
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU binary utilities (assembler, linker, ferramentas)
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM System <root@localhost>
+sha256sums=c50c0e7f9cb188980e2cc97e4537626b1672441815587f1eab69d2a1bfbef5d2
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.xz
