@@ -1,0 +1,12 @@
+name=gmp
+version=6.3.0
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Biblioteca de aritmética de precisão (GMP)
+homepage=https://gmplib.org/
+maintainer=ADM System <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
