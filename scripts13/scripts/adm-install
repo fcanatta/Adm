@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # adm-install - empacota DESTDIR, instala binários e remove pacotes
+# Versão evoluída: resolve dependências em install-bin (--with-deps)
 
 set -o pipefail
 set -o nounset
@@ -16,7 +17,7 @@ ADM_PKG_CACHE="${ADM_ROOT}/packages"      # binários cacheados
 DRY_RUN=0
 QUIET=0
 INSTALL_ROOT="/"                           # raiz real (normalmente /)
-DEFAULT_COMP="auto"                        # auto|zst|xz
+DEFAULT_COMP="auto"                        # auto|zst|xz|tar
 
 # =========[ CORES / LOG ]==================================================
 
@@ -231,6 +232,37 @@ meta_name()        { meta_get "$1" "$2" "name";        }
 meta_version()     { meta_get "$1" "$2" "version";     }
 meta_run_deps()    { meta_get "$1" "$2" "run_deps";    }
 
+# Encontrar categoria quando o dep não tem "categoria/"
+find_category_for_pkg() {
+    local pkg="$1"
+    [[ -d "${ADM_REPO}" ]] || die "Repositório não encontrado em ${ADM_REPO}"
+
+    local matches=()
+    local f
+    while IFS= read -r -d '' f; do
+        # .../repo/<category>/<pkg>/metafile
+        local cat dirpkg
+        cat="$(basename "$(dirname "${f}")")"
+        dirpkg="$(basename "$(dirname "$(dirname "${f}")")")"
+        if [[ "${dirpkg}" == "${pkg}" ]]; then
+            matches+=("${cat}")
+        fi
+    done < <(find "${ADM_REPO}" -mindepth 3 -maxdepth 5 -type f -name 'metafile' -print0 2>/dev/null || true)
+
+    if (( ${#matches[@]} == 0 )); then
+        die "Nenhum metafile encontrado para programa '${pkg}' ao resolver dependências."
+    elif (( ${#matches[@]} > 1 )); then
+        log_error "Metafiles múltiplos encontrados para '${pkg}' ao resolver dependências:"
+        local m
+        for m in "${matches[@]}"; do
+            echo "  - ${m}/${pkg}"
+        done
+        die "Especifique a categoria explicitamente no metafile (ex: categoria/${pkg})."
+    else
+        echo "${matches[0]}"
+    fi
+}
+
 # =========[ BINÁRIOS / COMPRESSÃO ]=======================================
 
 detect_comp() {
@@ -318,7 +350,6 @@ copy_destdir_to_root() {
         echo "COPY DESTDIR ${destdir} -> ${root}"
     } >> "${log_file}"
 
-    # copiar tudo preservando atributos
     cp -a "${destdir}/." "${root}/" >> "${log_file}" 2>&1 || die "Falha ao copiar DESTDIR para ${root}"
 }
 
@@ -335,13 +366,11 @@ record_file_list() {
 
     mkdir -p "$(dirname "${fdb}")" || die "Falha ao criar diretório de files DB."
 
-    # gera lista de caminhos finais (root)
     : > "${fdb}"
     (
         cd "${destdir}" || exit 1
         find . -mindepth 1 -print
     ) | while read -r p; do
-        # remove ./ do início
         p="${p#./}"
         printf "%s/%s\n" "${root%/}" "${p}" >> "${fdb}"
     done
@@ -367,7 +396,6 @@ remove_files_from_root() {
     tac "${fdb}" | while read -r path; do
         [[ -e "${path}" || -L "${path}" ]] || continue
         rm -f "${path}" >> "${log_file}" 2>&1 || log_warn "Falha ao remover ${path}"
-        # tentativa de remover diretório pai se vazio
         local dir
         dir="$(dirname "${path}")"
         rmdir "${dir}" >> "${log_file}" 2>&1 || true
@@ -461,6 +489,38 @@ reverse_deps_for() {
         fi
     done
     shopt -u nullglob
+}
+
+# --------- Resolução de deps para install-bin (--with-deps) ---------------
+
+declare -A DEP_VISITED
+DEP_ORDERED_PKGS=()
+
+dfs_resolve_pkg() {
+    local category="$1" pkg="$2"
+    local key="${category}/${pkg}"
+
+    if [[ -n "${DEP_VISITED[${key}]:-}" ]]; then
+        return 0
+    fi
+    DEP_VISITED["${key}"]=1
+
+    local run_deps dep dcat dpkg
+    run_deps="$(meta_run_deps "${category}" "${pkg}" 2>/dev/null || echo "")"
+
+    echo "${run_deps}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' | while read -r dep; do
+        [[ -z "${dep}" ]] && continue
+        if [[ "${dep}" == */* ]]; then
+            dcat="${dep%%/*}"
+            dpkg="${dep#*/}"
+        else
+            dpkg="${dep}"
+            dcat="$(find_category_for_pkg "${dpkg}")"
+        fi
+        dfs_resolve_pkg "${dcat}" "${dpkg}"
+    done
+
+    DEP_ORDERED_PKGS+=("${category}/${pkg}")
 }
 # =========[ EMPACOTAR DESTDIR ]============================================
 
@@ -671,7 +731,6 @@ remove_package() {
     log_info "Root:    ${root}"
     log_info "Log:     ${log_file}"
 
-    # remover dependentes primeiro se recursive
     if (( recursive == 1 && ${#rev[@]} > 0 )); then
         local r
         for r in "${rev[@]}"; do
@@ -736,7 +795,6 @@ cmd_list_installed() {
 
 # =========[ PARSE DE ARGUMENTOS DE PACOTE ]===============================
 
-# Entrada tipo "categoria/programa" -> categoria,programa
 split_cat_pkg() {
     local arg="$1"
     local category="${arg%%/*}"
@@ -751,7 +809,7 @@ split_cat_pkg() {
 cmd_pack() {
     local category="$1"; shift || true
     local pkg="$1"; shift || true
-    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz]"
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz|tar]"
 
     local destdir="" fmt="${DEFAULT_COMP}"
 
@@ -775,7 +833,7 @@ cmd_pack() {
 cmd_install_destdir() {
     local category="$1"; shift || true
     local pkg="$1"; shift || true
-    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz] [--root PATH]"
+    [[ -z "${category}" || -z "${pkg}" ]] && die "Uso: adm-install install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz|tar] [--root PATH]"
 
     local destdir="" fmt="${DEFAULT_COMP}" root="${INSTALL_ROOT}"
 
@@ -799,22 +857,70 @@ cmd_install_destdir() {
 
 cmd_install_bin() {
     local root="${INSTALL_ROOT}"
+    local with_deps=0
     local pkgs=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --root) root="$2"; shift 2 ;;
+            --root)      root="$2"; shift 2 ;;
+            --with-deps) with_deps=1; shift ;;
+            --no-deps)   with_deps=0; shift ;;
             *)
                 pkgs+=("$1"); shift ;;
         esac
     done
 
-    [[ ${#pkgs[@]} -ge 1 ]] || die "Uso: adm-install install-bin [--root PATH] categoria/programa ..."
+    [[ ${#pkgs[@]} -ge 1 ]] || die "Uso: adm-install install-bin [--root PATH] [--with-deps|--no-deps] categoria/programa ..."
+
+    if (( with_deps == 0 )); then
+        # Comportamento antigo: instala exatamente o que foi pedido, na ordem
+        local arg category pkg
+        for arg in "${pkgs[@]}"; do
+            read -r category pkg < <(split_cat_pkg "${arg}")
+            install_binary_package "${category}" "${pkg}" "${root}"
+        done
+        return 0
+    fi
+
+    # Novo: resolve dependências recursivas (run_deps) pelos metafiles
+    log_header "Instalação binária com resolução de dependências (--with-deps)"
+    log_info "Root: ${root}"
+
+    DEP_VISITED=()
+    DEP_ORDERED_PKGS=()
 
     local arg category pkg
     for arg in "${pkgs[@]}"; do
         read -r category pkg < <(split_cat_pkg "${arg}")
-        install_binary_package "${category}" "${pkg}" "${root}"
+        dfs_resolve_pkg "${category}" "${pkg}"
+    done
+
+    # remove duplicados preservando ordem
+    local -a final_list=()
+    declare -A seen
+    local k
+    for k in "${DEP_ORDERED_PKGS[@]}"; do
+        if [[ -z "${seen[${k}]:-}" ]]; then
+            seen["${k}"]=1
+            final_list+=("${k}")
+        fi
+    done
+
+    log_arrow "Ordem de instalação (deps -> dependentes):"
+    for k in "${final_list[@]}"; do
+        echo "  - ${k}"
+    done
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] instalaria (bin) na ordem acima em root=${root}"
+        return 0
+    fi
+
+    for k in "${final_list[@]}"; do
+        local c n
+        c="${k%%/*}"
+        n="${k#*/}"
+        install_binary_package "${c}" "${n}" "${root}"
     done
 }
 
@@ -888,16 +994,19 @@ OPÇÕES:
   -h, --help         Mostra esta ajuda
 
 COMANDOS:
-  pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz]
-      Empacota o DESTDIR em um tar.zst/tar.xz no cache.
+  pack <categoria> <programa> [--destdir PATH] [--format auto|zst|xz|tar]
+      Empacota o DESTDIR em um tar.zst/tar.xz/tar no cache.
 
-  install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz] [--root PATH]
+  install-destdir <categoria> <programa> [--destdir PATH] [--format auto|zst|xz|tar] [--root PATH]
       Instala a partir de DESTDIR, registra arquivos e cria pacote no cache.
 
-  install-bin [--root PATH] categoria/programa ...
+  install-bin [--root PATH] [--with-deps|--no-deps] categoria/programa ...
       Instala um ou mais pacotes a partir dos binários no cache.
+      --with-deps: resolve dependências (run_deps) pelos metafiles e instala
+                   na ordem correta (deps -> dependentes).
+      --no-deps  : instala apenas os pacotes passados, na ordem dada (padrão).
 
-  install-many-destdir --file lista.txt [--format auto|zst|xz] [--root PATH]
+  install-many-destdir --file lista.txt [--format auto|zst|xz|tar] [--root PATH]
       Instala vários pacotes listados em um arquivo (um categoria/programa por linha).
 
   remove [--recursive] [--root PATH] categoria/programa ...
@@ -954,14 +1063,14 @@ main() {
     shift || true
 
     case "${cmd}" in
-        pack)               cmd_pack "$@" ;;
-        install-destdir)    cmd_install_destdir "$@" ;;
-        install-bin)        cmd_install_bin "$@" ;;
+        pack)                 cmd_pack "$@" ;;
+        install-destdir)      cmd_install_destdir "$@" ;;
+        install-bin)          cmd_install_bin "$@" ;;
         install-many-destdir) cmd_install_many_destdir "$@" ;;
-        remove)             cmd_remove "$@" ;;
-        list-installed)     cmd_list_installed "$@" ;;
-        info)               cmd_info "$@" ;;
-        help|-h|--help)     cmd_help ;;
+        remove)               cmd_remove "$@" ;;
+        list-installed)       cmd_list_installed "$@" ;;
+        info)                 cmd_info "$@" ;;
+        help|-h|--help)       cmd_help ;;
         *)
             die "Comando desconhecido: ${cmd}"
             ;;
