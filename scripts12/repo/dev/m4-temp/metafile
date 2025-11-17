@@ -1,0 +1,10 @@
+name=m4-temp
+version=1.4.20
+category=dev
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=M4 - temporary tool
+homepage=https://www.gnu.org/software/m4/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz
