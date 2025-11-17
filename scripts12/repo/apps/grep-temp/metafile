@@ -1,0 +1,10 @@
+name=grep-temp
+version=3.12
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Grep - temporary tool
+homepage=https://www.gnu.org/software/grep/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/grep/grep-3.12.tar.xz
