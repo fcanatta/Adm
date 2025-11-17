@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[linux-api-headers] Instalando headers no sysroot..."
+
+mkdir -p "$DESTDIR/usr" || true
+cp -rv usr/include "$DESTDIR/usr"
+
+echo "[linux-api-headers] Headers instalados em $DESTDIR/usr/include"
