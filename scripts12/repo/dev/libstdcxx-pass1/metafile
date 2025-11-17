@@ -1,0 +1,12 @@
+name=libstdcxx-pass1
+version=15.2.0
+category=dev
+run_deps=glibc-cross
+build_deps=glibc-cross,gcc-pass1,binutils-pass1
+opt_deps=
+num_builds=0
+description=Libstdc++ for GCC (Cross) - Pass 1
+homepage=https://gcc.gnu.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
