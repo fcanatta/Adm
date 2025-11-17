@@ -1,0 +1,10 @@
+name=tar-temp
+version=1.35
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Tar - temporary tool
+homepage=https://www.gnu.org/software/tar/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/tar/tar-1.35.tar.xz
