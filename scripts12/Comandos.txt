@@ -1,0 +1,131 @@
+1. CRIE UM PERFIL PARA CROSS-TOOLCHAIN O nome ideal:
+
+cross-x86_64-unknown-linux-gnu
+cross-aarch64-linux-gnu
+cross-riscv64-linux-gnu
+
+Exemplo:
+
+adm profile-create cross-x86_64-unknown-linux-gnu
+
+O profile.sh automaticamente:
+
+gera CFLAGS, LDFLAGS, CC corretos
+
+adiciona prefix personalizado (/usr/src/adm/cross/<triplet>)
+
+exporta PATH com prioridade para ferramentas cross
+
+ativa comportamento minimal e 100% determinístico
+
+adm meta-create sys binutils-cross
+adm meta-create sys gcc-cross-stage1
+adm meta-create sys linux-headers-cross
+adm meta-create sys glibc-cross
+adm meta-create sys gcc-cross-final
+
+INSTALAR OS PACOTES EM ORDEM (DESTDIR)
+
+Para cross-toolchain, todos são instalados no prefix do profile.
+
+Assumindo que você ativou o perfil:
+
+adm profile use cross-x86_64-unknown-linux-gnu
+
+Etapa 1 — binutils
+
+adm install binutils-cross
+
+Etapa 2 — linux headers
+
+adm install linux-headers-cross
+
+Etapa 3 — gcc stage 1 (sem libstdc++)
+
+adm install gcc-cross-stage1
+
+Etapa 4 — glibc ou musl
+
+adm install glibc-cross
+
+ou
+
+adm install musl-cross
+
+Etapa 5 — gcc final
+
+adm install gcc-cross-final
+
+# Usar cross-toolchain em qualquer compilação 
+# Ativa o perfil
+adm profile use cross-x86_64-unknown-linux-gnu
+
+# E depois 
+adm install <algum-pacote> --target=cross
+
+# Se quiser construir um rootfs inteiro usando o cross-tollchain 
+adm install busybox --target=cross
+adm install musl --target=cross
+adm install coreutils --target=cross
+adm install util-linux --target=cross
+...
+# Todos os pacotes iram para 
+/usr/src/adm/cross/<TARGET>/rootfs/
+
+E SOBRE SYSTEMD, RUNIT, SYSV, MUSL, GLIBC?
+
+O ADM detecta isso automaticamente:
+
+se seu profile usa musl → constrói glibc-cross ignorada
+
+se seu profile usa glibc → constrói glibc-cross
+
+se seu profile define INIT=runit → os pacotes são construídos com suporte runit
+
+se define INIT=systemd → o build_core ativa systemd units
+
+
+(Basta o perfil ter profile_init="systemd" ou outro.)
+---
+
+EXEMPLO COMPLETO (RECOMENDADO)
+
+# Criar perfil
+adm profile-create cross-aarch64-linux-gnu
+adm profile use cross-aarch64-linux-gnu
+
+# Criar metafiles
+adm meta-create sys binutils-cross
+adm meta-create sys linux-headers-cross
+adm meta-create sys gcc-cross-stage1
+adm meta-create sys musl-cross
+adm meta-create sys gcc-cross-final
+
+# Construir tudo
+adm install binutils-cross
+adm install linux-headers-cross
+adm install gcc-cross-stage1
+adm install musl-cross
+adm install gcc-cross-final
+
+
+---
+
+✔ RESUMO FINAL
+
+PARA CRIAR O CROSS-TOOLCHAIN NO ADM:
+
+1. Criar perfil cross
+
+
+2. Criar pacotes com metafiles
+
+
+3. Instalar em ordem
+
+
+4. ADM monta chroot, destdir, flags e CC automaticamente
+
+
+5. Usar adm install normalmente
+
