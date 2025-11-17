@@ -1,5 +1,22 @@
 #!/usr/bin/env bash
 
+# install.sh – Instalador EXTREMO do ADM
+#
+# Modos:
+#   adm install <pkg> [--no-deps]
+#   adm install-bin <pkg> [--no-deps]
+#   adm install <arquivo.pkg|.deb|.rpm>
+#
+# Integração:
+#   - metafile.sh  -> adm_meta_load / MF_*
+#   - source.sh    -> adm_source_prepare_from_meta (chamado dentro do build_core)
+#   - build_core.sh-> adm_build_core_from_meta (chroot seguro + DESTDIR=/dest)
+#   - package.sh   -> adm_pkg_from_destdir, adm_pkg_install_file, reempacotar .deb/.rpm
+#   - db.sh        -> registro no banco
+#   - ui.sh        -> logs e contexto bonitinho, se disponível
+#
+# Este script NÃO usa set -e para não quebrar chamadores.
+
 ADM_ROOT="/usr/src/adm"
 ADM_SCRIPTS="$ADM_ROOT/scripts"
 ADM_REPO="$ADM_ROOT/repo"
@@ -9,297 +26,558 @@ ADM_BUILD="$ADM_ROOT/build"
 
 INSTALL_NO_DEPS=0
 INSTALL_BIN=0
-INSTALL_TARGET=""
 INSTALL_FILE=""
-UI_OK=1
+INSTALL_NAME=""
+UI_OK=0
 
-# ----------------------------------------------------
-# carregar módulos
-# ----------------------------------------------------
-for f in ui.sh db.sh metafile.sh source.sh build_core.sh package.sh profile.sh; do
-    if [ -r "$ADM_SCRIPTS/$f" ]; then
-        . "$ADM_SCRIPTS/$f"
-    fi
-done
+# -----------------------------
+# Carregar módulos
+# -----------------------------
+if [ -r "$ADM_SCRIPTS/ui.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/ui.sh
+    . "$ADM_SCRIPTS/ui.sh"
+    UI_OK=1
+fi
+if [ -r "$ADM_SCRIPTS/db.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/db.sh
+    . "$ADM_SCRIPTS/db.sh"
+fi
+if [ -r "$ADM_SCRIPTS/metafile.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/metafile.sh
+    . "$ADM_SCRIPTS/metafile.sh"
+fi
+if [ -r "$ADM_SCRIPTS/source.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/source.sh
+    . "$ADM_SCRIPTS/source.sh"
+fi
+if [ -r "$ADM_SCRIPTS/build_core.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/build_core.sh
+    . "$ADM_SCRIPTS/build_core.sh"
+fi
+if [ -r "$ADM_SCRIPTS/package.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/package.sh
+    . "$ADM_SCRIPTS/package.sh"
+fi
+if [ -r "$ADM_SCRIPTS/profile.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/profile.sh
+    . "$ADM_SCRIPTS/profile.sh"
+fi
 
-# ----------------------------------------------------
-# LOGS
-# ----------------------------------------------------
-log_info(){ [ $UI_OK -eq 1 ] && adm_ui_log_info "$@" || echo "[INFO] $@"; }
-log_warn(){ [ $UI_OK -eq 1 ] && adm_ui_log_warn "$@" || echo "[WARN] $@"; }
-log_error(){ [ $UI_OK -eq 1 ] && adm_ui_log_error "$@" || echo "[ERROR] $@"; }
-die(){ log_error "$@"; exit 1; }
+# -----------------------------
+# Logs básicos
+# -----------------------------
+log_info()  { [ "$UI_OK" -eq 1 ] && adm_ui_log_info  "$*" || printf '[INFO] %s\n'  "$*" >&2; }
+log_warn()  { [ "$UI_OK" -eq 1 ] && adm_ui_log_warn  "$*" || printf '[WARN] %s\n'  "$*" >&2; }
+log_error() { [ "$UI_OK" -eq 1 ] && adm_ui_log_error "$*" || printf '[ERROR] %s\n' "$*" >&2; }
 
-trim(){ local s="$*"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf "%s" "$s"; }
-
-timestamp(){ date +"%Y%m%d-%H%M%S"; }
-
-# ----------------------------------------------------
-# BACKUP modo C (local + global)
-# ----------------------------------------------------
-backup_local(){
-    local file="$1"
-    [ -f "$file" ] || return 0
-    cp -a "$file" "${file}.adm-bak-$(timestamp)"
+die() {
+    log_error "$@"
+    exit 1
 }
 
-backup_global(){
+_trim() {
+    local s="$*"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+_timestamp() {
+    date +"%Y%m%d-%H%M%S"
+}
+
+# -----------------------------
+# Backup de arquivos
+# -----------------------------
+backup_local() {
+    local file="$1"
+    local ts; ts="$(_timestamp)"
+    [ -e "$file" ] || return 0
+    cp -a "$file" "${file}.adm-bak-$ts" 2>/dev/null || true
+}
+
+backup_global() {
     local pkg="$1"
     local file="$2"
-    [ -f "$file" ] || return 0
+    local ts; ts="$(_timestamp)"
+    local dst="$ADM_BACKUP/$pkg/$ts"
+
+    mkdir -p "$dst" 2>/dev/null || true
+    [ -e "$file" ] || return 0
+
     local rel="${file#/}"
-    local dst="$ADM_BACKUP/$pkg/$(timestamp)/$rel"
-    mkdir -p "$(dirname "$dst")"
-    cp -a "$file" "$dst"
+    mkdir -p "$dst/$(dirname "$rel")" 2>/dev/null || true
+    cp -a "$file" "$dst/$rel" 2>/dev/null || true
 }
 
-backup_conflict(){
+install_backup() {
     local pkg="$1"
     local file="$2"
     backup_local "$file"
     backup_global "$pkg" "$file"
 }
 
-# ----------------------------------------------------
-# hooks
-# ----------------------------------------------------
-find_repo_dir(){
-    local name="$1"
-    find "$ADM_REPO" -type f -path "*/$name/metafile" -printf '%h\n' 2>/dev/null | head -n1
-}
-
-run_hooks_pre(){
-    local name="$1"
-    local d
-    d=$(find_repo_dir "$name")
-    [ -z "$d" ] && return 0
-    [ -x "$d/hooks/pre_install" ] && "$d/hooks/pre_install" "$name" || true
-}
-
-run_hooks_post(){
-    local name="$1"
-    local d
-    d=$(find_repo_dir "$name")
-    [ -z "$d" ] && return 0
-    [ -x "$d/hooks/post_install" ] && "$d/hooks/post_install" "$name" || true
-}
-
-# ----------------------------------------------------
-# validação de metafile
-# ----------------------------------------------------
-validate_meta(){
-    [ -z "$MF_NAME" ] && die "metafile: MF_NAME vazio"
-    [ -z "$MF_VERSION" ] && die "metafile: MF_VERSION vazio"
-    [ -z "$MF_SOURCES" ] && die "metafile: MF_SOURCES vazio"
-    return 0
-}
-
-# ----------------------------------------------------
-# resolução de tipo de arquivo
-# ----------------------------------------------------
-file_type(){
-    case "$1" in
+# -----------------------------
+# Tipo de arquivo (.pkg/.deb/.rpm)
+# -----------------------------
+detect_pkg_file_type() {
+    local f="$1"
+    case "$f" in
         *.pkg) echo "adm" ;;
         *.deb) echo "deb" ;;
         *.rpm) echo "rpm" ;;
-        *) echo "unknown" ;;
+        *)     echo "unknown" ;;
     esac
 }
 
-# ----------------------------------------------------
-# remoção de versões antigas (single-version)
-# ----------------------------------------------------
-remove_old_versions(){
+# -----------------------------
+# Localizar metafile no repo
+# -----------------------------
+load_metafile_for() {
     local name="$1"
-    adm_db_init
+    local meta
+
+    meta=$(find "$ADM_REPO" -type f -path "*/$name/metafile" 2>/dev/null | head -n1)
+    [ -z "$meta" ] && return 1
+
+    if ! adm_meta_load "$meta"; then
+        return 1
+    fi
+
+    # valida, se a função existir
+    if declare -F adm_meta_validate >/dev/null 2>&1; then
+        adm_meta_validate || return 1
+    fi
+    return 0
+}
+
+# compat: alguns trechos antigos esperavam load_metafile
+load_metafile() {
+    load_metafile_for "$1"
+}
+
+# -----------------------------
+# Hooks pre/post_install
+# -----------------------------
+_find_pkg_dir_in_repo() {
+    local name="$1"
+    find "$ADM_REPO" -type f -path "*/$name/metafile" 2>/dev/null | head -n1 | xargs -r dirname
+}
+
+run_hooks_pre() {
+    local name="$1"
+    local dir
+    dir="$(_find_pkg_dir_in_repo "$name")"
+    [ -z "$dir" ] && return 0
+
+    if [ -x "$dir/hooks/pre_install" ]; then
+        log_info "Executando pre_install hook para $name"
+        "$dir/hooks/pre_install" "$name" || die "Falha no pre_install hook de $name"
+    fi
+}
+
+run_hooks_post() {
+    local name="$1"
+    local dir
+    dir="$(_find_pkg_dir_in_repo "$name")"
+    [ -z "$dir" ] && return 0
+
+    if [ -x "$dir/hooks/post_install" ]; then
+        log_info "Executando post_install hook para $name"
+        "$dir/hooks/post_install" "$name" || die "Falha no post_install hook de $name"
+    fi
+}
+
+# -----------------------------
+# Remover versões antigas (modo single-version)
+# -----------------------------
+remove_old_versions() {
+    local name="$1"
+
+    if ! declare -F adm_db_init >/dev/null 2>&1; then
+        log_warn "db.sh não suporta adm_db_init; não removendo versões antigas de $name"
+        return 0
+    fi
+
+    adm_db_init || return 0
+
+    if ! declare -F adm_db_list_installed >/dev/null 2>&1; then
+        log_warn "adm_db_list_installed não encontrado; não removendo versões antigas de $name"
+        return 0
+    fi
+
+    if ! declare -F adm_db_unregister >/dev/null 2>&1; then
+        log_warn "adm_db_unregister não encontrado; não removendo versões antigas de $name"
+        return 0
+    fi
+
     local line
-    while read -r line; do
+    adm_db_list_installed 2>/dev/null | grep "^$name " || true | while read -r line; do
         [ -z "$line" ] && continue
-        local pkg
-        pkg=$(echo "$line" | awk '{print $1}')
-        adm_db_unregister "$pkg"
-    done <<< "$(adm_db_list_installed | grep "^$name ")"
+        # formato esperado: name version category ...
+        local pkg ver
+        pkg="$(echo "$line" | awk '{print $1"-"$2}')"
+        ver="$(echo "$line" | awk '{print $2}')"
+        log_info "Removendo registro de versão antiga de $name: $ver"
+        adm_db_unregister "$pkg" 2>/dev/null || true
+    done
 }
 
-# ----------------------------------------------------
-# instalação de arquivo de pacote
-# ----------------------------------------------------
-install_pkg_file_secure(){
-    local file="$1"
-    local tmp
-    tmp=$(mktemp -d)
-    _pkg_tar_extract_to_dir "$file" "$tmp" || die "Falha ao extrair $file"
+# -----------------------------
+# Instalação .pkg com backup de conflitos
+# -----------------------------
+install_pkg_file_secure() {
+    local pkgfile="$1"
 
-    _pkg_read_manifest_file "$tmp" || die
-    local name="$PKG_MAN_NAME"
+    if [ -z "$pkgfile" ]; then
+        die "install_pkg_file_secure: arquivo .pkg não informado"
+    fi
+    if [ ! -f "$pkgfile" ]; then
+        die "install_pkg_file_secure: arquivo não encontrado: $pkgfile"
+    fi
 
-    local list="$tmp/CONTROL/files"
-    [ -f "$list" ] || die "Lista de arquivos ausente em pkg"
+    if ! declare -F _pkg_ensure_db >/dev/null 2>&1; then
+        die "package.sh não parece carregado (_pkg_ensure_db ausente)"
+    fi
 
-    while IFS= read -r rel; do
-        [ -z "$rel" ] && continue
-        local dst="/$rel"
-        if [ -e "$dst" ]; then
-            backup_conflict "$name" "$dst"
+    _pkg_ensure_db || die "Falha em _pkg_ensure_db"
+    _pkg_check_tar_zstd || die "Falha em _pkg_check_tar_zstd"
+    adm_db_init || die "Falha em adm_db_init"
+
+    local stage
+    stage="$(mktemp -d "$ADM_ROOT/build/.pkginst.XXXXXX" 2>/dev/null)" || die "Não foi possível criar diretório temporário para instalação"
+
+    # Extrair .pkg inteiro para stage
+    if ! _pkg_tar_extract_to_dir "$pkgfile" "$stage"; then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao extrair pacote $pkgfile"
+    fi
+
+    # Ler manifest
+    if ! _pkg_read_manifest_file "$stage"; then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao ler manifest do pacote $pkgfile"
+    fi
+
+    # Ajustar arch se vazio
+    if [ -z "$PKG_MAN_ARCH" ]; then
+        PKG_MAN_ARCH="$(_pkg_detect_arch)"
+    fi
+
+    # Ler lista de arquivos
+    local files_file="$stage/CONTROL/files"
+    if [ ! -f "$files_file" ]; then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Lista de arquivos não encontrada em $files_file"
+    fi
+
+    local files_rel
+    files_rel="$(cat "$files_file" 2>/dev/null || true)"
+
+    # Backup de conflitos (modo C: local + global) ANTES de extrair
+    local f full
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        full="/$f"
+        if [ -e "$full" ]; then
+            install_backup "$PKG_MAN_NAME" "$full"
         fi
-    done < "$list"
+    done <<< "$files_rel"
 
-    (cd "$tmp" && tar -cf - . --exclude=CONTROL) | tar -C / -xf - || die "Falha ao instalar arquivos"
+    # Extrair arquivos para /
+    (
+        cd "$stage" || exit 1
+        tar -cf - . --exclude CONTROL 2>/dev/null
+    ) | tar -C / -xf - 2>/dev/null || {
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao extrair dados do pacote $pkgfile para /"
+    }
 
+    # Montar lista de arquivos com / inicial para DB
     local files_db=""
-    while IFS= read -r rel; do
-        files_db="${files_db}/$rel"$'\n'
-    done < "$list"
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        files_db="${files_db}/$f"$'\n'
+    done <<< "$files_rel"
 
-    adm_db_init
-    adm_db_register_install \
-        "$PKG_MAN_NAME" "$PKG_MAN_VERSION" "$PKG_MAN_CATEGORY" \
-        "$PKG_MAN_LIBC" "$PKG_MAN_INIT" "$PKG_MAN_PROFILE" "$PKG_MAN_TARGET" \
-        "$PKG_MAN_REASON" "$PKG_MAN_RUN_DEPS" "$PKG_MAN_BUILD_DEPS" "$PKG_MAN_OPT_DEPS" \
+    # Registrar no DB
+    local name="$PKG_MAN_NAME"
+    local version="$PKG_MAN_VERSION"
+    local category="$PKG_MAN_CATEGORY"
+    local libc="$PKG_MAN_LIBC"
+    local init="$PKG_MAN_INIT"
+    local profile="$PKG_MAN_PROFILE"
+    local target="$PKG_MAN_TARGET"
+    local reason="$PKG_MAN_REASON"
+    [ -z "$reason" ] && reason="manual"
+
+    if ! adm_db_register_install \
+        "$name" "$version" "$category" "$libc" "$init" "$profile" "$target" "$reason" \
+        "$PKG_MAN_RUN_DEPS" "$PKG_MAN_BUILD_DEPS" "$PKG_MAN_OPT_DEPS" \
         "$files_db"
+    then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao registrar pacote '$name' no DB"
+    fi
 
-    rm -rf "$tmp"
-}
-
-# ----------------------------------------------------
-# resolver dependência binária
-# ----------------------------------------------------
-bin_pkg_available(){
-    local dep="$1"
-    find "$ADM_PKG_CACHE/$dep" -type f -name "$dep-*.pkg" 2>/dev/null | head -n1
-}
-
-resolve_bin_dep(){
-    local dep="$1"
-    local f
-    f=$(bin_pkg_available "$dep")
-    [ -z "$f" ] && return 1
-    install_pkg_file_secure "$f"
+    log_info "Pacote instalado (com backup) e registrado: $name-$version (release=$PKG_MAN_RELEASE arch=$PKG_MAN_ARCH)"
+    rm -rf "$stage" 2>/dev/null || true
     return 0
 }
-
-# ----------------------------------------------------
-# fallback fonte
-# ----------------------------------------------------
-resolve_dep_source(){
-    local dep="$1"
-    load_metafile "$dep" || die "metafile não encontrado para $dep"
-    validate_meta
-
-    adm_profile_apply_current
-
-    adm_source_prepare_from_meta || die
-    local dest="$ADM_BUILD/${dep}-${MF_VERSION}/dest"
-    rm -rf "$dest"
-    mkdir -p "$dest"
-
-    adm_build_core_from_meta "$dest" || die
-
-    ADM_PKG_BUILD_ONLY=1 adm_pkg_from_destdir "$dest" > /tmp/dep.pkg || die
-    install_pkg_file_secure "$(cat /tmp/dep.pkg)"
+# -----------------------------
+# Cache binário / deps binários
+# -----------------------------
+is_bin_pkg_available() {
+    local name="$1"
+    local p="$ADM_PKG_CACHE/$name"
+    [ -d "$p" ] || return 1
+    find "$p" -type f -name "$name-*.pkg" 2>/dev/null | head -n1
 }
 
-# ----------------------------------------------------
-# resolução total de dependências
-# ----------------------------------------------------
-resolve_all_deps(){
-    local deps="$MF_RUN_DEPS $MF_BUILD_DEPS"
-    [ $INSTALL_NO_DEPS -eq 1 ] && return 0
+resolve_bin_dep() {
+    local dep="$1"
+    local file
 
+    file="$(is_bin_pkg_available "$dep")"
+    if [ -n "$file" ]; then
+        log_info "Instalando dependência binária $dep a partir de $file"
+        install_pkg_file_secure "$file"
+        return 0
+    fi
+
+    return 1
+}
+
+# -----------------------------
+# Resolver dependência via source (build_core novo)
+# -----------------------------
+resolve_dep_source() {
+    local dep="$1"
+
+    log_info "Resolvendo dependência via source: $dep"
+
+    load_metafile_for "$dep" || die "Metafile não encontrado para dependência $dep"
+
+    # build_core faz:
+    #   - adm_source_prepare_from_meta
+    #   - chroot seguro
+    #   - DESTDIR em /usr/src/adm/build/<name>-<version>/dest
+    if ! adm_build_core_from_meta; then
+        die "Build da dependência $dep falhou"
+    fi
+
+    local dest="$ADM_BUILD/${MF_NAME}-${MF_VERSION}/dest"
+    if [ ! -d "$dest" ]; then
+        die "DESTDIR inexistente após build de $dep: $dest"
+    fi
+
+    # pacote binário só (build-only) e depois instalar com backup seguro
+    local tmp_out
+    tmp_out="$(mktemp "$ADM_ROOT/build/.dep_pkg_out.XXXXXX" 2>/dev/null)" || die "Não foi possível criar tmp para pacote de $dep"
+    ADM_PKG_BUILD_ONLY=1 adm_pkg_from_destdir "$dest" >"$tmp_out" || {
+        rm -f "$tmp_out" 2>/dev/null || true
+        die "Falha ao empacotar dependência $dep a partir de $dest"
+    }
+
+    local pkgfile
+    pkgfile="$(cat "$tmp_out" 2>/dev/null || true)"
+    rm -f "$tmp_out" 2>/dev/null || true
+
+    [ -z "$pkgfile" ] && die "adm_pkg_from_destdir não retornou caminho de pacote para $dep"
+    [ -f "$pkgfile" ] || die "Pacote da dependência $dep não encontrado: $pkgfile"
+
+    install_pkg_file_secure "$pkgfile"
+}
+
+# -----------------------------
+# Resolver todas as dependências (run+build)
+# -----------------------------
+resolve_all_deps_full() {
+    local name="$1"
+    [ "$INSTALL_NO_DEPS" -eq 1 ] && return 0
+
+    # MF_* já carregados para o pacote corrente
+    local deps
+    deps="$(_trim "${MF_RUN_DEPS:-} ${MF_BUILD_DEPS:-}")"
+
+    [ -z "$deps" ] && return 0
+
+    local d
     for d in $deps; do
+        [ -z "$d" ] && continue
+        log_info "Resolvendo dependência: $d"
         resolve_bin_dep "$d" || resolve_dep_source "$d"
     done
 }
 
-# ----------------------------------------------------
-# instalação binária com fallback fonte
-# ----------------------------------------------------
-install_bin_fallback(){
+# -----------------------------
+# Fluxo binário com fallback p/ source
+# -----------------------------
+install_bin_fallback() {
     local name="$1"
+
     local f
-    f=$(bin_pkg_available "$name") || return 1
-    [ -z "$f" ] && return 1
+    f="$(is_bin_pkg_available "$name")"
+    if [ -z "$f" ]; then
+        log_info "Nenhum pacote binário encontrado para $name; caindo para build de source"
+        return 1
+    fi
 
-    local tmp
-    tmp=$(mktemp -d)
-    _pkg_tar_extract_to_dir "$f" "$tmp" || die
-    _pkg_read_manifest_file "$tmp" || die
+    log_info "Encontrado pacote binário para $name: $f"
 
-    for d in $PKG_MAN_RUN_DEPS; do
+    # Ler manifest para descobrir deps do pacote binário
+    local stage m tmp
+    stage="$(mktemp -d "$ADM_ROOT/build/.bininspect.XXXXXX" 2>/dev/null)" || die "Falha ao criar stage para inspeção de binário"
+    m="$stage/meta"
+
+    mkdir -p "$m" 2>/dev/null || true
+    if ! _pkg_tar_extract_to_dir "$f" "$m"; then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao extrair binário para inspeção: $f"
+    fi
+
+    if ! _pkg_read_manifest_file "$m"; then
+        rm -rf "$stage" 2>/dev/null || true
+        die "Falha ao ler manifest do binário: $f"
+    fi
+
+    local all_deps
+    all_deps="$(_trim "$PKG_MAN_RUN_DEPS")"
+
+    local d
+    for d in $all_deps; do
+        [ -z "$d" ] && continue
         resolve_bin_dep "$d" || resolve_dep_source "$d"
     done
 
+    rm -rf "$stage" 2>/dev/null || true
+
     install_pkg_file_secure "$f"
-    rm -rf "$tmp"
     return 0
 }
 
-# ----------------------------------------------------
-# fetch + extract + build + package + install
-# ----------------------------------------------------
-install_source(){
+# -----------------------------
+# Fluxo de instalação via source (build_core novo)
+# -----------------------------
+install_source_full() {
     local name="$1"
 
-    load_metafile "$name" || die "Metafile não encontrado"
-    validate_meta
-    adm_profile_apply_current
+    log_info "Instalando $name a partir de source (build_core)"
 
-    resolve_all_deps
+    load_metafile_for "$name" || die "Metafile de $name não encontrado"
 
-    adm_source_prepare_from_meta || die
+    # Resolver deps com base no MF_* do pacote
+    resolve_all_deps_full "$name"
 
-    local dest="$ADM_BUILD/${name}-${MF_VERSION}/dest"
-    rm -rf "$dest"
-    mkdir -p "$dest"
+    # Build extremo via chroot seguro
+    if ! adm_build_core_from_meta; then
+        die "Build de $name falhou via build_core"
+    fi
 
-    adm_build_core_from_meta "$dest" || die
-    ADM_PKG_BUILD_ONLY=1 adm_pkg_from_destdir "$dest" > /tmp/src.pkg || die
+    local dest="$ADM_BUILD/${MF_NAME}-${MF_VERSION}/dest"
+    if [ ! -d "$dest" ]; then
+        die "DESTDIR inexistente após build de $name: $dest"
+    fi
 
-    install_pkg_file_secure "$(cat /tmp/src.pkg)"
+    # Criar pacote com build-only e depois instalar com backup
+    local tmp_out pkgfile
+    tmp_out="$(mktemp "$ADM_ROOT/build/.pkgsrc_out.XXXXXX" 2>/dev/null)" || die "Não foi possível criar tmp para pacote de $name"
+    ADM_PKG_BUILD_ONLY=1 adm_pkg_from_destdir "$dest" >"$tmp_out" || {
+        rm -f "$tmp_out" 2>/dev/null || true
+        die "Falha ao empacotar $name a partir de $dest"
+    }
+
+    pkgfile="$(cat "$tmp_out" 2>/dev/null || true)"
+    rm -f "$tmp_out" 2>/dev/null || true
+
+    [ -z "$pkgfile" ] && die "adm_pkg_from_destdir não retornou caminho de pacote para $name"
+    [ -f "$pkgfile" ] || die "Pacote de $name não encontrado: $pkgfile"
+
+    install_pkg_file_secure "$pkgfile"
 }
-# ----------------------------------------------------
-# instalar arquivo explicitamente
-# ----------------------------------------------------
-install_from_file(){
-    local f="$1"
+
+# -----------------------------
+# Instalar arquivo direto (.pkg/.deb/.rpm)
+# -----------------------------
+install_file_auto() {
+    local file="$1"
     local t
-    t=$(file_type "$f")
+
+    t="$(detect_pkg_file_type "$file")"
     case "$t" in
-        adm) install_pkg_file_secure "$f" ;;
-        deb) adm_pkg_repack_deb "$f" ;;
-        rpm) adm_pkg_repack_rpm "$f" ;;
-        *) die "Tipo de arquivo não suportado: $f" ;;
+        adm)
+            log_info "Instalando pacote ADM direto: $file"
+            install_pkg_file_secure "$file"
+            ;;
+        deb)
+            log_info "Reempacotando .deb via package.sh: $file"
+            # adm_pkg_repack_deb já instala e registra usando adm_pkg_install_file
+            adm_pkg_repack_deb "$file" || die "Falha ao reempacotar .deb: $file"
+            ;;
+        rpm)
+            log_info "Reempacotando .rpm via package.sh: $file"
+            adm_pkg_repack_rpm "$file" || die "Falha ao reempacotar .rpm: $file"
+            ;;
+        *)
+            die "Arquivo desconhecido: $file (esperado .pkg, .deb ou .rpm)"
+            ;;
     esac
 }
 
-# ----------------------------------------------------
-# fluxo principal
-# ----------------------------------------------------
-install_main(){
+# -----------------------------
+# Fluxo principal por nome de pacote
+# -----------------------------
+install_main() {
     local name="$1"
+
+    if [ "$UI_OK" -eq 1 ]; then
+        adm_ui_set_context "install" "$name"
+        adm_ui_set_log_file "install" "$name" || true
+    fi
 
     run_hooks_pre "$name"
     remove_old_versions "$name"
 
-    if [ $INSTALL_BIN -eq 1 ]; then
-        install_bin_fallback "$name" || install_source "$name"
+    if [ "$INSTALL_BIN" -eq 1 ]; then
+        install_bin_fallback "$name" && {
+            run_hooks_post "$name"
+            return 0
+        }
+        log_warn "Pacote binário de $name indisponível ou falhou; construindo a partir do source"
+        install_source_full "$name"
         run_hooks_post "$name"
         return 0
     fi
 
-    install_source "$name"
+    install_source_full "$name"
     run_hooks_post "$name"
 }
 
-# ----------------------------------------------------
-# CLI
-# ----------------------------------------------------
-help(){
-cat <<EOF
-Uso:
-  adm install <pacote> [--no-deps]
-  adm install-bin <pacote> [--no-deps]
+install_from_pkg_or_source() {
+    local arg="$1"
+
+    if [ -f "$arg" ]; then
+        install_file_auto "$arg"
+        exit 0
+    fi
+
+    INSTALL_NAME="$arg"
+    install_main "$INSTALL_NAME"
+}
+
+# -----------------------------
+# Ajuda / CLI
+# -----------------------------
+print_help() {
+    cat <<EOF
+Usage:
+  adm install <pkg> [--no-deps]
+  adm install-bin <pkg> [--no-deps]
   adm install <arquivo.pkg|.deb|.rpm>
+
+Opções:
+  --no-deps   Não resolver dependências (apenas o pacote alvo)
+
 EOF
 }
 
@@ -311,29 +589,25 @@ case "$CMD" in
         for a in "$@"; do
             case "$a" in
                 --no-deps) INSTALL_NO_DEPS=1 ;;
-                *) INSTALL_TARGET="$a" ;;
+                *)         INSTALL_FILE="$a" ;;
             esac
         done
-        [ -z "$INSTALL_TARGET" ] && help && exit 1
-        if [ -f "$INSTALL_TARGET" ]; then
-            install_from_file "$INSTALL_TARGET"
-        else
-            install_main "$INSTALL_TARGET"
-        fi
+        [ -z "$INSTALL_FILE" ] && print_help && exit 1
+        install_from_pkg_or_source "$INSTALL_FILE"
         ;;
     install-bin)
         INSTALL_BIN=1
         for a in "$@"; do
             case "$a" in
                 --no-deps) INSTALL_NO_DEPS=1 ;;
-                *) INSTALL_TARGET="$a" ;;
+                *)         INSTALL_FILE="$a" ;;
             esac
         done
-        [ -z "$INSTALL_TARGET" ] && help && exit 1
-        install_main "$INSTALL_TARGET"
+        [ -z "$INSTALL_FILE" ] && print_help && exit 1
+        install_from_pkg_or_source "$INSTALL_FILE"
         ;;
     *)
-        help
+        print_help
         exit 1
         ;;
 esac
