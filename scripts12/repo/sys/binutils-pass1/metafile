@@ -1,0 +1,12 @@
+name=binutils-pass1
+version=2.45
+category=sys
+run_deps=
+build_deps=gmp,mpfr,mpc,isl
+opt_deps=
+num_builds=0
+description=Binutils Pass 1 (cross-compiler)
+homepage=https://www.gnu.org/software/binutils/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.45.tar.xz
