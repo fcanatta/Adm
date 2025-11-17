@@ -1,0 +1,10 @@
+name=ncurses-temp
+version=6.5-20250809
+category=libs
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=Ncurses - temporary tool
+homepage=https://invisible-island.net/ncurses/
+sha256sums=
+sources=https://invisible-mirror.net/archives/ncurses/ncurses-6.5-20250809.tgz
