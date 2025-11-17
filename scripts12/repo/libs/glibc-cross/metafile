@@ -1,0 +1,12 @@
+name=glibc-cross
+version=2.42
+category=libs
+run_deps=linux-api-headers
+build_deps=gcc-pass1,binutils-pass1,linux-api-headers
+opt_deps=
+num_builds=0
+description=Glibc para o target (cross)
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM <root@localhost>
+sha256sums=
+sources=https://ftp.gnu.org/gnu/glibc/glibc-2.42.tar.xz
