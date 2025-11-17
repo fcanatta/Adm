@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[linux-api-headers] Gerando Kernel API Headers..."
+make headers
+
+echo "[linux-api-headers] Limpando arquivos indevidos..."
+find usr/include -name '.*' -delete || true
