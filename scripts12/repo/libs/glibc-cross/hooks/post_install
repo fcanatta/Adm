@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[glibc-cross] Pós-instalação..."
+
+# ld-linux symlinks
+case "$ADM_TC_TARGET" in
+    x86_64*) 
+        ln -sf ld-linux-x86-64.so.2 "$DESTDIR/lib/ld-linux-x86-64.so.2"
+        ;;
+    aarch64*)
+        ln -sf ld-linux-aarch64.so.1 "$DESTDIR/lib/ld-linux-aarch64.so.1"
+        ;;
+    riscv64*)
+        ln -sf ld-linux-riscv64-lp64d.so.1 "$DESTDIR/lib/ld-linux-riscv64-lp64d.so.1"
+        ;;
+esac
+
+# Criar arquivos essenciais
+mkdir -p "$DESTDIR/etc" || true
+
+if [ ! -f "$DESTDIR/etc/nsswitch.conf" ]; then
+cat > "$DESTDIR/etc/nsswitch.conf" <<EOF
+passwd: files
+group: files
+shadow: files
+hosts: files dns
+networks: files
+protocols: files
+services: files
+ethers: files
+rpc: files
+EOF
+fi
