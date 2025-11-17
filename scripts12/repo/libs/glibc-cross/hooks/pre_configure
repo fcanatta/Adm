@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -e
+
+echo "[glibc-cross] Preparando configure (cross)..."
+
+cd build
+
+../configure \
+    --prefix=/usr \
+    --host="$ADM_TC_TARGET" \
+    --build="$(../scripts/config.guess)" \
+    --with-headers="$ADM_TC_ROOTFS/usr/include" \
+    --enable-kernel=3.2 \
+    --disable-werror
