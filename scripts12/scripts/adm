@@ -1,0 +1,619 @@
+#!/usr/bin/env bash
+# adm – CLI principal do sistema ADM
+#
+# Responsável por:
+#   - chamar todos os scripts: install, remove, update, clean, initramfs, runtime, db, etc.
+#   - procurar programas (search)
+#   - mostrar informações de programas (info)
+#   - ver logs (logs)
+#   - criar metafiles (meta-create)
+#   - menu TUI bonito/colorido
+#   - logo colorida quando chamado sem argumentos
+#
+# Caminhos principais:
+ADM_ROOT="/usr/src/adm"
+ADM_SCRIPTS="$ADM_ROOT/scripts"
+ADM_REPO="$ADM_ROOT/repo"
+ADM_LOG_DIR="$ADM_ROOT/logs"
+
+# --------------------------------
+# Cores / estilo (fallback se sem TTY)
+# --------------------------------
+if [ -t 1 ]; then
+    ADM_COLOR_RESET="\033[0m"
+    ADM_COLOR_BOLD="\033[1m"
+    ADM_COLOR_DIM="\033[2m"
+    ADM_COLOR_RED="\033[31m"
+    ADM_COLOR_GREEN="\033[32m"
+    ADM_COLOR_YELLOW="\033[33m"
+    ADM_COLOR_BLUE="\033[34m"
+    ADM_COLOR_MAGENTA="\033[35m"
+    ADM_COLOR_CYAN="\033[36m"
+    ADM_COLOR_WHITE="\033[37m"
+else
+    ADM_COLOR_RESET=""
+    ADM_COLOR_BOLD=""
+    ADM_COLOR_DIM=""
+    ADM_COLOR_RED=""
+    ADM_COLOR_GREEN=""
+    ADM_COLOR_YELLOW=""
+    ADM_COLOR_BLUE=""
+    ADM_COLOR_MAGENTA=""
+    ADM_COLOR_CYAN=""
+    ADM_COLOR_WHITE=""
+fi
+
+ADM_HAVE_UI=0
+
+# tenta carregar ui.sh (opcional)
+if [ -r "$ADM_SCRIPTS/ui.sh" ]; then
+    # shellcheck source=/usr/src/adm/scripts/ui.sh
+    . "$ADM_SCRIPTS/ui.sh" && ADM_HAVE_UI=1
+fi
+
+# --------------------------------
+# Logs padrão do adm
+# --------------------------------
+adm_log_info() {
+    local msg="$*"
+    if [ "$ADM_HAVE_UI" -eq 1 ] && declare -F adm_ui_log_info >/dev/null 2>&1; then
+        adm_ui_log_info "$msg"
+    else
+        printf "%b[ADM][INFO]%b %s\n" "$ADM_COLOR_CYAN" "$ADM_COLOR_RESET" "$msg" >&2
+    fi
+}
+
+adm_log_warn() {
+    local msg="$*"
+    if [ "$ADM_HAVE_UI" -eq 1 ] && declare -F adm_ui_log_warn >/dev/null 2>&1; then
+        adm_ui_log_warn "$msg"
+    else
+        printf "%b[ADM][WARN]%b %s\n" "$ADM_COLOR_YELLOW" "$ADM_COLOR_RESET" "$msg" >&2
+    fi
+}
+
+adm_log_error() {
+    local msg="$*"
+    if [ "$ADM_HAVE_UI" -eq 1 ] && declare -F adm_ui_log_error >/dev/null 2>&1; then
+        adm_ui_log_error "$msg"
+    else
+        printf "%b[ADM][ERROR]%b %s\n" "$ADM_COLOR_RED" "$ADM_COLOR_RESET" "$msg" >&2
+    fi
+}
+
+adm_die() {
+    adm_log_error "$*"
+    exit 1
+}
+
+adm_trim() {
+    local s="$*"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# --------------------------------
+# Carregar libs opcionais (db/metafile)
+# --------------------------------
+adm_ensure_db_lib() {
+    if declare -F adm_db_init >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local f="$ADM_SCRIPTS/db.sh"
+    if [ -r "$f" ]; then
+        # shellcheck source=/usr/src/adm/scripts/db.sh
+        . "$f" || adm_die "Falha ao carregar db.sh"
+        return 0
+    fi
+
+    adm_log_warn "db.sh não encontrado; alguns comandos (info, search por DB) ficarão limitados."
+    return 1
+}
+
+adm_ensure_metafile_lib() {
+    if declare -F adm_meta_load >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local f="$ADM_SCRIPTS/metafile.sh"
+    if [ -r "$f" ]; then
+        # shellcheck source=/usr/src/adm/scripts/metafile.sh
+        . "$f" || adm_die "Falha ao carregar metafile.sh"
+        return 0
+    fi
+
+    adm_log_warn "metafile.sh não encontrado; alguns comandos (meta-create, info) ficarão limitados."
+    return 1
+}
+
+# --------------------------------
+# Helpers para chamar outros scripts
+# --------------------------------
+adm_require_script() {
+    local f="$ADM_SCRIPTS/$1"
+    [ -x "$f" ] || [ -r "$f" ] || adm_die "Script requerido não encontrado ou não executável: $f"
+    printf '%s\n' "$f"
+}
+
+adm_run_install() {
+    local sub="$1"; shift || true
+    local f
+    f="$(adm_require_script install.sh)"
+    "$f" "$sub" "$@"
+}
+
+adm_run_remove() {
+    local f
+    f="$(adm_require_script remove.sh)"
+    "$f" remove "$@"
+}
+
+adm_run_update() {
+    local f
+    f="$(adm_require_script update.sh)"
+    "$f" update "$@"
+}
+
+adm_run_clean() {
+    local f
+    f="$(adm_require_script clean.sh)"
+    "$f" "$@"
+}
+
+adm_run_initramfs() {
+    local f
+    f="$(adm_require_script initramfs.sh)"
+    "$f" "$@"
+}
+
+adm_run_runtime() {
+    local f
+    f="$(adm_require_script runtime.sh)"
+    "$f" "$@"
+}
+
+adm_run_db() {
+    local f
+    f="$(adm_require_script db.sh)"
+    "$f" "$@"
+}
+
+# --------------------------------
+# Localizar metafile de um pacote
+# --------------------------------
+ADM_KNOWN_CATEGORIES=(apps libs sys dev x11 wayland base)
+
+adm_find_metafile_for_pkg() {
+    local pkg="$1"
+    local cat f
+    for cat in "${ADM_KNOWN_CATEGORIES[@]}"; do
+        f="$ADM_REPO/$cat/$pkg/metafile"
+        if [ -f "$f" ]; then
+            printf '%s\n' "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# --------------------------------
+# Comando: search (procura por programa)
+# --------------------------------
+adm_cmd_search() {
+    local pattern="$1"
+    [ -z "$pattern" ] && adm_die "Uso: adm search <padrão>"
+
+    [ -d "$ADM_REPO" ] || adm_die "ADM_REPO não existe: $ADM_REPO"
+
+    adm_log_info "Procurando por programas com padrão: '$pattern'"
+
+    local d cat name
+    local found=0
+
+    # procura por diretórios categoria/programa
+    while IFS= read -r d; do
+        cat="$(basename "$(dirname "$d")")"
+        name="$(basename "$d")"
+
+        if printf '%s\n' "$name" | grep -qi -- "$pattern"; then
+            printf "%b[REPO]%b %s/%s\n" \
+                "$ADM_COLOR_GREEN" "$ADM_COLOR_RESET" \
+                "$cat" "$name"
+            found=1
+            continue
+        fi
+
+        # se metafile.sh carregado, podemos ver descrições
+        if adm_ensure_metafile_lib && [ -f "$d/metafile" ]; then
+            if adm_meta_load "$d/metafile" >/dev/null 2>&1; then
+                local desc="${MF_DESCRIPTION:-}"
+                if printf '%s\n' "$desc" | grep -qi -- "$pattern"; then
+                    printf "%b[REPO]%b %s/%s - %s\n" \
+                        "$ADM_COLOR_GREEN" "$ADM_COLOR_RESET" \
+                        "$cat" "$name" "$desc"
+                    found=1
+                fi
+            fi
+        fi
+    done <<EOF_REPO
+$(find "$ADM_REPO" -mindepth 2 -maxdepth 2 -type d 2>/dev/null || true)
+EOF_REPO
+
+    # procura também em pacotes instalados no DB
+    if adm_ensure_db_lib; then
+        adm_db_init || true
+        if declare -F adm_db_list_installed >/dev/null 2>&1; then
+            local line
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                local pkg ver
+                pkg="$(printf '%s\n' "$line" | awk '{print $1}')"
+                ver="$(printf '%s\n' "$line" | awk '{print $2}')"
+                if printf '%s\n' "$pkg" | grep -qi -- "$pattern"; then
+                    printf "%b[INST]%b %s %s\n" \
+                        "$ADM_COLOR_CYAN" "$ADM_COLOR_RESET" \
+                        "$pkg" "$ver"
+                    found=1
+                fi
+            done <<EOF_DB
+$(adm_db_list_installed 2>/dev/null || true)
+EOF_DB
+        fi
+    fi
+
+    [ "$found" -eq 1 ] || adm_log_warn "Nenhum programa encontrado para '$pattern'"
+}
+
+# --------------------------------
+# Comando: info (informações sobre programa)
+# --------------------------------
+adm_cmd_info() {
+    local pkg="$1"
+    [ -z "$pkg" ] && adm_die "Uso: adm info <pacote>"
+
+    printf "%b== INFO: %s ==%b\n" "$ADM_COLOR_BOLD" "$pkg" "$ADM_COLOR_RESET"
+
+    # Info do DB (instalado)
+    if adm_ensure_db_lib; then
+        adm_db_init || true
+        if adm_db_read_meta "$pkg" >/dev/null 2>&1; then
+            printf "%b[DB]%b instalado\n" "$ADM_COLOR_GREEN" "$ADM_COLOR_RESET"
+            printf "  name      : %s\n" "${DB_META_NAME:-$pkg}"
+            printf "  version   : %s\n" "${DB_META_VERSION:-?}"
+            printf "  category  : %s\n" "${DB_META_CATEGORY:-?}"
+            printf "  libc      : %s\n" "${DB_META_LIBC:-?}"
+            printf "  init      : %s\n" "${DB_META_INIT:-?}"
+            printf "  profile   : %s\n" "${DB_META_PROFILE:-?}"
+            printf "  reason    : %s\n" "${DB_META_REASON:-?}"
+            printf "  run_deps  : %s\n" "${DB_META_RUN_DEPS:-}"
+            printf "  build_deps: %s\n" "${DB_META_BUILD_DEPS:-}"
+            printf "  opt_deps  : %s\n" "${DB_META_OPT_DEPS:-}"
+        else
+            printf "%b[DB]%b não instalado ou não encontrado no DB\n" "$ADM_COLOR_YELLOW" "$ADM_COLOR_RESET"
+        fi
+    else
+        printf "%b[DB]%b db.sh indisponível\n" "$ADM_COLOR_YELLOW" "$ADM_COLOR_RESET"
+    fi
+
+    # Info do metafile (repo)
+    if adm_ensure_metafile_lib; then
+        local mf
+        mf="$(adm_find_metafile_for_pkg "$pkg" || echo "")"
+        if [ -n "$mf" ] && adm_meta_load "$mf" >/dev/null 2>&1; then
+            printf "%b[REPO]%b metafile: %s\n" "$ADM_COLOR_GREEN" "$ADM_COLOR_RESET" "$mf"
+            printf "  name      : %s\n" "${MF_NAME:-$pkg}"
+            printf "  version   : %s\n" "${MF_VERSION:-?}"
+            printf "  category  : %s\n" "${MF_CATEGORY:-?}"
+            printf "  run_deps  : %s\n" "${MF_RUN_DEPS:-}"
+            printf "  build_deps: %s\n" "${MF_BUILD_DEPS:-}"
+            printf "  opt_deps  : %s\n" "${MF_OPT_DEPS:-}"
+            printf "  num_builds: %s\n" "${MF_NUM_BUILDS:-0}"
+            printf "  homepage  : %s\n" "${MF_HOMEPAGE:-}"
+            printf "  maintainer: %s\n" "${MF_MAINTAINER:-}"
+        else
+            printf "%b[REPO]%b metafile não encontrado para %s\n" "$ADM_COLOR_YELLOW" "$ADM_COLOR_RESET" "$pkg"
+        fi
+    else
+        printf "%b[REPO]%b metafile.sh indisponível\n" "$ADM_COLOR_YELLOW" "$ADM_COLOR_RESET"
+    fi
+}
+
+# --------------------------------
+# Comando: logs (listar / ver logs)
+# --------------------------------
+adm_cmd_logs() {
+    local sub="${1:-list}"
+    shift || true
+
+    if [ ! -d "$ADM_LOG_DIR" ]; then
+        adm_die "Diretório de logs não existe: $ADM_LOG_DIR"
+    fi
+
+    case "$sub" in
+        list)
+            adm_log_info "Listando logs em $ADM_LOG_DIR"
+            find "$ADM_LOG_DIR" -type f -maxdepth 3 2>/dev/null | sed "s|$ADM_LOG_DIR/||" | sort
+            ;;
+        show)
+            local pattern="${1:-}"
+            [ -z "$pattern" ] && adm_die "Uso: adm logs show <arquivo-ou-padrão>"
+            adm_log_info "Mostrando logs que combinam com: $pattern"
+            local file
+            while IFS= read -r file; do
+                printf "%b== %s ==%b\n" "$ADM_COLOR_BOLD" "$file" "$ADM_COLOR_RESET"
+                sed -n '1,200p' "$file"
+                printf "\n"
+            done <<EOF_LOGS
+$(find "$ADM_LOG_DIR" -type f -name "*$pattern*" 2>/dev/null)
+EOF_LOGS
+            ;;
+        *)
+            adm_die "Subcomando de logs desconhecido: $sub (use: list|show)"
+            ;;
+    esac
+}
+
+# --------------------------------
+# Comando: meta-create (criar esqueleto de metafile)
+# Exemplo: adm -meta-create base gcc
+#          adm meta-create base gcc
+# --------------------------------
+adm_cmd_meta_create() {
+    local cat="$1"
+    local name="$2"
+
+    [ -z "$cat" ] && adm_die "Uso: adm meta-create <categoria> <nome>"
+    [ -z "$name" ] && adm_die "Uso: adm meta-create <categoria> <nome>"
+
+    local dir="$ADM_REPO/$cat/$name"
+    local mf="$dir/metafile"
+
+    if [ -f "$mf" ]; then
+        adm_log_warn "metafile já existe: $mf"
+        printf "%s\n" "$mf"
+        return 0
+    fi
+
+    adm_log_info "Criando categoria '$cat' e pacote '$name' em $dir"
+    mkdir -p "$dir" || adm_die "Falha ao criar diretório $dir"
+
+    cat >"$mf" <<EOF
+name=$name
+version=0.1.0
+category=$cat
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Descrição curta de $name
+homepage=https://example.com/$name
+maintainer=Seu Nome <you@example.com>
+sha256sums=
+sources=
+EOF
+
+    adm_log_info "metafile criado: $mf"
+
+    # Se metafile.sh estiver disponível, já valida
+    if adm_ensure_metafile_lib; then
+        if adm_meta_load "$mf" && adm_meta_validate; then
+            adm_log_info "metafile validado com sucesso"
+        else
+            adm_log_warn "metafile criado mas não passou na validação do metafile.sh"
+        fi
+    fi
+
+    printf "%s\n" "$mf"
+}
+# --------------------------------
+# Logo bonita + help
+# --------------------------------
+adm_show_logo() {
+    cat <<EOF
+${ADM_COLOR_CYAN}${ADM_COLOR_BOLD}
+      █████╗ ██████╗ ███╗   ███╗
+     ██╔══██╗██╔══██╗████╗ ████║
+     ███████║██████╔╝██╔████╔██║
+     ██╔══██║██╔══██╗██║╚██╔╝██║
+     ██║  ██║██║  ██║██║ ╚═╝ ██║
+     ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝
+${ADM_COLOR_RESET}${ADM_COLOR_MAGENTA}${ADM_COLOR_BOLD}
+        ADM – Advanced Distribution Manager
+${ADM_COLOR_RESET}
+EOF
+}
+
+adm_print_help() {
+    cat <<EOF
+${ADM_COLOR_BOLD}Uso:${ADM_COLOR_RESET}
+  adm <comando> [opções] [argumentos]
+
+${ADM_COLOR_BOLD}Comandos principais:${ADM_COLOR_RESET}
+  install <pacote> [--no-deps]        Instala pacote (fonte/bin com fallback)
+  install-bin <pacote> [--no-deps]    Instala somente binário se disponível
+  remove <pacote> [opções]            Remove pacote (usa remove.sh)
+  update [opções] <pacote>            Atualiza metafile (upstream) + deps
+  clean <subcomando> [opções]         Limpeza do sistema ADM (clean.sh)
+  initramfs <subcomando> [...]        Gerenciar initramfs (initramfs.sh)
+  runtime <subcomando> [...]          Ações de runtime (serviços, ldconfig)
+  search <padrão>                     Procurar programa no repo/DB
+  info <pacote>                       Mostrar informações de um programa
+  logs list                           Listar todos os logs do ADM
+  logs show <padrão>                  Mostrar logs que combinam com o padrão
+  meta-create <cat> <nome>            Criar esqueleto de metafile
+  -meta-create <cat> <nome>           Alias para meta-create
+  db [...]                            Passar comandos direto para db.sh
+
+${ADM_COLOR_BOLD}Menu TUI:${ADM_COLOR_RESET}
+  adm menu                           Abre o menu interativo em modo texto
+
+${ADM_COLOR_BOLD}Exemplos:${ADM_COLOR_RESET}
+  adm install bash
+  adm install-bin gcc --no-deps
+  adm remove bash
+  adm search ssl
+  adm info zlib
+  adm logs list
+  adm logs show bash
+  adm meta-create base gcc
+EOF
+}
+
+# --------------------------------
+# Menu TUI simples
+# --------------------------------
+adm_menu() {
+    while true; do
+        clear 2>/dev/null || printf "\n"
+        adm_show_logo
+        printf "%bMENU ADM%b\n" "$ADM_COLOR_BOLD" "$ADM_COLOR_RESET"
+        cat <<EOF
+  1) Instalar pacote (fonte/bin)
+  2) Instalar pacote binário
+  3) Remover pacote
+  4) Procurar programa
+  5) Informações sobre programa
+  6) Ver logs
+  7) Atualizar metafile (upstream)
+  8) Limpeza (clean)
+  9) Rebuild de todos initramfs
+  0) Sair
+EOF
+        printf "\nEscolha uma opção: "
+        read -r opt || exit 0
+        case "$opt" in
+            1)
+                printf "Nome do pacote para instalar: "
+                read -r pkg || continue
+                [ -z "$pkg" ] && continue
+                adm_run_install install "$pkg"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            2)
+                printf "Nome do pacote para instalar (binário): "
+                read -r pkg || continue
+                [ -z "$pkg" ] && continue
+                adm_run_install install-bin "$pkg"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            3)
+                printf "Nome do pacote para remover: "
+                read -r pkg || continue
+                [ -z "$pkg" ] && continue
+                adm_run_remove "$pkg"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            4)
+                printf "Padrão de busca: "
+                read -r pat || continue
+                [ -z "$pat" ] && continue
+                adm_cmd_search "$pat"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            5)
+                printf "Nome do pacote: "
+                read -r pkg || continue
+                [ -z "$pkg" ] && continue
+                adm_cmd_info "$pkg"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            6)
+                printf "Opções de logs:\n  1) Listar\n  2) Mostrar por padrão\nEscolha: "
+                read -r lopt || continue
+                case "$lopt" in
+                    1) adm_cmd_logs list ;;
+                    2)
+                        printf "Padrão de arquivo de log: "
+                        read -r lp || continue
+                        adm_cmd_logs show "$lp"
+                        ;;
+                    *) ;;
+                esac
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            7)
+                printf "Nome do pacote para atualizar (metafile): "
+                read -r pkg || continue
+                [ -z "$pkg" ] && continue
+                adm_run_update "$pkg"
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            8)
+                printf "Limpeza rápida (1) ou profunda (2)? "
+                read -r copt || continue
+                case "$copt" in
+                    1) adm_run_clean all-quick ;;
+                    2) adm_run_clean all-deep ;;
+                    *) ;;
+                esac
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            9)
+                adm_run_initramfs rebuild-all
+                read -r -p "Pressione ENTER para continuar..." _ ;;
+            0)
+                exit 0
+                ;;
+            *)
+                ;;
+        esac
+    done
+}
+
+# --------------------------------
+# Dispatcher principal
+# --------------------------------
+adm_main() {
+    local cmd="$1"
+    shift || true
+
+    case "$cmd" in
+        ""|help|-h|--help)
+            adm_show_logo
+            adm_print_help
+            ;;
+        menu)
+            adm_menu
+            ;;
+        install)
+            adm_run_install install "$@"
+            ;;
+        install-bin)
+            adm_run_install install-bin "$@"
+            ;;
+        remove)
+            adm_run_remove "$@"
+            ;;
+        update)
+            adm_run_update "$@"
+            ;;
+        clean)
+            adm_run_clean "$@"
+            ;;
+        initramfs)
+            adm_run_initramfs "$@"
+            ;;
+        runtime)
+            adm_run_runtime "$@"
+            ;;
+        search)
+            adm_cmd_search "$@"
+            ;;
+        info)
+            adm_cmd_info "$@"
+            ;;
+        logs)
+            adm_cmd_logs "$@"
+            ;;
+        meta-create|-meta-create)
+            adm_cmd_meta_create "$@"
+            ;;
+        db)
+            adm_run_db "$@"
+            ;;
+        *)
+            adm_log_error "Comando desconhecido: $cmd"
+            adm_print_help
+            exit 1
+            ;;
+    esac
+}
+
+# --------------------------------
+# Entrada
+# --------------------------------
+adm_main "$@"
