@@ -1,0 +1,738 @@
+#!/usr/bin/env bash
+# adm-cross-toolchain - construção inteligente de cross toolchains
+# Caminho sugerido: /usr/src/adm/scripts/adm-cross-toolchain
+
+set -o pipefail
+set -o nounset
+
+# =========[ CONFIGURAÇÃO BÁSICA ]===========================================
+
+ADM_ROOT=${ADM_ROOT:-/usr/src/adm}
+ADM_REPO="${ADM_ROOT}/repo"
+ADM_WORK_BASE="${ADM_ROOT}/work/cross-toolchain"
+ADM_CACHE="${ADM_ROOT}/cache"
+ADM_LOG_DIR="${ADM_ROOT}/logs"
+ADM_PROFILE_CMD="${ADM_ROOT}/scripts/adm-profile"
+
+DRY_RUN=0
+QUIET=0
+
+# =========[ CORES E FORMATAÇÃO ]===========================================
+
+C_RESET='\033[0m'
+C_BOLD='\033[1m'
+
+C_MAGENTA='\033[35;1m'   # cabeçalhos
+C_GREEN='\033[32;1m'     # OK
+C_YELLOW='\033[33;1m'    # avisos
+C_RED='\033[31;1m'       # erros
+C_CYAN='\033[36;1m'      # info
+
+CHECK_MARK="✔"
+
+supports_color() {
+    [[ -t 1 ]] && tput colors &>/dev/null
+}
+
+colorize() {
+    local color="$1"; shift
+    if supports_color; then
+        printf "%b%s%b" "${color}" "$*" "${C_RESET}"
+    else
+        printf "%s" "$*"
+    fi
+}
+
+timestamp() {
+    date +%H:%M:%S
+}
+
+log_header() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %b%s%b\n" \
+        "$(colorize "${C_MAGENTA}" "==")" \
+        "$(timestamp)" \
+        "$(colorize "${C_MAGENTA}" "[CROSS]")" \
+        " ${msg}" \
+        "${C_RESET}"
+}
+
+log_arrow() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_GREEN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_info() {
+    local msg="$*"
+    (( QUIET )) && return 0
+    printf "%b %s %s\n" \
+        "$(colorize "${C_CYAN}" "->")" \
+        "$(timestamp)" \
+        "${msg}"
+}
+
+log_warn() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_YELLOW}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+log_error() {
+    local msg="$*"
+    printf "%b %s %s\n" \
+        "$(colorize "${C_RED}" "!!")" \
+        "$(timestamp)" \
+        "${msg}" 1>&2
+}
+
+die() {
+    log_error "$*"
+    exit 1
+}
+
+# =========[ SPINNER ]======================================================
+
+_spinner_pid=""
+
+spinner_start() {
+    local msg="$1"
+    (( QUIET )) && return 0
+
+    local spin='|/-\'
+    local i=0
+
+    printf "%s %s %s " "$(colorize "${C_GREEN}" "->")" "$(timestamp)" "${msg}"
+
+    (
+        tput civis 2>/dev/null || true
+        while :; do
+            printf "\r%s %s %s %b%c%b" \
+                "$(colorize "${C_GREEN}" "->")" \
+                "$(timestamp)" \
+                "${msg}" \
+                "${C_CYAN}" "${spin:i++%${#spin}:1}" "${C_RESET}"
+            sleep 0.1
+        done
+    ) &
+    _spinner_pid=$!
+    disown "$_spinner_pid" 2>/dev/null || true
+}
+
+spinner_stop() {
+    local status=${1:-0}
+    (( QUIET )) && return "${status}"
+
+    if [[ -n "${_spinner_pid}" ]] && kill -0 "${_spinner_pid}" &>/dev/null; then
+        kill "${_spinner_pid}" &>/dev/null || true
+        wait "${_spinner_pid}" 2>/dev/null || true
+    fi
+    _spinner_pid=""
+
+    tput cnorm 2>/dev/null || true
+
+    local symbol msg_color
+    if (( status == 0 )); then
+        symbol="${CHECK_MARK}"
+        msg_color="${C_GREEN}"
+    else
+        symbol="✖"
+        msg_color="${C_RED}"
+    fi
+
+    printf "\r%b %s %b%s%b\n" \
+        "$(colorize "${msg_color}" "->")" \
+        "$(timestamp)" \
+        "${msg_color}" "[${symbol}]" "${C_RESET}"
+
+    return "${status}"
+}
+
+run_with_spinner() {
+    local msg="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] ${msg}: $*"
+        return 0
+    fi
+
+    spinner_start "${msg}"
+    "$@" &
+    local pid=$!
+
+    wait "${pid}"
+    local status=$?
+
+    spinner_stop "${status}"
+    return "${status}"
+}
+
+# =========[ DIRETÓRIOS, ARQUIVOS, LOGS ]===================================
+
+ensure_dirs() {
+    local d
+    for d in "${ADM_WORK_BASE}" "${ADM_CACHE}" "${ADM_LOG_DIR}"; do
+        if [[ ! -d "${d}" ]]; then
+            if (( DRY_RUN )); then
+                log_arrow "[dry-run] mkdir -p ${d}"
+            else
+                mkdir -p "${d}" || die "Falha ao criar diretório ${d}"
+            fi
+        fi
+    done
+}
+
+log_file_for() {
+    local target="$1" libc="$2"
+    printf "%s/cross-%s-%s.%s.log" "${ADM_LOG_DIR}" "${target}" "${libc}" "$(date +%Y%m%d-%H%M%S)"
+}
+
+# =========[ METAFILES ]====================================================
+
+# Retorna caminho do metafile de um pacote de cross-toolchain
+# Ex.: repo/cross-toolchain/binutils/metafile
+meta_file() {
+    local pkg="$1"
+    printf "%s/cross-toolchain/%s/metafile" "${ADM_REPO}" "${pkg}"
+}
+
+meta_get() {
+    local pkg="$1" key="$2"
+    local file
+    file="$(meta_file "${pkg}")"
+    [[ -f "${file}" ]] || die "Metafile de '${pkg}' não encontrado em ${file}"
+    local line
+    line="$(grep -E "^${key}=" "${file}" 2>/dev/null || true)"
+    [[ -z "${line}" ]] && return 1
+    echo "${line#${key}=}"
+}
+
+meta_version() {
+    meta_get "$1" "version"
+}
+
+meta_sources() {
+    meta_get "$1" "sources"
+}
+
+meta_tarball_name() {
+    local pkg="$1"
+    local ver
+    ver="$(meta_version "${pkg}")" || return 1
+    # binutils -> binutils-<ver>.tar.*  (heurística)
+    echo "${pkg}-${ver}"
+}
+
+# =========[ TARGET E LIBC ]================================================
+
+detect_host_triplet() {
+    if command -v gcc &>/dev/null; then
+        gcc -dumpmachine 2>/dev/null && return 0
+    elif command -v clang &>/dev/null; then
+        clang -dumpmachine 2>/dev/null && return 0
+    fi
+    echo "x86_64-unknown-linux-gnu"
+}
+
+guess_target_triplet() {
+    local arch="$1" libc="$2"
+    case "${arch}" in
+        x86_64)  arch_trip="x86_64" ;;
+        i686)    arch_trip="i686" ;;
+        aarch64) arch_trip="aarch64" ;;
+        armv7)   arch_trip="armv7-unknown" ;;
+        riscv64) arch_trip="riscv64" ;;
+        *)
+            log_warn "Arquitetura desconhecida '${arch}', usando '${arch}-unknown'."
+            arch_trip="${arch}"
+            ;;
+    esac
+
+    case "${libc}" in
+        glibc) echo "${arch_trip}-unknown-linux-gnu" ;;
+        musl)  echo "${arch_trip}-unknown-linux-musl" ;;
+        *)
+            log_warn "Libc desconhecida '${libc}', assumindo glibc."
+            echo "${arch_trip}-unknown-linux-gnu"
+            ;;
+    esac
+}
+
+# =========[ PROFILE ]======================================================
+
+apply_profile_env() {
+    local profile="$1"
+
+    [[ -x "${ADM_PROFILE_CMD}" ]] || die "adm-profile não encontrado em ${ADM_PROFILE_CMD}"
+
+    # shellcheck disable=SC2046
+    eval "$("${ADM_PROFILE_CMD}" apply "${profile}")" || die "Falha ao aplicar profile '${profile}'"
+}
+
+# =========[ FETCH / CACHE ]================================================
+
+ensure_source_cached() {
+    local pkg="$1"
+    local tarbase
+    tarbase="$(meta_tarball_name "${pkg}")" || die "Não foi possível determinar tarball de ${pkg}"
+
+    local cached
+    cached="$(ls "${ADM_CACHE}/${tarbase}".tar.* 2>/dev/null | head -n1 || true)"
+
+    if [[ -n "${cached}" ]]; then
+        log_arrow "Source de ${pkg} já no cache: $(basename "${cached}")"
+        echo "${cached}"
+        return 0
+    fi
+
+    # Se não tiver no cache, tenta acionar adm-fetch (se existir) ou falha
+    local sources
+    sources="$(meta_sources "${pkg}")" || die "Metafile de ${pkg} não contém 'sources='"
+
+    if [[ -x "${ADM_ROOT}/scripts/adm-fetch" ]]; then
+        if (( DRY_RUN )); then
+            log_info "[dry-run] chamaria adm-fetch para ${pkg} (${sources})"
+            # não há arquivo real, mas retorna nome esperado
+            echo "${ADM_CACHE}/${tarbase}.tar.xz"
+            return 0
+        fi
+
+        log_header "Baixando sources de ${pkg}"
+        "${ADM_ROOT}/scripts/adm-fetch" fetch "${pkg}" || die "Falha no download de ${pkg}"
+
+        cached="$(ls "${ADM_CACHE}/${tarbase}".tar.* 2>/dev/null | head -n1 || true)"
+        [[ -n "${cached}" ]] || die "Download de ${pkg} aparentemente concluiu, mas arquivo não encontrado no cache."
+        echo "${cached}"
+        return 0
+    else
+        die "Source de ${pkg} não está no cache e adm-fetch não foi encontrado."
+    fi
+}
+
+extract_to_builddir() {
+    local pkg="$1" tarball="$2" builddir="$3"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] mkdir -p ${builddir} && tar -xf ${tarball} -C ${builddir}"
+        return 0
+    fi
+
+    mkdir -p "${builddir}" || die "Falha ao criar ${builddir}"
+    tar -xf "${tarball}" -C "${builddir}" || die "Falha ao extrair ${tarball} em ${builddir}"
+}
+
+# =========[ EXECUTAR COM LOG ]=============================================
+
+run_logged() {
+    local log_file="$1"; shift
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] $*"
+        return 0
+    fi
+
+    # stderr e stdout para log e para a tela
+    {
+        echo "=== $(date) ==="
+        echo "CMD: $*"
+    } >> "${log_file}"
+
+    "$@" >> "${log_file}" 2>&1
+}
+# =========[ ESTÁGIOS DE BUILD ]============================================
+
+build_linux_headers() {
+    local target="$1" libc="$2" prefix="$3" sysroot="$4" log_file="$5"
+
+    local pkg="linux-headers"
+    local tarball builddir srcdir
+
+    log_header "Instalando Linux headers para ${target} (${libc})"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    builddir="${ADM_WORK_BASE}/${target}-${libc}/linux-headers-build"
+    srcdir="${builddir}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Extraindo linux-headers" extract_to_builddir "${pkg}" "${tarball}" "${builddir}" || die "Falha ao extrair linux-headers."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] linux headers para sysroot=${sysroot}"
+        return 0
+    fi
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${srcdir}'
+        make mrproper || true
+        make headers
+        find usr/include -name '.*' -delete
+        rm -f usr/include/Makefile
+        mkdir -p '${sysroot}/usr'
+        cp -rv usr/include '${sysroot}/usr/'
+    " || die "Falha ao instalar linux-headers."
+}
+
+build_binutils() {
+    local target="$1" libc="$2" prefix="$3" sysroot="$4" log_file="$5"
+
+    local pkg="binutils"
+    local tarball buildroot srcdir builddir
+
+    log_header "Construindo binutils para ${target} (${libc})"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    buildroot="${ADM_WORK_BASE}/${target}-${libc}"
+    builddir="${buildroot}/binutils-build"
+    srcdir="${buildroot}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Extraindo binutils" extract_to_builddir "${pkg}" "${tarball}" "${buildroot}" || die "Falha ao extrair binutils."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] binutils --target=${target} --prefix=${prefix}"
+        return 0
+    fi
+
+    rm -rf "${builddir}"
+    mkdir -p "${builddir}"
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${builddir}'
+        '${srcdir}/configure' \
+            --target='${target}' \
+            --prefix='${prefix}' \
+            --with-sysroot='${sysroot}' \
+            --disable-nls \
+            --disable-werror
+        make
+        make install
+    " || die "Falha ao construir binutils."
+}
+
+build_gcc_pass1() {
+    local target="$1" libc="$2" prefix="$3" sysroot="$4" log_file="$5"
+
+    local pkg="gcc"
+    local tarball buildroot srcdir builddir
+
+    log_header "Construindo GCC (pass1) para ${target} (${libc})"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    buildroot="${ADM_WORK_BASE}/${target}-${libc}"
+    builddir="${buildroot}/gcc-pass1-build"
+    srcdir="${buildroot}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Extraindo gcc (pass1)" extract_to_builddir "${pkg}" "${tarball}" "${buildroot}" || die "Falha ao extrair gcc."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] gcc pass1 --target=${target} --prefix=${prefix}"
+        return 0
+    fi
+
+    rm -rf "${builddir}"
+    mkdir -p "${builddir}"
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${srcdir}'
+        # Baixar/ligar GMP/MPFR/MPC se necessário fica a cargo do administrador/metafiles.
+        cd '${builddir}'
+        '${srcdir}/configure' \
+            --target='${target}' \
+            --prefix='${prefix}' \
+            --with-sysroot='${sysroot}' \
+            --with-newlib \
+            --without-headers \
+            --enable-languages=c \
+            --disable-nls \
+            --disable-shared \
+            --disable-multilib \
+            --disable-decimal-float \
+            --disable-threads \
+            --disable-libatomic \
+            --disable-libgomp \
+            --disable-libmpx \
+            --disable-libquadmath \
+            --disable-libssp \
+            --disable-libstdcxx \
+            --disable-libvtv
+        make all-gcc
+        make install-gcc
+    " || die "Falha ao construir gcc pass1."
+}
+
+build_glibc() {
+    local target="$1" prefix="$2" sysroot="$3" log_file="$4"
+
+    local pkg="glibc"
+    local tarball buildroot srcdir builddir
+
+    log_header "Construindo glibc para ${target}"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    buildroot="${ADM_WORK_BASE}/${target}-glibc"
+    builddir="${buildroot}/glibc-build"
+    srcdir="${buildroot}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Extraindo glibc" extract_to_builddir "${pkg}" "${tarball}" "${buildroot}" || die "Falha ao extrair glibc."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] glibc --host=${target} --prefix=/usr"
+        return 0
+    fi
+
+    rm -rf "${builddir}"
+    mkdir -p "${builddir}"
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${builddir}'
+        BUILD_CC='$(detect_host_triplet | sed 's/.*/gcc/;q')' \
+        CC='${target}-gcc' \
+        AR='${target}-ar' \
+        RANLIB='${target}-ranlib' \
+        '${srcdir}/configure' \
+            --host='${target}' \
+            --build='$(detect_host_triplet)' \
+            --prefix=/usr \
+            --with-headers='${sysroot}/usr/include' \
+            --enable-kernel=3.2 \
+            --enable-obsolete-rpc || exit 1
+        make
+        make DESTDIR='${sysroot}' install
+    " || die "Falha ao construir glibc."
+}
+
+build_musl() {
+    local target="$1" prefix="$2" sysroot="$3" log_file="$4"
+
+    local pkg="musl"
+    local tarball buildroot srcdir
+
+    log_header "Construindo musl para ${target}"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    buildroot="${ADM_WORK_BASE}/${target}-musl"
+    srcdir="${buildroot}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Extraindo musl" extract_to_builddir "${pkg}" "${tarball}" "${buildroot}" || die "Falha ao extrair musl."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] musl --target=${target} --prefix=/usr"
+        return 0
+    fi
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${srcdir}'
+        CC='${target}-gcc' \
+        ./configure \
+            --prefix=/usr \
+            --host='${target}' \
+            --syslibdir=/lib
+        make
+        make DESTDIR='${sysroot}' install
+    " || die "Falha ao construir musl."
+}
+
+build_gcc_final() {
+    local target="$1" libc="$2" prefix="$3" sysroot="$4" log_file="$5"
+
+    local pkg="gcc"
+    local tarball buildroot srcdir builddir
+
+    log_header "Construindo GCC final para ${target} (${libc})"
+
+    tarball="$(ensure_source_cached "${pkg}")"
+    buildroot="${ADM_WORK_BASE}/${target}-${libc}"
+    builddir="${buildroot}/gcc-final-build"
+    srcdir="${buildroot}/$(meta_tarball_name "${pkg}")"
+
+    run_with_spinner "Preparando gcc final" extract_to_builddir "${pkg}" "${tarball}" "${buildroot}" || die "Falha ao extrair gcc para fase final."
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] gcc final --target=${target} --prefix=${prefix}"
+        return 0
+    fi
+
+    rm -rf "${builddir}"
+    mkdir -p "${builddir}"
+
+    run_logged "${log_file}" bash -c "
+        set -e
+        cd '${builddir}'
+        '${srcdir}/configure' \
+            --target='${target}' \
+            --prefix='${prefix}' \
+            --with-sysroot='${sysroot}' \
+            --enable-languages=c,c++ \
+            --disable-multilib \
+            --disable-nls
+        make
+        make install
+    " || die "Falha ao construir gcc final."
+}
+
+build_full_toolchain() {
+    local arch="$1" libc="$2" profile="$3"
+
+    ensure_dirs
+
+    apply_profile_env "${profile}"
+
+    local target host prefix sysroot log_file
+    host="$(detect_host_triplet)"
+    target="$(guess_target_triplet "${arch}" "${libc}")"
+    prefix="${ADM_ROOT}/cross/${target}"
+    sysroot="${prefix}/${target}/sysroot"
+    log_file="$(log_file_for "${target}" "${libc}")"
+
+    log_header "Iniciando construção do cross-toolchain"
+    log_info "Host:   ${host}"
+    log_info "Target: ${target}"
+    log_info "Libc:   ${libc}"
+    log_info "Prefix: ${prefix}"
+    log_info "Sysroot:${sysroot}"
+    log_info "Profile:${profile}"
+    log_info "Log:    ${log_file}"
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] criaria diretórios prefix/sysroot"
+    else
+        mkdir -p "${prefix}" "${sysroot}" || die "Falha ao criar prefix/sysroot."
+    fi
+
+    # Pipeline principal
+    build_linux_headers "${target}" "${libc}" "${prefix}" "${sysroot}" "${log_file}"
+    build_binutils      "${target}" "${libc}" "${prefix}" "${sysroot}" "${log_file}"
+    build_gcc_pass1     "${target}" "${libc}" "${prefix}" "${sysroot}" "${log_file}"
+
+    case "${libc}" in
+        glibc)
+            build_glibc "${target}" "${prefix}" "${sysroot}" "${log_file}"
+            ;;
+        musl)
+            build_musl  "${target}" "${prefix}" "${sysroot}" "${log_file}"
+            ;;
+        *)
+            die "Libc inválida: ${libc}. Use glibc ou musl."
+            ;;
+    esac
+
+    build_gcc_final "${target}" "${libc}" "${prefix}" "${sysroot}" "${log_file}"
+
+    log_arrow "Cross-toolchain para ${target} (${libc}) construído com sucesso."
+    log_arrow "Binário principal: ${prefix}/bin/${target}-gcc (ajuste PATH conforme necessário)."
+}
+
+# =========[ COMANDOS ]=====================================================
+
+cmd_build() {
+    local arch="x86_64"
+    local libc="glibc"
+    local profile="normal"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --arch)
+                arch="$2"; shift 2 ;;
+            --libc)
+                libc="$2"; shift 2 ;;
+            --profile)
+                profile="$2"; shift 2 ;;
+            *)
+                die "Parâmetro desconhecido em build: $1"
+                ;;
+        esac
+    done
+
+    build_full_toolchain "${arch}" "${libc}" "${profile}"
+}
+
+cmd_detect-host() {
+    echo "$(detect_host_triplet)"
+}
+
+cmd_help() {
+    cat <<EOF
+Uso: adm-cross-toolchain [OPÇÕES] <comando> [args]
+
+OPÇÕES:
+  -n, --dry-run      Não executa, apenas mostra o que faria
+  -q, --quiet        Menos saída (apenas erros)
+  -h, --help         Mostra esta ajuda
+
+COMANDOS:
+  build [--arch ARQ] [--libc glibc|musl] [--profile NOME]
+      Constrói um cross-toolchain completo (binutils + gcc + libc + gcc final)
+      para o alvo especificado. Exemplo:
+
+        adm-cross-toolchain build --arch x86_64 --libc glibc --profile aggressive
+
+  detect-host
+      Mostra o triplo (triplet) do host detectado.
+
+  help
+      Esta ajuda.
+EOF
+}
+
+# =========[ PARSE GLOBAL ]=================================================
+
+parse_global_opts() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run)
+                DRY_RUN=1; shift ;;
+            -q|--quiet)
+                QUIET=1; shift ;;
+            -h|--help)
+                cmd_help; exit 0 ;;
+            --)
+                shift; break ;;
+            -*)
+                die "Opção desconhecida: $1" ;;
+            *)
+                break ;;
+        esac
+    done
+
+    echo "$#"
+}
+
+# =========[ MAIN ]=========================================================
+
+main() {
+    local argc
+    argc=$(parse_global_opts "$@")
+    local args=("$@")
+    local consumed=$(( ${#args[@]} - argc ))
+    args=("${args[@]:${consumed}}")
+
+    if [[ ${#args[@]} -lt 1 ]]; then
+        cmd_help
+        exit 1
+    fi
+
+    local cmd="${args[0]}"
+    shift || true
+
+    case "${cmd}" in
+        build)        cmd_build "$@" ;;
+        detect-host)  cmd_detect-host "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            die "Comando desconhecido: ${cmd}"
+            ;;
+    esac
+}
+
+trap 'spinner_stop 1 >/dev/null 2>&1 || true' INT TERM
+
+main "$@"
