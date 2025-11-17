@@ -1,0 +1,10 @@
+name=file-temp
+version=5.46
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=File utility - temporary tool
+homepage=https://www.darwinsys.com/file/
+sha256sums=
+sources=https://astron.com/pub/file/file-5.46.tar.gz
