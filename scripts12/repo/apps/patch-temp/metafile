@@ -1,0 +1,10 @@
+name=patch-temp
+version=2.8
+category=apps
+run_deps=glibc-cross
+build_deps=gcc-pass1,binutils-pass1,glibc-cross
+opt_deps=
+description=GNU patch - temporary tool
+homepage=https://www.gnu.org/software/patch/
+sha256sums=
+sources=https://ftp.gnu.org/gnu/patch/patch-2.8.tar.gz
