@@ -1,0 +1,13 @@
+name=python
+version=3.14.0
+category=dev
+run_deps=glibc,libffi,openssl,xz,zlib
+build_deps=glibc,gcc-pass2,libffi,openssl,xz,zlib
+opt_deps=sqlite,readline
+num_builds=0
+description=Python programming language (CPython)
+homepage=https://www.python.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tar.xz
