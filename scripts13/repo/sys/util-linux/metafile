@@ -1,9 +1,9 @@
 name=util-linux
 version=2.41.2
 category=sys
-run_deps=glibc,zlib,xz,openssl
-build_deps=glibc,gcc-pass2,zlib,xz,openssl
-opt_deps=ncurses,readline
+run_deps=glibc,zlib,xz,openssl,ncurses,readline
+build_deps=glibc,gcc-pass2,zlib,xz,openssl,ncurses,readline
+opt_deps=
 num_builds=0
 description=System utilities suite (mount, fsck, hwclock, more)
 homepage=https://github.com/util-linux/util-linux
