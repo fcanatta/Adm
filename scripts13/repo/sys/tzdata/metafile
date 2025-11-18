@@ -1,0 +1,13 @@
+name=tzdata
+version=2025b
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=IANA timezone database (tzdata)
+homepage=https://www.iana.org/time-zones
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.iana.org/tz/releases/tzdata2025b.tar.gz
