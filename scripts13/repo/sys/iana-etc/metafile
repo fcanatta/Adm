@@ -1,0 +1,13 @@
+name=iana-etc
+version=20251022
+category=sys
+run_deps=glibc
+build_deps=glibc,coreutils
+opt_deps=
+num_builds=0
+description=/etc/protocols e /etc/services gerados a partir dos registros da IANA
+homepage=https://github.com/Mic92/iana-etc
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://github.com/Mic92/iana-etc/releases/download/20251022/iana-etc-20251022.tar.gz
