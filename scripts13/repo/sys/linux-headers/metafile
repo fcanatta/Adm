@@ -1,0 +1,13 @@
+name=linux-headers
+version=6.17.8
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux 6.17.8 API headers for libc and toolchain
+homepage=https://www.kernel.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz,https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz
