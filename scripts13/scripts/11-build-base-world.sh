@@ -8,6 +8,10 @@
 #   --root <path>
 #   --profile <minimal|normal|aggressive>
 #   --libc <glibc|musl>
+# base: cross-toolchain + categorias sys,libs,dev
+# 11-build-base-world.sh base  --root /mnt/lfs --profile minimal --libc glibc
+# world: tudo (sys,libs,dev,x11,wayland,apps)
+# 11-build-base-world.sh world --root /mnt/lfs --profile normal  --libc glibc
 
 set -euo pipefail
 
