@@ -1,0 +1,13 @@
+name=gmp
+version=6.3.0
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=GNU Multiple Precision Arithmetic Library
+homepage=https://gmplib.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=956dc04e864001a9c22429f761f2c283
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/gmp-6.3.0.tar.xz,https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
