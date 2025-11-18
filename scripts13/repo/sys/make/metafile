@@ -1,0 +1,13 @@
+name=make
+version=4.4.1
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=GNU make build tool
+homepage=https://www.gnu.org/software/make/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/make-4.4.1.tar.gz
