@@ -1,0 +1,13 @@
+name=glibc
+version=2.42
+category=sys
+run_deps=linux-headers-6.17.8
+build_deps=linux-headers-6.17.8,binutils-pass1,gcc-pass1
+opt_deps=tzdata,locale-data
+num_builds=0
+description=GNU C Library (glibc) 2.42 para ambiente LFS
+homepage=https://www.gnu.org/software/libc/
+maintainer=ADM <root@localhost>
+sha256sums=d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f
+md5sum=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz,https://ftpmirror.gnu.org/libc/glibc-2.42.tar.xz,https://mirror.slackware.com/slackware/slackware-current/source/l/glibc/glibc-2.42.tar.xz,https://fossies.org/linux/misc/glibc-2.42.tar.xz
