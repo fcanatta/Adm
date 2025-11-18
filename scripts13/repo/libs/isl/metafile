@@ -1,0 +1,13 @@
+name=isl
+version=0.27
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Integer Set Library, usada pelo GCC (Graphite)
+homepage=http://libisl.sourceforge.io/
+maintainer=adm <root@localhost>
+sha256sums=6d8babb59e7b672e8cb7870e874f3f7b813b6e00e6af3f8b04f7579965643d5
+md5sum=11ee9d335b227ea2e8579c4ba6e56138
+sources=https://libisl.sourceforge.io/isl-0.27.tar.xz,https://downloads.sourceforge.net/project/libisl/isl-0.27.tar.xz
