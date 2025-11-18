@@ -1,0 +1,13 @@
+name=db
+version=5.3.28
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=Berkeley DB key/value database library
+homepage=https://www.oracle.com/database/technologies/related/berkeleydb.html
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://download.oracle.com/berkeley-db/db-5.3.28.tar.gz
