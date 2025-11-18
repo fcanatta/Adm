@@ -1,0 +1,13 @@
+name=diffutils
+version=3.12
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=GNU diff utilities
+homepage=https://www.gnu.org/software/diffutils/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/diffutils/diffutils-3.12.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/diffutils-3.12.tar.xz
