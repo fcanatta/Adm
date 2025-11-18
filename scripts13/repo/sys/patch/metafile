@@ -1,0 +1,13 @@
+name=patch
+version=2.8
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=GNU patch utility
+homepage=https://www.gnu.org/software/patch/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/patch-2.8.tar.xz
