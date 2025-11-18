@@ -420,11 +420,26 @@ adm_install_pipeline() {
     filelist="$(adm_install_extract_and_list_files "$pkgfile")" || return 1
 
     adm_install_register_package "$pkgfile" "$filelist" || {
-        rm -f "$filelist" || true
-        return 1
-    }
-
     rm -f "$filelist" || true
+    return 1
+}
+
+rm -f "$filelist" || true
+
+###############################################################################
+# >>> HOOK GLOBAL PÓS-INSTALAÇÃO (adicionar aqui) <<<
+###############################################################################
+if [[ -f "${ADM_SCRIPTS}/99-global-hooks.sh" ]]; then
+    # shellcheck disable=SC1091
+    . "${ADM_SCRIPTS}/99-global-hooks.sh"
+    if declare -F adm_global_post_install >/dev/null 2>&1; then
+        adm_info "Executando hook global pós-instalação para '${ADM_META_name}'."
+        adm_global_post_install "${ADM_META_name}" "$(adm_install_pkg_db_file "${ADM_META_name}")" || true
+    fi
+fi
+###############################################################################
+# >>> FIM DO HOOK GLOBAL <<< 
+###############################################################################
 
     adm_info "05-install-pkg concluído com sucesso para ${ADM_META_name}-${ADM_META_version}."
 }
