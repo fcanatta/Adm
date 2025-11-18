@@ -1,0 +1,13 @@
+name=openssl
+version=3.4.0
+category=libs
+run_deps=glibc,zlib
+build_deps=glibc,gcc-pass2,zlib
+opt_deps=
+num_builds=0
+description=TLS/SSL and crypto library (OpenSSL)
+homepage=https://www.openssl.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.openssl.org/source/openssl-3.4.0.tar.gz,https://www.openssl.org/source/old/3.4/openssl-3.4.0.tar.gz
