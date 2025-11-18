@@ -1,0 +1,13 @@
+name=lz4
+version=1.10.0
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=LZ4 extremely fast compression library
+homepage=https://github.com/lz4/lz4
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/lz4-1.10.0.tar.gz,https://github.com/lz4/lz4/releases/download/v1.10.0/lz4-1.10.0.tar.gz
