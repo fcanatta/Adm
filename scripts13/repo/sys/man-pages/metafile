@@ -1,0 +1,13 @@
+name=man-pages
+version=6.16
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2,coreutils,make
+opt_deps=
+num_builds=0
+description=Linux man-pages (documentação de chamadas de sistema e bibliotecas)
+homepage=https://www.kernel.org/doc/man-pages/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.kernel.org/pub/linux/docs/man-pages/man-pages-6.16.tar.xz
