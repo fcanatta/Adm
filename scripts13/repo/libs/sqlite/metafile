@@ -1,0 +1,13 @@
+name=sqlite
+version=3.51.0
+category=libs
+run_deps=glibc,zlib
+build_deps=glibc,gcc-pass2,zlib
+opt_deps=
+num_builds=0
+description=SQLite embedded SQL database engine
+homepage=https://www.sqlite.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.sqlite.org/2025/sqlite-autoconf-3510000.tar.gz
