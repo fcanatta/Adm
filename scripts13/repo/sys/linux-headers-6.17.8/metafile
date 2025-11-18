@@ -1,0 +1,13 @@
+name=linux-headers-6.17.8
+version=6.17.8
+category=sys
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Linux API Headers 6.17.8 para toolchains
+homepage=https://www.kernel.org/
+maintainer=ADM <root@localhost>
+sha256sums=
+md5sum=
+sources=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz,https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz,https://fossies.org/linux/misc/linux-6.17.8.tar.xz
