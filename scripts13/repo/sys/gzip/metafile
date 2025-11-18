@@ -1,0 +1,13 @@
+name=gzip
+version=1.14
+category=sys
+run_deps=glibc,zlib
+build_deps=glibc,gcc-pass2,zlib
+opt_deps=
+num_builds=0
+description=GNU gzip compression utility
+homepage=https://www.gnu.org/software/gzip/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/gzip/gzip-1.14.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/gzip-1.14.tar.xz
