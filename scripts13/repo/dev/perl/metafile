@@ -1,0 +1,13 @@
+name=perl
+version=5.42.0
+category=dev
+run_deps=glibc,db
+build_deps=glibc,gcc-pass2,db
+opt_deps=
+num_builds=0
+description=Perl 5 programming language interpreter and core modules
+homepage=https://www.perl.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://www.cpan.org/src/5.0/perl-5.42.0.tar.xz
