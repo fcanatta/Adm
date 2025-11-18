@@ -1,0 +1,13 @@
+name=ncurses
+version=6.5-20250809
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=Ncurses wide-character terminal handling library
+homepage=https://invisible-island.net/ncurses/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://invisible-island.net/archives/ncurses/current/ncurses-6.5-20250809.tgz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/ncurses-6.5-20250809.tar.xz
