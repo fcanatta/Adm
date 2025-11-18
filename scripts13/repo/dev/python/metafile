@@ -1,9 +1,9 @@
 name=python
 version=3.14.0
 category=dev
-run_deps=glibc,libffi,openssl,xz,zlib
-build_deps=glibc,gcc-pass2,libffi,openssl,xz,zlib
-opt_deps=sqlite,readline
+run_deps=glibc,libffi,openssl,xz,zlib,sqlite,readline
+build_deps=glibc,gcc-pass2,libffi,openssl,xz,zlib,sqlite,readline
+opt_deps=
 num_builds=0
 description=Python programming language (CPython)
 homepage=https://www.python.org/
