@@ -1,0 +1,13 @@
+name=zstd
+version=1.5.7
+category=libs
+run_deps=
+build_deps=
+opt_deps=
+num_builds=0
+description=Zstandard fast compression library
+homepage=https://facebook.github.io/zstd/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=780fc1896922b1bc52a4e90980cdda48
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/zstd-1.5.7.tar.gz,https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
