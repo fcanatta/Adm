@@ -1,0 +1,13 @@
+name=xz
+version=5.8.1
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=XZ Utils compression tools
+homepage=https://tukaani.org/xz/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://tukaani.org/xz/xz-5.8.1.tar.gz,https://sourceforge.net/projects/lzmautils/files/xz-5.8.1.tar.gz/download
