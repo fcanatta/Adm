@@ -1,0 +1,13 @@
+name=gettext
+version=0.26
+category=sys
+run_deps=glibc,libxml2
+build_deps=glibc,gcc-pass2,libxml2
+opt_deps=
+num_builds=0
+description=GNU gettext internationalization utilities
+homepage=https://www.gnu.org/software/gettext/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/gettext/gettext-0.26.tar.xz
