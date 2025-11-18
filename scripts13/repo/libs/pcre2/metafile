@@ -1,0 +1,13 @@
+name=pcre2
+version=10.45
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=PCRE2 Perl Compatible Regular Expressions library
+homepage=https://www.pcre.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.45/pcre2-10.45.tar.gz
