@@ -1,0 +1,13 @@
+name=libffi
+version=3.5.2
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=Portable foreign function interface library
+homepage=https://sourceware.org/libffi/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz
