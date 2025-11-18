@@ -1,0 +1,13 @@
+name=mpfr
+version=4.2.2
+category=libs
+run_deps=gmp
+build_deps=gmp
+opt_deps=
+num_builds=0
+description=GNU MPFR multiple-precision floating-point library
+homepage=https://www.mpfr.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=7c32c39b8b6e3ae85f25156228156061
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/mpfr-4.2.2.tar.xz,https://www.mpfr.org/mpfr-4.2.2/mpfr-4.2.2.tar.xz
