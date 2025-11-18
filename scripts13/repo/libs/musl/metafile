@@ -1,0 +1,13 @@
+name=musl
+version=1.2.5
+category=libs
+run_deps=linux-headers-6.17.8
+build_deps=linux-headers-6.17.8,binutils-pass1,gcc-pass1
+opt_deps=
+num_builds=0
+description=musl libc 1.2.5 com patch de segurança para CVE-2025-26519
+homepage=https://musl.libc.org/
+maintainer=ADM <root@localhost>
+sha256sums=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+md5sum=
+sources=https://musl.libc.org/releases/musl-1.2.5.tar.gz,https://fossies.org/linux/misc/musl-1.2.5.tar.gz,https://deb.debian.org/debian/pool/main/m/musl/musl_1.2.5.orig.tar.gz
