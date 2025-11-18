@@ -1,0 +1,13 @@
+name=gcc-pass2
+version=15.2.0
+category=sys
+run_deps=glibc,gmp,mpfr,mpc,isl
+build_deps=binutils-pass2,glibc,gmp,mpfr,mpc,isl,linux-headers
+opt_deps=
+num_builds=0
+description=GCC (toolchain final sobre glibc, pass 2)
+homepage=https://gcc.gnu.org/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=b861b092bf1af683c46a8aa2e689a6fd
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/gcc-15.2.0.tar.xz,https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
