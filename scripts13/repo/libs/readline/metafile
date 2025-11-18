@@ -1,0 +1,13 @@
+name=readline
+version=8.3
+category=libs
+run_deps=glibc,ncurses
+build_deps=glibc,gcc-pass2,ncurses
+opt_deps=
+num_builds=0
+description=GNU Readline line-editing library
+homepage=https://tiswww.case.edu/php/chet/readline/rltop.html
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/readline/readline-8.3.tar.gz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/readline-8.3.tar.gz
