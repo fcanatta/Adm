@@ -1,0 +1,13 @@
+name=bzip2
+version=1.0.8
+category=libs
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=Bzip2 compression library and utilities
+homepage=https://sourceware.org/bzip2/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/bzip2-1.0.8.tar.gz,https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz
