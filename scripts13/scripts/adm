@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+# adm - Frontend principal do sistema ADM
+# Comandos de alto nível:
+#   adm install <pkg>
+#   adm remove <pkg>
+#   adm upgrade <pkg>
+#   adm update <pkg>
+#   adm build <pkg>
+#   adm detect <pkg>
+#   adm info <pkg>
+#   adm search <termo>
+#   adm list
+#   adm files <pkg>
+#   adm cross [args...]
+#   adm clean [args...]
+#
+# Sem parâmetros: mostra log do adm + menu TUI simples/colorido.
+
+###############################################################################
+# 0. Bootstrap env/lib
+###############################################################################
+
+ADM_CLI_MODE=1
+
+if [[ -z "${ADM_ENV_LOADED:-}" ]]; then
+    if [[ -f /usr/src/adm/scripts/01-env.sh ]]; then
+        # shellcheck disable=SC1091
+        . /usr/src/adm/scripts/01-env.sh
+    else
+        echo "ERRO: 01-env.sh não encontrado em /usr/src/adm/scripts." >&2
+        exit 1
+    fi
+fi
+
+if [[ -z "${ADM_LIB_LOADED:-}" ]]; then
+    if [[ -f /usr/src/adm/scripts/02-lib.sh ]]; then
+        # shellcheck disable=SC1091
+        . /usr/src/adm/scripts/02-lib.sh
+    else
+        echo "ERRO: 02-lib.sh não encontrado em /usr/src/adm/scripts." >&2
+        exit 1
+    fi
+fi
+
+: "${ADM_SCRIPTS:=/usr/src/adm/scripts}"
+
+###############################################################################
+# 1. Helpers genéricos
+###############################################################################
+
+adm_front_color_title=$'\033[1;36m'
+adm_front_color_menu=$'\033[1;33m'
+adm_front_color_reset=$'\033[0m'
+
+adm_front_have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+adm_front_require_script() {
+    local script="$1"
+    if [[ ! -x "${ADM_SCRIPTS}/${script}" ]]; then
+        adm_error "Script obrigatório '${ADM_SCRIPTS}/${script}' não encontrado ou não executável."
+        return 1
+    fi
+}
+
+adm_front_tail_log() {
+    local log="${ADM_LOGS}/adm.log"
+    [[ -f "$log" ]] || return 0
+
+    echo
+    echo "${adm_front_color_title}=== Últimas linhas do log do adm (${log}) ===${adm_front_color_reset}"
+    tail -n 20 "$log" 2>/dev/null || true
+    echo
+}
+
+adm_front_print_header() {
+    clear 2>/dev/null || true
+    echo "${adm_front_color_title}==============================================${adm_front_color_reset}"
+    echo "${adm_front_color_title}              ADM - PACKAGE MANAGER           ${adm_front_color_reset}"
+    echo "${adm_front_color_title}==============================================${adm_front_color_reset}"
+    echo "Profile: ${ADM_PROFILE} | libc: ${ADM_LIBC} | root: ${ADM_INSTALL_ROOT:-/}"
+}
+
+###############################################################################
+# 2. Comandos de alto nível (install, remove, upgrade, etc.)
+###############################################################################
+
+adm_front_cmd_install() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm install <pacote>"; return 1; }
+
+    adm_front_require_script "05-install-pkg.sh" || return 1
+    adm_run_with_spinner "Instalando '${pkg}'..." \
+        "${ADM_SCRIPTS}/05-install-pkg.sh" "$pkg"
+}
+
+adm_front_cmd_build() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm build <pacote>"; return 1; }
+
+    adm_front_require_script "04-build-pkg.sh" || return 1
+    adm_run_with_spinner "Construindo '${pkg}' (sem instalar)..." \
+        "${ADM_SCRIPTS}/04-build-pkg.sh" "$pkg"
+}
+
+adm_front_cmd_detect() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm detect <pacote>"; return 1; }
+
+    adm_front_require_script "03-detect.sh" || return 1
+    adm_run_with_spinner "Detectando/preparando sources de '${pkg}'..." \
+        "${ADM_SCRIPTS}/03-detect.sh" "$pkg"
+}
+
+adm_front_cmd_remove() {
+    local pkg="$1"
+    shift || true
+    local args=("$@")
+
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm remove <pacote> [--with-orphans|--no-orphans]"; return 1; }
+
+    adm_front_require_script "07-remove-pkg.sh" || return 1
+    adm_run_with_spinner "Removendo '${pkg}'..." \
+        "${ADM_SCRIPTS}/07-remove-pkg.sh" "${args[@]}" "$pkg"
+}
+
+adm_front_cmd_update() {
+    local pkg="$1"
+    shift || true
+    local args=("$@")
+
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm update <pacote> [--no-deps]"; return 1; }
+
+    adm_front_require_script "09-update-pkg.sh" || return 1
+    adm_run_with_spinner "Gerando metafile de update para '${pkg}'..." \
+        "${ADM_SCRIPTS}/09-update-pkg.sh" "${args[@]}" "$pkg"
+}
+
+adm_front_cmd_upgrade() {
+    local pkg="$1"
+    shift || true
+    local args=("$@")
+
+    [[ -z "$pkg" ]] && { adm_error "Uso: adm upgrade <pacote> [--no-deps|--deps]"; return 1; }
+
+    adm_front_require_script "10-upgrade-pkg.sh" || return 1
+    adm_run_with_spinner "Upgrade de '${pkg}'..." \
+        "${ADM_SCRIPTS}/10-upgrade-pkg.sh" "${args[@]}" "$pkg"
+}
+
+adm_front_cmd_cross() {
+    adm_front_require_script "06-cross-toolchain.sh" || return 1
+    "${ADM_SCRIPTS}/06-cross-toolchain.sh" "$@"
+}
+
+adm_front_cmd_clean() {
+    adm_front_require_script "08-clean.sh" || return 1
+    "${ADM_SCRIPTS}/08-clean.sh" "$@"
+}
+
+###############################################################################
+# 3. Info, search, list, files
+###############################################################################
+
+adm_front_find_metafile_for_pkg() {
+    local name="$1"
+    local f
+
+    # updates tem prioridade para info/upgrade
+    if [[ -f "${ADM_UPDATES}/${name}/metafile" ]]; then
+        echo "${ADM_UPDATES}/${name}/metafile"
+        return 0
+    fi
+
+    # usa helpers se existirem
+    if declare -F adm_build_find_metafile_for_pkg >/dev/null 2>&1; then
+        adm_build_find_metafile_for_pkg "$name" && return 0
+    fi
+    if declare -F adm_detect_find_metafile_for_pkg >/dev/null 2>&1; then
+        adm_detect_find_metafile_for_pkg "$name" && return 0
+    fi
+
+    while IFS= read -r -d '' f; do
+        if [[ "$(basename "$(dirname "$f")")" == "$name" ]]; then
+            echo "$f"
+            return 0
+        fi
+    done < <(find "${ADM_REPO}" -maxdepth 3 -type f -name "metafile" -print0 2>/dev/null || true)
+
+    return 1
+}
+
+adm_front_pkg_db_file() {
+    local name="$1"
+    echo "${ADM_DB_PKG}/${name}.installed"
+}
+
+adm_front_is_installed() {
+    local name="$1"
+    [[ -f "$(adm_front_pkg_db_file "$name")" ]]
+}
+
+adm_front_installed_version() {
+    local name="$1"
+    local f line
+    f="$(adm_front_pkg_db_file "$name")"
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && break
+        if [[ "$line" == version=* ]]; then
+            echo "${line#version=}"
+            return 0
+        fi
+    done < "$f"
+    echo ""
+}
+
+adm_front_cmd_list() {
+    [[ -d "${ADM_DB_PKG}" ]] || { adm_info "Nenhum pacote instalado ainda."; return 0; }
+
+    echo "${adm_front_color_title}Pacotes instalados:${adm_front_color_reset}"
+    for f in "${ADM_DB_PKG}"/*.installed; do
+        [[ -e "$f" ]] || continue
+        local name ver
+        name="$(basename "${f%.installed}")"
+        ver="$(grep -m1 '^version=' "$f" 2>/dev/null | sed 's/^version=//')"
+        printf "  %s%s%s %s\n" "${ADM_COLOR_INFO}" "$name" "${ADM_COLOR_RESET}" "${ver:+($ver)}"
+    done
+}
+
+adm_front_cmd_files() {
+    local name="$1"
+    [[ -z "$name" ]] && { adm_error "Uso: adm files <pacote>"; return 1; }
+
+    local f
+    f="$(adm_front_pkg_db_file "$name")"
+    if [[ ! -f "$f" ]]; then
+        adm_error "Pacote '${name}' não está instalado (DB: '${f}')."
+        return 1
+    fi
+
+    echo "${adm_front_color_title}Arquivos instalados por '${name}':${adm_front_color_reset}"
+    local in_files=0 line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$in_files" -eq 0 ]]; then
+            [[ -z "$line" ]] && { in_files=1; continue; }
+            continue
+        fi
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+        echo "  $line"
+    done < "$f"
+}
+
+adm_front_cmd_info() {
+    local name="$1"
+    [[ -z "$name" ]] && { adm_error "Uso: adm info <pacote>"; return 1; }
+
+    local metafile
+    metafile="$(adm_front_find_metafile_for_pkg "$name" 2>/dev/null || true)"
+    if [[ -z "$metafile" ]]; then
+        adm_error "Metafile não encontrado para '${name}'."
+        return 1
+    fi
+
+    adm_meta_load "$metafile" || return 1
+
+    local inst_ver
+    inst_ver="$(adm_front_installed_version "${ADM_META_name}")"
+
+    echo "${adm_front_color_title}Informações do pacote '${ADM_META_name}':${adm_front_color_reset}"
+    echo "  Nome      : ${ADM_META_name}"
+    echo "  Versão    : ${ADM_META_version}"
+    if [[ -n "$inst_ver" ]]; then
+        echo "  Instalado : ${inst_ver}"
+    else
+        echo "  Instalado : (não instalado)"
+    fi
+    echo "  Categoria : ${ADM_META_category}"
+    echo "  Descrição : ${ADM_META_description}"
+    echo "  Homepage  : ${ADM_META_homepage}"
+    echo "  Maintainer: ${ADM_META_maintainer}"
+    echo "  Run deps  : ${ADM_META_run_deps:-<nenhum>}"
+    echo "  Build deps: ${ADM_META_build_deps:-<nenhum>}"
+    echo "  Opt deps  : ${ADM_META_opt_deps:-<nenhum>}"
+    echo "  Metafile  : ${metafile}"
+
+    if [[ -f "${ADM_UPDATES}/${ADM_META_name}/metafile" ]]; then
+        local upd_ver
+        adm_meta_load "${ADM_UPDATES}/${ADM_META_name}/metafile" || true
+        upd_ver="${ADM_META_version}"
+        echo "  Update    : metafile em updates/ (versão target: ${upd_ver})"
+        # recarrega metafile original
+        adm_meta_load "$metafile" || true
+    fi
+}
+
+adm_front_cmd_search() {
+    local term="$1"
+    [[ -z "$term" ]] && { adm_error "Uso: adm search <termo>"; return 1; }
+
+    [[ -d "${ADM_REPO}" ]] || { adm_error "ADM_REPO='${ADM_REPO}' não existe."; return 1; }
+
+    echo "${adm_front_color_title}Resultados da busca por '${term}':${adm_front_color_reset}"
+
+    local found=0 mf
+    while IFS= read -r -d '' mf; do
+        local name desc
+        name="$(basename "$(dirname "$mf")")"
+        desc="$(grep -m1 '^description=' "$mf" 2>/dev/null | sed 's/^description=//')"
+
+        if echo "$name" | grep -qi "$term" || echo "$desc" | grep -qi "$term"; then
+            found=1
+            printf "  %s%s%s - %s\n" "${ADM_COLOR_INFO}" "$name" "${ADM_COLOR_RESET}" "$desc"
+        fi
+    done < <(find "${ADM_REPO}" -type f -name "metafile" -print0 2>/dev/null || true)
+
+    [[ "$found" -eq 0 ]] && adm_info "Nenhum pacote encontrado."
+}
+###############################################################################
+# 4. TUI simples (menu) quando chamado sem parâmetros
+###############################################################################
+
+adm_front_tui_menu() {
+    echo "${adm_front_color_menu}"
+    echo "Selecione uma opção:"
+    echo "  1) Instalar pacote"
+    echo "  2) Remover pacote"
+    echo "  3) Upgrade de pacote"
+    echo "  4) Procurar pacote"
+    echo "  5) Listar pacotes instalados"
+    echo "  6) Info de pacote"
+    echo "  7) Cross / Base / World"
+    echo "  8) Limpeza (clean)"
+    echo "  q) Sair"
+    echo "${adm_front_color_reset}"
+    printf ">> "
+}
+
+adm_front_tui_read_nonempty() {
+    local prompt="$1"
+    local var
+    while :; do
+        read -r -p "$prompt" var || return 1
+        [[ -n "$var" ]] && { printf '%s' "$var"; return 0; }
+    done
+}
+
+adm_front_tui() {
+    adm_front_print_header
+    adm_front_tail_log
+
+    local opt
+    while :; do
+        adm_front_tui_menu
+        read -r opt || break
+
+        case "$opt" in
+            1)
+                local p
+                p="$(adm_front_tui_read_nonempty 'Pacote para instalar: ')" || continue
+                adm_front_cmd_install "$p"
+                ;;
+            2)
+                local p
+                p="$(adm_front_tui_read_nonempty 'Pacote para remover: ')" || continue
+                adm_front_cmd_remove "$p" --with-orphans
+                ;;
+            3)
+                local p
+                p="$(adm_front_tui_read_nonempty 'Pacote para upgrade: ')" || continue
+                adm_front_cmd_update "$p" || true
+                adm_front_cmd_upgrade "$p" --deps
+                ;;
+            4)
+                local t
+                t="$(adm_front_tui_read_nonempty 'Termo de busca: ')" || continue
+                adm_front_cmd_search "$t"
+                ;;
+            5)
+                adm_front_cmd_list
+                ;;
+            6)
+                local p
+                p="$(adm_front_tui_read_nonempty 'Pacote: ')" || continue
+                adm_front_cmd_info "$p"
+                ;;
+            7)
+                echo
+                echo "  a) cross-toolchain completa"
+                echo "  b) base (cross + sys/libs/dev)"
+                echo "  c) world (cross + todas categorias)"
+                read -r -p "Escolha (a/b/c): " sub
+                case "$sub" in
+                    a|A) adm_front_cmd_cross cross ;;
+                    b|B) adm_front_cmd_cross base ;;
+                    c|C) adm_front_cmd_cross world ;;
+                    *)   echo "Opção inválida." ;;
+                esac
+                ;;
+            8)
+                echo
+                echo "  a) full   (padrão)"
+                echo "  b) cache"
+                echo "  c) logs"
+                echo "  d) cross"
+                echo "  e) quick"
+                read -r -p "Modo de limpeza (a/b/c/d/e): " sub
+                case "$sub" in
+                    a|A) adm_front_cmd_clean --mode full ;;
+                    b|B) adm_front_cmd_clean --mode cache ;;
+                    c|C) adm_front_cmd_clean --mode logs ;;
+                    d|D) adm_front_cmd_clean --mode cross ;;
+                    e|E) adm_front_cmd_clean --mode quick ;;
+                    *)   echo "Modo inválido." ;;
+                esac
+                ;;
+            q|Q)
+                echo "Saindo."
+                break
+                ;;
+            *)
+                echo "Opção inválida."
+                ;;
+        esac
+
+        echo
+        read -r -p "Pressione ENTER para continuar..." _dummy || break
+        adm_front_print_header
+    done
+}
+
+###############################################################################
+# 5. CLI principal
+###############################################################################
+
+adm_front_usage() {
+    cat <<EOF
+Uso: adm <comando> [opções] [args]
+
+Comandos principais:
+  install <pkg>          - constrói (se necessário) e instala pacote
+  remove <pkg> [...]     - remove pacote + órfãos (usa 07-remove-pkg.sh)
+  upgrade <pkg> [...]    - faz upgrade usando updates/ (10-upgrade-pkg.sh)
+  update <pkg> [...]     - gera metafile de update (09-update-pkg.sh)
+  build <pkg>            - só constrói (04-build-pkg.sh)
+  detect <pkg>           - só detecta/prepara sources (03-detect.sh)
+  info <pkg>             - mostra infos do pacote (repo + DB)
+  search <termo>         - busca por nome/descrição no repo
+  list                   - lista pacotes instalados
+  files <pkg>            - mostra arquivos instalados pelo pacote
+  cross [args...]        - chama 06-cross-toolchain.sh
+  clean [args...]        - chama 08-clean.sh
+
+Sem parâmetros:
+  - mostra uma visão rápida do log do adm
+  - entra em um menu TUI simples/colorido para operações comuns
+
+Exemplos:
+  adm install bash
+  adm remove bash --with-orphans
+  adm update bash
+  adm upgrade bash --deps
+  adm info bash
+  adm search ssl
+  adm cross base --profile minimal --libc musl
+EOF
+}
+
+adm_front_main() {
+    adm_enable_strict_mode
+    adm_init_log "adm"
+
+    if [[ $# -eq 0 ]]; then
+        adm_front_tui
+        return
+    fi
+
+    local cmd="$1"; shift || true
+
+    case "$cmd" in
+        install)
+            adm_front_cmd_install "$@"
+            ;;
+        remove)
+            [[ $# -lt 1 ]] && { adm_front_usage; return 1; }
+            local pkg="$1"; shift || true
+            adm_front_cmd_remove "$pkg" "$@"
+            ;;
+        upgrade)
+            [[ $# -lt 1 ]] && { adm_front_usage; return 1; }
+            local pkg="$1"; shift || true
+            adm_front_cmd_upgrade "$pkg" "$@"
+            ;;
+        update)
+            [[ $# -lt 1 ]] && { adm_front_usage; return 1; }
+            local pkg="$1"; shift || true
+            adm_front_cmd_update "$pkg" "$@"
+            ;;
+        build)
+            adm_front_cmd_build "$1"
+            ;;
+        detect)
+            adm_front_cmd_detect "$1"
+            ;;
+        info)
+            adm_front_cmd_info "$1"
+            ;;
+        search)
+            adm_front_cmd_search "$1"
+            ;;
+        list)
+            adm_front_cmd_list
+            ;;
+        files)
+            adm_front_cmd_files "$1"
+            ;;
+        cross)
+            adm_front_cmd_cross "$@"
+            ;;
+        clean)
+            adm_front_cmd_clean "$@"
+            ;;
+        -h|--help|help)
+            adm_front_usage
+            ;;
+        *)
+            adm_error "Comando desconhecido: '${cmd}'"
+            adm_front_usage
+            return 1
+            ;;
+    esac
+}
+
+adm_front_main "$@"
