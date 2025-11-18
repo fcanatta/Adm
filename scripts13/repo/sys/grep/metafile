@@ -1,0 +1,13 @@
+name=grep
+version=3.12
+category=sys
+run_deps=glibc,pcre2
+build_deps=glibc,gcc-pass2,pcre2
+opt_deps=
+num_builds=0
+description=GNU grep text search utility
+homepage=https://www.gnu.org/software/grep/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/grep/grep-3.12.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/grep-3.12.tar.xz
