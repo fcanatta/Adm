@@ -1,0 +1,13 @@
+name=locale-data
+version=glibc-2.42
+category=sys
+run_deps=glibc
+build_deps=glibc
+opt_deps=tzdata
+num_builds=0
+description=Glibc locale data (locales, charsets, collations)
+homepage=https://www.gnu.org/software/libc/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/glibc-2.42.tar.xz
