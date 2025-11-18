@@ -1,0 +1,13 @@
+name=sed
+version=4.9
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass2
+opt_deps=
+num_builds=0
+description=GNU sed stream editor
+homepage=https://www.gnu.org/software/sed/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/sed/sed-4.9.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/sed-4.9.tar.xz
