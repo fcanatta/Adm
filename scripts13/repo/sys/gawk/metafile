@@ -1,0 +1,13 @@
+name=gawk
+version=5.3.2
+category=sys
+run_deps=glibc,gmp,mpfr
+build_deps=glibc,gcc-pass2,gmp,mpfr
+opt_deps=readline
+num_builds=0
+description=GNU awk text processing language
+homepage=https://www.gnu.org/software/gawk/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/gawk/gawk-5.3.2.tar.xz,https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/gawk-5.3.2.tar.xz
