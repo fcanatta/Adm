@@ -1,0 +1,13 @@
+name=texinfo
+version=7.2
+category=dev
+run_deps=glibc,perl
+build_deps=glibc,gcc-pass2,perl
+opt_deps=
+num_builds=0
+description=GNU Texinfo documentation tools
+homepage=https://www.gnu.org/software/texinfo/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/texinfo/texinfo-7.2.tar.xz
