@@ -1,0 +1,13 @@
+name=util-linux
+version=2.41.2
+category=sys
+run_deps=glibc,zlib,xz,openssl
+build_deps=glibc,gcc-pass2,zlib,xz,openssl
+opt_deps=ncurses,readline
+num_builds=0
+description=System utilities suite (mount, fsck, hwclock, more)
+homepage=https://github.com/util-linux/util-linux
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://mirrors.edge.kernel.org/pub/linux/utils/util-linux/v2.41/util-linux-2.41.2.tar.xz
