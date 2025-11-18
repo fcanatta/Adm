@@ -1,0 +1,13 @@
+name=binutils-pass2
+version=2.45.1
+category=sys
+run_deps=glibc
+build_deps=glibc,gcc-pass1
+opt_deps=
+num_builds=0
+description=GNU Binutils (toolchain ajustado contra glibc, pass 2)
+homepage=https://www.gnu.org/software/binutils/
+maintainer=adm <root@localhost>
+sha256sums=
+md5sum=
+sources=https://ftp.gnu.org/gnu/binutils/binutils-2.45.1.tar.xz,https://ftpmirror.gnu.org/binutils/binutils-2.45.1.tar.xz
