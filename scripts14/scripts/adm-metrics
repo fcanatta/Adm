@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# adm-metrics - Coleta de métricas do ADM 2.0
+#
+# Responsável por:
+#   - Registrar tempos de operações (build, fetch, scan, check, etc.)
+#   - Registrar valores numéricos (tamanho de pacote, número de arquivos, etc.)
+#   - Fornecer função para rodar comandos medidos (time block)
+#
+# Formato de linha (TSV):
+#   ts<TAB>pid<TAB>op<TAB>pkg_id<TAB>metric<TAB>value<TAB>unit<TAB>extra
+#
+# Pode ser sourceado por outros scripts e usado via CLI para debug.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente, UI e eventos
+# =========
+
+_adm_metrics_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-metrics.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_METRICS_DIR="$(_adm_metrics_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_METRICS_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_METRICS_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_METRICS_DIR/adm-eventd"
+
+# Garante diretório de métricas
+if [[ ! -d "$ADM_DB_METRICS_DIR" ]]; then
+    mkdir -p "$ADM_DB_METRICS_DIR" || adm_log_fatal "Falha ao criar '$ADM_DB_METRICS_DIR'."
+fi
+
+# =========
+# Arquivo de métricas (por dia)
+# =========
+
+adm_metrics_file_for_today() {
+    local day
+    day="$(date '+%Y%m%d')"
+    printf '%s/metrics-%s.log' "$ADM_DB_METRICS_DIR" "$day"
+}
+
+# =========
+# Registro de métricas
+# =========
+
+adm_metrics_record() {
+    # Registra UMA métrica.
+    #
+    # Uso:
+    #   adm_metrics_record op pkg_id metric value unit [extra...]
+    #
+    # Exemplo:
+    #   adm_metrics_record BUILD base/kmod duration 4.23 s "build completo"
+    if [[ $# -lt 5 ]]; then
+        adm_log_fatal "adm_metrics_record: uso: adm_metrics_record op pkg_id metric value unit [extra...]"
+    fi
+
+    local op="$1"
+    local pkg_id="$2"
+    local metric="$3"
+    local value="$4"
+    local unit="$5"
+    shift 5 || true
+    local extra="$*"
+
+    # Sanitiza tabs para não quebrar TSV
+    op="${op//$'\t'/ }"
+    pkg_id="${pkg_id//$'\t'/ }"
+    metric="${metric//$'\t'/ }"
+    value="${value//$'\t'/ }"
+    unit="${unit//$'\t'/ }"
+    extra="${extra//$'\t'/ }"
+
+    local ts pid file line
+    ts="$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    pid="$$"
+    file="$(adm_metrics_file_for_today)"
+
+    line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$pid" "$op" "$pkg_id" "$metric" "$value" "$unit" "$extra")
+
+    adm_with_lock "metrics" bash -c '
+        local file="$1" line="$2"
+        mkdir -p "$(dirname "$file")" || {
+            printf "ADM-ERROR: falha ao criar diretório de métricas.\n" >&2
+            exit 1
+        }
+        printf "%s\n" "$line" >>"$file" || {
+            printf "ADM-ERROR: falha ao gravar métrica em %s\n" "$file" >&2
+            exit 1
+        }
+    ' _ "$file" "$line"
+
+    adm_log_debug "Métrica registrada: op=$op pkg=$pkg_id metric=$metric value=$value$unit"
+    adm_event_emit "METRIC_${metric^^}" "$pkg_id" "op=$op value=$value unit=$unit extra=$extra"
+}
+
+# =========
+# Medir blocos de código / comandos
+# =========
+
+adm_metrics_time_block() {
+    # Executa um comando e registra o tempo total.
+    #
+    # Uso:
+    #   adm_metrics_time_block op pkg_id description comando [args...]
+    #
+    # Exemplo:
+    #   adm_metrics_time_block BUILD base/kmod "compilar" make -j4
+    #
+    # - Registra métrica:
+    #   metric=duration, value=segundos, unit=s, extra=description rc=<code>
+    # - Retorna o mesmo código de saída do comando.
+    if [[ $# -lt 4 ]]; then
+        adm_log_fatal "adm_metrics_time_block: uso: adm_metrics_time_block op pkg_id description comando [args...]"
+    fi
+
+    local op="$1"
+    local pkg_id="$2"
+    local desc="$3"
+    shift 3 || true
+    local cmd=("$@")
+
+    if [[ ${#cmd[@]} -eq 0 ]]; then
+        adm_log_fatal "adm_metrics_time_block: nenhum comando fornecido."
+    fi
+
+    local start end dur rc
+    start="$(date +%s.%N)"
+
+    # Podemos combinar com spinner opcionalmente, mas aqui deixo só métrica.
+    if "${cmd[@]}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+
+    end="$(date +%s.%N)"
+
+    # Calcula duração em segundos com precisão (sem ferramentas externas caras)
+    # Se bc não estiver disponível, usamos diferença inteira.
+    if command -v bc >/dev/null 2>&1; then
+        dur=$(printf '%s - %s\n' "$end" "$start" | bc 2>/dev/null || printf '0')
+    else
+        # Fallback: segundos inteiros
+        local start_int end_int
+        start_int="${start%%.*}"
+        end_int="${end%%.*}"
+        dur=$((end_int - start_int))
+    fi
+
+    adm_metrics_record "$op" "$pkg_id" "duration" "$dur" "s" "$desc rc=$rc"
+
+    # Log visual básico
+    if [[ $rc -eq 0 ]]; then
+        adm_log_ok "Tempo ($op $pkg_id $desc): ${dur}s"
+    else
+        adm_log_error "Tempo ($op $pkg_id $desc): ${dur}s (rc=$rc)"
+    fi
+
+    return "$rc"
+}
+
+# =========
+# Utilitários de leitura (CLI)
+# =========
+
+adm_metrics_tail_today() {
+    # Mostra métricas de hoje
+    local file
+    file="$(adm_metrics_file_for_today)"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_warn "Nenhum arquivo de métricas para hoje ainda."
+        return 0
+    fi
+    cat "$file"
+}
+
+adm_metrics_tail_today_pretty() {
+    # Mostra métricas de hoje de forma legível
+    local file
+    file="$(adm_metrics_file_for_today)"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_warn "Nenhum arquivo de métricas para hoje ainda."
+        return 0
+    fi
+
+    awk -F '\t' '
+        NF >= 8 {
+            ts=$1; pid=$2; op=$3; pkg=$4; metric=$5; val=$6; unit=$7; extra=$8
+            printf "%s [pid=%s] %s %s: %s=%s%s %s\n", ts, pid, op, pkg, metric, val, unit, extra
+        }
+    ' "$file"
+}
+
+adm_metrics_filter_pkg_today() {
+    # Filtra métricas de hoje por pkg_id
+    # Uso:
+    #   adm_metrics_filter_pkg_today base/kmod
+    local pkg_id="${1:-}"
+    if [[ -z "$pkg_id" ]]; then
+        adm_log_fatal "adm_metrics_filter_pkg_today: uso: adm_metrics_filter_pkg_today pkg_id"
+    fi
+
+    local file
+    file="$(adm_metrics_file_for_today)"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_warn "Nenhum arquivo de métricas para hoje."
+        return 0
+    fi
+
+    awk -F '\t' -v target="$pkg_id" '
+        NF >= 8 && $4 == target {
+            print
+        }
+    ' "$file"
+}
+
+# =========
+# CLI
+# =========
+
+adm_metrics_usage() {
+    cat <<EOF
+adm-metrics - Coleta de métricas do ADM 2.0
+
+Uso (CLI, debug):
+
+  Registrar métrica manual:
+    adm-metrics record OP PKG_ID METRIC VALUE UNIT [EXTRA...]
+
+  Medir comando:
+    adm-metrics time OP PKG_ID DESCRIPTION comando [args...]
+
+      Exemplo:
+        adm-metrics time BUILD base/kmod "make all" make -j4
+
+  Ver métricas de hoje:
+    adm-metrics tail
+    adm-metrics tail-pretty
+
+  Filtrar métricas por pacote (hoje):
+    adm-metrics filter-pkg PKG_ID
+
+  adm-metrics --help
+    Mostra esta ajuda.
+
+Na prática:
+  - Outros scripts devem usar:
+      adm_metrics_record
+      adm_metrics_time_block
+EOF
+}
+
+adm_metrics_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        record)
+            shift || true
+            if [[ $# -lt 5 ]]; then
+                adm_log_fatal "Uso: adm-metrics record OP PKG_ID METRIC VALUE UNIT [EXTRA...]"
+            fi
+            adm_metrics_record "$@"
+            ;;
+        time)
+            shift || true
+            if [[ $# -lt 4 ]]; then
+                adm_log_fatal "Uso: adm-metrics time OP PKG_ID DESCRIPTION comando [args...]"
+            fi
+            local op="$1"
+            local pkg_id="$2"
+            local desc="$3"
+            shift 3 || true
+            adm_metrics_time_block "$op" "$pkg_id" "$desc" "$@"
+            ;;
+        tail)
+            adm_metrics_tail_today
+            ;;
+        tail-pretty)
+            adm_metrics_tail_today_pretty
+            ;;
+        filter-pkg)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-metrics filter-pkg PKG_ID"
+            fi
+            adm_metrics_filter_pkg_today "$1"
+            ;;
+        --help|-h|"")
+            adm_metrics_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-metrics: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_metrics_main "$@"
+fi
+
+# Fim do adm-metrics
