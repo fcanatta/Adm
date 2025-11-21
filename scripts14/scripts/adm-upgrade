@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+# adm-upgrade - Orquestrador de upgrades do ADM 2.0
+#
+# Responsável por:
+#   - Ler lista de pacotes pendentes (gerada pelo adm-update) ou lista manual
+#   - Resolver ordem de build com base em dependências (adm-deps)
+#   - Rebuildar apenas o que realmente precisa (versão/release diferente ou ausente)
+#   - Suportar --force para rebuildar mesmo sem nova versão
+#   - Integrar com adm-build (pipeline completo) e adm-db
+#
+# Fonte padrão da lista:
+#   - ${ADM_DB_DIR}/updates/pending.list  (manipulado por adm-update)
+#
+# CLI:
+#   adm-upgrade pending [--force]
+#       - Lê pending.list, resolve deps e upgradeia apenas o necessário.
+#
+#   adm-upgrade file LISTA.txt [--force]
+#       - Lê pacotes (um por linha) de LISTA.txt, resolve deps e upgradeia.
+#
+#   adm-upgrade pkgs PKG1 [PKG2 ...] [--force]
+#       - Usa a lista passada na linha de comando.
+#
+#   adm-upgrade list-pending
+#   adm-upgrade clear-pending
+# Descobrir updates primeiro
+# adm-update apply base/coreutils
+# adm-update apply base/bash
+# Forçar rebuild
+# ADM_UPGRADE_FORCE=1 adm-upgrade pending
+# adm-upgrade pending --force
+#
+# Flags:
+#   --force          -> força rebuild (passa ADM_BUILD_FORCE=1 para adm-build)
+#   ADM_UPGRADE_FORCE=1  (equivalente ao --force)
+#
+# Lógica de "rebuild só se precisar":
+#   - Se houver função adm_db_get_installed_version/adm_db_get_installed_release:
+#       * lê versão/release instalados e compara com metadado atual
+#       * se meta==instalado e not --force -> pula pacote
+#   - Se não houver função no adm-db:
+#       * assume que precisa rebuildar (comportamento conservador)
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_upgrade_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-upgrade.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_UPGRADE_DIR="$(_adm_upgrade_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-deps"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-knowledge"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-build"
+# shellcheck disable=SC1090
+source "$_ADM_UPGRADE_DIR/adm-update"
+
+ADM_UPGRADE_FORCE="${ADM_UPGRADE_FORCE:-0}"
+
+ADM_DB_UPDATES_DIR="${ADM_DB_DIR}/updates"
+ADM_DB_UPDATES_PENDING="${ADM_DB_UPDATES_DIR}/pending.list"
+
+# =========
+# Utilidades de metadado / versões
+# =========
+
+adm_upgrade_metadado_path() {
+    adm_deps_metadado_path "$1"
+}
+
+adm_upgrade_read_meta_single() {
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "adm-upgrade: metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit 0
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_upgrade_meta_version_for_pkg() {
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_upgrade_metadado_path "$pkg_id")"
+    adm_upgrade_read_meta_single "$meta" "version" || echo "unknown"
+}
+
+adm_upgrade_meta_release_for_pkg() {
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_upgrade_metadado_path "$pkg_id")"
+    adm_upgrade_read_meta_single "$meta" "release" || echo "1"
+}
+
+adm_upgrade_db_version_for_pkg() {
+    # Tenta obter versão instalada do adm-db, se houver função disponível.
+    #
+    # Uso:
+    #   adm_upgrade_db_version_for_pkg PKG_ID
+    #
+    # Saída:
+    #   version  (ou vazio se não conseguir)
+    local pkg_id="$1"
+
+    if [[ "$(type -t adm_db_get_installed_version || true)" == "function" ]]; then
+        adm_db_get_installed_version "$pkg_id" || true
+    else
+        # Sem suporte no adm-db: não sabemos
+        printf '\n'
+    fi
+}
+
+adm_upgrade_db_release_for_pkg() {
+    # Tenta obter release instalado do adm-db, se houver função disponível.
+    local pkg_id="$1"
+
+    if [[ "$(type -t adm_db_get_installed_release || true)" == "function" ]]; then
+        adm_db_get_installed_release "$pkg_id" || true
+    else
+        printf '\n'
+    fi
+}
+
+# =========
+# Pending list compatível com adm-update
+# =========
+
+adm_upgrade_pending_list() {
+    if [[ ! -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        return 0
+    fi
+    cat "$ADM_DB_UPDATES_PENDING"
+}
+
+adm_upgrade_pending_remove_pkg() {
+    # Remove PKG_ID da pending.list após upgrade bem sucedido.
+    local pkg_id="${1:-}"
+
+    if [[ -z "$pkg_id" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        return 0
+    fi
+
+    adm_with_lock "updates-pending" bash -c '
+        local file="$1" pkg="$2"
+        if [[ ! -f "$file" ]]; then
+            exit 0
+        fi
+        tmp="${file}.tmp"
+        grep -vxF "$pkg" "$file" >"$tmp" 2>/dev/null || true
+        mv "$tmp" "$file"
+    ' _ "$ADM_DB_UPDATES_PENDING" "$pkg_id"
+}
+
+adm_upgrade_pending_clear() {
+    if [[ -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        rm -f "$ADM_DB_UPDATES_PENDING" || adm_log_fatal "Não foi possível remover '$ADM_DB_UPDATES_PENDING'."
+    fi
+    adm_log_ok "Fila de upgrade (pending.list) limpa."
+}
+
+# =========
+# Carregar lista de pacotes a partir de várias fontes
+# =========
+
+adm_upgrade_load_list_from_pending() {
+    # Lê pending.list, ignorando linhas vazias e comentários.
+    if [[ ! -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        adm_log_info "Nenhum pacote pendente em '$ADM_DB_UPDATES_PENDING'."
+        return 0
+    fi
+
+    awk 'NF>0 && $1 !~ /^#/ {print $1}' "$ADM_DB_UPDATES_PENDING"
+}
+
+adm_upgrade_load_list_from_file() {
+    local file="${1:-}"
+    if [[ -z "$file" ]]; then
+        adm_log_fatal "adm-upgrade: nenhum arquivo fornecido para lista."
+    fi
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "Lista não encontrada: '$file'"
+    fi
+
+    awk 'NF>0 && $1 !~ /^#/ {print $1}' "$file"
+}
+
+adm_upgrade_load_list_from_args() {
+    # Apenas ecoa argumentos, filtrando vazios.
+    local out=()
+    local p
+    for p in "$@"; do
+        [[ -z "$p" ]] && continue
+        out+=("$p")
+    done
+    printf '%s\n' "${out[@]:-}"
+}
+
+# =========
+# Decidir se um pacote precisa rebuild
+# =========
+
+adm_upgrade_should_build_pkg() {
+    # Decide se precisa rebuildar PKG_ID.
+    #
+    # Uso:
+    #   adm_upgrade_should_build_pkg PKG_ID
+    #
+    # Retorno:
+    #   0 -> deve buildar
+    #   1 -> pode pular
+    #
+    # Lógica:
+    #   - Se ADM_UPGRADE_FORCE=1 -> sempre 0 (build)
+    #   - Se metadado não existe -> build (erro é tratado antes)
+    #   - Se não houver funções de DB -> build (comportamento conservador)
+    #   - Se houver DB:
+    #       * lê versão/release do meta e do DB
+    #       * se DB vazio -> build
+    #       * se meta != DB -> build
+    #       * se meta == DB -> skip (retorna 1)
+    local pkg_id="$1"
+
+    if [[ "$ADM_UPGRADE_FORCE" -eq 1 ]]; then
+        return 0
+    fi
+
+    local meta
+    meta="$(adm_upgrade_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        # Chamador já deve emitir erro de metadado; aqui, treat as "needs build"
+        return 0
+    fi
+
+    local meta_ver meta_rel db_ver db_rel
+    meta_ver="$(adm_upgrade_meta_version_for_pkg "$pkg_id")"
+    meta_rel="$(adm_upgrade_meta_release_for_pkg "$pkg_id")"
+    db_ver="$(adm_upgrade_db_version_for_pkg "$pkg_id")"
+    db_rel="$(adm_upgrade_db_release_for_pkg "$pkg_id")"
+
+    # Se DB não sabe nada, assume que precisa rebuild
+    if [[ -z "$db_ver" && -z "$db_rel" ]]; then
+        return 0
+    fi
+
+    if [[ "$meta_ver" == "$db_ver" && "$meta_rel" == "$db_rel" ]]; then
+        # Já instalada mesma versão/release
+        return 1
+    fi
+
+    # Versão ou release mudou -> rebuild
+    return 0
+}
+
+# =========
+# Upgrade de um pacote (chama adm-build)
+# =========
+
+adm_upgrade_build_pkg() {
+    # Uso:
+    #   adm_upgrade_build_pkg PKG_ID
+    #
+    # - Verifica se deve buildar (adm_upgrade_should_build_pkg)
+    # - Se sim, chama adm-build build-one com ADM_BUILD_FORCE ajustado.
+    local pkg_id="$1"
+
+    local meta
+    meta="$(adm_upgrade_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_error "Metadado não encontrado para $pkg_id; não é possível upgradear."
+        return 1
+    fi
+
+    local meta_ver meta_rel db_ver db_rel
+    meta_ver="$(adm_upgrade_meta_version_for_pkg "$pkg_id")"
+    meta_rel="$(adm_upgrade_meta_release_for_pkg "$pkg_id")"
+    db_ver="$(adm_upgrade_db_version_for_pkg "$pkg_id")"
+    db_rel="$(adm_upgrade_db_release_for_pkg "$pkg_id")"
+
+    if adm_upgrade_should_build_pkg "$pkg_id"; then
+        if [[ "$ADM_UPGRADE_FORCE" -eq 1 ]]; then
+            adm_log_phase_header "Upgrade (FORÇADO) de $pkg_id -> $meta_ver-$meta_rel"
+        else
+            adm_log_phase_header "Upgrade de $pkg_id: $db_ver-$db_rel → $meta_ver-$meta_rel"
+        fi
+
+        if ! command -v adm-build >/dev/null 2>&1; then
+            adm_log_fatal "'adm-build' não encontrado no PATH; não é possível upgradear."
+        fi
+
+        # Passa ADM_BUILD_FORCE conforme ADM_UPGRADE_FORCE
+        if [[ "$ADM_UPGRADE_FORCE" -eq 1 ]]; then
+            ADM_BUILD_FORCE=1 adm-build build-one "$pkg_id"
+        else
+            ADM_BUILD_FORCE=0 adm-build build-one "$pkg_id"
+        fi
+
+        # Se sucesso, removemos da pending.list
+        adm_upgrade_pending_remove_pkg "$pkg_id"
+        adm_event_pkg "PKG_UPGRADE_DONE" "$pkg_id" "version=$meta_ver release=$meta_rel"
+        return 0
+    else
+        adm_log_info "Pacote já está na versão/release atual: $pkg_id ($meta_ver-$meta_rel); pulando (use --force para rebuild)."
+        # Mesmo assim, se estava na lista pending, removemos – já está atualizado
+        adm_upgrade_pending_remove_pkg "$pkg_id"
+        adm_event_pkg "PKG_UPGRADE_SKIPPED" "$pkg_id" "reason=up-to-date"
+        return 0
+    fi
+}
+# =========
+# Orquestra upgrade de uma lista de pacotes
+# =========
+
+adm_upgrade_run_for_list() {
+    # Uso:
+    #   adm_upgrade_run_for_list PKG1 [PKG2 ...]
+    #
+    # Passos:
+    #   - Limpa entradas duplicadas
+    #   - Calcula ordem de build com adm-deps (deps antes dos dependentes)
+    #   - Para cada pacote na ordem:
+    #       * Decidir se precisa rebuild (adm_upgrade_should_build_pkg)
+    #       * Chamar adm-build se necessário
+    if [[ $# -lt 1 ]]; then
+        adm_log_warn "adm-upgrade: lista vazia; nada para fazer."
+        return 0
+    fi
+
+    local pkgs=()
+    local p
+    for p in "$@"; do
+        [[ -z "$p" ]] && continue
+        pkgs+=("$p")
+    done
+
+    # Dedup
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/upgrade-list-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para upgrade list."
+    printf '%s\n' "${pkgs[@]}" | awk 'NF>0 {print $1}' | awk '!seen[$0]++' >"$tmp"
+
+    mapfile -t pkgs <"$tmp"
+    rm -f "$tmp" || true
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        adm_log_warn "adm-upgrade: lista final vazia; nada para fazer."
+        return 0
+    fi
+
+    adm_log_phase_header "Resolvendo ordem de upgrade para: ${pkgs[*]}"
+
+    # Ordem de build com deps (adm-deps)
+    local order
+    if ! order="$(adm_deps_build_order "${pkgs[@]}")"; then
+        adm_log_fatal "Falha ao calcular ordem de build para upgrade."
+    fi
+
+    adm_log_info "Ordem de build calculada:"
+    printf '%s\n' "$order" | sed 's/^/  - /'
+
+    adm_event_emit "UPGRADE_START" "-" "pkgs=${pkgs[*]}"
+
+    local pkg rc
+    rc=0
+
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        if ! adm_upgrade_build_pkg "$pkg"; then
+            adm_log_error "Falha ao upgradear $pkg."
+            rc=1
+            # não abortamos a sequência inteira; tentamos continuar
+        fi
+    done <<<"$order"
+
+    adm_event_emit "UPGRADE_DONE" "-" "rc=$rc"
+    return "$rc"
+}
+
+# =========
+# CLI
+# =========
+
+adm_upgrade_usage() {
+    cat <<EOF
+adm-upgrade - Orquestrador de upgrades do ADM 2.0
+
+Uso:
+
+  Upgrade de pacotes pendentes (gerados pelo adm-update):
+    adm-upgrade pending [--force]
+
+      - Lê lista padrão:
+          ${ADM_DB_UPDATES_PENDING}
+      - Resolve dependências e ordem de build.
+      - Rebuilda apenas pacotes que:
+          * não estão instalados ou
+          * versão/release do metadado é diferente da instalada.
+      - Se --force (ou ADM_UPGRADE_FORCE=1):
+          * rebuilda sempre, mesmo se versão/release forem iguais.
+
+  Upgrade a partir de um arquivo de lista:
+    adm-upgrade file LISTA.txt [--force]
+
+      - LISTA.txt: um PKG_ID por linha (linhas em branco ou começando com # são ignoradas).
+
+  Upgrade passando pacotes diretamente:
+    adm-upgrade pkgs PKG1 [PKG2 ...] [--force]
+
+  Operações na fila de pendentes (compatível com adm-update):
+    adm-upgrade list-pending
+    adm-upgrade clear-pending
+
+Flags:
+
+  --force
+      Força rebuild (passa ADM_BUILD_FORCE=1 para adm-build),
+      mesmo que a versão/release instalada já seja a mesma do metadado.
+
+Variáveis:
+
+  ADM_UPGRADE_FORCE=1
+      Equivalente a passar --force na linha de comando.
+
+Notas:
+
+  - É esperado que adm-update tenha sido rodado antes, gerando:
+        ${ADM_DB_UPDATES_PENDING}
+    com a lista de pacotes que precisam upgrade.
+
+  - adm-upgrade usa adm-deps para resolver a ordem de build e
+    adm-build para realizar todo o pipeline de construção/instalação.
+
+EOF
+}
+
+adm_upgrade_parse_force_flag() {
+    # Remove --force da lista de argumentos e seta ADM_UPGRADE_FORCE=1 se presente.
+    local -n _out_args="$1"
+    shift || true
+    local args=("$@")
+    local filtered=()
+    local x
+    for x in "${args[@]}"; do
+        if [[ "$x" == "--force" ]]; then
+            ADM_UPGRADE_FORCE=1
+        else
+            filtered+=("$x")
+        fi
+    done
+    _out_args=("${filtered[@]}")
+}
+
+adm_upgrade_main() {
+    local cmd="${1:-}"
+    shift || true
+
+    local args=("$@")
+    # trata --force
+    local filtered_args=()
+    adm_upgrade_parse_force_flag filtered_args "${args[@]}"
+    args=("${filtered_args[@]}")
+
+    case "$cmd" in
+        pending)
+            # lista vem do pending.list
+            mapfile -t pkgs < <(adm_upgrade_load_list_from_pending)
+            if [[ ${#pkgs[@]} -eq 0 ]]; then
+                adm_log_info "Nenhum pacote pendente na fila de upgrade."
+                exit 0
+            fi
+            adm_metrics_time_block "UPGRADE" "UPGRADE_PENDING" "adm-upgrade pending" adm_upgrade_run_for_list "${pkgs[@]}"
+            ;;
+        file)
+            if [[ ${#args[@]} -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-upgrade file LISTA.txt [--force]"
+            fi
+            local list_file="${args[0]}"
+            mapfile -t pkgs < <(adm_upgrade_load_list_from_file "$list_file")
+            if [[ ${#pkgs[@]} -eq 0 ]]; then
+                adm_log_info "Lista '$list_file' não contém pacotes válidos."
+                exit 0
+            fi
+            adm_metrics_time_block "UPGRADE" "UPGRADE_FILE" "adm-upgrade file $list_file" adm_upgrade_run_for_list "${pkgs[@]}"
+            ;;
+        pkgs)
+            if [[ ${#args[@]} -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-upgrade pkgs PKG1 [PKG2 ...] [--force]"
+            fi
+            mapfile -t pkgs < <(adm_upgrade_load_list_from_args "${args[@]}")
+            if [[ ${#pkgs[@]} -eq 0 ]]; then
+                adm_log_info "Nenhum pacote fornecido para upgrade."
+                exit 0
+            fi
+            adm_metrics_time_block "UPGRADE" "UPGRADE_PKGS" "adm-upgrade pkgs ${pkgs[*]}" adm_upgrade_run_for_list "${pkgs[@]}"
+            ;;
+        list-pending)
+            adm_upgrade_pending_list
+            ;;
+        clear-pending)
+            adm_upgrade_pending_clear
+            ;;
+        --help|-h|"")
+            adm_upgrade_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-upgrade: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_upgrade_main "$@"
+fi
