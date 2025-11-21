@@ -1,0 +1,267 @@
+7. ROADMAP.txt (texto que você pode salvar)
+
+Abaixo um esqueleto de ROADMAP.txt que você pode copiar para um arquivo:
+
+
+---
+
+ROADMAP – Gerenciador ADM (source-based)
+
+Diretórios principais
+
+/root/usr/src/adm/
+
+scripts/ – todos os scripts ADM
+
+packages/<categoria>/<programa>/
+
+metadado
+
+hook-*
+
+
+build/ – builds em curso
+
+dest/ – DESTDIR por pacote
+
+cache-src/ – cache de fontes
+
+cache-bin/ – cache de pacotes binários
+
+logs/ – logs das operações
+
+db/ – estado (instalados, histórico, upgrade-list)
+
+tmp/ – temporários
+
+backup/metadados/ – backups de metadado
+
+
+
+Formato do arquivo metadado
+
+name
+
+version
+
+release
+
+category
+
+license
+
+url
+
+build_deps  (lista simples)
+
+run_deps
+
+opt_deps
+
+groups      (ex.: base, xorg, toolchain)
+
+source_uri  (uma por linha, suporta http(s), git, rsync, etc)
+
+source_checksum (uma por linha, sha256 correspondente a cada URI)
+
+
+Scripts (por ordem de criação)
+
+1. adm-env
+
+define ROOT e caminhos
+
+variáveis comuns a todos os scripts
+
+
+
+2. adm-log-ui
+
+imprime linhas com timestamp, spinner, cores e símbolos (✔, ✖, !)
+
+funções para: iniciar operação, atualizar, finalizar com sucesso/erro
+
+
+
+3. adm-db
+
+leitura/gravação:
+
+pacotes instalados
+
+histórico de builds
+
+listas de upgrade/update
+
+
+
+
+4. adm-fetch
+
+interpreta source_uri
+
+escolhe fetcher correto (git, http, rsync…)
+
+baixa em cache-src/
+
+calcula e verifica source_checksum
+
+integra com adm-log-ui para mostrar progresso
+
+
+
+5. adm-scan
+
+analisa árvore de source
+
+detecta:
+
+sistema de build
+
+linguagens
+
+compilador/linker pretendido
+
+dependências (via includes, pkg-config, manifests etc)
+
+docs
+
+
+produz “Plano de Construção”
+
+
+
+6. adm-deps
+
+junta:
+
+deps dos metadados
+
+deps detectadas pelo scanner
+
+
+monta grafo de dependências
+
+gera ordem de build
+
+resolve grupos (groups)
+
+
+
+7. adm-build
+
+cria diretório de build
+
+chama adm-fetch e adm-scan
+
+aplica hooks (hook-pre-*, hook-post-*)
+
+roda fases: configure, build, test, install em DESTDIR
+
+empacota DESTDIR e instala em /usr
+
+atualiza DB
+
+usa adm-log-ui para saída
+
+
+
+8. adm-check
+
+verifica pacotes instalados ou em DESTDIR:
+
+permissões, donos, links
+
+libs dinâmicas e RPATH
+
+shebangs
+
+docs/manpages
+
+
+marca problema no DB e em logs
+
+
+
+9. adm-update
+
+recebe alvo (programa, grupo, all)
+
+descobre nova versão upstream
+
+faz backup do metadado
+
+atualiza version, source_uri, source_checksum
+
+baixa novo source via adm-fetch
+
+roda adm-scan pra detectar deps
+
+atualiza build_deps/run_deps
+
+gera metadados esqueleto para deps novas
+
+grava db/upgrade-list com programas a atualizar
+
+suporta --force para marcar rebuild mesmo sem nova versão
+
+
+
+10. adm-upgrade
+
+lê db/upgrade-list
+
+identifica:
+
+pacotes com nova versão
+
+pacotes marcados para rebuild forçado
+
+dependentes de ABI quebrada
+
+
+resolve ordem via adm-deps
+
+chama adm-build para cada um
+
+opcionalmente chama adm-check após cada build
+
+atualiza DB com novas versões
+
+
+
+11. adm
+
+CLI principal
+
+comandos:
+
+build
+
+build-group
+
+update
+
+upgrade
+
+check
+
+search
+
+info
+
+list-installed
+
+log
+
+help
+
+tui (modo texto interativo)
+
+
+delega as ações para os scripts acima
+
+
+
+
+Futuras melhorias
