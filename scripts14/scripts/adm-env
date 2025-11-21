@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# adm-env - Inicialização de ambiente do ADM 2.0
+# Este script deve ser "sourceado" por todos os outros scripts.
+# Também pode ser executado diretamente com --print-vars para debug.
+
+# Segurança básica
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Utilidades internas básicas (não usam ainda variáveis globais do ADM)
+# =========
+
+_adm_die() {
+    # Imprime erro em stderr e sai com código != 0
+    # Uso: _adm_die "mensagem"
+    local msg=${1:-"erro desconhecido"}
+    printf 'ADM-ERROR: %s\n' "$msg" >&2
+    exit 1
+}
+
+_adm_warn() {
+    # Avisos não fatais
+    local msg=${1:-"aviso"}
+    printf 'ADM-WARN: %s\n' "$msg" >&2
+}
+
+_adm_cmd_exists() {
+    # Verifica se um comando existe no PATH
+    # Uso: _adm_cmd_exists nome && ...
+    command -v "$1" >/dev/null 2>&1
+}
+
+# =========
+# Detecção de localização e ROOT
+# =========
+
+# Detecta diretório onde o script está (funciona para source e execução direta)
+# BASH_SOURCE[0] existe quando o script é sourceado; $0 quando executado.
+_adm_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    # Se for um link simbólico, resolve
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || _adm_die "Não foi possível entrar no diretório do script."
+    pwd
+}
+
+# Se ADM_ROOT já estiver definido externamente, respeitamos.
+if [[ -n "${ADM_ROOT:-}" ]]; then
+    # Normaliza para caminho absoluto
+    if [[ "${ADM_ROOT:0:1}" != "/" ]]; then
+        ADM_ROOT="$(cd "$ADM_ROOT" >/dev/null 2>&1 && pwd)"
+    fi
+else
+    # ADM_ROOT padrão é o diretório pai de scripts/
+    _ADM_SCRIPTS_DIR_DETECTED="$(_adm_script_dir)"
+    ADM_ROOT="$(cd "$_ADM_SCRIPTS_DIR_DETECTED/.." >/dev/null 2>&1 && pwd)"
+fi
+
+# Valida se ADM_ROOT bate com o esperado do projeto
+if [[ ! -d "$ADM_ROOT" ]]; then
+    _adm_die "ADM_ROOT '$ADM_ROOT' não existe. Verifique a instalação em /root/usr/src/adm."
+fi
+
+# Diretório de scripts detectado
+ADM_SCRIPTS_DIR="${ADM_SCRIPTS_DIR:-"$ADM_ROOT/scripts"}"
+
+if [[ ! -d "$ADM_SCRIPTS_DIR" ]]; then
+    _adm_die "Diretório de scripts '$ADM_SCRIPTS_DIR' não existe. Esperado: $ADM_ROOT/scripts"
+fi
+
+# =========
+# Definição de diretórios padrão do ADM
+# =========
+
+ADM_PACKAGES_DIR="${ADM_PACKAGES_DIR:-"$ADM_ROOT/packages"}"
+ADM_BUILD_DIR="${ADM_BUILD_DIR:-"$ADM_ROOT/build"}"
+ADM_DEST_DIR="${ADM_DEST_DIR:-"$ADM_ROOT/dest"}"
+ADM_CACHE_SRC_DIR="${ADM_CACHE_SRC_DIR:-"$ADM_ROOT/cache-src"}"
+ADM_CACHE_BIN_DIR="${ADM_CACHE_BIN_DIR:-"$ADM_ROOT/cache-bin"}"
+ADM_LOG_DIR="${ADM_LOG_DIR:-"$ADM_ROOT/logs"}"
+ADM_DB_DIR="${ADM_DB_DIR:-"$ADM_ROOT/db"}"
+ADM_DB_INSTALLED_DIR="${ADM_DB_INSTALLED_DIR:-"$ADM_DB_DIR/installed"}"
+ADM_DB_HISTORY_DIR="${ADM_DB_HISTORY_DIR:-"$ADM_DB_DIR/history"}"
+ADM_DB_SNAPSHOTS_DIR="${ADM_DB_SNAPSHOTS_DIR:-"$ADM_DB_DIR/snapshots"}"
+ADM_DB_KNOWLEDGE_DIR="${ADM_DB_KNOWLEDGE_DIR:-"$ADM_DB_DIR/knowledge"}"
+ADM_DB_METRICS_DIR="${ADM_DB_METRICS_DIR:-"$ADM_DB_DIR/metrics"}"
+ADM_DB_EVENTS_DIR="${ADM_DB_EVENTS_DIR:-"$ADM_DB_DIR/events"}"
+ADM_DB_UPGRADE_LIST="${ADM_DB_UPGRADE_LIST:-"$ADM_DB_DIR/upgrade-list"}"
+
+ADM_BACKUP_DIR="${ADM_BACKUP_DIR:-"$ADM_ROOT/backup"}"
+ADM_BACKUP_METADADOS_DIR="${ADM_BACKUP_METADADOS_DIR:-"$ADM_BACKUP_DIR/metadados"}"
+
+ADM_TMP_DIR="${ADM_TMP_DIR:-"$ADM_ROOT/tmp"}"
+ADM_LOCK_DIR="${ADM_LOCK_DIR:-"$ADM_ROOT/lock"}"
+
+# Versão do ADM
+ADM_VERSION="${ADM_VERSION:-"2.0"}"
+
+# =========
+# Detecção de TTY, cores e emojis
+# =========
+
+# É TTY?
+if [ -t 1 ]; then
+    ADM_IS_TTY=1
+else
+    ADM_IS_TTY=0
+fi
+
+# Se não for forçado a desativar cor
+ADM_NO_COLOR="${ADM_NO_COLOR:-0}"
+
+if [[ "$ADM_NO_COLOR" -eq 0 && "$ADM_IS_TTY" -eq 1 ]]; then
+    ADM_COLOR_RESET=$'\033[0m'
+    ADM_COLOR_BOLD=$'\033[1m'
+    ADM_COLOR_DIM=$'\033[2m'
+    ADM_COLOR_RED=$'\033[31m'
+    ADM_COLOR_GREEN=$'\033[32m'
+    ADM_COLOR_YELLOW=$'\033[33m'
+    ADM_COLOR_BLUE=$'\033[34m'
+    ADM_COLOR_MAGENTA=$'\033[35m'
+    ADM_COLOR_CYAN=$'\033[36m'
+    ADM_COLOR_WHITE=$'\033[37m'
+else
+    ADM_COLOR_RESET=''
+    ADM_COLOR_BOLD=''
+    ADM_COLOR_DIM=''
+    ADM_COLOR_RED=''
+    ADM_COLOR_GREEN=''
+    ADM_COLOR_YELLOW=''
+    ADM_COLOR_BLUE=''
+    ADM_COLOR_MAGENTA=''
+    ADM_COLOR_CYAN=''
+    ADM_COLOR_WHITE=''
+fi
+
+# Emojis (podem ser desligados com ADM_NO_EMOJI=1)
+ADM_NO_EMOJI="${ADM_NO_EMOJI:-0}"
+if [[ "$ADM_NO_EMOJI" -eq 0 ]]; then
+    ADM_EMOJI_OK="✔"
+    ADM_EMOJI_FAIL="✖"
+    ADM_EMOJI_WARN="!"
+    ADM_EMOJI_SPIN='-\|/'
+else
+    ADM_EMOJI_OK="[OK]"
+    ADM_EMOJI_FAIL="[FAIL]"
+    ADM_EMOJI_WARN="[!]"
+    ADM_EMOJI_SPIN='-\|/'
+fi
+
+# =========
+# Checagem de dependências básicas do sistema
+# =========
+
+adm_check_core_deps() {
+    # Verifica se comandos essenciais existem; se não, aborta cedo
+    local missing=()
+
+    for cmd in bash mkdir date printf cat grep sed awk; do
+        if ! _adm_cmd_exists "$cmd"; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if ((${#missing[@]} > 0)); then
+        _adm_die "Faltam comandos essenciais no sistema: ${missing[*]}"
+    fi
+
+    # flock é usado para locks; se não existir, avisar mas não abortar
+    if ! _adm_cmd_exists flock; then
+        _adm_warn "Comando 'flock' não encontrado. Locks de arquivo não estarão disponíveis."
+    fi
+}
+
+# =========
+# Inicialização de diretórios
+# =========
+
+adm_init_dirs() {
+    # Cria toda a árvore de diretórios necessária, com checagem de erros
+    local dirs=(
+        "$ADM_PACKAGES_DIR"
+        "$ADM_BUILD_DIR"
+        "$ADM_DEST_DIR"
+        "$ADM_CACHE_SRC_DIR"
+        "$ADM_CACHE_BIN_DIR"
+        "$ADM_LOG_DIR"
+        "$ADM_DB_DIR"
+        "$ADM_DB_INSTALLED_DIR"
+        "$ADM_DB_HISTORY_DIR"
+        "$ADM_DB_SNAPSHOTS_DIR"
+        "$ADM_DB_KNOWLEDGE_DIR"
+        "$ADM_DB_METRICS_DIR"
+        "$ADM_DB_EVENTS_DIR"
+        "$ADM_BACKUP_DIR"
+        "$ADM_BACKUP_METADADOS_DIR"
+        "$ADM_TMP_DIR"
+        "$ADM_LOCK_DIR"
+    )
+
+    local d
+    for d in "${dirs[@]}"; do
+        if [[ ! -d "$d" ]]; then
+            mkdir -p "$d" || _adm_die "Falha ao criar diretório '$d'."
+        fi
+    done
+
+    # Garante que upgrade-list exista como arquivo (vazio se não houver)
+    if [[ ! -e "$ADM_DB_UPGRADE_LIST" ]]; then
+        : >"$ADM_DB_UPGRADE_LIST" || _adm_die "Falha ao criar '$ADM_DB_UPGRADE_LIST'."
+    fi
+}
+
+# =========
+# Locks de arquivo
+# =========
+
+adm_with_lock() {
+    # Executa um comando protegido por lock.
+    # Uso:
+    #   adm_with_lock nome_lock comando arg1 arg2 ...
+    #
+    # Se 'flock' não existir, executa sem lock, mas avisa uma vez.
+    local lock_name=${1:-}
+    shift || true
+
+    if [[ -z "$lock_name" ]]; then
+        _adm_die "adm_with_lock requer um nome de lock."
+    fi
+
+    if [[ $# -eq 0 ]]; then
+        _adm_die "adm_with_lock requer um comando para executar."
+    fi
+
+    local lock_file="$ADM_LOCK_DIR/$lock_name.lock"
+
+    if _adm_cmd_exists flock; then
+        # shellcheck disable=SC2016
+        flock --timeout 120 "$lock_file" bash -c '"$@"' _ "$@" || _adm_die "Falha ao obter lock '$lock_name'."
+    else
+        # Sem flock: executa direto (sem travamento real)
+        _adm_warn "Executando '$*' sem lock '$lock_name' porque 'flock' não está disponível."
+        "$@"
+    fi
+}
+
+# =========
+# Impressão de variáveis (modo CLI)
+# =========
+
+adm_print_vars() {
+    cat <<EOF
+ADM_VERSION=$ADM_VERSION
+ADM_ROOT=$ADM_ROOT
+ADM_SCRIPTS_DIR=$ADM_SCRIPTS_DIR
+ADM_PACKAGES_DIR=$ADM_PACKAGES_DIR
+ADM_BUILD_DIR=$ADM_BUILD_DIR
+ADM_DEST_DIR=$ADM_DEST_DIR
+ADM_CACHE_SRC_DIR=$ADM_CACHE_SRC_DIR
+ADM_CACHE_BIN_DIR=$ADM_CACHE_BIN_DIR
+ADM_LOG_DIR=$ADM_LOG_DIR
+ADM_DB_DIR=$ADM_DB_DIR
+ADM_DB_INSTALLED_DIR=$ADM_DB_INSTALLED_DIR
+ADM_DB_HISTORY_DIR=$ADM_DB_HISTORY_DIR
+ADM_DB_SNAPSHOTS_DIR=$ADM_DB_SNAPSHOTS_DIR
+ADM_DB_KNOWLEDGE_DIR=$ADM_DB_KNOWLEDGE_DIR
+ADM_DB_METRICS_DIR=$ADM_DB_METRICS_DIR
+ADM_DB_EVENTS_DIR=$ADM_DB_EVENTS_DIR
+ADM_DB_UPGRADE_LIST=$ADM_DB_UPGRADE_LIST
+ADM_BACKUP_DIR=$ADM_BACKUP_DIR
+ADM_BACKUP_METADADOS_DIR=$ADM_BACKUP_METADADOS_DIR
+ADM_TMP_DIR=$ADM_TMP_DIR
+ADM_LOCK_DIR=$ADM_LOCK_DIR
+ADM_IS_TTY=$ADM_IS_TTY
+EOF
+}
+
+# =========
+# Execução principal (quando chamado diretamente)
+# =========
+
+# Só inicializa diretórios automaticamente se NÃO for explicitamente desativado
+ADM_SKIP_INIT="${ADM_SKIP_INIT:-0}"
+
+adm_check_core_deps
+
+if [[ "$ADM_SKIP_INIT" -eq 0 ]]; then
+    adm_init_dirs
+fi
+
+# Se o script for executado diretamente (não via source) e tiver argumentos
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        --print-vars)
+            adm_print_vars
+            ;;
+        --help|-h)
+            cat <<EOF
+adm-env - Inicialização de ambiente do ADM 2.0
+
+Uso:
+  source adm-env          # em outros scripts, para carregar ambiente
+  adm-env --print-vars   # mostrar variáveis detectadas
+  adm-env --help         # esta ajuda
+
+Variáveis importantes:
+  ADM_ROOT               # raiz do ADM (detectada automaticamente)
+  ADM_*_DIR              # vários diretórios padrão (build, cache, db, etc)
+  ADM_VERSION            # versão do framework ADM
+
+EOF
+            ;;
+        "")
+            # Sem args: imprime variáveis básicas
+            adm_print_vars
+            ;;
+        *)
+            _adm_die "Opção desconhecida para adm-env: $1"
+            ;;
+    esac
+fi
+
+# Fim do adm-env
