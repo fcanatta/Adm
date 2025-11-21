@@ -1,0 +1,646 @@
+#!/usr/bin/env bash
+# adm-deps - Resolução de dependências do ADM 2.0
+#
+# Responsável por:
+#   - Ler build_deps / run_deps / opt_deps / groups do metadado
+#   - Incorporar auto_build_deps do .plan (gerado pelo adm-scan)
+#   - Resolver grafo de dependências de build (topological sort)
+#   - Resolver árvore completa de deps de um pacote
+#   - Descobrir reverse deps (quem depende de quem) a partir dos metadados
+#
+# Uso via outros scripts:
+#   source adm-deps
+#   adm_deps_get_build_deps "categoria/pacote"
+#   adm_deps_build_order "cat/pkg" "cat2/pkg2" ...
+#
+# Uso via CLI para debug:
+#   adm-deps list-build-deps PKG_ID
+#   adm-deps list-run-deps PKG_ID
+#   adm-deps build-order PKG1 [PKG2 ...]
+#   adm-deps full-tree PKG_ID
+#   adm-deps reverse-deps PKG_ID
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_deps_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-deps.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_DEPS_DIR="$(_adm_deps_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_DEPS_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_DEPS_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_DEPS_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_DEPS_DIR/adm-metrics"
+# adm-knowledge pode ser usado depois para heurísticas extras, se precisar
+# shellcheck disable=SC1090
+source "$_ADM_DEPS_DIR/adm-knowledge"
+
+# =========
+# Utilidades básicas
+# =========
+
+adm_deps_pkg_id_to_parts() {
+    # Converte "categoria/pacote" em "categoria pacote"
+    local pkg_id="${1:-}"
+    if [[ "$pkg_id" != */* ]]; then
+        adm_log_fatal "PKG_ID inválido (esperado categoria/pacote): '$pkg_id'"
+    fi
+    local cat="${pkg_id%%/*}"
+    local name="${pkg_id##*/}"
+    printf '%s %s\n' "$cat" "$name"
+}
+
+adm_deps_metadado_path() {
+    # Caminho do metadado para um pkg_id
+    # /root/usr/src/adm/packages/categoria/programa/metadado
+    local pkg_id="${1:-}"
+    local cat name
+    read -r cat name < <(adm_deps_pkg_id_to_parts "$pkg_id")
+    printf '%s/%s/%s/metadado' "$ADM_PACKAGES_DIR" "$cat" "$name"
+}
+
+adm_deps_prefix_for_pkg() {
+    local pkg_id="${1:-}"
+    printf '%s\n' "${pkg_id//\//__}"
+}
+
+adm_deps_read_meta_field_single() {
+    # Lê primeira ocorrência de "chave:" num metadado
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "adm-deps: metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit 0
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_deps_read_meta_field_list() {
+    # Lê TODAS as ocorrências de um campo "chave:" e quebra em tokens.
+    #
+    # Exemplo no metadado:
+    #   build_deps: base/kmod net/iproute2
+    #   build_deps: libs/zlib
+    #
+    # Uso:
+    #   adm_deps_read_meta_field_list arquivo "build_deps"
+    #
+    # Saída:
+    #   lista de tokens separados por espaço, sem duplicados.
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "adm-deps: metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            # chave sem valor na mesma linha: pega próxima linha, se não vazia
+            if (getline line > 0) {
+                sub(/#.*/, "", line)
+                gsub(/[[:space:]]+/, " ", line)
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                if (length(line) > 0) print line
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            # chave: valor...
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            sub(/#.*/, "", $0)
+            gsub(/[[:space:]]+/, " ", $0)
+            sub(/^[[:space:]]+/, "", $0)
+            sub(/[[:space:]]+$/, "", $0)
+            if (length($0) > 0) print $0
+        }
+    ' "$file" | awk '
+        {
+            for (i=1; i<=NF; i++) {
+                token=$i
+                if (!(token in seen)) {
+                    seen[token]=1
+                    printf "%s ", token
+                }
+            }
+        }
+        END {
+            # nada
+        }
+    ' | sed 's/[[:space:]]\+$//'
+}
+
+# =========
+# Leitura de deps e groups
+# =========
+
+adm_deps_get_build_deps() {
+    # Retorna build_deps do metadado + auto_build_deps do .plan (se houver).
+    #
+    # Saída: lista de pkg_id separados por espaço.
+    local pkg_id="${1:-}"
+    local meta plan_file version auto_deps build_deps
+
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    build_deps="$(adm_deps_read_meta_field_list "$meta" "build_deps" || true)"
+
+    # tenta ler versão pra localizar .plan
+    version="$(adm_deps_read_meta_field_single "$meta" "version" || true)"
+    if [[ -z "$version" ]]; then
+        version="unknown"
+    fi
+
+    # path do .plan (mesma convenção do adm-scan)
+    plan_file="$ADM_BUILD_DIR/$(adm_deps_prefix_for_pkg "$pkg_id")__${version}.plan"
+    auto_deps=""
+
+    if [[ -f "$plan_file" ]]; then
+        auto_deps="$(awk -F'=' '/^auto_build_deps[[:space:]]*=/{
+            $1=""; sub(/^[[:space:]]+/, "", $0); print $0; exit
+        }' "$plan_file" | sed 's/[[:space:]]\+$//' || true)"
+    fi
+
+    # Junta e remove duplicados
+    {
+        printf '%s\n' "$build_deps"
+        printf '%s\n' "$auto_deps"
+    } | tr ' ' '\n' | sed '/^$/d' | awk '!seen[$0]++' | tr '\n' ' ' | sed 's/[[:space:]]\+$//'
+}
+
+adm_deps_get_run_deps() {
+    local pkg_id="${1:-}"
+    local meta run_deps
+
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    run_deps="$(adm_deps_read_meta_field_list "$meta" "run_deps" || true)"
+    printf '%s\n' "$run_deps"
+}
+
+adm_deps_get_opt_deps() {
+    local pkg_id="${1:-}"
+    local meta opt_deps
+
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    opt_deps="$(adm_deps_read_meta_field_list "$meta" "opt_deps" || true)"
+    printf '%s\n' "$opt_deps"
+}
+
+adm_deps_get_groups() {
+    local pkg_id="${1:-}"
+    local meta groups
+
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    groups="$(adm_deps_read_meta_field_list "$meta" "groups" || true)"
+    printf '%s\n' "$groups"
+}
+
+# =========
+# Carregar deps recursivamente (grafo)
+# =========
+
+# Vamos manter mapas em arquivos temporários na chamada atual.
+# Formato:
+#   grafo: pkg_id<TAB>dep1 dep2 dep3 ...
+#   seen:  pkg_id uma-linha
+
+adm_deps_build_graph_for_roots() {
+    # Constrói grafo de dependências para uma lista de pacotes raiz.
+    #
+    # Uso:
+    #   adm_deps_build_graph_for_roots tmp_graph tmp_seen PKG1 [PKG2 ...]
+    #
+    # Efeito:
+    #   - preenche tmp_graph e tmp_seen
+    if [[ $# -lt 3 ]]; then
+        adm_log_fatal "adm_deps_build_graph_for_roots: uso: adm_deps_build_graph_for_roots GRAFO SEEN PKG1 [PKG2 ...]"
+    fi
+
+    local graph_file="$1"
+    local seen_file="$2"
+    shift 2 || true
+
+    : >"$graph_file"
+    : >"$seen_file"
+
+    local pkg
+    for pkg in "$@"; do
+        adm_deps__dfs_build_graph "$pkg" "$graph_file" "$seen_file"
+    done
+}
+
+adm_deps__dfs_build_graph() {
+    # DFS recursivo para construir grafo.
+    # Uso interno:
+    #   adm_deps__dfs_build_graph PKG graph_file seen_file
+    local pkg_id="${1:-}"
+    local graph_file="${2:-}"
+    local seen_file="${3:-}"
+
+    if [[ -z "$pkg_id" ]]; then
+        return 0
+    fi
+
+    # Verifica se já visto
+    if grep -qxF "$pkg_id" "$seen_file" 2>/dev/null; then
+        return 0
+    fi
+    printf '%s\n' "$pkg_id" >>"$seen_file"
+
+    local meta
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado ao resolver deps de '$pkg_id': '$meta'"
+    fi
+
+    local deps
+    deps="$(adm_deps_get_build_deps "$pkg_id" || true)"
+
+    # registra no grafo
+    printf '%s\t%s\n' "$pkg_id" "$deps" >>"$graph_file"
+
+    # recursão para deps
+    local dep
+    for dep in $deps; do
+        adm_deps__dfs_build_graph "$dep" "$graph_file" "$seen_file"
+    done
+}
+
+# =========
+# Topological sort (DFS com detecção de ciclo)
+# =========
+
+adm_deps_toposort_from_graph() {
+    # Recebe um arquivo de grafo (pkg_id<TAB>deps...) e imprime
+    # ordem topológica (um pkg por linha).
+    local graph_file="${1:-}"
+
+    if [[ ! -f "$graph_file" ]]; then
+        adm_log_fatal "adm_deps_toposort_from_graph: grafo não encontrado: '$graph_file'"
+    fi
+
+    # Vamos fazer toposort em awk (mais simples do que reimplementar DFS em bash puro)
+    awk -F '\t' '
+        {
+            pkg=$1
+            deps_line=(NF>=2 ? $2 : "")
+            pkgs[pkg]=1
+
+            ndeps=split(deps_line, arr, " ")
+            for (i=1; i<=ndeps; i++) {
+                d = arr[i]
+                if (d == "") continue
+                deps[pkg, d]=1
+                pkgs[d]=1
+            }
+        }
+        END {
+            # DFS com marcação:
+            # mark[pkg] = 0 (não visitado), 1 (visitando), 2 (finalizado)
+            for (p in pkgs) {
+                mark[p]=0
+            }
+
+            has_cycle=0
+
+            # define recursivo
+            function dfs(p,   d) {
+                if (mark[p] == 1) {
+                    # ciclo
+                    has_cycle=1
+                    printf "ADM-ERROR: ciclo de dependências detectado em %s\n", p >"/dev/stderr"
+                    return
+                }
+                if (mark[p] == 2) return
+
+                mark[p]=1
+                # percorre deps
+                for (d in pkgs) {
+                    if (deps[p, d]) {
+                        dfs(d)
+                        if (has_cycle) return
+                    }
+                }
+                mark[p]=2
+                order[norder++] = p
+            }
+
+            # roda DFS em todos
+            for (p in pkgs) {
+                if (mark[p] == 0) {
+                    dfs(p)
+                    if (has_cycle) {
+                        exit 1
+                    }
+                }
+            }
+
+            # imprime na ordem certa (deps primeiro)
+            for (i=norder-1; i>=0; i--) {
+                print order[i]
+            }
+        }
+    ' "$graph_file"
+}
+
+# =========
+# API: ordem de build e árvore completa
+# =========
+
+adm_deps_build_order() {
+    # Recebe uma lista de PKG_IDs e imprime ordem de build com deps.
+    #
+    # Uso:
+    #   adm_deps_build_order PKG1 [PKG2 ...]
+    #
+    # Resultado:
+    #   Pacotes em ordem de compilação (um por linha).
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_deps_build_order: uso: adm_deps_build_order PKG1 [PKG2 ...]"
+    fi
+
+    local tmp_graph tmp_seen
+    tmp_graph="$(mktemp "$ADM_TMP_DIR/deps-graph-XXXXXX")" || adm_log_fatal "Falha ao criar tmp grafo."
+    tmp_seen="$(mktemp "$ADM_TMP_DIR/deps-seen-XXXXXX")" || adm_log_fatal "Falha ao criar tmp vistos."
+
+    adm_deps_build_graph_for_roots "$tmp_graph" "$tmp_seen" "$@"
+
+    adm_log_info "Resolvendo ordem de build para: $*"
+    local order
+    if ! order="$(adm_deps_toposort_from_graph "$tmp_graph")"; then
+        adm_log_fatal "Falha ao resolver ordem de build (ciclo de dependências)."
+    fi
+
+    printf '%s\n' "$order"
+
+    rm -f "$tmp_graph" "$tmp_seen" || true
+
+    adm_event_emit "DEPS_BUILD_ORDER" "-" "pkgs=$*"
+}
+
+adm_deps_full_tree_for_pkg() {
+    # Imprime árvore completa de deps (apenas lista) para um pacote.
+    #
+    # Uso:
+    #   adm_deps_full_tree_for_pkg PKG_ID
+    #
+    # Saída:
+    #   lista de todos os pacotes necessários (exceto o próprio), um por linha.
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_deps_full_tree_for_pkg: uso: adm_deps_full_tree_for_pkg PKG_ID"
+    fi
+
+    local pkg="$1"
+    local tmp_graph tmp_seen
+    tmp_graph="$(mktemp "$ADM_TMP_DIR/deps-graph-XXXXXX")" || adm_log_fatal "Falha ao criar tmp grafo."
+    tmp_seen="$(mktemp "$ADM_TMP_DIR/deps-seen-XXXXXX")" || adm_log_fatal "Falha ao criar tmp vistos."
+
+    adm_deps_build_graph_for_roots "$tmp_graph" "$tmp_seen" "$pkg"
+
+    # extrai todos os pacotes do grafo (primeira coluna), exceto o próprio
+    awk -F '\t' -v root="$pkg" 'NF>=1 && $1 != root {print $1}' "$tmp_graph" | sort -u
+
+    rm -f "$tmp_graph" "$tmp_seen" || true
+
+    adm_event_emit "DEPS_FULL_TREE" "$pkg" ""
+}
+
+# =========
+# Reverse deps (por metadado)
+# =========
+
+adm_deps_reverse_deps() {
+    # Busca todos os pacotes que listam TARGET_PKG em build_deps ou run_deps.
+    #
+    # Uso:
+    #   adm_deps_reverse_deps TARGET_PKG_ID
+    #
+    # Nota:
+    #   - Percorre todos os metadados em ADM_PACKAGES_DIR.
+    #   - Pode ser pesado em árvores grandes, mas é simples e robusto.
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_deps_reverse_deps: uso: adm_deps_reverse_deps TARGET_PKG_ID"
+    fi
+
+    local target="$1"
+    local base="$ADM_PACKAGES_DIR"
+
+    if [[ ! -d "$base" ]]; then
+        adm_log_fatal "Diretório de packages não encontrado: '$base'"
+    fi
+
+    local meta pkg_id cat name
+    # Percorre todos os metadados
+    while IFS= read -r meta; do
+        [[ -z "$meta" ]] && continue
+
+        # Deduz pkg_id a partir do caminho:
+        # .../packages/categoria/nome/metadado
+        local rel
+        rel="${meta#$ADM_PACKAGES_DIR/}"      # remove prefixo
+        rel="${rel%/metadado}"                # remove /metadado
+        cat="${rel%%/*}"
+        name="${rel##*/}"
+        pkg_id="$cat/$name"
+
+        local bdeps rdeps
+        bdeps="$(adm_deps_read_meta_field_list "$meta" "build_deps" || true)"
+        rdeps="$(adm_deps_read_meta_field_list "$meta" "run_deps" || true)"
+
+        local found=0
+        local d
+        for d in $bdeps; do
+            if [[ "$d" == "$target" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            for d in $rdeps; do
+                if [[ "$d" == "$target" ]]; then
+                    found=1
+                    break
+                fi
+            done
+        fi
+
+        if [[ $found -eq 1 ]]; then
+            printf '%s\n' "$pkg_id"
+        fi
+    done < <(find "$base" -type f -name "metadado" 2>/dev/null)
+
+    adm_event_emit "DEPS_REVERSE" "$target" ""
+}
+
+# =========
+# CLI
+# =========
+
+adm_deps_usage() {
+    cat <<EOF
+adm-deps - Resolução de dependências do ADM 2.0
+
+Uso (CLI de debug):
+
+  Listar dependências de build:
+    adm-deps list-build-deps PKG_ID
+
+  Listar dependências de runtime:
+    adm-deps list-run-deps PKG_ID
+
+  Listar dependências opcionais:
+    adm-deps list-opt-deps PKG_ID
+
+  Listar grupos de um pacote:
+    adm-deps list-groups PKG_ID
+
+  Ordem de build (com deps):
+    adm-deps build-order PKG1 [PKG2 ...]
+      - Imprime pacotes em ordem de compilação, um por linha.
+      - Inclui todas as dependências de build (metadado + auto_build_deps).
+
+  Árvore completa de deps de um pacote:
+    adm-deps full-tree PKG_ID
+      - Lista todos os pacotes necessários para buildar PKG_ID.
+
+  Reverse deps:
+    adm-deps reverse-deps TARGET_PKG_ID
+      - Lista pacotes que dependem de TARGET_PKG_ID
+        (em build_deps ou run_deps).
+
+  adm-deps --help
+      Mostra esta ajuda.
+
+Na prática:
+  - adm-build e adm-upgrade devem usar:
+      adm_deps_get_build_deps
+      adm_deps_get_run_deps
+      adm_deps_build_order
+      adm_deps_reverse_deps
+EOF
+}
+
+adm_deps_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        list-build-deps)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps list-build-deps PKG_ID"
+            fi
+            adm_deps_get_build_deps "$1"
+            ;;
+        list-run-deps)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps list-run-deps PKG_ID"
+            fi
+            adm_deps_get_run_deps "$1"
+            ;;
+        list-opt-deps)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps list-opt-deps PKG_ID"
+            fi
+            adm_deps_get_opt_deps "$1"
+            ;;
+        list-groups)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps list-groups PKG_ID"
+            fi
+            adm_deps_get_groups "$1"
+            ;;
+        build-order)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps build-order PKG1 [PKG2 ...]"
+            fi
+            adm_deps_build_order "$@"
+            ;;
+        full-tree)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps full-tree PKG_ID"
+            fi
+            adm_deps_full_tree_for_pkg "$1"
+            ;;
+        reverse-deps)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-deps reverse-deps TARGET_PKG_ID"
+            fi
+            adm_deps_reverse_deps "$1"
+            ;;
+        --help|-h|"")
+            adm_deps_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-deps: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_deps_main "$@"
+fi
+
+# Fim do adm-deps
