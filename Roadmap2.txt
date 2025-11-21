@@ -261,7 +261,78 @@ tui (modo texto interativo)
 
 delega as ações para os scripts acima
 
+Futuras melhorias e evolução inteligente
+
+Implementar um orquestrador central de tarefas com estados (pendente/em andamento/concluído) para todas as operações (fetch, scan, build, check, update, upgrade).
+
+Criar um barramento de eventos (event bus) interno, onde scripts emitem eventos (PKG_BUILD_DONE, PKG_CHECK_FAILED, etc.) e o adm tui/outros componentes podem reagir.
+
+Construir um banco de conhecimento em db/knowledge/ com:
+
+mapeamento de includes → pacotes
+
+padrões de build → build_system
+
+histórico de detecções de dependências
 
 
+Adicionar lógica de auto-ajuste de metadados:
 
-Futuras melhorias
+sugerir ou aplicar correções em build_deps/run_deps com base no que o scanner detecta repetidamente.
+
+
+Evoluir adm-update/adm-upgrade com análise de impacto de ABI/API:
+
+comparar SONAMEs e símbolos exportados
+
+classificar atualizações em “seguras” ou “quebra-ABI”
+
+rebuild automático apenas de dependentes afetados.
+
+
+Implementar cache de compilação integrado (tipo ccache) e assinatura de build (pacote + versão + profile + libc + flags) para reutilizar binários de cache-bin/.
+
+Adicionar paralelismo global:
+
+fila de jobs de build respeitando dependências
+
+controle de número máximo de builds simultâneos por CPU/memória.
+
+
+Criar suporte a snapshots:
+
+adm snapshot create|diff|restore para capturar/voltar ao estado de versões de todo o sistema.
+
+
+Estender adm-check com validações avançadas de:
+
+RPATH, SONAME, compatibilidade com libc/toolchain
+
+detecção de scripts ou binários órfãos.
+
+
+Adicionar sistema de métricas e relatórios:
+
+tempos de build por pacote
+
+falhas recorrentes
+
+relatório adm report com estatísticas.
+
+
+Fortalecer segurança:
+
+builds sempre sandboxed em usuário não-root
+
+opção de desativar acesso à rede durante compilação
+
+assinatura/verificação de metadados e pacotes (GPG).
+
+
+Melhorar UX:
+
+TUI com barra de progresso global, gráficos simples e capacidade de pausar/priorizar builds
+
+ajuda contextual e sugestões baseadas em histórico de comandos
+
+pesquisa por linguagem, tipo de pacote, grupo, etc.
