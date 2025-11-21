@@ -1,44 +1,56 @@
-7. ROADMAP.txt (texto que você pode salvar)
-
-Abaixo um esqueleto de ROADMAP.txt que você pode copiar para um arquivo:
-
-
----
-
-ROADMAP – Gerenciador ADM (source-based)
+ROADMAP – ADM 2.0 (Gerenciador source-based inteligente)
 
 Diretórios principais
 
 /root/usr/src/adm/
 
-scripts/ – todos os scripts ADM
+scripts/ – todos os scripts ADM (sem subpastas)
 
 packages/<categoria>/<programa>/
 
 metadado
 
-hook-*
+hook-pre-*, hook-post-*
 
 
-build/ – builds em curso
+build/       – diretórios de build
 
-dest/ – DESTDIR por pacote
+dest/        – DESTDIR de cada pacote
 
-cache-src/ – cache de fontes
+cache-src/   – cache de fontes (tarballs, clones git, etc.)
 
-cache-bin/ – cache de pacotes binários
+cache-bin/   – pacotes binários gerados
 
-logs/ – logs das operações
+logs/        – logs de operações e builds
 
-db/ – estado (instalados, histórico, upgrade-list)
+db/
 
-tmp/ – temporários
+installed/   – pacotes instalados e seus arquivos
 
-backup/metadados/ – backups de metadado
+history/     – histórico de builds por pacote/operação
+
+upgrade-list – lista de pacotes para upgrade
+
+snapshots/   – snapshots de estado de sistema
+
+knowledge/   – banco de conhecimento (includes→pacotes, padrões, etc.)
+
+metrics/     – tempos, tamanhos, contadores
+
+events/      – eventos emitidos pelos scripts
 
 
+backup/metadados/ – backups de arquivos metadado
+
+tmp/         – temporários diversos
+
+
+
+Instalação final sempre em /usr.
 
 Formato do arquivo metadado
+
+Campos mínimos:
 
 name
 
@@ -52,7 +64,7 @@ license
 
 url
 
-build_deps  (lista simples)
+build_deps  (lista simples de nomes)
 
 run_deps
 
@@ -60,279 +72,332 @@ opt_deps
 
 groups      (ex.: base, xorg, toolchain)
 
-source_uri  (uma por linha, suporta http(s), git, rsync, etc)
+source_uri  (uma por linha; suporta http(s), git, gitlab, github, rsync, etc.)
 
-source_checksum (uma por linha, sha256 correspondente a cada URI)
+source_checksum (uma por linha; sha256 correspondente a cada URI)
 
 
-Scripts (por ordem de criação)
+Scripts (ordem lógica de implementação)
 
 1. adm-env
 
-define ROOT e caminhos
+Define ROOT e caminhos padrão.
 
-variáveis comuns a todos os scripts
+Ex: caminhos de build/, cache-src/, db/, logs/.
 
 
 
 2. adm-log-ui
 
-imprime linhas com timestamp, spinner, cores e símbolos (✔, ✖, !)
+Padroniza saída no terminal:
 
-funções para: iniciar operação, atualizar, finalizar com sucesso/erro
+timestamps, cores, spinner, símbolos ✔/✖/!.
 
 
+Funções para:
 
-3. adm-db
+iniciar operação, atualizar status, finalizar com sucesso/erro.
 
-leitura/gravação:
 
-pacotes instalados
-
-histórico de builds
-
-listas de upgrade/update
+Estilo visual igual ao da foto enviada.
 
 
 
+3. adm-eventd (barramento de eventos)
 
-4. adm-fetch
+API simples para scripts emitirem eventos:
 
-interpreta source_uri
+PKG_FETCH_STARTED, PKG_BUILD_DONE, UPGRADE_PLAN_READY, etc.
 
-escolhe fetcher correto (git, http, rsync…)
 
-baixa em cache-src/
+Grava eventos em db/events/.
 
-calcula e verifica source_checksum
-
-integra com adm-log-ui para mostrar progresso
+Permite que adm-tui e adm-metrics leiam em tempo real.
 
 
 
-5. adm-scan
+4. adm-db
 
-analisa árvore de source
+Lê/escreve:
 
-detecta:
+db/installed/ (info de pacotes instalados)
 
-sistema de build
+db/history/ (registros de build/update/upgrade)
 
-linguagens
-
-compilador/linker pretendido
-
-dependências (via includes, pkg-config, manifests etc)
-
-docs
+db/upgrade-list
 
 
-produz “Plano de Construção”
+Fornece funções para:
+
+registrar instalação, remoção, falha, etc.
 
 
 
-6. adm-deps
 
-junta:
+5. adm-knowledge
 
-deps dos metadados
+Mantém o banco de conhecimento em db/knowledge/:
 
-deps detectadas pelo scanner
+includes → pacotes
 
+libs detectadas → pacotes
 
-monta grafo de dependências
-
-gera ordem de build
-
-resolve grupos (groups)
+padrões de arquivos → build_system.
 
 
+Recebe eventos de adm-scan e adm-check e atualiza mapeamentos.
 
-7. adm-build
-
-cria diretório de build
-
-chama adm-fetch e adm-scan
-
-aplica hooks (hook-pre-*, hook-post-*)
-
-roda fases: configure, build, test, install em DESTDIR
-
-empacota DESTDIR e instala em /usr
-
-atualiza DB
-
-usa adm-log-ui para saída
+Ajuda adm-scan e adm-deps a inferirem deps com mais precisão.
 
 
 
-8. adm-check
+6. adm-metrics
 
-verifica pacotes instalados ou em DESTDIR:
+Grava métricas:
 
-permissões, donos, links
+tempo total de build por pacote
 
-libs dinâmicas e RPATH
+tempos das fases (fetch, scan, build, check)
+
+tamanho de pacotes binários
+
+contagem de falhas/sucessos.
+
+
+Lê eventos de adm-eventd.
+
+
+
+7. adm-fetch
+
+Lê source_uri do metadado.
+
+Identifica tipo (git, http, sourceforge, rsync…).
+
+Faz download em paralelo para cache-src/.
+
+Calcula sha256 e compara com source_checksum.
+
+Emite eventos PKG_FETCH_*.
+
+Integra com adm-log-ui e adm-metrics.
+
+
+
+8. adm-scan
+
+Extrai fontes em build/….
+
+Detecta:
+
+build_system (autotools, cmake, meson, python, rust, go, etc.)
+
+linguagens usadas (C, C++, Rust, Go, Fortran, etc.)
+
+compiladores/linkers preferidos (via Makefile, configure, etc.)
+
+dependências (includes, pkg-config, manifests).
+
+
+Gera um “Plano de Construção” para cada pacote.
+
+Emite PKG_SCAN_DONE.
+
+Alimenta adm-knowledge.
+
+
+
+9. adm-deps
+
+Junta deps declaradas (build_deps, run_deps, opt_deps) com deps detectadas pelo scanner.
+
+Constrói grafo de dependências:
+
+normal (quem eu preciso)
+
+reverso (quem depende de mim).
+
+
+Calcula ordens de build.
+
+É usado por adm, adm-build, adm-update, adm-upgrade.
+
+
+
+10. adm-build
+
+Recebe plano de build e ordem de dependências.
+
+Escolhe profile, libc e toolchain.
+
+Prepara chroot/sandbox.
+
+Executa fases:
+
+hooks hook-pre-*
+
+configure (conforme build_system)
+
+build (com cache de compilação)
+
+test (opcional)
+
+install em DESTDIR (dest/).
+
+hooks hook-post-*
+
+
+Empacota DESTDIR em cache-bin/.
+
+Instala em /usr.
+
+Atualiza db/installed e db/history.
+
+Emite eventos PKG_BUILD_*.
+
+Chama adm-check ao final (se configurado).
+
+
+
+11. adm-check
+
+Verifica:
+
+permissões, donos, links simbólicos
+
+libs dinâmicas (ldd) e RPATH seguro
 
 shebangs
 
-docs/manpages
+docs e manpages em locais certos.
 
 
-marca problema no DB e em logs
+Integra com adm-knowledge (associa libs detectadas a pacotes).
 
-
-
-9. adm-update
-
-recebe alvo (programa, grupo, all)
-
-descobre nova versão upstream
-
-faz backup do metadado
-
-atualiza version, source_uri, source_checksum
-
-baixa novo source via adm-fetch
-
-roda adm-scan pra detectar deps
-
-atualiza build_deps/run_deps
-
-gera metadados esqueleto para deps novas
-
-grava db/upgrade-list com programas a atualizar
-
-suporta --force para marcar rebuild mesmo sem nova versão
+Emite PKG_CHECK_OK ou PKG_CHECK_FAILED.
 
 
 
-10. adm-upgrade
+12. adm-update
 
-lê db/upgrade-list
+Alvos: pacote, grupo ou --all.
 
-identifica:
+Para cada alvo:
 
-pacotes com nova versão
+verifica nova versão upstream (GitHub/GitLab/tarball/rsync).
 
-pacotes marcados para rebuild forçado
+se houver:
 
-dependentes de ABI quebrada
+faz backup de metadado.
 
+atualiza version, source_uri.
 
-resolve ordem via adm-deps
+chama adm-fetch para baixar novo source e gerar source_checksum.
 
-chama adm-build para cada um
+chama adm-scan e ajusta build_deps/run_deps.
 
-opcionalmente chama adm-check após cada build
-
-atualiza DB com novas versões
-
+gera metadados-esqueleto para novas deps.
 
 
-11. adm
+se não houver:
 
-CLI principal
+marca como “up-to-date”.
 
-comandos:
+se --force, adiciona à lista com flag de rebuild.
 
-build
 
-build-group
 
-update
+Mantém db/upgrade-list com todos os pacotes e versões novas.
 
-upgrade
+Emite eventos UPDATE_*.
+
+
+
+13. adm-upgrade
+
+Lê db/upgrade-list (ou arquivo).
+
+Usa adm-deps para descobrir reverse deps.
+
+Analisa impacto de ABI/API:
+
+compara SONAMEs e, se possível, símbolos exportados.
+
+classifica upgrades como “safe” ou “abi-break”.
+
+
+Gera planos:
+
+safe, full ou customizados.
+
+
+Resolve ordem de build e chama adm-build para cada item.
+
+Reaproveita pacotes de cache-bin/ quando assinatura de build é igual.
+
+Atualiza db/installed e db/history.
+
+Emite eventos UPGRADE_*.
+
+
+
+14. adm-snapshot
+
+create: registra versões de todos os pacotes, profiles e toolchains.
+
+diff: compara snapshots.
+
+restore: calcula o que precisa ser buildado/upgrade/downgrade para voltar ao estado gravado.
+
+
+
+15. adm-report
+
+Lê db/metrics e db/history.
+
+Gera relatórios:
+
+pacotes que mais demoram
+
+pacotes que mais falham
+
+estatísticas de uso.
+
+
+
+
+16. adm-tui
+
+Interface de texto usando eventos e logs:
+
+mostra fila de tarefas
+
+status de cada pacote
+
+barra de progresso global
+
+acesso rápido a logs de build.
+
+
+Permite pausar/resumir build, priorizar pacotes, etc.
+
+
+
+17. adm (CLI principal)
+
+Comandos:
+
+build, build-group
+
+update, upgrade
 
 check
 
-search
+search, info, list-installed
 
-info
-
-list-installed
-
-log
+snapshot, report, tui
 
 help
 
-tui (modo texto interativo)
 
-
-delega as ações para os scripts acima
-
-Futuras melhorias e evolução inteligente
-
-Implementar um orquestrador central de tarefas com estados (pendente/em andamento/concluído) para todas as operações (fetch, scan, build, check, update, upgrade).
-
-Criar um barramento de eventos (event bus) interno, onde scripts emitem eventos (PKG_BUILD_DONE, PKG_CHECK_FAILED, etc.) e o adm tui/outros componentes podem reagir.
-
-Construir um banco de conhecimento em db/knowledge/ com:
-
-mapeamento de includes → pacotes
-
-padrões de build → build_system
-
-histórico de detecções de dependências
-
-
-Adicionar lógica de auto-ajuste de metadados:
-
-sugerir ou aplicar correções em build_deps/run_deps com base no que o scanner detecta repetidamente.
-
-
-Evoluir adm-update/adm-upgrade com análise de impacto de ABI/API:
-
-comparar SONAMEs e símbolos exportados
-
-classificar atualizações em “seguras” ou “quebra-ABI”
-
-rebuild automático apenas de dependentes afetados.
-
-
-Implementar cache de compilação integrado (tipo ccache) e assinatura de build (pacote + versão + profile + libc + flags) para reutilizar binários de cache-bin/.
-
-Adicionar paralelismo global:
-
-fila de jobs de build respeitando dependências
-
-controle de número máximo de builds simultâneos por CPU/memória.
-
-
-Criar suporte a snapshots:
-
-adm snapshot create|diff|restore para capturar/voltar ao estado de versões de todo o sistema.
-
-
-Estender adm-check com validações avançadas de:
-
-RPATH, SONAME, compatibilidade com libc/toolchain
-
-detecção de scripts ou binários órfãos.
-
-
-Adicionar sistema de métricas e relatórios:
-
-tempos de build por pacote
-
-falhas recorrentes
-
-relatório adm report com estatísticas.
-
-
-Fortalecer segurança:
-
-builds sempre sandboxed em usuário não-root
-
-opção de desativar acesso à rede durante compilação
-
-assinatura/verificação de metadados e pacotes (GPG).
-
-
-Melhorar UX:
-
-TUI com barra de progresso global, gráficos simples e capacidade de pausar/priorizar builds
-
-ajuda contextual e sugestões baseadas em histórico de comandos
-
-pesquisa por linguagem, tipo de pacote, grupo, etc.
+Converte comandos em tarefas, chama scripts apropriados e registra estado.
