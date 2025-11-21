@@ -1,0 +1,632 @@
+#!/usr/bin/env bash
+# adm-snapshot - Snapshots de estado do ADM 2.0
+#
+# Comandos:
+#
+#   adm-snapshot create [NOME]
+#       - Cria snapshot em:
+#           ${ADM_DB_DIR}/snapshots/snap-<NOME>.snap
+#         (se NOME não for passado, usa timestamp).
+#       - Registra:
+#           * [meta]
+#           * [packages]  (pkg_id, version, release, profile, libc)
+#           * [profiles]  (inclui sempre perfis extremos glibc/musl e simple toolchain)
+#           * [toolchains] (placeholder opcional, se um dia tiver adm-toolchain)
+#
+#   adm-snapshot diff SNAP_A SNAP_B
+#       - Compara dois snapshots (nomes ou caminhos explícitos).
+#       - Mostra:
+#           * pacotes só em A (removidos)
+#           * pacotes só em B (novos)
+#           * pacotes mudados (upgrade/downgrade A→B)
+#
+#   adm-snapshot restore SNAP
+#       - Compara estado atual (db/installed) com snapshot.
+#       - Calcula o que precisa para voltar ao snapshot:
+#           * install  (existem no snapshot, mas não instalados)
+#           * upgrade  (instalado < snapshot)
+#           * downgrade (instalado > snapshot)
+#           * remove   (instalados mas não aparecem no snapshot)
+#       - Gera planos:
+#           ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.install
+#           ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.upgrade
+#           ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.downgrade
+#           ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.remove
+#
+#   adm-snapshot --help
+#
+# Requisitos:
+#   - adm-env, adm-log-ui, adm-eventd, adm-metrics, adm-db
+#
+# Notas:
+#   - "Perfis extremos" para glibc/musl/toolchain são registrados na seção [profiles]
+#     mesmo que o gerenciador de profiles ainda não exista. Isso prepara terreno
+#     para o profile manager (glibc-extreme, musl-extreme, toolchain-simple).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Descobrir diretório do script e carregar módulos
+# =========
+
+_adm_snapshot_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-snapshot.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_SNAPSHOT_DIR="$(_adm_snapshot_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_SNAPSHOT_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_SNAPSHOT_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_SNAPSHOT_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_SNAPSHOT_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_SNAPSHOT_DIR/adm-db"
+
+ADM_SNAPSHOT_DIR="${ADM_DB_DIR}/snapshots"
+
+# =========
+# Utilidades de path / nome
+# =========
+
+adm_snapshot_ensure_dir() {
+    if [[ ! -d "$ADM_SNAPSHOT_DIR" ]]; then
+        mkdir -p "$ADM_SNAPSHOT_DIR" || adm_log_fatal "Falha ao criar '$ADM_SNAPSHOT_DIR'."
+    fi
+}
+
+adm_snapshot_normalize_name() {
+    # Converte um nome "foo" em "snap-foo.snap".
+    local name="$1"
+    if [[ "$name" == */* ]]; then
+        # Já parece caminho, devolve como veio
+        printf '%s\n' "$name"
+        return 0
+    fi
+    # Se já tem .snap, assume
+    if [[ "$name" == *.snap ]]; then
+        printf '%s\n' "${ADM_SNAPSHOT_DIR}/$name"
+    else
+        printf '%s\n' "${ADM_SNAPSHOT_DIR}/snap-${name}.snap"
+    fi
+}
+
+adm_snapshot_default_name() {
+    date '+snap-%Y%m%d-%H%M%S'
+}
+
+adm_snapshot_path_for_create() {
+    local name="${1:-}"
+    adm_snapshot_ensure_dir
+    if [[ -z "$name" ]]; then
+        name="$(adm_snapshot_default_name)"
+    fi
+    # tira prefixo "snap-" se o usuário passar, pra não duplicar
+    name="${name#snap-}"
+    printf '%s\n' "${ADM_SNAPSHOT_DIR}/snap-${name}.snap"
+}
+
+adm_snapshot_readable_name_from_path() {
+    local path="$1"
+    path="${path##*/}"          # tira diretórios
+    path="${path%.snap}"        # tira extensão
+    path="${path#snap-}"        # tira prefixo snap-
+    printf '%s\n' "$path"
+}
+
+# =========
+# Leitura do estado atual (db/installed)
+# =========
+
+adm_snapshot_current_packages_to_tmp() {
+    # Gera arquivo temporário com:
+    #   pkg_id<TAB>version<TAB>release<TAB>profile<TAB>libc
+    #
+    # Saída:
+    #   imprime caminho do arquivo temporário.
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/snap-current-pkgs-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para current pkgs."
+    adm_db_list_installed | awk 'NF>=2 {print $1 "\t" $2 "\t" $3 "\t" $4 "\t" $5}' >"$tmp"
+    printf '%s\n' "$tmp"
+}
+
+# =========
+# Escrita de snapshot
+# =========
+
+adm_snapshot_write_profiles_extreme() {
+    # Escreve perfis "extremos" básicos em stdout, no formato:
+    # profile_id<TAB>kind<TAB>libc<TAB>opt_level
+    #
+    # Para agora, definimos:
+    #   glibc/extreme     -> kind=extreme, libc=glibc, opt_level=O3+LTO+PGO
+    #   musl/extreme      -> kind=extreme, libc=musl, opt_level=O3+LTO
+    #   toolchain/simple  -> kind=simple,  libc=toolchain, opt_level=O2-safe
+    printf 'glibc/extreme\textreme\tglibc\tO3-LTO-PGO\n'
+    printf 'musl/extreme\textreme\tmusl\tO3-LTO\n'
+    printf 'toolchain/simple\tsimple\ttoolchain\tO2-safe\n'
+}
+
+adm_snapshot_write_toolchains_placeholder() {
+    # Por enquanto, apenas placeholder; quando existir um adm-toolchain,
+    # pode-se substituir por algo como: adm-toolchain list.
+    # Formato: toolchain_id<TAB>libc<TAB>profile<TAB>comment
+    :
+}
+
+adm_snapshot_create_core() {
+    # Uso interno: adm_snapshot_create_core NOME_SNAP
+    local name="${1:-}"
+    local path
+    path="$(adm_snapshot_path_for_create "$name")"
+
+    local short_name
+    short_name="$(adm_snapshot_readable_name_from_path "$path")"
+
+    adm_log_phase_header "Criando snapshot '$short_name' em $path"
+    adm_event_emit "SNAPSHOT_CREATE_START" "-" "name=$short_name path=$path"
+
+    local tmp_pkgs
+    tmp_pkgs="$(adm_snapshot_current_packages_to_tmp)"
+
+    local ts_epoch ts_human pid
+    ts_epoch="$(date +%s)"
+    ts_human="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    pid="$$"
+
+    {
+        echo "[meta]"
+        echo "name=$short_name"
+        echo "created_epoch=$ts_epoch"
+        echo "created_human=$ts_human"
+        echo "creator_pid=$pid"
+        echo "adm_version=2.0"
+        echo
+
+        echo "[packages]"
+        # pkg_id version release profile libc
+        awk 'NF>=2 {print}' "$tmp_pkgs"
+        echo
+
+        echo "[profiles]"
+        adm_snapshot_write_profiles_extreme
+        echo
+
+        echo "[toolchains]"
+        adm_snapshot_write_toolchains_placeholder
+        echo
+    } >"$path.tmp" || adm_log_fatal "Falha ao escrever snapshot temporário em '$path.tmp'."
+
+    mv "$path.tmp" "$path" || adm_log_fatal "Falha ao mover snapshot temporário para '$path'."
+
+    rm -f "$tmp_pkgs" || true
+
+    adm_log_ok "Snapshot criado: $path"
+    adm_event_emit "SNAPSHOT_CREATE_DONE" "-" "name=$short_name path=$path"
+}
+
+adm_snapshot_create() {
+    local name="${1:-}"
+    adm_metrics_time_block "SNAPSHOT" "SNAPSHOT_CREATE" "adm-snapshot create $name" adm_snapshot_create_core "$name"
+}
+
+# =========
+# Leitura de pacotes de um snapshot
+# =========
+
+adm_snapshot_read_packages_to_tmp() {
+    # Uso:
+    #   adm_snapshot_read_packages_to_tmp SNAP_PATH
+    #
+    # Saída:
+    #   caminho de arquivo temporário com:
+    #       pkg_id<TAB>version<TAB>release<TAB>profile<TAB>libc
+    local snap="$1"
+
+    if [[ ! -f "$snap" ]]; then
+        adm_log_fatal "Snapshot não encontrado: '$snap'"
+    fi
+
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/snap-pkgs-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para snapshot pkgs."
+
+    awk '
+        BEGIN{inpk=0}
+        /^\[packages\]/ {inpk=1; next}
+        /^\[/ && $0 !~ /^\[packages\]/ {inpk=0}
+        inpk && NF>0 {
+            # aceita campos separados por tab ou espaço
+            # esperamos: pkg_id version release profile libc
+            # se menos campos, completamos com "-"
+            pkg=$1; ver=$2; rel=$3; prof=$4; libc=$5;
+            if (ver=="") ver="-";
+            if (rel=="") rel="-";
+            if (prof=="") prof="-";
+            if (libc=="") libc="-";
+            print pkg "\t" ver "\t" rel "\t" prof "\t" libc;
+        }
+    ' "$snap" >"$tmp"
+
+    printf '%s\n' "$tmp"
+}
+
+# =========
+# Comparação de versões (sort -V)
+# =========
+
+adm_snapshot_vercmp() {
+    # Compara duas strings de versão (pode incluir release junto, ex: "1.2-1").
+    #
+    # Uso:
+    #   result=$(adm_snapshot_vercmp V1 V2)
+    #
+    # Retorno (via stdout):
+    #   -1  se V1 < V2
+    #    0  se V1 == V2
+    #    1  se V1 > V2
+    #
+    local v1="$1"
+    local v2="$2"
+
+    if [[ "$v1" == "$v2" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    if sort -V </dev/null >/dev/null 2>&1; then
+        local highest
+        highest="$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | tail -n1)"
+        if [[ "$highest" == "$v1" ]]; then
+            echo "1"
+        else
+            echo "-1"
+        fi
+    else
+        # fallback: comparação lexicográfica simples
+        if [[ "$v1" > "$v2" ]]; then
+            echo "1"
+        else
+            echo "-1"
+        fi
+    fi
+}
+
+# =========
+# Diff entre dois snapshots
+# =========
+
+adm_snapshot_diff_core() {
+    # Uso:
+    #   adm_snapshot_diff_core SNAP_A SNAP_B
+    #
+    # Interpretação:
+    #   - A = "antes"
+    #   - B = "depois"
+    local snap_a="$1"
+    local snap_b="$2"
+
+    local path_a path_b
+    path_a="$(adm_snapshot_normalize_name "$snap_a")"
+    path_b="$(adm_snapshot_normalize_name "$snap_b")"
+
+    local name_a name_b
+    name_a="$(adm_snapshot_readable_name_from_path "$path_a")"
+    name_b="$(adm_snapshot_readable_name_from_path "$path_b")"
+
+    adm_log_phase_header "Diff entre snapshots '$name_a' e '$name_b'"
+    adm_event_emit "SNAPSHOT_DIFF_START" "-" "A=$name_a B=$name_b"
+
+    local tmp_a tmp_b
+    tmp_a="$(adm_snapshot_read_packages_to_tmp "$path_a")"
+    tmp_b="$(adm_snapshot_read_packages_to_tmp "$path_b")"
+
+    # sort por pkg_id
+    local sa sb
+    sa="$(mktemp "$ADM_TMP_DIR/snapA-sorted-XXXXXX")" || adm_log_fatal "Falha ao criar tmp."
+    sb="$(mktemp "$ADM_TMP_DIR/snapB-sorted-XXXXXX")" || adm_log_fatal "Falha ao criar tmp."
+
+    sort -k1,1 "$tmp_a" >"$sa"
+    sort -k1,1 "$tmp_b" >"$sb"
+
+    adm_log_info "Pacotes removidos (presentes em $name_a, não em $name_b):"
+    local any_removed=0
+    # join com -a1 para ver entradas só em A
+    while IFS=$'\t' read -r pkg a_ver a_rel b_ver b_rel; do
+        if [[ -n "$a_ver" && -z "$b_ver" ]]; then
+            adm_log_info "  - $pkg $a_ver-$a_rel"
+            any_removed=1
+        fi
+    done < <(join -t $'\t' -a 1 -e '' -o '0,1.2,1.3,2.2,2.3' "$sa" "$sb")
+    if [[ $any_removed -eq 0 ]]; then
+        adm_log_info "  (nenhum)"
+    fi
+
+    adm_log_info ""
+    adm_log_info "Pacotes novos (presentes em $name_b, não em $name_a):"
+    local any_new=0
+    while IFS=$'\t' read -r pkg a_ver a_rel b_ver b_rel; do
+        if [[ -z "$a_ver" && -n "$b_ver" ]]; then
+            adm_log_info "  + $pkg $b_ver-$b_rel"
+            any_new=1
+        fi
+    done < <(join -t $'\t' -a 2 -e '' -o '0,1.2,1.3,2.2,2.3' "$sa" "$sb")
+    if [[ $any_new -eq 0 ]]; then
+        adm_log_info "  (nenhum)"
+    fi
+
+    adm_log_info ""
+    adm_log_info "Pacotes com versão diferente ($name_a → $name_b):"
+    local any_changed=0
+    while IFS=$'\t' read -r pkg a_ver a_rel b_ver b_rel; do
+        if [[ -n "$a_ver" && -n "$b_ver" ]]; then
+            local v_old v_new cmp
+            v_old="${a_ver}-${a_rel}"
+            v_new="${b_ver}-${b_rel}"
+            if [[ "$v_old" != "$v_new" ]]; then
+                cmp="$(adm_snapshot_vercmp "$v_old" "$v_new")"
+                any_changed=1
+                if [[ "$cmp" -lt 0 ]]; then
+                    adm_log_info "  ↑ $pkg $v_old -> $v_new (upgrade)"
+                elif [[ "$cmp" -gt 0 ]]; then
+                    adm_log_info "  ↓ $pkg $v_old -> $v_new (downgrade)"
+                else
+                    adm_log_info "  * $pkg $v_old -> $v_new (diferença não ordenável)"
+                fi
+            fi
+        fi
+    done < <(join -t $'\t' -e '' -o '0,1.2,1.3,2.2,2.3' "$sa" "$sb")
+    if [[ $any_changed -eq 0 ]]; then
+        adm_log_info "  (nenhum)"
+    fi
+
+    rm -f "$tmp_a" "$tmp_b" "$sa" "$sb" || true
+
+    adm_event_emit "SNAPSHOT_DIFF_DONE" "-" "A=$name_a B=$name_b"
+}
+
+adm_snapshot_diff() {
+    local snap_a="$1"
+    local snap_b="$2"
+    adm_metrics_time_block "SNAPSHOT" "SNAPSHOT_DIFF" "adm-snapshot diff $snap_a $snap_b" adm_snapshot_diff_core "$snap_a" "$snap_b"
+}
+
+# =========
+# Restore (plano para voltar ao snapshot)
+# =========
+
+adm_snapshot_restore_core() {
+    # Uso:
+    #   adm_snapshot_restore_core SNAP_NAME_OR_PATH
+    #
+    # Interpretação:
+    #   - estado atual = A
+    #   - snapshot      = B (alvo)
+    local snap="$1"
+
+    adm_snapshot_ensure_dir
+    local path
+    path="$(adm_snapshot_normalize_name "$snap")"
+    local name
+    name="$(adm_snapshot_readable_name_from_path "$path")"
+
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "Snapshot alvo não encontrado: '$path'"
+    fi
+
+    adm_log_phase_header "Calculando plano de restore para snapshot '$name' ($path)"
+    adm_event_emit "SNAPSHOT_RESTORE_START" "-" "name=$name path=$path"
+
+    local tmp_current tmp_target
+    tmp_current="$(adm_snapshot_current_packages_to_tmp)"
+    tmp_target="$(adm_snapshot_read_packages_to_tmp "$path")"
+
+    local sa sb
+    sa="$(mktemp "$ADM_TMP_DIR/restore-current-XXXXXX")" || adm_log_fatal "Falha ao criar tmp."
+    sb="$(mktemp "$ADM_TMP_DIR/restore-target-XXXXXX")" || adm_log_fatal "Falha ao criar tmp."
+
+    sort -k1,1 "$tmp_current" >"$sa"
+    sort -k1,1 "$tmp_target" >"$sb"
+
+    local ts
+    ts="$(date '+%Y%m%d-%H%M%S')"
+
+    local base="${ADM_SNAPSHOT_DIR}/restore-${name}-${ts}"
+    local f_install="${base}.install"
+    local f_upgrade="${base}.upgrade"
+    local f_downgrade="${base}.downgrade"
+    local f_remove="${base}.remove"
+
+    : >"$f_install"
+    : >"$f_upgrade"
+    : >"$f_downgrade"
+    : >"$f_remove"
+
+    # join: pkg_id, cur_ver, cur_rel, tgt_ver, tgt_rel
+    while IFS=$'\t' read -r pkg cur_ver cur_rel tgt_ver tgt_rel; do
+        if [[ -z "$pkg" ]]; then
+            continue
+        fi
+
+        if [[ -n "$cur_ver" && -z "$tgt_ver" ]]; then
+            # existe na instalação atual, não existe no snapshot alvo -> remove
+            printf '%s\n' "$pkg" >>"$f_remove"
+            continue
+        fi
+
+        if [[ -z "$cur_ver" && -n "$tgt_ver" ]]; then
+            # não instalado, mas existe no snapshot -> install
+            printf '%s\n' "$pkg" >>"$f_install"
+            continue
+        fi
+
+        if [[ -n "$cur_ver" && -n "$tgt_ver" ]]; then
+            local v_cur v_tgt
+            v_cur="${cur_ver}-${cur_rel}"
+            v_tgt="${tgt_ver}-${tgt_rel}"
+
+            if [[ "$v_cur" == "$v_tgt" ]]; then
+                # já na versão certinha
+                continue
+            fi
+
+            local cmp
+            cmp="$(adm_snapshot_vercmp "$v_cur" "$v_tgt")"
+            if [[ "$cmp" -lt 0 ]]; then
+                # cur < tgt -> upgrade pra versão do snapshot
+                printf '%s\n' "$pkg" >>"$f_upgrade"
+            elif [[ "$cmp" -gt 0 ]]; then
+                # cur > tgt -> downgrade pra versão do snapshot
+                printf '%s\n' "$pkg" >>"$f_downgrade"
+            else
+                # empate "esquisito", mas diferente de string: trata como upgrade
+                printf '%s\n' "$pkg" >>"$f_upgrade"
+            fi
+        fi
+    done < <(join -t $'\t' -a 1 -a 2 -e '' -o '0,1.2,1.3,2.2,2.3' "$sa" "$sb")
+
+    rm -f "$tmp_current" "$tmp_target" "$sa" "$sb" || true
+
+    adm_log_phase_header "Plano de restore para snapshot '$name' (arquivos):"
+    adm_log_info "  Instalar : $f_install"
+    adm_log_info "  Upgrade  : $f_upgrade"
+    adm_log_info "  Downgrade: $f_downgrade"
+    adm_log_info "  Remover  : $f_remove"
+
+    adm_log_info ""
+    adm_log_info "Resumo (contagem):"
+
+    local c_install c_upgrade c_downgrade c_remove
+    c_install=$(wc -l <"$f_install" 2>/dev/null || echo 0)
+    c_upgrade=$(wc -l <"$f_upgrade" 2>/dev/null || echo 0)
+    c_downgrade=$(wc -l <"$f_downgrade" 2>/dev/null || echo 0)
+    c_remove=$(wc -l <"$f_remove" 2>/dev/null || echo 0)
+
+    adm_log_info "  instalar : $c_install"
+    adm_log_info "  upgrade  : $c_upgrade"
+    adm_log_info "  downgrade: $c_downgrade"
+    adm_log_info "  remover  : $c_remove"
+    adm_log_info ""
+    adm_log_info "Você pode, por exemplo:"
+    adm_log_info "  - Rodar upgrades:   adm-upgrade file $f_upgrade"
+    adm_log_info "  - Rodar downgrades: (usando adm-upgrade com metadados travados ou script específico)"
+    adm_log_info "  - Rodar installs:   adm-upgrade file $f_install"
+    adm_log_info "  - Remover:          usar um script de remoção lendo $f_remove"
+
+    adm_event_emit "SNAPSHOT_RESTORE_DONE" "-" "name=$name install=$c_install upgrade=$c_upgrade downgrade=$c_downgrade remove=$c_remove"
+}
+
+adm_snapshot_restore() {
+    local snap="$1"
+    adm_metrics_time_block "SNAPSHOT" "SNAPSHOT_RESTORE" "adm-snapshot restore $snap" adm_snapshot_restore_core "$snap"
+}
+
+# =========
+# CLI
+# =========
+
+adm_snapshot_usage() {
+    cat <<EOF
+adm-snapshot - Snapshots de estado do ADM 2.0
+
+Uso:
+
+  Criar snapshot:
+    adm-snapshot create [NOME]
+
+      - Cria arquivo em:
+          ${ADM_DB_DIR}/snapshots/snap-<NOME>.snap
+        (se NOME não for informado, usa timestamp).
+      - Registra:
+          * todos os pacotes instalados (pkg_id, versão, release, profile, libc)
+          * seção [profiles] com:
+                glibc/extreme     (otimizações extremas para glibc)
+                musl/extreme      (otimizações extremas para musl)
+                toolchain/simple  (perfil simples para toolchain)
+
+  Diff entre snapshots:
+    adm-snapshot diff SNAP_A SNAP_B
+
+      - Mostra:
+          * pacotes removidos (só em A)
+          * pacotes novos (só em B)
+          * pacotes com versão diferente (upgrade/downgrade A -> B)
+
+      - SNAP_A e SNAP_B podem ser:
+          * nome lógico (ex: "20250101" -> snap-20250101.snap)
+          * caminho completo de arquivo .snap
+
+  Gerar plano de restore para um snapshot:
+    adm-snapshot restore SNAP
+
+      - Compara estado atual (db/installed) com o snapshot SNAP.
+      - Gera arquivos:
+          ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.install
+          ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.upgrade
+          ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.downgrade
+          ${ADM_DB_DIR}/snapshots/restore-<nome>-<ts>.remove
+
+      - Esses arquivos podem ser usados com adm-upgrade e scripts de remoção
+        para voltar o sistema ao estado do snapshot.
+
+  Ajuda:
+    adm-snapshot --help
+
+EOF
+}
+
+adm_snapshot_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        create)
+            shift || true
+            local name="${1:-}"
+            adm_snapshot_create "$name"
+            ;;
+        diff)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-snapshot diff SNAP_A SNAP_B"
+            fi
+            adm_snapshot_diff "$1" "$2"
+            ;;
+        restore)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-snapshot restore SNAP"
+            fi
+            adm_snapshot_restore "$1"
+            ;;
+        --help|-h|"")
+            adm_snapshot_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-snapshot: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_snapshot_main "$@"
+fi
+
+# Fim do adm-snapshot
