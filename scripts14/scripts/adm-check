@@ -1,0 +1,764 @@
+#!/usr/bin/env bash
+# adm-check - Verificador de construção/instalação do ADM 2.0
+#
+# Responsável por:
+#   - Conferir se um pacote construído (em DESTDIR) está consistente:
+#       * libs faltando (ldd)
+#       * RPATH/RUNPATH estranhos
+#       * intérpretes de scripts (#!) inexistentes
+#       * permissões perigosas (world-writable, suid/sgid)
+#       * donos não-root em /usr/*
+#       * symlinks quebrados
+#   - Alimentar banco de conhecimento (adm-knowledge) com SONAMEs das libs que o pacote fornece
+#   - Sugerir dependências de runtime com base em libs usadas x run_deps declaradas
+#
+# API principal:
+#   adm_check_package PKG_ID DESTDIR
+#
+# CLI:
+#   adm-check run PKG_ID DESTDIR
+#   adm-check --help
+#
+# Resultado:
+#   - exit 0 se só warnings/ok
+#   - exit 1 se houver falhas de nível "FAIL"
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_check_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-check.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_CHECK_DIR="$(_adm_check_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-deps"
+# shellcheck disable=SC1090
+source "$_ADM_CHECK_DIR/adm-knowledge"
+
+ADM_CHECK_STRICT="${ADM_CHECK_STRICT:-0}"
+
+# =========
+# Estado/counters internos
+# =========
+
+ADM_CHECK_FAILS=0
+ADM_CHECK_WARNINGS=0
+ADM_CHECK_OKS=0
+
+adm_check_reset_counters() {
+    ADM_CHECK_FAILS=0
+    ADM_CHECK_WARNINGS=0
+    ADM_CHECK_OKS=0
+}
+
+adm_check_note_ok() {
+    ADM_CHECK_OKS=$((ADM_CHECK_OKS + 1))
+    adm_log_ok "$*"
+}
+
+adm_check_note_warn() {
+    ADM_CHECK_WARNINGS=$((ADM_CHECK_WARNINGS + 1))
+    adm_log_warn "$*"
+}
+
+adm_check_note_fail() {
+    ADM_CHECK_FAILS=$((ADM_CHECK_FAILS + 1))
+    adm_log_error "$*"
+}
+
+adm_check_summary() {
+    adm_log_phase_header "Resumo da verificação:"
+    adm_log_info "OK     : $ADM_CHECK_OKS"
+    adm_log_info "WARN   : $ADM_CHECK_WARNINGS"
+    adm_log_info "FAIL   : $ADM_CHECK_FAILS"
+}
+
+# =========
+# Utilidades
+# =========
+
+adm_check_realpath_or_same() {
+    local p="${1:-}"
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$p" 2>/dev/null || printf '%s\n' "$p"
+    else
+        printf '%s\n' "$p"
+    fi
+}
+
+adm_check_is_elf() {
+    local f="${1:-}"
+    if [[ ! -f "$f" ]]; then
+        return 1
+    fi
+    if command -v file >/dev/null 2>&1; then
+        file -b "$f" 2>/dev/null | grep -q "ELF"
+    else
+        # fallback tosco: lê os 4 primeiros bytes
+        local magic
+        magic="$(dd if="$f" bs=4 count=1 2>/dev/null | hexdump -v -e '1/1 "%02X"')"
+        [[ "$magic" == "7F454C46" ]] || [[ "$magic" == "7f454c46" ]]
+    fi
+}
+
+adm_check_get_soname() {
+    # Tenta extrair SONAME de uma biblioteca ELF.
+    # Saída: SONAME ou nada se não conseguir.
+    local f="${1:-}"
+    if ! adm_check_is_elf "$f"; then
+        return 1
+    fi
+
+    if command -v readelf >/dev/null 2>&1; then
+        readelf -d "$f" 2>/dev/null \
+            | awk -F'[][]' '/SONAME/ {print $2; exit}'
+    elif command -v objdump >/dev/null 2>&1; then
+        objdump -p "$f" 2>/dev/null \
+            | awk -F'[][]' '/SONAME/ {print $2; exit}'
+    else
+        # sem ferramentas, não conseguimos SONAME
+        return 1
+    fi
+}
+
+adm_check_ldd_missing_libs() {
+    # Roda ldd num ELF e extrai libs "not found".
+    # Saída: nomes das libs faltando (um por linha).
+    local f="${1:-}"
+
+    if ! command -v ldd >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ldd "$f" 2>/dev/null \
+        | awk '/not found/ {print $1}' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | sed 's/ *=>//'
+}
+
+adm_check_ldd_rpaths() {
+    # Tenta detectar RPATH/RUNPATH via readelf (mais confiável que ldd).
+    local f="${1:-}"
+    if ! command -v readelf >/dev/null 2>&1; then
+        return 0
+    fi
+    readelf -d "$f" 2>/dev/null \
+        | grep -E 'RPATH|RUNPATH' \
+        || true
+}
+
+adm_check_is_executable_file() {
+    local f="${1:-}"
+    [[ -f "$f" && -x "$f" ]]
+}
+
+adm_check_file_mode() {
+    local f="${1:-}"
+    if [[ ! -e "$f" ]]; then
+        return 1
+    fi
+    if stat --version >/dev/null 2>&1; then
+        stat -c '%a' "$f"
+    else
+        # fallback bem limitado: sem stat GNU
+        ls -l "$f" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+adm_check_file_owner_group() {
+    local f="${1:-}"
+    if stat --version >/dev/null 2>&1; then
+        stat -c '%u:%g' "$f"
+    else
+        # fallback tosco
+        ls -ln "$f" | awk '{print $3":"$4}'
+    fi
+}
+
+adm_check_is_world_writable_mode() {
+    local mode="${1:-}"
+    # modo numérico: verificamos bit w do "others" (1)
+    # se string tipo -rw-rw-rw-, detectamos o 'w' na posição final
+    if [[ "$mode" =~ ^[0-7]+$ ]]; then
+        # último dígito & 2 != 0 => world writable
+        local last="${mode: -1}"
+        # se last é 2,3,6,7 => world writable
+        case "$last" in
+            2|3|6|7) return 0 ;;
+            *) return 1 ;;
+        esac
+    else
+        # string -rwxrwxrwx
+        [[ "$mode" == *"w" ]]
+    fi
+}
+
+adm_check_is_suid_sgid_mode() {
+    local mode="${1:-}"
+    if [[ "$mode" =~ ^[0-7]+$ ]]; then
+        # valor >= 4000 ou >=2000
+        local num="$mode"
+        # suid/sgid é no milhar
+        # modo >=2000 indica sgid ou suid/sticky specifics, mas simplificamos:
+        if (( num >= 2000 )); then
+            return 0
+        fi
+    else
+        # se string, procurar s/S
+        [[ "$mode" == *"s"* || "$mode" == *"S"* ]]
+    fi
+}
+
+adm_check_read_shebang() {
+    # Lê primeira linha de um arquivo e extrai o caminho do intérprete (#!...).
+    local f="${1:-}"
+
+    if [[ ! -f "$f" ]]; then
+        return 1
+    fi
+
+    local first
+    first="$(head -n1 "$f" 2>/dev/null || true)"
+    [[ "$first" == "#!"* ]] || return 1
+
+    # Remove "#!" e espaços
+    first="${first#\#!}"
+    first="$(echo "$first" | sed 's/^[[:space:]]*//')"
+    # pega primeiro token (interpreter)
+    echo "$first" | awk '{print $1}'
+}
+
+# =========
+# Checks: libs & ELF
+# =========
+
+adm_check_elves_and_libs() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_check_note_fail "DESTDIR inválido em libs/ELF para $pkg_id: '$destdir'"
+        return 1
+    fi
+
+    local tmp_missing tmp_rpaths tmp_provided
+    tmp_missing="$(mktemp "$ADM_TMP_DIR/check-missing-libs-XXXXXX")" || adm_log_fatal "Falha ao criar tmp missing libs."
+    tmp_rpaths="$(mktemp "$ADM_TMP_DIR/check-rpaths-XXXXXX")" || adm_log_fatal "Falha ao criar tmp rpaths."
+    tmp_provided="$(mktemp "$ADM_TMP_DIR/check-provided-libs-XXXXXX")" || adm_log_fatal "Falha ao criar tmp provided libs."
+
+    local f
+    local had_elf=0
+
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if ! adm_check_is_elf "$f"; then
+            continue
+        fi
+        had_elf=1
+
+        # libs faltando
+        adm_check_ldd_missing_libs "$f" >>"$tmp_missing" || true
+
+        # rpaths
+        adm_check_ldd_rpaths "$f" >>"$tmp_rpaths" || true
+    done < <(find "$destdir" -type f -print 2>/dev/null || true)
+
+    # libs fornecidas (SONAME) - apenas nas libs do próprio pacote
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if ! adm_check_is_elf "$f"; then
+            continue
+        fi
+        # heurística: libs normalmente em lib*/ e nome "lib*.so*"
+        case "$f" in
+            */lib*.so|*/lib*.so.*)
+                local soname
+                soname="$(adm_check_get_soname "$f" || true)"
+                if [[ -n "$soname" ]]; then
+                    printf '%s\n' "$soname" >>"$tmp_provided" || true
+                fi
+                ;;
+        esac
+    done < <(find "$destdir" -type f -print 2>/dev/null || true)
+
+    if [[ $had_elf -eq 0 ]]; then
+        adm_check_note_warn "Nenhum ELF encontrado em $pkg_id (pode ser normal, ex: pacotes só de dados)."
+    else
+        adm_check_note_ok "ELFs encontrados para $pkg_id (ldd/readelf aplicados)."
+    fi
+
+    # Trata libs faltando
+    if [[ -s "$tmp_missing" ]]; then
+        sort -u "$tmp_missing" >"$tmp_missing.sorted"
+        mv "$tmp_missing.sorted" "$tmp_missing"
+
+        adm_check_note_fail "Bibliotecas dinâmicas faltando (ldd) para $pkg_id:"
+        while IFS= read -r lib; do
+            [[ -z "$lib" ]] && continue
+            adm_log_error "  - $lib (not found)"
+        done <"$tmp_missing"
+    else
+        adm_check_note_ok "Nenhuma biblioteca 'not found' reportada por ldd para $pkg_id."
+    fi
+
+    # Trata RPATH/RUNPATH
+    if [[ -s "$tmp_rpaths" ]]; then
+        adm_check_note_warn "RPATH/RUNPATH detectados em alguns binários/libs de $pkg_id:"
+        sed 's/^/  /' "$tmp_rpaths" | while IFS= read -r line; do adm_log_warn "$line"; done
+    else
+        adm_check_note_ok "Nenhum RPATH/RUNPATH suspeito detectado em $pkg_id (ou readelf ausente)."
+    fi
+
+    # Alimenta knowledge com libs fornecidas
+    if [[ -s "$tmp_provided" ]]; then
+        sort -u "$tmp_provided" >"$tmp_provided.sorted"
+        mv "$tmp_provided.sorted" "$tmp_provided"
+        while IFS= read -r son; do
+            [[ -z "$son" ]] && continue
+            adm_know_add_libsoname "$son" "$pkg_id"
+        done <"$tmp_provided"
+        adm_log_info "SONAMEs registrados no knowledge para $pkg_id."
+    fi
+
+    # Sugere deps de runtime com base em libs faltando (se houver)
+    if [[ -s "$tmp_missing" ]]; then
+        local lib
+        adm_log_info "Tentando sugerir pacotes para libs faltando em $pkg_id:"
+        while IFS= read -r lib; do
+            [[ -z "$lib" ]] && continue
+            local p
+            p="$(adm_know_best_pkg_for_libsoname "$lib" || true)"
+            if [[ -n "$p" ]]; then
+                adm_log_warn "  - $lib provavelmente fornecida por pacote: $p"
+            else
+                adm_log_warn "  - $lib sem mapeamento em knowledge (avaliar manualmente)."
+            fi
+        done <"$tmp_missing"
+    fi
+
+    rm -f "$tmp_missing" "$tmp_rpaths" "$tmp_provided" 2>/dev/null || true
+}
+
+# =========
+# Checks: scripts / intérpretes
+# =========
+
+adm_check_scripts_and_shebangs() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_check_note_fail "DESTDIR inválido em scripts/shebangs para $pkg_id: '$destdir'"
+        return 1
+    fi
+
+    local f
+    local bad=0
+    local total=0
+
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        # só consideramos arquivos marcados como executáveis
+        if ! adm_check_is_executable_file "$f"; then
+            continue
+        fi
+
+        local interp
+        interp="$(adm_check_read_shebang "$f" || true)"
+        [[ -z "$interp" ]] && continue
+
+        total=$((total + 1))
+
+        # se intérprete é relativo, avisamos
+        if [[ "$interp" != /* ]]; then
+            adm_check_note_warn "Script com intérprete relativo em $pkg_id: $f -> $interp (idealmente caminho absoluto)."
+            bad=$((bad + 1))
+            continue
+        fi
+
+        # intérprete deve existir em DESTDIR ou no sistema (root)
+        local dest_interp="$destdir$interp"
+        if [[ -x "$dest_interp" || -x "$interp" ]]; then
+            # ok
+            continue
+        else
+            adm_check_note_warn "Intérprete de script não encontrado para $pkg_id: $f -> $interp (nem em DESTDIR nem no sistema)."
+            bad=$((bad + 1))
+        fi
+    done < <(find "$destdir" -type f -perm -111 -print 2>/dev/null || true)
+
+    if [[ $total -eq 0 ]]; then
+        adm_check_note_ok "Nenhum script executável com shebang explícito detectado em $pkg_id."
+    else
+        if [[ $bad -gt 0 ]]; then
+            adm_log_warn "Total de scripts verificados: $total; com problemas de intérprete: $bad"
+        else
+            adm_check_note_ok "Todos os $total scripts com shebang têm intérprete resolvível em $pkg_id."
+        fi
+    fi
+}
+
+# =========
+# Checks: permissões / ownership
+# =========
+
+adm_check_permissions_and_owners() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_check_note_fail "DESTDIR inválido em permissões/owners para $pkg_id: '$destdir'"
+        return 1
+    fi
+
+    local f
+    local worldw=0
+    local suidsgid=0
+    local nonroot=0
+
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+
+        local mode owner
+        mode="$(adm_check_file_mode "$f" || echo "")"
+        owner="$(adm_check_file_owner_group "$f" || echo "")"
+
+        if [[ -z "$mode" || -z "$owner" ]]; then
+            continue
+        fi
+
+        if adm_check_is_world_writable_mode "$mode"; then
+            adm_check_note_warn "World-writable detectado em $pkg_id: $f (modo=$mode)"
+            worldw=$((worldw + 1))
+        fi
+
+        if adm_check_is_suid_sgid_mode "$mode"; then
+            adm_check_note_warn "SUID/SGID detectado em $pkg_id: $f (modo=$mode)"
+            suidsgid=$((suidsgid + 1))
+        fi
+
+        # Checa dono != root:root em /usr/*
+        case "$f" in
+            "$destdir"/usr/*)
+                if [[ "$owner" != "0:0" ]]; then
+                    adm_check_note_warn "Arquivo em /usr com owner != root: $f (owner=$owner)"
+                    nonroot=$((nonroot + 1))
+                fi
+                ;;
+        esac
+    done < <(find "$destdir" -mindepth 1 -print 2>/dev/null || true)
+
+    if [[ $worldw -eq 0 ]]; then
+        adm_check_note_ok "Nenhum arquivo world-writable detectado em $pkg_id."
+    fi
+    if [[ $suidsgid -eq 0 ]]; then
+        adm_check_note_ok "Nenhum arquivo SUID/SGID detectado em $pkg_id."
+    fi
+    if [[ $nonroot -eq 0 ]]; then
+        adm_check_note_ok "Nenhum arquivo em /usr com owner diferente de root para $pkg_id."
+    fi
+}
+
+# =========
+# Checks: symlinks
+# =========
+
+adm_check_symlinks() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_check_note_fail "DESTDIR inválido em symlinks para $pkg_id: '$destdir'"
+        return 1
+    fi
+
+    local l
+    local broken=0
+    local total=0
+
+    while IFS= read -r l; do
+        [[ -n "$l" ]] || continue
+        total=$((total + 1))
+
+        local target
+        target="$(readlink "$l" 2>/dev/null || true)"
+        [[ -z "$target" ]] && continue
+
+        # Se o link é absoluto, checamos se existe em DESTDIR+target (instalado por este pacote)
+        if [[ "$target" == /* ]]; then
+            if [[ ! -e "$destdir$target" && ! -e "$target" ]]; then
+                adm_check_note_warn "Symlink quebrado (alvo absoluto) em $pkg_id: $l -> $target"
+                broken=$((broken + 1))
+            fi
+        else
+            # relativo
+            local base
+            base="$(dirname "$l")"
+            if [[ ! -e "$base/$target" ]]; then
+                adm_check_note_warn "Symlink quebrado (alvo relativo) em $pkg_id: $l -> $target"
+                broken=$((broken + 1))
+            fi
+        fi
+    done < <(find "$destdir" -type l -print 2>/dev/null || true)
+
+    if [[ $total -eq 0 ]]; then
+        adm_check_note_ok "Nenhum symlink encontrado em $pkg_id."
+    else
+        if [[ $broken -eq 0 ]]; then
+            adm_check_note_ok "Todos os symlinks de $pkg_id parecem válidos ($total)."
+        else
+            adm_log_warn "Total de symlinks em $pkg_id: $total; quebrados: $broken"
+        fi
+    fi
+}
+
+# =========
+# Checks: deps de runtime vs knowledge
+# =========
+
+adm_check_runtime_deps_suggestions() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    # Se metadado não existir, não há como sugerir
+    local meta
+    meta="$(adm_deps_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_check_note_warn "Metadado não encontrado para sugerir deps de runtime de $pkg_id."
+        return 0
+    fi
+
+    local run_deps
+    run_deps="$(adm_deps_get_run_deps "$pkg_id" || true)"
+
+    # Para libs necessárias (ldd) que conseguimos mapear -> sugerimos se não estiverem em run_deps.
+    if ! command -v ldd >/dev/null 2>&1; then
+        adm_log_info "Sem ldd; não é possível sugerir deps de runtime baseadas em libs."
+        return 0
+    fi
+
+    local tmp_needed tmp_suggest
+    tmp_needed="$(mktemp "$ADM_TMP_DIR/check-needed-libs-XXXXXX")" || adm_log_fatal "Falha ao criar tmp needed libs."
+    tmp_suggest="$(mktemp "$ADM_TMP_DIR/check-sug-deps-XXXXXX")" || adm_log_fatal "Falha ao criar tmp sug deps."
+
+    # lista de libs usadas (sem filtrar found/not found)
+    local f
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        if ! adm_check_is_elf "$f"; then
+            continue
+        fi
+        ldd "$f" 2>/dev/null \
+            | awk '/=>/ {print $1}' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | sed 's/ *=>//' \
+            >>"$tmp_needed" || true
+    done < <(find "$destdir" -type f -print 2>/dev/null || true)
+
+    if [[ ! -s "$tmp_needed" ]]; then
+        rm -f "$tmp_needed" "$tmp_suggest" || true
+        return 0
+    fi
+
+    sort -u "$tmp_needed" >"$tmp_needed.sorted"
+    mv "$tmp_needed.sorted" "$tmp_needed"
+
+    # Map libs -> pacotes prováveis
+    while IFS= read -r lib; do
+        [[ -z "$lib" ]] && continue
+        local p
+        p="$(adm_know_best_pkg_for_libsoname "$lib" || true)"
+        [[ -z "$p" ]] && continue
+        printf '%s\n' "$p" >>"$tmp_suggest"
+    done <"$tmp_needed"
+
+    if [[ ! -s "$tmp_suggest" ]]; then
+        rm -f "$tmp_needed" "$tmp_suggest" || true
+        return 0
+    fi
+
+    sort -u "$tmp_suggest" >"$tmp_suggest.sorted"
+    mv "$tmp_suggest.sorted" "$tmp_suggest"
+
+    adm_log_info "Sugerindo deps de runtime para $pkg_id com base em libs usadas:"
+    local p
+    for p in $run_deps; do
+        : # só pra ter run_deps no escopo
+    done
+
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        local found=0
+        local d
+        for d in $run_deps; do
+            if [[ "$d" == "$p" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            adm_check_note_warn "Possível run_dep não declarado em $pkg_id: $p (inferido de libs e knowledge)."
+        fi
+    done <"$tmp_suggest"
+
+    rm -f "$tmp_needed" "$tmp_suggest" || true
+}
+
+# =========
+# Verificação completa interna (sem métricas)
+# =========
+
+adm_check__do_checks() {
+    # Uso interno:
+    #   adm_check__do_checks PKG_ID DESTDIR
+    local pkg_id="$1"
+    local destdir="$2"
+
+    adm_check_reset_counters
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_check_note_fail "DESTDIR inexistente para $pkg_id: '$destdir'"
+        adm_check_summary
+        return 1
+    fi
+
+    adm_log_phase_header "Verificando pacote $pkg_id em DESTDIR=$destdir"
+
+    adm_event_pkg "PKG_CHECK_START" "$pkg_id" "destdir=$destdir"
+
+    adm_check_elves_and_libs "$pkg_id" "$destdir"
+    adm_check_scripts_and_shebangs "$pkg_id" "$destdir"
+    adm_check_permissions_and_owners "$pkg_id" "$destdir"
+    adm_check_symlinks "$pkg_id" "$destdir"
+    adm_check_runtime_deps_suggestions "$pkg_id" "$destdir"
+
+    adm_check_summary
+
+    local rc=0
+    if [[ $ADM_CHECK_FAILS -gt 0 ]]; then
+        rc=1
+    fi
+
+    adm_event_pkg "PKG_CHECK_DONE" "$pkg_id" "fails=$ADM_CHECK_FAILS warns=$ADM_CHECK_WARNINGS"
+
+    return "$rc"
+}
+
+# =========
+# API pública: adm_check_package
+# =========
+
+adm_check_package() {
+    # Verifica um pacote completo.
+    #
+    # Uso:
+    #   adm_check_package PKG_ID DESTDIR
+    #
+    # Retorno:
+    #   0 = ok (apenas warnings ou nenhum problema)
+    #   1 = houve falhas
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_check_package: uso: adm_check_package PKG_ID DESTDIR"
+    fi
+
+    local pkg_id="$1"
+    local destdir="$2"
+
+    adm_metrics_time_block "CHECK" "$pkg_id" "adm_check_package" adm_check__do_checks "$pkg_id" "$destdir"
+}
+
+# =========
+# CLI
+# =========
+
+adm_check_usage() {
+    cat <<EOF
+adm-check - Verificador de build/instalação do ADM 2.0
+
+Uso:
+
+  Verificar um pacote já construído em DESTDIR:
+    adm-check run PKG_ID DESTDIR
+
+      - Roda:
+          * checagem de libs e ELFs (ldd, RPATH/RUNPATH, libs faltando)
+          * scripts e shebangs
+          * permissões (world-writable, SUID/SGID)
+          * owners (root em /usr/*)
+          * symlinks (links quebrados)
+          * sugestões de run_deps com base em libs + knowledge
+
+      - Retorna:
+          0 se sem falhas, 1 se houver FAILs.
+
+  Ajuda:
+    adm-check --help
+
+Na prática:
+  - adm-build chama adm_check_package PKG_ID DESTDIR após instalar.
+
+Variáveis:
+
+  ADM_CHECK_STRICT=1
+      (Reservado para futura política mais rígida; atualmente não altera o comportamento,
+       mas poderá futuramente transformar alguns WARN em FAIL).
+
+EOF
+}
+
+adm_check_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        run)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-check run PKG_ID DESTDIR"
+            fi
+            adm_check_package "$1" "$2"
+            ;;
+        --help|-h|"")
+            adm_check_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-check: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_check_main "$@"
+fi
+
+# Fim do adm-check
