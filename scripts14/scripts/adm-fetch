@@ -1,0 +1,548 @@
+#!/usr/bin/env bash
+# adm-fetch - Download e cache de fontes do ADM 2.0
+#
+# Responsável por:
+#   - Ler source_uri/source_checksum do metadado
+#   - Fazer download dos fontes em cache-src/
+#   - Verificar sha256 (quando aplicável)
+#   - Reaproveitar arquivos já em cache quando válidos
+#
+# Formato de metadado esperado (trecho relevante):
+#   source_uri: URL1
+#   source_uri: URL2
+#   source_checksum: SHA256_1
+#   source_checksum: SHA256_2
+#
+# Pode ser sourceado por outros scripts:
+#   adm_fetch_for_pkg "categoria/pacote" "/.../metadado"
+#
+# E usado em CLI para debug:
+#   adm-fetch fetch-from-meta categoria/pacote /.../metadado
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente, UI, eventos, métricas
+# =========
+
+_adm_fetch_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-fetch.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_FETCH_DIR="$(_adm_fetch_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_FETCH_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_FETCH_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_FETCH_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_FETCH_DIR/adm-metrics"
+
+# =========
+# Checagem de dependências específicas de fetch
+# =========
+
+adm_fetch_check_deps() {
+    local have_http=0
+
+    if command -v curl >/dev/null 2>&1; then
+        have_http=1
+    elif command -v wget >/dev/null 2>&1; then
+        have_http=1
+    fi
+
+    if [[ $have_http -eq 0 ]]; then
+        adm_log_warn "Nem 'curl' nem 'wget' encontrados. Downloads HTTP/HTTPS não funcionarão."
+    fi
+
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        adm_log_warn "'sha256sum' não encontrado. Não será possível conferir checksums de arquivos."
+    fi
+
+    if ! command -v git >/dev/null 2>&1; then
+        adm_log_warn "'git' não encontrado. URIs git não funcionarão."
+    fi
+
+    if ! command -v rsync >/dev/null 2>&1; then
+        adm_log_warn "'rsync' não encontrado. URIs rsync não funcionarão."
+    fi
+}
+
+adm_fetch_check_deps
+
+# =========
+# Utilidades internas
+# =========
+
+adm_fetch_is_git_uri() {
+    local uri="${1:-}"
+    # heurística: começa com git:// ou ssh://git@ ou termina com .git
+    if [[ "$uri" == git://* ]] || [[ "$uri" == ssh://git@* ]] || [[ "$uri" == *".git" ]] || [[ "$uri" == https://github.com/* ]] || [[ "$uri" == https://gitlab.* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+adm_fetch_is_rsync_uri() {
+    local uri="${1:-}"
+    if [[ "$uri" == rsync://* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+adm_fetch_is_http_uri() {
+    local uri="${1:-}"
+    if [[ "$uri" == http://* || "$uri" == https://* ]]; then
+        return 0
+    fi
+    return 1
+}
+
+adm_fetch_pkg_id_to_prefix() {
+    # Converte "categoria/pacote" em "categoria__pacote"
+    local pkg_id="${1:-}"
+    printf '%s\n' "${pkg_id//\//__}"
+}
+
+adm_fetch_read_meta_field_all() {
+    # Lê todas as ocorrências de um campo "chave:" no metadado
+    # Uso:
+    #   adm_fetch_read_meta_field_all arquivo "source_uri"
+    # Saída: cada valor em uma linha (sem "chave:")
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "Metadado não encontrado: '$file'"
+    fi
+
+    # aceita formas como "source_uri: valor" com espaços
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" {
+            # linha "source_uri:" sem valor na mesma linha
+            # pega próxima linha se não vazia
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                if (length(line) > 0) print line
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 { next }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            # linha "source_uri: valor"
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+        }
+    ' "$file"
+}
+
+adm_fetch_read_meta_single() {
+    # Lê um único valor de campo "chave:" (primeira ocorrência)
+    # Uso:
+    #   adm_fetch_read_meta_single arquivo "version"
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "Metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit 0
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_fetch_compute_sha256() {
+    local path="${1:-}"
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "adm_fetch_compute_sha256: arquivo não encontrado: '$path'"
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        adm_log_fatal "sha256sum não disponível para calcular checksum."
+    fi
+    sha256sum "$path" | awk '{print $1}'
+}
+
+# =========
+# Downloads de baixo nível
+# =========
+
+adm_fetch_http() {
+    # HTTP/HTTPS via curl ou wget
+    # Uso:
+    #   adm_fetch_http URL DEST
+    local url="${1:-}"
+    local dest="${2:-}"
+
+    if adm_fetch_is_http_uri "$url"; then
+        :
+    else
+        adm_log_fatal "adm_fetch_http chamado com URL não HTTP: '$url'"
+    fi
+
+    local tmp="${dest}.tmp"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail --silent --show-error "$url" -o "$tmp"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp" "$url"
+    else
+        adm_log_fatal "Nem 'curl' nem 'wget' estão disponíveis para download HTTP."
+    fi
+
+    mv "$tmp" "$dest"
+}
+
+adm_fetch_rsync() {
+    # Uso:
+    #   adm_fetch_rsync URL DEST_DIR
+    local url="${1:-}"
+    local dest="${2:-}"
+
+    if ! adm_fetch_is_rsync_uri "$url"; then
+        adm_log_fatal "adm_fetch_rsync chamado com URL não rsync: '$url'"
+    fi
+    if ! command -v rsync >/dev/null 2>&1; then
+        adm_log_fatal "'rsync' não encontrado para URL '$url'"
+    fi
+
+    local tmp="${dest}.tmp"
+    mkdir -p "$tmp"
+    rsync -av --delete "$url" "$tmp" >/dev/null 2>&1
+    # empacota diretorio em tar dentro do dest (para manter padrão arquivo)
+    tar -C "$tmp" -cf "$dest" . || adm_log_fatal "Falha ao criar tar a partir do rsync '$url'"
+    rm -rf "$tmp"
+}
+
+adm_fetch_git() {
+    # Uso:
+    #   adm_fetch_git URL DEST_DIR [GIT_REF]
+    #
+    # Clona (ou atualiza) um repositório em cache.
+    # Para integração com o resto do sistema, vamos:
+    #   - clonar/atualizar repositorio em DEST_DIR.git
+    #   - criar um tar no caminho DEST (tar do repo em um commit)
+    local url="${1:-}"
+    local dest="${2:-}"
+    local git_ref="${3:-}"
+
+    if ! adm_fetch_is_git_uri "$url"; then
+        adm_log_fatal "adm_fetch_git chamado com URL não git: '$url'"
+    fi
+    if ! command -v git >/dev/null 2>&1; then
+        adm_log_fatal "'git' não encontrado para URL '$url'"
+    fi
+
+    local repo_dir="${dest}.gitrepo"
+    local tmp_tar="${dest}.tmp"
+
+    if [[ -d "$repo_dir/.git" ]]; then
+        (cd "$repo_dir" && git fetch --all --prune >/dev/null 2>&1) || adm_log_warn "Falha ao atualizar repositório git em '$repo_dir'"
+    else
+        mkdir -p "$(dirname "$repo_dir")"
+        git clone --mirror "$url" "$repo_dir" >/dev/null 2>&1 || adm_log_fatal "Falha ao clonar repositório git '$url'"
+    fi
+
+    # Para produzir um arquivo único no cache, geramos um tar de um ref.
+    # Se git_ref estiver definido, usamos; senão, usamos HEAD (padrão refs/heads/master/main).
+    local ref="${git_ref:-HEAD}"
+
+    # Para mirror, precisamos usar git --git-dir e git archive
+    (cd "$repo_dir" && git archive --format=tar "$ref" >"$tmp_tar") || adm_log_fatal "Falha ao criar archive tar do git '$url' @ '$ref'"
+
+    mv "$tmp_tar" "$dest"
+}
+
+# =========
+# Função principal de download de uma URI
+# =========
+
+adm_fetch_one_uri() {
+    # Download de UMA URI específica, com cache e verificação opcional de checksum.
+    #
+    # Uso:
+    #   adm_fetch_one_uri pkg_id uri dest expected_checksum index
+    #
+    # Retorna 0 se ok, >0 se erro.
+    local pkg_id="${1:-}"
+    local uri="${2:-}"
+    local dest="${3:-}"
+    local expected_checksum="${4:-}"
+    local idx="${5:-0}"
+
+    if [[ -z "$pkg_id" || -z "$uri" || -z "$dest" ]]; then
+        adm_log_fatal "adm_fetch_one_uri: argumentos insuficientes."
+    fi
+
+    mkdir -p "$(dirname "$dest")" || adm_log_fatal "Falha ao criar diretório para '$dest'."
+
+    # Se arquivo já existe e checksum bate (se fornecido), reaproveita
+    if [[ -f "$dest" && -n "$expected_checksum" && $(adm_fetch_compute_sha256 "$dest") == "$expected_checksum" ]]; then
+        adm_log_ok "Cache de source válido encontrado para '$pkg_id' [parte $idx]."
+        adm_event_pkg "PKG_FETCH_CACHE_HIT" "$pkg_id" "uri=$uri idx=$idx"
+        return 0
+    fi
+
+    if [[ -f "$dest" && -z "$expected_checksum" ]]; then
+        adm_log_warn "Arquivo em cache para '$pkg_id' mas sem checksum esperado; reutilizando mesmo assim: $dest"
+        adm_event_pkg "PKG_FETCH_CACHE_NOCHK" "$pkg_id" "uri=$uri idx=$idx"
+        return 0
+    fi
+
+    # Faz download novo
+    local start_ts end_ts dur rc
+    start_ts="$(date +%s.%N)"
+
+    adm_spinner_start "Baixando fonte [$idx] para ${pkg_id}..."
+
+    rc=0
+    if adm_fetch_is_http_uri "$uri"; then
+        adm_fetch_http "$uri" "$dest" || rc=$?
+    elif adm_fetch_is_rsync_uri "$uri"; then
+        adm_fetch_rsync "$uri" "$dest" || rc=$?
+    elif adm_fetch_is_git_uri "$uri"; then
+        # Para git, tratamos expected_checksum como ref opcional (commit/tag)
+        adm_fetch_git "$uri" "$dest" "$expected_checksum" || rc=$?
+        # checksum para git é tratado de forma diferente;
+        # aqui não comparamos sha256 (o "checksum" é a ref).
+        expected_checksum=""
+    else
+        adm_spinner_stop_fail "Protocolo desconhecido em URI: $uri"
+        adm_log_fatal "URI com protocolo não suportado: '$uri'"
+    fi
+
+    if [[ $rc -ne 0 ]]; then
+        adm_spinner_stop_fail "Falha ao baixar fonte [$idx] para $pkg_id"
+        adm_event_pkg "PKG_FETCH_FAILED" "$pkg_id" "uri=$uri idx=$idx rc=$rc"
+        end_ts="$(date +%s.%N)"
+        # registra métrica mesmo em falha
+        if command -v bc >/dev/null 2>&1; then
+            dur=$(printf '%s - %s\n' "$end_ts" "$start_ts" | bc 2>/dev/null || printf '0')
+        else
+            local s1 s2
+            s1="${start_ts%%.*}"
+            s2="${end_ts%%.*}"
+            dur=$((s2 - s1))
+        fi
+        adm_metrics_record "FETCH" "$pkg_id" "duration" "$dur" "s" "uri=$uri idx=$idx rc=$rc"
+        return "$rc"
+    fi
+
+    # Confere checksum se tivermos
+    if [[ -n "$expected_checksum" ]]; then
+        if ! command -v sha256sum >/dev/null 2>&1; then
+            adm_spinner_stop_warn "Baixado, mas não conferido (sha256sum indisponível)."
+            adm_log_warn "Não foi possível conferir sha256 de '$dest' (sha256sum não encontrado)."
+        else
+            local got
+            got="$(adm_fetch_compute_sha256 "$dest")"
+            if [[ "$got" != "$expected_checksum" ]]; then
+                adm_spinner_stop_fail "Checksum incorreto para parte [$idx] de $pkg_id"
+                adm_event_pkg "PKG_FETCH_BAD_CHECKSUM" "$pkg_id" "uri=$uri idx=$idx expected=$expected_checksum got=$got"
+                adm_log_error "Checksum incorreto para '$dest': esperado=$expected_checksum, obtido=$got"
+                rm -f "$dest" || true
+                end_ts="$(date +%s.%N)"
+                if command -v bc >/dev/null 2>&1; then
+                    dur=$(printf '%s - %s\n' "$end_ts" "$start_ts" | bc 2>/dev/null || printf '0')
+                else
+                    local s1 s2
+                    s1="${start_ts%%.*}"
+                    s2="${end_ts%%.*}"
+                    dur=$((s2 - s1))
+                fi
+                adm_metrics_record "FETCH" "$pkg_id" "duration" "$dur" "s" "uri=$uri idx=$idx checksum=fail"
+                return 1
+            fi
+        fi
+    fi
+
+    adm_spinner_stop_ok "Download [$idx] concluído para $pkg_id"
+    adm_event_pkg "PKG_FETCH_OK" "$pkg_id" "uri=$uri idx=$idx"
+
+    end_ts="$(date +%s.%N)"
+    if command -v bc >/dev/null 2>&1; then
+        dur=$(printf '%s - %s\n' "$end_ts" "$start_ts" | bc 2>/dev/null || printf '0')
+    else
+        local s1 s2
+        s1="${start_ts%%.*}"
+        s2="${end_ts%%.*}"
+        dur=$((s2 - s1))
+    fi
+    adm_metrics_record "FETCH" "$pkg_id" "duration" "$dur" "s" "uri=$uri idx=$idx"
+
+    return 0
+}
+
+# =========
+# Função de alto nível: fetch a partir de metadado
+# =========
+
+adm_fetch_for_pkg() {
+    # Faz fetch de TODAS as URIs listadas no metadado para um pacote.
+    #
+    # Uso:
+    #   adm_fetch_for_pkg pkg_id metadado_path
+    #
+    # Efeito:
+    #   - Cria arquivos em cache-src/ com nomes previsíveis.
+    #   - Em caso de erro em QUALQUER parte, aborta.
+    #   - Imprime na saída padrão a lista de arquivos baixados (um por linha).
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_fetch_for_pkg: uso: adm_fetch_for_pkg pkg_id metadado_path"
+    fi
+
+    local pkg_id="$1"
+    local meta="$2"
+
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    local prefix version
+    prefix="$(adm_fetch_pkg_id_to_prefix "$pkg_id")"
+    version="$(adm_fetch_read_meta_single "$meta" "version" || true)"
+    if [[ -z "$version" ]]; then
+        version="unknown"
+    fi
+
+    # Lê URIs e checksums
+    local -a uris=() sums=()
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        uris+=("$line")
+    done < <(adm_fetch_read_meta_field_all "$meta" "source_uri")
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        sums+=("$line")
+    done < <(adm_fetch_read_meta_field_all "$meta" "source_checksum")
+
+    if ((${#uris[@]} == 0)); then
+        adm_log_fatal "Nenhuma 'source_uri:' encontrada no metadado de $pkg_id."
+    fi
+
+    if ((${#sums[@]} > 0 && ${#sums[@]} != ${#uris[@]})); then
+        adm_log_warn "Número de source_checksum não bate com número de source_uri para $pkg_id. Alguns arquivos não serão checados."
+    fi
+
+    adm_event_pkg "PKG_FETCH_START" "$pkg_id" "n_uris=${#uris[@]} version=$version"
+    adm_log_phase_header "Fetch de fontes para $pkg_id (version=$version, partes=${#uris[@]})"
+
+    local -a outputs=()
+    local idx=0
+
+    # Podemos futuramente paralelizar; aqui fazemos em série para simplicidade e logs limpos.
+    for uri in "${uris[@]}"; do
+        idx=$((idx + 1))
+        # nome básico derivado da URI
+        local base
+        base="$(basename "$uri")"
+        if [[ -z "$base" || "$base" == "/" || "$base" == "." ]]; then
+            base="part${idx}.src"
+        fi
+
+        local dest
+        dest="$ADM_CACHE_SRC_DIR/${prefix}__${version}__${idx}__${base}"
+
+        local sum=""
+        if ((${#sums[@]} >= idx)); then
+            sum="${sums[idx-1]}"
+        fi
+
+        adm_log_info "Parte [$idx/${#uris[@]}]: $uri"
+        adm_fetch_one_uri "$pkg_id" "$uri" "$dest" "$sum" "$idx"
+        outputs+=("$dest")
+    done
+
+    adm_event_pkg "PKG_FETCH_DONE" "$pkg_id" "n_uris=${#uris[@]}"
+
+    # imprime caminhos locais (um por linha)
+    local o
+    for o in "${outputs[@]}"; do
+        printf '%s\n' "$o"
+    done
+}
+
+# =========
+# CLI
+# =========
+
+adm_fetch_usage() {
+    cat <<EOF
+adm-fetch - Download e cache de fontes do ADM
+
+Uso (para outros scripts, via CLI):
+
+  adm-fetch fetch-from-meta PKG_ID METADADO
+      Lê source_uri/source_checksum do METADADO e faz download
+      de todas as partes para cache-src/.
+      Imprime na saída padrão a lista de caminhos baixados (um por linha).
+
+Exemplos:
+  adm-fetch fetch-from-meta base/kmod /root/usr/src/adm/packages/base/kmod/metadado
+
+Na prática, scripts devem sourcear este arquivo e usar:
+  adm_fetch_for_pkg "categoria/pacote" "/caminho/do/metadado"
+EOF
+}
+
+adm_fetch_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        fetch-from-meta)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-fetch fetch-from-meta PKG_ID METADADO"
+            fi
+            adm_fetch_for_pkg "$1" "$2"
+            ;;
+        --help|-h|"")
+            adm_fetch_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-fetch: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_fetch_main "$@"
+fi
+
+# Fim do adm-fetch
