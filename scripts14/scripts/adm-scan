@@ -1,0 +1,643 @@
+#!/usr/bin/env bash
+# adm-scan - Scanner de source do ADM 2.0
+#
+# Responsável por:
+#   - Extrair arquivos de source em build/
+#   - Detectar build-system (cmake, meson, autotools, python, etc.)
+#   - Detectar linguagens de programação usadas
+#   - Coletar includes e módulos pkg-config
+#   - Consultar adm-knowledge para sugerir dependências automáticas
+#   - Gerar um "Plano de Construção" (.plan) para uso pelo adm-build/adm-deps
+#
+# Uso via CLI:
+#   adm-scan scan-from-meta PKG_ID METADADO SRC1 [SRC2 ...]
+#
+# Saída:
+#   - Gera diretório de build do pacote
+#   - Gera arquivo .plan (caminho impresso na saída padrão)
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_scan_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-scan.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_SCAN_DIR="$(_adm_scan_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_SCAN_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_SCAN_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_SCAN_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_SCAN_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_SCAN_DIR/adm-knowledge"
+
+# =========
+# Utilidades para PKG/versão e diretório de build
+# =========
+
+adm_scan_pkg_id_to_prefix() {
+    local pkg_id="${1:-}"
+    printf '%s\n' "${pkg_id//\//__}"
+}
+
+adm_scan_read_meta_single() {
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "adm-scan: metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit 0
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_scan_build_dir_for_pkg() {
+    local pkg_id="${1:-}"
+    local version="${2:-unknown}"
+    local prefix
+    prefix="$(adm_scan_pkg_id_to_prefix "$pkg_id")"
+    printf '%s/%s__%s' "$ADM_BUILD_DIR" "$prefix" "$version"
+}
+
+adm_scan_plan_file_for_pkg() {
+    local pkg_id="${1:-}"
+    local version="${2:-unknown}"
+    local prefix
+    prefix="$(adm_scan_pkg_id_to_prefix "$pkg_id")"
+    printf '%s/%s__%s.plan' "$ADM_BUILD_DIR" "$prefix" "$version"
+}
+
+# =========
+# Extração de fontes
+# =========
+
+adm_scan_extract_one() {
+    # Extrai um arquivo de source para um diretório base.
+    # Uso:
+    #   adm_scan_extract_one SRC_PATH DEST_DIR
+    #
+    # Suporta:
+    #   - .tar, .tar.gz, .tgz, .tar.xz, .tar.bz2
+    #   - .zip
+    #   - tar genérico sem extensão conhecida (último recurso)
+    local src="${1:-}"
+    local dest="${2:-}"
+
+    if [[ ! -f "$src" ]]; then
+        adm_log_fatal "adm-scan: arquivo de source não encontrado: '$src'"
+    fi
+
+    mkdir -p "$dest" || adm_log_fatal "adm-scan: não foi possível criar '$dest'"
+
+    local lower
+    lower="$(printf '%s\n' "$src" | tr 'A-Z' 'a-z')"
+
+    if [[ "$lower" == *.tar || "$lower" == *.tar.gz || "$lower" == *.tgz || "$lower" == *.tar.xz || "$lower" == *.tar.bz2 || "$lower" == *.tar.zst ]]; then
+        tar -xf "$src" -C "$dest" || adm_log_fatal "Falha ao extrair tar: '$src'"
+    elif [[ "$lower" == *.zip ]]; then
+        if ! command -v unzip >/dev/null 2>&1; then
+            adm_log_fatal "'unzip' não encontrado para extrair: '$src'"
+        fi
+        unzip -q "$src" -d "$dest" || adm_log_fatal "Falha ao extrair zip: '$src'"
+    else
+        # tentativa genérica com tar
+        if tar -tf "$src" >/dev/null 2>&1; then
+            tar -xf "$src" -C "$dest" || adm_log_fatal "Falha ao extrair tar genérico: '$src'"
+        else
+            adm_log_warn "Formato desconhecido para '$src'; copiando para '$dest' sem extrair."
+            cp -a "$src" "$dest/" || adm_log_fatal "Falha ao copiar '$src' para '$dest'."
+        fi
+    fi
+}
+
+adm_scan_extract_sources() {
+    # Extrai múltiplos arquivos de source em um diretório de build limpo.
+    #
+    # Uso:
+    #   adm_scan_extract_sources BUILD_DIR SRC1 [SRC2 ...]
+    #
+    # Retorna:
+    #   - build_dir preenchido com o código fonte
+    local build_dir="${1:-}"
+    shift || true
+
+    if [[ -z "$build_dir" ]]; then
+        adm_log_fatal "adm_scan_extract_sources: BUILD_DIR vazio."
+    fi
+
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_scan_extract_sources: nenhum source fornecido."
+    fi
+
+    # Limpa build_dir anterior (se existir) com cuidado
+    if [[ -d "$build_dir" ]]; then
+        adm_log_warn "Limpando diretório de build existente: $build_dir"
+        rm -rf "$build_dir" || adm_log_fatal "Falha ao limpar '$build_dir'."
+    fi
+
+    mkdir -p "$build_dir" || adm_log_fatal "Falha ao criar '$build_dir'."
+
+    local src
+    for src in "$@"; do
+        adm_log_info "Extraindo source: $src → $build_dir"
+        adm_scan_extract_one "$src" "$build_dir"
+    done
+}
+
+# =========
+# Detecção de build-system
+# =========
+
+adm_scan_detect_build_system() {
+    # Detecta build-system com base em arquivos conhecidos.
+    #
+    # Ordem de prioridade (aprox):
+    #   meson.build            -> meson
+    #   CMakeLists.txt         -> cmake
+    #   configure.ac/.in       -> autotools
+    #   configure              -> autotools
+    #   setup.py/pyproject     -> python
+    #   Cargo.toml             -> cargo
+    #   go.mod                 -> go
+    #   Makefile.PL            -> perl-make
+    #   Makefile               -> plain-make
+    #   else                   -> unknown
+    local dir="${1:-}"
+
+    if [[ ! -d "$dir" ]]; then
+        adm_log_fatal "adm_scan_detect_build_system: diretório inválido: '$dir'"
+    fi
+
+    # Procuramos em nível recursivo, mas pegando só o primeiro de cada tipo
+    local found
+
+    # Meson
+    found="$(find "$dir" -maxdepth 3 -name "meson.build" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "meson"
+        adm_know_add_buildsystem_hint "meson.build" "meson"
+        return 0
+    fi
+
+    # CMake
+    found="$(find "$dir" -maxdepth 3 -name "CMakeLists.txt" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "cmake"
+        adm_know_add_buildsystem_hint "CMakeLists.txt" "cmake"
+        return 0
+    fi
+
+    # Autotools (configure.ac ou configure)
+    found="$(find "$dir" -maxdepth 3 -name "configure.ac" -o -name "configure.in" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "autotools"
+        adm_know_add_buildsystem_hint "configure.ac" "autotools"
+        return 0
+    fi
+
+    found="$(find "$dir" -maxdepth 3 -name "configure" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "autotools"
+        adm_know_add_buildsystem_hint "configure" "autotools"
+        return 0
+    fi
+
+    # Python
+    found="$(find "$dir" -maxdepth 3 -name "setup.py" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "python"
+        adm_know_add_buildsystem_hint "setup.py" "python"
+        return 0
+    fi
+
+    found="$(find "$dir" -maxdepth 3 -name "pyproject.toml" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "python"
+        adm_know_add_buildsystem_hint "pyproject.toml" "python"
+        return 0
+    fi
+
+    # Cargo (Rust)
+    found="$(find "$dir" -maxdepth 3 -name "Cargo.toml" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "cargo"
+        adm_know_add_buildsystem_hint "Cargo.toml" "cargo"
+        return 0
+    fi
+
+    # Go
+    found="$(find "$dir" -maxdepth 3 -name "go.mod" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "go"
+        adm_know_add_buildsystem_hint "go.mod" "go"
+        return 0
+    fi
+
+    # Perl MakeMaker
+    found="$(find "$dir" -maxdepth 3 -name "Makefile.PL" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "perl-make"
+        adm_know_add_buildsystem_hint "Makefile.PL" "perl-make"
+        return 0
+    fi
+
+    # Makefile simples
+    found="$(find "$dir" -maxdepth 3 -name "Makefile" -print -quit 2>/dev/null || true)"
+    if [[ -n "$found" ]]; then
+        echo "plain-make"
+        adm_know_add_buildsystem_hint "Makefile" "plain-make"
+        return 0
+    fi
+
+    echo "unknown"
+    return 0
+}
+
+# =========
+# Detecção de linguagens
+# =========
+
+adm_scan_detect_languages() {
+    # Varre arquivos no diretório e detecta linguagens pela extensão.
+    #
+    # Saída: lista de linguagens separadas por vírgula.
+    local dir="${1:-}"
+
+    if [[ ! -d "$dir" ]]; then
+        adm_log_fatal "adm_scan_detect_languages: diretório inválido: '$dir'"
+    fi
+
+    local langs=""
+    local add_lang
+    add_lang() {
+        local l="$1"
+        case ",$langs," in
+            *",$l,"*) : ;;
+            *) langs="${langs:+$langs,}$l" ;;
+        esac
+    }
+
+    while IFS= read -r f; do
+        case "$f" in
+            *.c) add_lang "c" ;;
+            *.cc|*.cpp|*.cxx) add_lang "c++" ;;
+            *.h|*.hpp) : ;;  # cabeçalhos, já cobertos por c/c++
+            *.rs) add_lang "rust" ;;
+            *.go) add_lang "go" ;;
+            *.f90|*.f95|*.f03|*.f) add_lang "fortran" ;;
+            *.py) add_lang "python" ;;
+            *.java) add_lang "java" ;;
+            *.cs) add_lang "csharp" ;;
+            *.rb) add_lang "ruby" ;;
+            *.pl) add_lang "perl" ;;
+            *.js) add_lang "javascript" ;;
+        esac
+    done < <(find "$dir" -type f -maxdepth 10 2>/dev/null || true)
+
+    printf '%s\n' "$langs"
+}
+
+# =========
+# Coleta de includes e pkg-config
+# =========
+
+adm_scan_collect_includes() {
+    # Procura #include em arquivos C/C++ e grava em um arquivo (um include por linha, sem repetição).
+    #
+    # Uso:
+    #   adm_scan_collect_includes SRC_DIR OUT_FILE
+    local dir="${1:-}"
+    local out="${2:-}"
+
+    if [[ ! -d "$dir" ]]; then
+        adm_log_fatal "adm_scan_collect_includes: diretório inválido: '$dir'"
+    fi
+
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/scan-includes-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para includes."
+
+    # Procuramos padrões #include <...> e #include "..."
+    # Limitamos a alguns tipos de arquivo para evitar lixo demais.
+    if command -v grep >/dev/null 2>&1; then
+        grep -Rho --include='*.c' --include='*.cc' --include='*.cpp' --include='*.cxx' --include='*.h' --include='*.hpp' \
+            '#[[:space:]]*include[[:space:]]*["<][^">]*[">]' "$dir" 2>/dev/null \
+            | sed -E 's/.*include[[:space:]]*["<]([^">]+)[">].*/\1/' \
+            | sort -u >"$tmp" || true
+    else
+        : >"$tmp"
+    fi
+
+    mv "$tmp" "$out"
+}
+
+adm_scan_collect_pkgconfig_modules() {
+    # Procura uso de pkg-config em scripts/configure/meson/etc.
+    #
+    # Uso:
+    #   adm_scan_collect_pkgconfig_modules SRC_DIR OUT_FILE
+    local dir="${1:-}"
+    local out="${2:-}"
+
+    if [[ ! -d "$dir" ]]; then
+        adm_log_fatal "adm_scan_collect_pkgconfig_modules: diretório inválido: '$dir'"
+    fi
+
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/scan-pc-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para pkg-config."
+
+    if command -v grep >/dev/null 2>&1; then
+        # Pega linhas com pkg-config
+        grep -Rho 'pkg-config[[:space:]][^"]*' "$dir" 2>/dev/null \
+            | sed -E 's/.*pkg-config[[:space:]]+([^[:space:]]+).*/\1/' \
+            | sed -E 's/["'"'"']//g' \
+            | sort -u >"$tmp" || true
+    else
+        : >"$tmp"
+    fi
+
+    mv "$tmp" "$out"
+}
+# =========
+# Detecção de docs e manpages (simples)
+# =========
+
+adm_scan_detect_docs() {
+    # Retorna "1" se encontrar diretórios/doc arquivos típicos de doc/man, senão "0"
+    local dir="${1:-}"
+
+    if [[ ! -d "$dir" ]]; then
+        printf '0\n'
+        return 0
+    fi
+
+    local d
+    for d in doc docs Documentation man; do
+        if find "$dir" -maxdepth 3 -type d -name "$d" -print -quit 2>/dev/null | grep -q .; then
+            printf '1\n'
+            return 0
+        fi
+    done
+
+    printf '0\n'
+}
+
+# =========
+# Construção da lista de deps automáticas (usando knowledge)
+# =========
+
+adm_scan_guess_auto_deps() {
+    # Dado includes_file e pkgconfig_file, usa adm-knowledge para sugerir deps.
+    #
+    # Uso:
+    #   adm_scan_guess_auto_deps INCLUDES_FILE PKGCONFIG_FILE
+    #
+    # Saída:
+    #   lista de pkg_id separados por espaço (ordenados por peso desc)
+    local inc_file="${1:-}"
+    local pc_file="${2:-}"
+
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/scan-autodeps-XXXXXX")" || adm_log_fatal "Falha ao criar tmp auto deps."
+
+    adm_know_guess_deps_from_includes_and_pkgconfig "$inc_file" "$pc_file" >"$tmp" || true
+
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp" || true
+        printf '\n'
+        return 0
+    fi
+
+    # Converte "pkg_id TAB peso" -> apenas pkg_id ordenado por peso desc
+    awk -F '\t' 'NF>=1 {print $1}' "$tmp" | tr '\n' ' ' | sed 's/[[:space:]]\+$//' || true
+
+    rm -f "$tmp" || true
+}
+
+# =========
+# Geração do arquivo de plano (.plan)
+# =========
+
+adm_scan_write_plan() {
+    # Gera arquivo .plan com informações sintetizadas
+    #
+    # Uso:
+    #   adm_scan_write_plan PKG_ID VERSION BUILD_DIR BUILD_SYSTEM LANGS INCLUDES_FILE PKGCONFIG_FILE AUTO_DEPS
+    #
+    # Saída:
+    #   imprime caminho do .plan
+    if [[ $# -lt 8 ]]; then
+        adm_log_fatal "adm_scan_write_plan: uso: adm_scan_write_plan PKG_ID VERSION BUILD_DIR BUILD_SYSTEM LANGS INCLUDES_FILE PKGCONFIG_FILE AUTO_DEPS"
+    fi
+
+    local pkg_id="$1"
+    local version="$2"
+    local build_dir="$3"
+    local build_system="$4"
+    local langs="$5"
+    local includes_file="$6"
+    local pc_file="$7"
+    local auto_deps="$8"
+
+    local plan
+    plan="$(adm_scan_plan_file_for_pkg "$pkg_id" "$version")"
+
+    mkdir -p "$(dirname "$plan")" || adm_log_fatal "Falha ao criar diretório para plano '$plan'."
+
+    local has_docs
+    has_docs="$(adm_scan_detect_docs "$build_dir")"
+
+    adm_with_lock "plan-$(adm_scan_pkg_id_to_prefix "$pkg_id")" bash -c '
+        local plan="$1" pkg_id="$2" version="$3" build_dir="$4"
+        local build_system="$5" langs="$6" includes_file="$7" pc_file="$8" auto_deps="$9" has_docs="${10}"
+
+        {
+            printf "[plan]\n"
+            printf "pkg_id=%s\n" "$pkg_id"
+            printf "version=%s\n" "$version"
+            printf "build_system=%s\n" "$build_system"
+            printf "languages=%s\n" "$langs"
+            printf "source_dir=%s\n" "$build_dir"
+            printf "includes_file=%s\n" "$includes_file"
+            printf "pkgconfig_file=%s\n" "$pc_file"
+            printf "auto_build_deps=%s\n" "$auto_deps"
+            printf "has_docs=%s\n" "$has_docs"
+        } >"$plan.tmp" || {
+            printf "ADM-ERROR: falha ao escrever arquivo de plano temporário %s\n" "$plan" >&2
+            exit 1
+        }
+
+        mv "$plan.tmp" "$plan" || {
+            printf "ADM-ERROR: falha ao renomear arquivo de plano %s\n" "$plan" >&2
+            exit 1
+        }
+    ' _ "$plan" "$pkg_id" "$version" "$build_dir" "$build_system" "$langs" "$includes_file" "$pc_file" "$auto_deps" "$has_docs"
+
+    adm_log_ok "Plano de construção gerado para $pkg_id → $plan"
+    adm_event_pkg "PKG_SCAN_PLAN_WRITTEN" "$pkg_id" "plan=$plan"
+
+    printf '%s\n' "$plan"
+}
+
+# =========
+# Função de alto nível: scan para pacote
+# =========
+
+adm_scan_for_pkg() {
+    # Função principal do scanner.
+    #
+    # Uso:
+    #   adm_scan_for_pkg PKG_ID METADADO SRC1 [SRC2 ...]
+    #
+    # Passos:
+    #   - Determina versão e diretório de build
+    #   - Extrai fontes em build_dir
+    #   - Detecta build-system e linguagens
+    #   - Coleta includes e módulos pkg-config
+    #   - Usa adm-knowledge para sugerir deps
+    #   - Gera arquivo .plan e imprime seu caminho
+    if [[ $# -lt 3 ]]; then
+        adm_log_fatal "adm_scan_for_pkg: uso: adm_scan_for_pkg PKG_ID METADADO SRC1 [SRC2 ...]"
+    fi
+
+    local pkg_id="$1"
+    local meta="$2"
+    shift 2 || true
+
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "adm-scan: metadado não encontrado: '$meta'"
+    fi
+
+    local version
+    version="$(adm_scan_read_meta_single "$meta" "version" || true)"
+    if [[ -z "$version" ]]; then
+        version="unknown"
+    fi
+
+    local build_dir
+    build_dir="$(adm_scan_build_dir_for_pkg "$pkg_id" "$version")"
+
+    adm_log_phase_header "Scan de source para $pkg_id (version=$version)"
+    adm_event_pkg "PKG_SCAN_START" "$pkg_id" "version=$version"
+
+    # Extrai fontes
+    adm_metrics_time_block "SCAN" "$pkg_id" "extract_sources" adm_scan_extract_sources "$build_dir" "$@"
+
+    # Detecta build-system
+    local build_system
+    build_system="$(adm_scan_detect_build_system "$build_dir")"
+    adm_log_info "Build-system detectado: ${build_system:-unknown}"
+
+    # Detecta linguagens
+    local langs
+    langs="$(adm_scan_detect_languages "$build_dir")"
+    adm_log_info "Linguagens detectadas: ${langs:-nenhuma}"
+
+    # Coleta includes e pkg-config
+    local includes_file pkgconfig_file
+    includes_file="$build_dir/.adm-includes"
+    pkgconfig_file="$build_dir/.adm-pkgconfig"
+
+    adm_metrics_time_block "SCAN" "$pkg_id" "collect_includes" adm_scan_collect_includes "$build_dir" "$includes_file"
+    adm_metrics_time_block "SCAN" "$pkg_id" "collect_pkgconfig" adm_scan_collect_pkgconfig_modules "$build_dir" "$pkgconfig_file"
+
+    # Sugere deps automáticas
+    local auto_deps
+    auto_deps="$(adm_scan_guess_auto_deps "$includes_file" "$pkgconfig_file")"
+    adm_log_info "Dependências automáticas sugeridas: ${auto_deps:-nenhuma}"
+
+    # Gera arquivo de plano
+    local plan
+    plan="$(adm_scan_write_plan "$pkg_id" "$version" "$build_dir" "$build_system" "$langs" "$includes_file" "$pkgconfig_file" "$auto_deps")"
+
+    adm_event_pkg "PKG_SCAN_DONE" "$pkg_id" "plan=$plan"
+    printf '%s\n' "$plan"
+}
+
+# =========
+# CLI
+# =========
+
+adm_scan_usage() {
+    cat <<EOF
+adm-scan - Scanner de source do ADM 2.0
+
+Uso:
+  adm-scan scan-from-meta PKG_ID METADADO SRC1 [SRC2 ...]
+      - Extrai fontes em build/
+      - Detecta build-system, linguagens
+      - Coleta includes e módulos pkg-config
+      - Usa adm-knowledge para sugerir deps
+      - Gera arquivo .plan e imprime o caminho na saída padrão
+
+Exemplo:
+  SRC_LIST=\$(adm-fetch fetch-from-meta base/kmod /root/usr/src/adm/packages/base/kmod/metadado)
+  adm-scan scan-from-meta base/kmod /root/usr/src/adm/packages/base/kmod/metadado \$SRC_LIST
+
+Na prática, scripts de build devem sourcear este arquivo e usar:
+  adm_scan_for_pkg "categoria/pacote" "/caminho/metadado" SRC1 [SRC2 ...]
+
+EOF
+}
+
+adm_scan_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        scan-from-meta)
+            shift || true
+            if [[ $# -lt 3 ]]; then
+                adm_log_fatal "Uso: adm-scan scan-from-meta PKG_ID METADADO SRC1 [SRC2 ...]"
+            fi
+            adm_scan_for_pkg "$1" "$2" "${@:3}"
+            ;;
+        --help|-h|"")
+            adm_scan_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-scan: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_scan_main "$@"
+fi
