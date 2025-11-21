@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# adm-eventd - Barramento de eventos simples para o ADM 2.0
+#
+# Pode ser:
+#   - sourceado por outros scripts para usar funções adm_event_*
+#   - executado diretamente como ferramenta de debug/monitoramento
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e UI
+# =========
+
+_adm_eventd_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-eventd.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_EVENTD_DIR="$(_adm_eventd_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_EVENTD_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_EVENTD_DIR/adm-log-ui"
+
+# Garante que diretório de eventos exista
+if [[ ! -d "$ADM_DB_EVENTS_DIR" ]]; then
+    mkdir -p "$ADM_DB_EVENTS_DIR" || adm_log_fatal "Falha ao criar diretório de eventos '$ADM_DB_EVENTS_DIR'."
+fi
+
+# =========
+# Configuração dos arquivos de evento
+# =========
+
+# Nome do arquivo de eventos atual (por dia)
+adm_event_file_for_today() {
+    local day
+    day="$(date '+%Y%m%d')"
+    printf '%s/events-%s.log' "$ADM_DB_EVENTS_DIR" "$day"
+}
+
+# =========
+# Serialização de eventos
+# =========
+
+# Formato interno: linha TSV
+# ts \t pid \t tipo \t alvo \t msg
+
+adm_event_timestamp() {
+    date '+%Y-%m-%dT%H:%M:%S%z'
+}
+
+adm_event_serialize() {
+    # Serializa um evento como linha TSV segura.
+    # Uso: adm_event_serialize tipo alvo msg...
+    local tipo="${1:-}"
+    local alvo="${2:-}"
+    shift 2 || true
+    local msg="$*"
+
+    if [[ -z "$tipo" ]]; then
+        adm_log_fatal "adm_event_serialize: tipo vazio."
+    fi
+
+    local ts pid
+    ts="$(adm_event_timestamp)"
+    pid="$$"
+
+    # Garantir que não haja tabs; substitui tabs por espaço
+    tipo="${tipo//$'\t'/ }"
+    alvo="${alvo//$'\t'/ }"
+    msg="${msg//$'\t'/ }"
+
+    printf '%s\t%s\t%s\t%s\t%s\n' "$ts" "$pid" "$tipo" "$alvo" "$msg"
+}
+
+# =========
+# Emissão de eventos
+# =========
+
+adm_event_emit() {
+    # Emite um evento genérico.
+    # Uso:
+    #   adm_event_emit TIPO ALVO "mensagem..."
+    #
+    # Exemplos:
+    #   adm_event_emit PKG_BUILD_STARTED base/kmod "Iniciando build"
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_event_emit: uso: adm_event_emit TIPO ALVO [MENSAGEM...]"
+    fi
+
+    local tipo="$1"
+    local alvo="$2"
+    shift 2 || true
+    local msg="$*"
+
+    local line file
+    line="$(adm_event_serialize "$tipo" "$alvo" "$msg")"
+    file="$(adm_event_file_for_today)"
+
+    adm_with_lock "events" bash -c '
+        local file="$1" line="$2"
+        # Garante que o diretório do arquivo exista
+        mkdir -p "$(dirname "$file")" || {
+            printf "ADM-ERROR: não foi possível criar diretório de eventos.\n" >&2
+            exit 1
+        }
+        printf "%s\n" "$line" >>"$file" || {
+            printf "ADM-ERROR: não foi possível gravar evento em %s\n" "$file" >&2
+            exit 1
+        }
+    ' _ "$file" "$line"
+}
+
+adm_event_pkg() {
+    # Conveniência para eventos de pacote.
+    # Uso:
+    #   adm_event_pkg PKG_BUILD_STARTED "categoria/pacote" "mensagem..."
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_event_pkg: uso: adm_event_pkg TIPO pacote [MENSAGEM...]"
+    fi
+    adm_event_emit "$@"
+}
+
+adm_event_simple() {
+    # Evento sem alvo específico.
+    # Uso:
+    #   adm_event_simple "MSG" -> tipo=GENERIC, alvo="-"
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_event_simple: uso: adm_event_simple MENSAGEM..."
+    fi
+    adm_event_emit "GENERIC" "-" "$*"
+}
+
+# =========
+# Leitura e exibição de eventos
+# =========
+
+adm_event_pretty_line() {
+    # Converte uma linha TSV em saída legível
+    # Uso: echo "linha" | adm_event_pretty_line
+    local line
+    if ! IFS= read -r line; then
+        return 1
+    fi
+
+    # Divide em campos
+    local ts pid tipo alvo msg
+    ts="${line%%$'\t'*}"
+    local rest="${line#*$'\t'}"
+
+    pid="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+
+    tipo="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+
+    alvo="${rest%%$'\t'*}"
+    msg="${rest#*$'\t'}"
+
+    # Estilo da saída
+    local color_type color_target
+    color_type="$ADM_COLOR_BLUE"
+    color_target="$ADM_COLOR_CYAN"
+
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_DIM}[pid=${pid}]${ADM_COLOR_RESET} ${color_type}${tipo}${ADM_COLOR_RESET} ${color_target}${alvo}${ADM_COLOR_RESET} ${msg}"
+}
+
+adm_event_tail_file() {
+    # Exibe eventos de um arquivo (inteiro ou seguindo)
+    # Uso:
+    #   adm_event_tail_file arquivo [--follow]
+    local file="${1:-}"
+    local follow="${2:-}"
+
+    if [[ -z "$file" ]]; then
+        adm_log_fatal "adm_event_tail_file: arquivo não informado."
+    fi
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_warn "Arquivo de eventos '$file' não existe (ainda)."
+        return 0
+    fi
+
+    if [[ "$follow" == "--follow" ]]; then
+        # Tail -F com pretty-print
+        # shellcheck disable=SC2002
+        tail -F "$file" 2>/dev/null | while IFS= read -r line; do
+            printf '%s\n' "$line" | adm_event_pretty_line || true
+        done
+    else
+        # Apenas o conteúdo atual
+        while IFS= read -r line; do
+            printf '%s\n' "$line" | adm_event_pretty_line || true
+        done <"$file"
+    fi
+}
+
+adm_event_tail_today() {
+    # Exibe eventos do arquivo de hoje
+    local file
+    file="$(adm_event_file_for_today)"
+    adm_event_tail_file "$file" "${1:-}"
+}
+
+adm_event_list_files() {
+    # Lista arquivos de eventos disponíveis
+    # Ordenados por nome
+    local f
+    for f in "$ADM_DB_EVENTS_DIR"/events-*.log; do
+        [[ -e "$f" ]] || continue
+        printf '%s\n' "$f"
+    done
+}
+
+# =========
+# CLI: adm-eventd
+# =========
+
+adm_eventd_usage() {
+    cat <<EOF
+adm-eventd - Barramento de eventos do ADM 2.0
+
+Uso:
+  adm-eventd emit TIPO ALVO [MENSAGEM...]
+      Emite um evento simples para o barramento.
+
+  adm-eventd simple MENSAGEM...
+      Emite um evento genérico (TIPO=GENERIC, ALVO=-).
+
+  adm-eventd tail [--follow]
+      Mostra eventos de hoje de forma legível.
+      --follow: acompanha novos eventos em tempo real.
+
+  adm-eventd tail-file ARQUIVO [--follow]
+      Mostra eventos de um arquivo específico.
+
+  adm-eventd list-files
+      Lista arquivos de eventos existentes.
+
+  adm-eventd --help
+      Mostra esta ajuda.
+
+Geralmente, outros scripts fonteiam este arquivo e usam:
+  adm_event_emit, adm_event_pkg, adm_event_simple
+EOF
+}
+
+adm_eventd_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        emit)
+            shift
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-eventd emit TIPO ALVO [MENSAGEM...]"
+            fi
+            adm_event_emit "$@"
+            ;;
+        simple)
+            shift
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-eventd simple MENSAGEM..."
+            fi
+            adm_event_simple "$*"
+            ;;
+        tail)
+            shift
+            adm_event_tail_today "${1:-}"
+            ;;
+        tail-file)
+            shift
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-eventd tail-file ARQUIVO [--follow]"
+            fi
+            local file="$1"
+            shift || true
+            adm_event_tail_file "$file" "${1:-}"
+            ;;
+        list-files)
+            adm_event_list_files
+            ;;
+        --help|-h|"")
+            adm_eventd_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-eventd: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_eventd_main "${@:-}"
+fi
+
+# Fim do adm-eventd
