@@ -1,0 +1,562 @@
+#!/usr/bin/env bash
+# adm-knowledge - Banco de conhecimento do ADM 2.0
+#
+# Mapeia:
+#   - includes  -> pacotes (includes.map)
+#   - pkg-config -> pacotes (pkgconfig.map)
+#   - lib SONAME -> pacotes (libsoname.map)
+#   - padrões / arquivos -> build-system (buildsystem.map)
+#
+# Formato das linhas (TSV):
+#   chave<TAB>pkg_id<TAB>peso
+#
+# Pode ser sourceado por outros scripts (especialmente adm-scan, adm-check)
+# e também usado como ferramenta de debug via CLI.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente, UI e eventos
+# =========
+
+_adm_know_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-knowledge.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_KNOW_DIR="$(_adm_know_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_KNOW_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_KNOW_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_KNOW_DIR/adm-eventd"
+
+# Garante diretório de knowledge
+if [[ ! -d "$ADM_DB_KNOWLEDGE_DIR" ]]; then
+    mkdir -p "$ADM_DB_KNOWLEDGE_DIR" || adm_log_fatal "Falha ao criar '$ADM_DB_KNOWLEDGE_DIR'."
+fi
+
+ADM_KNOW_INCLUDES_MAP="$ADM_DB_KNOWLEDGE_DIR/includes.map"
+ADM_KNOW_PKGCONFIG_MAP="$ADM_DB_KNOWLEDGE_DIR/pkgconfig.map"
+ADM_KNOW_LIBSONAME_MAP="$ADM_DB_KNOWLEDGE_DIR/libsoname.map"
+ADM_KNOW_BUILDSYSTEM_MAP="$ADM_DB_KNOWLEDGE_DIR/buildsystem.map"
+
+# =========
+# Utilidades internas
+# =========
+
+adm_know__sanitize_key() {
+    # Remove tabs da chave para não quebrar o formato TSV
+    local key="$1"
+    key="${key//$'\t'/ }"
+    printf '%s' "$key"
+}
+
+adm_know__sanitize_pkg() {
+    local pkg="$1"
+    pkg="${pkg//$'\t'/ }"
+    printf '%s' "$pkg"
+}
+
+adm_know__map_add() {
+    # Adiciona/atualiza uma linha em um arquivo de mapeamento:
+    #   arquivo, chave, pkg_id
+    #
+    # - Se (chave, pkg) já existir: incrementa peso.
+    # - Se não: cria com peso=1.
+    #
+    # Uso interno:
+    #   adm_know__map_add "$ADM_KNOW_INCLUDES_MAP" "#include <gtk/gtk.h>" "x11/gtk+3"
+    if [[ $# -lt 3 ]]; then
+        adm_log_fatal "adm_know__map_add: uso: adm_know__map_add arquivo chave pkg_id"
+    fi
+
+    local file="$1"
+    local key
+    key="$(adm_know__sanitize_key "$2")"
+    local pkg
+    pkg="$(adm_know__sanitize_pkg "$3")"
+
+    local lock_name
+    lock_name="knowledge-$(basename "$file")"
+
+    adm_with_lock "$lock_name" bash -c '
+        local file="$1" key="$2" pkg="$3"
+
+        mkdir -p "$(dirname "$file")" || {
+            printf "ADM-ERROR: falha ao criar diretório para knowledge map.\n" >&2
+            exit 1
+        }
+
+        local tmp="${file}.tmp"
+        local found=0
+
+        if [[ -f "$file" ]]; then
+            while IFS=$'\t' read -r k p w; do
+                # Se linha estiver vazia, pula
+                [[ -z "$k" && -z "$p" && -z "$w" ]] && continue
+                if [[ "$k" == "$key" && "$p" == "$pkg" ]]; then
+                    # incrementa peso
+                    if [[ -z "$w" ]]; then
+                        w=1
+                    fi
+                    w=$((w + 1))
+                    found=1
+                fi
+                printf "%s\t%s\t%s\n" "$k" "$p" "$w" >>"$tmp"
+            done <"$file"
+        fi
+
+        if [[ $found -eq 0 ]]; then
+            printf "%s\t%s\t1\n" "$key" "$pkg" >>"$tmp"
+        fi
+
+        mv "$tmp" "$file" || {
+            printf "ADM-ERROR: falha ao atualizar knowledge map %s\n" "$file" >&2
+            exit 1
+        }
+    ' _ "$file" "$key" "$pkg"
+
+    adm_log_debug "Knowledge atualizado: $(basename "$file"): $key -> $pkg"
+}
+
+adm_know__map_best_for_key() {
+    # Retorna o pkg_id com maior peso para uma chave num arquivo de map.
+    # Uso:
+    #   adm_know__map_best_for_key arquivo chave
+    #
+    # Saída: pkg_id (stdout) ou nada se não houver
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know__map_best_for_key: uso: adm_know__map_best_for_key arquivo chave"
+    fi
+
+    local file="$1"
+    local key
+    key="$(adm_know__sanitize_key "$2")"
+
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+
+    awk -v target="$key" -F '\t' '
+        NF >= 2 && $1 == target {
+            pkg = $2
+            w = (NF >= 3 && $3 != "" ? $3 : 1)
+            if (w > best) {
+                best = w
+                bestpkg = pkg
+            }
+        }
+        END {
+            if (bestpkg != "") {
+                print bestpkg
+            }
+        }
+    ' "$file"
+}
+
+adm_know__map_list_for_key() {
+    # Lista todos os pacotes para uma chave num map, em ordem de peso (descendente)
+    # Formato: pkg_id<TAB>peso
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know__map_list_for_key: uso: adm_know__map_list_for_key arquivo chave"
+    fi
+
+    local file="$1"
+    local key
+    key="$(adm_know__sanitize_key "$2")"
+
+    if [[ ! -f "$file" ]]; then
+        return 1
+    fi
+
+    awk -v target="$key" -F '\t' '
+        NF >= 2 && $1 == target {
+            pkg=$2
+            w=(NF>=3 && $3 != "" ? $3 : 1)
+            printf "%s\t%d\n", pkg, w
+        }
+    ' "$file" | sort -k2,2nr
+}
+
+# =========
+# API pública de includes
+# =========
+
+adm_know_add_include() {
+    # Registra que o include "incl" está associado ao pacote pkg_id.
+    #
+    # Exemplos de "incl":
+    #   "gtk/gtk.h"
+    #   "openssl/ssl.h"
+    #
+    # Uso:
+    #   adm_know_add_include "gtk/gtk.h" "x11/gtk+3"
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know_add_include: uso: adm_know_add_include include pkg_id"
+    fi
+
+    local incl="$1"
+    local pkg_id="$2"
+
+    adm_know__map_add "$ADM_KNOW_INCLUDES_MAP" "$incl" "$pkg_id"
+    adm_event_emit "KNOW_INCLUDE_ADD" "$pkg_id" "include=$incl"
+}
+
+adm_know_best_pkg_for_include() {
+    # Retorna o pacote mais provável para um include.
+    # Uso:
+    #   adm_know_best_pkg_for_include "gtk/gtk.h"
+    adm_know__map_best_for_key "$ADM_KNOW_INCLUDES_MAP" "$1"
+}
+
+adm_know_list_pkgs_for_include() {
+    # Lista todos os pacotes candidatos para um include, com peso.
+    # Uso:
+    #   adm_know_list_pkgs_for_include "gtk/gtk.h"
+    adm_know__map_list_for_key "$ADM_KNOW_INCLUDES_MAP" "$1"
+}
+
+# =========
+# API pública de pkg-config
+# =========
+
+adm_know_add_pkgconfig() {
+    # Registra que o módulo pkg-config "pc_name" está associado ao pacote pkg_id.
+    #
+    # Exemplo:
+    #   adm_know_add_pkgconfig "gtk+-3.0" "x11/gtk+3"
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know_add_pkgconfig: uso: adm_know_add_pkgconfig pc_name pkg_id"
+    fi
+
+    local pc="$1"
+    local pkg_id="$2"
+
+    adm_know__map_add "$ADM_KNOW_PKGCONFIG_MAP" "$pc" "$pkg_id"
+    adm_event_emit "KNOW_PKGCONFIG_ADD" "$pkg_id" "pc=$pc"
+}
+
+adm_know_best_pkg_for_pkgconfig() {
+    # Retorna pacote mais provável para um módulo pkg-config.
+    # Uso:
+    #   adm_know_best_pkg_for_pkgconfig "gtk+-3.0"
+    adm_know__map_best_for_key "$ADM_KNOW_PKGCONFIG_MAP" "$1"
+}
+
+adm_know_list_pkgs_for_pkgconfig() {
+    # Lista todos os pacotes candidatos para um módulo pkg-config.
+    adm_know__map_list_for_key "$ADM_KNOW_PKGCONFIG_MAP" "$1"
+}
+
+# =========
+# API pública de lib SONAME (ELF)
+# =========
+
+adm_know_add_libsoname() {
+    # Registra que o SONAME de biblioteca "libname.so.X" pertence ao pacote pkg_id.
+    #
+    # Exemplo:
+    #   adm_know_add_libsoname "libssl.so.3" "security/openssl"
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know_add_libsoname: uso: adm_know_add_libsoname soname pkg_id"
+    fi
+
+    local soname="$1"
+    local pkg_id="$2"
+
+    adm_know__map_add "$ADM_KNOW_LIBSONAME_MAP" "$soname" "$pkg_id"
+    adm_event_emit "KNOW_LIBSONAME_ADD" "$pkg_id" "soname=$soname"
+}
+
+adm_know_best_pkg_for_libsoname() {
+    # Retorna pacote mais provável para um SONAME.
+    adm_know__map_best_for_key "$ADM_KNOW_LIBSONAME_MAP" "$1"
+}
+
+adm_know_list_pkgs_for_libsoname() {
+    # Lista todos os pacotes candidatos para um SONAME.
+    adm_know__map_list_for_key "$ADM_KNOW_LIBSONAME_MAP" "$1"
+}
+
+# =========
+# API pública de build-system (padrões)
+# =========
+
+adm_know_add_buildsystem_hint() {
+    # Registra que certo padrão/arquivo indica um build-system.
+    #
+    # Exemplo:
+    #   adm_know_add_buildsystem_hint "CMakeLists.txt" "cmake"
+    #   adm_know_add_buildsystem_hint "meson.build"   "meson"
+    #
+    # Aqui, "chave" geralmente será nome de arquivo ou padrão textual.
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know_add_buildsystem_hint: uso: adm_know_add_buildsystem_hint pattern buildsystem"
+    fi
+
+    local pattern="$1"
+    local buildsys="$2"
+
+    adm_know__map_add "$ADM_KNOW_BUILDSYSTEM_MAP" "$pattern" "$buildsys"
+    adm_event_emit "KNOW_BUILDSYS_ADD" "$buildsys" "pattern=$pattern"
+}
+
+adm_know_best_buildsystem_for_pattern() {
+    # Retorna o build-system mais provável para um padrão/arquivo.
+    #
+    # Exemplo:
+    #   adm_know_best_buildsystem_for_pattern "CMakeLists.txt"
+    adm_know__map_best_for_key "$ADM_KNOW_BUILDSYSTEM_MAP" "$1"
+}
+
+adm_know_list_buildsystems_for_pattern() {
+    # Lista todos os build-systems candidatos para um padrão.
+    adm_know__map_list_for_key "$ADM_KNOW_BUILDSYSTEM_MAP" "$1"
+}
+
+# =========
+# Sugestões combinadas (para uso pelo adm-scan / adm-deps)
+# =========
+
+adm_know_guess_deps_from_includes_and_pkgconfig() {
+    # Dada uma lista de includes e módulos pkg-config, sugere pacotes.
+    #
+    # Entrada:
+    #   - arquivo com includes (um por linha)
+    #   - arquivo com nomes de pkg-config (um por linha)
+    #
+    # Saída:
+    #   pkg_id<TAB>peso_total
+    #
+    # Uso:
+    #   adm_know_guess_deps_from_includes_and_pkgconfig includes.txt pc.txt
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_know_guess_deps_from_includes_and_pkgconfig: uso: adm_know_guess_deps_from_includes_and_pkgconfig arq_includes arq_pkgconfig"
+    fi
+
+    local inc_file="$1"
+    local pc_file="$2"
+
+    if [[ ! -f "$inc_file" ]]; then
+        adm_log_warn "Arquivo de includes não encontrado: $inc_file"
+    fi
+    if [[ ! -f "$pc_file" ]]; then
+        adm_log_warn "Arquivo de pkg-config não encontrado: $pc_file"
+    fi
+
+    # Vamos acumular pesos numa map temporária (arquivo)
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/know-deps-XXXXXX")" || adm_log_fatal "Falha ao criar tmp knowledge deps."
+
+    # Para cada include, soma peso dos pacotes
+    if [[ -f "$inc_file" ]]; then
+        while IFS= read -r incl; do
+            [[ -z "$incl" ]] && continue
+            adm_know_list_pkgs_for_include "$incl" 2>/dev/null || continue
+        done <"$inc_file" >>"$tmp"
+    fi
+
+    # Para cada pkg-config, soma peso
+    if [[ -f "$pc_file" ]]; then
+        while IFS= read -r pc; do
+            [[ -z "$pc" ]] && continue
+            adm_know_list_pkgs_for_pkgconfig "$pc" 2>/dev/null || continue
+        done <"$pc_file" >>"$tmp"
+    fi
+
+    if [[ ! -s "$tmp" ]]; then
+        # nada conhecido
+        rm -f "$tmp" || true
+        return 0
+    fi
+
+    # Agrupa por pkg_id somando pesos
+    awk -F '\t' '
+        NF>=2 {
+            pkg=$1
+            w=(NF>=2 ? $2 : 1)
+            sum[pkg]+=w
+        }
+        END {
+            for (p in sum) {
+                printf "%s\t%d\n", p, sum[p]
+            }
+        }
+    ' "$tmp" | sort -k2,2nr
+
+    rm -f "$tmp" || true
+}
+
+# =========
+# CLI de debug
+# =========
+
+adm_know_usage() {
+    cat <<EOF
+adm-knowledge - Banco de conhecimento do ADM 2.0
+
+Uso (CLI de debug):
+
+  Includes:
+    adm-knowledge add-include INCLUDE PKG_ID
+        Registra include -> pacote.
+
+    adm-knowledge best-include INCLUDE
+        Mostra pacote mais provável para INCLUDE.
+
+    adm-knowledge list-include INCLUDE
+        Lista todos os pacotes candidatos para INCLUDE.
+
+  Pkg-config:
+    adm-knowledge add-pkgconfig PC_NAME PKG_ID
+    adm-knowledge best-pkgconfig PC_NAME
+    adm-knowledge list-pkgconfig PC_NAME
+
+  Lib SONAME:
+    adm-knowledge add-libsoname SONAME PKG_ID
+    adm-knowledge best-libsoname SONAME
+    adm-knowledge list-libsoname SONAME
+
+  Build-system:
+    adm-knowledge add-buildsys PATTERN BUILDSYS
+    adm-knowledge best-buildsys PATTERN
+    adm-knowledge list-buildsys PATTERN
+
+  Sugestão combinada:
+    adm-knowledge guess-deps INCLUDES_FILE PKGCONFIG_FILE
+        Devolve pacotes sugeridos com peso acumulado.
+
+  adm-knowledge --help
+        Mostra esta ajuda.
+
+Na prática, adm-scan e adm-check irão chamar as funções adm_know_* diretamente.
+EOF
+}
+
+adm_know_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        add-include)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-knowledge add-include INCLUDE PKG_ID"
+            fi
+            adm_know_add_include "$1" "$2"
+            ;;
+        best-include)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge best-include INCLUDE"
+            fi
+            adm_know_best_pkg_for_include "$1" || true
+            ;;
+        list-include)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge list-include INCLUDE"
+            fi
+            adm_know_list_pkgs_for_include "$1" || true
+            ;;
+        add-pkgconfig)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-knowledge add-pkgconfig PC_NAME PKG_ID"
+            fi
+            adm_know_add_pkgconfig "$1" "$2"
+            ;;
+        best-pkgconfig)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge best-pkgconfig PC_NAME"
+            fi
+            adm_know_best_pkg_for_pkgconfig "$1" || true
+            ;;
+        list-pkgconfig)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge list-pkgconfig PC_NAME"
+            fi
+            adm_know_list_pkgs_for_pkgconfig "$1" || true
+            ;;
+        add-libsoname)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-knowledge add-libsoname SONAME PKG_ID"
+            fi
+            adm_know_add_libsoname "$1" "$2"
+            ;;
+        best-libsoname)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge best-libsoname SONAME"
+            fi
+            adm_know_best_pkg_for_libsoname "$1" || true
+            ;;
+        list-libsoname)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge list-libsoname SONAME"
+            fi
+            adm_know_list_pkgs_for_libsoname "$1" || true
+            ;;
+        add-buildsys)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-knowledge add-buildsys PATTERN BUILDSYS"
+            fi
+            adm_know_add_buildsystem_hint "$1" "$2"
+            ;;
+        best-buildsys)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge best-buildsys PATTERN"
+            fi
+            adm_know_best_buildsystem_for_pattern "$1" || true
+            ;;
+        list-buildsys)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-knowledge list-buildsys PATTERN"
+            fi
+            adm_know_list_buildsystems_for_pattern "$1" || true
+            ;;
+        guess-deps)
+            shift || true
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-knowledge guess-deps INCLUDES_FILE PKGCONFIG_FILE"
+            fi
+            adm_know_guess_deps_from_includes_and_pkgconfig "$1" "$2"
+            ;;
+        --help|-h|"")
+            adm_know_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-knowledge: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_know_main "$@"
+fi
+
+# Fim do adm-knowledge
