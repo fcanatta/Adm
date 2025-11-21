@@ -1,0 +1,961 @@
+#!/usr/bin/env bash
+# adm-build - Pipeline de construção do ADM 2.0
+#
+# Responsável por:
+#   - Garantir fetch + scan (se necessário)
+#   - Ler plano (.plan) e metadado
+#   - Preparar DESTDIR
+#   - Rodar hooks (hook-pre-*, hook-post-*)
+#   - Executar configure/build/test/install conforme build_system
+#   - Empacotar DESTDIR em cache-bin/
+#   - Instalar em / (normalmente /usr/*)
+#   - Registrar em db (adm-db)
+#   - Chamar verificador (adm-check)
+#
+# Uso via CLI (debug / direto):
+#   adm-build build-one PKG_ID
+#   adm-build build-with-deps PKG_ID [PKG2 ...]
+#
+# Flags via env:
+#   ADM_DRY_RUN=1        -> não executa comandos destrutivos (só loga)
+#   ADM_BUILD_FORCE=1    -> ignora binário em cache e recompila
+#   ADM_BUILD_NO_CHECK=1 -> não roda adm-check após instalar
+#   ADM_BUILD_RESCAN=1   -> força refetch+scan (regenera .plan)
+#
+# Na prática, o "adm" (CLI principal) vai orquestrar isto.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_build_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-build.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_BUILD_DIR="$(_adm_build_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-deps"
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-knowledge"
+
+# adm-check ainda será implementado; assumimos função adm_check_package PKG_ID DESTDIR
+if [[ -f "$_ADM_BUILD_DIR/adm-check" ]]; then
+    # shellcheck disable=SC1090
+    source "$_ADM_BUILD_DIR/adm-check"
+fi
+
+ADM_BUILD_FORCE="${ADM_BUILD_FORCE:-0}"
+ADM_BUILD_NO_CHECK="${ADM_BUILD_NO_CHECK:-0}"
+ADM_BUILD_RESCAN="${ADM_BUILD_RESCAN:-0}"
+ADM_BUILD_RUN_TESTS="${ADM_BUILD_RUN_TESTS:-0}"
+
+# =========
+# Utilidades de metadado / plano / paths
+# =========
+
+adm_build_metadado_path() {
+    adm_deps_metadado_path "$1"
+}
+
+adm_build_pkg_prefix() {
+    adm_deps_prefix_for_pkg "$1"
+}
+
+adm_build_read_meta_single() {
+    local file="${1:-}"
+    local key="${2:-}"
+
+    if [[ ! -f "$file" ]]; then
+        adm_log_fatal "adm-build: metadado não encontrado: '$file'"
+    fi
+
+    awk -v k="$key" -F':' '
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
+            if (getline line > 0) {
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                print line
+                exit 0
+            }
+        }
+        $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
+            $1=""
+            sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_build_version_for_pkg() {
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+    adm_build_read_meta_single "$meta" "version" || echo "unknown"
+}
+
+adm_build_release_for_pkg() {
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+    adm_build_read_meta_single "$meta" "release" || echo "1"
+}
+
+adm_build_build_dir_for_pkg() {
+    local pkg_id="$1"
+    local version
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    printf '%s/%s__%s' "$ADM_BUILD_DIR" "$(adm_build_pkg_prefix "$pkg_id")" "$version"
+}
+
+adm_build_plan_path_for_pkg() {
+    local pkg_id="$1"
+    local version
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    printf '%s/%s__%s.plan' "$ADM_BUILD_DIR" "$(adm_build_pkg_prefix "$pkg_id")" "$version"
+}
+
+adm_build_destdir_for_pkg() {
+    local pkg_id="$1"
+    local version release
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    release="$(adm_build_release_for_pkg "$pkg_id")"
+    printf '%s/%s__%s-%s' "$ADM_DEST_DIR" "$(adm_build_pkg_prefix "$pkg_id")" "$version" "$release"
+}
+
+adm_build_binpkg_path_for_pkg() {
+    # Caminho do pacote binário no cache-bin
+    local pkg_id="$1"
+    local version release
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    release="$(adm_build_release_for_pkg "$pkg_id")"
+    local base
+    base="$(adm_build_pkg_prefix "$pkg_id")__${version}-${release}.tar"
+    # preferimos zstd, depois xz, depois gz
+    if command -v zstd >/dev/null 2>&1; then
+        printf '%s/%s.zst' "$ADM_CACHE_BIN_DIR" "$base"
+    elif command -v xz >/dev/null 2>&1; then
+        printf '%s/%s.xz' "$ADM_CACHE_BIN_DIR" "$base"
+    else
+        printf '%s/%s.gz' "$ADM_CACHE_BIN_DIR" "$base"
+    fi
+}
+
+adm_build_log_file_for_pkg() {
+    local pkg_id="$1"
+    local version release
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    release="$(adm_build_release_for_pkg "$pkg_id")"
+    printf '%s/build-%s__%s-%s.log' "$ADM_LOG_DIR" "$(adm_build_pkg_prefix "$pkg_id")" "$version" "$release"
+}
+
+# =========
+# Execução de comandos de build com log + métricas + DRY-RUN
+# =========
+
+adm_build_run_cmd() {
+    # Uso:
+    #   adm_build_run_cmd PKG_ID "descrição" comando [args...]
+    #
+    # - Registra métricas (op=BUILD, metric=duration)
+    # - Redireciona stdout/stderr para log do pacote
+    # - Respeita ADM_DRY_RUN
+    if [[ $# -lt 3 ]]; then
+        adm_log_fatal "adm_build_run_cmd: uso: adm_build_run_cmd PKG_ID \"descrição\" comando [args...]"
+    fi
+
+    local pkg_id="$1"
+    local desc="$2"
+    shift 2 || true
+    local cmd=("$@")
+
+    local log_file
+    log_file="$(adm_build_log_file_for_pkg "$pkg_id")"
+
+    adm_log_phase "[$pkg_id] $desc (log: $log_file)"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN][$pkg_id] $desc: ${cmd[*]}"
+        return 0
+    fi
+
+    LOG_FILE="$log_file" adm_metrics_time_block "BUILD" "$pkg_id" "$desc" bash -c ' "$@" >>"$LOG_FILE" 2>&1' _ "${cmd[@]}"
+}
+
+# =========
+# Hooks
+# =========
+
+adm_build_pkg_dir() {
+    local pkg_id="$1"
+    local cat name
+    read -r cat name < <(adm_deps_pkg_id_to_parts "$pkg_id")
+    printf '%s/%s/%s' "$ADM_PACKAGES_DIR" "$cat" "$name"
+}
+
+adm_build_run_hook() {
+    # Uso:
+    #   adm_build_run_hook PKG_ID HOOK_NAME BUILD_DIR DESTDIR BUILD_SYSTEM
+    #
+    # HOOK_NAME ex:
+    #   hook-pre-configure, hook-post-configure, hook-pre-build,
+    #   hook-post-build, hook-pre-install, hook-post-install
+    local pkg_id="${1:-}"
+    local hook_name="${2:-}"
+    local build_dir="${3:-}"
+    local destdir="${4:-}"
+    local build_system="${5:-}"
+
+    if [[ -z "$pkg_id" || -z "$hook_name" ]]; then
+        adm_log_fatal "adm_build_run_hook: uso: adm_build_run_hook PKG_ID HOOK_NAME BUILD_DIR DESTDIR BUILD_SYSTEM"
+    fi
+
+    local pkg_dir
+    pkg_dir="$(adm_build_pkg_dir "$pkg_id")"
+    local hook_path="$pkg_dir/$hook_name"
+
+    if [[ ! -f "$hook_path" ]]; then
+        return 0
+    fi
+    if [[ ! -x "$hook_path" ]]; then
+        adm_log_warn "Hook '$hook_path' existe mas não é executável; ignorando."
+        return 0
+    fi
+
+    adm_log_info "Executando hook $hook_name para $pkg_id"
+    (
+        export ADM_PKG_ID="$pkg_id"
+        export ADM_BUILD_DIR_CURRENT="$build_dir"
+        export ADM_DESTDIR="$destdir"
+        export ADM_BUILD_SYSTEM="$build_system"
+        cd "$build_dir" || exit 1
+        adm_build_run_cmd "$pkg_id" "hook $hook_name" "$hook_path"
+    )
+}
+
+# =========
+# Garantir fetch + scan + plano
+# =========
+
+adm_build_ensure_plan() {
+    # Garante que existe um .plan válido para o pacote.
+    # Se faltar ou ADM_BUILD_RESCAN=1, roda:
+    #   - adm-fetch fetch-from-meta PKG_ID METADADO
+    #   - adm-scan  scan-from-meta  PKG_ID METADADO SRC_LIST
+    #
+    # Saída:
+    #   - imprime caminho do .plan
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_build_ensure_plan: uso: adm_build_ensure_plan PKG_ID"
+    fi
+
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    local version
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+
+    local plan
+    plan="$(adm_build_plan_path_for_pkg "$pkg_id")"
+
+    if [[ "$ADM_BUILD_RESCAN" -eq 0 && -f "$plan" ]]; then
+        adm_log_info "Plano de build já existe para $pkg_id: $plan"
+        printf '%s\n' "$plan"
+        return 0
+    fi
+
+    # Precisamos de adm-fetch e adm-scan no PATH
+    if ! command -v adm-fetch >/dev/null 2>&1; then
+        adm_log_fatal "'adm-fetch' não encontrado no PATH. Certifique-se que scripts/ está exportado."
+    fi
+    if ! command -v adm-scan >/dev/null 2>&1; then
+        adm_log_fatal "'adm-scan' não encontrado no PATH. Certifique-se que scripts/ está exportado."
+    fi
+
+    adm_log_phase_header "Preparando fontes e plano para $pkg_id (version=$version)"
+    adm_event_pkg "PKG_BUILD_PREPARE" "$pkg_id" "version=$version"
+
+    local src_list
+    # Fetch
+    src_list="$(adm-fetch fetch-from-meta "$pkg_id" "$meta")"
+
+    # Scan
+    # shellcheck disable=SC2086
+    plan="$(adm-scan scan-from-meta "$pkg_id" "$meta" $src_list)"
+
+    if [[ ! -f "$plan" ]]; then
+        adm_log_fatal "adm-build: plano não encontrado após scan: '$plan'"
+    fi
+
+    printf '%s\n' "$plan"
+}
+
+# =========
+# Leitura do .plan
+# =========
+
+adm_build_load_plan() {
+    # Carrega dados do .plan em variáveis globais:
+    #   ADM_PLAN_BUILD_SYSTEM
+    #   ADM_PLAN_LANGS
+    #   ADM_PLAN_SOURCE_DIR
+    #   ADM_PLAN_INCLUDES_FILE
+    #   ADM_PLAN_PKGCONFIG_FILE
+    #   ADM_PLAN_AUTO_DEPS
+    #   ADM_PLAN_HAS_DOCS
+    #
+    # Uso:
+    #   adm_build_load_plan PATH
+    local plan="${1:-}"
+    if [[ ! -f "$plan" ]]; then
+        adm_log_fatal "adm-build: plano não encontrado: '$plan'"
+    fi
+
+    ADM_PLAN_BUILD_SYSTEM=""
+    ADM_PLAN_LANGS=""
+    ADM_PLAN_SOURCE_DIR=""
+    ADM_PLAN_INCLUDES_FILE=""
+    ADM_PLAN_PKGCONFIG_FILE=""
+    ADM_PLAN_AUTO_DEPS=""
+    ADM_PLAN_HAS_DOCS="0"
+
+    while IFS='=' read -r key val; do
+        # ignora seções [plan] etc
+        if [[ "$key" =~ ^\[.*\]$ || -z "$key" ]]; then
+            continue
+        fi
+        key="$(echo "$key" | sed 's/[[:space:]]//g')"
+        val="${val:-}"
+        # remove espaços iniciais/finais da val
+        val="$(echo "$val" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+        case "$key" in
+            build_system) ADM_PLAN_BUILD_SYSTEM="$val" ;;
+            languages) ADM_PLAN_LANGS="$val" ;;
+            source_dir) ADM_PLAN_SOURCE_DIR="$val" ;;
+            includes_file) ADM_PLAN_INCLUDES_FILE="$val" ;;
+            pkgconfig_file) ADM_PLAN_PKGCONFIG_FILE="$val" ;;
+            auto_build_deps) ADM_PLAN_AUTO_DEPS="$val" ;;
+            has_docs) ADM_PLAN_HAS_DOCS="$val" ;;
+        esac
+    done <"$plan"
+
+    if [[ -z "$ADM_PLAN_SOURCE_DIR" || ! -d "$ADM_PLAN_SOURCE_DIR" ]]; then
+        adm_log_fatal "Plano inválido: source_dir ausente ou inexistente em '$plan'"
+    fi
+
+    if [[ -z "$ADM_PLAN_BUILD_SYSTEM" ]]; then
+        ADM_PLAN_BUILD_SYSTEM="unknown"
+    fi
+
+    adm_log_info "Plano carregado: build_system=$ADM_PLAN_BUILD_SYSTEM, languages=${ADM_PLAN_LANGS:-nenhuma}"
+}
+# =========
+# Preparar DESTDIR
+# =========
+
+adm_build_prepare_destdir() {
+    local pkg_id="$1"
+    local dest
+    dest="$(adm_build_destdir_for_pkg "$pkg_id")"
+
+    if [[ -d "$dest" ]]; then
+        adm_log_warn "DESTDIR existente para $pkg_id; removendo: $dest"
+        if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+            adm_log_info "[DRY-RUN] Não removendo DESTDIR: $dest"
+        else
+            rm -rf "$dest" || adm_log_fatal "Falha ao remover DESTDIR antigo '$dest'"
+        fi
+    fi
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN] Não criando DESTDIR (seria: $dest)"
+    else
+        mkdir -p "$dest" || adm_log_fatal "Falha ao criar DESTDIR '$dest'"
+    fi
+
+    printf '%s\n' "$dest"
+}
+
+# =========
+# Execução por tipo de build_system
+# =========
+
+adm_build_do_autotools() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    (
+        cd "$build_dir" || exit 1
+
+        if [[ -x "./autogen.sh" ]]; then
+            adm_build_run_cmd "$pkg_id" "autogen.sh" ./autogen.sh
+        fi
+
+        if [[ -x "./configure" ]]; then
+            adm_build_run_cmd "$pkg_id" "configure" ./configure --prefix=/usr
+        else
+            adm_log_warn "autotools sem ./configure em $build_dir"
+        fi
+
+        adm_build_run_cmd "$pkg_id" "make all" make -j"$(nproc || echo 1)"
+
+        if [[ "$ADM_BUILD_RUN_TESTS" -eq 1 ]]; then
+            adm_build_run_cmd "$pkg_id" "make check" make check
+        fi
+
+        adm_build_run_cmd "$pkg_id" "make install" make DESTDIR="$destdir" install
+    )
+}
+
+adm_build_do_cmake() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    local bdir="$build_dir/.adm-build-cmake"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 0 ]]; then
+        rm -rf "$bdir" || true
+        mkdir -p "$bdir" || adm_log_fatal "Falha ao criar builddir cmake '$bdir'"
+    fi
+
+    (
+        cd "$bdir" || exit 1
+        adm_build_run_cmd "$pkg_id" "cmake configure" cmake .. -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release
+        adm_build_run_cmd "$pkg_id" "cmake build" cmake --build . -- -j"$(nproc || echo 1)"
+        if [[ "$ADM_BUILD_RUN_TESTS" -eq 1 ]]; then
+            adm_build_run_cmd "$pkg_id" "ctest" ctest --output-on-failure
+        fi
+        adm_build_run_cmd "$pkg_id" "cmake install" cmake --install . --prefix /usr --component Runtime -- DESTDIR="$destdir"
+    )
+}
+
+adm_build_do_meson() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    local bdir="$build_dir/.adm-build-meson"
+
+    if ! command -v meson >/dev/null 2>&1; then
+        adm_log_fatal "meson não encontrado para build_system=meson"
+    fi
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 0 ]]; then
+        rm -rf "$bdir" || true
+        mkdir -p "$bdir" || adm_log_fatal "Falha ao criar builddir meson '$bdir'"
+    fi
+
+    (
+        cd "$build_dir" || exit 1
+        adm_build_run_cmd "$pkg_id" "meson setup" meson setup "$bdir" --prefix=/usr --buildtype=release
+        adm_build_run_cmd "$pkg_id" "meson compile" meson compile -C "$bdir"
+        if [[ "$ADM_BUILD_RUN_TESTS" -eq 1 ]]; then
+            adm_build_run_cmd "$pkg_id" "meson test" meson test -C "$bdir"
+        fi
+        adm_build_run_cmd "$pkg_id" "meson install" meson install -C "$bdir" --destdir "$destdir"
+    )
+}
+
+adm_build_do_python() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    (
+        cd "$build_dir" || exit 1
+        if [[ -f "pyproject.toml" ]]; then
+            # Tentamos PEP 517 via pip
+            if command -v python -m pip >/dev/null 2>&1 || command -v pip >/dev/null 2>&1; then
+                # DRY-RUN: só informa
+                if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+                    adm_log_info "[DRY-RUN][$pkg_id] pip install --prefix /usr --root $destdir ."
+                else
+                    if command -v python >/dev/null 2>&1; then
+                        adm_build_run_cmd "$pkg_id" "pip install (pyproject)" python -m pip install --no-deps --prefix=/usr --root="$destdir" .
+                    else
+                        adm_build_run_cmd "$pkg_id" "pip install (pyproject)" pip install --no-deps --prefix=/usr --root="$destdir" .
+                    fi
+                fi
+            else
+                adm_log_fatal "pip/python não encontrados para pacote python com pyproject.toml"
+            fi
+        elif [[ -f "setup.py" ]]; then
+            if command -v python >/dev/null 2>&1; then
+                adm_build_run_cmd "$pkg_id" "python setup.py install" python setup.py install --root="$destdir" --prefix=/usr
+            else
+                adm_log_fatal "python não encontrado para setup.py"
+            fi
+        else
+            adm_log_fatal "build_system=python mas nem setup.py nem pyproject.toml encontrados."
+        fi
+    )
+}
+
+adm_build_do_cargo() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    if ! command -v cargo >/dev/null 2>&1; then
+        adm_log_fatal "cargo não encontrado para build_system=cargo"
+    fi
+
+    (
+        cd "$build_dir" || exit 1
+        adm_build_run_cmd "$pkg_id" "cargo build --release" cargo build --release
+        # Instala executáveis em /usr/bin dentro do DESTDIR.
+        # Simples: copia target/release/* executável.
+        if [[ "${ADM_DRY_RUN:-0}" -eq 0 ]]; then
+            mkdir -p "$destdir/usr/bin" || adm_log_fatal "Falha ao criar $destdir/usr/bin"
+            find target/release -maxdepth 1 -type f -perm -111 2>/dev/null | while IFS= read -r f; do
+                cp -a "$f" "$destdir/usr/bin/" || adm_log_fatal "Falha ao copiar $f para $destdir/usr/bin/"
+            done
+        else
+            adm_log_info "[DRY-RUN][$pkg_id] install cargo bins em $destdir/usr/bin"
+        fi
+    )
+}
+
+adm_build_do_go() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    if ! command -v go >/dev/null 2>&1; then
+        adm_log_fatal "go não encontrado para build_system=go"
+    fi
+
+    (
+        cd "$build_dir" || exit 1
+        # Simples: go build ./...
+        adm_build_run_cmd "$pkg_id" "go build ./..." go build ./...
+        if [[ "${ADM_DRY_RUN:-0}" -eq 0 ]]; then
+            mkdir -p "$destdir/usr/bin" || adm_log_fatal "Falha ao criar $destdir/usr/bin"
+            # Copia binários da raiz
+            find . -maxdepth 1 -type f -perm -111 2>/dev/null | while IFS= read -r f; do
+                cp -a "$f" "$destdir/usr/bin/" || adm_log_fatal "Falha ao copiar $f para $destdir/usr/bin/"
+            done
+        else
+            adm_log_info "[DRY-RUN][$pkg_id] install go bins em $destdir/usr/bin"
+        fi
+    )
+}
+
+adm_build_do_plain_make() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    (
+        cd "$build_dir" || exit 1
+        adm_build_run_cmd "$pkg_id" "make all" make -j"$(nproc || echo 1)"
+        if [[ "$ADM_BUILD_RUN_TESTS" -eq 1 ]]; then
+            adm_build_run_cmd "$pkg_id" "make test" make test
+        fi
+        adm_build_run_cmd "$pkg_id" "make install" make DESTDIR="$destdir" prefix=/usr install
+    )
+}
+
+adm_build_do_unknown() {
+    local pkg_id="$1"
+    local build_dir="$2"
+    local destdir="$3"
+
+    adm_log_warn "build_system=unknown para $pkg_id; tentando heurísticas básicas."
+
+    if [[ -x "$build_dir/configure" ]]; then
+        adm_build_do_autotools "$pkg_id" "$build_dir" "$destdir"
+    elif [[ -f "$build_dir/Makefile" ]]; then
+        adm_build_do_plain_make "$pkg_id" "$build_dir" "$destdir"
+    else
+        adm_log_fatal "Não sei como construir $pkg_id (build_system=unknown, sem configure/Makefile)."
+    fi
+}
+
+# =========
+# Empacotar DESTDIR e instalar
+# =========
+
+adm_build_pack_destdir() {
+    local pkg_id="$1"
+    local destdir="$2"
+
+    local binpkg
+    binpkg="$(adm_build_binpkg_path_for_pkg "$pkg_id")"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN][$pkg_id] Empacotaria DESTDIR $destdir em $binpkg"
+        printf '%s\n' "$binpkg"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$binpkg")" || adm_log_fatal "Falha ao criar diretório para binpkg '$binpkg'"
+
+    local base_no_ext="${binpkg%.*}"
+    local tmp_tar="${base_no_ext}.tmp.tar"
+
+    adm_log_info "Empacotando DESTDIR para $pkg_id → $binpkg"
+
+    # tar relativo ao DESTDIR
+    (
+        cd "$destdir" || exit 1
+        tar -cf "$tmp_tar" . || exit 1
+    ) || adm_log_fatal "Falha ao criar tar de $destdir"
+
+    local final_ext
+    final_ext="${binpkg##*.}"
+
+    case "$final_ext" in
+        zst)
+            if ! command -v zstd >/dev/null 2>&1; then
+                adm_log_fatal "zstd não encontrado para criar $binpkg"
+            fi
+            zstd -q -f "$tmp_tar" -o "$binpkg" || adm_log_fatal "Falha ao comprimir tar em zstd para $pkg_id"
+            rm -f "$tmp_tar" || true
+            ;;
+        xz)
+            if ! command -v xz >/dev/null 2>&1; then
+                adm_log_fatal "xz não encontrado para criar $binpkg"
+            fi
+            xz -f "$tmp_tar" || adm_log_fatal "Falha ao comprimir tar em xz para $pkg_id"
+            mv "$tmp_tar.xz" "$binpkg" || adm_log_fatal "Falha ao mover tar.xz para $binpkg"
+            ;;
+        gz)
+            gzip -f "$tmp_tar" || adm_log_fatal "Falha ao comprimir tar em gz para $pkg_id"
+            mv "$tmp_tar.gz" "$binpkg" || adm_log_fatal "Falha ao mover tar.gz para $binpkg"
+            ;;
+        *)
+            adm_log_fatal "Extensão desconhecida para binpkg: $binpkg"
+            ;;
+    esac
+
+    adm_log_ok "Pacote binário gerado: $binpkg"
+    adm_event_pkg "PKG_BINPKG_BUILT" "$pkg_id" "path=$binpkg"
+
+    printf '%s\n' "$binpkg"
+}
+
+adm_build_install_destdir() {
+    # Copia conteudo do DESTDIR para /
+    local pkg_id="$1"
+    local destdir="$2"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN][$pkg_id] Instalaria conteúdo de $destdir em /"
+        return 0
+    fi
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_log_fatal "DESTDIR não existe para instalação: '$destdir'"
+    fi
+
+    adm_log_phase "Instalando $pkg_id a partir de $destdir para /"
+    adm_build_run_cmd "$pkg_id" "instalar em /" bash -c 'cd "$1" && cp -a . /' _ "$destdir"
+}
+
+adm_build_generate_filelist() {
+    # Gera lista de arquivos instalados, com caminhos absolutos.
+    # Uso:
+    #   adm_build_generate_filelist DESTDIR OUTFILE
+    local destdir="$1"
+    local outfile="$2"
+
+    if [[ ! -d "$destdir" ]]; then
+        adm_log_fatal "DESTDIR não existe: '$destdir'"
+    fi
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        : >"$outfile"
+        adm_log_info "[DRY-RUN] Lista de arquivos vazia gerada em $outfile"
+        return 0
+    fi
+
+    (
+        cd "$destdir" || exit 1
+        # Arquivos, links e diretórios; converte ./foo para /foo
+        find . -mindepth 1 \( -type f -o -type l -o -type d \) -print \
+            | sed 's#^\./#/#' \
+            | sort
+    ) >"$outfile" || adm_log_fatal "Falha ao gerar lista de arquivos em '$outfile'"
+}
+
+# =========
+# Build de um pacote (sem resolver deps)
+# =========
+
+adm_build_one_pkg_no_deps() {
+    # Build completo de um único pacote (assume deps resolvidas/instaladas).
+    #
+    # Uso:
+    #   adm_build_one_pkg_no_deps PKG_ID
+    local pkg_id="$1"
+
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+    if [[ ! -f "$meta" ]]; then
+        adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
+    fi
+
+    local version release
+    version="$(adm_build_version_for_pkg "$pkg_id")"
+    release="$(adm_build_release_for_pkg "$pkg_id")"
+
+    adm_log_phase_header "Building $pkg_id $version-$release"
+    adm_event_pkg "PKG_BUILD_START" "$pkg_id" "version=$version release=$release"
+
+    # Verifica se já existe binário em cache e não é FORCE
+    local binpkg
+    binpkg="$(adm_build_binpkg_path_for_pkg "$pkg_id")"
+    if [[ "$ADM_BUILD_FORCE" -eq 0 && -f "$binpkg" ]]; then
+        adm_log_warn "Binário em cache já existe para $pkg_id: $binpkg"
+        adm_log_info "Reutilizando binário de cache (use ADM_BUILD_FORCE=1 para recompilar)."
+        # Instala direto do binário
+        local destdir
+        destdir="$(adm_build_destdir_for_pkg "$pkg_id")"
+        if [[ "${ADM_DRY_RUN:-0}" -eq 0 ]]; then
+            rm -rf "$destdir" || true
+            mkdir -p "$destdir" || adm_log_fatal "Falha ao criar DESTDIR '$destdir' para extrair binário."
+            # extrai
+            local ext="${binpkg##*.}"
+            case "$ext" in
+                zst)
+                    zstd -d -c "$binpkg" | tar -C "$destdir" -xf - || adm_log_fatal "Falha ao extrair binário zst para $pkg_id"
+                    ;;
+                xz)
+                    xz -d -c "$binpkg" | tar -C "$destdir" -xf - || adm_log_fatal "Falha ao extrair binário xz para $pkg_id"
+                    ;;
+                gz)
+                    gzip -d -c "$binpkg" | tar -C "$destdir" -xf - || adm_log_fatal "Falha ao extrair binário gz para $pkg_id"
+                    ;;
+                *)
+                    adm_log_fatal "Extensão desconhecida para binário: $binpkg"
+                    ;;
+            esac
+        else
+            adm_log_info "[DRY-RUN][$pkg_id] Extrairia binário em $destdir"
+            destdir="$(adm_build_destdir_for_pkg "$pkg_id")"
+        fi
+
+        adm_build_install_destdir "$pkg_id" "$destdir"
+
+        # Gera lista de arquivos e registra no DB
+        local filelist
+        filelist="$(mktemp "$ADM_TMP_DIR/build-files-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para filelist."
+        adm_build_generate_filelist "$destdir" "$filelist"
+        adm_db_register_install "$pkg_id" "$version" "$release" "-" "-" "$filelist" "binpkg-cache"
+        rm -f "$filelist" || true
+
+        if [[ "$ADM_BUILD_NO_CHECK" -eq 0 && "$(type -t adm_check_package || true)" == "function" ]]; then
+            adm_check_package "$pkg_id" "$destdir" || adm_log_warn "Verificação falhou para $pkg_id (cache)."
+        fi
+
+        adm_event_pkg "PKG_BUILD_DONE" "$pkg_id" "from_cache=1"
+        return 0
+    fi
+
+    # Garante plano
+    local plan
+    plan="$(adm_build_ensure_plan "$pkg_id")"
+
+    # Carrega plano
+    adm_build_load_plan "$plan"
+
+    local build_dir destdir
+    build_dir="$ADM_PLAN_SOURCE_DIR"
+    destdir="$(adm_build_prepare_destdir "$pkg_id")"
+
+    # Hooks / pré-configuração
+    adm_build_run_hook "$pkg_id" "hook-pre-configure" "$build_dir" "$destdir" "$ADM_PLAN_BUILD_SYSTEM"
+
+    # Build por tipo
+    case "$ADM_PLAN_BUILD_SYSTEM" in
+        autotools)
+            adm_build_do_autotools "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        cmake)
+            adm_build_do_cmake "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        meson)
+            adm_build_do_meson "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        python)
+            adm_build_do_python "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        cargo)
+            adm_build_do_cargo "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        go)
+            adm_build_do_go "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        plain-make)
+            adm_build_do_plain_make "$pkg_id" "$build_dir" "$destdir"
+            ;;
+        *)
+            adm_build_do_unknown "$pkg_id" "$build_dir" "$destdir"
+            ;;
+    esac
+
+    # Hooks pós-build/pré-install
+    adm_build_run_hook "$pkg_id" "hook-post-build" "$build_dir" "$destdir" "$ADM_PLAN_BUILD_SYSTEM"
+    adm_build_run_hook "$pkg_id" "hook-pre-install" "$build_dir" "$destdir" "$ADM_PLAN_BUILD_SYSTEM"
+
+    # Empacota DESTDIR
+    binpkg="$(adm_build_pack_destdir "$pkg_id" "$destdir")"
+
+    # Instala
+    adm_build_install_destdir "$pkg_id" "$destdir"
+
+    # Gera lista de arquivos e registra no DB
+    local filelist
+    filelist="$(mktemp "$ADM_TMP_DIR/build-files-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para filelist."
+    adm_build_generate_filelist "$destdir" "$filelist"
+
+    # Para agora, não temos profile/libc manager ainda -> usamos "-"
+    adm_db_register_install "$pkg_id" "$version" "$release" "-" "-" "$filelist" "build"
+
+    rm -f "$filelist" || true
+
+    # Hook pós-install
+    adm_build_run_hook "$pkg_id" "hook-post-install" "$build_dir" "$destdir" "$ADM_PLAN_BUILD_SYSTEM"
+
+    # Verificação (se disponível)
+    if [[ "$ADM_BUILD_NO_CHECK" -eq 0 && "$(type -t adm_check_package || true)" == "function" ]]; then
+        if ! adm_check_package "$pkg_id" "$destdir"; then
+            adm_log_warn "Verificação falhou para $pkg_id"
+        fi
+    fi
+
+    adm_event_pkg "PKG_BUILD_DONE" "$pkg_id" "from_cache=0 binpkg=$binpkg"
+}
+
+# =========
+# Build com resolução de deps
+# =========
+
+adm_build_with_deps() {
+    # Recebe lista de PKG_IDs "top-level" e:
+    #   - Calcula ordem de build com adm-deps
+    #   - Builda cada pacote na ordem (ignorando se já foi buildado na rodada)
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "adm_build_with_deps: uso: adm_build_with_deps PKG1 [PKG2 ...]"
+    fi
+
+    local order
+    order="$(adm_deps_build_order "$@")" || adm_log_fatal "Falha ao calcular ordem de build."
+
+    adm_log_phase_header "Ordem de build calculada:"
+    printf '%s\n' "$order" | while IFS= read -r p; do
+        adm_log_info "  - $p"
+    done
+
+    # Build na ordem (deps primeiro)
+    local pkg
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        adm_build_one_pkg_no_deps "$pkg"
+    done <<<"$order"
+}
+
+# =========
+# CLI
+# =========
+
+adm_build_usage() {
+    cat <<EOF
+adm-build - Pipeline de construção do ADM 2.0
+
+Uso:
+
+  Build de um pacote (sem resolver deps):
+    adm-build build-one PKG_ID
+
+  Build de pacote(s) com resolução de deps:
+    adm-build build-with-deps PKG1 [PKG2 ...]
+
+Variáveis de ambiente importantes:
+
+  ADM_DRY_RUN=1
+      Não executa comandos reais (build/install); apenas loga o que faria.
+
+  ADM_BUILD_FORCE=1
+      Ignora binários em cache-bin e recompila do zero.
+
+  ADM_BUILD_NO_CHECK=1
+      Não roda o verificador adm-check após instalar.
+
+  ADM_BUILD_RESCAN=1
+      Força refetch+scan (regenera .plan), mesmo se já existir.
+
+Na prática, o CLI principal "adm" irá orquestrar:
+  - fetch -> scan -> deps -> build -> check -> db -> metrics
+
+EOF
+}
+
+adm_build_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        build-one)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-build build-one PKG_ID"
+            fi
+            adm_build_one_pkg_no_deps "$1"
+            ;;
+        build-with-deps)
+            shift || true
+            if [[ $# -lt 1 ]]; then
+                adm_log_fatal "Uso: adm-build build-with-deps PKG1 [PKG2 ...]"
+            fi
+            adm_build_with_deps "$@"
+            ;;
+        --help|-h|"")
+            adm_build_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-build: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_build_main "$@"
+fi
