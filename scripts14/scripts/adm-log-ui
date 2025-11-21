@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# adm-log-ui - Camada de saída visual (cores, spinner, ✔/✖/!)
+# Deve ser sourceado pelos outros scripts depois do adm-env.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente do ADM
+# =========
+
+_adm_log_ui_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-log-ui.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_LOG_UI_DIR="$(_adm_log_ui_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_LOG_UI_DIR/adm-env"
+
+# =========
+# Funções internas auxiliares
+# =========
+
+_adm_log_ts() {
+    # Timestamp HH:MM:SS
+    date "+%H:%M:%S"
+}
+
+_adm_log_raw() {
+    # Imprime a linha bruta já formatada (sem adicionar nada extra)
+    # Uso: _adm_log_raw "texto"
+    printf '%s\n' "$1"
+}
+
+# =========
+# Funções de log de alto nível
+# =========
+
+adm_log_info() {
+    # Mensagem informativa
+    local ts msg
+    msg="$*"
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_WHITE}${msg}${ADM_COLOR_RESET}"
+}
+
+adm_log_ok() {
+    # Mensagem de sucesso
+    local ts msg
+    msg="$*"
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_GREEN}${ADM_EMOJI_OK} ${msg}${ADM_COLOR_RESET}"
+}
+
+adm_log_warn() {
+    # Mensagem de aviso
+    local ts msg
+    msg="$*"
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_YELLOW}${ADM_EMOJI_WARN} ${msg}${ADM_COLOR_RESET}"
+}
+
+adm_log_error() {
+    # Mensagem de erro (não sai do script chamador)
+    local ts msg
+    msg="$*"
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_RED}${ADM_EMOJI_FAIL} ${msg}${ADM_COLOR_RESET}"
+}
+
+adm_log_fatal() {
+    # Mensagem de erro fatal (sai com código != 0)
+    local msg="$*"
+    adm_log_error "$msg"
+    exit 1
+}
+
+adm_log_debug() {
+    # Debug só aparece se ADM_DEBUG=1
+    if [[ "${ADM_DEBUG:-0}" -ne 1 ]]; then
+        return 0
+    fi
+    local ts msg
+    msg="$*"
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_MAGENTA}[DEBUG] ${msg}${ADM_COLOR_RESET}"
+}
+
+# =========
+# Fases legíveis (tipo "Building ...", "Writing output ...")
+# =========
+
+adm_log_phase() {
+    # Fase simples (linha de contexto, sem ícone)
+    # Ex: "Building in src.kmod..."
+    local msg="$*"
+    local ts
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET} ${ADM_COLOR_CYAN}${msg}${ADM_COLOR_RESET}"
+}
+
+adm_log_phase_header() {
+    # Cabeçalho de fase maior, em negrito
+    # Ex: "Building 2-base/kmod (33) ~4s"
+    local msg="$*"
+    local ts
+    ts="$(_adm_log_ts)"
+    _adm_log_raw "${ADM_COLOR_BOLD}${ts} ${msg}${ADM_COLOR_RESET}"
+}
+
+# =========
+# Spinner
+# =========
+
+# Variáveis internas do spinner
+ADM_SPINNER_PID=""
+ADM_SPINNER_MSG=""
+
+_adm_spinner_is_running() {
+    if [[ -n "${ADM_SPINNER_PID:-}" ]]; then
+        if kill -0 "$ADM_SPINNER_PID" 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+_adm_spinner_loop() {
+    # Loop interno do spinner: NÃO chamar diretamente
+    local msg="$1"
+    local chars="$ADM_EMOJI_SPIN"
+    local len=${#chars}
+    local i=0
+    local ts ch
+
+    # Usa printf com \r para sobrescrever a linha
+    while true; do
+        ts="$(_adm_log_ts)"
+        ch="${chars:$((i % len)):1}"
+        printf '\r%s %s%s %s%s' \
+            "${ADM_COLOR_DIM}${ts}${ADM_COLOR_RESET}" \
+            "${ADM_COLOR_CYAN}" "$ch" \
+            "$msg" \
+            "${ADM_COLOR_RESET}"
+        i=$((i + 1))
+        sleep 0.1
+    done
+}
+
+adm_spinner_start() {
+    # Inicia spinner com mensagem.
+    # Ex: adm_spinner_start "Building base/kmod..."
+    local msg="${*:-}"
+    if [[ -z "$msg" ]]; then
+        adm_log_fatal "adm-spinner-start exige uma mensagem."
+    fi
+
+    # Se não for TTY, apenas loga uma info e não inicia spinner real
+    if [[ "${ADM_IS_TTY:-0}" -ne 1 ]]; then
+        adm_log_info "$msg"
+        ADM_SPINNER_PID=""
+        ADM_SPINNER_MSG=""
+        return 0
+    fi
+
+    # Se já tem spinner, encerra antes
+    if _adm_spinner_is_running; then
+        adm_spinner_stop_warn "Interrompendo operação anterior."
+    fi
+
+    ADM_SPINNER_MSG="$msg"
+    # Inicia spinner em subshell
+    _adm_spinner_loop "$msg" &
+    ADM_SPINNER_PID=$!
+    disown "$ADM_SPINNER_PID" 2>/dev/null || true
+}
+
+_adm_spinner_stop_generic() {
+    # Parada genérica de spinner, sem ícone ainda
+    # Limpa linha e mata processo filho
+    if _adm_spinner_is_running; then
+        kill "$ADM_SPINNER_PID" >/dev/null 2>&1 || true
+        wait "$ADM_SPINNER_PID" >/dev/null 2>&1 || true
+    fi
+    ADM_SPINNER_PID=""
+    # Limpa a linha do spinner
+    if [[ "${ADM_IS_TTY:-0}" -eq 1 ]]; then
+        printf '\r\033[K'  # volta ao início da linha e limpa
+    fi
+}
+
+adm_spinner_stop_ok() {
+    # Para spinner e imprime linha final de sucesso
+    # Uso: adm_spinner_stop_ok "Finished building base/kmod"
+    local msg="${*:-$ADM_SPINNER_MSG}"
+    _adm_spinner_stop_generic
+    if [[ -z "$msg" ]]; then
+        msg="Operação concluída."
+    fi
+    adm_log_ok "$msg"
+    ADM_SPINNER_MSG=""
+}
+
+adm_spinner_stop_fail() {
+    # Para spinner e imprime linha de erro
+    # Uso: adm_spinner_stop_fail "Build falhou para base/kmod"
+    local msg="${*:-$ADM_SPINNER_MSG}"
+    _adm_spinner_stop_generic
+    if [[ -z "$msg" ]]; then
+        msg="Operação falhou."
+    fi
+    adm_log_error "$msg"
+    ADM_SPINNER_MSG=""
+}
+
+adm_spinner_stop_warn() {
+    # Para spinner e imprime aviso
+    local msg="${*:-$ADM_SPINNER_MSG}"
+    _adm_spinner_stop_generic
+    if [[ -z "$msg" ]]; then
+        msg="Operação interrompida."
+    fi
+    adm_log_warn "$msg"
+    ADM_SPINNER_MSG=""
+}
+
+# =========
+# Rodar comandos com spinner
+# =========
+
+adm_run_with_spinner() {
+    # Executa um comando com spinner automático.
+    # Uso:
+    #   adm_run_with_spinner "Mensagem..." comando arg1 arg2 ...
+    #
+    # Retorna o mesmo código de saída do comando.
+    if [[ $# -lt 2 ]]; then
+        adm_log_fatal "adm_run_with_spinner: uso: adm_run_with_spinner \"mensagem\" comando [args...]"
+    fi
+
+    local msg="$1"
+    shift
+    local cmd=("$@")
+
+    # Se não for TTY, apenas loga e roda comando
+    if [[ "${ADM_IS_TTY:-0}" -ne 1 ]]; then
+        adm_log_info "$msg"
+        if "${cmd[@]}"; then
+            adm_log_ok "$msg"
+            return 0
+        else
+            local rc=$?
+            adm_log_error "$msg (rc=$rc)"
+            return "$rc"
+        fi
+    fi
+
+    adm_spinner_start "$msg"
+
+    if "${cmd[@]}"; then
+        adm_spinner_stop_ok "$msg"
+        return 0
+    else
+        local rc=$?
+        adm_spinner_stop_fail "$msg (rc=$rc)"
+        return "$rc"
+    fi
+}
+
+# =========
+# Modo CLI de teste/demonstração
+# =========
+
+adm_log_ui_demo() {
+    adm_log_phase_header "Building 2-base/kmod (33) ~4s"
+    adm_log_phase "Building in src.kmod..."
+    adm_log_phase "Writing output to logs/base-kmod.log"
+
+    adm_run_with_spinner "Compilando base/kmod..." sleep 1
+
+    adm_log_warn "Este é um aviso de teste."
+    adm_log_error "Este é um erro de teste (sem abortar)."
+    adm_log_debug "Mensagem de debug (aparece só se ADM_DEBUG=1)."
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        --demo)
+            adm_log_ui_demo
+            ;;
+        --help|-h)
+            cat <<EOF
+adm-log-ui - Saída visual do ADM (cores, spinner, ✔/✖/!)
+
+Uso:
+  source adm-log-ui        # em outros scripts
+  adm-log-ui --demo        # demonstração de saída
+  adm-log-ui --help        # esta ajuda
+
+Funções principais:
+  adm_log_info "mensagem"
+  adm_log_ok "mensagem"
+  adm_log_warn "mensagem"
+  adm_log_error "mensagem"
+  adm_log_fatal "mensagem"  # log + exit 1
+  adm_log_phase "descrição da fase"
+  adm_log_phase_header "cabeçalho de fase"
+
+Spinner:
+  adm_spinner_start "mensagem"
+  adm_spinner_stop_ok "mensagem final"
+  adm_spinner_stop_fail "mensagem final"
+  adm_run_with_spinner "mensagem" comando [args...]
+
+EOF
+            ;;
+        "")
+            adm_log_info "adm-log-ui carregado. Use --demo para ver um exemplo."
+            ;;
+        *)
+            adm_log_fatal "Opção desconhecida para adm-log-ui: $1"
+            ;;
+    esac
+fi
+
+# Fim do adm-log-ui
