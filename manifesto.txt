@@ -1,7 +1,6 @@
 MANIFESTO DO SISTEMA DE BUILD INTELIGENTE adm
 ======================================================
 
-
 Versão: 1.0
 Autor: Fernando (conceito) + assistente (organização)
 Formato: texto simples
@@ -22,7 +21,7 @@ Este manifesto descreve:
 1. OBJETIVO GERAL DO PROGRAMA
 ====================================================================
 
-O sistema em /usr/src/adm  um ambiente de construção automatizado e inteligente
+O sistema em /root/usr/src/adm  um ambiente de construção automatizado e inteligente
 para criar, do zero, um sistema Linux tipo "Linux From Scratch" ampliado.
 
 Objetivos:
@@ -45,56 +44,56 @@ Objetivos:
 
 Raiz do sistema de build:
 
-    /usr/src/adm/
+    /root/usr/src/adm/
 
 Subdiretorios principais:
 
-    /usr/src/adm/repo/
+    /root/usr/src/adm/packages/
         <categoria>/<programa>/
             metadados
             patch/
                 *.patch
             hook/
-                pre-fetch
-                post-fetch
-                pre-extract
-                post-extract
-                pre-build
-                post-build
-                pre-install
-                post-install
-                pre-package
-                post-package
-                pre-uninstall 
-                post-uninstall
+                pre_fetch
+                post_fetch
+                pre_extract
+                post_extract
+                pre_build
+                post_build
+                pre_install
+                post_install
+                pre_package
+                post_package
+                pre_uninstall 
+                post_uninstall
 
-    /usr/src/adm/scripts/
+    /root/usr/src/adm/scripts/
         (os 25 scripts principais e auxiliares)
 
-    /usr/src/adm/sources/
+    /root/usr/src/adm/sources/
         (fontes baixadas)
 
-       /usr/src/adm/build/
-        (?rvore de compilação, chroot, etc.)
+    /root/usr/src/adm/build/
+        (árvore de compilação, chroot, etc.)
 
-    /usr/src/adm/cache/
+    /root/usr/src/adm/cache/
         (cache binários e de fontes)
 
-    /usr/src/adm/logs/
+    /root/usr/src/adm/logs/
         (logs globais e por pacote)
 
-    /usr/src/adm/meta/
+    /root/usr/src/adm/meta/
         hardware.info
         global-env.sh
         detected-tools.info
         optimization.profile
         outros arquivos de metadados globais
 
-    /usr/src/adm/intelligence/
+    /root/usr/src/adm/intelligence/
         intelligence.db / knowledge.db
         README.intelligence (descrição do propósito)
 
-    /usr/src/adm/profiles/
+    /root/usr/src/adm/profiles/
         (opcional) arquivos simples com listas de pacotes por perfil
 
 ====================================================================
@@ -103,7 +102,7 @@ Subdiretorios principais:
 
 Cada programa/pacote controlado pelo sistema possui um diretório:
 
-    /usr/src/adm/repo/<categoria>/<programa>/
+    /root/usr/src/adm/packages/<categoria>/<programa>/
 
 Dentro dele, existe um arquivo de texto simples chamado:
 
@@ -114,11 +113,15 @@ Formato EXATO do arquivo metadados (uma chave por linha):
     name: <nome-do-programa>
     version: <versao>
     categoria: <categoria>
+    chanel: stable ou testing 
+    mode: cross-toolchain ou x86_64 ou multilib....
     run_deps: lista de dependencias de execução separadas por espaço ou none
     build_deps: lista de dependências de compilação separadas por espaço ou none
     opt_deps: lista de dependencias opcionais separadas por espaço ou none
-    url: url-do-source url-do-source
-    checksum: sha256:VALOR sha256:VALOR ou md5:VALOR md5:VALOR
+    site: http//www.kdjdjdj.com
+    description: descrição do programa
+    url: url-do-source 1 url-do-source 2
+    checksum: sha256:VALOR 1 sha256:VALOR 2 ou md5:VALOR 1 md5:VALOR 2
 
 Regras:
 
@@ -132,11 +135,16 @@ Exemplo:
     name: kmod
     version: 33
     categoria: base
-    url: https://www.kernel.org/pub/linux/utils/kernel/kmod/kmod-33.tar.xz
-    checksum: sha256:4a8291e3ab9845d62c9d...
+    chanel: stable
+    mode: cross-toolchain
     run_deps: zlib xz openssl
     build_deps: autoconf automake libtool pkgconf
     opt_deps: none
+    site: https://www.kernel.org/pub/linux/utils/
+    description: kmod is a set of utilities in Linux designed for managing kernel modules.
+    It provides tools to perform common tasks related to kernel modules, including loading,         unloading, listing, and querying their properties.
+    url: https://www.kernel.org/pub/linux/utils/kernel/kmod/$name-$version.tar.xz
+    checksum: sha256:4a8291e3ab9845d62c9d...
 
 ====================================================================
 4. PATCHES E HOOKS
@@ -144,10 +152,10 @@ Exemplo:
 
 Para cada programa:
 
-    /usr/src/adm/repo/<categoria>/<programa>/patch/
+    /root/usr/src/adm/packages/<categoria>/<programa>/patch/
         *.patch  são aplicados automaticamente.
 
-    /usr/src/adm/repo/<categoria>/<programa>/hook/
+    /root/usr/src/adm/packages/<categoria>/<programa>/hook/
         (todos opcionais, se existirem e forem executáveis, rodam)
         pre_fetch
         post_fetch 
@@ -181,7 +189,7 @@ Funções típicas:
     log_warn  (avisos)
     log_error (erros)
     task_start "Mensagem..."  (inicia uma tarefa com spinner)
-    task_ok                   (encerra spinner e mostra sinal de ??)
+    task_ok                   (encerra spinner e mostra sinal de ✔️)
     task_fail                 (encerra spinner e mostra sinal de erro)
 
 Formato padrão no terminal:
@@ -193,7 +201,7 @@ Saída esperado na tela em toda operação do programa:
 16:24:42 [0] Building apps/cpio [ 2.13 21.12] (cor parágrafo inteiro rosa bold)
 spinner Parallel build using 32 jobs (cor cinza)
 spinner Preparing build in src.cpio.x86.202111221.162442.7972.ryzen (cinza)
-sppiner Building. Writing output to /usr/src/adm/logs/0-cpio.out (cinza)
+sppiner Building. Writing output to $root/usr/src/adm/logs/0-cpio.out (cinza)
 spinner Install. In directory (caminho do diretório destdir) (em amarelo bold)
 spinner Packaging. cpio v1.4 in (caminho/cpio-1.4-x86_64-1-musl-(profile).tar.zst)
 (Em verde)✔️ Correct package construction e verificated cpio v1.4(Em amarelo bold)
@@ -284,11 +292,11 @@ Ferramentas de documentação:
 
 Todas as detecções são gravadas em:
 
-    /usr/src/adm/meta/detected-tools.info
+    /root/usr/src/adm/meta/detected-tools.info
 
 E as flags de otimização recomendadas são gravadas em:
 
-    /usr/src/adm/meta/optimization.profile
+    /root/usr/src/adm/meta/optimization.profile
 
 ====================================================================
 7. VISÃO GERAL DO FLUXO DE CONSTRUÇÃO 
@@ -310,7 +318,7 @@ Fluxo macro tipico para construir um sistema (resumido):
    - garante que nada serão passado do host para o sistema e nada do sistema passara para o host
 
 4) detect-optimizations.sh  
-   - detecta CPU, toolchains, linkers, linguagens, docs, tipos de constru??es 
+   - detecta CPU, toolchains, linkers, linguagens, docs, tipos de construções 
    - gera optimization.profile + detected-tools.info
 
 5) environment-wrapper.sh  
@@ -319,40 +327,40 @@ Fluxo macro tipico para construir um sistema (resumido):
 
 6) profile-manager.sh + template-builder.sh  
    - define o perfil (desktop/server/minimal/etc.)
-   - monta lista de pacotes e combina??es de libc/init/otimiza??es 
+   - monta lista de pacotes e combinações de libc/init/otimization
 
 7) fetch-sources.sh + patch-engine + hooks  
-   - l? metadados, baixa m?ltiplas fontes em todos os formatos git,github,gitlab,https,rsync,sourceforge,diret?rio, aplica patches, hooks de pre/post em todos os est?gios 
+   - le metadados, baixa múltiplas fontes em todos os formatos git,github,gitlab,https,rsync,sourceforge,diretório, aplica patches, hooks de pre/post em todos os estágio 
 
 8) build-toolchain.sh  
    - construir binutils, gcc, libc (musl/glibc) isolado do host
-   - com as flags, profiles, par?metros, seguros para n?o quebrar
+   - com as flags, profiles, parâmetros, seguros para não quebrar
    - com intelig?ncia para criar cross-toolchain e toolchain final
 
 9) build-core-system.sh  
    - compila base do sistema (LFS estendido)
-   - constr?i a base do sistema
+   - constrói a base do sistema
 
 10) build-init-systems.sh + unify-libs.sh + unify-inits.sh  
    - constroem e integram systemd/sysvinit e diferentes libcs
 
 11) cache-manager.sh + build-intelligence.sh + rebuild-intelligent.sh  
-    - cache bin?rio, heur?sticas, rebuild seletivo
+    - cache binário, heurísticas, rebuild seletivo
 
 12) package-manager.sh + update-system.sh  
     - gerenciam pacotes, atualizam componentes
-    - em update olha o cache de source se tiver vers?o maior constr?i 
+    - em update olha o cache de source se tiver versão maior constrói 
     - detectar toolchain e usar o script de toolchain para construir(atualizar)
 
 13) system-health.sh + test-suite.sh  
     - checam integridade, rodam testes, QEMU/chroot
 
 14) snapshot-system.sh  
-    - gera ISO/IMG/TAR.XZ reprodut?veis 
+    - gera ISO/IMG/TAR.XZ reprodutíveis 
     - dos stages, ou sistema inteiro
 
 15) cli-interface.sh + finalize-system.sh  
-    - fun??es de interface com o usuário e finalização do build
+    - funções de interface com o usuário e finalização do build
     - comandos de informações sobre programa, procura por programa
     - todos os comandos e parâmetros de todos os scripts
     - help com todos os comandos e parâmetros 
@@ -369,24 +377,24 @@ A seguir, cada script principal do sistema e seus papéis.
 1) setup-environment.sh (evoluído e inteligente)
 ------------------------------------------------------------
 Função:
-- Inicializar toda a estrutura /usr/src/adm.
+- Inicializar toda a estrutura /root/usr/src/adm.
 - Criar diretórios: repo, scripts, sources, build, cache, logs, meta, intelligence, profiles.
 - Validar permissões de escrita.
 - Verificar ferramentas mínimas do host.
 - Gerar meta/hardware.info (CPU, memória, arquitetura, kernel).
-- Gerar meta/global-env.sh com vari?veis globais.
+- Gerar meta/global-env.sh com variáveis globais.
 - Gera todos os perfis
 
 Erros:
-- Falta de permiss?o.
+- Falta de permissão.
 - Falta de ferramentas essenciais.
-- Problemas ao criar diret?rios ou arquivos.
+- Problemas ao criar diretórios ou arquivos.
 - Nenhum erro é silencioso.
 
 ------------------------------------------------------------
 2) log-manager.sh (inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Centralizar e organizar logs do sistema:
   - logs globais
   - logs por pacote
@@ -394,26 +402,26 @@ Fun??o:
   - gerar sumários de erros, tempos de build, etc.
 
 Erros:
-- Problemas de escrita em disco ou acesso a logs s?o reportados, nunca ignorados.
+- Problemas de escrita em disco ou acesso a logs são reportados, nunca ignorados.
 
 ------------------------------------------------------------
-3) verify-dependencies.sh (evolu?do e inteligente)
+3) verify-dependencies.sh (evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
-- Confirmar que o sistema host possui todas as depend?ncias m?nimas para o build:
-  compiladores, ferramentas b?sicas, utilit?rios fundamentais.
-- Criar relat?rio em logs/deps-report.txt.
-- Avisar claramente o que est? faltando.
+Função:
+- Confirmar que o sistema host possui todas as dependências mínimas para o build:
+  compiladores, ferramentas básica, utilitários fundamentais.
+- Criar relatório em logs/deps-report.txt.
+- Avisar claramente o que estão faltando.
 
 Erros:
-- Qualquer depend?ncia essencial faltando gera erro expl?cito.
+- Qualquer dependência essencial faltando gera erro explícito.
 
 ------------------------------------------------------------
-4) fetch-sources.sh (evolu?do e inteligente)
+4) fetch-sources.sh (evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Ler metadados de cada programa (name, version, url, checksum, deps).
-- M?ltiplos downloads e em paralelo git,gitlab,github,rsync,ftp,https,sourceforge,diret?rio 
+- Múltiplos downloads e em paralelo git,gitlab,github,rsync,ftp,https,sourceforge,diret?rio 
 - Baixar tarballs/arquivos de fonte para sources/.
 - Validar checksum (sha256 ou md5).
 - extrair em todos os formatos com otimiza??es 
@@ -426,42 +434,42 @@ Erros:
   sempre com erro claro e build interrompido.
 
 ------------------------------------------------------------
-5) detect-optimizations.sh (extremamente evolu?do e inteligente)
+5) detect-optimizations.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Detectar hardware:
-  - CPU, instru??es suportadas, n?mero de cores.
+  - CPU, instruções suportadas, número de cores.
 - Detectar todos os tipos compiladores, linkers, linguagens, ferramentas de docs.
-- Definir flags de otimiza??o (CFLAGS, CXXFLAGS etc.) baseadas em hardware.
+- Definir flags de otimização (CFLAGS, CXXFLAGS etc.) baseadas em hardware.
 - Gerar meta/detected-tools.info.
 - Gerar meta/optimization.profile.
 
 Erros:
-- Aus?ncia total de compilador C ou linker gera falha imediata, sem continuar.
+- Ausência total de compilador C ou linker gera falha imediata, sem continuar.
 
 ------------------------------------------------------------
-6) build-intelligence.sh (extremamente evolu?do e inteligente)
+6) build-intelligence.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
-- C?rebro da constru??o:
+Função:
+- Cérebro da construção:
   - coordenar ordem de build de pacotes.
   - analisar falhas e ajustar flags (ex.: reduzir de -O3 para -O2, desativar LTO).
-  - decidir reconstru??es necess?rias.
+  - decidir reconstruções necessárias.
 - Alimentar intelligence.db com:
-  - tempos de compila??o,
+  - tempos de compilação,
   - flags usadas,
-  - falhas e solu??es,
-  - depend?ncias reais detectadas.
+  - falhas e soluções,
+  - dependências reais detectadas.
 
 Erros:
-- Detec??o de ciclos de depend?ncias.
-- Falhas ao ler/gravar intelig?ncia.
+- Detecção de ciclos de dependências.
+- Falhas ao ler/gravar inteligência.
 - Nunca ignorar problemas.
 
 ------------------------------------------------------------
-7) build-toolchain.sh (extremamente evolu?do e inteligente)
+7) build-toolchain.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Construir toolchain isolado:
   - binutils,
   - gcc,
@@ -473,53 +481,53 @@ Erros:
 - Falha em qualquer etapa do toolchain interrompe o processo, com logs detalhados.
 
 ------------------------------------------------------------
-8) build-core-system.sh (extremamente evolu?do e inteligente)
+8) build-core-system.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Construir o conjunto de pacotes base do sistema (similar ao LFS base):
   bash, coreutils, sed, grep, gawk, util-linux, zlib, xz etc.
-- Aplicar flags de otimiza??o do optimization.profile.
-- Integrar com cache-manager e intelig?ncia.
-- continuar do ?ltimo programa constru?do com sucesso
+- Aplicar flags de otimização do optimization.profile.
+- Integrar com cache-manager e inteligência.
+- continuar do último programa construído com sucesso
 
 Erros:
 - Falha em qualquer pacote base registrada claramente com nome do pacote e logs.
 
 ------------------------------------------------------------
-9) build-init-systems.sh (extremamente evolu?do e inteligente)
+9) build-init-systems.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Construir e configurar:
   - systemd
   - sysvinit
   - runit
   - ou ambos, conforme perfil.
-- Configurar servi?os b?sicos (logging, networking m?nimo, etc.).
+- Configurar serviços básicos (logging, networking mínimo, etc.).
 
 Erros:
-- Falhas espec?ficas em init geram logs dedicados.
-- Se ambos forem constru?dos, garantir de forma inteligente que n?o entrem em conflito.
-- e se quiser trocar de init depois garantir que n?o precise reconstruir todo o sistema s? o necess?rio de forma inteligente 
+- Falhas específicas em init geram logs dedicados.
+- Se ambos forem construídos, garantir de forma inteligente que não entrem em conflito.
+- e se quiser trocar de init depois garantir que não precise reconstruir todo o sistema só o necessário de forma inteligente 
 
 ------------------------------------------------------------
-10) profile-manager.sh (extremamente evolu?do e inteligente)
+10) profile-manager.sh (extremamente evoluído e inteligente)
 ------------------------------------------------------------
-Fun??o:
+Função:
 - Gerenciar perfis de build:
   - minimal
   - desktop
   - server
   - embedded
-  - extreme (tudo no m?ximo para performance lto,pgo,03....)
+  - extreme (tudo no máximo para performance lto,pgo,03....)
 - Traduzir o perfil em:
   - tipo de libc,
   - tipo de init,
-  - n?vel padr?o de otimiza??o,
+  - nível padrão de otimização,
   - conjunto de pacotes recomendados.
   - conjunto de pacotes recomendado para o perfil extreme
 
 Erros:
-- Perfil inexistente ou inv?lido gera erro claro.
+- Perfil inexistente ou inválido gera erro claro.
 
 ------------------------------------------------------------
 11) template-builder.sh (evolu?do ao extremo e inteligente)
