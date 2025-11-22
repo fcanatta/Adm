@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/glibc (sanity checks LFS 5.5)
+#
+# Executado pelo adm-build DEPOIS da instalação (make DESTDIR=... install
+# + cópia do DESTDIR para o sysroot real).
+#
+# Objetivo:
+#   - Rodar os sanity checks do LFS 5.5:
+#       echo 'int main(){}' | $LFS_TGT-gcc -x c - -v -Wl,--verbose &> dummy.log
+#       readelf -l a.out | grep ': /lib'
+#       grep -E -o "$LFS/lib.*/S?crt[1in].*succeeded" dummy.log
+#       grep -B3 "^ $LFS/usr/include" dummy.log
+#       grep 'SEARCH.*/usr/lib' dummy.log | sed 's|; |\n|g'
+#       grep "/lib.*/libc.so.6 " dummy.log
+#       grep 'found' dummy.log
+#       rm -v a.out dummy.log
+#
+# Integração ADM 2.0:
+#   - Usa ADM_BUILD_DIR_CURRENT como diretório de trabalho (onde o build da glibc foi feito).
+#   - Requer que LFS e LFS_TGT estejam definidos (como no livro).
+#   - Se não estiverem definidos, o hook APENAS AVISA e sai com sucesso (não quebra o build).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/glibc}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+# Precisamos de LFS e LFS_TGT exatamente como no ambiente do livro
+if [[ -z "${LFS:-}" || -z "${LFS_TGT:-}" ]]; then
+    echo "[hook-post-install][$ADM_PKG_ID] LFS ou LFS_TGT não definidos; pulando sanity checks de Glibc (modo LFS)." >&2
+    exit 0
+fi
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+echo "[hook-post-install][$ADM_PKG_ID] Rodando sanity checks do LFS para Glibc em $ADM_BUILD_DIR_CURRENT..."
+echo "  LFS      = $LFS"
+echo "  LFS_TGT  = $LFS_TGT"
+
+# 1) Compilar o dummy.c com o toolchain cross, capturando log detalhado
+echo 'int main(){}' | "$LFS_TGT-gcc" -x c - -v -Wl,--verbose &> dummy.log
+
+# 2) Verificar o program interpreter (dinamic linker) em a.out
+echo "[hook-post-install][$ADM_PKG_ID] Saída de readelf -l a.out | grep ': /lib':"
+readelf -l a.out | grep ': /lib'
+
+# 3) Verificar se os crt*.o corretos foram usados (start files)
+echo "[hook-post-install][$ADM_PKG_ID] Verificando start files (crt*.o) em dummy.log:"
+grep -E -o "$LFS/lib.*/S?crt[1in].*succeeded" dummy.log
+
+# 4) Verificar se o caminho de include inclui $LFS/usr/include
+echo "[hook-post-install][$ADM_PKG_ID] Verificando ordem de diretórios de include em dummy.log:"
+grep -B3 "^ $LFS/usr/include" dummy.log
+
+# 5) Verificar SEARCH_DIR do linker (sysroot e /usr/lib corretos)
+echo "[hook-post-install][$ADM_PKG_ID] Verificando SEARCH_DIR(.../usr/lib...) em dummy.log:"
+grep 'SEARCH.*/usr/lib' dummy.log | sed 's|; |\n|g'
+
+# 6) Verificar se a libc correta está sendo usada
+echo "[hook-post-install][$ADM_PKG_ID] Verificando referência a libc.so.6 em dummy.log:"
+grep "/lib.*/libc.so.6 " dummy.log
+
+# 7) Verificar se o dynamic linker encontrado é o correto
+echo "[hook-post-install][$ADM_PKG_ID] Verificando linha 'found ... ld-linux-*.so.*' em dummy.log:"
+grep 'found' dummy.log
+
+echo "[hook-post-install][$ADM_PKG_ID] Sanity checks executados."
+echo "[hook-post-install][$ADM_PKG_ID] Revise cuidadosamente a saída acima (especialmente readelf e as linhas de grep)."
+
+# 8) Limpeza dos arquivos temporários
+echo "[hook-post-install][$ADM_PKG_ID] Limpando arquivos temporários (a.out, dummy.log)..."
+rm -v a.out dummy.log || true
+
+echo "[hook-post-install][$ADM_PKG_ID] Sanity checks concluídos."
