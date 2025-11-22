@@ -1,0 +1,31 @@
+name: make-temp
+version: 4.4.1
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/make/
+
+# ajuda o adm-profile a escolher libc/toolchain certo
+libc: glibc
+
+summary: Make 4.4.1 temporário (cross) para o LFS (cap. 6.12)
+description: >
+  Make 4.4.1 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.12 do LFS (Cross Compiling Temporary Tools). Usa
+  --host=$LFS_TGT e --build=$(build-aux/config.guess), integrado ao
+  pipeline ADM 2.0 com DESTDIR.
+
+# toolchain temporária já precisa estar funcional
+build_deps: toolchain/gzip-temp toolchain/grep-temp toolchain/gawk-temp toolchain/findutils-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: pra build-group temp-tools, relatórios, etc.
+groups: toolchain temp-tools cross-temp make
+
+# tarball oficial (LFS usa esse)
+source_uri: https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz
+
+# pode preencher depois com sha256/MD5 se quiser
+source_checksum:
