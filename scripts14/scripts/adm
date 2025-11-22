@@ -38,6 +38,7 @@
 #   - eventos ADM_TASK_START / ADM_TASK_DONE / ADM_TASK_FAIL via adm-eventd.
 #
 # Instalação final: sempre em / (quem cuida é o adm-build + adm_build_install_destdir).
+#   daemon-build [...]  -> inicia o daemon de builds (adm-daemon-build)
 
 set -o errexit
 set -o nounset
@@ -503,6 +504,16 @@ adm_cli_cmd_report() {
         "$_ADM_CLI_DIR/adm-report" "$@"
 }
 
+adm_cli_cmd_daemon_build() {
+    # adm daemon-build [--once] [--sleep SEC] [--profile ID] [--dry-run] [--force]
+    local descr="Daemon de build: $*"
+
+    # Aqui eu embrulho o daemon em uma "task" também. Se preferir rodar sem task,
+    # dá pra chamar direto "$_ADM_CLI_DIR/adm-daemon-build" "$@".
+    adm_task_run "daemon-build" "$descr" \
+        "$_ADM_CLI_DIR/adm-daemon-build" "$@"
+}
+
 adm_cli_cmd_tui() {
     # adm tui -> abre o adm-tui
     local descr="TUI (monitor de builds)"
@@ -561,6 +572,7 @@ Comandos principais:
 
   uninstall PKG...    Desinstala pacote(s) usando adm-uninstall
   autoremove          Remove pacotes órfãos
+  daemon-build [...]  Inicia o daemon de builds (adm-daemon-build)
 
 Flags globais:
   --profile ID        Força profile em builds (ADM_BUILD_PROFILE_OVERRIDE)
@@ -649,6 +661,9 @@ adm_main() {
             ;;
         install)
             adm_cli_cmd_install "${args[@]}"
+            ;;
+        daemon-build)
+            adm_cli_cmd_daemon_build "${args[@]}"
             ;;
         build-group)
             if [[ ${#args[@]} -lt 1 ]]; then
