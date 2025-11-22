@@ -1,0 +1,581 @@
+#!/usr/bin/env bash
+# adm-daemon-build - Scheduler/daemon de builds do ADM 2.0
+#
+# Responsável por:
+#   - Ler fila de pendências (db/updates/pending.list)
+#   - Considerar prioridades (db/control/build.priority)
+#   - Respeitar pausa global (db/control/build.paused)
+#   - Decidir o próximo pacote a buildar
+#   - Chamar "adm build PKG" (com deps), registrando estado
+#
+# Estado por pacote:
+#   db/updates/state/<pkg_id>.state
+#
+# Campos (key=value):
+#   pkg_id=cat/name
+#   status=PENDING|BUILDING|DONE|FAIL|SKIP
+#   rc=<exit_code>
+#   ts_last=...
+#   meta_version=...
+#   meta_release=...
+#   installed_version_before=...
+#   installed_release_before=...
+#   requested_profile=<profile>
+#
+# Integração com profiles:
+#   - O daemon respeita:
+#       ADM_BUILD_PROFILE_OVERRIDE  (ou flag --profile)
+#     e chama "adm --profile ID build ...".
+#   - O adm-build já aplica o profile certo em todo o build.
+#
+# Flags:
+#   --once          -> faz uma varredura na fila e sai quando não houver mais o que fazer
+#   --sleep SEC     -> intervalo entre iterações (default 3s)
+#   --profile ID    -> seta ADM_BUILD_PROFILE_OVERRIDE (profile forçado)
+#   --dry-run, -n   -> ADM_DRY_RUN=1 (não executa adm build, só loga decisão)
+#   --force         -> ADM_BUILD_FORCE=1 (não pula builds mesmo se versão igual)
+#
+# Convenção:
+#   - "pending.list": lista de pkg_id (um por linha), gerada pelo adm-update/adm-upgrade.
+#   - "build.priority": lista de pkg_id. Primeiros têm prioridade.
+#   - "build.paused": sentinel; se existir, daemon não inicia novos builds.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Descobrir diretório e carregar módulos
+# =========
+
+_adm_daemon_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-daemon-build.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_DAEMON_DIR="$(_adm_daemon_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-build"
+# shellcheck disable=SC1090
+source "$_ADM_DAEMON_DIR/adm-profile"
+
+ADM_DB_UPDATES_DIR="${ADM_DB_UPDATES_DIR:-${ADM_DB_DIR}/updates}"
+ADM_DB_CONTROL_DIR="${ADM_DB_CONTROL_DIR:-${ADM_DB_DIR}/control}"
+
+ADM_DB_UPDATES_PENDING="${ADM_DB_UPDATES_DIR}/pending.list"
+ADM_DB_UPDATES_STATE_DIR="${ADM_DB_UPDATES_DIR}/state"
+ADM_DB_CONTROL_PAUSED="${ADM_DB_CONTROL_DIR}/build.paused"
+ADM_DB_CONTROL_PRIORITY="${ADM_DB_CONTROL_DIR}/build.priority"
+
+mkdir -p "$ADM_DB_UPDATES_DIR" "$ADM_DB_UPDATES_STATE_DIR" "$ADM_DB_CONTROL_DIR" >/dev/null 2>&1 || true
+
+# Flags globais (podem vir do ambiente)
+ADM_DAEMON_ONCE=0
+ADM_DAEMON_SLEEP="${ADM_DAEMON_SLEEP:-3}"
+
+ADM_DRY_RUN="${ADM_DRY_RUN:-0}"
+ADM_BUILD_FORCE="${ADM_BUILD_FORCE:-0}"
+ADM_BUILD_PROFILE_OVERRIDE="${ADM_BUILD_PROFILE_OVERRIDE:-}"
+
+# =========
+# Funções utilitárias de metadado / instalado
+# =========
+
+adm_daemon_state_file_for_pkg() {
+    local pkg_id="$1"
+    printf '%s/%s.state\n' "$ADM_DB_UPDATES_STATE_DIR" "$pkg_id"
+}
+
+adm_daemon_state_set() {
+    # adm_daemon_state_set PKG_ID STATUS RC EXTRA_KV...
+    local pkg_id="$1"
+    local status="$2"
+    local rc="$3"
+    shift 3 || true
+    local extra=("$@")
+
+    local f
+    f="$(adm_daemon_state_file_for_pkg "$pkg_id")"
+
+    {
+        echo "pkg_id=$pkg_id"
+        echo "status=$status"
+        echo "rc=${rc:-0}"
+        echo "ts_last=$(date '+%Y-%m-%dT%H:%M:%S%z')"
+        for kv in "${extra[@]}"; do
+            echo "$kv"
+        done
+    } >"$f"
+}
+
+adm_daemon_state_status() {
+    local pkg_id="$1"
+    local f
+    f="$(adm_daemon_state_file_for_pkg "$pkg_id")"
+    [[ -f "$f" ]] || { echo ""; return 0; }
+    awk -F'=' '$1=="status"{print $2; exit 0}' "$f" 2>/dev/null || echo ""
+}
+
+adm_daemon_read_pending() {
+    # Imprime pkg_id de pending.list (ignorando comentários e linhas vazias)
+    if [[ ! -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        return 0
+    fi
+    awk '
+        NF==0 {next}
+        $1 ~ /^#/ {next}
+        {print $1}
+    ' "$ADM_DB_UPDATES_PENDING"
+}
+
+adm_daemon_read_priority() {
+    # Imprime pkg_id de build.priority
+    if [[ ! -f "$ADM_DB_CONTROL_PRIORITY" ]]; then
+        return 0
+    fi
+    awk '
+        NF==0 {next}
+        $1 ~ /^#/ {next}
+        {print $1}
+    ' "$ADM_DB_CONTROL_PRIORITY"
+}
+
+adm_daemon_pkg_meta_ver_rel() {
+    # Lê version/release do metadado do pacote.
+    #
+    # Saída:
+    #   version<TAB>release
+    local pkg_id="$1"
+    local meta
+    if type -t adm_build_metadado_path >/dev/null 2>&1; then
+        meta="$(adm_build_metadado_path "$pkg_id")"
+    else
+        meta="${ADM_PACKAGES_DIR:-${ADM_ROOT}/packages}/$pkg_id/metadado"
+    fi
+
+    if [[ ! -f "$meta" ]]; then
+        echo "-	-"
+        return 0
+    fi
+
+    local ver rel
+    ver="$(awk -F':' '
+        tolower($1) ~ /^[[:space:]]*version[[:space:]]*$/ {
+            $1=""; sub(/^[[:space:]]+/, "", $0); print; exit 0
+        }
+    ' "$meta" 2>/dev/null || echo "-")"
+
+    rel="$(awk -F':' '
+        tolower($1) ~ /^[[:space:]]*release[[:space:]]*$/ {
+            $1=""; sub(/^[[:space:]]+/, "", $0); print; exit 0
+        }
+    ' "$meta" 2>/dev/null || echo "-")"
+
+    printf '%s\t%s\n' "$ver" "$rel"
+}
+
+adm_daemon_pkg_installed_ver_rel() {
+    # Lê versão/release instalados, se existir.
+    #
+    # Saída:
+    #   version<TAB>release
+    local pkg_id="$1"
+    local file
+
+    if ! type -t adm_db_pkg_file >/dev/null 2>&1; then
+        echo "-	-"
+        return 0
+    fi
+
+    file="$(adm_db_pkg_file "$pkg_id")"
+    if [[ ! -f "$file" ]]; then
+        echo "-	-"
+        return 0
+    fi
+
+    local ver rel
+    ver="$(awk -F'=' '$1=="version"{print $2; exit 0}' "$file" 2>/dev/null || echo "-")"
+    rel="$(awk -F'=' '$1=="release"{print $2; exit 0}' "$file" 2>/dev/null || echo "-")"
+
+    printf '%s\t%s\n' "$ver" "$rel"
+}
+
+adm_daemon_same_ver_rel() {
+    # Retorna 0 se (meta_ver,meta_rel) == (inst_ver,inst_rel),
+    # senão retorna 1.
+    local meta_ver="$1" meta_rel="$2" inst_ver="$3" inst_rel="$4"
+    if [[ "$meta_ver" == "$inst_ver" && "$meta_rel" == "$inst_rel" && "$meta_ver" != "-" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+adm_daemon_is_paused() {
+    [[ -f "$ADM_DB_CONTROL_PAUSED" ]]
+}
+
+# =========
+# Seleção do próximo pacote
+# =========
+
+adm_daemon_pick_next_pkg() {
+    # Decide o próximo pacote a buildar.
+    #
+    # Regras:
+    #   1. Considera primeiro build.priority:
+    #        - pkg presente em pending.list
+    #        - com status != DONE/FAIL/SKIP/BUILDING
+    #   2. Depois, percorre pending.list na ordem:
+    #        - primeiro com status vazio/PENDING
+    #
+    # Saída:
+    #   imprime pkg_id ou nada se não houver candidatos.
+
+    local pending priority
+    pending="$(adm_daemon_read_pending || true)"
+    [[ -z "$pending" ]] && return 0
+
+    local pending_set_file
+    pending_set_file="$(mktemp "$ADM_TMP_DIR/daemon-pending-XXXXXX")" || return 1
+    printf '%s\n' "$pending" >"$pending_set_file"
+
+    # 1) prioridade
+    local p
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        # só considera se estiver em pending
+        if ! grep -qxF "$p" "$pending_set_file" 2>/dev/null; then
+            continue
+        fi
+        local st
+        st="$(adm_daemon_state_status "$p" || true)"
+        case "$st" in
+            DONE|FAIL|SKIP|BUILDING)
+                continue
+                ;;
+            *)
+                echo "$p"
+                rm -f "$pending_set_file" 2>/dev/null || true
+                return 0
+                ;;
+        esac
+    done < <(adm_daemon_read_priority || true)
+
+    # 2) ordem normal da pending.list
+    while IFS= read -r p; do
+        [[ -z "$p" ]] && continue
+        local st
+        st="$(adm_daemon_state_status "$p" || true)"
+        case "$st" in
+            DONE|FAIL|SKIP|BUILDING)
+                continue
+                ;;
+            *)
+                echo "$p"
+                rm -f "$pending_set_file" 2>/dev/null || true
+                return 0
+                ;;
+        esac
+    done <"$pending_set_file"
+
+    rm -f "$pending_set_file" 2>/dev/null || true
+    return 0
+}
+
+# =========
+# Execução do build de um pacote
+# =========
+
+adm_daemon_profile_to_use() {
+    # Decide qual profile registrar como "requested_profile" para o state.
+    #
+    # Prioridade:
+    #   1) ADM_BUILD_PROFILE_OVERRIDE
+    #   2) profile atual (adm-profile current)
+    #   3) vazio
+    local override="${ADM_BUILD_PROFILE_OVERRIDE:-}"
+    if [[ -n "$override" ]]; then
+        echo "$override"
+        return 0
+    fi
+
+    if type -t adm_profile_get_current >/dev/null 2>&1; then
+        local cur
+        cur="$(adm_profile_get_current || true)"
+        if [[ -n "$cur" ]]; then
+            echo "$cur"
+            return 0
+        fi
+    fi
+
+    echo ""
+}
+
+adm_daemon_build_one_pkg() {
+    local pkg_id="$1"
+
+    # Lê versões
+    local meta_ver meta_rel inst_ver inst_rel
+    IFS=$'\t' read -r meta_ver meta_rel < <(adm_daemon_pkg_meta_ver_rel "$pkg_id")
+    IFS=$'\t' read -r inst_ver inst_rel < <(adm_daemon_pkg_installed_ver_rel "$pkg_id")
+
+    local requested_profile
+    requested_profile="$(adm_daemon_profile_to_use)"
+
+    # Se já estiver instalado com mesma versão/release e não for FORCE, pulamos
+    if [[ "$ADM_BUILD_FORCE" -eq 0 ]]; then
+        if adm_daemon_same_ver_rel "$meta_ver" "$meta_rel" "$inst_ver" "$inst_rel"; then
+            adm_log_info "[DAEMON] Pulando $pkg_id (já instalado $inst_ver-$inst_rel, meta=$meta_ver-$meta_rel)."
+            adm_daemon_state_set "$pkg_id" "SKIP" 0 \
+                "meta_version=$meta_ver" \
+                "meta_release=$meta_rel" \
+                "installed_version_before=$inst_ver" \
+                "installed_release_before=$inst_rel" \
+                "requested_profile=$requested_profile"
+            return 0
+        fi
+    fi
+
+    adm_log_phase_header "[DAEMON] Build de $pkg_id (meta=$meta_ver-$meta_rel, inst=$inst_ver-$inst_rel, profile=${requested_profile:-"(auto)"})"
+
+    adm_daemon_state_set "$pkg_id" "BUILDING" 0 \
+        "meta_version=$meta_ver" \
+        "meta_release=$meta_rel" \
+        "installed_version_before=$inst_ver" \
+        "installed_release_before=$inst_rel" \
+        "requested_profile=$requested_profile"
+
+    adm_event_emit "ADM_DAEMON_BUILD_START" "$pkg_id" "meta=${meta_ver}-${meta_rel} inst=${inst_ver}-${inst_rel} requested_profile=${requested_profile}"
+
+    local rc=0
+
+    if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN][DAEMON] Chamaria: adm build $pkg_id"
+        rc=0
+    else
+        local cmd=( "$_ADM_DAEMON_DIR/adm" )
+        # replica flags globais para adm
+        if [[ -n "$requested_profile" ]]; then
+            cmd+=( --profile "$requested_profile" )
+        fi
+        if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+            cmd+=( --dry-run )
+        fi
+        if [[ "$ADM_BUILD_FORCE" -eq 1 ]]; then
+            cmd+=( --force )
+        fi
+        cmd+=( build "$pkg_id" )
+
+        "${cmd[@]}" || rc=$?
+    fi
+
+    if [[ "$rc" -eq 0 ]]; then
+        adm_log_ok "[DAEMON] Build OK para $pkg_id."
+        adm_daemon_state_set "$pkg_id" "DONE" "$rc" \
+            "meta_version=$meta_ver" \
+            "meta_release=$meta_rel" \
+            "installed_version_before=$inst_ver" \
+            "installed_release_before=$inst_rel" \
+            "requested_profile=$requested_profile"
+        adm_event_emit "ADM_DAEMON_BUILD_DONE" "$pkg_id" "rc=$rc"
+    else
+        adm_log_error "[DAEMON] Build FALHOU para $pkg_id (rc=$rc)."
+        adm_daemon_state_set "$pkg_id" "FAIL" "$rc" \
+            "meta_version=$meta_ver" \
+            "meta_release=$meta_rel" \
+            "installed_version_before=$inst_ver" \
+            "installed_release_before=$inst_rel" \
+            "requested_profile=$requested_profile"
+        adm_event_emit "ADM_DAEMON_BUILD_FAIL" "$pkg_id" "rc=$rc"
+    fi
+
+    return "$rc"
+}
+
+# =========
+# Loop principal
+# =========
+
+adm_daemon_loop() {
+    local last_paused_state=""
+
+    adm_log_phase_header "[DAEMON] Iniciando adm-daemon-build"
+    adm_event_emit "ADM_DAEMON_START" "-" "once=${ADM_DAEMON_ONCE} sleep=${ADM_DAEMON_SLEEP} profile_override=${ADM_BUILD_PROFILE_OVERRIDE:-}"
+
+    while :; do
+        if adm_daemon_is_paused; then
+            if [[ "$last_paused_state" != "paused" ]]; then
+                adm_log_warn "[DAEMON] Build PAUSADO (db/control/build.paused presente)."
+                last_paused_state="paused"
+            fi
+            sleep "$ADM_DAEMON_SLEEP"
+            continue
+        else
+            if [[ "$last_paused_state" == "paused" ]]; then
+                adm_log_info "[DAEMON] Build RESUMIDO."
+                last_paused_state="running"
+            fi
+        fi
+
+        # Seleciona próximo pacote
+        local next_pkg
+        next_pkg="$(adm_daemon_pick_next_pkg || true)"
+
+        if [[ -z "$next_pkg" ]]; then
+            # Nada a fazer
+            if [[ "$ADM_DAEMON_ONCE" -eq 1 ]]; then
+                adm_log_info "[DAEMON] Nenhum pacote pendente. Encerrando (modo --once)."
+                break
+            fi
+            adm_log_info "[DAEMON] Nenhum pacote pendente. Aguardando..."
+            sleep "$ADM_DAEMON_SLEEP"
+            continue
+        fi
+
+        adm_daemon_build_one_pkg "$next_pkg" || true
+
+        if [[ "$ADM_DAEMON_ONCE" -eq 1 ]]; then
+            # Em modo once, fazemos um ciclo por vez:
+            #   - se ainda houver outros pacotes, eles serão tratados na próxima execução do daemon.
+            adm_log_info "[DAEMON] Modo --once: build de $next_pkg concluído, encerrando."
+            break
+        fi
+
+        # Em modo normal, apenas segue o loop.
+    done
+
+    adm_event_emit "ADM_DAEMON_STOP" "-" ""
+    adm_log_phase_header "[DAEMON] adm-daemon-build finalizado"
+}
+
+# =========
+# CLI do daemon
+# =========
+
+adm_daemon_usage() {
+    cat <<EOF
+adm-daemon-build - Scheduler/daemon de builds do ADM 2.0
+
+Uso:
+  adm-daemon-build [FLAGS]
+
+Flags:
+  --once
+      Processa a fila uma vez e encerra quando não houver mais pacotes pendentes
+      (ou quando não houver candidatos para build).
+
+  --sleep SEG
+      Intervalo em segundos entre verificações da fila (default: ${ADM_DAEMON_SLEEP}s).
+
+  --profile ID
+      Força o uso do profile ID em todos os builds (ADM_BUILD_PROFILE_OVERRIDE).
+
+  --dry-run, -n
+      Não chama "adm build" de fato; apenas loga as decisões do daemon.
+
+  --force
+      Seta ADM_BUILD_FORCE=1. Não pula pacotes mesmo se a versão instalada
+      for igual à do metadado.
+
+Integração com controle:
+
+  Pausa/resume:
+    - Se o arquivo:
+        ${ADM_DB_CONTROL_PAUSED}
+      existir, o daemon não iniciará novos builds.
+
+  Prioridade:
+    - Arquivo:
+        ${ADM_DB_CONTROL_PRIORITY}
+      com pkg_id por linha, mais acima = maior prioridade.
+
+  Fila de pacotes:
+    - Arquivo:
+        ${ADM_DB_UPDATES_PENDING}
+      com pkg_id por linha, gerado por adm-update/adm-upgrade.
+
+  Estado:
+    - Diretório:
+        ${ADM_DB_UPDATES_STATE_DIR}
+      com arquivos <pkg_id>.state (status, rc, versão, profile, etc).
+
+EOF
+}
+
+adm_daemon_parse_args() {
+    local args=("$@")
+    local i=0
+    local a
+
+    while [[ $i -lt ${#args[@]} ]]; do
+        a="${args[$i]}"
+        case "$a" in
+            --once)
+                ADM_DAEMON_ONCE=1
+                ;;
+            --sleep)
+                i=$((i + 1))
+                if [[ $i -lt ${#args[@]} ]]; then
+                    ADM_DAEMON_SLEEP="${args[$i]}"
+                else
+                    adm_log_fatal "--sleep exige um número de segundos."
+                fi
+                ;;
+            --profile)
+                i=$((i + 1))
+                if [[ $i -lt ${#args[@]} ]]; then
+                    ADM_BUILD_PROFILE_OVERRIDE="${args[$i]}"
+                else
+                    adm_log_fatal "--profile exige um ID de profile."
+                fi
+                ;;
+            --dry-run|-n)
+                ADM_DRY_RUN=1
+                ;;
+            --force)
+                ADM_BUILD_FORCE=1
+                ;;
+            --help|-h)
+                adm_daemon_usage
+                exit 0
+                ;;
+            *)
+                adm_log_fatal "Flag desconhecida para adm-daemon-build: '$a'"
+                ;;
+        esac
+        i=$((i + 1))
+    done
+}
+
+adm_daemon_main() {
+    adm_daemon_parse_args "$@"
+    adm_daemon_loop
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_daemon_main "$@"
+fi
+
+# Fim do adm-daemon-build
