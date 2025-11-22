@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/ncurses-temp
+#
+# Executado pelo adm-build DEPOIS da instalação no DESTDIR
+# (make DESTDIR=... install + cópia do DESTDIR para /).
+#
+# Objetivo:
+#   - Criar symlink libncurses.so -> libncursesw.so (no DESTDIR)
+#   - Ajustar curses.h para usar sempre as estruturas wide-char,
+#     como descrito no LFS 6.3 (libncursesw.so substituindo libncurses.so).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/ncurses-temp}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+dest="$ADM_DESTDIR"
+
+libdir="$dest/usr/lib"
+incdir="$dest/usr/include"
+
+if [[ ! -d "$libdir" ]]; then
+    echo "[hook-post-install][$pkg_id] AVISO: $libdir não existe; nada para ajustar." >&2
+    exit 0
+fi
+
+if [[ ! -d "$incdir" ]]; then
+    echo "[hook-post-install][$pkg_id] AVISO: $incdir não existe; nada para ajustar em curses.h." >&2
+    exit 0
+fi
+
+# 1) Symlink libncurses.so -> libncursesw.so
+echo "[hook-post-install][$pkg_id] Criando symlink libncurses.so -> libncursesw.so em $libdir..."
+
+if [[ -f "$libdir/libncursesw.so" || -L "$libdir/libncursesw.so" ]]; then
+    (
+        cd "$libdir"
+        # remove symlink antigo se existir
+        if [[ -L "libncurses.so" || -f "libncurses.so" ]]; then
+            rm -f libncurses.so
+        fi
+        ln -sv libncursesw.so libncurses.so
+    )
+else
+    echo "[hook-post-install][$pkg_id] AVISO: libncursesw.so não encontrado em $libdir; não criei symlink." >&2
+fi
+
+# 2) Ajuste em curses.h
+curses_h="$incdir/curses.h"
+
+if [[ -f "$curses_h" ]]; then
+    echo "[hook-post-install][$pkg_id] Ajustando $curses_h para usar sempre definição wide-char..." >&2
+    # LFS: sed -e 's/^#if.*XOPEN.*$/#if 1/' -i $LFS/usr/include/curses.h
+    sed -e 's/^#if.*XOPEN.*$/#if 1/' -i "$curses_h"
+else
+    echo "[hook-post-install][$pkg_id] AVISO: $curses_h não encontrado; pulando ajuste de XOPEN." >&2
+fi
+
+echo "[hook-post-install][$pkg_id] hook-post-install de Ncurses concluído."
