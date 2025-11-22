@@ -1,0 +1,32 @@
+name: coreutils-temp
+version: 9.8
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/coreutils/
+
+# Ajuda o adm-build/adm-profile a escolher o profile correto
+libc: glibc
+
+summary: Coreutils 9.8 temporário (cross) para o LFS (cap. 6.5)
+description: >
+  Coreutils 9.8 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.5 do LFS (Cross Compiling Temporary Tools), usando
+  --host=$LFS_TGT, --build=$(build-aux/config.guess),
+  --enable-install-program=hostname e
+  --enable-no-install-program=kill,uptime, integrado ao pipeline ADM 2.0.
+
+# Depende da toolchain e do bash/ncurses temporários já estarem disponíveis
+build_deps: toolchain/m4 toolchain/ncurses-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: para build-group e heurística de "kind"
+groups: toolchain temp-tools cross-temp coreutils
+
+# Fonte oficial (versão do livro r12.4-44)
+source_uri: https://ftp.gnu.org/gnu/coreutils/coreutils-9.8.tar.xz
+
+# Pode preencher depois com o sha256 real
+source_checksum:
