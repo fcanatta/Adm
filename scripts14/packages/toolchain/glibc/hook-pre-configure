@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/glibc
+#
+# Objetivo:
+#   - Injetar flags corretas para configurar a glibc em modo toolchain,
+#     usando build dir separado.
+#
+# Premissas:
+#   - ADM_BUILD_DIR_CURRENT é o diretório de build (ex: .../glibc/build)
+#   - O source da glibc está em ../ (onde está o configure original)
+#   - O adm-build chama ./configure no build dir.
+#
+# Variáveis de profile:
+#   ADM_CROSS_TARGET  -> host (ex: x86_64-lfs-linux-gnu)
+#   ADM_BUILD_SYSTEM  -> build (config.guess, se disponível)
+#   ADM_SYSROOT       -> sysroot do alvo (ex: /, $LFS)
+#
+# Flags típicas (baseado em LFS):
+#   ../configure \
+#       --prefix=/usr \
+#       --host=${CROSS_TARGET} \
+#       --build=${BUILD_SYSTEM} \
+#       --with-headers=${SYSROOT}/usr/include \
+#       --disable-werror
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+PKG_ID="${ADM_PKG_ID:-toolchain/glibc}"
+BUILD_DIR="${ADM_BUILD_DIR_CURRENT:-.}"
+
+CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+BUILD_SYSTEM="${ADM_BUILD_SYSTEM:-$(gcc -dumpmachine 2>/dev/null || echo x86_64-pc-linux-gnu)}"
+SYSROOT="${ADM_SYSROOT:-/}"
+
+echo "[hook-pre-configure][$PKG_ID] BUILD_DIR=$BUILD_DIR"
+echo "[hook-pre-configure][$PKG_ID] TARGET=$CROSS_TARGET BUILD=$BUILD_SYSTEM SYSROOT=$SYSROOT"
+
+cd "$BUILD_DIR"
+
+if [[ ! -x ../configure ]]; then
+    echo "[hook-pre-configure][$PKG_ID] ../configure não encontrado ou não executável."
+    exit 1
+fi
+
+if [[ -x ./configure.orig ]]; then
+    echo "[hook-pre-configure][$PKG_ID] ./configure.orig já existe; não vou sobrescrever."
+    exit 0
+fi
+
+# Caso o adm-build já tenha gerado um configure aqui, preserva
+if [[ -x ./configure ]]; then
+    mv ./configure ./configure.orig
+fi
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+set -o errexit
+set -o nounset
+set -o pipefail
+
+CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+BUILD_SYSTEM="${ADM_BUILD_SYSTEM:-$(gcc -dumpmachine 2>/dev/null || echo x86_64-pc-linux-gnu)}"
+SYSROOT="${ADM_SYSROOT:-/}"
+
+orig_args=("$@")
+filtered=()
+
+# Remove possíveis --prefix=/usr duplicados ou flags conflitantes
+for a in "${orig_args[@]}"; do
+    case "$a" in
+        --prefix=*|--host=*|--build=*|--with-headers=*|--disable-werror)
+            # ignoramos esses para usar os nossos
+            ;;
+        *)
+            filtered+=("$a")
+            ;;
+    esac
+done
+
+extra=(
+    "--prefix=/usr"
+    "--host=${CROSS_TARGET}"
+    "--build=${BUILD_SYSTEM}"
+    "--with-headers=${SYSROOT%/}/usr/include"
+    "--disable-werror"
+)
+
+echo "[hook-glibc-wrapper] chamando ../configure com:"
+printf '  %s\n' "${extra[@]}" "${filtered[@]}"
+
+exec ../configure "${extra[@]}" "${filtered[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$PKG_ID] wrapper ./configure criado (aponta para ../configure)."
