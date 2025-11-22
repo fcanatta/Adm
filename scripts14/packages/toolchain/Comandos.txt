@@ -4,3 +4,5 @@ adm build toolchain/binutils-pass1
 adm build toolchain/gcc-pass1
 adm build toolchain/linux-headers
 adm build toolchain/glibc
+
+adm build-group cross-toolchain
