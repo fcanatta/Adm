@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# /root/usr/src/adm/packages/toolchain/gcc-pass1/hook-post-install
+# hook-post-install para toolchain/gcc-pass1
+#
+# Executado pelo adm-build DEPOIS de instalar o pacote (DESTDIR já copiado
+# para o sistema final) e registrar no DB.
+#
+# Objetivo:
+#   - Criar o header interno completo limits.h, igual ao livro LFS:
+#       cd ..
+#       cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
+#         `dirname $($LFS_TGT-gcc -print-libgcc-file-name)`/include/limits.h
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gcc-pass1}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+if [[ -n "${LFS_TGT:-}" ]]; then
+    ADM_CROSS_TARGET="$LFS_TGT"
+fi
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+if ! command -v "${ADM_CROSS_TARGET}-gcc" >/dev/null 2>&1; then
+    echo "[hook-post-install][$ADM_PKG_ID] AVISO: ${ADM_CROSS_TARGET}-gcc não está no PATH; não foi possível gerar limits.h." >&2
+    exit 0
+fi
+
+# Caminho onde o libgcc está instalado
+libgcc_file="$("${ADM_CROSS_TARGET}-gcc" -print-libgcc-file-name)"
+libgcc_dir="$(dirname "$libgcc_file")"
+include_dir="${libgcc_dir}/include"
+
+mkdir -p "$include_dir"
+
+if [[ ! -f "gcc/limitx.h" || ! -f "gcc/glimits.h" || ! -f "gcc/limity.h" ]]; then
+    echo "[hook-post-install][$ADM_PKG_ID] AVISO: algum dos arquivos gcc/limitx.h, gcc/glimits.h, gcc/limity.h não foi encontrado; não criando limits.h." >&2
+    exit 0
+fi
+
+cat gcc/limitx.h gcc/glimits.h gcc/limity.h > "${include_dir}/limits.h"
+
+echo "[hook-post-install][$ADM_PKG_ID] limits.h gerado em ${include_dir}/limits.h (gcc-pass1 LFS-style)." >&2
