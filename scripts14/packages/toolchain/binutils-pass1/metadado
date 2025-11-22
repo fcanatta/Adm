@@ -20,7 +20,7 @@ run_deps:
 opt_deps:
 
 # groups: usado pela heurística de "kind" (toolchain) e por build-group, relatórios etc
-groups: toolchain toolchain-bootstrap cross binutils pass1
+groups: toolchain-bootstrap cross binutils pass1
 
 # Fonte oficial (alinhado com LFS "development")
 # Veja LFS capítulo 3 – lista de pacotes (Binutils 2.45.1, download .tar.xz).
