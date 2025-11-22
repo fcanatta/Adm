@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/util-linux-temp (LFS 7.12 + ADM 2.0)
+#
+# LFS:
+#   mkdir -pv /var/lib/hwclock
+#
+#   ./configure --libdir=/usr/lib     \
+#               --runstatedir=/run    \
+#               --disable-chfn-chsh   \
+#               --disable-login       \
+#               --disable-nologin     \
+#               --disable-su          \
+#               --disable-setpriv     \
+#               --disable-runuser     \
+#               --disable-pylibmount  \
+#               --disable-static      \
+#               --disable-liblastlog2 \
+#               --without-python      \
+#               ADJTIME_PATH=/var/lib/hwclock/adjtime \
+#               --docdir=/usr/share/doc/util-linux-2.40.2
+#
+#   make
+#   make install
+#
+# No ADM 2.0:
+#   - criamos /var/lib/hwclock (como no LFS)
+#   - transformamos ./configure em wrapper que injeta exatamente
+#     esses parâmetros (mantendo prefix=/usr compatível com o livro)
+#   - adm-build cuida do make / make DESTDIR=... install
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/util-linux-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+
+# 1) Criar /var/lib/hwclock como no livro
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    echo "[hook-pre-configure][$pkg_id][DRY-RUN] Criaria diretório /var/lib/hwclock" >&2
+else
+    if [[ ! -d "/var/lib/hwclock" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Criando /var/lib/hwclock (FHS / LFS 7.12)..." >&2
+        mkdir -pv /var/lib/hwclock
+    else
+        echo "[hook-pre-configure][$pkg_id] /var/lib/hwclock já existe; ok." >&2
+    fi
+fi
+
+# 2) Wrapper de ./configure
+cd "$build_dir"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $build_dir; nada a fazer." >&2
+    exit 0
+fi
+
+# idempotente: não recria se já existe configure.orig
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure para Util-linux 2.40.2 temporário (LFS 7.12 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/util-linux-temp}"
+build_dir="$(pwd)"
+
+# Filtrar args vindos do adm-build
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--libdir=*|--runstatedir=*|\
+        --disable-chfn-chsh|--enable-chfn-chsh|\
+        --disable-login|--enable-login|\
+        --disable-nologin|--enable-nologin|\
+        --disable-su|--enable-su|\
+        --disable-setpriv|--enable-setpriv|\
+        --disable-runuser|--enable-runuser|\
+        --disable-pylibmount|--enable-pylibmount|\
+        --disable-static|--enable-static|\
+        --disable-liblastlog2|--enable-liblastlog2|\
+        --without-python|--with-python|\
+        --docdir=*|ADJTIME_PATH=*)
+            # vamos sobrescrever todos estes
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+# ADJTIME_PATH como variável de ambiente, igual ao livro
+env_vars=( "ADJTIME_PATH=/var/lib/hwclock/adjtime" )
+
+# Montar comando final alinhado com o LFS
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--libdir=/usr/lib"
+  "--runstatedir=/run"
+  "--disable-chfn-chsh"
+  "--disable-login"
+  "--disable-nologin"
+  "--disable-su"
+  "--disable-setpriv"
+  "--disable-runuser"
+  "--disable-pylibmount"
+  "--disable-static"
+  "--disable-liblastlog2"
+  "--without-python"
+  "--docdir=/usr/share/doc/util-linux-2.40.2"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s %s\n' \
+    "$pkg_id" "${env_vars[*]}" "${args[*]}" >&2
+
+# aplica ADJTIME_PATH no ambiente desta chamada
+env "${env_vars[@]}" "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Util-linux-2.40.2 (LFS/ADM 2.0)." >&2
