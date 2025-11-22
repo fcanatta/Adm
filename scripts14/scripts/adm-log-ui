@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # adm-log-ui - Camada de saída visual (cores, spinner, ✔/✖/!)
-# Deve ser sourceado pelos outros scripts depois do adm-env.
+# Deve ser *sourceado* pelos outros scripts depois do adm-env.
 
 set -o errexit
 set -o nounset
@@ -12,6 +12,7 @@ set -o pipefail
 
 _adm_log_ui_script_dir() {
     local src="${BASH_SOURCE[0]:-$0}"
+
     while [ -L "$src" ]; do
         local target
         target=$(readlink "$src") || break
@@ -21,6 +22,7 @@ _adm_log_ui_script_dir() {
             src="$(dirname "$src")/$target"
         fi
     done
+
     cd "$(dirname "$src")" >/dev/null 2>&1 || {
         printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-log-ui.\n' >&2
         exit 1
@@ -125,6 +127,32 @@ adm_log_phase_header() {
 }
 
 # =========
+# Helpers com contexto de pacote (opcional)
+# =========
+
+adm_log_pkg_info() {
+    # Mensagem informativa com prefixo [pkg_id]
+    # Uso: adm_log_pkg_info base/bash "Iniciando build..."
+    local pkg_id="$1"; shift
+    adm_log_info "[$pkg_id] $*"
+}
+
+adm_log_pkg_ok() {
+    local pkg_id="$1"; shift
+    adm_log_ok "[$pkg_id] $*"
+}
+
+adm_log_pkg_warn() {
+    local pkg_id="$1"; shift
+    adm_log_warn "[$pkg_id] $*"
+}
+
+adm_log_pkg_error() {
+    local pkg_id="$1"; shift
+    adm_log_error "[$pkg_id] $*"
+}
+
+# =========
 # Spinner
 # =========
 
@@ -167,6 +195,7 @@ adm_spinner_start() {
     # Inicia spinner com mensagem.
     # Ex: adm_spinner_start "Building base/kmod..."
     local msg="${*:-}"
+
     if [[ -z "$msg" ]]; then
         adm_log_fatal "adm-spinner-start exige uma mensagem."
     fi
@@ -185,6 +214,7 @@ adm_spinner_start() {
     fi
 
     ADM_SPINNER_MSG="$msg"
+
     # Inicia spinner em subshell
     _adm_spinner_loop "$msg" &
     ADM_SPINNER_PID=$!
@@ -198,10 +228,13 @@ _adm_spinner_stop_generic() {
         kill "$ADM_SPINNER_PID" >/dev/null 2>&1 || true
         wait "$ADM_SPINNER_PID" >/dev/null 2>&1 || true
     fi
+
     ADM_SPINNER_PID=""
+
     # Limpa a linha do spinner
     if [[ "${ADM_IS_TTY:-0}" -eq 1 ]]; then
-        printf '\r\033[K'  # volta ao início da linha e limpa
+        # volta ao início da linha e limpa
+        printf '\r\033[K'
     fi
 }
 
@@ -209,10 +242,13 @@ adm_spinner_stop_ok() {
     # Para spinner e imprime linha final de sucesso
     # Uso: adm_spinner_stop_ok "Finished building base/kmod"
     local msg="${*:-$ADM_SPINNER_MSG}"
+
     _adm_spinner_stop_generic
+
     if [[ -z "$msg" ]]; then
         msg="Operação concluída."
     fi
+
     adm_log_ok "$msg"
     ADM_SPINNER_MSG=""
 }
@@ -221,10 +257,13 @@ adm_spinner_stop_fail() {
     # Para spinner e imprime linha de erro
     # Uso: adm_spinner_stop_fail "Build falhou para base/kmod"
     local msg="${*:-$ADM_SPINNER_MSG}"
+
     _adm_spinner_stop_generic
+
     if [[ -z "$msg" ]]; then
         msg="Operação falhou."
     fi
+
     adm_log_error "$msg"
     ADM_SPINNER_MSG=""
 }
@@ -232,10 +271,13 @@ adm_spinner_stop_fail() {
 adm_spinner_stop_warn() {
     # Para spinner e imprime aviso
     local msg="${*:-$ADM_SPINNER_MSG}"
+
     _adm_spinner_stop_generic
+
     if [[ -z "$msg" ]]; then
         msg="Operação interrompida."
     fi
+
     adm_log_warn "$msg"
     ADM_SPINNER_MSG=""
 }
@@ -246,6 +288,7 @@ adm_spinner_stop_warn() {
 
 adm_run_with_spinner() {
     # Executa um comando com spinner automático.
+    #
     # Uso:
     #   adm_run_with_spinner "Mensagem..." comando arg1 arg2 ...
     #
@@ -272,7 +315,6 @@ adm_run_with_spinner() {
     fi
 
     adm_spinner_start "$msg"
-
     if "${cmd[@]}"; then
         adm_spinner_stop_ok "$msg"
         return 0
@@ -294,49 +336,66 @@ adm_log_ui_demo() {
 
     adm_run_with_spinner "Compilando base/kmod..." sleep 1
 
-    adm_log_warn "Este é um aviso de teste."
+    adm_log_warn  "Este é um aviso de teste."
     adm_log_error "Este é um erro de teste (sem abortar)."
-    adm_log_debug "Mensagem de debug (aparece só se ADM_DEBUG=1)."
+    ADM_DEBUG=1 adm_log_debug "Mensagem de debug (aparece só se ADM_DEBUG=1)."
+
+    adm_log_pkg_info  "base/bash" "Mensagem informativa com contexto de pacote."
+    adm_log_pkg_ok    "base/coreutils" "Build finalizado com sucesso."
+    adm_log_pkg_warn  "base/util-linux" "Alguns testes foram ignorados."
+    adm_log_pkg_error "base/shadow" "Falha ao aplicar patch."
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+adm_log_ui_usage() {
+    cat <<'EOF'
+adm-log-ui - Camada de saída visual do ADM 2.0
+
+Uso:
+  # Em outros scripts (recomendado):
+  source /root/usr/src/adm/scripts/adm-env
+  source /root/usr/src/adm/scripts/adm-log-ui
+
+Funções principais:
+  adm_log_info "msg"
+  adm_log_ok "msg"
+  adm_log_warn "msg"
+  adm_log_error "msg"
+  adm_log_fatal "msg"
+  adm_log_debug "msg"
+
+Fases:
+  adm_log_phase "Building in src.kmod..."
+  adm_log_phase_header "Building base/kmod (33) ~4s"
+
+Spinner:
+  adm_spinner_start "Compilando base/kmod..."
+  # ... comando longo ...
+  adm_spinner_stop_ok "Base/kmod compilado."
+
+  ou use helper:
+  adm_run_with_spinner "Compilando base/kmod..." comando args...
+
+Helpers com contexto de pacote:
+  adm_log_pkg_info  PKG_ID "msg"
+  adm_log_pkg_ok    PKG_ID "msg"
+  adm_log_pkg_warn  PKG_ID "msg"
+  adm_log_pkg_error PKG_ID "msg"
+
+Modo demo:
+  adm-log-ui --demo
+EOF
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     case "${1:-}" in
         --demo)
             adm_log_ui_demo
             ;;
         --help|-h)
-            cat <<EOF
-adm-log-ui - Saída visual do ADM (cores, spinner, ✔/✖/!)
-
-Uso:
-  source adm-log-ui        # em outros scripts
-  adm-log-ui --demo        # demonstração de saída
-  adm-log-ui --help        # esta ajuda
-
-Funções principais:
-  adm_log_info "mensagem"
-  adm_log_ok "mensagem"
-  adm_log_warn "mensagem"
-  adm_log_error "mensagem"
-  adm_log_fatal "mensagem"  # log + exit 1
-  adm_log_phase "descrição da fase"
-  adm_log_phase_header "cabeçalho de fase"
-
-Spinner:
-  adm_spinner_start "mensagem"
-  adm_spinner_stop_ok "mensagem final"
-  adm_spinner_stop_fail "mensagem final"
-  adm_run_with_spinner "mensagem" comando [args...]
-
-EOF
-            ;;
-        "")
-            adm_log_info "adm-log-ui carregado. Use --demo para ver um exemplo."
+            adm_log_ui_usage
             ;;
         *)
-            adm_log_fatal "Opção desconhecida para adm-log-ui: $1"
+            adm_log_ui_usage
             ;;
     esac
 fi
-
-# Fim do adm-log-ui
