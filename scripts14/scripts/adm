@@ -1,44 +1,65 @@
 #!/usr/bin/env bash
 # adm - CLI principal do ADM 2.0
 #
-# Comandos:
+# Comandos de alto nível (integram todos os scripts):
 #
-#   build PKG...        -> constrói (com deps) e instala pacote(s)
-#   build-group GRUPO   -> constrói todos os pacotes de um grupo (ex: xorg, toolchain)
-#   install PKG...      -> alias amigável para build (construir + instalar)
+#  Build / instalação:
+#    build PKG...          -> constrói (com deps) e instala pacote(s)   (adm-build)
+#    build-group GRUPO     -> constrói todos os pacotes de um grupo     (adm-build)
+#    install PKG...        -> alias amigável para build
 #
-#   update [alvos...]   -> orquestra adm-update
-#   upgrade [opções...] -> orquestra adm-upgrade
+#  Fetch / scan / deps:
+#    fetch ...             -> delega para adm-fetch (download/cache de fontes)
+#    scan ...              -> delega para adm-scan (scanner de source / plano de build)
+#    deps ...              -> delega para adm-deps (debug/resolução de deps)
 #
-#   check PKG...        -> roda adm-check em pacotes instalados
+#  Update / upgrade:
+#    update [...]          -> orquestra adm-update
+#    upgrade [...]         -> orquestra adm-upgrade
 #
-#   search PADRÃO       -> procura pacotes nos metadados
-#   info PKG_ID         -> mostra metadado de um pacote
-#   list-installed      -> lista pacotes instalados (db/installed)
+#  Check:
+#    check PKG...          -> roda adm-check em pacotes (instalados ou alvos)
 #
-#   snapshot ...        -> delega para adm-snapshot (create/diff/restore)
-#   report ...          -> delega para adm-report
-#   tui                 -> abre adm-tui (monitor de builds)
+#  Busca / info / list:
+#    search PADRÃO         -> procura pacotes nos metadados
+#    info PKG_ID           -> mostra metadado de um pacote
+#    list-installed        -> lista pacotes instalados (db/installed)
 #
-#   uninstall PKG...    -> desinstala pacotes (usa adm-uninstall)
-#   autoremove          -> remove pacotes órfãos (usa adm-uninstall)
+#  Profiles:
+#    profile ...           -> delega para adm-profile (init-defaults, list, show, export, current, set-current, create)
 #
-#   help [comando]      -> ajuda geral ou ajuda do subcomando
+#  Snapshot / report / TUI:
+#    snapshot ...          -> delega para adm-snapshot (create/diff/restore)
+#    report ...            -> delega para adm-report
+#    tui                   -> abre adm-tui (monitor de builds)
+#
+#  Uninstall:
+#    uninstall PKG...      -> desinstala pacotes (usa adm-uninstall)
+#    autoremove            -> remove pacotes órfãos (usa adm-uninstall)
+#
+#  Daemon:
+#    daemon-build [...]    -> inicia o daemon de builds (adm-daemon-build)
+#
+#  Knowledge / metrics (debug/observabilidade):
+#    knowledge ...         -> delega para adm-knowledge
+#    metrics ...           -> delega para adm-metrics
+#
+#  Help:
+#    help [comando]        -> ajuda geral ou ajuda do subcomando
 #
 # Flags globais:
 #
-#   --profile ID  -> força o uso do profile ID em todos os builds (via ADM_BUILD_PROFILE_OVERRIDE)
-#   --dry-run, -n -> ADM_DRY_RUN=1 (mostra o que faria, sem executar)
-#   --force       -> ADM_BUILD_FORCE=1, ADM_UPDATE_FORCE=1,
-#                    ADM_UPGRADE_FORCE=1, ADM_UNINSTALL_FORCE=1
+#   --profile ID           -> força o uso do profile ID em todos os builds (via ADM_BUILD_PROFILE_OVERRIDE)
+#   --dry-run, -n          -> ADM_DRY_RUN=1 (mostra o que faria, sem executar)
+#   --force                -> ADM_BUILD_FORCE=1, ADM_UPDATE_FORCE=1,
+#                             ADM_UPGRADE_FORCE=1, ADM_UNINSTALL_FORCE=1
 #
-# Cada comando é tratado como uma "tarefa" (task):
+# Cada comando é tratado como uma "tarefa" (task) quando faz ações reais:
 #   - ID único: task-YYYYMMDD-HHMMSS-PID-RANDOM
-#   - arquivo em db/tasks/<task>.task com status, comando, profile etc.
+#   - arquivo em db/tasks/<task>.task com status, comando, profile, flags etc.
 #   - eventos ADM_TASK_START / ADM_TASK_DONE / ADM_TASK_FAIL via adm-eventd.
 #
 # Instalação final: sempre em / (quem cuida é o adm-build + adm_build_install_destdir).
-#   daemon-build [...]  -> inicia o daemon de builds (adm-daemon-build)
 
 set -o errexit
 set -o nounset
@@ -50,7 +71,6 @@ set -o pipefail
 
 _adm_cli_script_dir() {
     local src="${BASH_SOURCE[0]:-$0}"
-
     while [ -L "$src" ]; do
         local target
         target=$(readlink "$src") || break
@@ -60,7 +80,6 @@ _adm_cli_script_dir() {
             src="$(dirname "$src")/$target"
         fi
     done
-
     cd "$(dirname "$src")" >/dev/null 2>&1 || {
         printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm.\n' >&2
         exit 1
@@ -72,6 +91,7 @@ _adm_cli_script_dir() {
 # (no teu layout: /root/usr/src/adm/scripts)
 _ADM_CLI_DIR="$(_adm_cli_script_dir)"
 
+# Módulos base (bibliotecas principais)
 # shellcheck disable=SC1090
 source "$_ADM_CLI_DIR/adm-env"
 # shellcheck disable=SC1090
@@ -121,7 +141,6 @@ adm_task_write_status() {
     local exit_code="$3"
     local file
     file="$(adm_task_file "$task_id")"
-
     {
         echo "id=$task_id"
         echo "status=$status"
@@ -140,8 +159,8 @@ adm_task_run() {
     local type="$1"
     local descr="$2"
     shift 2 || true
-
     local task_cmd=( "$@" )
+
     local task_id
     task_id="$(adm_task_new_id)"
     local file
@@ -163,7 +182,6 @@ adm_task_run() {
         "task_id=$task_id descr=$(printf '%q' "$descr") cmd=$(printf '%q' "${task_cmd[*]}")"
 
     local rc=0
-
     if [[ "${ADM_DRY_RUN:-0}" -eq 1 && \
           "$type" != "tui" && \
           "$type" != "search" && \
@@ -199,14 +217,12 @@ adm_cli_parse_global_opts() {
     #   args=("${filtered[@]}")
     local -n _out_args="$1"
     shift || true
-
     local args=("$@")
     local filtered=()
     local i=0
 
     while [[ $i -lt ${#args[@]} ]]; do
         local a="${args[$i]}"
-
         case "$a" in
             --profile)
                 i=$((i + 1))
@@ -229,7 +245,6 @@ adm_cli_parse_global_opts() {
                 filtered+=("$a")
                 ;;
         esac
-
         i=$((i + 1))
     done
 
@@ -245,7 +260,6 @@ adm_cli_all_pkg_ids() {
     if [[ ! -d "$ADM_PACKAGES_DIR" ]]; then
         return 0
     fi
-
     find "$ADM_PACKAGES_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null \
         | sed "s#^${ADM_PACKAGES_DIR}/##" \
         | sort
@@ -255,7 +269,7 @@ adm_cli_metadado_path() {
     # Resolve pkg_id -> caminho do metadado.
     #
     # Tenta usar adm_build_metadado_path se existir,
-    # senão assume layout packages/<cat>/<nome>/metadado.
+    # senão assume layout packages/<cat>/<pkg>/metadado.
     local pkg_id="$1"
 
     if type -t adm_build_metadado_path >/dev/null 2>&1; then
@@ -273,17 +287,14 @@ adm_cli_packages_with_group() {
     #   adm_cli_packages_with_group xorg
     local group="$1"
     local ids
-
     ids="$(adm_cli_all_pkg_ids || true)"
     [[ -z "$ids" ]] && return 0
 
     local id meta groups
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
-
         meta="$(adm_cli_metadado_path "$id")"
         [[ ! -f "$meta" ]] && continue
-
         groups="$(
             awk -F':' '
                 tolower($1) ~ /^[[:space:]]*groups[[:space:]]*$/ {
@@ -294,7 +305,6 @@ adm_cli_packages_with_group() {
                 }
             ' "$meta" 2>/dev/null || true
         )"
-
         if echo " $groups " | grep -q " $(printf '%s' "$group" | tr '[:upper:]' '[:lower:]') "; then
             echo "$id"
         fi
@@ -303,7 +313,6 @@ adm_cli_packages_with_group() {
 
 adm_cli_search() {
     local pattern="${1:-}"
-
     if [[ -z "$pattern" ]]; then
         adm_log_fatal "Uso: adm search PADRÃO"
     fi
@@ -320,12 +329,10 @@ adm_cli_search() {
 
     adm_log_phase_header "Busca por: $pattern"
 
-    local id meta name desc hit
+    local id meta name desc haystack hit
     hit=0
-
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
-
         meta="$(adm_cli_metadado_path "$id")"
         [[ ! -f "$meta" ]] && continue
 
@@ -339,7 +346,6 @@ adm_cli_search() {
                 }
             ' "$meta" 2>/dev/null || true
         )"
-
         desc="$(
             awk -F':' '
                 tolower($1) ~ /^[[:space:]]*description[[:space:]]*$/ {
@@ -351,9 +357,7 @@ adm_cli_search() {
             ' "$meta" 2>/dev/null || true
         )"
 
-        local haystack
         haystack="$(printf '%s %s %s\n' "$id" "$name" "$desc" | tr '[:upper:]' '[:lower:]')"
-
         if echo "$haystack" | grep -q "$pattern_lc"; then
             printf " %s - %s\n" "$id" "${name:-"(sem name)"}"
             hit=1
@@ -367,14 +371,12 @@ adm_cli_search() {
 
 adm_cli_info() {
     local pkg_id="${1:-}"
-
     if [[ -z "$pkg_id" ]]; then
         adm_log_fatal "Uso: adm info PKG_ID"
     fi
 
     local meta
     meta="$(adm_cli_metadado_path "$pkg_id")"
-
     if [[ ! -f "$meta" ]]; then
         adm_log_fatal "Metadado não encontrado para $pkg_id em '$meta'."
     fi
@@ -412,10 +414,8 @@ adm_cli_cmd_build() {
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm build PKG1 [PKG2 ...] [--profile ID] [--dry-run] [--force]"
     fi
-
     local pkgs=("$@")
     local descr="Build de pacotes: ${pkgs[*]}"
-
     adm_task_run "build" "$descr" \
         "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs[@]}"
 }
@@ -431,13 +431,10 @@ adm_cli_cmd_build_group() {
     if [[ -z "$group" ]]; then
         adm_log_fatal "Uso: adm build-group GRUPO [--profile ID] [--dry-run] [--force]"
     fi
-
     shift || true
-    # (flags globais já foram parseadas lá em cima e aplicadas)
 
     local pkgs
     pkgs="$(adm_cli_packages_with_group "$group" || true)"
-
     if [[ -z "$pkgs" ]]; then
         adm_log_fatal "Nenhum pacote encontrado com grupo '$group'."
     fi
@@ -449,7 +446,6 @@ adm_cli_cmd_build_group() {
     done <<<"$pkgs"
 
     local descr="Build de grupo '$group' com pacotes: ${pkgs_arr[*]}"
-
     adm_task_run "build-group" "$descr" \
         "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs_arr[@]}"
 }
@@ -470,14 +466,12 @@ adm_cli_cmd_upgrade() {
 }
 
 adm_cli_cmd_check() {
-    # adm check PKG...  (ou sem args -> checa tudo instalado, se você evoluir depois)
+    # adm check PKG... (ou sem args se expandir depois)
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm check PKG1 [PKG2 ...]"
     fi
-
     local pkgs=("$@")
     local descr="Check: ${pkgs[*]}"
-
     adm_task_run "check" "$descr" \
         "$_ADM_CLI_DIR/adm-check" "${pkgs[@]}"
 }
@@ -487,7 +481,6 @@ adm_cli_cmd_snapshot() {
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm snapshot (create|diff|restore ...)"
     fi
-
     local descr="Snapshot: $*"
     adm_task_run "snapshot" "$descr" \
         "$_ADM_CLI_DIR/adm-snapshot" "$@"
@@ -498,7 +491,6 @@ adm_cli_cmd_report() {
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm report (usage|top-time|top-fail ...)"
     fi
-
     local descr="Report: $*"
     adm_task_run "report" "$descr" \
         "$_ADM_CLI_DIR/adm-report" "$@"
@@ -507,9 +499,6 @@ adm_cli_cmd_report() {
 adm_cli_cmd_daemon_build() {
     # adm daemon-build [--once] [--sleep SEC] [--profile ID] [--dry-run] [--force]
     local descr="Daemon de build: $*"
-
-    # Aqui eu embrulho o daemon em uma "task" também. Se preferir rodar sem task,
-    # dá pra chamar direto "$_ADM_CLI_DIR/adm-daemon-build" "$@".
     adm_task_run "daemon-build" "$descr" \
         "$_ADM_CLI_DIR/adm-daemon-build" "$@"
 }
@@ -526,10 +515,8 @@ adm_cli_cmd_uninstall() {
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm uninstall PKG1 [PKG2 ...] [--dry-run] [--force]"
     fi
-
     local pkgs=("$@")
     local descr="Uninstall de pacotes: ${pkgs[*]}"
-
     adm_task_run "uninstall" "$descr" \
         "$_ADM_CLI_DIR/adm-uninstall" uninstall "${pkgs[@]}"
 }
@@ -537,9 +524,77 @@ adm_cli_cmd_uninstall() {
 adm_cli_cmd_autoremove() {
     # adm autoremove -> remove pacotes órfãos
     local descr="Autoremove (órfãos)"
-
     adm_task_run "uninstall-orphans" "$descr" \
         "$_ADM_CLI_DIR/adm-uninstall" autoremove
+}
+
+adm_cli_cmd_fetch() {
+    # adm fetch ...  (delegado 1:1 para adm-fetch)
+    #
+    # Exemplo:
+    #   adm fetch fetch-from-meta base/bash /root/usr/src/adm/packages/base/bash/metadado
+    local descr="Fetch: $*"
+    adm_task_run "fetch" "$descr" \
+        "$_ADM_CLI_DIR/adm-fetch" "$@"
+}
+
+adm_cli_cmd_scan() {
+    # adm scan ...  (delegado 1:1 para adm-scan)
+    #
+    # Exemplo:
+    #   adm scan scan-from-meta base/bash /.../metadado SRC1 [SRC2 ...]
+    local descr="Scan: $*"
+    adm_task_run "scan" "$descr" \
+        "$_ADM_CLI_DIR/adm-scan" "$@"
+}
+
+adm_cli_cmd_deps() {
+    # adm deps ...  (delegado 1:1 para adm-deps – uso de debug)
+    #
+    # Exemplo:
+    #   adm deps list-build-deps base/bash
+    #   adm deps build-order base/bash base/coreutils ...
+    local descr="Deps: $*"
+    adm_task_run "deps" "$descr" \
+        "$_ADM_CLI_DIR/adm-deps" "$@"
+}
+
+adm_cli_cmd_profile() {
+    # adm profile ... (delegado 1:1 para adm-profile)
+    #
+    # Exemplos:
+    #   adm profile init-defaults
+    #   adm profile list
+    #   adm profile show glibc/extreme
+    #   adm profile export glibc/extreme
+    #   adm profile current
+    #   adm profile set-current glibc/extreme
+    #   adm profile create custom/debug-glibc --libc glibc --kind safe --desc "Debug seguro glibc"
+    local descr="Profile: $*"
+    adm_task_run "profile" "$descr" \
+        "$_ADM_CLI_DIR/adm-profile" "$@"
+}
+
+adm_cli_cmd_knowledge() {
+    # adm knowledge ... (delegado 1:1 para adm-knowledge)
+    #
+    # Exemplos:
+    #   adm knowledge best-include gtk/gtk.h
+    #   adm knowledge guess-deps includes.txt pc.txt
+    local descr="Knowledge: $*"
+    adm_task_run "knowledge" "$descr" \
+        "$_ADM_CLI_DIR/adm-knowledge" "$@"
+}
+
+adm_cli_cmd_metrics() {
+    # adm metrics ... (delegado 1:1 para adm-metrics, usado para debug/leitura)
+    #
+    # Exemplos (dependem do CLI do adm-metrics):
+    #   adm metrics --help
+    #   adm metrics tail-today
+    local descr="Metrics: $*"
+    adm_task_run "metrics" "$descr" \
+        "$_ADM_CLI_DIR/adm-metrics" "$@"
 }
 
 # =========
@@ -554,54 +609,86 @@ Uso:
   adm [FLAGS] <comando> [args...]
 
 Comandos principais:
-  build PKG...        Build + install de pacotes (com deps)
-  build-group GRUPO   Build de todos os pacotes de um grupo
-  install PKG...      Alias para 'build'
 
-  update [...]        Orquestra adm-update
-  upgrade [...]       Orquestra adm-upgrade
-  check PKG...        Roda adm-check para pacotes instalados
+  build PKG...           Build + install de pacotes (com deps)
+  build-group GRUPO      Build de todos os pacotes de um grupo
+  install PKG...         Alias para 'build'
 
-  search PADRÃO       Busca em metadados
-  info PKG_ID         Mostra metadado de um pacote
-  list-installed      Lista pacotes instalados
+  fetch ...              Delegado para adm-fetch (download/cache de fontes)
+  scan ...               Delegado para adm-scan (scanner de source / plano)
+  deps ...               Delegado para adm-deps (debug/resolução de deps)
 
-  snapshot ...        Delegado para adm-snapshot (create/diff/restore)
-  report ...          Delegado para adm-report
-  tui                 Interface TUI (adm-tui)
+  update [...]           Orquestra adm-update
+  upgrade [...]          Orquestra adm-upgrade
 
-  uninstall PKG...    Desinstala pacote(s) usando adm-uninstall
-  autoremove          Remove pacotes órfãos
-  daemon-build [...]  Inicia o daemon de builds (adm-daemon-build)
+  check PKG...           Roda adm-check para pacotes
+
+  search PADRÃO          Busca em metadados
+  info PKG_ID            Mostra metadado de um pacote
+  list-installed         Lista pacotes instalados
+
+  profile ...            Delegado para adm-profile (profiles de build)
+
+  snapshot ...           Delegado para adm-snapshot (create/diff/restore)
+  report ...             Delegado para adm-report
+  tui                    Interface TUI (adm-tui)
+
+  uninstall PKG...       Desinstala pacote(s) usando adm-uninstall
+  autoremove             Remove pacotes órfãos
+
+  daemon-build [...]     Inicia o daemon de builds (adm-daemon-build)
+
+  knowledge ...          Delegado para adm-knowledge (banco de conhecimento)
+  metrics ...            Delegado para adm-metrics (métricas / tempo de build)
 
 Flags globais:
-  --profile ID        Força profile em builds (ADM_BUILD_PROFILE_OVERRIDE)
-  --dry-run, -n       Simula execução (ADM_DRY_RUN=1)
-  --force             Força build/update/upgrade/uninstall (FORCE=1)
+
+  --profile ID           Força profile em builds (ADM_BUILD_PROFILE_OVERRIDE)
+  --dry-run, -n          Simula execução (ADM_DRY_RUN=1)
+  --force                Força build/update/upgrade/uninstall (FORCE=1)
 
 Notas:
-  - Profiles: o adm-build escolhe profiles com base em category/groups/libc:
-      * toolchain + glibc -> toolchain/safe-glibc ou glibc/extreme
-      * musl            -> musl/extreme, musl/safe, etc.
-      * outros pacotes  -> perfis /extreme normais
-    E o --profile ID sobrepõe essa escolha.
 
-  - Tasks: o adm registra tasks em db/tasks e emite eventos ADM_TASK_*,
-    enquanto adm-build emite PKG_BUILD_* e registra em db/installed/history.
+  - Profiles:
+      * adm-profile init-defaults
+          - glibc/extreme
+          - musl/extreme
+          - toolchain/safe-glibc
+          - toolchain/safe-musl
+      * adm build/adm-daemon-build usam o profile atual ou o override (--profile).
+
+  - Tasks:
+      * o adm registra tasks em db/tasks e emite eventos ADM_TASK_*,
+        enquanto adm-build emite PKG_BUILD_* e registra em db/installed/history.
 
 Exemplos:
+
   adm build base/bash
   adm --profile glibc/extreme build base/coreutils base/sed
   adm build-group xorg
+
+  adm fetch fetch-from-meta base/bash /root/usr/src/adm/packages/base/bash/metadado
+  adm scan scan-from-meta base/bash /root/usr/src/adm/packages/base/bash/metadado SRC.tar.xz
+  adm deps list-build-deps base/bash
+
+  adm profile init-defaults
+  adm profile list
+  adm profile set-current glibc/extreme
+
   adm update --all
   adm upgrade --plan safe
+
   adm search gcc
   adm info base/coreutils
   adm list-installed
+
   adm uninstall base/bash
   adm autoremove
+
   adm snapshot create before-big-upgrade
   adm report usage
+
+  adm daemon-build --once
   adm tui
 EOF
 }
@@ -610,7 +697,7 @@ adm_cli_help_subcommand() {
     local sub="$1"
 
     case "$sub" in
-        build|install|build-group|update|upgrade|check|snapshot|report|tui|search|info|list-installed|uninstall|autoremove)
+        build|install|build-group|update|upgrade|check|snapshot|report|tui|search|info|list-installed|uninstall|autoremove|daemon-build|fetch|scan|deps|profile|knowledge|metrics)
             case "$sub" in
                 build|install|build-group|search|info|list-installed|uninstall|autoremove)
                     adm_cli_usage
@@ -632,6 +719,27 @@ adm_cli_help_subcommand() {
                     ;;
                 tui)
                     "$_ADM_CLI_DIR/adm-tui" --help || true
+                    ;;
+                daemon-build)
+                    "$_ADM_CLI_DIR/adm-daemon-build" --help || true
+                    ;;
+                fetch)
+                    "$_ADM_CLI_DIR/adm-fetch" --help || true
+                    ;;
+                scan)
+                    "$_ADM_CLI_DIR/adm-scan" --help || true
+                    ;;
+                deps)
+                    "$_ADM_CLI_DIR/adm-deps" --help || true
+                    ;;
+                profile)
+                    "$_ADM_CLI_DIR/adm-profile" --help || true
+                    ;;
+                knowledge)
+                    "$_ADM_CLI_DIR/adm-knowledge" --help || true
+                    ;;
+                metrics)
+                    "$_ADM_CLI_DIR/adm-metrics" --help || true
                     ;;
             esac
             ;;
@@ -662,13 +770,7 @@ adm_main() {
         install)
             adm_cli_cmd_install "${args[@]}"
             ;;
-        daemon-build)
-            adm_cli_cmd_daemon_build "${args[@]}"
-            ;;
         build-group)
-            if [[ ${#args[@]} -lt 1 ]]; then
-                adm_log_fatal "Uso: adm build-group GRUPO [--profile ID] [--dry-run] [--force]"
-            fi
             adm_cli_cmd_build_group "${args[@]}"
             ;;
         update)
@@ -704,6 +806,27 @@ adm_main() {
         autoremove)
             adm_cli_cmd_autoremove
             ;;
+        daemon-build)
+            adm_cli_cmd_daemon_build "${args[@]}"
+            ;;
+        fetch)
+            adm_cli_cmd_fetch "${args[@]}"
+            ;;
+        scan)
+            adm_cli_cmd_scan "${args[@]}"
+            ;;
+        deps)
+            adm_cli_cmd_deps "${args[@]}"
+            ;;
+        profile)
+            adm_cli_cmd_profile "${args[@]}"
+            ;;
+        knowledge)
+            adm_cli_cmd_knowledge "${args[@]}"
+            ;;
+        metrics)
+            adm_cli_cmd_metrics "${args[@]}"
+            ;;
         help|"")
             if [[ ${#args[@]} -ge 1 ]]; then
                 adm_cli_help_subcommand "${args[0]}"
@@ -717,6 +840,6 @@ adm_main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     adm_main "$@"
 fi
