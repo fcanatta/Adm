@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/xz-temp (LFS 6.16 + ADM 2.0)
+#
+# LFS:
+#   rm -v $LFS/usr/lib/liblzma.la
+#
+# Aqui fazemos o equivalente no DESTDIR do ADM.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/xz-temp}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+destdir="$ADM_DESTDIR"
+
+la_path="$destdir/usr/lib/liblzma.la"
+
+if [[ ! -e "$la_path" ]]; then
+    echo "[hook-post-install][$pkg_id] $la_path não existe; nada para remover." >&2
+    exit 0
+fi
+
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    echo "[hook-post-install][$pkg_id][DRY-RUN] Removeria $la_path" >&2
+    exit 0
+fi
+
+echo "[hook-post-install][$pkg_id] Removendo $la_path (como no LFS)..." >&2
+rm -v "$la_path"
