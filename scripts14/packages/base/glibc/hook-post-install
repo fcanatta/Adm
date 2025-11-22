@@ -1,11 +1,25 @@
 #!/usr/bin/env bash
 # hook-post-install para base/glibc (LFS 8.x + ADM 2.0)
 #
-# Responsável por:
-#   - criar /etc/nsswitch.conf padrão, se ainda não existir
-#   - criar /etc/ld.so.conf básico e diretório ld.so.conf.d
+# Faz:
+#   1) Corrige caminho hardcoded do loader no /usr/bin/ldd:
+#        sed '/RTLDLIST=/s@/usr@@g' -i /usr/bin/ldd
+#      (adaptado para $ADM_DESTDIR)
 #
-# Tudo isso é feito dentro de $ADM_DESTDIR, para ser empacotado pelo ADM.
+#   2) Cria /etc/nsswitch.conf padrão (se não existir) dentro do DESTDIR
+#
+#   3) Cria /etc/ld.so.conf e /etc/ld.so.conf.d dentro do DESTDIR
+#
+#   4) Gera alguns locales básicos com localedef dentro do DESTDIR:
+#        C.UTF-8
+#        en_US
+#        en_US.UTF-8
+#      (padrão LFS; você pode adicionar mais, ex: pt_BR.UTF-8)
+#
+#   5) Configura timezone padrão criando /etc/localtime em DESTDIR
+#      usando ADM_TIMEZONE ou TZ (fallback: UTC)
+#
+# Tudo sempre trabalhando em $ADM_DESTDIR.
 
 set -o errexit
 set -o nounset
@@ -18,10 +32,29 @@ pkg_id="$ADM_PKG_ID"
 destdir="$ADM_DESTDIR"
 
 etc_dir="$destdir/etc"
-
 mkdir -p "$etc_dir"
 
-# ---------- 1) /etc/nsswitch.conf ----------
+echo "[hook-post-install][$pkg_id] Iniciando pós-instalação da Glibc em DESTDIR=$destdir" >&2
+
+# ---------------------------------------------------------------------------
+# 1) Corrigir /usr/bin/ldd (RTLDLIST) dentro do DESTDIR
+# ---------------------------------------------------------------------------
+
+ldd_path="$destdir/usr/bin/ldd"
+if [[ -f "$ldd_path" ]]; then
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        echo "[hook-post-install][$pkg_id][DRY-RUN] sed '/RTLDLIST=/s@/usr@@g' -i $ldd_path" >&2
+    else
+        echo "[hook-post-install][$pkg_id] Corrigindo RTLDLIST em $ldd_path (removendo /usr hardcoded)..." >&2
+        sed '/RTLDLIST=/s@/usr@@g' -i "$ldd_path"
+    fi
+else
+    echo "[hook-post-install][$pkg_id] Aviso: $ldd_path não existe; pulando fix do ldd." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# 2) /etc/nsswitch.conf dentro do DESTDIR
+# ---------------------------------------------------------------------------
 
 nsswitch="$etc_dir/nsswitch.conf"
 
@@ -33,7 +66,7 @@ else
 # /etc/nsswitch.conf - gerado pelo ADM para Glibc
 #
 # Ajuste conforme seu ambiente (LDAP, systemd, etc.). Este é um
-# conjunto seguro e simples baseado em arquivos locais.
+# conjunto simples baseado em arquivos locais.
 
 passwd:     files
 group:      files
@@ -49,7 +82,9 @@ rpc:        files
 EOF
 fi
 
-# ---------- 2) /etc/ld.so.conf + ld.so.conf.d ----------
+# ---------------------------------------------------------------------------
+# 3) /etc/ld.so.conf + /etc/ld.so.conf.d dentro do DESTDIR
+# ---------------------------------------------------------------------------
 
 ldconf="$etc_dir/ld.so.conf"
 ldconf_d="$etc_dir/ld.so.conf.d"
@@ -70,4 +105,74 @@ include /etc/ld.so.conf.d/*.conf
 EOF
 fi
 
-echo "[hook-post-install][$pkg_id] hook-post-install da Glibc final concluído." >&2
+# ---------------------------------------------------------------------------
+# 4) localedef - criar locales dentro do DESTDIR
+# ---------------------------------------------------------------------------
+# Usamos:
+#   localedef --prefix="$destdir" ...
+# para instalar os arquivos em $DESTDIR/usr/lib/locale.
+#
+# Locais básicos (seguindo LFS):
+#   C.UTF-8
+#   en_US
+#   en_US.UTF-8
+#
+# Você pode adicionar mais locais chamando este hook manualmente
+# com ADM_EXTRA_LOCALES (não implementado aqui) ou criando outro script.
+
+run_localedef() {
+    local in="$1"
+    local ch="$2"
+    local name="$3"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        echo "[hook-post-install][$pkg_id][DRY-RUN] localedef --prefix=\"$destdir\" -i $in -f $ch $name" >&2
+        return 0
+    fi
+
+    echo "[hook-post-install][$pkg_id] Gerando locale $name (in=$in, ch=$ch)..." >&2
+    if ! localedef --prefix="$destdir" -i "$in" -f "$ch" "$name" 2>>"$destdir/var/log/adm-localedef.log"; then
+        echo "[hook-post-install][$pkg_id] AVISO: localedef falhou para $name (veja var/log/adm-localedef.log em DESTDIR)." >&2
+    fi
+}
+
+# Garante diretório de log em DESTDIR
+mkdir -p "$destdir/var/log"
+
+# Locais mínimos (padrão LFS)
+run_localedef C       UTF-8       C.UTF-8
+run_localedef en_US   ISO-8859-1  en_US
+run_localedef en_US   UTF-8       en_US.UTF-8
+
+# Se quiser, você pode habilitar por padrão o pt_BR.UTF-8 também:
+# run_localedef pt_BR UTF-8       pt_BR.UTF-8
+
+# ---------------------------------------------------------------------------
+# 5) Timezone - criar /etc/localtime em DESTDIR
+# ---------------------------------------------------------------------------
+# Escolha do timezone:
+#   1) ADM_TIMEZONE (ex: "America/Sao_Paulo")
+#   2) TZ (se existir)
+#   3) fallback para "UTC"
+#
+# Criamos um link simbólico:
+#   /etc/localtime -> /usr/share/zoneinfo/<zona>
+
+tz_name="${ADM_TIMEZONE:-${TZ:-UTC}}"
+zoneinfo_root="$destdir/usr/share/zoneinfo"
+
+if [[ -e "$zoneinfo_root/$tz_name" ]]; then
+    localtime_path="$etc_dir/localtime"
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        echo "[hook-post-install][$pkg_id][DRY-RUN] ln -sf /usr/share/zoneinfo/$tz_name $localtime_path" >&2
+    else
+        echo "[hook-post-install][$pkg_id] Configurando timezone padrão: $tz_name" >&2
+        ln -sf "/usr/share/zoneinfo/$tz_name" "$localtime_path"
+    fi
+else
+    echo "[hook-post-install][$pkg_id] AVISO: timezone '$tz_name' não encontrado em $zoneinfo_root; não criando /etc/localtime." >&2
+    echo "[hook-post-install][$pkg_id]        Ajuste ADM_TIMEZONE ou TZ e rode novamente se quiser." >&2
+fi
+
+echo "[hook-post-install][$pkg_id] Pós-instalação da Glibc final concluída." >&2
