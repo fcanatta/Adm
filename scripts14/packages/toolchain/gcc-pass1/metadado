@@ -1,0 +1,27 @@
+name: gcc-pass1
+version: 14.2.0
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://gcc.gnu.org/
+
+# Ajuda o adm-build a escolher profile
+libc: glibc
+
+summary: GCC cross-compiler (pass 1) para bootstrap do toolchain
+description: GCC pass1: compilador cruzado C apenas, sem libstdc++, usado para construir o resto do toolchain e a libc dentro do sysroot.
+
+# Lidos por adm-deps / adm-build
+build_deps: toolchain/binutils-pass1
+run_deps: toolchain/binutils-pass1
+opt_deps: docs/texinfo
+
+# Usado na heurística de toolchain e em build-group
+groups: toolchain toolchain-bootstrap cross gcc pass1
+
+# Fontes — formato que adm-fetch entende
+source_uri: https://gcc.gnu.org/pub/gcc/releases/gcc-14.2.0/gcc-14.2.0.tar.xz
+
+# SHA256 puro (sem prefixo)
+source_checksum: a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9
