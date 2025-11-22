@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# hook-pre-build para toolchain/gcc-libstdc++
+#
+# Integração LFS 5.6 (Libstdc++ from GCC-15.2.0) com o pipeline ADM 2.0.
+#
+# Ambiente (exportado pelo adm_build_run_hook):
+#   ADM_PKG_ID
+#   ADM_BUILD_DIR_CURRENT  -> diretório com a árvore do GCC (gcc-15.2.0)
+#   ADM_DESTDIR            -> DESTDIR do pacote (staging para empacotar)
+#   ADM_BUILD_SYSTEM       -> plain-make/autotools (não usado aqui)
+#
+# O que fazemos:
+#   - mkdir -v build && cd build
+#   - ../libstdc++-v3/configure \
+#         --host=$ADM_CROSS_TARGET \
+#         --build=$(../config.guess) \
+#         --prefix=/usr \
+#         --disable-multilib \
+#         --disable-nls \
+#         --disable-libstdcxx-pch \
+#         --with-gxx-include-dir=$ADM_CROSS_PREFIX/$ADM_CROSS_TARGET/include/c++/15.2.0
+#   - make
+#   - make DESTDIR=$ADM_DESTDIR install
+#   - rm -v $ADM_DESTDIR/usr/lib/lib{stdc++{,exp,fs},supc++}.la
+#   - neutraliza "all" e "install" dos Makefiles para o resto do fluxo do ADM.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gcc-libstdc++}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+src_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$src_dir"
+
+# =========
+# 1) Parâmetros de cross
+# =========
+
+# fallback padrão
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+
+# Respeita ambiente LFS, se estiver definido
+if [[ -n "${LFS_TGT:-}" ]]; then
+    ADM_CROSS_TARGET="$LFS_TGT"
+fi
+if [[ -n "${LFS:-}" ]]; then
+    # no livro, libstdc++ usa /tools/$LFS_TGT/include/... como include dir
+    # aqui adaptamos: se prefix não foi override, usamos $LFS/tools
+    if [[ "$ADM_CROSS_PREFIX" == "/usr/cross" ]]; then
+        ADM_CROSS_PREFIX="${LFS%/}/tools"
+    fi
+fi
+
+# Onde o compilador C++ cross acha os includes padrão:
+GXX_INCLUDE_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/include/c++/15.2.0"
+
+echo "[hook-pre-build][$pkg_id] CROSS_TARGET = $ADM_CROSS_TARGET"
+echo "[hook-pre-build][$pkg_id] CROSS_PREFIX = $ADM_CROSS_PREFIX"
+echo "[hook-pre-build][$pkg_id] GXX_INCLUDE_DIR = $GXX_INCLUDE_DIR"
+echo "[hook-pre-build][$pkg_id] DESTDIR = $ADM_DESTDIR"
+
+# Ajuste de PATH (caso já exista toolchain em $ADM_CROSS_PREFIX/$ADM_CROSS_TARGET/bin)
+cross_bin_dir="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
+if [[ -d "$cross_bin_dir" ]]; then
+    export PATH="$cross_bin_dir:$PATH"
+fi
+
+# =========
+# 2) Criar diretório de build da libstdc++ (gcc-15.2.0/build)
+# =========
+
+build_dir="$src_dir/build"
+
+mkdir -p "$build_dir"
+cd "$build_dir"
+
+# =========
+# 3) Rodar configure da libstdc++ (LFS 5.6)
+# =========
+# ../libstdc++-v3/configure      \
+#     --host=$LFS_TGT            \
+#     --build=$(../config.guess) \
+#     --prefix=/usr              \
+#     --disable-multilib         \
+#     --disable-nls              \
+#     --disable-libstdcxx-pch    \
+#     --with-gxx-include-dir=/tools/$LFS_TGT/include/c++/15.2.0
+
+conf_cmd=(
+    "../libstdc++-v3/configure"
+    "--host=${ADM_CROSS_TARGET}"
+    "--build=$(../config.guess)"
+    "--prefix=/usr"
+    "--disable-multilib"
+    "--disable-nls"
+    "--disable-libstdcxx-pch"
+    "--with-gxx-include-dir=${GXX_INCLUDE_DIR}"
+)
+
+echo "[hook-pre-build][$pkg_id] Rodando configure da libstdc++:"
+printf '  %s\n' "${conf_cmd[@]}"
+
+"${conf_cmd[@]}"
+
+# =========
+# 4) Build e install (DESTDIR = ADM_DESTDIR)
+# =========
+
+echo "[hook-pre-build][$pkg_id] Compilando libstdc++ (make)..."
+make
+
+echo "[hook-pre-build][$pkg_id] Instalando libstdc++ em DESTDIR=$ADM_DESTDIR (make install)..."
+make DESTDIR="$ADM_DESTDIR" install
+
+# =========
+# 5) Remover .la prejudiciais para cross (como no LFS)
+# =========
+# LFS: rm -v $LFS/usr/lib/lib{stdc++{,exp,fs},supc++}.la
+
+la_pattern="$ADM_DESTDIR/usr/lib/lib"{stdc++{,exp,fs},supc++}".la"
+
+echo "[hook-pre-build][$pkg_id] Removendo libtool archives (.la) em $ADM_DESTDIR/usr/lib..."
+rm -vf $la_pattern 2>/dev/null || true
+
+# =========
+# 6) Neutralizar Makefiles para o restante do fluxo do ADM
+# =========
+# O adm-build ainda vai tentar rodar "make" / "make install" no build_dir.
+# Para evitar rebuilds ou instalação duplicada, sobrescrevemos os alvos
+# "all" e "install" com versões no-op, tanto no build/Makefile quanto
+# no Makefile da raiz (por segurança).
+
+echo "[hook-pre-build][$pkg_id] Neutralizando alvos 'all' e 'install' dos Makefiles..."
+
+# Aplica stub no Makefile do build_dir (onde configuramos libstdc++)
+if [[ -f "$build_dir/Makefile" ]]; then
+    cat >> "$build_dir/Makefile" << 'EOF'
+
+# Alvos adicionados pelo ADM (toolchain/gcc-libstdc++)
+.PHONY: all install
+
+all:
+	@echo "ADM gcc-libstdc++: alvo 'all' ignorado (libstdc++ já construída/instalada pelo hook-pre-build)."
+
+install:
+	@echo "ADM gcc-libstdc++: alvo 'install' ignorado (libstdc++ já instalada pelo hook-pre-build)."
+
+EOF
+fi
+
+# Também neutraliza o Makefile da raiz do source (gcc-15.2.0), se existir,
+# caso o build_system queira chamar make ali.
+if [[ -f "$src_dir/Makefile" ]]; then
+    cat >> "$src_dir/Makefile" << 'EOF'
+
+# Alvos adicionados pelo ADM (toolchain/gcc-libstdc++)
+.PHONY: all install
+
+all:
+	@echo "ADM gcc-libstdc++ (top-level): alvo 'all' ignorado."
+
+install:
+	@echo "ADM gcc-libstdc++ (top-level): alvo 'install' ignorado."
+
+EOF
+fi
+
+echo "[hook-pre-build][$pkg_id] hook-pre-build concluído com sucesso."
