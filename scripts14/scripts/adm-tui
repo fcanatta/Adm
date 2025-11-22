@@ -1,0 +1,629 @@
+#!/usr/bin/env bash
+# adm-tui - Interface TUI (texto) para monitorar builds do ADM 2.0
+#
+# Funcionalidades:
+#
+# - Mostra fila de pacotes, status e progresso global.
+# - Usa eventos do adm-eventd (PKG_BUILD_*) para estado dos pacotes.
+# - Usa adm-build_log_file_for_pkg para mostrar logs do build do pacote selecionado.
+# - Permite:
+#     * q       -> sair
+#     * ↑/↓ j/k -> mover seleção
+#     * espaço  -> pausar / retomar builds (flag em db/control/build.paused)
+#     * p       -> marcar pacote selecionado como prioritário (db/control/build.priority)
+#     * r       -> forçar refresh imediato
+#
+# O TUI não executa builds; ele só observa e controla via arquivos:
+#
+#   - Pausa/Resume:
+#       ${ADM_DB_CONTROL_DIR}/build.paused (arquivo sentinel)
+#
+#   - Prioridade:
+#       ${ADM_DB_CONTROL_DIR}/build.priority
+#         -> uma linha por pkg_id, o topo é mais prioritário.
+#
+# Espera-se que um scheduler (futuro) ou script de build em loop respeite:
+#   - se build.paused existir -> não iniciar builds novos
+#   - usar build.priority para decidir próxima tarefa.
+#
+# Eventos esperados (de adm-eventd):
+#
+#   PKG_BUILD_QUEUED
+#   PKG_BUILD_START
+#   PKG_BUILD_DONE
+#   PKG_BUILD_FAIL
+#
+# Formato assumido de linha de evento (TSV):
+#   ts  pid  event  pkg_id  extra
+#
+# Logs de build:
+#   Usa adm_build_log_file_for_pkg(pkg_id) para resolver o caminho.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Descobrir diretório do script e carregar módulos
+# =========
+
+_adm_tui_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-tui.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_TUI_DIR="$(_adm_tui_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-build"
+# shellcheck disable=SC1090
+source "$_ADM_TUI_DIR/adm-profile"
+
+ADM_DB_EVENTS_DIR="${ADM_DB_EVENTS_DIR:-${ADM_DB_DIR}/events}"
+ADM_DB_CONTROL_DIR="${ADM_DB_CONTROL_DIR:-${ADM_DB_DIR}/control}"
+ADM_DB_UPDATES_DIR="${ADM_DB_UPDATES_DIR:-${ADM_DB_DIR}/updates}"
+ADM_DB_UPDATES_PENDING="${ADM_DB_UPDATES_DIR}/pending.list"
+
+mkdir -p "$ADM_DB_CONTROL_DIR" >/dev/null 2>&1 || true
+
+ADM_TUI_REFRESH_INTERVAL="${ADM_TUI_REFRESH_INTERVAL:-0.5}"  # segundos
+ADM_TUI_LOG_LINES="${ADM_TUI_LOG_LINES:-10}"                 # linhas de log do pacote selecionado
+ADM_TUI_MAX_ROWS="${ADM_TUI_MAX_ROWS:-20}"                  # máximo de linhas da tabela na tela
+
+# =========
+# Utilidades de terminal
+# =========
+
+adm_tui_term_init() {
+    tput civis || true    # esconde cursor
+    tput smcup || true    # salva tela
+    tput clear || true
+}
+
+adm_tui_term_restore() {
+    tput rmcup || true    # restaura tela
+    tput cnorm || true    # mostra cursor
+}
+
+adm_tui_move() {
+    local row="$1"
+    local col="$2"
+    tput cup "$row" "$col"
+}
+
+adm_tui_clear_screen() {
+    tput clear
+}
+
+adm_tui_color_title() {
+    tput bold; tput setaf 6   # ciano
+}
+adm_tui_color_header() {
+    tput bold; tput setaf 3   # amarelo
+}
+adm_tui_color_ok() {
+    tput setaf 2; tput bold   # verde
+}
+adm_tui_color_warn() {
+    tput setaf 3              # amarelo
+}
+adm_tui_color_error() {
+    tput setaf 1; tput bold   # vermelho
+}
+adm_tui_color_dim() {
+    tput dim
+}
+adm_tui_color_reset() {
+    tput sgr0
+}
+
+# =========
+# Estado / fila / eventos
+# =========
+
+adm_tui_is_paused() {
+    [[ -f "${ADM_DB_CONTROL_DIR}/build.paused" ]]
+}
+
+adm_tui_toggle_pause() {
+    if adm_tui_is_paused; then
+        rm -f "${ADM_DB_CONTROL_DIR}/build.paused" || true
+    else
+        touch "${ADM_DB_CONTROL_DIR}/build.paused" || true
+    fi
+}
+
+adm_tui_priority_add() {
+    # Adiciona PKG_ID ao topo da lista de prioridade (se não estiver já).
+    local pkg_id="$1"
+    local file="${ADM_DB_CONTROL_DIR}/build.priority"
+
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/tui-prio-XXXXXX")" || return 1
+
+    {
+        echo "$pkg_id"
+        if [[ -f "$file" ]]; then
+            grep -vxF "$pkg_id" "$file" 2>/dev/null || true
+        fi
+    } >"$tmp"
+
+    mv "$tmp" "$file" || true
+}
+
+adm_tui_read_pending_list() {
+    # Lê pending.list (se existir) - fila "lógica" de updates.
+    if [[ ! -f "$ADM_DB_UPDATES_PENDING" ]]; then
+        return 0
+    fi
+    awk 'NF>0 && $1 !~ /^#/ {print $1}' "$ADM_DB_UPDATES_PENDING"
+}
+
+adm_tui_last_events_file() {
+    # Pega o arquivo de eventos mais recente, se existir.
+    if [[ ! -d "$ADM_DB_EVENTS_DIR" ]]; then
+        return 1
+    fi
+    local f
+    f=$(ls "$ADM_DB_EVENTS_DIR"/events-*.log 2>/dev/null | sort | tail -n1 || true)
+    if [[ -z "$f" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$f"
+}
+
+adm_tui_collect_state() {
+    # Gera o estado dos pacotes a partir de:
+    #   - eventos (último arquivo events-*.log)
+    #   - pending.list (como fila "base")
+    #
+    # Saída (TSV):
+    #   pkg_id<TAB>status<TAB>last_ts
+    #
+    # status:
+    #   QUEUED, BUILDING, DONE, FAIL
+    #
+    # Regras:
+    #   - pending.list adiciona pacotes como QUEUED se ainda não tiver estado.
+    #   - eventos sobrescrevem status conforme a ordem nas linhas.
+    local tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/tui-state-XXXXXX")" || return 1
+
+    local pending_file
+    pending_file="$(mktemp "$ADM_TMP_DIR/tui-pending-XXXXXX")" || return 1
+    adm_tui_read_pending_list >"$pending_file" 2>/dev/null || true
+
+    local events_file
+    events_file="$(adm_tui_last_events_file || true)"
+
+    # Usamos awk pra montar map de status/ts por pkg.
+    awk -v pending_file="$pending_file" -v events_file="$events_file" '
+        BEGIN {
+            FS = "\t"
+            # Primeiro, pending.list -> QUEUED
+            if (pending_file != "") {
+                while ((getline pl < pending_file) > 0) {
+                    if (pl == "" || pl ~ /^#/) continue
+                    pkg = pl
+                    if (!(pkg in status)) {
+                        status[pkg] = "QUEUED"
+                        ts_last[pkg] = "-"
+                    }
+                }
+                close(pending_file)
+            }
+
+            # Depois, eventos, se existir
+            if (events_file != "") {
+                while ((getline ev < events_file) > 0) {
+                    # ts pid event pkg extra
+                    if (NF < 4) continue
+                    ts = $1
+                    evt = $3
+                    pkg = $4
+
+                    if (pkg == "") continue
+
+                    if (evt == "PKG_BUILD_QUEUED") {
+                        status[pkg] = "QUEUED"
+                        ts_last[pkg] = ts
+                    } else if (evt == "PKG_BUILD_START") {
+                        status[pkg] = "BUILDING"
+                        ts_last[pkg] = ts
+                    } else if (evt == "PKG_BUILD_DONE") {
+                        status[pkg] = "DONE"
+                        ts_last[pkg] = ts
+                    } else if (evt == "PKG_BUILD_FAIL") {
+                        status[pkg] = "FAIL"
+                        ts_last[pkg] = ts
+                    }
+                }
+                close(events_file)
+            }
+
+            # imprime
+            for (p in status) {
+                printf "%s\t%s\t%s\n", p, status[p], ts_last[p]
+            }
+        }
+    ' >"$tmp"
+
+    cat "$tmp"
+    rm -f "$pending_file" "$tmp" 2>/dev/null || true
+}
+
+adm_tui_build_log_tail() {
+    # Imprime as últimas N linhas de log do pkg_id, se existir.
+    local pkg_id="$1"
+    local lines="${2:-$ADM_TUI_LOG_LINES}"
+
+    if ! type -t adm_build_log_file_for_pkg >/dev/null 2>&1; then
+        echo "(adm_build_log_file_for_pkg não disponível.)"
+        return 0
+    fi
+
+    local log
+    log="$(adm_build_log_file_for_pkg "$pkg_id" || true)"
+
+    if [[ -z "$log" || ! -f "$log" ]]; then
+        echo "(Nenhum log encontrado para $pkg_id.)"
+        return 0
+    fi
+
+    tail -n "$lines" "$log" 2>/dev/null || echo "(Erro lendo log de $pkg_id.)"
+}
+
+# =========
+# Desenho da tela
+# =========
+
+adm_tui_draw_progress_bar() {
+    local row="$1"
+    local col="$2"
+    local width="$3"
+    local done="$4"
+    local total="$5"
+
+    local ratio=0
+    if [[ "$total" -gt 0 ]]; then
+        # ratio em %
+        ratio=$(( done * 100 / total ))
+    fi
+
+    local filled=0
+    if [[ "$total" -gt 0 ]]; then
+        filled=$(( done * width / total ))
+    fi
+
+    adm_tui_move "$row" "$col"
+    printf "["
+    local i
+    for ((i=0; i<width; i++)); do
+        if (( i < filled )); then
+            printf "#"
+        else
+            printf " "
+        fi
+    done
+    printf "] %3d%%" "$ratio"
+}
+
+adm_tui_draw_screen() {
+    local selected_index="$1"
+    local state_file="$2"
+
+    adm_tui_clear_screen
+
+    local rows cols
+    rows=$(tput lines 2>/dev/null || echo 24)
+    cols=$(tput cols 2>/dev/null || echo 80)
+
+    # Header
+    adm_tui_move 0 0
+    adm_tui_color_title
+    printf " ADM TUI - Monitor de Build "
+    adm_tui_color_reset
+
+    # Linhas de status/prompt
+    adm_tui_move 1 0
+    if adm_tui_is_paused; then
+        adm_tui_color_warn; printf " [PAUSADO] "; adm_tui_color_reset
+    else
+        adm_tui_color_ok; printf " [ATIVO] "; adm_tui_color_reset
+    fi
+    printf "q: sair  ↑/↓/j/k: mover  espaço: pausa/resume  p: priorizar  r: refresh"
+
+    # Coleta estado para desenhar
+    local tmp_state="$state_file"
+
+    local total=0 done=0 fail=0 building=0 queued=0
+    local line pkg status ts
+    while IFS=$'\t' read -r pkg status ts; do
+        [[ -z "$pkg" ]] && continue
+        total=$((total + 1))
+        case "$status" in
+            DONE) done=$((done + 1)) ;;
+            FAIL) fail=$((fail + 1)) ;;
+            BUILDING) building=$((building + 1)) ;;
+            QUEUED) queued=$((queued + 1)) ;;
+        esac
+    done <"$tmp_state"
+
+    local finished=$((done + fail))
+
+    adm_tui_move 2 0
+    printf " Total: %d  Queued: %d  Building: %d  Done: %d  Fail: %d" \
+        "$total" "$queued" "$building" "$done" "$fail"
+
+    # Barra de progresso global
+    adm_tui_draw_progress_bar 3 0 $((cols - 10)) "$finished" "$total"
+
+    # Cabeçalho da tabela
+    adm_tui_move 5 0
+    adm_tui_color_header
+    printf "%-4s %-40s %-10s %-20s\n" "Sel" "Pacote" "Status" "Último evento"
+    adm_tui_color_reset
+
+    # Tabela de pacotes
+    local idx=0
+    local table_start_row=6
+    local max_rows="$ADM_TUI_MAX_ROWS"
+
+    # Para iterar duas vezes, carregamos em array
+    mapfile -t state_lines <"$tmp_state"
+
+    local total_lines=${#state_lines[@]}
+    # scroll básico: se selected_index for muito grande, ajusta janela
+    local offset=0
+    if (( selected_index >= max_rows )); then
+        offset=$((selected_index - max_rows + 1))
+    fi
+
+    local row cur_pkg cur_status cur_ts
+    for ((i=0; i<total_lines; i++)); do
+        line="${state_lines[$i]}"
+        [[ -z "$line" ]] && continue
+        IFS=$'\t' read -r pkg status ts <<<"$line"
+
+        if (( idx < offset )); then
+            idx=$((idx + 1))
+            continue
+        fi
+
+        row=$((table_start_row + idx - offset))
+        if (( row >= rows - 5 )); then
+            break
+        fi
+
+        adm_tui_move "$row" 0
+
+        if (( idx == selected_index )); then
+            tput rev  # highlight
+            printf " -> "
+        else
+            printf "    "
+        fi
+
+        case "$status" in
+            DONE)   adm_tui_color_ok ;;
+            FAIL)   adm_tui_color_error ;;
+            BUILDING) tput bold; tput setaf 4 ;;  # azul
+            QUEUED) adm_tui_color_dim ;;
+            *)      adm_tui_color_reset ;;
+        esac
+
+        printf "%-40s %-10s %-20s" "$pkg" "$status" "$ts"
+        adm_tui_color_reset
+
+        idx=$((idx + 1))
+        if (( idx - offset >= max_rows )); then
+            break
+        fi
+    done
+
+    # Se não há pacotes
+    if (( total == 0 )); then
+        adm_tui_move "$table_start_row" 0
+        adm_tui_color_dim
+        printf "(Nenhum pacote na fila / sem eventos ainda.)"
+        adm_tui_color_reset
+    fi
+
+    # Log do pacote selecionado
+    local selected_pkg=""
+    if (( selected_index >= 0 && selected_index < total_lines )); then
+        IFS=$'\t' read -r selected_pkg _ <<<"${state_lines[$selected_index]}"
+    fi
+
+    local log_row=$((rows - ADM_TUI_LOG_LINES - 2))
+    if (( log_row < table_start_row + 3 )); then
+        log_row=$((table_start_row + 3))
+    fi
+
+    adm_tui_move "$log_row" 0
+    adm_tui_color_header
+    printf "Log do pacote selecionado: %s (últimas %d linhas)" "${selected_pkg:-"(nenhum)"}" "$ADM_TUI_LOG_LINES"
+    adm_tui_color_reset
+
+    if [[ -n "$selected_pkg" ]]; then
+        local lr
+        lr=$((log_row + 1))
+        local log_lines
+        IFS=$'\n' read -r -d '' -a log_lines < <(adm_tui_build_log_tail "$selected_pkg" "$ADM_TUI_LOG_LINES" && printf '\0')
+
+        local j
+        for ((j=0; j<ADM_TUI_LOG_LINES; j++)); do
+            adm_tui_move $((lr + j)) 0
+            tput el  # apaga linha
+            if (( j < ${#log_lines[@]} )); then
+                adm_tui_color_dim
+                printf "%s" "${log_lines[$j]}"
+                adm_tui_color_reset
+            fi
+        done
+    fi
+
+    # Linha de rodapé
+    adm_tui_move $((rows - 1)) 0
+    adm_tui_color_dim
+    printf "Pressione q para sair."
+    adm_tui_color_reset
+}
+
+# =========
+# Loop principal
+# =========
+
+adm_tui_main_loop() {
+    local selected_index=0
+    local key=""
+    local state_file
+    state_file="$(mktemp "$ADM_TMP_DIR/tui-state-main-XXXXXX")" || adm_log_fatal "Falha ao criar tmp state."
+
+    adm_tui_term_init
+    trap 'adm_tui_term_restore; rm -f "$state_file" 2>/dev/null || true; exit 0' INT TERM EXIT
+
+    while :; do
+        # Atualiza estado
+        adm_tui_collect_state >"$state_file" 2>/dev/null || true
+
+        # Ajusta seleção se passou do fim
+        local line_count
+        line_count=$(wc -l <"$state_file" 2>/dev/null || echo 0)
+        if (( line_count == 0 )); then
+            selected_index=0
+        elif (( selected_index >= line_count )); then
+            selected_index=$((line_count - 1))
+        fi
+        if (( selected_index < 0 )); then
+            selected_index=0
+        fi
+
+        # Desenha
+        adm_tui_draw_screen "$selected_index" "$state_file"
+
+        # Espera por tecla com timeout
+        key=""
+        IFS= read -rsn1 -t "$ADM_TUI_REFRESH_INTERVAL" key || true
+
+        case "$key" in
+            q)
+                break
+                ;;
+            "k")
+                selected_index=$((selected_index - 1))
+                if (( selected_index < 0 )); then selected_index=0; fi
+                ;;
+            "j")
+                selected_index=$((selected_index + 1))
+                ;;
+            "A") # Up arrow (sequência ESC [ A, mas aqui pegamos só último char)
+                selected_index=$((selected_index - 1))
+                if (( selected_index < 0 )); then selected_index=0; fi
+                ;;
+            "B") # Down arrow
+                selected_index=$((selected_index + 1))
+                ;;
+            " ")
+                adm_tui_toggle_pause
+                ;;
+            "p")
+                # Priorizar pacote selecionado
+                if (( line_count > 0 )); then
+                    local pkg
+                    pkg="$(awk -v idx="$((selected_index+1))" 'NR==idx{print $1}' "$state_file" 2>/dev/null || echo "")"
+                    if [[ -n "$pkg" ]]; then
+                        adm_tui_priority_add "$pkg"
+                    fi
+                fi
+                ;;
+            "r")
+                # refresh manual (já faz naturalmente no loop, então nada a fazer)
+                ;;
+            *)
+                # ignora outras teclas
+                ;;
+        esac
+    done
+
+    adm_tui_term_restore
+    rm -f "$state_file" 2>/dev/null || true
+    trap - INT TERM EXIT
+}
+
+adm_tui_usage() {
+    cat <<EOF
+adm-tui - Interface TUI para monitorar builds do ADM 2.0
+
+Uso:
+    adm-tui
+
+Descrição:
+
+  - Mostra:
+      * fila de pacotes (a partir de db/updates/pending.list e eventos)
+      * status por pacote (QUEUED, BUILDING, DONE, FAIL)
+      * barra de progresso global
+      * log do pacote selecionado (via adm-build_log_file_for_pkg)
+
+  - Teclas:
+      q       -> sair
+      ↑/k     -> mover seleção para cima
+      ↓/j     -> mover seleção para baixo
+      espaço  -> pausar/resumir builds (cria/remove db/control/build.paused)
+      p       -> colocar pacote selecionado no topo da prioridade (db/control/build.priority)
+      r       -> refresh manual (o TUI já atualiza periodicamente)
+
+  - Arquivos de controle:
+      ${ADM_DB_CONTROL_DIR}/build.paused
+      ${ADM_DB_CONTROL_DIR}/build.priority
+
+  - Eventos:
+      Usa o arquivo de eventos mais recente em:
+          ${ADM_DB_EVENTS_DIR}/events-*.log
+
+EOF
+}
+
+adm_tui_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        "" )
+            adm_tui_main_loop
+            ;;
+        --help|-h)
+            adm_tui_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-tui: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_tui_main "$@"
+fi
+
+# Fim do adm-tui
