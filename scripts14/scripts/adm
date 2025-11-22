@@ -13,7 +13,7 @@
 #   check PKG...        -> roda adm-check em pacotes instalados
 #
 #   search PADRÃO       -> procura pacotes nos metadados
-#   info PKG_ID         -> mostra metadado bruto de um pacote
+#   info PKG_ID         -> mostra metadado de um pacote
 #   list-installed      -> lista pacotes instalados (db/installed)
 #
 #   snapshot ...        -> delega para adm-snapshot (create/diff/restore)
@@ -27,14 +27,14 @@
 #
 # Flags globais:
 #
-#   --profile ID  -> força o uso do profile ID em todos os builds (ADM_BUILD_PROFILE_OVERRIDE)
+#   --profile ID  -> força o uso do profile ID em todos os builds (via ADM_BUILD_PROFILE_OVERRIDE)
 #   --dry-run, -n -> ADM_DRY_RUN=1 (mostra o que faria, sem executar)
 #   --force       -> ADM_BUILD_FORCE=1, ADM_UPDATE_FORCE=1,
 #                    ADM_UPGRADE_FORCE=1, ADM_UNINSTALL_FORCE=1
 #
 # Cada comando é tratado como uma "tarefa" (task):
 #   - ID único: task-YYYYMMDD-HHMMSS-PID-RANDOM
-#   - arquivo em db/tasks/<id>.task com status, comando, profile etc
+#   - arquivo em db/tasks/<id>.task com status, comando, profile etc.
 #   - eventos ADM_TASK_START / ADM_TASK_DONE / ADM_TASK_FAIL via adm-eventd.
 #
 # Instalação final: sempre em / (quem cuida é o adm-build + adm-build_install_destdir).
@@ -44,7 +44,7 @@ set -o nounset
 set -o pipefail
 
 # =========
-# Descobrir diretório deste script apenas para achar o adm-env
+# Descobrir diretório do script e carregar módulos base
 # =========
 
 _adm_cli_script_dir() {
@@ -65,28 +65,21 @@ _adm_cli_script_dir() {
     pwd
 }
 
-# Diretório onde está este script (deve ser /root/usr/src/adm/scripts)
+# Diretório onde estão TODOS os scripts do ADM (correto: /root/usr/src/adm/scripts)
 _ADM_CLI_DIR="$(_adm_cli_script_dir)"
 
-# =========
-# Carregar ambiente e módulos base
-# =========
-
-# Primeiro adm-env (ele define ADM_ROOT e ADM_SCRIPTS_DIR corretamente)
-/* shellcheck disable=SC1090 */
+# shellcheck disable=SC1090
 source "$_ADM_CLI_DIR/adm-env"
-
-# Agora usamos SEMPRE ADM_SCRIPTS_DIR para os demais scripts
-/* shellcheck disable=SC1090 */
-source "$ADM_SCRIPTS_DIR/adm-log-ui"
-/* shellcheck disable=SC1090 */
-source "$ADM_SCRIPTS_DIR/adm-eventd"
-/* shellcheck disable=SC1090 */
-source "$ADM_SCRIPTS_DIR/adm-db"
-/* shellcheck disable=SC1090 */
-source "$ADM_SCRIPTS_DIR/adm-build"
-/* shellcheck disable=SC1090 */
-source "$ADM_SCRIPTS_DIR/adm-profile"
+# shellcheck disable=SC1090
+source "$_ADM_CLI_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_CLI_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_CLI_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_CLI_DIR/adm-build"
+# shellcheck disable=SC1090
+source "$_ADM_CLI_DIR/adm-profile"
 
 ADM_DB_TASKS_DIR="${ADM_DB_TASKS_DIR:-${ADM_DB_DIR}/tasks}"
 ADM_PACKAGES_DIR="${ADM_PACKAGES_DIR:-${ADM_ROOT}/packages}"
@@ -124,7 +117,6 @@ adm_task_write_status() {
     local exit_code="$3"
     local file
     file="$(adm_task_file "$task_id")"
-
     {
         echo "id=$task_id"
         echo "status=$status"
@@ -138,7 +130,7 @@ adm_task_run() {
     #   adm_task_run TYPE DESCR COMANDO...
     #
     # Ex:
-    #   adm_task_run "build" "Build pkg foo" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps foo
+    #   adm_task_run "build" "Build pkg foo" "$_ADM_CLI_DIR/adm-build" build-with-deps foo
     local type="$1"
     local descr="$2"
     shift 2 || true
@@ -277,7 +269,6 @@ adm_cli_packages_with_group() {
     [[ -z "$ids" ]] && return 0
 
     local id meta groups
-
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
         meta="$(adm_cli_metadado_path "$id")"
@@ -403,7 +394,7 @@ adm_cli_cmd_build() {
     fi
     local pkgs=("$@")
     local descr="Build de pacotes: ${pkgs[*]}"
-    adm_task_run "build" "$descr" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps "${pkgs[@]}"
+    adm_task_run "build" "$descr" "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs[@]}"
 }
 
 adm_cli_cmd_install() {
@@ -433,19 +424,20 @@ adm_cli_cmd_build_group() {
     done <<<"$pkgs"
 
     local descr="Build de grupo '$group' com pacotes: ${pkgs_arr[*]}"
-    adm_task_run "build-group" "$descr" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps "${pkgs_arr[@]}"
+    adm_task_run "build-group" "$descr" "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs_arr[@]}"
 }
 
 adm_cli_cmd_update() {
     # adm update [alvos...] [--force] [--dry-run]
+    # Delegado para adm-update (CLI próprio).
     local descr="Update: $*"
-    adm_task_run "update" "$descr" "$ADM_SCRIPTS_DIR/adm-update" "$@"
+    adm_task_run "update" "$descr" "$_ADM_CLI_DIR/adm-update" "$@"
 }
 
 adm_cli_cmd_upgrade() {
     # adm upgrade [opções...]
     local descr="Upgrade: $*"
-    adm_task_run "upgrade" "$descr" "$ADM_SCRIPTS_DIR/adm-upgrade" "$@"
+    adm_task_run "upgrade" "$descr" "$_ADM_CLI_DIR/adm-upgrade" "$@"
 }
 
 adm_cli_cmd_check() {
@@ -455,7 +447,7 @@ adm_cli_cmd_check() {
     fi
     local pkgs=("$@")
     local descr="Check: ${pkgs[*]}"
-    adm_task_run "check" "$descr" "$ADM_SCRIPTS_DIR/adm-check" "${pkgs[@]}"
+    adm_task_run "check" "$descr" "$_ADM_CLI_DIR/adm-check" "${pkgs[@]}"
 }
 
 adm_cli_cmd_snapshot() {
@@ -464,7 +456,7 @@ adm_cli_cmd_snapshot() {
         adm_log_fatal "Uso: adm snapshot (create|diff|restore ...)"
     fi
     local descr="Snapshot: $*"
-    adm_task_run "snapshot" "$descr" "$ADM_SCRIPTS_DIR/adm-snapshot" "$@"
+    adm_task_run "snapshot" "$descr" "$_ADM_CLI_DIR/adm-snapshot" "$@"
 }
 
 adm_cli_cmd_report() {
@@ -473,13 +465,13 @@ adm_cli_cmd_report() {
         adm_log_fatal "Uso: adm report (usage|top-time|top-fail ...)"
     fi
     local descr="Report: $*"
-    adm_task_run "report" "$descr" "$ADM_SCRIPTS_DIR/adm-report" "$@"
+    adm_task_run "report" "$descr" "$_ADM_CLI_DIR/adm-report" "$@"
 }
 
 adm_cli_cmd_tui() {
     # adm tui -> abre o adm-tui
     local descr="TUI (monitor de builds)"
-    adm_task_run "tui" "$descr" "$ADM_SCRIPTS_DIR/adm-tui"
+    adm_task_run "tui" "$descr" "$_ADM_CLI_DIR/adm-tui"
 }
 
 adm_cli_cmd_uninstall() {
@@ -489,13 +481,13 @@ adm_cli_cmd_uninstall() {
     fi
     local pkgs=("$@")
     local descr="Uninstall de pacotes: ${pkgs[*]}"
-    adm_task_run "uninstall" "$descr" "$ADM_SCRIPTS_DIR/adm-uninstall" uninstall "${pkgs[@]}"
+    adm_task_run "uninstall" "$descr" "$_ADM_CLI_DIR/adm-uninstall" uninstall "${pkgs[@]}"
 }
 
 adm_cli_cmd_autoremove() {
     # adm autoremove -> remove pacotes órfãos
     local descr="Autoremove (órfãos)"
-    adm_task_run "uninstall-orphans" "$descr" "$ADM_SCRIPTS_DIR/adm-uninstall" autoremove
+    adm_task_run "uninstall-orphans" "$_ADM_CLI_DIR/adm-uninstall" autoremove
 }
 
 # =========
@@ -543,7 +535,7 @@ Notas:
     E o --profile ID sobrepõe essa escolha.
 
   - Tasks: o adm registra tasks em db/tasks e emite eventos ADM_TASK_*,
-    enquanto adm-build emite eventos PKG_BUILD_* e registra em db/installed/history.
+    enquanto adm-build emite PKG_BUILD_* e registra em db/installed/history.
 
 Exemplos:
   adm build base/bash
@@ -571,22 +563,22 @@ adm_cli_help_subcommand() {
                     adm_cli_usage
                     ;;
                 update)
-                    "$ADM_SCRIPTS_DIR/adm-update" --help || true
+                    "$_ADM_CLI_DIR/adm-update" --help || true
                     ;;
                 upgrade)
-                    "$ADM_SCRIPTS_DIR/adm-upgrade" --help || true
+                    "$_ADM_CLI_DIR/adm-upgrade" --help || true
                     ;;
                 check)
-                    "$ADM_SCRIPTS_DIR/adm-check" --help || true
+                    "$_ADM_CLI_DIR/adm-check" --help || true
                     ;;
                 snapshot)
-                    "$ADM_SCRIPTS_DIR/adm-snapshot" --help || true
+                    "$_ADM_CLI_DIR/adm-snapshot" --help || true
                     ;;
                 report)
-                    "$ADM_SCRIPTS_DIR/adm-report" --help || true
+                    "$_ADM_CLI_DIR/adm-report" --help || true
                     ;;
                 tui)
-                    "$ADM_SCRIPTS_DIR/adm-tui" --help || true
+                    "$_ADM_CLI_DIR/adm-tui" --help || true
                     ;;
             esac
             ;;
@@ -618,6 +610,9 @@ adm_main() {
             adm_cli_cmd_install "${args[@]}"
             ;;
         build-group)
+            if [[ ${#args[@]} -lt 1 ]]; then
+                adm_log_fatal "Uso: adm build-group GRUPO [--profile ID] [--dry-run] [--force]"
+            fi
             adm_cli_cmd_build_group "${args[@]}"
             ;;
         update)
