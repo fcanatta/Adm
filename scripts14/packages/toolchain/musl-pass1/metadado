@@ -1,0 +1,34 @@
+name: musl-pass1
+version: 1.2.5
+release: 1
+category: toolchain
+license: MIT
+url: https://musl.libc.org/
+
+# Ajuda o adm-build a escolher o profile (toolchain + musl)
+libc: musl
+
+summary: Musl libc cross (pass 1) para bootstrap do toolchain
+description: |
+  Musl libc pass1: instala headers e runtime básico da musl para o
+  cross-toolchain inicial (TARGET-linux-musl), seguindo o estilo CLFS
+  (CROSS_COMPILE=${TARGET}-, prefix=/usr/cross/${TARGET}, target=${TARGET}).
+
+# Lidos por adm-deps / adm-build
+# Para pass1 normalmente não há deps de runtime, apenas de build se você
+# tiver um "host-base" depois.
+build_deps:
+run_deps:
+opt_deps:
+
+# groups: usado por build-group, relatórios etc
+# cross-toolchain agrupa todo o toolchain cross (binutils-pass1, gcc-pass1,
+# linux-headers, musl-pass1, libstdc++-pass1, etc).
+groups: toolchain toolchain-bootstrap cross cross-toolchain libc pass1 musl
+
+# Fonte oficial (alinhado com versões atuais da musl)
+# https://musl.libc.org/releases/musl-1.2.5.tar.gz
+source_uri: https://musl.libc.org/releases/musl-1.2.5.tar.gz
+
+# SHA256 pode ficar vazio como você pediu; adm-fetch aceita em branco.
+source_checksum:
