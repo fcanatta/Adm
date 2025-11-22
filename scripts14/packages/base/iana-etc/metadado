@@ -1,0 +1,31 @@
+name: iana-etc
+version: 20250807
+release: 1
+
+category: base
+license: custom
+url: https://www.iana.org/protocols
+
+libc: glibc
+
+summary: Iana-Etc 20250807 para LFS (cap. 8.4)
+description: >
+  Dados de serviços e protocolos de rede fornecidos pela IANA, versão 20250807,
+  instalados conforme o capítulo 8.4 do LFS: cópia direta dos arquivos
+  'services' e 'protocols' para /etc. Integrado ao ADM 2.0 usando DESTDIR
+  para instalar em /etc dentro do sysroot.
+
+# Tecnicamente só precisa de coreutils/bash para copiar
+build_deps: toolchain/coreutils-temp toolchain/bash-temp
+run_deps:
+opt_deps:
+
+# groups para build-group e relatórios
+groups: base net config iana-etc
+
+# Fonte oficial usada no LFS 12.4
+# (lista de pacotes: Download: https://github.com/Mic92/iana-etc/releases/download/20250807/iana-etc-20250807.tar.gz) 
+source_uri: https://github.com/Mic92/iana-etc/releases/download/20250807/iana-etc-20250807.tar.gz
+
+# você disse que pode deixar em branco
+source_checksum:
