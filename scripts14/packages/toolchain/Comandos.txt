@@ -1,0 +1,6 @@
+adm profile set-current toolchain/safe-glibc
+
+adm build toolchain/binutils-pass1
+adm build toolchain/gcc-pass1
+adm build toolchain/linux-headers
+adm build toolchain/glibc
