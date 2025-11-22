@@ -1,0 +1,32 @@
+name: patch-temp
+version: 2.8
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://savannah.gnu.org/projects/patch/
+
+# ajuda o adm-profile a escolher o profile certo (toolchain+glibc)
+libc: glibc
+
+summary: Patch 2.8 temporário (cross) para o LFS (cap. 6.13)
+description: >
+  Patch 2.8 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.13 do LFS (Cross Compiling Temporary Tools). Usa
+  --host=$LFS_TGT e --build=$(build-aux/config.guess), integrado ao
+  pipeline ADM 2.0 com DESTDIR.
+
+# depende da toolchain temporária já funcional
+build_deps: toolchain/make-temp toolchain/gzip-temp toolchain/grep-temp toolchain/gawk-temp toolchain/findutils-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: pra build-group temp-tools, relatórios, etc.
+groups: toolchain temp-tools cross-temp patch
+
+# Pacote conforme lista oficial de pacotes do LFS 12.4
+# Patch (2.8) - Download em: https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz 
+source_uri: https://ftp.gnu.org/gnu/patch/patch-2.8.tar.xz
+
+# pode preencher depois com o md5/sha256; o livro dá MD5: 149327a021d41c8f88d034eab41c039f 
+source_checksum:
