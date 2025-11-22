@@ -1,31 +1,38 @@
 name: glibc
-version: 2.40
+version: 2.42
 release: 1
-category: toolchain
-license: LGPL-2.1-or-later
 
+category: toolchain
+license: LGPL-2.1-or-later GPL-2.0-or-later
 url: https://www.gnu.org/software/libc/
 
+# Ajuda o adm-build a escolher o profile (toolchain + glibc)
 libc: glibc
 
-summary: GNU C Library (glibc) para sistema alvo
-description: >
-  GNU C Library (glibc) usada como libc padrão do sistema alvo,
-  construída a partir do cross-toolchain e dos Linux API Headers.
+summary: Glibc 2.42 cross (LFS capítulo 5.5) para o toolchain.
+description: Glibc 2.42 construída no estágio de cross-toolchain do LFS (capítulo 5.5), \
+usando o compilador $LFS_TGT e instalando no sysroot via DESTDIR (modo ADM 2.0).
 
-# Dependências de build para fase "toolchain/cross":
-#   - toolchain/linux-headers   (headers API do kernel)
-#   - toolchain/gcc-pass1       (toolchain GCC inicial)
-build_deps: toolchain/linux-headers toolchain/gcc-pass1
+# Dependências de build:
+# - Binutils pass1 (linker/assembler cross)
+# - GCC pass1 (cross-compiler)
+# - Linux API headers já instalados no sysroot alvo
+build_deps: toolchain/binutils-pass1 toolchain/gcc-pass1 toolchain/linux-headers
 
+# Em estágio de toolchain, não há deps de runtime "normais"
 run_deps:
 opt_deps:
 
-groups: toolchain libc glibc
+# groups: usado por build-group, relatórios e heurística de "kind"
+groups: toolchain toolchain-bootstrap cross glibc
 
-# Fonte oficial
-# https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.xz 
-source_uri: https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.xz
+# Fontes oficiais (LFS usa exatamente esses artefatos)
+# Tarball principal
+source_uri: https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz
+# Patch FHS oficial do LFS (não embutimos o conteúdo, apenas baixamos)
+source_uri: https://www.linuxfromscratch.org/patches/lfs/development/glibc-2.42-fhs-1.patch
 
-# SHA256 do tarball glibc-2.40.tar.xz (exemplo de distro que registra esse hash) 
-source_checksum: a5a26b22f545d6b7d7b3dd828e11e428f24f4fac43c934fb071b6a7d0828e901
+# Você disse que pode deixar o sha256 em branco se tiver patch,
+# então deixo vazio para você preencher depois, se quiser.
+source_checksum:
+source_checksum:
