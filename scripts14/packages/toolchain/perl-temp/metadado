@@ -1,36 +1,30 @@
 name: perl-temp
-version: 5.42.0
+version: 5.36.0
 release: 1
 
 category: toolchain
-license: Artistic-1.0-Perl OR GPL-1.0-or-later
+license: GPL-1.0-or-later & Artistic-1.0-Perl
 url: https://www.perl.org/
 
-# Ajuda o adm-build/adm-profile a escolher o profile correto
-# Aqui marcamos glibc porque esse Perl temporário é para o sistema LFS glibc.
 libc: glibc
 
-summary: Perl temporário (Chapter 7) para o ambiente LFS dentro do chroot
+summary: Perl 5.36.0 temporário para LFS (cap. 7.9, chroot)
 description: >
-  Perl 5.42.0 conforme LFS Chapter 7 (Additional Temporary Tools),
-  instalado em /usr dentro do ambiente chroot, usado por outros
-  pacotes durante o build do sistema base.
+  Perl 5.36.0 construído como ferramenta temporária dentro do chroot,
+  seguindo o capítulo 7.9 do LFS. Configurado com sh Configure -des e
+  diretórios de libs/perl5 iguais ao livro, integrado ao pipeline ADM 2.0
+  usando DESTDIR para instalar em /usr dentro do sysroot.
 
-# Lidos por adm-deps / adm-build
-# Você pode ir preenchendo os deps conforme for refinando o grafo.
-# Na prática, esse Perl depende de já existir o toolchain temporário e
-# os utilitários básicos (bash, coreutils, sed, etc).
-build_deps:
+# Já estamos no chroot com toolchain Pass 2 funcional
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp
 run_deps:
 opt_deps:
 
-# groups: usado pela heurística de "kind" (toolchain) e por build-group, relatórios etc
-groups: toolchain-temp lfs-temp perl
+# groups para build-group e relatórios
+groups: toolchain temp-tools chroot perl
 
-# Fonte oficial (alinhado com LFS "development" 7.9 / Perl 5.42.0)
-# Veja LFS capítulo 3 – lista de pacotes.
-source_uri: https://www.cpan.org/src/5.0/perl-5.42.0.tar.xz
+# Fonte oficial usada no LFS 11.x / 12.x
+source_uri: https://www.cpan.org/src/5.0/perl-5.36.0.tar.xz
 
-# SHA256 puro (sem prefixo), para o adm-fetch:
-# Pode deixar em branco por enquanto como você pediu.
+# pode ficar em branco e ser preenchido depois
 source_checksum:
