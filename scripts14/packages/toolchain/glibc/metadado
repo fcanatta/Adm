@@ -1,0 +1,31 @@
+name: glibc
+version: 2.40
+release: 1
+category: toolchain
+license: LGPL-2.1-or-later
+
+url: https://www.gnu.org/software/libc/
+
+libc: glibc
+
+summary: GNU C Library (glibc) para sistema alvo
+description: >
+  GNU C Library (glibc) usada como libc padrão do sistema alvo,
+  construída a partir do cross-toolchain e dos Linux API Headers.
+
+# Dependências de build para fase "toolchain/cross":
+#   - toolchain/linux-headers   (headers API do kernel)
+#   - toolchain/gcc-pass1       (toolchain GCC inicial)
+build_deps: toolchain/linux-headers toolchain/gcc-pass1
+
+run_deps:
+opt_deps:
+
+groups: toolchain libc glibc
+
+# Fonte oficial
+# https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.xz 
+source_uri: https://ftp.gnu.org/gnu/glibc/glibc-2.40.tar.xz
+
+# SHA256 do tarball glibc-2.40.tar.xz (exemplo de distro que registra esse hash) 
+source_checksum: a5a26b22f545d6b7d7b3dd828e11e428f24f4fac43c934fb071b6a7d0828e901
