@@ -24,7 +24,7 @@ run_deps:
 opt_deps:
 
 # groups: usado por build-group, relatórios e heurística de "kind"
-groups: toolchain toolchain-bootstrap cross glibc
+groups: toolchain-bootstrap cross glibc
 
 # Fontes oficiais (LFS usa exatamente esses artefatos)
 # Tarball principal
