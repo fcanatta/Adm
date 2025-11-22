@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# adm-profile - Gerenciador de profiles de compilação do ADM 2.0
+#
+# Funções principais:
+#
+#   - init-defaults
+#       Cria os perfis padrão (se ainda não existirem):
+#         * glibc/extreme        (otimizações extremas para glibc)
+#         * musl/extreme         (otimizações extremas para musl)
+#         * toolchain/safe-glibc (perfil seguro para toolchain com glibc)
+#         * toolchain/safe-musl  (perfil seguro para toolchain com musl)
+#
+#   - list
+#       Lista todos os profiles disponíveis.
+#  Criar os perfis padrão 
+#   adm-profile init-defaults
+#   adm-profile list
+#   Aplica um profile extreme
+#   eval "$(adm-profile export glibc/extreme)"
+#   Definir profile default para o sistema
+#   adm-profile set-current glibc/extreme
+#   adm-profile current
+#  Criar profile custom 
+#  adm-profile create custom/debug-glibc --libc glibc --kind safe --desc "Debug seguro glibc"
+#  adm-profile show custom/debug-glibc
+#   - show ID
+#       Mostra o conteúdo detalhado de um profile (ID ex: glibc/extreme).
+#
+#   - export ID
+#       Imprime na saída comandos "export" com as variáveis de ambiente
+#       para usar o profile:
+#         ADM_PROFILE_ID, ADM_PROFILE_LIBC, ADM_PROFILE_KIND,
+#         CFLAGS, CXXFLAGS, LDFLAGS, MAKEFLAGS (com -j$(nproc) se disponível)
+#
+#       Exemplo de uso:
+#         eval "$(adm-profile export glibc/extreme)"
+#
+#   - current
+#       Mostra o profile atual (se definido).
+#
+#   - set-current ID
+#       Define o profile atual (grava em db/profiles/current).
+#
+#   - create ID --libc glibc|musl --kind extreme|safe [--desc "texto"]
+#       Cria um profile novo baseado nos templates internos de flags.
+#
+# Notas:
+#   - Os profiles são armazenados em:
+#         ${ADM_DB_DIR}/profiles/<ID>.profile
+#     ou seja:
+#         glibc/extreme -> ${ADM_DB_DIR}/profiles/glibc/extreme.profile
+#
+#   - Outros scripts (como adm-build) podem:
+#         source adm-profile
+#         adm_profile_load_env "glibc/extreme"
+#     ou usar o CLI:
+#         eval "$(adm-profile export glibc/extreme)"
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Descobrir diretório e carregar módulos
+# =========
+
+_adm_profile_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-profile.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_PROFILE_DIR="$(_adm_profile_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_PROFILE_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_PROFILE_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_PROFILE_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_PROFILE_DIR/adm-metrics"
+# shellcheck disable=SC1090
+source "$_ADM_PROFILE_DIR/adm-db"
+
+ADM_PROFILE_DB_DIR="${ADM_DB_DIR}/profiles"
+ADM_PROFILE_CURRENT_FILE="${ADM_PROFILE_DB_DIR}/current"
+
+# =========
+# Utilidades básicas
+# =========
+
+adm_profile_ensure_dir() {
+    if [[ ! -d "$ADM_PROFILE_DB_DIR" ]]; then
+        mkdir -p "$ADM_PROFILE_DB_DIR" || adm_log_fatal "Falha ao criar '$ADM_PROFILE_DB_DIR'."
+    fi
+}
+
+adm_profile_id_to_path() {
+    # ID ex: glibc/extreme -> ${ADM_DB_DIR}/profiles/glibc/extreme.profile
+    local id="$1"
+    adm_profile_ensure_dir
+    printf '%s/%s.profile\n' "$ADM_PROFILE_DB_DIR" "$id"
+}
+
+adm_profile_list_ids() {
+    # Lista IDs existentes, convertendo caminhos para ID (removendo prefixo e .profile).
+    if [[ ! -d "$ADM_PROFILE_DB_DIR" ]]; then
+        return 0
+    fi
+    local base="$ADM_PROFILE_DB_DIR"
+    find "$base" -type f -name '*.profile' 2>/dev/null \
+        | sed "s#^${base}/##" \
+        | sed 's/\.profile$//' \
+        | sort
+}
+
+adm_profile_read_field() {
+    # Lê um campo key=value de um arquivo .profile.
+    local file="$1"
+    local key="$2"
+    awk -F'=' -v k="$key" '
+        $1 == k {
+            $1=""; sub(/^=/, "", $0); sub(/^[[:space:]]+/, "", $0)
+            print $0
+            exit 0
+        }
+    ' "$file"
+}
+
+adm_profile_default_flags() {
+    # Retorna CFLAGS, CXXFLAGS, LDFLAGS (separados por TAB) para
+    # a combinação (libc, kind).
+    #
+    # Uso:
+    #   out=$(adm_profile_default_flags glibc extreme)
+    #   cflags="${out%%$'\t'*}"
+    #   rest="${out#*$'\t'}"
+    #   cxxflags="${rest%%$'\t'*}"
+    #   ldflags="${rest#*$'\t'}"
+    local libc="$1"
+    local kind="$2"
+
+    local cflags="" cxxflags="" ldflags=""
+
+    case "${libc}:${kind}" in
+        glibc:extreme)
+            cflags="-O3 -pipe -march=native -mtune=native -fno-plt -flto=auto -fgraphite-identity -floop-nest-optimize"
+            cxxflags="$cflags"
+            ldflags="-Wl,-O2,-Wl,-as-needed,-Wl,-z,relro,-Wl,-z,now"
+            ;;
+        musl:extreme)
+            # mais conservador com musl, mas ainda agressivo
+            cflags="-O3 -pipe -march=native -mtune=native -fno-plt -flto=auto -fvisibility=hidden -fstack-protector-strong"
+            cxxflags="$cflags"
+            ldflags="-Wl,-O2,-Wl,-z,relro,-Wl,-z,now"
+            ;;
+        glibc:safe)
+            # seguro para toolchain glibc
+            cflags="-O2 -pipe -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fno-plt"
+            cxxflags="$cflags"
+            ldflags="-Wl,-O2,-Wl,-z,relro,-Wl,-z,now"
+            ;;
+        musl:safe)
+            # seguro para toolchain musl
+            cflags="-O2 -pipe -fstack-protector-strong -fno-plt"
+            cxxflags="$cflags"
+            ldflags="-Wl,-O2,-Wl,-z,relro,-Wl,-z,now"
+            ;;
+        *)
+            # fallback neutro
+            cflags="-O2 -pipe"
+            cxxflags="$cflags"
+            ldflags="-Wl,-O2"
+            ;;
+    esac
+
+    printf '%s\t%s\t%s\n' "$cflags" "$cxxflags" "$ldflags"
+}
+
+adm_profile_write_file() {
+    # Cria/atualiza um arquivo de profile com campos básicos.
+    #
+    # Uso:
+    #   adm_profile_write_file ID libc kind desc cflags cxxflags ldflags
+    local id="$1"
+    local libc="$2"
+    local kind="$3"
+    local desc="$4"
+    local cflags="$5"
+    local cxxflags="$6"
+    local ldflags="$7"
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+
+    local dir
+    dir="$(dirname "$path")"
+    mkdir -p "$dir" || adm_log_fatal "Falha ao criar diretório '$dir' para profile $id."
+
+    cat >"$path.tmp" <<EOF
+id=$id
+libc=$libc
+kind=$kind
+description=$desc
+
+# Flags principais
+cflags=$cflags
+cxxflags=$cxxflags
+ldflags=$ldflags
+
+# Espaço reservado para futuras opções específicas:
+#   cflags_append=
+#   cxxflags_append=
+#   ldflags_append=
+EOF
+
+    mv "$path.tmp" "$path" || adm_log_fatal "Falha ao gravar profile '$path'."
+    adm_log_ok "Profile salvo: $id ($path)"
+}
+
+# =========
+# Criação de profiles (init-defaults / create)
+# =========
+
+adm_profile_create_one() {
+    # Uso:
+    #   adm_profile_create_one ID libc kind desc
+    local id="$1"
+    local libc="$2"
+    local kind="$3"
+    local desc="$4"
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+
+    if [[ -f "$path" ]]; then
+        adm_log_info "Profile já existe: $id ($path) - mantendo."
+        return 0
+    fi
+
+    local flags
+    flags="$(adm_profile_default_flags "$libc" "$kind")"
+    local cflags="${flags%%$'\t'*}"
+    local rest="${flags#*$'\t'}"
+    local cxxflags="${rest%%$'\t'*}"
+    local ldflags="${rest#*$'\t'}"
+
+    adm_profile_write_file "$id" "$libc" "$kind" "$desc" "$cflags" "$cxxflags" "$ldflags"
+}
+
+adm_profile_init_defaults_core() {
+    adm_profile_ensure_dir
+
+    adm_log_phase_header "Inicializando profiles padrão (extreme/safe)"
+
+    adm_profile_create_one \
+        "glibc/extreme" \
+        "glibc" \
+        "extreme" \
+        "Perfil extremo otimizado para glibc em hosts modernos (O3, LTO, graphite, march=native)."
+
+    adm_profile_create_one \
+        "musl/extreme" \
+        "musl" \
+        "extreme" \
+        "Perfil extremo otimizado para musl com foco em performance segura (O3, LTO, stack protector)."
+
+    adm_profile_create_one \
+        "toolchain/safe-glibc" \
+        "glibc" \
+        "safe" \
+        "Perfil seguro para toolchain glibc (O2, hardening, FORTIFY_SOURCE, stack protector)."
+
+    adm_profile_create_one \
+        "toolchain/safe-musl" \
+        "musl" \
+        "safe" \
+        "Perfil seguro para toolchain musl (O2, hardening moderado)."
+
+    adm_event_emit "PROFILE_INIT_DEFAULTS" "-" ""
+}
+
+adm_profile_init_defaults() {
+    adm_metrics_time_block "PROFILE" "PROFILE_INIT" "adm-profile init-defaults" adm_profile_init_defaults_core
+}
+
+adm_profile_create() {
+    # Cria um profile a partir de templates de flags.
+    #
+    # Uso:
+    #   adm-profile create ID --libc glibc|musl --kind extreme|safe [--desc "texto"]
+    local id="${1:-}"
+    shift || true
+
+    if [[ -z "$id" ]]; then
+        adm_log_fatal "Uso: adm-profile create ID --libc glibc|musl --kind extreme|safe [--desc \"texto\"]"
+    fi
+
+    local libc=""
+    local kind=""
+    local desc="Profile custom criado pelo usuário."
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --libc)
+                shift || true
+                libc="${1:-}"
+                ;;
+            --kind)
+                shift || true
+                kind="${1:-}"
+                ;;
+            --desc)
+                shift || true
+                desc="${1:-}"
+                ;;
+            *)
+                adm_log_fatal "Parâmetro desconhecido em adm-profile create: '$1'"
+                ;;
+        esac
+        shift || true
+    done
+
+    if [[ -z "$libc" || -z "$kind" ]]; then
+        adm_log_fatal "adm-profile create: é necessário informar --libc e --kind."
+    fi
+
+    adm_log_phase_header "Criando profile $id (libc=$libc, kind=$kind)"
+    adm_profile_create_one "$id" "$libc" "$kind" "$desc"
+    adm_event_emit "PROFILE_CREATE" "$id" "libc=$libc kind=$kind"
+}
+
+# =========
+# Listar / mostrar profiles
+# =========
+
+adm_profile_list() {
+    adm_profile_ensure_dir
+
+    adm_log_phase_header "Profiles disponíveis"
+
+    local ids
+    ids="$(adm_profile_list_ids || true)"
+    if [[ -z "$ids" ]]; then
+        adm_log_info "Nenhum profile encontrado. Você pode rodar: adm-profile init-defaults"
+        return 0
+    fi
+
+    printf '%-30s %-8s %-8s %s\n' "ID" "libc" "kind" "descrição"
+    printf '%-30s %-8s %-8s %s\n' "------------------------------" "--------" "--------" "-----------------------------"
+
+    local id path libc kind desc
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        path="$(adm_profile_id_to_path "$id")"
+        libc="$(adm_profile_read_field "$path" "libc" || echo "?")"
+        kind="$(adm_profile_read_field "$path" "kind" || echo "?")"
+        desc="$(adm_profile_read_field "$path" "description" || echo "")"
+        printf '%-30s %-8s %-8s %s\n' "$id" "$libc" "$kind" "$desc"
+    done <<<"$ids"
+}
+
+adm_profile_show() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        adm_log_fatal "Uso: adm-profile show ID"
+    fi
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "Profile não encontrado: $id ($path)"
+    fi
+
+    adm_log_phase_header "Profile: $id ($path)"
+    cat "$path"
+}
+
+# =========
+# current / set-current
+# =========
+
+adm_profile_get_current() {
+    if [[ -f "$ADM_PROFILE_CURRENT_FILE" ]]; then
+        cat "$ADM_PROFILE_CURRENT_FILE"
+    else
+        echo ""
+    fi
+}
+
+adm_profile_current() {
+    local cur
+    cur="$(adm_profile_get_current)"
+    if [[ -z "$cur" ]]; then
+        adm_log_info "Nenhum profile atual definido."
+    else
+        adm_log_info "Profile atual: $cur"
+    fi
+}
+
+adm_profile_set_current() {
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        adm_log_fatal "Uso: adm-profile set-current ID"
+    fi
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "Profile não encontrado: $id ($path)"
+    fi
+
+    adm_profile_ensure_dir
+    echo "$id" >"$ADM_PROFILE_CURRENT_FILE.tmp" \
+        && mv "$ADM_PROFILE_CURRENT_FILE.tmp" "$ADM_PROFILE_CURRENT_FILE" \
+        || adm_log_fatal "Falha ao gravar profile atual em '$ADM_PROFILE_CURRENT_FILE'."
+
+    adm_log_ok "Profile atual definido: $id"
+    adm_event_emit "PROFILE_SET_CURRENT" "$id" ""
+}
+
+# =========
+# Aplicar profile (export/env)
+# =========
+
+adm_profile_load_env() {
+    # Uso (para scripts que dão source em adm-profile):
+    #   adm_profile_load_env ID
+    #
+    # Efeitos:
+    #   export ADM_PROFILE_ID, ADM_PROFILE_LIBC, ADM_PROFILE_KIND
+    #   export CFLAGS, CXXFLAGS, LDFLAGS (substituindo os atuais)
+    #   export MAKEFLAGS="-j$(nproc)" (se nproc disponível)
+    local id="${1:-}"
+
+    if [[ -z "$id" ]]; then
+        adm_log_fatal "adm_profile_load_env: ID não informado."
+    fi
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "Profile não encontrado: $id ($path)"
+    fi
+
+    local libc kind cflags cxxflags ldflags
+    libc="$(adm_profile_read_field "$path" "libc" || echo "")"
+    kind="$(adm_profile_read_field "$path" "kind" || echo "")"
+    cflags="$(adm_profile_read_field "$path" "cflags" || echo "")"
+    cxxflags="$(adm_profile_read_field "$path" "cxxflags" || echo "")"
+    ldflags="$(adm_profile_read_field "$path" "ldflags" || echo "")"
+
+    export ADM_PROFILE_ID="$id"
+    export ADM_PROFILE_LIBC="$libc"
+    export ADM_PROFILE_KIND="$kind"
+    export CFLAGS="$cflags"
+    export CXXFLAGS="$cxxflags"
+    export LDFLAGS="$ldflags"
+
+    if command -v nproc >/dev/null 2>&1; then
+        export MAKEFLAGS="-j$(nproc)"
+    fi
+
+    adm_event_emit "PROFILE_APPLY" "$id" "libc=$libc kind=$kind"
+}
+
+adm_profile_export() {
+    # CLI: imprime exports para o profile ID
+    #
+    # Uso:
+    #   adm-profile export glibc/extreme
+    #   eval "$(adm-profile export glibc/extreme)"
+    local id="${1:-}"
+
+    if [[ -z "$id" ]]; then
+        adm_log_fatal "Uso: adm-profile export ID"
+    fi
+
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+    if [[ ! -f "$path" ]]; then
+        adm_log_fatal "Profile não encontrado: $id ($path)"
+    fi
+
+    local libc kind cflags cxxflags ldflags
+    libc="$(adm_profile_read_field "$path" "libc" || echo "")"
+    kind="$(adm_profile_read_field "$path" "kind" || echo "")"
+    cflags="$(adm_profile_read_field "$path" "cflags" || echo "")"
+    cxxflags="$(adm_profile_read_field "$path" "cxxflags" || echo "")"
+    ldflags="$(adm_profile_read_field "$path" "ldflags" || echo "")"
+
+    # gera export seguro com %q
+    printf "export ADM_PROFILE_ID=%q\n" "$id"
+    printf "export ADM_PROFILE_LIBC=%q\n" "$libc"
+    printf "export ADM_PROFILE_KIND=%q\n" "$kind"
+    printf "export CFLAGS=%q\n" "$cflags"
+    printf "export CXXFLAGS=%q\n" "$cxxflags"
+    printf "export LDFLAGS=%q\n" "$ldflags"
+
+    if command -v nproc >/dev/null 2>&1; then
+        local jobs
+        jobs="$(nproc 2>/dev/null || echo 1)"
+        printf "export MAKEFLAGS=%q\n" "-j${jobs}"
+    fi
+
+    # valores padrão de compiladores se não definidos
+    printf 'export CC=${CC:-gcc}\n'
+    printf 'export CXX=${CXX:-g++}\n'
+
+    adm_event_emit "PROFILE_EXPORT" "$id" "libc=$libc kind=$kind"
+}
+
+# =========
+# CLI
+# =========
+
+adm_profile_usage() {
+    cat <<EOF
+adm-profile - Gerenciador de profiles de compilação do ADM 2.0
+
+Uso:
+
+  Inicializar profiles padrão:
+    adm-profile init-defaults
+
+      Cria (se não existirem):
+        - glibc/extreme
+        - musl/extreme
+        - toolchain/safe-glibc
+        - toolchain/safe-musl
+
+  Listar profiles disponíveis:
+    adm-profile list
+
+  Mostrar detalhes de um profile:
+    adm-profile show ID
+
+      Exemplo:
+        adm-profile show glibc/extreme
+
+  Exportar variáveis de ambiente de um profile:
+    adm-profile export ID
+
+      Exemplo:
+        eval "\$(adm-profile export glibc/extreme)"
+
+  Ver/definir profile atual:
+    adm-profile current
+    adm-profile set-current ID
+
+  Criar um novo profile baseado em templates de flags:
+    adm-profile create ID --libc glibc|musl --kind extreme|safe [--desc "texto"]
+
+      Exemplos:
+        adm-profile create custom/glibc-o3 --libc glibc --kind extreme --desc "Profile custom O3 glibc"
+        adm-profile create custom/musl-safe --libc musl --kind safe
+
+EOF
+}
+
+adm_profile_main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        init-defaults)
+            shift || true
+            adm_profile_init_defaults
+            ;;
+        list)
+            shift || true
+            adm_profile_list
+            ;;
+        show)
+            shift || true
+            adm_profile_show "${1:-}"
+            ;;
+        export)
+            shift || true
+            adm_profile_export "${1:-}"
+            ;;
+        current)
+            shift || true
+            adm_profile_current
+            ;;
+        set-current)
+            shift || true
+            adm_profile_set_current "${1:-}"
+            ;;
+        create)
+            shift || true
+            adm_profile_create "$@"
+            ;;
+        --help|-h|"")
+            adm_profile_usage
+            ;;
+        *)
+            adm_log_fatal "Comando desconhecido para adm-profile: '$cmd'"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    adm_profile_main "$@"
+fi
+
+# Fim do adm-profile
