@@ -1,0 +1,37 @@
+name: glibc
+version: 2.40
+release: 1
+
+category: base
+license: LGPL-2.1-or-later & GPL-2.0-or-later
+url: https://www.gnu.org/software/libc/
+
+# libc final do sistema
+libc: glibc
+
+summary: Glibc 2.40 final para LFS/ADM 2.0 (cap. 8.x)
+description: >
+  Glibc 2.40 construída como biblioteca C principal do sistema, seguindo o
+  capítulo 8.x do LFS. Usa build em diretório separado (build/), aplica
+  patch FHS, configura com --prefix=/usr, --disable-werror,
+  --enable-kernel=4.19, --enable-stack-protector=strong e
+  --with-headers=/usr/include. Integrada ao pipeline ADM 2.0 com DESTDIR,
+  perfis de toolchain/libc e hooks para configuração de FHS e /etc.
+
+# dependências para build da libc final
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/linux-headers base/man-pages base/iana-etc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp
+run_deps:
+opt_deps:
+
+# grupos para build-group base, relatórios, etc.
+groups: base libc glibc core
+
+# Fonte oficial da glibc
+source_uri: https://ftp.gnu.org/gnu/libc/glibc-2.40.tar.xz
+
+# Patch FHS do LFS (ajuste a URL/versão do LFS se necessário)
+# Exemplo padrão (12.x), adapte se a pasta de patches for outra:
+source_uri: https://www.linuxfromscratch.org/patches/lfs/12.2/glibc-2.40-fhs-1.patch
+
+# Você pode preencher depois com o sha256 se quiser
+source_checksum:
