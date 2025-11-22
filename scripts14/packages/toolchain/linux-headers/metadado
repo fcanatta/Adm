@@ -18,7 +18,7 @@ run_deps:
 opt_deps:
 
 # groups: usado pela heurística de "kind" toolchain, build-group e relatórios
-groups: toolchain toolchain-bootstrap linux headers api pass1
+groups: toolchain-bootstrap linux headers api pass1
 
 # Fonte oficial (LFS usa este tarball)
 # https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz
