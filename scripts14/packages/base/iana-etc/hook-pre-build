@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# hook-pre-build para base/iana-etc (LFS 8.4 + ADM 2.0)
+#
+# LFS 8.4:
+#   cp services protocols /etc
+#
+# No ADM 2.0:
+#   - copiamos para $ADM_DESTDIR/etc (para empacotamento/instalação limpa)
+#   - criamos um Makefile stub para o restante do pipeline não quebrar,
+#     já que não há nada para compilar ou instalar com make.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=base/iana-etc}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+destdir="$ADM_DESTDIR"
+
+cd "$build_dir"
+
+# Evita repetir se o hook já rodou com sucesso
+if [[ -f ".adm-iana-etc-installed.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Iana-Etc já foi instalado em DESTDIR (stamp encontrado); pulando." >&2
+    exit 0
+fi
+
+services_src="$build_dir/services"
+protocols_src="$build_dir/protocols"
+
+if [[ ! -f "$services_src" || ! -f "$protocols_src" ]]; then
+    echo "[hook-pre-build][$pkg_id] ERRO: arquivos 'services' ou 'protocols' não encontrados em $build_dir" >&2
+    exit 1
+fi
+
+target_etc="$destdir/etc"
+
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    cat <<EOF >&2
+[hook-pre-build][$pkg_id][DRY-RUN] Copiaria:
+  $services_src  ->  $target_etc/services
+  $protocols_src ->  $target_etc/protocols
+EOF
+else
+    echo "[hook-pre-build][$pkg_id] Instalando services/protocols em $target_etc..." >&2
+    mkdir -p "$target_etc"
+    cp -v "$services_src"  "$target_etc/services"
+    cp -v "$protocols_src" "$target_etc/protocols"
+fi
+
+touch ".adm-iana-etc-installed.stamp"
+
+# Criar Makefile stub para o caso do adm-build tentar 'make' ou 'make install'
+makefile_path="$build_dir/Makefile"
+
+if [[ ! -f "$makefile_path" ]]; then
+    cat > "$makefile_path" << 'EOF'
+# Makefile stub gerado pelo ADM para base/iana-etc
+.PHONY: all install
+
+all:
+	@echo "ADM iana-etc: nada para compilar (apenas cópia de arquivos)."
+
+install:
+	@echo "ADM iana-etc: já instalado pelo hook-pre-build em DESTDIR."
+EOF
+    echo "[hook-pre-build][$pkg_id] Makefile stub criado em $makefile_path" >&2
+else
+    echo "[hook-pre-build][$pkg_id] Makefile já existe; não sobrescrevendo." >&2
+fi
+
+echo "[hook-pre-build][$pkg_id] hook-pre-build de Iana-Etc concluído com sucesso." >&2
