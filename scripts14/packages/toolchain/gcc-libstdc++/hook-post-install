@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/gcc-libstdc++
+#
+# Executado pelo adm-build DEPOIS da instalação do pacote
+# (DESTDIR já foi copiado para o sistema real).
+#
+# Objetivo:
+#   - Verificar se as bibliotecas principais da libstdc++ foram instaladas.
+#   - Confirmar que arquivos .la de libstdc++/supc++ foram removidos.
+#
+# OBS:
+#   - Usa ADM_DESTDIR para procurar as bibliotecas no staging
+#     (o mesmo DESTDIR usado no hook-pre-build).
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gcc-libstdc++}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+
+libdir="$ADM_DESTDIR/usr/lib"
+
+if [[ ! -d "$libdir" ]]; then
+    echo "[hook-post-install][$pkg_id] AVISO: diretório $libdir não encontrado; nada para verificar." >&2
+    exit 0
+fi
+
+echo "[hook-post-install][$pkg_id] Verificando bibliotecas em $libdir..."
+
+# 1) Verifica existência das libs principais
+required_libs=(
+    "libstdc++.so"
+    "libsupc++.a"
+)
+
+missing=0
+for pat in "${required_libs[@]}"; do
+    if ! ls "$libdir"/"$pat"* >/dev/null 2>&1; then
+        echo "[hook-post-install][$pkg_id] ERRO: não encontrei $pat* em $libdir" >&2
+        missing=1
+    else
+        echo "[hook-post-install][$pkg_id] OK: encontrado $pat* em $libdir"
+    fi
+done
+
+if [[ "$missing" -ne 0 ]]; then
+    echo "[hook-post-install][$pkg_id] Falha no sanity check: bibliotecas fundamentais ausentes." >&2
+    exit 1
+fi
+
+# 2) Verificar se ainda existem .la de libstdc++/supc++
+la_globs=(
+    "libstdc++.la"
+    "libstdc++exp.la"
+    "libstdc++fs.la"
+    "libsupc++.la"
+)
+
+la_found=0
+for gl in "${la_globs[@]}"; do
+    if ls "$libdir"/"$gl" >/dev/null 2>&1; then
+        echo "[hook-post-install][$pkg_id] AVISO: arquivo .la ainda presente: $libdir/$gl (será removido)." >&2
+        rm -vf "$libdir/$gl" || true
+        la_found=1
+    fi
+done
+
+if [[ "$la_found" -eq 0 ]]; then
+    echo "[hook-post-install][$pkg_id] OK: nenhum arquivo .la de libstdc++/supc++ encontrado."
+else
+    echo "[hook-post-install][$pkg_id] Arquivos .la residuais foram removidos."
+fi
+
+echo "[hook-post-install][$pkg_id] Sanity check de libstdc++ concluído com sucesso."
