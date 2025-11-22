@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# hook-pre-build para toolchain/gettext-temp (LFS 7.7 + ADM 2.0)
+#
+# LFS:
+#   make
+#   cp -v gettext-tools/src/{msgfmt,msgmerge,xgettext} /usr/bin
+#
+# No ADM:
+#   - Compila gettext (make)
+#   - Copia msgfmt/msgmerge/xgettext para $ADM_DESTDIR/usr/bin
+#   - Neutraliza 'all' e 'install' no Makefile para o restante
+#     do pipeline do adm-build ser NO-OP neste pacote.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gettext-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+destdir="$ADM_DESTDIR"
+
+cd "$build_dir"
+
+# stamp pra não recompilar se o hook rodar de novo
+if [[ -f ".adm-gettext-built.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Gettext já foi compilado e instalado em DESTDIR; pulando build." >&2
+else
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        echo "[hook-pre-build][$pkg_id][DRY-RUN] Rodaria 'make' e copiaria msgfmt/msgmerge/xgettext para $destdir/usr/bin" >&2
+    else
+        echo "[hook-pre-build][$pkg_id] Compilando Gettext-0.24 (make)..." >&2
+        make
+
+        echo "[hook-pre-build][$pkg_id] Instalando msgfmt/msgmerge/xgettext em $destdir/usr/bin..." >&2
+        mkdir -p "$destdir/usr/bin"
+
+        for bin in msgfmt msgmerge xgettext; do
+            src="gettext-tools/src/$bin"
+            if [[ ! -x "$src" ]]; then
+                echo "[hook-pre-build][$pkg_id] ERRO: binário esperado não encontrado: $src" >&2
+                exit 1
+            fi
+            cp -v "$src" "$destdir/usr/bin/"
+        done
+    fi
+
+    touch ".adm-gettext-built.stamp"
+fi
+
+# Neutralizar Makefile para o restante do fluxo do adm-build
+makefile_path="$build_dir/Makefile"
+
+if [[ -f "$makefile_path" ]]; then
+    if ! grep -q "ADM gettext-temp: alvo 'all' ignorado" "$makefile_path" 2>/dev/null; then
+        echo "[hook-pre-build][$pkg_id] Neutralizando alvos 'all' e 'install' no Makefile..." >&2
+        cat >> "$makefile_path" << 'EOF'
+
+# Alvos adicionados pelo ADM (toolchain/gettext-temp)
+.PHONY: all install
+
+all:
+	@echo "ADM gettext-temp: alvo 'all' ignorado (Gettext-0.24 já construído pelo hook-pre-build)."
+
+install:
+	@echo "ADM gettext-temp: alvo 'install' ignorado (Gettext-0.24 já instalado pelo hook-pre-build)."
+
+EOF
+    else
+        echo "[hook-pre-build][$pkg_id] Makefile já contém stubs ADM; não vou repetir." >&2
+    fi
+else
+    echo "[hook-pre-build][$pkg_id] AVISO: Makefile não encontrado em $build_dir; nada para neutralizar." >&2
+fi
+
+echo "[hook-pre-build][$pkg_id] hook-pre-build de Gettext-0.24 concluído com sucesso." >&2
