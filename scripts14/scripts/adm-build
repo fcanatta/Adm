@@ -804,12 +804,22 @@ adm_build_pack_destdir() {
 }
 
 adm_build_install_destdir() {
-    # Copia conteudo do DESTDIR para /
+    # Instala conteúdo de DESTDIR em um root (padrão /).
+    #
+    # Uso:
+    #   adm_build_install_destdir PKG_ID DESTDIR
+    #
+    # Variáveis:
+    #   ADM_INSTALL_ROOT  -> root de instalação (default: /)
+    #
     local pkg_id="$1"
     local destdir="$2"
 
+    # Root final de instalação (pode ser / ou um chroot tipo /mnt/root)
+    local install_root="${ADM_INSTALL_ROOT:-/}"
+
     if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
-        adm_log_info "[DRY-RUN][$pkg_id] Instalaria conteúdo de $destdir em /"
+        adm_log_info "[DRY-RUN][$pkg_id] Instalaria conteúdo de $destdir em $install_root"
         return 0
     fi
 
@@ -817,8 +827,31 @@ adm_build_install_destdir() {
         adm_log_fatal "DESTDIR não existe para instalação: '$destdir'"
     fi
 
-    adm_log_phase "Instalando $pkg_id a partir de $destdir para /"
-    adm_build_run_cmd "$pkg_id" "instalar em /" bash -c 'cd "$1" && cp -a . /' _ "$destdir"
+    if [[ ! -d "$install_root" ]]; then
+        adm_log_fatal "Root de instalação não existe: '$install_root' (ADM_INSTALL_ROOT)"
+    fi
+
+    # Pequena proteção: evita instalar se DESTDIR estiver vazio demais (pode ser sintoma de build quebrado)
+    local count
+    count=$(find "$destdir" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l || echo 0)
+    if [[ "$count" -eq 0 ]]; then
+        adm_log_warn "DESTDIR '$destdir' está praticamente vazio (nenhum item no nível superior). Instalando mesmo assim."
+    fi
+
+    adm_log_phase "Instalando $pkg_id a partir de $destdir para $install_root"
+
+    # Instala usando tar para preservar permissões, donos, symlinks etc.
+    # Equivalente lógico a: (cd destdir && tar cf - .) | (cd / && tar xpf -)
+    #
+    adm_build_run_cmd "$pkg_id" "instalar em $install_root" bash -c '
+        set -euo pipefail
+        src="$1"
+        dst="$2"
+
+        cd "$src"
+        # Usar tar é geralmente mais robusto do que cp -a . /
+        tar -cf - . | (cd "$dst" && tar -xpf -)
+    ' _ "$destdir" "$install_root"
 }
 
 adm_build_generate_filelist() {
