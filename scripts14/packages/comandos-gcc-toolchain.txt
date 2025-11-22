@@ -1,0 +1,14 @@
+cd /root/usr/src/adm
+
+# Garantir binutils-pass1 antes
+adm-build build-one toolchain/binutils-pass1
+
+# Construir gcc-pass1 com target e prefix desejados
+ADM_CROSS_TARGET=x86_64-lfs-linux-gnu \
+ADM_CROSS_PREFIX=/usr/cross \
+ADM_SYSROOT=/ \
+adm-build build-one toolchain/gcc-pass1
+
+  ADM_CROSS_TARGET=x86_64-lfs-linux-gnu \
+ADM_CROSS_PREFIX=/usr/cross \
+adm build toolchain/gcc-pass1
