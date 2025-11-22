@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/coreutils-temp
+#
+# Executado pelo adm-build DEPOIS da instalação (DESTDIR -> /).
+#
+# Objetivo:
+#   - Reproduzir os ajustes de Coreutils do LFS 6.5:
+#       mv -v $LFS/usr/bin/chroot              $LFS/usr/sbin
+#       mkdir -pv $LFS/usr/share/man/man8
+#       mv -v $LFS/usr/share/man/man1/chroot.1 $LFS/usr/share/man/man8/chroot.8
+#       sed -i 's/"1"/"8"/'                    $LFS/usr/share/man/man8/chroot.8
+#
+#   Adaptado para:
+#       - $ADM_DESTDIR como raiz de staging
+#       - opcionalmente $LFS (se definido)
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/coreutils-temp}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+dest="$ADM_DESTDIR"
+
+# ===== Ajustes dentro do DESTDIR =====
+
+usr_bin="$dest/usr/bin"
+usr_sbin="$dest/usr/sbin"
+man1="$dest/usr/share/man/man1"
+man8="$dest/usr/share/man/man8"
+
+# Move chroot para /usr/sbin
+if [[ -x "$usr_bin/chroot" || -f "$usr_bin/chroot" || -L "$usr_bin/chroot" ]]; then
+    mkdir -p "$usr_sbin"
+    echo "[hook-post-install][$pkg_id] Movendo chroot de $usr_bin para $usr_sbin..."
+    mv -v "$usr_bin/chroot" "$usr_sbin/"
+else
+    echo "[hook-post-install][$pkg_id] AVISO: chroot não encontrado em $usr_bin; pulando move no DESTDIR." >&2
+fi
+
+# Move manpage para seção 8
+if [[ -f "$man1/chroot.1" ]]; then
+    mkdir -p "$man8"
+    echo "[hook-post-install][$pkg_id] Movendo manpage chroot.1 -> man8/chroot.8 no DESTDIR..."
+    mv -v "$man1/chroot.1" "$man8/chroot.8"
+    # Ajusta a seção no cabeçalho
+    sed -i 's/"1"/"8"/' "$man8/chroot.8" || true
+else
+    echo "[hook-post-install][$pkg_id] AVISO: man1/chroot.1 não encontrada em $man1; pulando move de manpage no DESTDIR." >&2
+fi
+
+# ===== Ajuste opcional no LFS real =====
+# Se você estiver montando um /mnt/lfs e copiando DESTDIR para lá, podemos
+# garantir o mesmo layout lá também.
+
+if [[ -n "${LFS:-}" ]]; then
+    lfs_root="${LFS%/}"
+    lfs_usr_bin="$lfs_root/usr/bin"
+    lfs_usr_sbin="$lfs_root/usr/sbin"
+    lfs_man1="$lfs_root/usr/share/man/man1"
+    lfs_man8="$lfs_root/usr/share/man/man8"
+
+    # chroot
+    if [[ -x "$lfs_usr_bin/chroot" || -f "$lfs_usr_bin/chroot" || -L "$lfs_usr_bin/chroot" ]]; then
+        mkdir -p "$lfs_usr_sbin"
+        echo "[hook-post-install][$pkg_id] (LFS) Movendo chroot de $lfs_usr_bin para $lfs_usr_sbin..."
+        mv -v "$lfs_usr_bin/chroot" "$lfs_usr_sbin/"
+    fi
+
+    # manpage
+    if [[ -f "$lfs_man1/chroot.1" ]]; then
+        mkdir -p "$lfs_man8"
+        echo "[hook-post-install][$pkg_id] (LFS) Movendo manpage chroot.1 -> man8/chroot.8 ..."
+        mv -v "$lfs_man1/chroot.1" "$lfs_man8/chroot.8"
+        sed -i 's/"1"/"8"/' "$lfs_man8/chroot.8" || true
+    fi
+fi
+
+echo "[hook-post-install][$pkg_id] hook-post-install de Coreutils temporário concluído."
