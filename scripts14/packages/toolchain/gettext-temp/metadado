@@ -1,0 +1,31 @@
+name: gettext-temp
+version: 0.24
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/gettext/
+
+# ajuda o adm-profile a escolher profile toolchain/glibc
+libc: glibc
+
+summary: Gettext 0.24 temporário (msgfmt/msgmerge/xgettext) para LFS (cap. 7.7)
+description: >
+  Gettext 0.24 construído como ferramenta temporária dentro do chroot,
+  seguindo o capítulo 7.7 do LFS. Compila com --disable-shared e
+  instala apenas os binários msgfmt, msgmerge e xgettext, sem bibliotecas
+  compartilhadas, integrado ao pipeline ADM 2.0 com DESTDIR e hooks.
+
+# já estamos dentro do chroot com toolchain temporária pronta
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc toolchain/xz-temp toolchain/tar-temp toolchain/sed-temp toolchain/make-temp toolchain/coreutils-temp toolchain/bash-temp
+run_deps:
+opt_deps:
+
+# groups: para build-group e relatórios
+groups: toolchain temp-tools chroot gettext
+
+# Fonte oficial usada no LFS 12.3
+source_uri: https://ftp.gnu.org/gnu/gettext/gettext-0.24.tar.xz
+
+# Você disse que pode deixar em branco, então não preencho o checksum
+source_checksum:
