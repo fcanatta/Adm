@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/python-temp (LFS 7.10 + ADM 2.0)
+#
+# LFS:
+#   ./configure --prefix=/usr   \
+#               --enable-shared \
+#               --without-ensurepip
+#   make
+#   make install
+#
+# No ADM 2.0 o adm-build faz:
+#   ./configure --prefix=/usr
+#   make
+#   make DESTDIR="$ADM_DESTDIR" install
+#
+# Aqui transformamos ./configure em wrapper que:
+#   - força --prefix=/usr
+#   - força --enable-shared
+#   - força --without-ensurepip
+#   - ignora opções conflitantes vindas do adm-build
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/python-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$build_dir"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $build_dir; nada a fazer." >&2
+    exit 0
+fi
+
+# evita recriar wrapper se já existe
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure para Python 3.12.5 temporário (LFS 7.10 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/python-temp}"
+build_dir="$(pwd)"
+
+# Filtrar args vindos do adm-build
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--enable-shared|--disable-shared|--with-ensurepip|--without-ensurepip)
+            # vamos sobrescrever estes explicitamente
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+# Montar comando final igual ao livro
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--enable-shared"
+  "--without-ensurepip"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Python-3.12.5 (LFS/ADM 2.0)." >&2
