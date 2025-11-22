@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# hook-pre-build para toolchain/linux-headers
+#
+# Executado pelo adm-build ANTES da fase de build (make all / make install).
+#
+# Ambiente (exportado pelo adm_build_run_hook):
+#   ADM_PKG_ID
+#   ADM_BUILD_DIR_CURRENT  -> diretório de build / fonte (linux-6.17.8)
+#   ADM_DESTDIR            -> DESTDIR do pacote (onde o ADM vai empacotar)
+#   ADM_BUILD_SYSTEM       -> normalmente "plain-make" para o kernel
+#
+# Objetivo:
+#   - Reproduzir o passo 5.4 do LFS:
+#       make mrproper
+#       make headers
+#       find usr/include -type f ! -name '*.h' -delete
+#       cp -rv usr/include $LFS/usr
+#   - Adaptado para o ADM:
+#       - Instala os headers sanitizados em $ADM_DESTDIR/usr/include
+#       - Depois neutraliza os alvos "all" e "install" do Makefile
+#         para que o adm-build (plain-make) não tente compilar / instalar o kernel.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/linux-headers}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+# ADM_SYSROOT pode ser usado no futuro, mas aqui seguimos o modelo LFS
+# e instalamos em /usr/include via DESTDIR.
+# Se quiser somar sysroot, você pode adaptar depois para algo como:
+#   DESTROOT="${ADM_SYSROOT:-/}"
+#   TARGET_ROOT="$ADM_DESTDIR${DESTROOT%/}"
+# e copiar para "$TARGET_ROOT/usr/include".
+ADM_SYSROOT="${ADM_SYSROOT:-/}"
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+echo "[hook-pre-build][$ADM_PKG_ID] Limpando árvore do kernel (make mrproper)..."
+make mrproper
+
+echo "[hook-pre-build][$ADM_PKG_ID] Gerando Linux API headers (make headers)..."
+make headers
+
+echo "[hook-pre-build][$ADM_PKG_ID] Removendo arquivos não-.h de usr/include..."
+find usr/include -type f ! -name '*.h' -delete
+
+# Agora copiamos os headers saneados para dentro do DESTDIR.
+# O ADM depois empacota esse DESTDIR e instala em /, resultando em /usr/include
+# (tal como o LFS quer).
+echo "[hook-pre-build][$ADM_PKG_ID] Instalando headers saneados em \$DESTDIR/usr/include..."
+mkdir -p "$ADM_DESTDIR/usr" || {
+    echo "[hook-pre-build][$ADM_PKG_ID] Falha ao criar diretório $ADM_DESTDIR/usr" >&2
+    exit 1
+}
+
+cp -av usr/include "$ADM_DESTDIR/usr/" || {
+    echo "[hook-pre-build][$ADM_PKG_ID] Falha ao copiar usr/include para $ADM_DESTDIR/usr" >&2
+    exit 1
+}
+
+# IMPORTANTE:
+# O adm-build (build_system=plain-make) ainda vai chamar:
+#   make -j...
+#   make install DESTDIR=...
+#
+# Para evitar que isso tente compilar o kernel ou instalar coisas indevidas,
+# sobrescrevemos os alvos "all" e "install" com versões inofensivas.
+# Fazemos um append no Makefile.
+#
+# Isso é feio, mas é eficaz para este pacote especial de "headers-only".
+# Já fizemos tudo que interessa (headers em DESTDIR/usr/include).
+
+echo "[hook-pre-build][$ADM_PKG_ID] Neutralizando alvos 'all' e 'install' do Makefile para evitar build de kernel..."
+
+cat >> Makefile << 'EOF'
+
+# Alvos adicionados pelo ADM (toolchain/linux-headers)
+.PHONY: all install
+
+all:
+	@echo "ADM linux-headers: alvo 'all' ignorado (headers já gerados)."
+
+install:
+	@echo "ADM linux-headers: alvo 'install' ignorado (uso apenas de headers)."
+
+EOF
+
+echo "[hook-pre-build][$ADM_PKG_ID] Makefile ajustado; build principal do ADM será no-op para este pacote."
