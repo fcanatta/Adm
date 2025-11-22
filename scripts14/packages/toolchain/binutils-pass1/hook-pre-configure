@@ -3,27 +3,30 @@
 #
 # Executado pelo adm-build ANTES do ./configure.
 #
-# Ambiente (exportado pelo adm-build_run_hook):
+# Ambiente exportado pelo adm_build_run_hook:
 #   ADM_PKG_ID
 #   ADM_BUILD_DIR_CURRENT
 #   ADM_DESTDIR
 #   ADM_BUILD_SYSTEM
 #
-# Objetivo:
-#   - Configurar Binutils como cross (pass1), no estilo LFS:
-#       ../configure --prefix=$LFS/tools \
-#                    --with-sysroot=$LFS \
-#                    --target=$LFS_TGT   \
-#                    --disable-nls       \
-#                    --enable-gprofng=no \
-#                    --disable-werror    \
-#                    --enable-new-dtags  \
-#                    --enable-default-hash-style=gnu
-#     
-#   - Adaptado para o ADM:
-#       ADM_CROSS_TARGET   -> target
-#       ADM_CROSS_PREFIX   -> prefix
-#       ADM_SYSROOT        -> sysroot
+# Este hook adapta o binutils-pass1 ao livro LFS (cross, pass 1),
+# mas integrado ao pipeline do ADM:
+#
+#  - usa um diretório de build separado (build/)
+#  - força configure com:
+#      --prefix=$LFS/tools (ou /tools se LFS não existir)
+#      --with-sysroot=$LFS    (ou / se LFS não existir)
+#      --target=$LFS_TGT      (ou x86_64-lfs-linux-gnu)
+#      --disable-nls
+#      --enable-gprofng=no
+#      --disable-werror
+#      --enable-new-dtags
+#      --enable-default-hash-style=gnu
+#
+#  - remove qualquer --prefix injetado pelo adm-build.
+#
+# O restante do fluxo (make, make install DESTDIR=..., empacotar,
+# instalar em /, registrar no DB) continua controlado pelo adm-build.
 
 set -o errexit
 set -o nounset
@@ -34,17 +37,25 @@ set -o pipefail
 : "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
 
 # =========
-# 1. Parâmetros de cross (podem ser sobrescritos no ambiente ou profile)
+# 1. Detecta parâmetros de cross (LFS / defaults)
 # =========
 
-ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-ADM_SYSROOT="${ADM_SYSROOT:-/}"
+# Se o usuário definiu LFS/LFS_TGT como no livro, usamos isso.
+# Caso contrário, caímos nos defaults seguros.
+if [[ -n "${LFS:-}" ]]; then
+    : "${ADM_SYSROOT:=$LFS}"
+    : "${ADM_CROSS_PREFIX:=$LFS/tools}"
+else
+    : "${ADM_SYSROOT:=/}"
+    : "${ADM_CROSS_PREFIX:=/tools}"
+fi
+
+# Target padrão, se não vier nem de ADM_CROSS_TARGET nem de LFS_TGT
+: "${ADM_CROSS_TARGET:=${ADM_CROSS_TARGET:-${LFS_TGT:-x86_64-lfs-linux-gnu}}}"
 
 # =========
-# 2. PATH para toolchain cross (se já existir binutils de algum estágio anterior)
+# 2. Ajusta PATH para toolchain cross (se já existir)
 # =========
-# Ex: /usr/cross/<target>/bin/<target>-ld, <target>-as, etc.
 
 CROSS_BIN_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
 if [[ -d "$CROSS_BIN_DIR" ]]; then
@@ -52,7 +63,7 @@ if [[ -d "$CROSS_BIN_DIR" ]]; then
 fi
 
 # =========
-# 3. Envolver ./configure com wrapper
+# 3. Envolver ./configure com wrapper que segue o LFS
 # =========
 
 cd "$ADM_BUILD_DIR_CURRENT"
@@ -78,9 +89,16 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-ADM_SYSROOT="${ADM_SYSROOT:-/}"
+# Parâmetros de cross podem vir do ambiente ou assumir defaults
+if [[ -n "${LFS:-}" ]]; then
+    : "${ADM_SYSROOT:=$LFS}"
+    : "${ADM_CROSS_PREFIX:=$LFS/tools}"
+else
+    : "${ADM_SYSROOT:=/}"
+    : "${ADM_CROSS_PREFIX:=/tools}"
+fi
+
+: "${ADM_CROSS_TARGET:=${ADM_CROSS_TARGET:-${LFS_TGT:-x86_64-lfs-linux-gnu}}}"
 
 # Resolve diretório real do script
 src="${BASH_SOURCE[0]:-$0}"
@@ -94,31 +112,39 @@ while [ -L "$src" ]; do
 done
 cd "$(dirname "$src")" >/dev/null 2>&1
 
-# Remove o "--prefix=/usr" que o adm-build passa fixo
+# Vamos construir em um subdiretório "build" como no LFS
+mkdir -p build
+cd build
+
+# Filtra qualquer --prefix=... que o adm-build tenha passado
 filtered_args=()
 for a in "$@"; do
-    if [[ "$a" == "--prefix=/usr" ]]; then
-        continue
-    fi
-    filtered_args+=("$a")
+    case "$a" in
+        --prefix=*) ;;
+        *) filtered_args+=("$a") ;;
+    esac
 done
 
 extra_cfg=(
-  "--target=${ADM_CROSS_TARGET}"
-  "--prefix=${ADM_CROSS_PREFIX}"
-  "--with-sysroot=${ADM_SYSROOT}"
-  "--disable-nls"
-  "--enable-gprofng=no"
-  "--disable-werror"
-  "--enable-new-dtags"
-  "--enable-default-hash-style=gnu"
+    "--prefix=${ADM_CROSS_PREFIX}"
+    "--with-sysroot=${ADM_SYSROOT}"
+    "--target=${ADM_CROSS_TARGET}"
+    "--disable-nls"
+    "--enable-gprofng=no"
+    "--disable-werror"
+    "--enable-new-dtags"
+    "--enable-default-hash-style=gnu"
 )
 
 echo "[configure-wrapper][binutils-pass1] target=${ADM_CROSS_TARGET} prefix=${ADM_CROSS_PREFIX} sysroot=${ADM_SYSROOT}" >&2
 
-exec bash ./configure.orig "${extra_cfg[@]}" "${filtered_args[@]}"
+# ../configure.orig é o configure original do binutils
+exec bash ../configure.orig "${filtered_args[@]}" "${extra_cfg[@]}"
 EOF
 
 chmod +x ./configure
 
-echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure criado: target=${ADM_CROSS_TARGET}, prefix=${ADM_CROSS_PREFIX}, sysroot=${ADM_SYSROOT}"
+echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure criado:"
+echo "  target=${ADM_CROSS_TARGET}"
+echo "  prefix=${ADM_CROSS_PREFIX}"
+echo "  sysroot=${ADM_SYSROOT}"
