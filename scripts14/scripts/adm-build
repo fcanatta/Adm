@@ -185,6 +185,131 @@ adm_build_log_file_for_pkg() {
 }
 
 # =========
+# Integração com adm-profile
+# =========
+
+adm_build_profile_exists() {
+    local id="$1"
+    local path
+    path="$(adm_profile_id_to_path "$id")"
+    [[ -f "$path" ]]
+}
+
+adm_build_guess_libc_for_pkg() {
+    # Tenta descobrir o libc alvo a partir do metadado (campo 'libc:').
+    # Se não achar, assume glibc.
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+
+    if [[ -f "$meta" ]]; then
+        local libc
+        libc="$(adm_build_read_meta_single "$meta" "libc" || true)"
+        if [[ -n "$libc" ]]; then
+            echo "$libc"
+            return 0
+        fi
+    fi
+
+    echo "glibc"
+}
+
+adm_build_guess_kind_for_pkg() {
+    # Define se o pacote é "toolchain" ou "normal" usando category/groups.
+    local pkg_id="$1"
+    local meta
+    meta="$(adm_build_metadado_path "$pkg_id")"
+
+    local category groups
+    category="$(adm_build_read_meta_single "$meta" "category" || true)"
+    groups="$(adm_build_read_meta_single "$meta" "groups" || true)"
+
+    if echo "$category $groups" | grep -qi "toolchain"; then
+        echo "toolchain"
+    else
+        echo "normal"
+    fi
+}
+
+adm_build_resolve_profile_for_pkg() {
+    # Decide qual profile aplicar.
+    #
+    # Prioridade:
+    #   1. ADM_BUILD_PROFILE_OVERRIDE  (CLI/env)
+    #   2. adm-profile current         (se existir e válido)
+    #   3. Heurística:
+    #        - kind=toolchain -> toolchain/safe-<libc>
+    #        - kind=normal    -> <libc>/extreme
+    #   4. Fallback:
+    #        - glibc/extreme
+    #        - toolchain/safe-glibc
+    local pkg_id="$1"
+
+    # 1) override explícito
+    if [[ -n "${ADM_BUILD_PROFILE_OVERRIDE:-}" ]]; then
+        echo "$ADM_BUILD_PROFILE_OVERRIDE"
+        return 0
+    fi
+
+    # 2) profile atual
+    local cur
+    cur="$(adm_profile_get_current || true)"
+    if [[ -n "$cur" ]] && adm_build_profile_exists "$cur"; then
+        echo "$cur"
+        return 0
+    fi
+
+    # 3) heurística
+    local libc kind cand
+    libc="$(adm_build_guess_libc_for_pkg "$pkg_id")"
+    kind="$(adm_build_guess_kind_for_pkg "$pkg_id")"
+
+    if [[ "$kind" == "toolchain" ]]; then
+        cand="toolchain/safe-${libc}"
+        if adm_build_profile_exists "$cand"; then
+            echo "$cand"
+            return 0
+        fi
+    fi
+
+    cand="${libc}/extreme"
+    if adm_build_profile_exists "$cand"; then
+        echo "$cand"
+        return 0
+    fi
+
+    # 4) fallback
+    if adm_build_profile_exists "glibc/extreme"; then
+        echo "glibc/extreme"
+        return 0
+    fi
+    if adm_build_profile_exists "toolchain/safe-glibc"; then
+        echo "toolchain/safe-glibc"
+        return 0
+    fi
+
+    # último recurso: nenhum profile
+    echo ""
+}
+
+adm_build_apply_profile_for_pkg() {
+    # Aplica profile (CFLAGS/CXXFLAGS/LDFLAGS/MAKEFLAGS, ADM_PROFILE_*)
+    # para o PKG_ID.
+    local pkg_id="$1"
+
+    local pid
+    pid="$(adm_build_resolve_profile_for_pkg "$pkg_id" || true)"
+
+    if [[ -z "$pid" ]]; then
+        adm_log_warn "Nenhum profile válido encontrado para $pkg_id; usando flags atuais do ambiente."
+        return 0
+    fi
+
+    adm_log_info "Aplicando profile para $pkg_id: $pid"
+    adm_profile_load_env "$pid"
+}
+
+# =========
 # Execução de comandos de build com log + métricas + DRY-RUN
 # =========
 
@@ -746,9 +871,13 @@ adm_build_one_pkg_no_deps() {
     adm_log_phase_header "Building $pkg_id $version-$release"
     adm_event_pkg "PKG_BUILD_START" "$pkg_id" "version=$version release=$release"
 
+    # Aplica profile de compilação
+    adm_build_apply_profile_for_pkg "$pkg_id"
+
     # Verifica se já existe binário em cache e não é FORCE
     local binpkg
     binpkg="$(adm_build_binpkg_path_for_pkg "$pkg_id")"
+    
     if [[ "$ADM_BUILD_FORCE" -eq 0 && -f "$binpkg" ]]; then
         adm_log_warn "Binário em cache já existe para $pkg_id: $binpkg"
         adm_log_info "Reutilizando binário de cache (use ADM_BUILD_FORCE=1 para recompilar)."
