@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/ncurses-temp (LFS 6.3 + ADM 2.0)
+#
+# Responsável por:
+#   - Construir tic nativo e instalar em $LFS/tools/bin (ou ADM_DESTDIR/tools/bin)
+#   - Criar wrapper ./configure alinhado ao capítulo 6.3 do LFS:
+#       ./configure --prefix=/usr                \
+#                   --host=$LFS_TGT              \
+#                   --build=$(./config.guess)    \
+#                   --mandir=/usr/share/man      \
+#                   --with-manpage-format=normal \
+#                   --with-shared                \
+#                   --without-normal             \
+#                   --with-cxx-shared            \
+#                   --without-debug              \
+#                   --without-ada                \
+#                   --disable-stripping          \
+#                   AWK=gawk
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/ncurses-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+src_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$src_dir"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $src_dir; nada a fazer." >&2
+    exit 0
+fi
+
+# =====================================================
+# 1) Build do 'tic' nativo em build/ e instalação em tools/bin
+# =====================================================
+
+# Se já tiver um tic-build.stamp, assumimos que esta parte já rodou (rebuilds).
+if [[ ! -f ".adm-tic-built.stamp" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Construindo tic nativo (build host)..." >&2
+
+    build_tic_dir="$src_dir/build"
+    mkdir -p "$build_tic_dir"
+
+    pushd "$build_tic_dir" >/dev/null
+
+    # Prefixo de instalação para o tic:
+    # - se LFS definido: $LFS/tools (igual livro)
+    # - senão: ADM_DESTDIR/tools (mantém integridade com staging do ADM)
+    if [[ -n "${LFS:-}" ]]; then
+        tic_prefix="${LFS%/}/tools"
+    else
+        tic_prefix="${ADM_DESTDIR%/}/tools"
+    fi
+
+    mkdir -p "$tic_prefix/bin"
+
+    # configure host-side para tic
+    ../configure --prefix="$tic_prefix" AWK=gawk
+
+    make -C include
+    make -C progs tic
+
+    install -v -m755 progs/tic "$tic_prefix/bin/"
+
+    popd >/dev/null
+
+    touch ".adm-tic-built.stamp"
+    echo "[hook-pre-configure][$pkg_id] tic construído e instalado em $tic_prefix/bin/tic." >&2
+else
+    echo "[hook-pre-configure][$pkg_id] tic já foi construído anteriormente; pulando etapa." >&2
+fi
+
+# =====================================================
+# 2) Wrapper ./configure (cross LFS + ADM)
+# =====================================================
+
+# Se já criamos um wrapper antes, não sobrescreve
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando recriação." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure gerado pelo hook-pre-configure do ADM (ncurses-temp)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/ncurses-temp}"
+build_dir="$(pwd)"
+
+# ===== Descobrir HOST (alvo cross) =====
+host="${LFS_TGT:-${ADM_CROSS_TARGET:-}}"
+
+if [[ -z "$host" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+        host="$(gcc -dumpmachine 2>/dev/null || true)"
+    fi
+fi
+
+if [[ -z "$host" ]]; then
+    # fallback desesperado
+    if [[ -x "$build_dir/config.guess" ]]; then
+        host="$("$build_dir/config.guess")"
+    elif [[ -x "$build_dir/build-aux/config.guess" ]]; then
+        host="$("$build_dir/build-aux/config.guess")"
+    else
+        printf 'ADM-ERROR[%s]: não consegui determinar HOST (LFS_TGT/ADM_CROSS_TARGET/gcc -dumpmachine).\n' \
+            "$pkg_id" >&2
+        exit 1
+    fi
+fi
+
+# ===== Descobrir BUILD =====
+if [[ -x "$build_dir/config.guess" ]]; then
+    build="$("$build_dir/config.guess")"
+elif [[ -x "$build_dir/build-aux/config.guess" ]]; then
+    build="$("$build_dir/build-aux/config.guess")"
+else
+    if command -v gcc >/dev/null 2>&1; then
+        build="$(gcc -dumpmachine 2>/dev/null || echo "$host")"
+    else
+        build="$host"
+    fi
+fi
+
+# AWK preferido
+awk_prog="${ADM_AWK:-gawk}"
+
+# Filtrar args vindo do adm-build para evitar conflitos
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--host=*|--build=*|--mandir=*|AWK=* )
+            # Ignora, vamos forçar os nossos
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+# Monta comando final (LFS 6.3)
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--host=${host}"
+  "--build=${build}"
+  "--mandir=/usr/share/man"
+  "--with-manpage-format=normal"
+  "--with-shared"
+  "--without-normal"
+  "--with-cxx-shared"
+  "--without-debug"
+  "--without-ada"
+  "--disable-stripping"
+  "AWK=${awk_prog}"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Ncurses (cross LFS/ADM 2.0)." >&2
