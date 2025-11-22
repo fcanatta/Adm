@@ -1,0 +1,2 @@
+# Antes de rodar o build exportar o locale
+export ADM_TIMEZONE="America/Sao_Paulo"
