@@ -1,0 +1,36 @@
+name: gcc-pass2
+version: 12.2.0
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://gcc.gnu.org/
+
+# ajuda o adm-build a escolher profile (toolchain + glibc)
+libc: glibc
+
+summary: GCC 12.2.0 - Pass 2 temporário (cross) para LFS (chap. 6.18)
+description: >
+  GCC 12.2.0 construído como ferramenta temporária (Pass 2) seguindo o
+  capítulo 6.18 do LFS. Usa GMP, MPFR e MPC empacotados dentro da árvore
+  do GCC, compila como cross (build/host/target = LFS_TGT), com
+  --with-build-sysroot=$LFS e LDFLAGS_FOR_TARGET para usar a libgcc
+  compartilhada. Integrado ao pipeline ADM 2.0 (DESTDIR, profiles,
+  métricas e hooks).
+
+# Dependências de build: toolchain + temp-tools necessários
+build_deps: toolchain/binutils-pass2 toolchain/binutils-pass1 toolchain/gcc-pass1 toolchain/glibc toolchain/linux-headers toolchain/m4-temp toolchain/ncurses-temp toolchain/bash-temp toolchain/coreutils-temp toolchain/diffutils-temp toolchain/file-temp toolchain/findutils-temp toolchain/gawk-temp toolchain/grep-temp toolchain/gzip-temp toolchain/make-temp toolchain/patch-temp toolchain/sed-temp toolchain/tar-temp toolchain/xz-temp
+run_deps:
+opt_deps:
+
+# Grupos usados por build-group, relatórios e heurísticas
+groups: toolchain temp-tools cross gcc pass2
+
+# Fontes (mesmas versões do LFS para o Pass 2)
+source_uri: https://ftp.gnu.org/gnu/gcc/gcc-12.2.0/gcc-12.2.0.tar.xz
+source_uri: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.0.tar.xz
+source_uri: https://ftp.gnu.org/gnu/gmp/gmp-6.2.1.tar.xz
+source_uri: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+
+# Você disse que pode pular sha256, então não coloco nenhum aqui.
+# Se quiser, é só adicionar um source_checksum: por linha de source_uri.
