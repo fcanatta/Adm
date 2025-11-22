@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/binutils-pass2 (LFS 6.17 + ADM 2.0)
+#
+# LFS:
+#   rm -v $LFS/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la}
+#
+# Aqui fazemos o equivalente em $ADM_DESTDIR.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/binutils-pass2}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+destdir="$ADM_DESTDIR"
+
+libs=(bfd ctf ctf-nobfd opcodes sframe)
+exts=(a la)
+
+for lib in "${libs[@]}"; do
+    for ext in "${exts[@]}"; do
+        path="$destdir/usr/lib/lib${lib}.${ext}"
+        if [[ -e "$path" ]]; then
+            if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+                echo "[hook-post-install][$pkg_id][DRY-RUN] Removeria $path" >&2
+            else
+                echo "[hook-post-install][$pkg_id] Removendo $path (como no LFS)..." >&2
+                rm -v "$path"
+            fi
+        else
+            echo "[hook-post-install][$pkg_id] $path não existe; nada a remover." >&2
+        fi
+    done
+done
