@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/coreutils-temp (LFS 6.5 + ADM 2.0)
+#
+# Transforma ./configure em um wrapper que aplica exatamente:
+#   ./configure --prefix=/usr                     \
+#               --host=$LFS_TGT                   \
+#               --build=$(build-aux/config.guess) \
+#               --enable-install-program=hostname \
+#               --enable-no-install-program=kill,uptime
+#
+# O restante do fluxo (make / make DESTDIR=... install) fica a cargo do adm-build.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/coreutils-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$build_dir"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $build_dir; nada a fazer." >&2
+    exit 0
+fi
+
+# Evita recriar wrapper se já existir
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure para Coreutils temporário (LFS 6.5 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/coreutils-temp}"
+build_dir="$(pwd)"
+
+# ===== Determinar HOST =====
+# Prioridade:
+#   1) LFS_TGT
+#   2) ADM_CROSS_TARGET
+#   3) gcc -dumpmachine
+#   4) build-aux/config.guess (fallback final)
+host="${LFS_TGT:-${ADM_CROSS_TARGET:-}}"
+
+if [[ -z "$host" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+        host="$(gcc -dumpmachine 2>/dev/null || true)"
+    fi
+fi
+
+if [[ -z "$host" ]]; then
+    if [[ -x "$build_dir/build-aux/config.guess" ]]; then
+        host="$("$build_dir/build-aux/config.guess")"
+    else
+        printf 'ADM-ERROR[%s]: não consegui determinar HOST (LFS_TGT/ADM_CROSS_TARGET/gcc/config.guess).\n' \
+            "$pkg_id" >&2
+        exit 1
+    fi
+fi
+
+# ===== Determinar BUILD =====
+if [[ -x "$build_dir/build-aux/config.guess" ]]; then
+    build="$("$build_dir/build-aux/config.guess")"
+else
+    if command -v gcc >/dev/null 2>&1; then
+        build="$(gcc -dumpmachine 2>/dev/null || echo "$host")"
+    else
+        build="$host"
+    fi
+fi
+
+# ===== Filtrar args vindos do adm-build =====
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--host=*|--build=*|--enable-install-program=*|--enable-no-install-program=*)
+            # Ignora: vamos forçar os nossos valores
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+# ===== Montar comando final =====
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--host=${host}"
+  "--build=${build}"
+  "--enable-install-program=hostname"
+  "--enable-no-install-program=kill,uptime"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Coreutils-9.8 (cross LFS/ADM 2.0)." >&2
