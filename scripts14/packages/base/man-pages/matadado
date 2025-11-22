@@ -1,0 +1,30 @@
+name: man-pages
+version: 6.16
+release: 1
+
+category: base
+license: Various
+url: https://www.kernel.org/doc/man-pages/
+
+libc: glibc
+
+summary: Man-pages 6.16 para LFS (cap. 8.3)
+description: >
+  Coleção de páginas de manual do sistema, versão 6.16, instalada conforme
+  o capítulo 8.3 do LFS: remoção das páginas crypt* substituídas por
+  libxcrypt e instalação com make -R GIT=false prefix=/usr install.
+  Integrado ao ADM 2.0 usando DESTDIR para empacotar em /usr.
+
+# Já na base dentro do chroot com toolchain final funcional
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc base/texinfo-temp base/util-linux-temp toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp
+run_deps:
+opt_deps:
+
+# groups para build-group da base, relatórios, etc.
+groups: base docs man-pages
+
+# tarball oficial do livro (Man-pages-6.16)
+source_uri: https://www.kernel.org/pub/linux/docs/man-pages/man-pages-6.16.tar.xz
+
+# pode preencher depois com o sha256 oficial se quiser
+source_checksum:
