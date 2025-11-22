@@ -1,0 +1,30 @@
+name: texinfo-temp
+version: 7.1
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/texinfo/
+
+libc: glibc
+
+summary: Texinfo 7.1 temporário para LFS (cap. 7.11, chroot)
+description: >
+  Texinfo 7.1 construído como ferramenta temporária dentro do chroot,
+  seguindo o capítulo 7.11 do LFS. Configurado com ./configure --prefix=/usr
+  e instalado via make install, integrado ao pipeline ADM 2.0 usando
+  DESTDIR para instalar em /usr dentro do sysroot.
+
+# Toolchain e ferramentas básicas já ativas no chroot
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp
+run_deps:
+opt_deps:
+
+# groups para build-group e relatórios
+groups: toolchain temp-tools chroot texinfo
+
+# Tarball oficial (mesma versão do livro)
+source_uri: https://ftp.gnu.org/gnu/texinfo/texinfo-7.1.tar.xz
+
+# pode preencher depois com o sha256 se quiser
+source_checksum:
