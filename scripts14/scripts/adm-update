@@ -11,14 +11,14 @@
 #   - Rodar adm-fetch + adm-scan na nova versão
 #   - Detectar novas dependências de build (comparando com as antigas)
 #   - Gerar metadados stub para novas deps (se não existirem)
-#   - Registrar pacote + novas deps em uma lista de upgrade (para adm-upgrade)
+#   - Registrar pacote + novas deps em uma lista de upgrade (pending.list, usada por adm-upgrade)
 #
-# API CLI:
+# CLI:
 #   adm-update check PKG_ID
 #       - Só checa se existe nova versão upstream, sem alterar nada.
 #
 #   adm-update apply PKG_ID
-#       - Aplica update de versão + URIs + checksums + scan + deps + lista de upgrade.
+#       - Aplica update de versão + URIs + checksums + scan + deps + pending.list.
 #
 #   adm-update list-pending
 #       - Lista pacotes pendentes de upgrade (fila gerada pelo adm-update apply).
@@ -27,13 +27,8 @@
 #       - Limpa fila de upgrade.
 #
 # Variáveis importantes:
-#   ADM_DRY_RUN=1   -> não altera arquivos, nem escreve lista; só mostra o que faria.
-#
-# Limitações intencionais:
-#   - Descoberta de nova versão hoje é implementada apenas para upstreams git
-#     (url: ou source_uri: apontando para repositório git).
-#   - Outros casos geram warning e não fazem update automático (podem ser tratados
-#     via hooks no futuro).
+#   ADM_DRY_RUN=1
+#       -> não altera arquivos nem escreve pending.list; só mostra o que faria.
 
 set -o errexit
 set -o nounset
@@ -45,6 +40,7 @@ set -o pipefail
 
 _adm_update_script_dir() {
     local src="${BASH_SOURCE[0]:-$0}"
+
     while [ -L "$src" ]; do
         local target
         target=$(readlink "$src") || break
@@ -54,6 +50,7 @@ _adm_update_script_dir() {
             src="$(dirname "$src")/$target"
         fi
     done
+
     cd "$(dirname "$src")" >/dev/null 2>&1 || {
         printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-update.\n' >&2
         exit 1
@@ -97,6 +94,11 @@ adm_update_metadado_path() {
 }
 
 adm_update_read_meta_single() {
+    # Lê um campo simples do metadado (funciona com "key: valor" ou
+    # em duas linhas "key:" / "  valor").
+    #
+    # Uso:
+    #   adm_update_read_meta_single META key
     local file="${1:-}"
     local key="${2:-}"
 
@@ -105,6 +107,7 @@ adm_update_read_meta_single() {
     fi
 
     awk -v k="$key" -F':' '
+        # linha só com a chave (key:)
         $1 ~ "^[[:space:]]*"k"[[:space:]]*$" && NF==1 {
             if (getline line > 0) {
                 sub(/^[[:space:]]+/, "", line)
@@ -113,6 +116,7 @@ adm_update_read_meta_single() {
                 exit 0
             }
         }
+        # linha key: valor...
         $1 ~ "^[[:space:]]*"k"[[:space:]]*" && NF>=2 {
             $1=""
             sub(/^[[:space:]]+/, "", $0)
@@ -146,20 +150,19 @@ adm_update_guess_upstream_url() {
     # Saída:
     #   URL ou vazio
     local meta="${1:-}"
-
     local url
+
     url="$(adm_update_read_meta_single "$meta" "url" || true)"
 
-    if [[ -n "$url" && "$(adm_fetch_is_git_uri "$url"; echo $?)" -eq 0 ]]; then
+    if [[ -n "$url" ]] && adm_fetch_is_git_uri "$url"; then
         printf '%s\n' "$url"
         return 0
     fi
 
-    # pega primeira source_uri
     local first_src
     first_src="$(adm_fetch_read_meta_field_all "$meta" "source_uri" | head -n1 || true)"
 
-    if [[ -n "$first_src" && "$(adm_fetch_is_git_uri "$first_src"; echo $?)" -eq 0 ]]; then
+    if [[ -n "$first_src" ]] && adm_fetch_is_git_uri "$first_src"; then
         printf '%s\n' "$first_src"
         return 0
     fi
@@ -188,16 +191,13 @@ adm_update_pending_add() {
 
     adm_with_lock "updates-pending" bash -c '
         local file="$1" pkg="$2"
-
         touch "$file" || {
             printf "ADM-ERROR: não foi possível acessar %s\n" "$file" >&2
             exit 1
         }
-
         if grep -qxF "$pkg" "$file" 2>/dev/null; then
             exit 0
         fi
-
         printf "%s\n" "$pkg" >>"$file" || {
             printf "ADM-ERROR: falha ao adicionar %s em %s\n" "$pkg" "$file" >&2
             exit 1
@@ -212,6 +212,7 @@ adm_update_pending_list() {
         adm_log_info "Nenhum pacote pendente de upgrade."
         return 0
     fi
+
     cat "$ADM_DB_UPDATES_PENDING"
 }
 
@@ -220,9 +221,12 @@ adm_update_pending_clear() {
         adm_log_info "[DRY-RUN] Não limpando pending.list."
         return 0
     fi
+
     if [[ -f "$ADM_DB_UPDATES_PENDING" ]]; then
-        rm -f "$ADM_DB_UPDATES_PENDING" || adm_log_fatal "Não foi possível remover '$ADM_DB_UPDATES_PENDING'."
+        rm -f "$ADM_DB_UPDATES_PENDING" \
+            || adm_log_fatal "Não foi possível remover '$ADM_DB_UPDATES_PENDING'."
     fi
+
     adm_log_ok "Fila de upgrade limpa."
 }
 
@@ -235,7 +239,7 @@ adm_update_detect_latest_git_tag() {
     #   adm_update_detect_latest_git_tag URL CURRENT_VERSION
     #
     # Saída:
-    #   new_version<TAB>new_tag  (se new_version > current_version)
+    #   new_version<tab>new_tag
     #
     # Retornos:
     #   0 -> sucesso, há versão nova
@@ -254,9 +258,11 @@ adm_update_detect_latest_git_tag() {
         return 1
     fi
 
-    # lista tags
     local tags
-    if ! tags="$(git ls-remote --tags "$url" 2>/dev/null | awk '{print $2}' | sed 's#refs/tags/##' | sed 's/\^{}$//' )"; then
+    if ! tags="$(git ls-remote --tags "$url" 2>/dev/null \
+                | awk '{print $2}' \
+                | sed 's#refs/tags/##' \
+                | sed 's/\^{}$//')"; then
         adm_log_warn "Falha ao executar 'git ls-remote --tags' em '$url'."
         return 1
     fi
@@ -266,14 +272,14 @@ adm_update_detect_latest_git_tag() {
         return 2
     fi
 
-    # escolhe a "maior" via sort -V
-    if ! sort -V </dev/null >/dev/null 2>&1; then
+    if ! sort -V /dev/null 2>&1; then
         adm_log_warn "sort -V não disponível; comparação de versões pode ser imprecisa."
     fi
 
     local best_tag best_ver
     best_tag="$(printf '%s\n' "$tags" | sort -V | tail -n1)"
-    # remove prefixo 'v' se houver
+
+    # remove prefixo v/V se houver
     best_ver="${best_tag#v}"
     best_ver="${best_ver#V}"
 
@@ -285,12 +291,10 @@ adm_update_detect_latest_git_tag() {
         return 3
     fi
 
-    # compara current vs best_ver
-    if sort -V </dev/null >/dev/null 2>&1; then
+    if sort -V /dev/null 2>&1; then
         local highest
         highest="$(printf '%s\n%s\n' "$current" "$best_ver" | sort -V | tail -n1)"
         if [[ "$highest" == "$current" && "$current" != "$best_ver" ]]; then
-            # current > best -> não faz sentido atualizar
             adm_log_warn "Versão atual ($current) é >= última tag ($best_ver) em '$url'."
             return 3
         fi
@@ -305,16 +309,16 @@ adm_update_detect_new_version() {
     #   adm_update_detect_new_version PKG_ID
     #
     # Saída:
-    #   new_version<TAB>new_tag
+    #   new_version<tab>new_tag
     #
     # Retornos:
     #   0 -> ok, existe nova versão
     #   1 -> erro ou não suportado
     #   2 -> sem nova versão (igual ou mais antiga)
     local pkg_id="${1:-}"
-
     local meta
     meta="$(adm_update_metadado_path "$pkg_id")"
+
     if [[ ! -f "$meta" ]]; then
         adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
     fi
@@ -348,7 +352,6 @@ adm_update_detect_new_version() {
         return 1
     fi
 
-    # se new_ver == current, não há nova
     if [[ "$new_ver" == "$current" ]]; then
         return 2
     fi
@@ -403,11 +406,11 @@ adm_update_edit_meta_version_and_sources() {
     fi
 
     local tmp
-    tmp="$(mktemp "$ADM_TMP_DIR/meta-update-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para meta update."
+    tmp="$(mktemp "$ADM_TMP_DIR/meta-update-XXXXXX")" \
+        || adm_log_fatal "Falha ao criar tmp para meta update."
 
-    # 1) Atualiza versão e URIs
     awk -v oldv="$oldver" -v newv="$newver" '
-        function replace_version_in_uri(line,    idx) {
+        function replace_version_in_uri(line, idx) {
             idx = index(line, oldv)
             if (idx > 0) {
                 sub(oldv, newv, line)
@@ -419,31 +422,35 @@ adm_update_edit_meta_version_and_sources() {
             if ($1 ~ "^[[:space:]]*source_checksum[[:space:]]*:") {
                 next
             }
+
             # version:
             if ($1 ~ "^[[:space:]]*version[[:space:]]*:") {
                 print "version: " newv
                 next
             }
+
             # source_uri:
             if ($1 ~ "^[[:space:]]*source_uri[[:space:]]*:") {
-                # reconstrói linha
                 line=$0
                 sub(/^[[:space:]]*source_uri[[:space:]]*:[[:space:]]*/, "source_uri: ", line)
                 line=replace_version_in_uri(line)
                 print line
                 next
             }
+
             print
         }
     ' "$meta" >"$tmp" || adm_log_fatal "Falha ao reescrever metadado temporário para '$meta'."
 
     mv "$tmp" "$meta" || adm_log_fatal "Falha ao aplicar atualização de metadado em '$meta'."
+
     adm_log_ok "Metadado atualizado para versão $newver (URIs ajustadas e checksums limpos)."
 }
 
 adm_update_recompute_checksums() {
-    # Recalcula source_checksum: chamando adm-fetch para baixar novas fontes
-    # e anotando sha256 para cada source_uri.
+    # Recalcula source_checksum:
+    #   - chamando adm-fetch para baixar novas fontes
+    #   - anotando sha256 para cada source_uri.
     #
     # Uso:
     #   adm_update_recompute_checksums PKG_ID META
@@ -470,9 +477,9 @@ adm_update_recompute_checksums() {
     adm_log_phase "Recalculando checksums para $pkg_id a partir de $meta"
 
     local src_list
-    src_list="$(adm-fetch fetch-from-meta "$pkg_id" "$meta")" || adm_log_fatal "Falha em adm-fetch para $pkg_id durante recálculo."
+    src_list="$(adm-fetch fetch-from-meta "$pkg_id" "$meta")" \
+        || adm_log_fatal "Falha em adm-fetch para $pkg_id durante recálculo."
 
-    # append novas linhas source_checksum: ao final do metadado
     local f sum
     while IFS= read -r f; do
         [[ -z "$f" ]] && continue
@@ -480,7 +487,8 @@ adm_update_recompute_checksums() {
             adm_log_fatal "Fonte baixada não encontrada para checksum: '$f'"
         fi
         sum="$(sha256sum "$f" | awk '{print $1}')"
-        echo "source_checksum: $sum" >>"$meta" || adm_log_fatal "Falha ao escrever source_checksum em '$meta'."
+        echo "source_checksum: $sum" >>"$meta" \
+            || adm_log_fatal "Falha ao escrever source_checksum em '$meta'."
     done <<<"$src_list"
 
     adm_log_ok "Checksums recalculados e gravados em $meta."
@@ -500,7 +508,6 @@ adm_update_compare_build_deps() {
     local old="$1"
     local new="$2"
 
-    # bota cada um em uma linha e usa awk para diferença
     printf '%s\n' "$new" \
         | tr ' ' '\n' \
         | sed '/^$/d' \
@@ -525,6 +532,7 @@ adm_update_ensure_stub_metadata_for_pkg() {
     # Uso:
     #   adm_update_ensure_stub_metadata_for_pkg PKG_ID
     local dep_id="${1:-}"
+
     if [[ -z "$dep_id" ]]; then
         return 0
     fi
@@ -550,34 +558,26 @@ adm_update_ensure_stub_metadata_for_pkg() {
     mkdir -p "$dir" || adm_log_fatal "Falha ao criar diretório para metadado de dep $dep_id: '$dir'"
 
     cat >"$meta" <<EOF
+# Metadado stub gerado automaticamente por adm-update para dependência descoberta.
 name: $name
 version: 0
 release: 1
 category: $cat
-license: UNKNOWN
+license: TODO
 url:
-
 build_deps:
 run_deps:
 opt_deps:
-
 groups:
-
-# TODO: preencher source_uri/source_checksum manualmente
 source_uri:
 source_checksum:
 EOF
 
     adm_log_warn "Metadado stub criado para dependência nova: $dep_id ($meta)"
-    adm_event_pkg "PKG_STUB_META_CREATED" "$dep_id" "meta=$meta"
 }
 
 adm_update_scan_and_new_deps() {
-    # Depois de atualizar metadado e checksums:
-    #   - roda adm-scan para gerar novo .plan
-    #   - obtém novos build_deps via adm-deps
-    #   - compara com build_deps antigos e gera metas stub para novos
-    #   - adiciona deps novas na fila de upgrade
+    # Roda adm-fetch + adm-scan na nova versão e detecta novas build_deps.
     #
     # Uso:
     #   adm_update_scan_and_new_deps PKG_ID META OLD_BUILD_DEPS
@@ -585,22 +585,16 @@ adm_update_scan_and_new_deps() {
     local meta="${2:-}"
     local old_build_deps="${3:-}"
 
-    if [[ ! -f "$meta" ]]; then
-        adm_log_fatal "Metadado não encontrado em adm_update_scan_and_new_deps: '$meta'"
-    fi
-
     if ! command -v adm-scan >/dev/null 2>&1; then
         adm_log_fatal "'adm-scan' não encontrado no PATH; não é possível recalcular plano/deps."
     fi
 
-    # Precisamos de fontes baixadas; adm_update_recompute_checksums já fez adm-fetch,
-    # mas aqui garantimos com fetch de novo (sem custo em cache).
-    local src_list
     if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
         adm_log_info "[DRY-RUN][$pkg_id] Rodaria adm-fetch + adm-scan para descobrir novas dependências."
         return 0
     fi
 
+    local src_list
     src_list="$(adm-fetch fetch-from-meta "$pkg_id" "$meta")"
 
     local plan
@@ -615,8 +609,8 @@ adm_update_scan_and_new_deps() {
     local new_build_deps
     new_build_deps="$(adm_deps_get_build_deps "$pkg_id" || true)"
 
-    adm_log_info "Build deps antigos de $pkg_id: ${old_build_deps:-<nenhum>}"
-    adm_log_info "Build deps novos de $pkg_id:   ${new_build_deps:-<nenhum>}"
+    adm_log_info "Build deps antigos de $pkg_id: ${old_build_deps:-}"
+    adm_log_info "Build deps novos   de $pkg_id: ${new_build_deps:-}"
 
     local new_only
     new_only="$(adm_update_compare_build_deps "$old_build_deps" "$new_build_deps" || true)"
@@ -645,9 +639,9 @@ adm_update_check_one() {
     # Uso:
     #   adm_update_check_one PKG_ID
     local pkg_id="${1:-}"
-
     local meta
     meta="$(adm_update_metadado_path "$pkg_id")"
+
     if [[ ! -f "$meta" ]]; then
         adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
     fi
@@ -677,7 +671,6 @@ adm_update_check_one() {
 
     adm_log_ok "Nova versão disponível para $pkg_id: $current → $new_ver (tag upstream: $new_tag)"
     adm_event_pkg "PKG_UPDATE_CHECK_DONE" "$pkg_id" "result=has-update new=$new_ver"
-
     return 0
 }
 
@@ -687,9 +680,9 @@ adm_update_apply_one_core() {
     # Uso interno:
     #   adm_update_apply_one_core PKG_ID
     local pkg_id="${1:-}"
-
     local meta
     meta="$(adm_update_metadado_path "$pkg_id")"
+
     if [[ ! -f "$meta" ]]; then
         adm_log_fatal "Metadado não encontrado para $pkg_id: '$meta'"
     fi
@@ -745,7 +738,9 @@ adm_update_apply_one_core() {
 adm_update_apply_one() {
     # Wrapper com métricas
     local pkg_id="${1:-}"
-    adm_metrics_time_block "UPDATE" "$pkg_id" "adm_update_apply" adm_update_apply_one_core "$pkg_id"
+
+    adm_metrics_time_block "UPDATE" "$pkg_id" "adm_update_apply" \
+        adm_update_apply_one_core "$pkg_id"
 }
 
 # =========
@@ -757,31 +752,29 @@ adm_update_usage() {
 adm-update - Atualizador de metadados / versão do ADM 2.0
 
 Uso:
+  adm-update check PKG_ID
+      Checa se existe nova versão upstream para o pacote (não altera nada).
 
-  Checar se existe nova versão no upstream (sem modificar nada):
-    adm-update check PKG_ID
+  adm-update apply PKG_ID
+      Aplica update de metadado:
+        - descobre nova versão via tags git
+        - faz backup do metadado
+        - atualiza version: e source_uri:
+        - recalcula source_checksum:
+        - roda adm-fetch + adm-scan
+        - detecta novas build_deps
+        - gera metadado stub para deps novas (se necessário)
+        - adiciona deps + PKG_ID na pending.list (fila de upgrade)
 
-  Aplicar update de versão/URIs/checksums/scan/deps e registrar na fila de upgrade:
-    adm-update apply PKG_ID
+  adm-update list-pending
+      Mostra os pacotes na fila de upgrade (db/updates/pending.list).
 
-  Ver fila de pacotes pendentes de upgrade:
-    adm-update list-pending
-
-  Limpar fila de pendentes:
-    adm-update clear-pending
-
-Notas:
-
-  - Hoje, a detecção automática de nova versão funciona para upstreams git
-    (url: ou source_uri: apontando para repositório git).
-  - Outros tipos de upstream podem ser suportados futuramente (hooks específicos, etc).
+  adm-update clear-pending
+      Limpa a fila de upgrade.
 
 Variáveis:
-
   ADM_DRY_RUN=1
-      Não altera arquivos (metadado, pending.list, etc).
-      Apenas mostra (logs) o que seria feito.
-
+      Não altera metadados nem pending.list; apenas mostra o que faria.
 EOF
 }
 
@@ -804,12 +797,14 @@ adm_update_main() {
             adm_update_apply_one "$1"
             ;;
         list-pending)
+            shift || true
             adm_update_pending_list
             ;;
         clear-pending)
+            shift || true
             adm_update_pending_clear
             ;;
-        --help|-h|"")
+        help|--help|-h|"")
             adm_update_usage
             ;;
         *)
@@ -818,8 +813,6 @@ adm_update_main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     adm_update_main "$@"
 fi
-
-# Fim do adm-update
