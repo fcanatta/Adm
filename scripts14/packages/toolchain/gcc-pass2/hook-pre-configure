@@ -1,0 +1,273 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/gcc-pass2 (LFS 6.18 + ADM 2.0)
+#
+# Responsável por:
+#  - Encontrar diretório do GCC (gcc-12.2.0)
+#  - Mover mpfr-4.2.0, gmp-6.2.1 e mpc-1.3.1 para dentro do gcc/
+#  - Aplicar:
+#       * sed em gcc/config/i386/t-linux64 (lib64 -> lib, em x86_64)
+#       * sed para thread_header = gthr-posix.h
+#  - Criar:
+#       * build-gcc/ (build separado)
+#       * wrapper ./configure na raiz do build_dir que:
+#           - entra em build-gcc/
+#           - roda ../gcc-12.2.0/configure com as opções do LFS
+#       * Makefile na raiz que delega all/check/install para build-gcc/
+
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gcc-pass2}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+
+echo "[hook-pre-configure][$pkg_id] build_dir = $build_dir" >&2
+
+# ---------- 1) Descobrir diretórios gcc / mpfr / gmp / mpc ----------
+
+find_one_dir() {
+    local pattern="$1"
+    local found
+    found="$(find "$build_dir" -maxdepth 1 -type d -name "$pattern" -print | head -n1 || true)"
+    [[ -n "$found" ]] && printf '%s\n' "$found"
+}
+
+gcc_src_dir="$(find_one_dir 'gcc-12.2.0')"
+if [[ -z "$gcc_src_dir" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ERRO: não encontrei diretório gcc-12.2.0 em $build_dir" >&2
+    exit 1
+fi
+
+mpfr_dir="$(find_one_dir 'mpfr-4.2.0')"
+gmp_dir="$(find_one_dir 'gmp-6.2.1')"
+mpc_dir="$(find_one_dir 'mpc-1.3.1')"
+
+echo "[hook-pre-configure][$pkg_id] gcc_src_dir = $gcc_src_dir" >&2
+[[ -n "$mpfr_dir" ]] && echo "[hook-pre-configure][$pkg_id] mpfr_dir  = $mpfr_dir" >&2
+[[ -n "$gmp_dir"  ]] && echo "[hook-pre-configure][$pkg_id] gmp_dir   = $gmp_dir"  >&2
+[[ -n "$mpc_dir"  ]] && echo "[hook-pre-configure][$pkg_id] mpc_dir   = $mpc_dir"  >&2
+
+# Move mpfr/gmp/mpc para dentro da árvore do GCC, como no LFS
+(
+    cd "$gcc_src_dir"
+
+    if [[ -n "$mpfr_dir" && ! -d "mpfr" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Movendo $(basename "$mpfr_dir") → mpfr/" >&2
+        mv -v "$mpfr_dir" mpfr
+    fi
+
+    if [[ -n "$gmp_dir" && ! -d "gmp" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Movendo $(basename "$gmp_dir") → gmp/" >&2
+        mv -v "$gmp_dir" gmp
+    fi
+
+    if [[ -n "$mpc_dir" && ! -d "mpc" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Movendo $(basename "$mpc_dir") → mpc/" >&2
+        mv -v "$mpc_dir" mpc
+    fi
+)
+
+# ---------- 2) Ajustes de fonte como no livro ----------
+
+(
+    cd "$gcc_src_dir"
+
+    # If building on x86_64, mudar lib64 -> lib em t-linux64
+    if [[ "$(uname -m)" == "x86_64" ]]; then
+        if [[ -f "gcc/config/i386/t-linux64" ]]; then
+            echo "[hook-pre-configure][$pkg_id] Ajustando t-linux64 (lib64 → lib)..." >&2
+            sed -e '/m64=/s/lib64/lib/' -i.orig gcc/config/i386/t-linux64
+        else
+            echo "[hook-pre-configure][$pkg_id] Aviso: gcc/config/i386/t-linux64 não encontrado." >&2
+        fi
+    fi
+
+    # Override thread_header para gthr-posix.h (libgcc + libstdc++)
+    if [[ -f "libgcc/Makefile.in" && -f "libstdc++-v3/include/Makefile.in" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Ajustando thread_header = gthr-posix.h ..." >&2
+        sed '/thread_header =/s/@.*@/gthr-posix.h/' \
+            -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+    else
+        echo "[hook-pre-configure][$pkg_id] Aviso: arquivos Makefile.in para thread_header não encontrados." >&2
+    fi
+)
+
+# ---------- 3) Criar build-gcc/ e wrapper ./configure na raiz ----------
+
+build_gcc_dir="$build_dir/build-gcc"
+
+if [[ ! -d "$build_gcc_dir" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Criando diretório de build separado: $build_gcc_dir" >&2
+    mkdir -p "$build_gcc_dir"
+fi
+
+wrapper="$build_dir/configure"
+
+# Se já existir um wrapper configurado, não recria (idempotente)
+if [[ -x "$wrapper" && ! -x "$build_dir/configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper ./configure já existe; mantendo." >&2
+else
+    # Não deve haver um configure real na raiz; se existir, renomeamos
+    if [[ -x "$wrapper" && -x "$build_dir/configure.orig" ]]; then
+        echo "[hook-pre-configure][$pkg_id] configure.orig já existe; não alterando wrapper." >&2
+    else
+        if [[ -x "$wrapper" && ! -x "$build_dir/configure.orig" ]]; then
+            mv "$wrapper" "$build_dir/configure.orig"
+        fi
+
+        cat > "$wrapper" << 'EOF'
+#!/usr/bin/env bash
+# Wrapper ./configure para toolchain/gcc-pass2 (LFS 6.18 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/gcc-pass2}"
+build_dir="${ADM_BUILD_DIR_CURRENT:-$(pwd)}"
+
+gcc_src_dir=""
+# Descobrir o diretório gcc-12.2.0 relativo ao build_dir
+for d in "$build_dir"/gcc-12.2.0 "$build_dir"/gcc-*; do
+    if [[ -d "$d" && -f "$d/configure" ]]; then
+        gcc_src_dir="$d"
+        break
+    fi
+done
+
+if [[ -z "$gcc_src_dir" ]]; then
+    printf 'ADM-ERROR[%s]: não encontrei diretório gcc-12.2.0 com configure dentro de %s\n' \
+        "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+build_gcc_dir="$build_dir/build-gcc"
+mkdir -p "$build_gcc_dir"
+
+# ------------ Determinar build/host/target ------------
+
+# host/target vêm preferencialmente de LFS_TGT ou ADM_CROSS_TARGET
+host="${LFS_TGT:-${ADM_CROSS_TARGET:-}}"
+target="$host"
+
+# build via config.guess ou fallback para gcc -dumpmachine
+if [[ -x "$gcc_src_dir/config.guess" ]]; then
+    build="$("$gcc_src_dir/config.guess")"
+else
+    if command -v gcc >/dev/null 2>&1; then
+        build="$(gcc -dumpmachine 2>/dev/null || echo "${host:-unknown}")"
+    else
+        build="${host:-unknown}"
+    fi
+fi
+
+if [[ -z "$host" ]]; then
+    printf 'ADM-ERROR[%s]: LFS_TGT/ADM_CROSS_TARGET não definidos; não sei o host/target.\n' \
+        "$pkg_id" >&2
+    exit 1
+fi
+
+# sysroot do LFS
+sysroot="${LFS:-}"
+if [[ -z "$sysroot" ]]; then
+    printf 'ADM-WARN[%s]: variável LFS não definida; usando / como sysroot (não recomendado).\n' \
+        "$pkg_id" >&2
+    sysroot="/"
+fi
+
+# Filtrar argumentos vindos do adm-build
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--host=*|--build=*|--target=*|\
+        --disable-nls|--enable-nls|\
+        --disable-multilib|--enable-multilib|\
+        --disable-libatomic|--enable-libatomic|\
+        --disable-libgomp|--enable-libgomp|\
+        --disable-libquadmath|--enable-libquadmath|\
+        --disable-libssp|--enable-libssp|\
+        --disable-libvtv|--enable-libvtv|\
+        --enable-default-pie|--disable-default-pie|\
+        --enable-default-ssp|--disable-default-ssp|\
+        --with-build-sysroot=*|LDFLAGS_FOR_TARGET=*)
+            # vamos sobrescrever todos estes explicitamente
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+cd "$build_gcc_dir"
+
+real_conf="${gcc_src_dir}/configure"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure real não encontrado em %s\n' "$pkg_id" "$real_conf" >&2
+    exit 1
+fi
+
+# Montar LDFLAGS_FOR_TARGET como no LFS:
+ldflags_for_target="LDFLAGS_FOR_TARGET=-L$PWD/${host}/libgcc"
+
+args=(
+  "$real_conf"
+  "--build=${build}"
+  "--host=${host}"
+  "--target=${host}"
+  "$ldflags_for_target"
+  "--prefix=/usr"
+  "--with-build-sysroot=${sysroot}"
+  "--enable-default-pie"
+  "--enable-default-ssp"
+  "--disable-nls"
+  "--disable-multilib"
+  "--disable-libatomic"
+  "--disable-libgomp"
+  "--disable-libquadmath"
+  "--disable-libssp"
+  "--disable-libvtv"
+  "--enable-languages=c,c++"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real em %s\n' "$pkg_id" "$real_conf" >&2
+printf 'ADM-INFO[%s]: args: %s\n' "$pkg_id" "${args[*]}" >&2
+
+exec "${args[@]}"
+EOF
+
+        chmod +x "$wrapper"
+        echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para GCC Pass 2 (LFS/ADM 2.0)." >&2
+    fi
+fi
+
+# ---------- 4) Makefile “proxy” na raiz para delegar a build-gcc/ ----------
+
+makefile="$build_dir/Makefile"
+
+if [[ ! -f "$makefile" ]]; then
+    cat > "$makefile" << 'EOF'
+# Makefile proxy para toolchain/gcc-pass2 (ADM 2.0)
+# Delega as operações para o diretório build-gcc/ gerado pelo wrapper configure.
+
+all:
+	$(MAKE) -C build-gcc all
+
+check:
+	$(MAKE) -C build-gcc check
+
+install:
+	$(MAKE) -C build-gcc DESTDIR="$(DESTDIR)" install
+EOF
+    echo "[hook-pre-configure][$pkg_id] Makefile proxy criado em $makefile" >&2
+else
+    echo "[hook-pre-configure][$pkg_id] Makefile já existe em $makefile; mantendo." >&2
+fi
+
+echo "[hook-pre-configure][$pkg_id] preparo do GCC Pass 2 concluído." >&2
