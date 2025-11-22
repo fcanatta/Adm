@@ -1,0 +1,40 @@
+name: m4
+version: 1.4.20
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/m4/
+
+# Ajuda o adm-build/adm-profile a escolher profile (toolchain + glibc)
+libc: glibc
+
+summary: M4 1.4.20 temporário (cross) para o LFS (cap. 6.2)
+description: >
+  M4 1.4.20 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.2 do LFS (Cross Compiling Temporary Tools), usando
+  --host=$LFS_TGT e DESTDIR para instalar no sysroot, integrado ao
+  pipeline do ADM 2.0.
+
+# Dependências para conseguir compilar em modo cross:
+# - binutils-pass1 (linker/assembler cross)
+# - gcc-pass1 (compilador cross)
+# - glibc (sysroot com libc instalada)
+build_deps: toolchain/binutils-pass1 toolchain/gcc-pass1 toolchain/glibc
+
+run_deps:
+opt_deps:
+
+# groups: permite build-group, relatórios e heurística de kind
+# "toolchain" => ADM entende que é pacote de cadeia de ferramentas
+# "temp-tools"/"cross-temp" marcam que é da fase capítulo 6
+groups: toolchain temp-tools cross-temp m4
+
+# Fonte oficial, conforme LFS development (r12.4-45)
+# https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz
+source_uri: https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz
+
+# Você pode preencher depois com sha256 real.
+# Exemplo de formato:
+# source_checksum: <sha256 m4-1.4.20.tar.xz>
+source_checksum:
