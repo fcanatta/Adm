@@ -1,0 +1,30 @@
+name: gzip-temp
+version: 1.14
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/gzip/
+
+# Ajuda o adm-build/adm-profile a escolher profile toolchain+glibc
+libc: glibc
+
+summary: Gzip 1.14 temporário (cross) para o LFS (cap. 6.11)
+description: >
+  Gzip 1.14 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.11 do LFS (Cross Compiling Temporary Tools). Usa
+  --host=$LFS_TGT e instala via DESTDIR, integrado ao pipeline do ADM 2.0.
+
+# Depende da toolchain temporária já funcional
+build_deps: toolchain/grep-temp toolchain/gawk-temp toolchain/findutils-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: permite build-group temp-tools, relatórios, etc.
+groups: toolchain temp-tools cross-temp gzip
+
+# Tarball oficial 1.14 (o mesmo usado pelo LFS 12.4)
+source_uri: https://ftp.gnu.org/gnu/gzip/gzip-1.14.tar.xz
+
+# Você pode preencher depois com o SHA256 oficial se quiser
+source_checksum:
