@@ -1,12 +1,12 @@
 name: binutils-pass1
 version: 2.43.1
 release: 1
-
 category: toolchain
 license: GPL-3.0-or-later
+
 url: https://www.gnu.org/software/binutils/
 
-# ajuda o adm-build a escolher profile (toolchain + glibc)
+# Ajuda o adm-build a escolher o profile (toolchain + glibc)
 libc: glibc
 
 summary: Binutils cross (pass 1) para bootstrap do toolchain
@@ -22,9 +22,9 @@ opt_deps:
 groups: toolchain toolchain-bootstrap cross binutils pass1
 
 # Fonte oficial (LFS usa exatamente esse URL)
-#   https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz 
+# https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz
 source_uri: https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz
 
 # SHA256 puro (sem prefixo), para o adm-fetch:
-#   binutils-2.43.1.tar.xz sha256 = 13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd 
+# binutils-2.43.1.tar.xz sha256 = 13f7...
 source_checksum: 13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd
