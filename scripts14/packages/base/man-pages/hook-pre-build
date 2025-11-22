@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# hook-pre-build para base/man-pages (LFS 8.3 + ADM 2.0)
+#
+# LFS:
+#   rm -v man3/crypt*
+#   make -R GIT=false prefix=/usr install
+#
+# No ADM 2.0:
+#   - precisamos respeitar DESTDIR
+#   - então fazemos:
+#       rm -v man3/crypt*
+#       make -R GIT=false
+#       make -R GIT=false prefix=/usr DESTDIR="$ADM_DESTDIR" install
+#   - depois neutralizamos Makefile para que o make/make install padrão
+#     do adm-build não reinstalem nada.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=base/man-pages}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+destdir="$ADM_DESTDIR"
+
+cd "$build_dir"
+
+# se já rodou antes, não repetir instalação
+if [[ -f ".adm-man-pages-installed.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Man-pages já foi construído/instalado (stamp encontrado); pulando." >&2
+    exit 0
+fi
+
+# 1) Remover man3/crypt* como no LFS
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    echo "[hook-pre-build][$pkg_id][DRY-RUN] Removeria man3/crypt* em $build_dir" >&2
+else
+    if [[ -d "man3" ]]; then
+        echo "[hook-pre-build][$pkg_id] Removendo man3/crypt* (serão substituídos por libxcrypt)..." >&2
+        # se não existir, rm retorna erro; usamos '|| true' pra não quebrar o hook
+        rm -v man3/crypt* 2>/dev/null || true
+    else
+        echo "[hook-pre-build][$pkg_id] Diretório man3/ não encontrado; nada para remover." >&2
+    fi
+fi
+
+# 2) Construir e instalar como no LFS, mas respeitando DESTDIR
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    cat <<EOF >&2
+[hook-pre-build][$pkg_id][DRY-RUN] Rodaria:
+  make -R GIT=false
+  make -R GIT=false prefix=/usr DESTDIR="$destdir" install
+EOF
+else
+    echo "[hook-pre-build][$pkg_id] Rodando 'make -R GIT=false'..." >&2
+    make -R GIT=false
+
+    echo "[hook-pre-build][$pkg_id] Rodando 'make -R GIT=false prefix=/usr DESTDIR=\"$destdir\" install'..." >&2
+    make -R GIT=false prefix=/usr DESTDIR="$destdir" install
+fi
+
+touch ".adm-man-pages-installed.stamp"
+
+# 3) Neutralizar Makefile para evitar builds/instalações duplicadas
+makefile_path="$build_dir/Makefile"
+
+if [[ -f "$makefile_path" ]]; then
+    if ! grep -q "ADM man-pages: alvo 'all' ignorado" "$makefile_path" 2>/dev/null; then
+        echo "[hook-pre-build][$pkg_id] Adicionando stubs para 'all' e 'install' no Makefile..." >&2
+        cat >> "$makefile_path" << 'EOF'
+
+# Alvos adicionados pelo ADM (base/man-pages)
+.PHONY: all install
+
+all:
+	@echo "ADM man-pages: alvo 'all' ignorado (man-pages já construído pelo hook-pre-build)."
+
+install:
+	@echo "ADM man-pages: alvo 'install' ignorado (man-pages já instalado pelo hook-pre-build)."
+
+EOF
+    else
+        echo "[hook-pre-build][$pkg_id] Makefile já contém stubs ADM; não vou duplicar." >&2
+    fi
+else
+    echo "[hook-pre-build][$pkg_id] AVISO: Makefile não encontrado em $build_dir; não foi possível neutralizar." >&2
+fi
+
+echo "[hook-pre-build][$pkg_id] hook-pre-build concluído com sucesso." >&2
