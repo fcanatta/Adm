@@ -1,0 +1,32 @@
+name: findutils-temp
+version: 4.10.0
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/findutils/
+
+# Ajuda o adm-build/adm-profile a escolher profile correto (toolchain+glibc)
+libc: glibc
+
+summary: Findutils 4.10.0 temporário (cross) para o LFS (cap. 6.8)
+description: >
+  Findutils 4.10.0 construído como ferramenta temporária cross, seguindo
+  o capítulo 6.8 do LFS (Cross Compiling Temporary Tools). Usa
+  --host=$LFS_TGT, --build=$(build-aux/config.guess) e
+  --localstatedir=/var/lib/locate, integrado ao pipeline do ADM 2.0.
+
+# Depende da toolchain temporária já funcional
+build_deps: toolchain/file-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: para build-group (ex: temp-tools), relatórios, etc.
+groups: toolchain temp-tools cross-temp findutils
+
+# Tarball oficial 4.10.0
+source_uri: https://ftp.gnu.org/gnu/findutils/findutils-4.10.0.tar.xz
+
+# Pode preencher depois com o SHA256 se quiser (ex: do anúncio oficial)
+# 1387e0b67ff247d2abde998f90dfbf70c1491391a59ddfecb8ae698789f0a4f5 
+source_checksum:
