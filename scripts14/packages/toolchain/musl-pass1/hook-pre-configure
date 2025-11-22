@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/musl-pass1
+#
+# Executado pelo adm-build ANTES do ./configure.
+#
+# Ambiente (exportado pelo adm_build_run_hook):
+#   ADM_PKG_ID
+#   ADM_BUILD_DIR_CURRENT
+#   ADM_DESTDIR
+#   ADM_BUILD_SYSTEM
+#
+# Objetivo:
+#   - Configurar musl como libc do cross-toolchain (pass1), no estilo CLFS:
+#       ./configure \
+#         CROSS_COMPILE=${TARGET}- \
+#         --prefix=/usr/cross/${TARGET} \
+#         --target=${TARGET}
+#       make
+#       make DESTDIR=$DESTDIR install
+#
+#   - Adaptado para o ADM 2.0:
+#       ADM_CROSS_TARGET -> target (ex: x86_64-lfs-linux-musl)
+#       ADM_CROSS_PREFIX -> /usr/cross
+#       ADM_SYSROOT      -> (reservado, se precisar depois)
+#
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/musl-pass1}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+# =========
+# 1. Parâmetros de cross (podem ser sobrescritos no ambiente ou profile)
+# =========
+
+# Triplet padrão para musl, seguindo convenção *-linux-musl
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-musl}"
+
+# Prefixo padrão do cross-toolchain (binutils/gcc/musl...)
+ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+
+# Sysroot reservado (ainda não usamos diretamente aqui, mas mantemos
+# por consistência com outros hooks do toolchain).
+ADM_SYSROOT="${ADM_SYSROOT:-/}"
+
+# =========
+# 2. PATH para toolchain cross (se já existir gcc/binutils anteriores)
+# =========
+
+CROSS_BIN_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
+if [[ -d "$CROSS_BIN_DIR" ]]; then
+    export PATH="$CROSS_BIN_DIR:$PATH"
+fi
+
+# =========
+# 3. Aplicar patches locais (se existirem *.patch ao lado deste hook)
+# =========
+
+_hook_dir() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || exit 1
+    pwd
+}
+
+HOOK_DIR="$(_hook_dir)"
+
+if compgen -G "$HOOK_DIR"/*.patch >/dev/null 2>&1; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] Aplicando patches em $ADM_BUILD_DIR_CURRENT" >&2
+    for p in "$HOOK_DIR"/*.patch; do
+        [[ -f "$p" ]] || continue
+        echo "  -> patch $(basename "$p")" >&2
+        (
+            cd "$ADM_BUILD_DIR_CURRENT" || exit 1
+            patch -Np1 -i "$p"
+        )
+    done
+fi
+
+# =========
+# 4. Envolver ./configure com wrapper
+# =========
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] ./configure não encontrado em $ADM_BUILD_DIR_CURRENT, nada a fazer." >&2
+    exit 0
+fi
+
+# Se já rodou antes, não recria
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] wrapper de configure já existe, pulando." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper gerado pelo hook-pre-configure do ADM para musl-pass1
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-musl}"
+ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+ADM_SYSROOT="${ADM_SYSROOT:-/}"
+
+# Ajusta PATH para o toolchain cross, se existir
+CROSS_BIN_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
+if [[ -d "$CROSS_BIN_DIR" ]]; then
+    export PATH="$CROSS_BIN_DIR:$PATH"
+fi
+
+# Resolve diretório real do script (caso seja symlink)
+src="${BASH_SOURCE[0]:-$0}"
+while [ -L "$src" ]; do
+    target=$(readlink "$src") || break
+    if [[ "$target" = /* ]]; then
+        src="$target"
+    else
+        src="$(dirname "$src")/$target"
+    fi
+done
+cd "$(dirname "$src")" >/dev/null 2>&1
+
+# Remove o "--prefix=/usr" que o adm-build passa fixo
+filtered_args=()
+for a in "$@"; do
+    if [[ "$a" == "--prefix=/usr" ]]; then
+        continue
+    fi
+    filtered_args+=("$a")
+done
+
+# Config extra para musl cross
+cross_prefix="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}"
+
+extra_cfg=(
+    "--target=${ADM_CROSS_TARGET}"
+    "--prefix=${cross_prefix}"
+)
+
+echo "[configure-wrapper][musl-pass1] target=${ADM_CROSS_TARGET} prefix=${cross_prefix}" >&2
+
+# musl recomenda CROSS_COMPILE=${TARGET}- para cross-build
+export CROSS_COMPILE="${ADM_CROSS_TARGET}-"
+
+exec bash ./configure.orig "${extra_cfg[@]}" "${filtered_args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure criado: target=${ADM_CROSS_TARGET}, prefix=${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}" >&2
