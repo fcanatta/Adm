@@ -1,55 +1,58 @@
 #!/usr/bin/env bash
 # hook-pre-configure para toolchain/gcc-pass1
 #
-# Executado pelo adm-build ANTES do ./configure.
-# Ambiente (exportado pelo adm-build_run_hook):
-#   ADM_PKG_ID
-#   ADM_BUILD_DIR_CURRENT
-#   ADM_DESTDIR
-#   ADM_BUILD_SYSTEM
+# Objetivo:
+#   - Transformar o ./configure em um wrapper que:
+#       * ignora o --prefix=/usr padrão do adm-build
+#       * injeta flags de cross para o GCC pass1:
+#           - --target
+#           - --prefix (cross prefix)
+#           - --with-sysroot
+#           - --with-newlib
+#           - --without-headers
+#           - --enable-languages=c
+#           - desabilita tudo que não é C (como LFS cross pass1)
+#
+# Depende de variáveis (preferencialmente definidas pelo profile):
+#   ADM_CROSS_TARGET  (ex: x86_64-lfs-linux-gnu)
+#   ADM_CROSS_PREFIX  (ex: /usr/cross)
+#   ADM_SYSROOT       (ex: / ou $LFS)
+#
+# O adm-build:
+#   - entra no diretório do source
+#   - exporta ADM_BUILD_DIR_CURRENT
+#   - chama este hook
+#   - depois chama ./configure com uma lista de args padrão
+#
+# Aqui nós renomeamos o configure original para configure.orig
+# e colocamos um wrapper que adiciona os parâmetros certos.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-: "${ADM_PKG_ID:=toolchain/gcc-pass1}"
-: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
-: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+PKG_ID="${ADM_PKG_ID:-toolchain/gcc-pass1}"
+BUILD_DIR="${ADM_BUILD_DIR_CURRENT:-.}"
 
-# =========
-# 1. Parâmetros de cross (podem ser sobrescritos no ambiente ou profile)
-# =========
+CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+SYSROOT="${ADM_SYSROOT:-/}"
 
-ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-ADM_SYSROOT="${ADM_SYSROOT:-/}"
-ADM_TOOLCHAIN_GLIBC_VERSION="${ADM_TOOLCHAIN_GLIBC_VERSION:-2.40}"
+echo "[hook-pre-configure][$PKG_ID] usando:"
+echo "  TARGET = $CROSS_TARGET"
+echo "  PREFIX = $CROSS_PREFIX"
+echo "  SYSROOT = $SYSROOT"
+echo "  BUILD_DIR = $BUILD_DIR"
 
-# =========
-# 2. PATH para binutils-pass1
-# =========
-# Esperado algo como:
-#   /usr/cross/<target>/bin/<target>-as, <target>-ld, etc.
+cd "$BUILD_DIR"
 
-CROSS_BIN_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
-if [[ -d "$CROSS_BIN_DIR" ]]; then
-    export PATH="$CROSS_BIN_DIR:$PATH"
+if [[ ! -x ./configure ]]; then
+    echo "[hook-pre-configure][$PKG_ID] ./configure não encontrado ou não executável."
+    exit 1
 fi
 
-# =========
-# 3. Envolver ./configure com wrapper
-# =========
-
-cd "$ADM_BUILD_DIR_CURRENT"
-
-if [[ ! -x "./configure" ]]; then
-    echo "[hook-pre-configure][$ADM_PKG_ID] ./configure não encontrado em $ADM_BUILD_DIR_CURRENT, nada a fazer." >&2
-    exit 0
-fi
-
-# Se já rodou antes, não recria
-if [[ -x "./configure.orig" ]]; then
-    echo "[hook-pre-configure][$ADM_PKG_ID] wrapper de configure já existe, pulando." >&2
+if [[ -x ./configure.orig ]]; then
+    echo "[hook-pre-configure][$PKG_ID] ./configure.orig já existe; não vou sobrescrever."
     exit 0
 fi
 
@@ -57,64 +60,51 @@ mv ./configure ./configure.orig
 
 cat > ./configure << 'EOF'
 #!/usr/bin/env bash
-# Wrapper gerado pelo hook-pre-configure do ADM para gcc-pass1
-
 set -o errexit
 set -o nounset
 set -o pipefail
 
-ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-ADM_SYSROOT="${ADM_SYSROOT:-/}"
-ADM_TOOLCHAIN_GLIBC_VERSION="${ADM_TOOLCHAIN_GLIBC_VERSION:-2.40}"
+CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+SYSROOT="${ADM_SYSROOT:-/}"
 
-# Resolve diretório real do script
-src="${BASH_SOURCE[0]:-$0}"
-while [ -L "$src" ]; do
-    target=$(readlink "$src") || break
-    if [[ "$target" = /* ]]; then
-        src="$target"
-    else
-        src="$(dirname "$src")/$target"
-    fi
-done
-cd "$(dirname "$src")" >/dev/null 2>&1
+orig_args=("$@")
+filtered=()
 
-# Remove o "--prefix=/usr" que o adm-build passa fixo
-filtered_args=()
-for a in "$@"; do
-    if [[ "$a" == "--prefix=/usr" ]]; then
-        continue
-    fi
-    filtered_args+=("$a")
+# Remove qualquer --prefix=/usr que o adm-build passou
+for a in "${orig_args[@]}"; do
+    case "$a" in
+        --prefix=/usr) ;;
+        *) filtered+=("$a") ;;
+    esac
 done
 
-extra_cfg=(
-  "--target=${ADM_CROSS_TARGET}"
-  "--prefix=${ADM_CROSS_PREFIX}"
-  "--with-sysroot=${ADM_SYSROOT}"
-  "--with-glibc-version=${ADM_TOOLCHAIN_GLIBC_VERSION}"
-  "--with-newlib"
-  "--without-headers"
-  "--disable-nls"
-  "--disable-shared"
-  "--disable-multilib"
-  "--disable-decimal-float"
-  "--disable-threads"
-  "--disable-libatomic"
-  "--disable-libgomp"
-  "--disable-libquadmath"
-  "--disable-libssp"
-  "--disable-libvtv"
-  "--disable-libstdcxx"
-  "--enable-languages=c"
+# Flags padrão para GCC pass1 (cross, C-only, sem headers)
+extra=(
+    "--target=${CROSS_TARGET}"
+    "--prefix=${CROSS_PREFIX}"
+    "--with-sysroot=${SYSROOT}"
+    "--with-newlib"
+    "--without-headers"
+    "--enable-languages=c"
+    "--disable-nls"
+    "--disable-shared"
+    "--disable-multilib"
+    "--disable-decimal-float"
+    "--disable-libatomic"
+    "--disable-libgomp"
+    "--disable-libquadmath"
+    "--disable-libssp"
+    "--disable-libvtv"
+    "--disable-libstdcxx"
 )
 
-echo "[configure-wrapper][gcc-pass1] target=${ADM_CROSS_TARGET} prefix=${ADM_CROSS_PREFIX} sysroot=${ADM_SYSROOT}" >&2
+echo "[hook-gcc-pass1-wrapper] chamando ./configure.orig com:"
+printf '  %s\n' "${extra[@]}" "${filtered[@]}"
 
-exec bash ./configure.orig "${extra_cfg[@]}" "${filtered_args[@]}"
+exec bash ./configure.orig "${extra[@]}" "${filtered[@]}"
 EOF
 
 chmod +x ./configure
 
-echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure criado: target=${ADM_CROSS_TARGET}, prefix=${ADM_CROSS_PREFIX}, sysroot=${ADM_SYSROOT}"
+echo "[hook-pre-configure][$PKG_ID] wrapper ./configure criado com sucesso."
