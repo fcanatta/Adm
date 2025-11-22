@@ -3,44 +3,48 @@
 #
 # Comandos:
 #
-#   build         PKG...         -> constrói (com deps) e instala pacote(s)
-#   build-group   GRUPO          -> constrói todos os pacotes de um grupo (ex: xorg, toolchain)
-#   install       PKG...         -> alias amigável para build (construir + instalar)
+#   build PKG...        -> constrói (com deps) e instala pacote(s)
+#   build-group GRUPO   -> constrói todos os pacotes de um grupo (ex: xorg, toolchain)
+#   install PKG...      -> alias amigável para build (construir + instalar)
 #
-#   update        [alvos...]     -> orquestra adm-update
-#   upgrade       [opções...]    -> orquestra adm-upgrade
+#   update [alvos...]   -> orquestra adm-update
+#   upgrade [opções...] -> orquestra adm-upgrade
 #
-#   check         PKG...         -> roda adm-check em pacotes instalados
+#   check PKG...        -> roda adm-check em pacotes instalados
 #
-#   search        PADRÃO         -> procura pacotes nos metadados
-#   info          PKG_ID         -> mostra metadado de um pacote
-#   list-installed               -> lista pacotes instalados (db/installed)
+#   search PADRÃO       -> procura pacotes nos metadados
+#   info PKG_ID         -> mostra metadado bruto de um pacote
+#   list-installed      -> lista pacotes instalados (db/installed)
 #
-#   snapshot      ...            -> delega para adm-snapshot (create/diff/restore)
-#   report        ...            -> delega para adm-report
-#   tui                           -> abre adm-tui (monitor de builds)
+#   snapshot ...        -> delega para adm-snapshot (create/diff/restore)
+#   report ...          -> delega para adm-report
+#   tui                 -> abre adm-tui (monitor de builds)
 #
-#   help          [comando]      -> ajuda geral ou ajuda do subcomando
+#   uninstall PKG...    -> desinstala pacotes (usa adm-uninstall)
+#   autoremove          -> remove pacotes órfãos (usa adm-uninstall)
+#
+#   help [comando]      -> ajuda geral ou ajuda do subcomando
 #
 # Flags globais:
 #
-#   --profile ID      -> força o uso do profile ID em todos os builds (via ADM_BUILD_PROFILE_OVERRIDE)
-#   --dry-run, -n     -> ADM_DRY_RUN=1 (mostra o que faria, sem executar)
-#   --force           -> ADM_BUILD_FORCE=1, ADM_UPDATE_FORCE=1, ADM_UPGRADE_FORCE=1
+#   --profile ID  -> força o uso do profile ID em todos os builds (ADM_BUILD_PROFILE_OVERRIDE)
+#   --dry-run, -n -> ADM_DRY_RUN=1 (mostra o que faria, sem executar)
+#   --force       -> ADM_BUILD_FORCE=1, ADM_UPDATE_FORCE=1,
+#                    ADM_UPGRADE_FORCE=1, ADM_UNINSTALL_FORCE=1
 #
 # Cada comando é tratado como uma "tarefa" (task):
 #   - ID único: task-YYYYMMDD-HHMMSS-PID-RANDOM
-#   - arquivo em db/tasks/<ID>.task com status, comando, profile etc.
+#   - arquivo em db/tasks/<id>.task com status, comando, profile etc
 #   - eventos ADM_TASK_START / ADM_TASK_DONE / ADM_TASK_FAIL via adm-eventd.
 #
-# Instalação final: sempre em /usr (quem cuida é o adm-build).
+# Instalação final: sempre em / (quem cuida é o adm-build + adm-build_install_destdir).
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
 # =========
-# Descobrir diretório do script e carregar módulos base
+# Descobrir diretório deste script apenas para achar o adm-env
 # =========
 
 _adm_cli_script_dir() {
@@ -61,20 +65,28 @@ _adm_cli_script_dir() {
     pwd
 }
 
+# Diretório onde está este script (deve ser /root/usr/src/adm/scripts)
 _ADM_CLI_DIR="$(_adm_cli_script_dir)"
 
-# shellcheck disable=SC1090
+# =========
+# Carregar ambiente e módulos base
+# =========
+
+# Primeiro adm-env (ele define ADM_ROOT e ADM_SCRIPTS_DIR corretamente)
+/* shellcheck disable=SC1090 */
 source "$_ADM_CLI_DIR/adm-env"
-# shellcheck disable=SC1090
-source "$_ADM_CLI_DIR/adm-log-ui"
-# shellcheck disable=SC1090
-source "$_ADM_CLI_DIR/adm-eventd"
-# shellcheck disable=SC1090
-source "$_ADM_CLI_DIR/adm-db"
-# shellcheck disable=SC1090
-source "$_ADM_CLI_DIR/adm-build"
-# shellcheck disable=SC1090
-source "$_ADM_CLI_DIR/adm-profile"
+
+# Agora usamos SEMPRE ADM_SCRIPTS_DIR para os demais scripts
+/* shellcheck disable=SC1090 */
+source "$ADM_SCRIPTS_DIR/adm-log-ui"
+/* shellcheck disable=SC1090 */
+source "$ADM_SCRIPTS_DIR/adm-eventd"
+/* shellcheck disable=SC1090 */
+source "$ADM_SCRIPTS_DIR/adm-db"
+/* shellcheck disable=SC1090 */
+source "$ADM_SCRIPTS_DIR/adm-build"
+/* shellcheck disable=SC1090 */
+source "$ADM_SCRIPTS_DIR/adm-profile"
 
 ADM_DB_TASKS_DIR="${ADM_DB_TASKS_DIR:-${ADM_DB_DIR}/tasks}"
 ADM_PACKAGES_DIR="${ADM_PACKAGES_DIR:-${ADM_ROOT}/packages}"
@@ -86,6 +98,7 @@ ADM_DRY_RUN="${ADM_DRY_RUN:-0}"
 ADM_BUILD_FORCE="${ADM_BUILD_FORCE:-0}"
 ADM_UPDATE_FORCE="${ADM_UPDATE_FORCE:-0}"
 ADM_UPGRADE_FORCE="${ADM_UPGRADE_FORCE:-0}"
+ADM_UNINSTALL_FORCE="${ADM_UNINSTALL_FORCE:-0}"
 ADM_BUILD_PROFILE_OVERRIDE="${ADM_BUILD_PROFILE_OVERRIDE:-}"
 
 # =========
@@ -109,7 +122,6 @@ adm_task_write_status() {
     local task_id="$1"
     local status="$2"
     local exit_code="$3"
-
     local file
     file="$(adm_task_file "$task_id")"
 
@@ -126,16 +138,14 @@ adm_task_run() {
     #   adm_task_run TYPE DESCR COMANDO...
     #
     # Ex:
-    #   adm_task_run "build" "Build pkg foo" "$_ADM_CLI_DIR/adm-build" build-with-deps foo
+    #   adm_task_run "build" "Build pkg foo" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps foo
     local type="$1"
     local descr="$2"
     shift 2 || true
 
     local task_cmd=( "$@" )
-
     local task_id
     task_id="$(adm_task_new_id)"
-
     local file
     file="$(adm_task_file "$task_id")"
 
@@ -147,13 +157,20 @@ adm_task_run() {
         echo "profile_override=${ADM_BUILD_PROFILE_OVERRIDE:-}"
         echo "dry_run=${ADM_DRY_RUN:-0}"
         echo "force_build=${ADM_BUILD_FORCE:-0}"
+        echo "force_uninstall=${ADM_UNINSTALL_FORCE:-0}"
         echo "ts_start=$(date '+%Y-%m-%dT%H:%M:%S%z')"
     } >"$file"
 
-    adm_event_emit "ADM_TASK_START" "$type" "task_id=$task_id descr=$(printf '%q' "$descr") cmd=$(printf '%q' "${task_cmd[*]}")"
+    adm_event_emit "ADM_TASK_START" "$type" \
+        "task_id=$task_id descr=$(printf '%q' "$descr") cmd=$(printf '%q' "${task_cmd[*]}")"
 
     local rc=0
-    if [[ "${ADM_DRY_RUN:-0}" -eq 1 && "$type" != "tui" && "$type" != "search" && "$type" != "info" && "$type" != "list-installed" ]]; then
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 && \
+          "$type" != "tui" && \
+          "$type" != "search" && \
+          "$type" != "info" && \
+          "$type" != "list-installed" ]]; then
         adm_log_info "[DRY-RUN][task=$task_id] Execução simulada: ${task_cmd[*]}"
         rc=0
     else
@@ -207,6 +224,7 @@ adm_cli_parse_global_opts() {
                 ADM_BUILD_FORCE=1
                 ADM_UPDATE_FORCE=1
                 ADM_UPGRADE_FORCE=1
+                ADM_UNINSTALL_FORCE=1
                 ;;
             *)
                 filtered+=("$a")
@@ -227,6 +245,7 @@ adm_cli_all_pkg_ids() {
     if [[ ! -d "$ADM_PACKAGES_DIR" ]]; then
         return 0
     fi
+
     find "$ADM_PACKAGES_DIR" -mindepth 2 -maxdepth 2 -type d 2>/dev/null \
         | sed "s#^${ADM_PACKAGES_DIR}/##" \
         | sort
@@ -236,12 +255,14 @@ adm_cli_metadado_path() {
     # Resolve pkg_id -> caminho do metadado.
     #
     # Tenta usar adm_build_metadado_path se existir,
-    # senão assume layout packages/<cat>/<name>/metadado.
+    # senão assume layout packages/<categoria>/<nome>/metadado.
     local pkg_id="$1"
+
     if type -t adm_build_metadado_path >/dev/null 2>&1; then
         adm_build_metadado_path "$pkg_id"
         return $?
     fi
+
     printf '%s/%s/metadado\n' "$ADM_PACKAGES_DIR" "$pkg_id"
 }
 
@@ -256,15 +277,21 @@ adm_cli_packages_with_group() {
     [[ -z "$ids" ]] && return 0
 
     local id meta groups
+
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
         meta="$(adm_cli_metadado_path "$id")"
         [[ ! -f "$meta" ]] && continue
+
         groups="$(awk -F':' '
             tolower($1) ~ /^[[:space:]]*groups[[:space:]]*$/ {
-                $1=""; sub(/^[[:space:]]+/, "", $0); print tolower($0); exit 0
+                $1="";
+                sub(/^[[:space:]]+/, "", $0);
+                print tolower($0);
+                exit 0
             }
         ' "$meta" 2>/dev/null || true)"
+
         if echo " $groups " | grep -q " $(printf '%s' "$group" | tr '[:upper:]' '[:lower:]') "; then
             echo "$id"
         fi
@@ -284,31 +311,42 @@ adm_cli_search() {
         return 0
     fi
 
+    local pattern_lc
     pattern_lc="$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')"
 
     adm_log_phase_header "Busca por: $pattern"
 
     local id meta name desc hit
     hit=0
+
     while IFS= read -r id; do
         [[ -z "$id" ]] && continue
         meta="$(adm_cli_metadado_path "$id")"
         [[ ! -f "$meta" ]] && continue
+
         name="$(awk -F':' '
             tolower($1) ~ /^[[:space:]]*name[[:space:]]*$/ {
-                $1=""; sub(/^[[:space:]]+/, "", $0); print; exit 0
+                $1="";
+                sub(/^[[:space:]]+/, "", $0);
+                print;
+                exit 0
             }
         ' "$meta" 2>/dev/null || true)"
+
         desc="$(awk -F':' '
             tolower($1) ~ /^[[:space:]]*description[[:space:]]*$/ {
-                $1=""; sub(/^[[:space:]]+/, "", $0); print; exit 0
+                $1="";
+                sub(/^[[:space:]]+/, "", $0);
+                print;
+                exit 0
             }
         ' "$meta" 2>/dev/null || true)"
 
         local haystack
         haystack="$(printf '%s %s %s\n' "$id" "$name" "$desc" | tr '[:upper:]' '[:lower:]')"
+
         if echo "$haystack" | grep -q "$pattern_lc"; then
-            printf "  %s - %s\n" "$id" "${name:-"(sem name)"}"
+            printf " %s - %s\n" "$id" "${name:-"(sem name)"}"
             hit=1
         fi
     done <<<"$ids"
@@ -326,7 +364,6 @@ adm_cli_info() {
 
     local meta
     meta="$(adm_cli_metadado_path "$pkg_id")"
-
     if [[ ! -f "$meta" ]]; then
         adm_log_fatal "Metadado não encontrado para $pkg_id em '$meta'."
     fi
@@ -344,7 +381,8 @@ adm_cli_list_installed() {
 
     local line
     printf "%-40s %-12s %-8s %-20s %-8s\n" "PKG_ID" "VERSION" "REL" "PROFILE" "LIBC"
-    printf "%-40s %-12s %-8s %-20s %-8s\n" "----------------------------------------" "------------" "--------" "--------------------" "--------"
+    printf "%-40s %-12s %-8s %-20s %-8s\n" \
+        "----------------------------------------" "------------" "--------" "--------------------" "--------"
 
     adm_db_list_installed | while read -r line; do
         # esperado: pkg_id version release profile libc
@@ -365,7 +403,7 @@ adm_cli_cmd_build() {
     fi
     local pkgs=("$@")
     local descr="Build de pacotes: ${pkgs[*]}"
-    adm_task_run "build" "$descr" "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs[@]}"
+    adm_task_run "build" "$descr" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps "${pkgs[@]}"
 }
 
 adm_cli_cmd_install() {
@@ -379,12 +417,11 @@ adm_cli_cmd_build_group() {
     if [[ -z "$group" ]]; then
         adm_log_fatal "Uso: adm build-group GRUPO [--profile ID] [--dry-run] [--force]"
     fi
-
     shift || true
+
     # (flags globais já foram parseadas lá em cima e aplicadas)
     local pkgs
     pkgs="$(adm_cli_packages_with_group "$group" || true)"
-
     if [[ -z "$pkgs" ]]; then
         adm_log_fatal "Nenhum pacote encontrado com grupo '$group'."
     fi
@@ -396,55 +433,69 @@ adm_cli_cmd_build_group() {
     done <<<"$pkgs"
 
     local descr="Build de grupo '$group' com pacotes: ${pkgs_arr[*]}"
-    adm_task_run "build-group" "$descr" "$_ADM_CLI_DIR/adm-build" build-with-deps "${pkgs_arr[@]}"
+    adm_task_run "build-group" "$descr" "$ADM_SCRIPTS_DIR/adm-build" build-with-deps "${pkgs_arr[@]}"
 }
 
 adm_cli_cmd_update() {
     # adm update [alvos...] [--force] [--dry-run]
-    #
-    # Delegado para adm-update (CLI próprio).
     local descr="Update: $*"
-    adm_task_run "update" "$descr" "$_ADM_CLI_DIR/adm-update" "$@"
+    adm_task_run "update" "$descr" "$ADM_SCRIPTS_DIR/adm-update" "$@"
 }
 
 adm_cli_cmd_upgrade() {
     # adm upgrade [opções...]
     local descr="Upgrade: $*"
-    adm_task_run "upgrade" "$descr" "$_ADM_CLI_DIR/adm-upgrade" "$@"
+    adm_task_run "upgrade" "$descr" "$ADM_SCRIPTS_DIR/adm-upgrade" "$@"
 }
 
 adm_cli_cmd_check() {
-    # adm check PKG... (ou sem args -> checa tudo instalado, se desejar evoluir)
+    # adm check PKG... (ou sem args -> checa tudo instalado, se você evoluir depois)
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm check PKG1 [PKG2 ...]"
     fi
     local pkgs=("$@")
     local descr="Check: ${pkgs[*]}"
-    adm_task_run "check" "$descr" "$_ADM_CLI_DIR/adm-check" "${pkgs[@]}"
+    adm_task_run "check" "$descr" "$ADM_SCRIPTS_DIR/adm-check" "${pkgs[@]}"
 }
 
 adm_cli_cmd_snapshot() {
-    # adm snapshot <subcomandos do adm-snapshot...>
+    # adm snapshot ...
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm snapshot (create|diff|restore ...)"
     fi
     local descr="Snapshot: $*"
-    adm_task_run "snapshot" "$descr" "$_ADM_CLI_DIR/adm-snapshot" "$@"
+    adm_task_run "snapshot" "$descr" "$ADM_SCRIPTS_DIR/adm-snapshot" "$@"
 }
 
 adm_cli_cmd_report() {
-    # adm report <subcomandos do adm-report...>
+    # adm report ...
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "Uso: adm report (usage|top-time|top-fail ...)"
     fi
     local descr="Report: $*"
-    adm_task_run "report" "$descr" "$_ADM_CLI_DIR/adm-report" "$@"
+    adm_task_run "report" "$descr" "$ADM_SCRIPTS_DIR/adm-report" "$@"
 }
 
 adm_cli_cmd_tui() {
     # adm tui -> abre o adm-tui
     local descr="TUI (monitor de builds)"
-    adm_task_run "tui" "$descr" "$_ADM_CLI_DIR/adm-tui"
+    adm_task_run "tui" "$descr" "$ADM_SCRIPTS_DIR/adm-tui"
+}
+
+adm_cli_cmd_uninstall() {
+    # adm uninstall PKG...
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "Uso: adm uninstall PKG1 [PKG2 ...] [--dry-run] [--force]"
+    fi
+    local pkgs=("$@")
+    local descr="Uninstall de pacotes: ${pkgs[*]}"
+    adm_task_run "uninstall" "$descr" "$ADM_SCRIPTS_DIR/adm-uninstall" uninstall "${pkgs[@]}"
+}
+
+adm_cli_cmd_autoremove() {
+    # adm autoremove -> remove pacotes órfãos
+    local descr="Autoremove (órfãos)"
+    adm_task_run "uninstall-orphans" "$descr" "$ADM_SCRIPTS_DIR/adm-uninstall" autoremove
 }
 
 # =========
@@ -452,91 +503,49 @@ adm_cli_cmd_tui() {
 # =========
 
 adm_cli_usage() {
-    cat <<EOF
+    cat <<'EOF'
 adm - CLI principal do ADM 2.0
 
-Uso geral:
-  adm [FLAGS_GLOBAIS] comando [argumentos...]
+Uso:
+  adm [FLAGS] <comando> [args...]
 
-Comandos:
+Comandos principais:
+  build PKG...           Build + install de pacotes (com deps)
+  build-group GRUPO      Build de todos os pacotes de um grupo
+  install PKG...         Alias para 'build'
 
-  build          PKG1 [PKG2 ...]
-      Constrói (com dependências) e instala o(s) pacote(s) informado(s).
+  update [...]           Orquestra adm-update
+  upgrade [...]          Orquestra adm-upgrade
 
-  build-group    GRUPO
-      Constrói todos os pacotes que possuem o grupo GRUPO no metadado
-      (ex.: base, xorg, toolchain).
+  check PKG...           Roda adm-check para pacotes instalados
 
-  install        PKG1 [PKG2 ...]
-      Alias para "build": constrói tudo e instala, entregando o programa pronto.
+  search PADRÃO          Busca em metadados
+  info PKG_ID            Mostra metadado de um pacote
+  list-installed         Lista pacotes instalados
 
-  update         [alvos...]
-      Wrapper para adm-update. Pode aceitar:
-        - PKG_ID
-        - grupo
-        - --all
-      (conforme CLI do adm-update).
+  snapshot ...           Delegado para adm-snapshot (create/diff/restore)
+  report ...             Delegado para adm-report
+  tui                    Interface TUI (adm-tui)
 
-  upgrade        [opções...]
-      Wrapper para adm-upgrade. Usa db/upgrade-list ou arquivos passados.
-
-  check          PKG1 [PKG2 ...]
-      Wrapper para adm-check em um ou mais pacotes.
-
-  search         PADRÃO
-      Busca pacotes em packages/ lendo metadados (name, description, id).
-
-  info           PKG_ID
-      Mostra o metadado de um pacote.
-
-  list-installed
-      Lista os pacotes instalados (db/installed via adm-db).
-
-  snapshot       (create|diff|restore ...)
-      Wrapper para adm-snapshot.
-
-  report         (usage|top-time|top-fail ...)
-      Wrapper para adm-report.
-
-  tui
-      Abre o adm-tui (monitor de builds, fila, logs).
-
-  help [comando]
-      Mostra este help ou delega para o --help do subcomando apropriado.
+  uninstall PKG...       Desinstala pacote(s) usando adm-uninstall
+  autoremove             Remove pacotes órfãos
 
 Flags globais:
+  --profile ID           Força profile em builds (ADM_BUILD_PROFILE_OVERRIDE)
+  --dry-run, -n          Simula execução (ADM_DRY_RUN=1)
+  --force                Força build/update/upgrade/uninstall (FORCE=1)
 
-  --profile ID
-      Força o uso do profile ID em todos os builds (seta ADM_BUILD_PROFILE_OVERRIDE).
-      Exemplo:
-        adm --profile glibc/extreme build base/coreutils
+Notas:
+  - Profiles: o adm-build escolhe profiles com base em category/groups/libc:
+      * toolchain + glibc  -> toolchain/safe-glibc ou glibc/extreme
+      * musl               -> musl/extreme, musl/safe, etc.
+      * outros pacotes     -> /extreme normal
+    E o --profile ID sobrepõe essa escolha.
 
-  --dry-run, -n
-      Seta ADM_DRY_RUN=1. As tarefas de build/update/upgrade só logam o que fariam,
-      sem executar de fato.
-
-  --force
-      Seta:
-        ADM_BUILD_FORCE=1
-        ADM_UPDATE_FORCE=1
-        ADM_UPGRADE_FORCE=1
-
-Integração com profiles:
-
-  - TODO build passa pelo adm-build, que escolhe profile assim:
-      1) Se ADM_BUILD_PROFILE_OVERRIDE estiver setado (via --profile ou ambiente),
-         é usado esse profile.
-      2) Caso contrário, usa o profile atual (adm-profile current), se existir.
-      3) Se ainda não, heurística:
-           * pacotes de toolchain -> toolchain/safe-<libc>
-           * outros pacotes       -> <libc>/extreme
-      4) Fallback: glibc/extreme ou toolchain/safe-glibc, se existirem.
-
-  - O adm registra tasks em db/tasks e emite eventos ADM_TASK_*,
-    enquanto adm-build emite PKG_BUILD_* e registra em db/installed/history.
+  - Tasks: o adm registra tasks em db/tasks e emite eventos ADM_TASK_*,
+    enquanto adm-build emite eventos PKG_BUILD_* e registra em db/installed/history.
 
 Exemplos:
-
   adm build base/bash
   adm --profile glibc/extreme build base/coreutils base/sed
   adm build-group xorg
@@ -545,41 +554,39 @@ Exemplos:
   adm search gcc
   adm info base/coreutils
   adm list-installed
+  adm uninstall base/bash
+  adm autoremove
   adm snapshot create before-big-upgrade
   adm report usage
   adm tui
-
 EOF
 }
 
 adm_cli_help_subcommand() {
     local sub="$1"
     case "$sub" in
-        build|install|build-group|update|upgrade|check|snapshot|report|tui|search|info|list-installed)
+        build|install|build-group|update|upgrade|check|snapshot|report|tui|search|info|list-installed|uninstall|autoremove)
             case "$sub" in
-                build|install|build-group)
+                build|install|build-group|search|info|list-installed|uninstall|autoremove)
                     adm_cli_usage
                     ;;
                 update)
-                    "$_ADM_CLI_DIR/adm-update" --help || true
+                    "$ADM_SCRIPTS_DIR/adm-update" --help || true
                     ;;
                 upgrade)
-                    "$_ADM_CLI_DIR/adm-upgrade" --help || true
+                    "$ADM_SCRIPTS_DIR/adm-upgrade" --help || true
                     ;;
                 check)
-                    "$_ADM_CLI_DIR/adm-check" --help || true
+                    "$ADM_SCRIPTS_DIR/adm-check" --help || true
                     ;;
                 snapshot)
-                    "$_ADM_CLI_DIR/adm-snapshot" --help || true
+                    "$ADM_SCRIPTS_DIR/adm-snapshot" --help || true
                     ;;
                 report)
-                    "$_ADM_CLI_DIR/adm-report" --help || true
+                    "$ADM_SCRIPTS_DIR/adm-report" --help || true
                     ;;
                 tui)
-                    "$_ADM_CLI_DIR/adm-tui" --help || true
-                    ;;
-                search|info|list-installed)
-                    adm_cli_usage
+                    "$ADM_SCRIPTS_DIR/adm-tui" --help || true
                     ;;
             esac
             ;;
@@ -611,9 +618,6 @@ adm_main() {
             adm_cli_cmd_install "${args[@]}"
             ;;
         build-group)
-            if [[ ${#args[@]} -lt 1 ]]; then
-                adm_log_fatal "Uso: adm build-group GRUPO [--profile ID] [--dry-run] [--force]"
-            fi
             adm_cli_cmd_build_group "${args[@]}"
             ;;
         update)
@@ -642,6 +646,12 @@ adm_main() {
             ;;
         tui)
             adm_cli_cmd_tui
+            ;;
+        uninstall)
+            adm_cli_cmd_uninstall "${args[@]}"
+            ;;
+        autoremove)
+            adm_cli_cmd_autoremove
             ;;
         help|"")
             if [[ ${#args[@]} -ge 1 ]]; then
