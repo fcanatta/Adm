@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# hook-post-install para base/glibc (LFS 8.x + ADM 2.0)
+#
+# Responsável por:
+#   - criar /etc/nsswitch.conf padrão, se ainda não existir
+#   - criar /etc/ld.so.conf básico e diretório ld.so.conf.d
+#
+# Tudo isso é feito dentro de $ADM_DESTDIR, para ser empacotado pelo ADM.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=base/glibc}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+destdir="$ADM_DESTDIR"
+
+etc_dir="$destdir/etc"
+
+mkdir -p "$etc_dir"
+
+# ---------- 1) /etc/nsswitch.conf ----------
+
+nsswitch="$etc_dir/nsswitch.conf"
+
+if [[ -f "$nsswitch" ]]; then
+    echo "[hook-post-install][$pkg_id] $nsswitch já existe; não sobrescrevendo." >&2
+else
+    echo "[hook-post-install][$pkg_id] Criando nsswitch.conf padrão em $nsswitch..." >&2
+    cat > "$nsswitch" << 'EOF'
+# /etc/nsswitch.conf - gerado pelo ADM para Glibc
+#
+# Ajuste conforme seu ambiente (LDAP, systemd, etc.). Este é um
+# conjunto seguro e simples baseado em arquivos locais.
+
+passwd:     files
+group:      files
+shadow:     files
+
+hosts:      files dns
+networks:   files
+
+protocols:  files
+services:   files
+ethers:     files
+rpc:        files
+EOF
+fi
+
+# ---------- 2) /etc/ld.so.conf + ld.so.conf.d ----------
+
+ldconf="$etc_dir/ld.so.conf"
+ldconf_d="$etc_dir/ld.so.conf.d"
+
+mkdir -p "$ldconf_d"
+
+if [[ -f "$ldconf" ]]; then
+    echo "[hook-post-install][$pkg_id] $ldconf já existe; não sobrescrevendo." >&2
+else
+    echo "[hook-post-install][$pkg_id] Criando ld.so.conf básico em $ldconf..." >&2
+    cat > "$ldconf" << 'EOF'
+# /etc/ld.so.conf - gerado pelo ADM para Glibc
+/usr/local/lib
+/usr/lib
+
+# Diretório de configuração extra
+include /etc/ld.so.conf.d/*.conf
+EOF
+fi
+
+echo "[hook-post-install][$pkg_id] hook-post-install da Glibc final concluído." >&2
