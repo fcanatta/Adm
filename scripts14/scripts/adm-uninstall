@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# adm-uninstall - Desinstalação de pacotes do ADM 2.0
+#
+# Responsável por:
+#   - Desinstalar pacotes instalados (remover arquivos de /, atualizar db/installed)
+#   - Executar hooks de uninstall (hook-pre-uninstall, hook-post-uninstall)
+#   - Remover órfãos de forma limpa (sem reverse deps instalados)
+#   - Registrar histórico rico (history.log) e emitir eventos ADM/Pkg
+#
+# Conceitos:
+#   - Usa adm-db para saber o que está instalado e lista de arquivos ([files])
+#   - Usa adm-deps (adm_deps_reverse_deps) para detectar reverse deps e órfãos
+#   - Respeita ADM_DRY_RUN (não remove nada, só loga o que faria)
+#   - Respeita ADM_UNINSTALL_FORCE=1 (ignora reverse deps e força remoção)
+#
+# CLI:
+#   adm-uninstall uninstall PKG1 [PKG2 ...]
+#   adm-uninstall orphans          -> lista órfãos
+#   adm-uninstall autoremove       -> desinstala todos os órfãos
+#   adm-uninstall help
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+# =========
+# Carrega ambiente e módulos
+# =========
+
+_adm_uninst_script_dir() {
+    local src="${BASH_SOURCE[0]:-$0}"
+    while [ -L "$src" ]; do
+        local target
+        target=$(readlink "$src") || break
+        if [[ "$target" = /* ]]; then
+            src="$target"
+        else
+            src="$(dirname "$src")/$target"
+        fi
+    done
+    cd "$(dirname "$src")" >/dev/null 2>&1 || {
+        printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-uninstall.\n' >&2
+        exit 1
+    }
+    pwd
+}
+
+_ADM_UNINST_DIR="$(_adm_uninst_script_dir)"
+
+# shellcheck disable=SC1090
+source "$_ADM_UNINST_DIR/adm-env"
+# shellcheck disable=SC1090
+source "$_ADM_UNINST_DIR/adm-log-ui"
+# shellcheck disable=SC1090
+source "$_ADM_UNINST_DIR/adm-eventd"
+# shellcheck disable=SC1090
+source "$_ADM_UNINST_DIR/adm-db"
+# shellcheck disable=SC1090
+source "$_ADM_UNINST_DIR/adm-deps"
+
+ADM_UNINSTALL_FORCE="${ADM_UNINSTALL_FORCE:-0}"
+ADM_DRY_RUN="${ADM_DRY_RUN:-0}"
+
+# =========
+# Hooks de uninstall
+# =========
+
+adm_uninstall_pkg_dir() {
+    local pkg_id="$1"
+    local cat name
+    read -r cat name < <(adm_db_pkg_parse_id "$pkg_id")
+    printf '%s/%s/%s\n' "$ADM_PACKAGES_DIR" "$cat" "$name"
+}
+
+adm_uninstall_run_hook() {
+    # Uso:
+    #   adm_uninstall_run_hook PKG_ID HOOK_NAME ROOT FILELIST
+    #
+    # HOOK_NAME:
+    #   hook-pre-uninstall
+    #   hook-post-uninstall
+    local pkg_id="${1:-}"
+    local hook_name="${2:-}"
+    local root="${3:-/}"
+    local filelist="${4:-}"
+
+    if [[ -z "$pkg_id" || -z "$hook_name" ]]; then
+        adm_log_fatal "adm_uninstall_run_hook: uso: adm_uninstall_run_hook PKG_ID HOOK_NAME ROOT FILELIST"
+    fi
+
+    local pkg_dir hook_path
+    pkg_dir="$(adm_uninstall_pkg_dir "$pkg_id")"
+    hook_path="$pkg_dir/$hook_name"
+
+    if [[ ! -f "$hook_path" ]]; then
+        return 0
+    fi
+    if [[ ! -x "$hook_path" ]]; then
+        adm_log_warn "Hook '$hook_path' existe mas não é executável; ignorando."
+        return 0
+    fi
+
+    adm_log_info "Executando hook $hook_name para $pkg_id"
+
+    (
+        export ADM_PKG_ID="$pkg_id"
+        export ADM_UNINSTALL_ROOT="$root"
+        export ADM_UNINSTALL_FILELIST="$filelist"
+        cd "$root" || exit 1
+        "$hook_path"
+    )
+}
+
+# =========
+# Utilidades para arquivos
+# =========
+
+adm_uninstall_normalize_path() {
+    # Garante caminhos absolutos seguros
+    local p="${1:-}"
+    # ignora vazio
+    [[ -z "$p" ]] && return 1
+    # remove espaços extra
+    p="${p#"${p%%[![:space:]]*}"}"
+    p="${p%"${p##*[![:space:]]}"}"
+    [[ -z "$p" ]] && return 1
+    # ignora comentários
+    [[ "$p" == \#* ]] && return 1
+    # se não começa com "/", assume raiz
+    if [[ "$p" != /* ]]; then
+        p="/$p"
+    fi
+    # nunca permitir "/" puro
+    if [[ "$p" == "/" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$p"
+    return 0
+}
+
+adm_uninstall_prune_empty_dirs() {
+    # Recebe arquivo com lista de caminhos de arquivo e tenta apagar
+    # diretórios vazios relacionados (de baixo pra cima).
+    local filelist="${1:-}"
+
+    [[ -f "$filelist" ]] || return 0
+
+    local dirs tmp
+    tmp="$(mktemp "$ADM_TMP_DIR/uninstall-dirs-XXXXXX")" || return 0
+
+    # extrai diretórios
+    while IFS= read -r line; do
+        local p d
+        p="$(adm_uninstall_normalize_path "$line" || true)" || continue
+        d="$(dirname "$p")"
+        # acumula cadeia de diretórios até /
+        while [[ "$d" != "/" && -n "$d" ]]; do
+            echo "$d" >>"$tmp"
+            d="$(dirname "$d")"
+        done
+    done <"$filelist"
+
+    # remove duplicados, ordena por comprimento decrescente
+    dirs=$(awk '!seen[$0]++ { print }' "$tmp" 2>/dev/null | awk '{ print length, $0 }' | sort -rn | cut -d" " -f2-)
+    rm -f "$tmp" || true
+
+    local d
+    for d in $dirs; do
+        # nunca tenta remover / ou diretórios muito sensíveis fora da árvore padrão
+        if [[ "$d" == "/" ]]; then
+            continue
+        fi
+        if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+            adm_log_info "[DRY-RUN] rmdir (se vazio): $d"
+        else
+            rmdir "$d" 2>/dev/null || true
+        fi
+    done
+}
+
+# =========
+# Reverse deps instalados / órfãos
+# =========
+
+adm_uninstall_installed_reverse_deps() {
+    # Lista apenas reverse deps INSTALADOS de um pacote
+    local target="${1:-}"
+    [[ -z "$target" ]] && return 0
+
+    local revs
+    revs="$(adm_deps_reverse_deps "$target" || true)"
+
+    local out=""
+    local r
+    while IFS= read -r r; do
+        [[ -z "$r" ]] && continue
+        if adm_db_pkg_exists "$r"; then
+            out+="$r "
+        fi
+    done <<<"$revs"
+
+    # trim
+    out="${out#"${out%%[![:space:]]*}"}"
+    out="${out%"${out##*[![:space:]]}"}"
+
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+}
+
+adm_uninstall_list_orphans() {
+    # Pacotes instalados que não são dependência (build/run) de nenhum outro
+    # instalado, segundo adm_deps_reverse_deps.
+    local line pkg
+    local orphans=""
+
+    while IFS=$'\t' read -r pkg _ver _rel _prof _libc; do
+        [[ -z "$pkg" ]] && continue
+        local rev
+        rev="$(adm_uninstall_installed_reverse_deps "$pkg" || true)"
+        if [[ -z "$rev" ]]; then
+            orphans+="$pkg"$'\n'
+        fi
+    done < <(adm_db_list_installed)
+
+    printf '%s' "$orphans"
+}
+
+# =========
+# Desinstalação de um pacote
+# =========
+
+adm_uninstall_one() {
+    local pkg_id="${1:-}"
+
+    if [[ -z "$pkg_id" ]]; then
+        adm_log_fatal "adm_uninstall_one: pkg_id não informado."
+    fi
+
+    if ! adm_db_pkg_exists "$pkg_id"; then
+        adm_log_warn "Pacote não está registrado como instalado: $pkg_id"
+        return 0
+    fi
+
+    local version release profile libc
+    version="$(adm_db_get_meta_value "$pkg_id" "version" || echo "-")"
+    release="$(adm_db_get_meta_value "$pkg_id" "release" || echo "-")"
+    profile="$(adm_db_get_meta_value "$pkg_id" "profile" || echo "-")"
+    libc="$(adm_db_get_meta_value "$pkg_id" "libc" || echo "-")"
+
+    # Verifica reverse deps instalados
+    local rev
+    rev="$(adm_uninstall_installed_reverse_deps "$pkg_id" || true)"
+    if [[ -n "$rev" && "${ADM_UNINSTALL_FORCE:-0}" -ne 1 ]]; then
+        adm_log_error "Não é seguro remover $pkg_id ($version-$release): requerido por: $rev"
+        adm_log_error "Use --force (ADM_UNINSTALL_FORCE=1) se quiser ignorar esta checagem."
+        return 1
+    fi
+
+    adm_log_phase "Desinstalando $pkg_id ($version-$release)"
+
+    adm_event_pkg "PKG_UNINSTALL_START" "$pkg_id" "version=$version release=$release profile=$profile libc=$libc"
+
+    # Obtem lista de arquivos
+    local filelist
+    filelist="$(mktemp "$ADM_TMP_DIR/uninstall-${pkg_id//\//__}-XXXXXX")" || adm_log_fatal "Falha ao criar arquivo temporário."
+    if ! adm_db_list_files "$pkg_id" >"$filelist"; then
+        adm_log_warn "Não foi possível obter lista de arquivos para $pkg_id; seguindo com remoção do registro apenas."
+    fi
+
+    # Hook pre-uninstall
+    adm_uninstall_run_hook "$pkg_id" "hook-pre-uninstall" "/" "$filelist"
+
+    local removed_count=0
+    if [[ -s "$filelist" ]]; then
+        local line path
+        while IFS= read -r line; do
+            path="$(adm_uninstall_normalize_path "$line" || true)" || continue
+
+            if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+                adm_log_info "[DRY-RUN][$pkg_id] removeria $path"
+                continue
+            fi
+
+            if [[ -e "$path" || -L "$path" ]]; then
+                if rm -f -- "$path"; then
+                    removed_count=$((removed_count + 1))
+                else
+                    adm_log_warn "Falha ao remover $path (continuando)."
+                fi
+            fi
+        done <"$filelist"
+
+        # Tenta remover diretórios vazios
+        adm_uninstall_prune_empty_dirs "$filelist"
+    else
+        adm_log_warn "Lista de arquivos vazia para $pkg_id; nenhum arquivo removido."
+    fi
+
+    if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+        adm_log_info "[DRY-RUN][$pkg_id] Não removemos arquivos nem o registro de instalação."
+        rm -f "$filelist" || true
+        adm_event_pkg "PKG_UNINSTALL_DONE" "$pkg_id" "dry_run=1 removed=0"
+        return 0
+    fi
+
+    # Registra histórico da operação de UNINSTALL (arquivos)
+    adm_db_history_append "UNINSTALL" "$pkg_id" "$version" "$release" "OK" \
+        "type=uninstall profile=${profile} libc=${libc} files_removed=${removed_count}"
+
+    # Remove registro de instalação (isso também registra HISTORY_REMOVE internamente)
+    adm_db_remove_install "$pkg_id"
+
+    # Hook post-uninstall (recebe a lista de arquivos ainda)
+    adm_uninstall_run_hook "$pkg_id" "hook-post-uninstall" "/" "$filelist"
+
+    rm -f "$filelist" || true
+
+    adm_log_ok "Desinstalação concluída: $pkg_id ($version-$release), arquivos removidos: $removed_count"
+    adm_event_pkg "PKG_UNINSTALL_DONE" "$pkg_id" "removed=${removed_count}"
+
+    return 0
+}
+
+# =========
+# CLI
+# =========
+
+adm_uninstall_usage() {
+    cat <<EOF
+Uso: adm-uninstall <comando> [args...]
+
+Comandos:
+  uninstall PKG1 [PKG2 ...]
+      Desinstala um ou mais pacotes, executando hooks de uninstall se existirem.
+      Respeita:
+        ADM_DRY_RUN=1          -> não remove nada, só loga
+        ADM_UNINSTALL_FORCE=1  -> ignora reverse deps instalados
+
+  orphans
+      Lista pacotes órfãos (sem reverse deps instalados).
+
+  autoremove
+      Desinstala automaticamente todos os órfãos detectados.
+
+  help
+      Mostra esta ajuda.
+
+Exemplos:
+  adm-uninstall uninstall base/bash
+  ADM_DRY_RUN=1 adm-uninstall uninstall xorg/xterm
+  ADM_UNINSTALL_FORCE=1 adm-uninstall uninstall libs/zlib
+  adm-uninstall orphans
+  adm-uninstall autoremove
+EOF
+}
+
+adm_uninstall_cmd_uninstall() {
+    if [[ $# -lt 1 ]]; then
+        adm_log_fatal "Uso: adm-uninstall uninstall PKG1 [PKG2 ...]"
+    fi
+    local pkg
+    for pkg in "$@"; do
+        adm_uninstall_one "$pkg"
+    done
+}
+
+adm_uninstall_cmd_orphans() {
+    local orphans
+    orphans="$(adm_uninstall_list_orphans || true)"
+    if [[ -z "$orphans" ]]; then
+        adm_log_info "Nenhum órfão detectado."
+        return 0
+    fi
+    adm_log_phase_header "Pacotes órfãos detectados"
+    printf '%s\n' "$orphans"
+}
+
+adm_uninstall_cmd_autoremove() {
+    local orphans
+    orphans="$(adm_uninstall_list_orphans || true)"
+    if [[ -z "$orphans" ]]; then
+        adm_log_info "Nenhum órfão para remover."
+        return 0
+    fi
+    adm_log_phase_header "Removendo órfãos"
+    local pkg
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        adm_uninstall_one "$pkg"
+    done <<<"$orphans"
+}
+
+# =========
+# main
+# =========
+
+adm_uninstall_main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        uninstall)
+            adm_uninstall_cmd_uninstall "$@"
+            ;;
+        orphans)
+            adm_uninstall_cmd_orphans "$@"
+            ;;
+        autoremove)
+            adm_uninstall_cmd_autoremove "$@"
+            ;;
+        help|--help|-h)
+            adm_uninstall_usage
+            ;;
+        *)
+            adm_log_error "Comando desconhecido para adm-uninstall: $cmd"
+            adm_uninstall_usage
+            return 1
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
+    adm_uninstall_main "$@"
+fi
