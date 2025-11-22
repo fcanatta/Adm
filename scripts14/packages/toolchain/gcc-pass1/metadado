@@ -1,36 +1,42 @@
+# /root/usr/src/adm/packages/toolchain/gcc-pass1/metadado
+
 name: gcc-pass1
-version: 14.2.0
+version: 15.2.0
 release: 1
+
 category: toolchain
 license: GPL-3.0-or-later
-
 url: https://gcc.gnu.org/
 
-# glibc é o alvo final do sistema, mesmo que esse GCC ainda seja "cross"
+# Ajuda o adm-build/adm-profile a escolher o profile certo
 libc: glibc
 
 summary: GCC cross (pass 1) para bootstrap do toolchain
 description: >
-  GCC pass1: compilador C cross usado para construir temporariamente
-  o toolchain inicial antes da libc final, seguindo o esquema LFS.
+  GCC-15.2.0 Pass 1: compilador C/C++ cross, estático, usado antes da libc
+  final, seguindo o capítulo 5.3 do LFS (cross-toolchain inicial).
 
-# Dependências de build na visão do ADM.
-# Tipicamente:
-#   - toolchain/binutils-pass1
-#   - toolchain/linux-headers      (às vezes vem depois, dependendo da pipeline)
-#   - toolchain/mpfr, gmp, mpc... (se você modelar como pacotes separados)
+# Lidos por adm-deps / adm-build
+# gcc-pass1 precisa do binutils-pass1 já instalado no prefix do toolchain
 build_deps: toolchain/binutils-pass1
-
 run_deps:
 opt_deps:
 
-# Ajuda o ADM a classificar e fazer build-group/upgrade correto.
+# Usado por relatórios, build-group (toolchain inteiro, base inteira, etc)
 groups: toolchain toolchain-bootstrap cross gcc pass1
 
-# Fonte oficial (exemplo LFS 12.2)
-# Download: https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
-source_uri: https://ftp.gnu.org/gnu/gcc/gcc-14.2.0/gcc-14.2.0.tar.xz
+# Fontes oficiais conforme LFS development (cap. 5.3)
+# O ADM vai baixar todos e o hook-pre-configure embute mpfr/gmp/mpc na árvore do GCC.
 
-# SHA256 de gcc-14.2.0.tar.xz
-# (exemplo: ports de FreeBSD registram SHA256 a7b39b... para esse tarball) 
-source_checksum: a7b39bc69cbf9e25826c5a60ab26477001f7c08d85cec04bc0e29cabed6f3cc9
+source_uri: https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
+source_uri: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz
+source_uri: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+source_uri: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+
+# Você pode preencher depois com os sha256 reais.
+# De propósito, deixei sem checksums para não travar o adm-fetch.
+# Exemplo de formato (um por linha, na mesma ordem das URIs acima):
+# source_checksum: <sha256 gcc-15.2.0.tar.xz>
+# source_checksum: <sha256 mpfr-4.2.2.tar.xz>
+# source_checksum: <sha256 gmp-6.3.0.tar.xz>
+# source_checksum: <sha256 mpc-1.3.1.tar.gz>
