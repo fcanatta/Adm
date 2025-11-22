@@ -1,0 +1,30 @@
+name: grep-temp
+version: 3.12
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/grep/
+
+libc: glibc
+
+summary: Grep 3.12 temporário (cross) para o LFS (cap. 6.10)
+description: >
+  Grep 3.12 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.10 do LFS (Cross Compiling Temporary Tools). Usa
+  --host=$LFS_TGT e --build=$(./build-aux/config.guess),
+  integrado ao pipeline do ADM 2.0 com DESTDIR.
+
+# depende da toolchain temporária já funcional
+build_deps: toolchain/gawk-temp toolchain/findutils-temp toolchain/file-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: para build-group temp-tools, relatórios, etc
+groups: toolchain temp-tools cross-temp grep
+
+# Tarball oficial 3.12 (igual livro)
+source_uri: https://ftp.gnu.org/gnu/grep/grep-3.12.tar.xz
+
+# Pode preencher depois com o SHA256 real
+source_checksum:
