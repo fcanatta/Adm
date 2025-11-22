@@ -1,0 +1,30 @@
+name: python-temp
+version: 3.12.5
+release: 1
+
+category: toolchain
+license: Python-2.0
+url: https://www.python.org/
+
+libc: glibc
+
+summary: Python 3.12.5 temporário para LFS (cap. 7.10, chroot)
+description: >
+  Python 3.12.5 construído como ferramenta temporária dentro do chroot,
+  seguindo o capítulo 7.10 do LFS. Configurado com --prefix=/usr,
+  --enable-shared e --without-ensurepip, integrado ao pipeline ADM 2.0
+  usando DESTDIR para instalar em /usr dentro do sysroot.
+
+# Toolchain já pronta dentro do chroot
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp toolchain/perl-temp toolchain/gettext-temp
+run_deps:
+opt_deps:
+
+# groups para build-group e relatórios
+groups: toolchain temp-tools chroot python
+
+# IMPORTANTE: nome com P maiúsculo, igual no livro
+source_uri: https://www.python.org/ftp/python/3.12.5/Python-3.12.5.tar.xz
+
+# pode preencher depois com o sha256 oficial
+source_checksum:
