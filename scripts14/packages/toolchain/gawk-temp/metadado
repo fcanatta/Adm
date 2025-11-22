@@ -1,0 +1,31 @@
+name: gawk-temp
+version: 5.3.2
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/gawk/
+
+# Ajuda o adm-build/adm-profile a escolher o profile certo
+libc: glibc
+
+summary: Gawk 5.3.2 temporário (cross) para o LFS (cap. 6.9)
+description: >
+  Gawk 5.3.2 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.9 do LFS (Cross Compiling Temporary Tools). Aplica o sed
+  para não instalar 'extras' e usa --host=$LFS_TGT, --build=$(build-aux/config.guess),
+  integrado ao pipeline do ADM 2.0 com DESTDIR.
+
+# Depende da toolchain temporária já funcional
+build_deps: toolchain/findutils-temp toolchain/file-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: para build-group (ex: temp-tools), relatórios, etc.
+groups: toolchain temp-tools cross-temp gawk
+
+# Tarball 5.3.2 (LFS 12.4)
+source_uri: https://ftp.gnu.org/gnu/gawk/gawk-5.3.2.tar.xz
+
+# Você pode preencher depois com o SHA256 oficial se quiser
+source_checksum:
