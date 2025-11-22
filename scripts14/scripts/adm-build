@@ -559,7 +559,15 @@ adm_build_do_autotools() {
         fi
 
         if [[ -x "./configure" ]]; then
-            adm_build_run_cmd "$pkg_id" "configure" ./configure --prefix=/usr
+            # Permitir argumentos extras de configure por pacote
+            local extra_cfg
+            extra_cfg="${ADM_CONFIGURE_ARGS_EXTRA:-}"
+
+            if [[ -n "$extra_cfg" ]]; then
+                adm_log_info "Usando argumentos extras de configure para $pkg_id: $extra_cfg"
+            fi
+
+            adm_build_run_cmd "$pkg_id" "configure" ./configure --prefix=/usr $extra_cfg
         else
             adm_log_warn "autotools sem ./configure em $build_dir"
         fi
