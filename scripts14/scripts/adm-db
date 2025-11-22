@@ -1,13 +1,24 @@
 #!/usr/bin/env bash
 # adm-db - Camada de acesso ao banco de dados do ADM 2.0
 # /root/usr/src/adm/scripts/
+#
 # Responsável por:
 #   - Registrar/leitura de pacotes instalados (db/installed/)
 #   - Registrar histórico de ações (db/history/)
 #   - Gerenciar upgrade-list (db/upgrade-list)
 #
 # Pode ser sourceado por outros scripts ou usado via CLI para debug.
-# adm_db_history_snapshot ACTION SNAP_NAME STATUS [MSG...]
+#
+# Histórico rico:
+#   - adm_db_history_install    -> INSTALL
+#   - adm_db_history_remove     -> REMOVE
+#   - adm_db_history_upgrade    -> UPGRADE (upgrade/downgrade, planned/applied)
+#   - adm_db_history_snapshot   -> SNAPSHOT_CREATE / SNAPSHOT_DIFF / SNAPSHOT_RESTORE / etc.
+#
+# Formato history:
+#   ts\tpid\taction\tpkg_id\tversion\trelease\tstatus\tmsg
+#
+# Onde msg é uma string "k=v ... :: extra texto livre"
 
 set -o errexit
 set -o nounset
@@ -19,6 +30,7 @@ set -o pipefail
 
 _adm_db_script_dir() {
     local src="${BASH_SOURCE[0]:-$0}"
+
     while [ -L "$src" ]; do
         local target
         target=$(readlink "$src") || break
@@ -28,6 +40,7 @@ _adm_db_script_dir() {
             src="$(dirname "$src")/$target"
         fi
     done
+
     cd "$(dirname "$src")" >/dev/null 2>&1 || {
         printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-db.\n' >&2
         exit 1
@@ -46,11 +59,13 @@ source "$_ADM_DB_DIR/adm-eventd"
 
 # Garante diretórios básicos do DB
 if [[ ! -d "$ADM_DB_INSTALLED_DIR" ]]; then
-    mkdir -p "$ADM_DB_INSTALLED_DIR" || adm_log_fatal "Falha ao criar '$ADM_DB_INSTALLED_DIR'."
+    mkdir -p "$ADM_DB_INSTALLED_DIR" \
+        || adm_log_fatal "Falha ao criar '$ADM_DB_INSTALLED_DIR'."
 fi
 
 if [[ ! -d "$ADM_DB_HISTORY_DIR" ]]; then
-    mkdir -p "$ADM_DB_HISTORY_DIR" || adm_log_fatal "Falha ao criar '$ADM_DB_HISTORY_DIR'."
+    mkdir -p "$ADM_DB_HISTORY_DIR" \
+        || adm_log_fatal "Falha ao criar '$ADM_DB_HISTORY_DIR'."
 fi
 
 # =========
@@ -62,9 +77,11 @@ adm_db_pkg_parse_id() {
     # Uso:
     #   read cat name < <(adm_db_pkg_parse_id "base/kmod")
     local pkg_id="${1:-}"
+
     if [[ "$pkg_id" != */* ]]; then
         adm_log_fatal "pkg_id inválido (esperado categoria/pacote): '$pkg_id'"
     fi
+
     local cat="${pkg_id%%/*}"
     local name="${pkg_id##*/}"
     printf '%s %s\n' "$cat" "$name"
@@ -77,7 +94,7 @@ adm_db_pkg_file() {
     local pkg_id="${1:-}"
     local cat name
     read -r cat name < <(adm_db_pkg_parse_id "$pkg_id")
-    printf '%s/%s__%s.pkg' "$ADM_DB_INSTALLED_DIR" "$cat" "$name"
+    printf '%s/%s__%s.pkg\n' "$ADM_DB_INSTALLED_DIR" "$cat" "$name"
 }
 
 adm_db_pkg_exists() {
@@ -107,6 +124,7 @@ adm_db_register_install() {
     #   - libc: libc usada (glibc, musl, etc. pode ser "-")
     #   - files_list_path: arquivo temporário com lista de arquivos (um por linha)
     #   - build_id: identificador de build (opcional; pode ser "-")
+
     if [[ $# -lt 6 ]]; then
         adm_log_fatal "adm_db_register_install: uso: adm_db_register_install pkg_id version release profile libc files_list_path [build_id]"
     fi
@@ -160,18 +178,22 @@ adm_db_register_install() {
         }
 
         mv "$file.tmp" "$file" || {
-        printf "ADM-ERROR: falha ao substituir arquivo de instalado %s\n" "$file" >&2
-        exit 1
-    }
-' _ "$file" "$pkg_id" "$cat" "$name" "$version" "$release" "$profile" "$libc" "$files_list" "$ts_epoch" "$ts_human" "$build_id"
+            printf "ADM-ERROR: falha ao substituir arquivo de instalado %s\n" "$file" >&2
+            exit 1
+        }
+    ' _ "$file" "$pkg_id" "$cat" "$name" "$version" "$release" "$profile" "$libc" \
+        "$files_list" "$ts_epoch" "$ts_human" "$build_id"
 
     adm_log_ok "Registrado pacote instalado: $pkg_id $version-$release"
-    adm_event_pkg "PKG_INSTALL_REGISTERED" "$pkg_id" "version=$version release=$release profile=$profile libc=$libc"
+    adm_event_pkg "PKG_INSTALL_REGISTERED" "$pkg_id" \
+        "version=$version release=$release profile=$profile libc=$libc"
 
-    # Novo: histórico rico de instalação
+    # Histórico rico de instalação
     local files_count
     files_count=$(wc -l <"$files_list" 2>/dev/null || echo 0)
-    adm_db_history_install "$pkg_id" "$version" "$release" "$profile" "$libc" "$build_id" "OK" "files=${files_count}"
+    adm_db_history_install \
+        "$pkg_id" "$version" "$release" "$profile" "$libc" "$build_id" \
+        "OK" "files=${files_count}"
 }
 
 adm_db_remove_install() {
@@ -179,9 +201,11 @@ adm_db_remove_install() {
     # Uso:
     #   adm_db_remove_install pkg_id
     local pkg_id="${1:-}"
+
     if [[ -z "$pkg_id" ]]; then
         adm_log_fatal "adm_db_remove_install: pkg_id não informado."
     fi
+
     local file
     file="$(adm_db_pkg_file "$pkg_id")"
 
@@ -208,8 +232,9 @@ adm_db_remove_install() {
     adm_log_ok "Removido registro de instalado: $pkg_id"
     adm_event_pkg "PKG_INSTALL_REMOVED" "$pkg_id" ""
 
-    # Novo: histórico rico de remoção
-    adm_db_history_remove "$pkg_id" "$version" "$release" "$profile" "$libc" "OK" "db-record-removed=1"
+    # Histórico rico de remoção
+    adm_db_history_remove "$pkg_id" "$version" "$release" "$profile" "$libc" \
+        "OK" "db-record-removed=1"
 }
 
 # =========
@@ -218,8 +243,9 @@ adm_db_remove_install() {
 
 adm_db_list_installed() {
     # Lista pacotes instalados em formato:
-    # pkg_id<TAB>version<TAB>release<TAB>profile<TAB>libc
+    #   pkg_id<TAB>version<TAB>release<TAB>profile<TAB>libc
     local f pkg_id version release profile libc
+
     for f in "$ADM_DB_INSTALLED_DIR"/*.pkg; do
         [[ -e "$f" ]] || continue
 
@@ -231,28 +257,37 @@ adm_db_list_installed() {
 
         while IFS='=' read -r key val; do
             case "$key" in
-                pkg_id) pkg_id="$val" ;;
+                pkg_id)  pkg_id="$val" ;;
                 version) version="$val" ;;
                 release) release="$val" ;;
                 profile) profile="$val" ;;
-                libc) libc="$val" ;;
+                libc)    libc="$val" ;;
             esac
-        done < <(awk 'BEGIN{inmeta=0} /^\[meta\]/{inmeta=1;next} /^\[/{inmeta=0} inmeta && NF>0{print}' "$f")
+        done < <(awk '
+            BEGIN{inmeta=0}
+            /^\[meta\]/{inmeta=1;next}
+            /^\[/{inmeta=0}
+            inmeta && NF>0{print}
+        ' "$f")
 
         if [[ -n "$pkg_id" ]]; then
-            printf '%s\t%s\t%s\t%s\t%s\n' "$pkg_id" "$version" "$release" "$profile" "$libc"
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+                "$pkg_id" "$version" "$release" "$profile" "$libc"
         fi
     done
 }
 
 adm_db_get_meta_value() {
     # Lê um valor específico do [meta] de um pacote.
+    #
     # Uso:
     #   adm_db_get_meta_value pkg_id chave
-    # Saída: valor (stdout).  Retorno 0 se encontrado, 1 se não.
+    # Saída:
+    #   valor (stdout). Retorno 0 se encontrado, 1 se não.
     if [[ $# -lt 2 ]]; then
         adm_log_fatal "adm_db_get_meta_value: uso: adm_db_get_meta_value pkg_id chave"
     fi
+
     local pkg_id="$1"
     local key_target="$2"
     local file
@@ -263,24 +298,31 @@ adm_db_get_meta_value() {
         return 1
     fi
 
-    local line key val
+    local key val
     while IFS='=' read -r key val; do
         if [[ "$key" == "$key_target" ]]; then
             printf '%s\n' "$val"
             return 0
         fi
-    done < <(awk 'BEGIN{inmeta=0} /^\[meta\]/{inmeta=1;next} /^\[/{inmeta=0} inmeta && NF>0{print}' "$file")
+    done < <(awk '
+        BEGIN{inmeta=0}
+        /^\[meta\]/{inmeta=1;next}
+        /^\[/{inmeta=0}
+        inmeta && NF>0{print}
+    ' "$file")
 
     return 1
 }
 
 adm_db_list_files() {
     # Lista arquivos de um pacote (seção [files])
+    #
     # Uso:
     #   adm_db_list_files pkg_id
     if [[ $# -lt 1 ]]; then
         adm_log_fatal "adm_db_list_files: uso: adm_db_list_files pkg_id"
     fi
+
     local pkg_id="$1"
     local file
     file="$(adm_db_pkg_file "$pkg_id")"
@@ -290,7 +332,12 @@ adm_db_list_files() {
         return 1
     fi
 
-    awk 'BEGIN{infiles=0} /^\[files\]/{infiles=1;next} /^\[/{infiles=0} infiles{print}' "$file"
+    awk '
+        BEGIN{infiles=0}
+        /^\[files\]/{infiles=1;next}
+        /^\[/{infiles=0}
+        infiles{print}
+    ' "$file"
 }
 
 # =========
@@ -300,7 +347,7 @@ adm_db_list_files() {
 adm_db_history_file_for_today() {
     local day
     day="$(date '+%Y%m%d')"
-    printf '%s/history-%s.log' "$ADM_DB_HISTORY_DIR" "$day"
+    printf '%s/history-%s.log\n' "$ADM_DB_HISTORY_DIR" "$day"
 }
 
 adm_db_history_append() {
@@ -311,6 +358,7 @@ adm_db_history_append() {
     #
     # Exemplo:
     #   adm_db_history_append BUILD base/kmod 1.0 1 OK "Build concluído"
+
     if [[ $# -lt 5 ]]; then
         adm_log_fatal "adm_db_history_append: uso: adm_db_history_append action pkg_id version release status [mensagem...]"
     fi
@@ -336,7 +384,8 @@ adm_db_history_append() {
     status="${status//$'\t'/ }"
     msg="${msg//$'\t'/ }"
 
-    line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ts" "$pid" "$action" "$pkg_id" "$version" "$release" "$status" "$msg")
+    line=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$ts" "$pid" "$action" "$pkg_id" "$version" "$release" "$status" "$msg")
 
     adm_with_lock "db-history" bash -c '
         local file="$1" line="$2"
@@ -365,6 +414,7 @@ adm_db_history_install() {
     #
     # Exemplo:
     #   adm_db_history_install base/bash 5.2 1 glibc/extreme glibc build123 OK "instalação concluída"
+
     if [[ $# -lt 7 ]]; then
         adm_log_fatal "adm_db_history_install: uso: adm_db_history_install pkg_id version release profile libc build_id status [msg...]"
     fi
@@ -393,6 +443,7 @@ adm_db_history_remove() {
     #
     # Uso:
     #   adm_db_history_remove pkg_id version release profile libc status [msg_livre...]
+
     if [[ $# -lt 6 ]]; then
         adm_log_fatal "adm_db_history_remove: uso: adm_db_history_remove pkg_id version release profile libc status [msg...]"
     fi
@@ -422,6 +473,7 @@ adm_db_history_upgrade() {
     #   adm_db_history_upgrade pkg_id old_ver old_rel new_ver new_rel status direction [reason] [msg_livre...]
     #
     # direction: "upgrade" ou "downgrade"
+
     if [[ $# -lt 7 ]]; then
         adm_log_fatal "adm_db_history_upgrade: uso: adm_db_history_upgrade pkg_id old_ver old_rel new_ver new_rel status direction [reason] [msg...]"
     fi
@@ -439,6 +491,7 @@ adm_db_history_upgrade() {
     if [[ -n "${1:-}" ]]; then
         shift 1 || true
     fi
+
     local extra_msg="$*"
 
     local version_for_line="$new_ver"
@@ -464,6 +517,7 @@ adm_db_history_snapshot() {
     #
     # Onde "action" pode ser:
     #   SNAPSHOT_CREATE, SNAPSHOT_DIFF, SNAPSHOT_RESTORE, etc.
+
     if [[ $# -lt 3 ]]; then
         adm_log_fatal "adm_db_history_snapshot: uso: adm_db_history_snapshot action snapshot_name status [msg...]"
     fi
@@ -492,10 +546,11 @@ adm_db_upgrade_add() {
     # Adiciona/atualiza uma entrada na upgrade-list.
     #
     # Formato da linha:
-    #   pkg_id<TAB>old_ver<TAB>old_rel<TAB>new_ver<TAB>new_rel<TAB>reason
+    #   pkg_id old_ver old_rel new_ver new_rel reason
     #
     # Uso:
     #   adm_db_upgrade_add pkg_id old_ver old_rel new_ver new_rel reason
+
     if [[ $# -lt 6 ]]; then
         adm_log_fatal "adm_db_upgrade_add: uso: adm_db_upgrade_add pkg_id old_ver old_rel new_ver new_rel reason"
     fi
@@ -516,7 +571,9 @@ adm_db_upgrade_add() {
     reason="${reason//$'\t'/ }"
 
     adm_with_lock "upgrade-list" bash -c '
-        local file="$1" pkg_id="$2" old_ver="$3" old_rel="$4" new_ver="$5" new_rel="$6" reason="$7"
+        local file="$1" pkg_id="$2" old_ver="$3" old_rel="$4"
+        local new_ver="$5" new_rel="$6" reason="$7"
+
         mkdir -p "$(dirname "$file")" || {
             printf "ADM-ERROR: falha ao criar diretório para upgrade-list.\n" >&2
             exit 1
@@ -525,12 +582,14 @@ adm_db_upgrade_add() {
         # Remove qualquer linha existente para este pkg_id
         local tmp="${file}.tmp"
         if [[ -f "$file" ]]; then
-            grep -v -F -e "$pkg_id"$'"'\t'"'" "$file" >"$tmp" || true
+            grep -v -F -e "$pkg_id"$'\t' "$file" >"$tmp" || true
         else
             : >"$tmp"
         fi
 
-        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" "$reason" >>"$tmp" || {
+        printf "%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" "$reason" \
+            >>"$tmp" || {
             printf "ADM-ERROR: falha ao escrever upgrade-list temporário.\n" >&2
             exit 1
         }
@@ -542,12 +601,14 @@ adm_db_upgrade_add() {
     ' _ "$ADM_DB_UPGRADE_LIST" "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" "$reason"
 
     adm_log_ok "Adicionada entrada na upgrade-list: $pkg_id $old_ver-$old_rel -> $new_ver-$new_rel ($reason)"
-    adm_event_pkg "UPGRADE_LIST_ADD" "$pkg_id" "from=$old_ver-$old_rel to=$new_ver-$new_rel reason=$reason"
+    adm_event_pkg "UPGRADE_LIST_ADD" "$pkg_id" \
+        "from=$old_ver-$old_rel to=$new_ver-$new_rel reason=$reason"
 
-    # Novo: histórico rico de upgrade planejado
-    local direction="upgrade"
-    # Se quiser, você pode tentar detectar downgrade aqui comparando versões.
-    adm_db_history_upgrade "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" "PLANNED" "$direction" "$reason" "source=upgrade-list"
+    # Histórico rico de upgrade planejado
+    local direction="upgrade"  # se quiser, pode detectar downgrade comparando versões
+    adm_db_history_upgrade \
+        "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" \
+        "PLANNED" "$direction" "$reason" "source=upgrade-list"
 }
 
 adm_db_upgrade_list() {
@@ -577,78 +638,57 @@ adm_db_upgrade_clear() {
 # =========
 
 adm_db_usage() {
-    cat <<EOF
-adm-db - Acesso ao banco de dados do ADM
+    cat <<'EOF'
+adm-db - Camada de DB do ADM 2.0 (debug/inspeção)
 
 Uso:
   adm-db list-installed
-      Lista pacotes instalados (pkg_id, versão, release, profile, libc).
-
-  adm-db is-installed pkg_id
-      Retorna 0 se o pacote está instalado, 1 caso contrário.
-
-  adm-db show-meta pkg_id
-      Mostra seção [meta] do registro de instalado.
-
-  adm-db list-files pkg_id
-      Lista os arquivos associados ao pacote (seção [files]).
-
+  adm-db meta PKG_ID KEY
+  adm-db files PKG_ID
+  adm-db history-tail [N]
   adm-db upgrade-list
-      Mostra o conteúdo de db/upgrade-list.
-
   adm-db upgrade-clear
-      Limpa db/upgrade-list.
+  adm-db help
 
-  adm-db history-add action pkg_id version release status [mensagem...]
-      Adiciona uma entrada no histórico.
-
-  adm-db --help
-      Mostra esta ajuda.
-
-ATENÇÃO:
-  - Funções de alto nível para registrar instalações e upgrade-list
-    devem ser usadas pelos scripts de build/update/upgrade.
+Comandos:
+  list-installed    Lista pacotes instalados (pkg_id version release profile libc)
+  meta PKG KEY      Lê um campo do [meta] de um pacote
+  files PKG         Lista arquivos registrados para um pacote
+  history-tail [N]  Mostra últimas N linhas do histórico (default 50)
+  upgrade-list      Mostra o conteúdo de db/upgrade-list
+  upgrade-clear     Limpa db/upgrade-list
 EOF
 }
 
 adm_db_main() {
     local cmd="${1:-}"
+    [[ -n "$cmd" ]] && shift || true
 
     case "$cmd" in
         list-installed)
             adm_db_list_installed
             ;;
-        is-installed)
-            shift || true
-            if [[ $# -lt 1 ]]; then
-                adm_log_fatal "Uso: adm-db is-installed pkg_id"
+        meta)
+            if [[ $# -lt 2 ]]; then
+                adm_log_fatal "Uso: adm-db meta PKG_ID KEY"
             fi
-            if adm_db_pkg_exists "$1"; then
-                adm_log_ok "Pacote instalado: $1"
-                exit 0
-            else
-                adm_log_warn "Pacote NÃO instalado: $1"
-                exit 1
-            fi
+            adm_db_get_meta_value "$1" "$2"
             ;;
-        show-meta)
-            shift || true
+        files)
             if [[ $# -lt 1 ]]; then
-                adm_log_fatal "Uso: adm-db show-meta pkg_id"
-            fi
-            local file
-            file="$(adm_db_pkg_file "$1")"
-            if [[ ! -f "$file" ]]; then
-                adm_log_fatal "Registro não encontrado para $1"
-            fi
-            awk 'BEGIN{inmeta=0} /^\[meta\]/{inmeta=1;next} /^\[/{inmeta=0} inmeta{print}' "$file"
-            ;;
-        list-files)
-            shift || true
-            if [[ $# -lt 1 ]]; then
-                adm_log_fatal "Uso: adm-db list-files pkg_id"
+                adm_log_fatal "Uso: adm-db files PKG_ID"
             fi
             adm_db_list_files "$1"
+            ;;
+        history-tail)
+            local n="${1:-50}"
+            local file
+            file="$(adm_db_history_file_for_today)"
+            if [[ ! -f "$file" ]]; then
+                adm_log_warn "Nenhum histórico para hoje ainda: $file"
+                return 0
+            fi
+            tail -n "$n" "$file"
             ;;
         upgrade-list)
             adm_db_upgrade_list
@@ -656,14 +696,7 @@ adm_db_main() {
         upgrade-clear)
             adm_db_upgrade_clear
             ;;
-        history-add)
-            shift || true
-            if [[ $# -lt 5 ]]; then
-                adm_log_fatal "Uso: adm-db history-add action pkg_id version release status [mensagem...]"
-            fi
-            adm_db_history_append "$@"
-            ;;
-        --help|-h|"")
+        help|"")
             adm_db_usage
             ;;
         *)
@@ -672,8 +705,6 @@ adm_db_main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     adm_db_main "$@"
 fi
-
-# Fim do adm-db
