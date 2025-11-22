@@ -1,98 +1,215 @@
 #!/usr/bin/env bash
-# hook-pre-configure para toolchain/glibc
+# hook-pre-configure para toolchain/glibc (ADM 2.0 + LFS 5.5)
 #
-# Objetivo:
-#   - Injetar flags corretas para configurar a glibc em modo toolchain,
-#     usando build dir separado.
+# Executado pelo adm-build dentro de $ADM_BUILD_DIR_CURRENT,
+# ANTES do configure/autotools.
 #
-# Premissas:
-#   - ADM_BUILD_DIR_CURRENT é o diretório de build (ex: .../glibc/build)
-#   - O source da glibc está em ../ (onde está o configure original)
-#   - O adm-build chama ./configure no build dir.
-#
-# Variáveis de profile:
-#   ADM_CROSS_TARGET  -> host (ex: x86_64-lfs-linux-gnu)
-#   ADM_BUILD_SYSTEM  -> build (config.guess, se disponível)
-#   ADM_SYSROOT       -> sysroot do alvo (ex: /, $LFS)
-#
-# Flags típicas (baseado em LFS):
-#   ../configure \
-#       --prefix=/usr \
-#       --host=${CROSS_TARGET} \
-#       --build=${BUILD_SYSTEM} \
-#       --with-headers=${SYSROOT}/usr/include \
-#       --disable-werror
+# Responsável por:
+#  - Ajustes de LSB (links em $LFS/lib*/...)
+#  - Aplicar o patch FHS da glibc (glibc-2.42-fhs-1.patch)
+#  - Criar um wrapper ./configure na raiz do build_dir que
+#    chama o configure REAL da glibc com as flags do LFS.
 
 set -o errexit
 set -o nounset
 set -o pipefail
 
-PKG_ID="${ADM_PKG_ID:-toolchain/glibc}"
-BUILD_DIR="${ADM_BUILD_DIR_CURRENT:-.}"
+# =========================
+# Descobrir diretórios base
+# =========================
 
-CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-BUILD_SYSTEM="${ADM_BUILD_SYSTEM:-$(gcc -dumpmachine 2>/dev/null || echo x86_64-pc-linux-gnu)}"
-SYSROOT="${ADM_SYSROOT:-/}"
+# Diretório onde o hook está (packages/toolchain/glibc)
+_hook_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# build_dir é definido pelo adm-build e passado via ADM_BUILD_DIR_CURRENT
+build_dir="${ADM_BUILD_DIR_CURRENT:-}"
 
-echo "[hook-pre-configure][$PKG_ID] BUILD_DIR=$BUILD_DIR"
-echo "[hook-pre-configure][$PKG_ID] TARGET=$CROSS_TARGET BUILD=$BUILD_SYSTEM SYSROOT=$SYSROOT"
-
-cd "$BUILD_DIR"
-
-if [[ ! -x ../configure ]]; then
-    echo "[hook-pre-configure][$PKG_ID] ../configure não encontrado ou não executável."
+if [[ -z "$build_dir" || ! -d "$build_dir" ]]; then
+    printf 'ADM-ERROR[glibc hook-pre-configure]: ADM_BUILD_DIR_CURRENT inválido: %s\n' "${build_dir:-<vazio>}" >&2
     exit 1
 fi
 
-if [[ -x ./configure.orig ]]; then
-    echo "[hook-pre-configure][$PKG_ID] ./configure.orig já existe; não vou sobrescrever."
-    exit 0
+cd "$build_dir"
+
+# PKG_ID só para mensagens
+pkg_id="${ADM_PKG_ID:-toolchain/glibc}"
+
+# =========================
+# 1) Sysroot para links LSB
+# =========================
+# O LFS faz:
+#   case $(uname -m) in
+#     i?86)   ln -sfv ld-linux.so.2 $LFS/lib/ld-lsb.so.3
+#     x86_64) ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64
+#             ln -sfv ../lib/ld-linux-x86-64.so.2 $LFS/lib64/ld-lsb-x86-64.so.3
+#   esac
+#
+# Aqui, preferimos:
+#  - usar $LFS se estiver definido (modo LFS puro), SENÃO
+#  - usar $ADM_SYSROOT se existir e não for "/".
+# Se nada estiver definido, apenas avisamos e não criamos links.
+
+sysroot=""
+if [[ -n "${LFS:-}" ]]; then
+    sysroot="$LFS"
+elif [[ -n "${ADM_SYSROOT:-}" && "${ADM_SYSROOT}" != "/" ]]; then
+    sysroot="$ADM_SYSROOT"
 fi
 
-# Caso o adm-build já tenha gerado um configure aqui, preserva
-if [[ -x ./configure ]]; then
-    mv ./configure ./configure.orig
+if [[ -n "$sysroot" ]]; then
+    mkdir -p "$sysroot/lib" "$sysroot/lib64" 2>/dev/null || true
+    arch="$(uname -m || echo unknown)"
+    case "$arch" in
+        i?86)
+            ln -sfv ld-linux.so.2 "$sysroot/lib/ld-lsb.so.3" 2>/dev/null || true
+            ;;
+        x86_64)
+            ln -sfv ../lib/ld-linux-x86-64.so.2 "$sysroot/lib64/ld-linux-x86-64.so.2" 2>/dev/null || true
+            ln -sfv ../lib/ld-linux-x86-64.so.2 "$sysroot/lib64/ld-lsb-x86-64.so.3" 2>/dev/null || true
+            ;;
+        *)
+            printf 'ADM-WARN[%s]: arquitetura %s não tratada para links LSB, pulando.\n' \
+                "$pkg_id" "$arch" >&2
+            ;;
+    esac
+else
+    printf 'ADM-WARN[%s]: nem LFS nem ADM_SYSROOT definidos; links LSB não serão criados.\n' \
+        "$pkg_id" >&2
 fi
 
-cat > ./configure << 'EOF'
+# =========================
+# 2) Aplicar patch FHS
+# =========================
+# O adm-fetch já baixou o patch e o adm-scan copiou para o build_dir.
+# Nome esperado: glibc-2.42-fhs-1.patch
+# LFS manda rodar isso dentro do diretório raiz da glibc, com:
+#   patch -Np1 -i ../glibc-2.42-fhs-1.patch
+
+patch_file="${build_dir}/glibc-2.42-fhs-1.patch"
+
+# Descobrir diretório raiz da glibc: glibc-2.42/ (ou glibc-2.42.x etc)
+glibc_src_dir=""
+while IFS= read -r d; do
+    # preferimos diretórios glibc-2.42* na raiz
+    base="${d#./}"
+    glibc_src_dir="$d"
+    break
+done < <(find . -maxdepth 1 -type d -name 'glibc-*' -print | sort)
+
+if [[ -z "$glibc_src_dir" ]]; then
+    printf 'ADM-ERROR[%s]: não encontrei diretório glibc-* dentro de %s\n' \
+        "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+if [[ -f "$patch_file" ]]; then
+    printf 'ADM-INFO[%s]: aplicando patch FHS: %s\n' "$pkg_id" "$patch_file" >&2
+    (
+        cd "$glibc_src_dir"
+        # Mesmo comando do LFS, só que com caminho absoluto do patch
+        patch -Np1 -i "$patch_file"
+    )
+else
+    printf 'ADM-WARN[%s]: patch FHS não encontrado (%s); construção continuará sem patch.\n' \
+        "$pkg_id" "$patch_file" >&2
+fi
+
+# =========================
+# 3) Wrapper ./configure (modelo autotools + LFS)
+# =========================
+# O adm-build, para build_system=autotools, faz:
+#   cd "$build_dir"
+#   ./configure --prefix=/usr $extra
+#   make
+#   make DESTDIR="$destdir" install
+#
+# Como o source real fica em $glibc_src_dir, criamos um wrapper ./configure
+# na raiz de $build_dir que:
+#   - escreve configparms com rootsbindir=/usr/sbin (como LFS)
+#   - resolve o configure real da glibc
+#   - chama o configure real com as flags do LFS
+#   - repassa qualquer argumento extra vindo do adm-build ($@)
+
+wrapper_path="${build_dir}/configure"
+
+cat >"$wrapper_path" <<'EOF'
 #!/usr/bin/env bash
 set -o errexit
 set -o nounset
 set -o pipefail
 
-CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-BUILD_SYSTEM="${ADM_BUILD_SYSTEM:-$(gcc -dumpmachine 2>/dev/null || echo x86_64-pc-linux-gnu)}"
-SYSROOT="${ADM_SYSROOT:-/}"
+pkg_id="${ADM_PKG_ID:-toolchain/glibc}"
 
-orig_args=("$@")
-filtered=()
+# Diretório de build (raiz onde o adm-build trabalha)
+build_dir="$(pwd)"
 
-# Remove possíveis --prefix=/usr duplicados ou flags conflitantes
-for a in "${orig_args[@]}"; do
-    case "$a" in
-        --prefix=*|--host=*|--build=*|--with-headers=*|--disable-werror)
-            # ignoramos esses para usar os nossos
-            ;;
-        *)
-            filtered+=("$a")
-            ;;
-    esac
-done
+# Tenta localizar o configure real da glibc (glibc-*/configure)
+real_conf=""
+while IFS= read -r f; do
+    real_conf="$f"
+    break
+done < <(find "$build_dir" -maxdepth 2 -type f -name 'configure' -path '*/glibc-*/configure' -print | sort)
 
-extra=(
-    "--prefix=/usr"
-    "--host=${CROSS_TARGET}"
-    "--build=${BUILD_SYSTEM}"
-    "--with-headers=${SYSROOT%/}/usr/include"
-    "--disable-werror"
+if [[ -z "$real_conf" ]]; then
+    # fallback genérico: qualquer configure dentro de glibc-*
+    while IFS= read -r f; do
+        real_conf="$f"
+        break
+    done < <(find "$build_dir" -maxdepth 4 -type f -name 'configure' -path '*/glibc-*/configure' -print | sort)
+fi
+
+if [[ -z "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: não consegui encontrar o configure real da glibc em %s\n' \
+        "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+real_src_dir="$(cd "$(dirname "$real_conf")" && pwd)"
+
+# configparms no build_dir, como recomenda o manual da glibc
+echo "rootsbindir=/usr/sbin" > "${build_dir}/configparms"
+
+# Precisamos de um host triplet, como no LFS (LFS_TGT)
+host="${LFS_TGT:-}"
+
+if [[ -z "$host" ]]; then
+    printf 'ADM-ERROR[%s]: variável LFS_TGT não definida; defina LFS_TGT (ex: x86_64-lfs-linux-gnu) para construir a glibc cross.\n' \
+        "$pkg_id" >&2
+    exit 1
+fi
+
+build="$("$real_src_dir/../scripts/config.guess")"
+
+# Flags principais conforme LFS capítulo 5.5:
+#   --prefix=/usr
+#   --host=$LFS_TGT
+#   --build=$(../scripts/config.guess)
+#   --disable-nscd
+#   libc_cv_slibdir=/usr/lib
+#   --enable-kernel=5.4
+#
+# Repassamos também qualquer arg extra que o adm-build fizer (ex: --enable-debug).
+
+args=(
+  "$real_conf"
+  --prefix=/usr
+  --host="${host}"
+  --build="${build}"
+  --disable-nscd
+  libc_cv_slibdir=/usr/lib
+  --enable-kernel=5.4
 )
 
-echo "[hook-glibc-wrapper] chamando ../configure com:"
-printf '  %s\n' "${extra[@]}" "${filtered[@]}"
+# Repassa argumentos que vieram do adm-build (ex: --prefix=/usr, etc.)
+if [[ $# -gt 0 ]]; then
+    args+=("$@")
+fi
 
-exec ../configure "${extra[@]}" "${filtered[@]}"
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+
+exec "${args[@]}"
 EOF
 
-chmod +x ./configure
+chmod +x "$wrapper_path"
 
-echo "[hook-pre-configure][$PKG_ID] wrapper ./configure criado (aponta para ../configure)."
+printf 'ADM-INFO[%s]: hook-pre-configure finalizado; wrapper ./configure criado em %s\n' \
+    "$pkg_id" "$wrapper_path" >&2
