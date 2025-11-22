@@ -12,31 +12,24 @@ summary: i3 4.24 tiling window manager para X11 (LFS/ADM 2.0)
 description: >
   i3 é um window manager tiling para X11, escrito em C e usando libxcb,
   pango, libxkbcommon-x11 e outras libs de X11. A versão 4.24 é
-  construída com Meson + Ninja, e aqui é integrada ao ADM 2.0 via
-  hook que cria build/ com meson setup e Makefile proxy para meson
-  compile / meson install respeitando DESTDIR.
+  construída com Meson + Ninja, integrada ao ADM 2.0 através do
+  build_system=meson (adm_build_do_meson), respeitando DESTDIR
+  e profiles de performance/segurança.
 
-# Deps de build reais (nomes genéricos; mapeie para seus pacotes ADM)
 build_deps: devel/gcc devel/make devel/meson devel/ninja devel/pkgconf devel/perl \
             xorg/xorg-server xorg/libX11 xorg/libxcb \
             xorg/xcb-util xorg/xcb-util-keysyms xorg/xcb-util-wm xorg/xcb-util-xrm xorg/xcb-util-cursor \
             xorg/libxkbcommon-x11 \
             libs/pango libs/libev libs/yajl libs/startup-notification
 
-# Deps de runtime reais (sem duplicar tudo de Xorg)
 run_deps: xorg/xorg-server xorg/libX11 xorg/libxcb \
           xorg/xcb-util-keysyms xorg/xcb-util-wm xorg/xcb-util-xrm xorg/xcb-util-cursor \
           xorg/libxkbcommon-x11 \
           libs/pango libs/libev libs/yajl libs/startup-notification
 
-# Dependências opcionais típicas (não estritamente necessárias para i3 rodar)
 opt_deps: xorg/dmenu xorg/xterm fonts/ttf-dejavu fonts/noto-fonts
 
-# Grupos: pra build-group, reports, snapshots, etc.
 groups: xorg wm i3 desktop
 
-# Tarball oficial 4.24
 source_uri: https://i3wm.org/downloads/i3-4.24.tar.xz
-
-# Preencha depois se quiser
 source_checksum:
