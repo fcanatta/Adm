@@ -1,58 +1,153 @@
 #!/usr/bin/env bash
+# /root/usr/src/adm/packages/toolchain/gcc-pass1/hook-pre-configure
 # hook-pre-configure para toolchain/gcc-pass1
 #
+# Executado pelo adm-build ANTES do ./configure.
+#
+# Ambiente exportado pelo adm-build_run_hook:
+#   ADM_PKG_ID
+#   ADM_BUILD_DIR_CURRENT  (source_dir do plano)
+#   ADM_DESTDIR            (DESTDIR da build atual)
+#   ADM_BUILD_SYSTEM       (autotools, etc)
+#
 # Objetivo:
-#   - Transformar o ./configure em um wrapper que:
-#       * ignora o --prefix=/usr padrão do adm-build
-#       * injeta flags de cross para o GCC pass1:
-#           - --target
-#           - --prefix (cross prefix)
-#           - --with-sysroot
-#           - --with-newlib
-#           - --without-headers
-#           - --enable-languages=c
-#           - desabilita tudo que não é C (como LFS cross pass1)
+#   - Embutir mpfr/gmp/mpc na árvore do GCC (como no LFS 5.3).
+#   - Ajustar t-linux64 em x86_64 (lib64 -> lib).
+#   - Envolver ./configure com wrapper que aplica os flags de cross
+#     equivalentes ao comando do livro gcc-pass1.
 #
-# Depende de variáveis (preferencialmente definidas pelo profile):
-#   ADM_CROSS_TARGET  (ex: x86_64-lfs-linux-gnu)
-#   ADM_CROSS_PREFIX  (ex: /usr/cross)
-#   ADM_SYSROOT       (ex: / ou $LFS)
+# Integração com ADM:
+#   - Usa o mesmo padrão de cross do binutils-pass1:
+#       ADM_CROSS_TARGET (default: x86_64-lfs-linux-gnu)
+#       ADM_CROSS_PREFIX (default: /usr/cross ou $LFS/tools se LFS definido)
+#       ADM_SYSROOT      (default: / ou $LFS se LFS definido)
+#   - ADM_GLIBC_VERSION (default: 2.42) para --with-glibc-version.
 #
-# O adm-build:
-#   - entra no diretório do source
-#   - exporta ADM_BUILD_DIR_CURRENT
-#   - chama este hook
-#   - depois chama ./configure com uma lista de args padrão
-#
-# Aqui nós renomeamos o configure original para configure.orig
-# e colocamos um wrapper que adiciona os parâmetros certos.
-
 set -o errexit
 set -o nounset
 set -o pipefail
 
-PKG_ID="${ADM_PKG_ID:-toolchain/gcc-pass1}"
-BUILD_DIR="${ADM_BUILD_DIR_CURRENT:-.}"
+: "${ADM_PKG_ID:=toolchain/gcc-pass1}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+: "${ADM_CACHE_SRC_DIR:?ADM_CACHE_SRC_DIR não definido}"
 
-CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-SYSROOT="${ADM_SYSROOT:-/}"
+# =========
+# 1. Parâmetros de cross (podem ser sobrescritos no ambiente ou profile)
+# =========
 
-echo "[hook-pre-configure][$PKG_ID] usando:"
-echo "  TARGET = $CROSS_TARGET"
-echo "  PREFIX = $CROSS_PREFIX"
-echo "  SYSROOT = $SYSROOT"
-echo "  BUILD_DIR = $BUILD_DIR"
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+ADM_SYSROOT="${ADM_SYSROOT:-/}"
 
-cd "$BUILD_DIR"
-
-if [[ ! -x ./configure ]]; then
-    echo "[hook-pre-configure][$PKG_ID] ./configure não encontrado ou não executável."
-    exit 1
+# Se ambiente LFS estiver setado, respeita:
+if [[ -n "${LFS_TGT:-}" ]]; then
+    ADM_CROSS_TARGET="$LFS_TGT"
 fi
 
-if [[ -x ./configure.orig ]]; then
-    echo "[hook-pre-configure][$PKG_ID] ./configure.orig já existe; não vou sobrescrever."
+if [[ -n "${LFS:-}" ]]; then
+    ADM_SYSROOT="$LFS"
+    # Se o prefixo ainda estiver no default /usr/cross, troca para $LFS/tools
+    if [[ "${ADM_CROSS_PREFIX:-/usr/cross}" == "/usr/cross" ]]; then
+        ADM_CROSS_PREFIX="${LFS%/}/tools"
+    fi
+fi
+
+ADM_GLIBC_VERSION="${ADM_GLIBC_VERSION:-2.42}"
+
+# PATH para toolchain cross já existente (se houver)
+CROSS_BIN_DIR="${ADM_CROSS_PREFIX%/}/${ADM_CROSS_TARGET}/bin"
+if [[ -d "$CROSS_BIN_DIR" ]]; then
+    export PATH="$CROSS_BIN_DIR:$PATH"
+fi
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+# =========
+# 2. Função utilitária: embutir mpfr/gmp/mpc na árvore do GCC
+# =========
+
+ensure_in_tree_lib() {
+    local name="$1"          # mpfr | gmp | mpc
+    local version_dir="$2"   # mpfr-4.2.2 ...
+    local tar_base="$3"      # mpfr-4.2.2.tar.xz ...
+
+    # Já está pronto?
+    if [[ -d "$name" ]]; then
+        echo "[hook-pre-configure][$ADM_PKG_ID] Diretório '$name/' já existe, pulando." >&2
+        return 0
+    fi
+
+    # Se a árvore versionada já foi extraída, só renomeia.
+    if [[ -d "$version_dir" ]]; then
+        mv -v "$version_dir" "$name"
+        return 0
+    fi
+
+    local tar_path=""
+
+    # 1) Procura na árvore local (por segurança, caso o user já tenha copiado)
+    if [[ -f "$tar_base" ]]; then
+        tar_path="$tar_base"
+    elif [[ -f "../$tar_base" ]]; then
+        tar_path="../$tar_base"
+    fi
+
+    # 2) Se não achar local, procura no cache-src do ADM (nomeado por adm-fetch)
+    if [[ -z "$tar_path" ]]; then
+        local prefix
+        prefix="${ADM_PKG_ID//\//__}"  # toolchain/gcc-pass1 -> toolchain__gcc-pass1
+        # pega o primeiro que bater o padrão
+        tar_path="$(ls "$ADM_CACHE_SRC_DIR"/"${prefix}"__*__*__"$tar_base" 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [[ -z "$tar_path" ]]; then
+        echo "[hook-pre-configure][$ADM_PKG_ID] AVISO: não encontrei tarball $tar_base para embutir $name." >&2
+        return 0
+    fi
+
+    echo "[hook-pre-configure][$ADM_PKG_ID] Extraindo $tar_path para embutir $name..." >&2
+    tar -xf "$tar_path"
+
+    if [[ -d "$version_dir" ]]; then
+        mv -v "$version_dir" "$name"
+    else
+        echo "[hook-pre-configure][$ADM_PKG_ID] AVISO: após extrair $tar_base, diretório $version_dir não encontrado." >&2
+    fi
+}
+
+# mpfr-4.2.2, gmp-6.3.0, mpc-1.3.1 conforme LFS
+ensure_in_tree_lib "mpfr" "mpfr-4.2.2" "mpfr-4.2.2.tar.xz"
+ensure_in_tree_lib "gmp"  "gmp-6.3.0"  "gmp-6.3.0.tar.xz"
+ensure_in_tree_lib "mpc"  "mpc-1.3.1"  "mpc-1.3.1.tar.gz"
+
+# =========
+# 3. Ajuste t-linux64 em x86_64 (lib64 -> lib) como no livro
+# =========
+
+case "$(uname -m)" in
+    x86_64)
+        if [[ -f "gcc/config/i386/t-linux64" ]]; then
+            sed -e '/m64=/s/lib64/lib/' -i gcc/config/i386/t-linux64
+            echo "[hook-pre-configure][$ADM_PKG_ID] Ajuste de lib64->lib aplicado em gcc/config/i386/t-linux64." >&2
+        else
+            echo "[hook-pre-configure][$ADM_PKG_ID] AVISO: gcc/config/i386/t-linux64 não encontrado." >&2
+        fi
+        ;;
+esac
+
+# =========
+# 4. Envolver ./configure com wrapper (sem build/ separado)
+# =========
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] ./configure não encontrado em $ADM_BUILD_DIR_CURRENT, nada a fazer." >&2
+    exit 0
+fi
+
+# Se já rodou antes, não recria
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure já existe, pulando." >&2
     exit 0
 fi
 
@@ -60,51 +155,76 @@ mv ./configure ./configure.orig
 
 cat > ./configure << 'EOF'
 #!/usr/bin/env bash
+# Wrapper gerado pelo hook-pre-configure do ADM para gcc-pass1
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
-CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
-SYSROOT="${ADM_SYSROOT:-/}"
+ADM_CROSS_TARGET="${ADM_CROSS_TARGET:-x86_64-lfs-linux-gnu}"
+ADM_CROSS_PREFIX="${ADM_CROSS_PREFIX:-/usr/cross}"
+ADM_SYSROOT="${ADM_SYSROOT:-/}"
+ADM_GLIBC_VERSION="${ADM_GLIBC_VERSION:-2.42}"
 
-orig_args=("$@")
-filtered=()
+# Respeita ambiente LFS se estiver definido
+if [[ -n "${LFS_TGT:-}" ]]; then
+    ADM_CROSS_TARGET="$LFS_TGT"
+fi
+if [[ -n "${LFS:-}" ]]; then
+    ADM_SYSROOT="$LFS"
+    if [[ "${ADM_CROSS_PREFIX:-/usr/cross}" == "/usr/cross" ]]; then
+        ADM_CROSS_PREFIX="${LFS%/}/tools"
+    fi
+fi
 
-# Remove qualquer --prefix=/usr que o adm-build passou
-for a in "${orig_args[@]}"; do
-    case "$a" in
-        --prefix=/usr) ;;
-        *) filtered+=("$a") ;;
-    esac
+# Resolve diretório real do script (para rodar ./configure.orig no lugar certo)
+src="${BASH_SOURCE[0]:-$0}"
+while [ -L "$src" ]; do
+    target=$(readlink "$src") || break
+    if [[ "$target" = /* ]]; then
+        src="$target"
+    else
+        src="$(dirname "$src")/$target"
+    fi
+done
+cd "$(dirname "$src")" >/dev/null 2>&1
+
+# Remove o "--prefix=/usr" que o adm-build passa fixo
+filtered_args=()
+for a in "$@"; do
+    if [[ "$a" == "--prefix=/usr" ]]; then
+        continue
+    fi
+    filtered_args+=("$a")
 done
 
-# Flags padrão para GCC pass1 (cross, C-only, sem headers)
-extra=(
-    "--target=${CROSS_TARGET}"
-    "--prefix=${CROSS_PREFIX}"
-    "--with-sysroot=${SYSROOT}"
+extra_cfg=(
+    "--target=${ADM_CROSS_TARGET}"
+    "--prefix=${ADM_CROSS_PREFIX}"
+    "--with-glibc-version=${ADM_GLIBC_VERSION}"
+    "--with-sysroot=${ADM_SYSROOT}"
     "--with-newlib"
     "--without-headers"
-    "--enable-languages=c"
+    "--enable-default-pie"
+    "--enable-default-ssp"
     "--disable-nls"
     "--disable-shared"
     "--disable-multilib"
-    "--disable-decimal-float"
+    "--disable-threads"
     "--disable-libatomic"
     "--disable-libgomp"
     "--disable-libquadmath"
     "--disable-libssp"
     "--disable-libvtv"
     "--disable-libstdcxx"
+    "--enable-languages=c,c++"
 )
 
-echo "[hook-gcc-pass1-wrapper] chamando ./configure.orig com:"
-printf '  %s\n' "${extra[@]}" "${filtered[@]}"
+echo "[configure-wrapper][gcc-pass1] target=${ADM_CROSS_TARGET} prefix=${ADM_CROSS_PREFIX} sysroot=${ADM_SYSROOT} glibc=${ADM_GLIBC_VERSION}" >&2
 
-exec bash ./configure.orig "${extra[@]}" "${filtered[@]}"
+exec bash ./configure.orig "${extra_cfg[@]}" "${filtered_args[@]}"
 EOF
 
 chmod +x ./configure
 
-echo "[hook-pre-configure][$PKG_ID] wrapper ./configure criado com sucesso."
+echo "[hook-pre-configure][$ADM_PKG_ID] Wrapper de configure criado para gcc-pass1 (cross LFS-like)." >&2
