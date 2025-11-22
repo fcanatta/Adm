@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/perl-temp
+#
+# Executado pelo adm-build ANTES do passo de build (adm_build_do_*),
+# logo depois do fetch+scan e da criação do DESTDIR.
+#
+# Ambiente exportado pelo adm_build_run_hook:
+#   ADM_PKG_ID
+#   ADM_BUILD_DIR_CURRENT  -> diretório de source extraído (ADM_PLAN_SOURCE_DIR)
+#   ADM_DESTDIR            -> DESTDIR usado no make install
+#   ADM_BUILD_SYSTEM       -> valor de build_system do .plan (aqui será "unknown")
+#
+# Objetivo:
+# - Rodar "sh Configure -des ..." exatamente como no LFS Chapter 7.9 (Perl 5.42.0)
+# - Gerar o Makefile no diretório de build
+# - Deixar o resto (make / make install DESTDIR=...) por conta do adm-build,
+#   que vai cair em build_system=unknown -> adm_build_do_unknown -> plain-make
+#
+# Obs:
+# - Não rodamos "make" nem "make install" aqui. Isso será feito pelo adm-build.
+# - O DESTDIR é respeitado apenas na fase de "make install", que o adm-build
+#   faz via "make DESTDIR=$ADM_DESTDIR prefix=/usr install".
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/perl-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+cd "$ADM_BUILD_DIR_CURRENT"
+
+echo "[hook-pre-configure][$ADM_PKG_ID] Preparando Perl (LFS 7.9 / 5.42.0) com sh Configure..."
+
+# Se já foi configurado (config.sh + Makefile presentes), evitamos rodar de novo.
+if [[ -f config.sh && -f Makefile ]]; then
+    echo "[hook-pre-configure][$ADM_PKG_ID] Encontrado config.sh e Makefile; aparentemente Configure já foi executado. Pulando."
+    exit 0
+fi
+
+# Comando exatamente como no LFS:
+#   sh Configure -des \
+#        -D prefix=/usr \
+#        -D vendorprefix=/usr \
+#        -D useshrplib \
+#        -D privlib=/usr/lib/perl5/5.42/core_perl \
+#        -D archlib=/usr/lib/perl5/5.42/core_perl \
+#        -D sitelib=/usr/lib/perl5/5.42/site_perl \
+#        -D sitearch=/usr/lib/perl5/5.42/site_perl \
+#        -D vendorlib=/usr/lib/perl5/5.42/vendor_perl \
+#        -D vendorarch=/usr/lib/perl5/5.42/vendor_perl
+#
+# (O DESTDIR é aplicado depois, via make DESTDIR=... install pelo adm-build.)
+
+sh Configure -des \
+    -D prefix=/usr \
+    -D vendorprefix=/usr \
+    -D useshrplib \
+    -D privlib=/usr/lib/perl5/5.42/core_perl
