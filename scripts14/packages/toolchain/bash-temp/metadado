@@ -1,0 +1,34 @@
+# /root/usr/src/adm/packages/toolchain/bash-temp/metadado
+
+name: bash-temp
+version: 5.3
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/bash/
+
+# Ajuda o adm-build/adm-profile a escolher o profile certo
+libc: glibc
+
+summary: Bash 5.3 temporário (cross) para o LFS (cap. 6.4)
+description: >
+  Bash 5.3 construído como ferramenta temporária cross, seguindo o
+  capítulo 6.4 do LFS (Cross Compiling Temporary Tools), usando
+  --host=$LFS_TGT, --build=$(sh support/config.guess) e
+  --without-bash-malloc, integrado ao pipeline do ADM 2.0.
+
+# Dependências: já ter toolchain + ncurses wide-char disponíveis
+build_deps: toolchain/m4 toolchain/ncurses-temp toolchain/gcc-pass1 toolchain/glibc toolchain/gcc-libstdc++
+run_deps:
+opt_deps:
+
+# groups: p/ build-group e relatórios
+groups: toolchain temp-tools cross-temp bash
+
+# Fonte oficial (igual livro)
+# https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
+source_uri: https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz
+
+# Pode preencher depois:
+source_checksum:
