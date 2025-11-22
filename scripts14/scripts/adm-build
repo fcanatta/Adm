@@ -66,6 +66,12 @@ source "$_ADM_BUILD_DIR/adm-db"
 source "$_ADM_BUILD_DIR/adm-deps"
 # shellcheck disable=SC1090
 source "$_ADM_BUILD_DIR/adm-knowledge"
+# Integração com profiles
+# shellcheck disable=SC1090
+source "$_ADM_BUILD_DIR/adm-profile"
+
+# Pode ser sobrescrito via CLI (--profile) ou env (ADM_BUILD_PROFILE_OVERRIDE)
+ADM_BUILD_PROFILE_OVERRIDE="${ADM_BUILD_PROFILE_OVERRIDE:-}"
 
 # adm-check ainda será implementado; assumimos função adm_check_package PKG_ID DESTDIR
 if [[ -f "$_ADM_BUILD_DIR/adm-check" ]]; then
