@@ -23,7 +23,7 @@ run_deps:
 opt_deps:
 
 # groups: usado por build-group, relatórios e heurística de "kind"
-groups: toolchain toolchain-bootstrap cross libstdc++ pass1
+groups: toolchain-bootstrap cross libstdc++ pass1
 
 # Libstdc++ é parte da árvore do GCC. Usamos o mesmo tarball do GCC-15.2.0.
 source_uri: https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
