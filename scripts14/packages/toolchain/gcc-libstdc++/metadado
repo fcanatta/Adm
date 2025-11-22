@@ -1,0 +1,32 @@
+name: gcc-libstdc++
+version: 15.2.0
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://gcc.gnu.org/
+
+# Ajuda o adm-build/adm-profile a escolher o profile correto
+libc: glibc
+
+summary: Libstdc++ a partir do GCC-15.2.0 (LFS 5.6) para toolchain.
+description: >
+  Libstdc++ (biblioteca padrão C++ do GCC-15.2.0) construída a partir do GCC
+  no estágio de cross-toolchain do LFS (capítulo 5.6), usando o compilador
+  $LFS_TGT-g++ e instalando no sysroot via DESTDIR (modelo ADM 2.0).
+
+# Depende do toolchain já existente:
+# - gcc-pass1 (compilador C/C++ cross)
+# - glibc    (libc já instalada no sysroot alvo)
+build_deps: toolchain/gcc-pass1 toolchain/glibc
+run_deps:
+opt_deps:
+
+# groups: usado por build-group, relatórios e heurística de "kind"
+groups: toolchain toolchain-bootstrap cross libstdc++ pass1
+
+# Libstdc++ é parte da árvore do GCC. Usamos o mesmo tarball do GCC-15.2.0.
+source_uri: https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
+
+# Pode preencher o sha256 depois (um só, para esse tarball).
+source_checksum:
