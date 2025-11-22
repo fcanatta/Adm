@@ -13,12 +13,13 @@ summary: Binutils cross (pass 1) para bootstrap do toolchain
 description: Binutils pass1: vinculador, montador e ferramentas para o cross-toolchain inicial, usados antes da libc final.
 
 # Lidos por adm-deps / adm-build
-# Aqui normalmente não há deps antes de tudo, mas se você tiver um "toolchain/base-host" pode pôr aqui.
+# Aqui normalmente não há deps antes de tudo, mas se você tiver um
+# "toolchain/base-host" ou similar, pode colocar aqui.
 build_deps:
 run_deps:
 opt_deps:
 
-# groups: usado pela heurística de "kind" toolchain, build-group etc.
+# groups: usado pela heurística de "kind" toolchain, build-group e relatórios
 groups: toolchain toolchain-bootstrap cross binutils pass1
 
 # Fonte oficial (LFS usa exatamente esse URL)
@@ -26,5 +27,5 @@ groups: toolchain toolchain-bootstrap cross binutils pass1
 source_uri: https://sourceware.org/pub/binutils/releases/binutils-2.43.1.tar.xz
 
 # SHA256 puro (sem prefixo), para o adm-fetch:
-# binutils-2.43.1.tar.xz sha256 = 13f7...
+# binutils-2.43.1.tar.xz sha256 = 13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd
 source_checksum: 13f74202a3c4c51118b797a39ea4200d3f6cfbe224da6d1d95bb938480132dfd
