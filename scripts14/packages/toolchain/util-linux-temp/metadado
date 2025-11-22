@@ -1,0 +1,31 @@
+name: util-linux-temp
+version: 2.40.2
+release: 1
+
+category: toolchain
+license: GPL-2.0-or-later & LGPL-2.1-or-later & BSD-2-Clause
+url: https://www.kernel.org/pub/linux/utils/util-linux/
+
+libc: glibc
+
+summary: Util-linux 2.40.2 temporário para LFS (cap. 7.12, chroot)
+description: >
+  Util-linux 2.40.2 construído como ferramenta temporária dentro do chroot,
+  seguindo o capítulo 7.12 do LFS. Configurado com libdir=/usr/lib,
+  runstatedir=/run, vários --disable-* para evitar dependências externas,
+  ADJTIME_PATH=/var/lib/hwclock/adjtime e docdir em
+  /usr/share/doc/util-linux-2.40.2, integrado ao ADM 2.0 usando DESTDIR.
+
+# toolchain + ferramentas básicas já prontas no chroot
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/glibc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp toolchain/texinfo-temp toolchain/python-temp
+run_deps:
+opt_deps:
+
+# groups para build-group e relatórios
+groups: toolchain temp-tools chroot util-linux
+
+# tarball do livro
+source_uri: https://www.kernel.org/pub/linux/utils/util-linux/v2.40/util-linux-2.40.2.tar.xz
+
+# pode preencher depois
+source_checksum:
