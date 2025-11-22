@@ -7,6 +7,7 @@
 #   - Gerenciar upgrade-list (db/upgrade-list)
 #
 # Pode ser sourceado por outros scripts ou usado via CLI para debug.
+# adm_db_history_snapshot ACTION SNAP_NAME STATUS [MSG...]
 
 set -o errexit
 set -o nounset
@@ -159,13 +160,18 @@ adm_db_register_install() {
         }
 
         mv "$file.tmp" "$file" || {
-            printf "ADM-ERROR: falha ao substituir arquivo de instalado %s\n" "$file" >&2
-            exit 1
-        }
-    ' _ "$file" "$pkg_id" "$cat" "$name" "$version" "$release" "$profile" "$libc" "$files_list" "$ts_epoch" "$ts_human" "$build_id"
+        printf "ADM-ERROR: falha ao substituir arquivo de instalado %s\n" "$file" >&2
+        exit 1
+    }
+' _ "$file" "$pkg_id" "$cat" "$name" "$version" "$release" "$profile" "$libc" "$files_list" "$ts_epoch" "$ts_human" "$build_id"
 
     adm_log_ok "Registrado pacote instalado: $pkg_id $version-$release"
     adm_event_pkg "PKG_INSTALL_REGISTERED" "$pkg_id" "version=$version release=$release profile=$profile libc=$libc"
+
+    # Novo: histórico rico de instalação
+    local files_count
+    files_count=$(wc -l <"$files_list" 2>/dev/null || echo 0)
+    adm_db_history_install "$pkg_id" "$version" "$release" "$profile" "$libc" "$build_id" "OK" "files=${files_count}"
 }
 
 adm_db_remove_install() {
@@ -184,6 +190,13 @@ adm_db_remove_install() {
         return 0
     fi
 
+    # Lê alguns metadados ANTES de remover o arquivo, para log/histórico
+    local version release profile libc
+    version="$(adm_db_get_meta_value "$pkg_id" "version" || echo "-")"
+    release="$(adm_db_get_meta_value "$pkg_id" "release" || echo "-")"
+    profile="$(adm_db_get_meta_value "$pkg_id" "profile" || echo "-")"
+    libc="$(adm_db_get_meta_value "$pkg_id" "libc" || echo "-")"
+
     adm_with_lock "db-installed" bash -c '
         local file="$1"
         rm -f "$file" || {
@@ -194,6 +207,9 @@ adm_db_remove_install() {
 
     adm_log_ok "Removido registro de instalado: $pkg_id"
     adm_event_pkg "PKG_INSTALL_REMOVED" "$pkg_id" ""
+
+    # Novo: histórico rico de remoção
+    adm_db_history_remove "$pkg_id" "$version" "$release" "$profile" "$libc" "OK" "db-record-removed=1"
 }
 
 # =========
@@ -338,6 +354,137 @@ adm_db_history_append() {
 }
 
 # =========
+# Helpers de histórico ricos
+# =========
+
+adm_db_history_install() {
+    # Registra evento de instalação.
+    #
+    # Uso:
+    #   adm_db_history_install pkg_id version release profile libc build_id status [msg_livre...]
+    #
+    # Exemplo:
+    #   adm_db_history_install base/bash 5.2 1 glibc/extreme glibc build123 OK "instalação concluída"
+    if [[ $# -lt 7 ]]; then
+        adm_log_fatal "adm_db_history_install: uso: adm_db_history_install pkg_id version release profile libc build_id status [msg...]"
+    fi
+
+    local pkg_id="$1"
+    local version="$2"
+    local release="$3"
+    local profile="$4"
+    local libc="$5"
+    local build_id="$6"
+    local status="$7"
+    shift 7 || true
+    local extra_msg="$*"
+
+    local kv_msg
+    kv_msg="type=install profile=${profile} libc=${libc} build_id=${build_id}"
+    if [[ -n "$extra_msg" ]]; then
+        kv_msg="${kv_msg} :: ${extra_msg}"
+    fi
+
+    adm_db_history_append "INSTALL" "$pkg_id" "$version" "$release" "$status" "$kv_msg"
+}
+
+adm_db_history_remove() {
+    # Registra evento de remoção de registro de instalação.
+    #
+    # Uso:
+    #   adm_db_history_remove pkg_id version release profile libc status [msg_livre...]
+    if [[ $# -lt 6 ]]; then
+        adm_log_fatal "adm_db_history_remove: uso: adm_db_history_remove pkg_id version release profile libc status [msg...]"
+    fi
+
+    local pkg_id="$1"
+    local version="$2"
+    local release="$3"
+    local profile="$4"
+    local libc="$5"
+    local status="$6"
+    shift 6 || true
+    local extra_msg="$*"
+
+    local kv_msg
+    kv_msg="type=remove profile=${profile} libc=${libc}"
+    if [[ -n "$extra_msg" ]]; then
+        kv_msg="${kv_msg} :: ${extra_msg}"
+    fi
+
+    adm_db_history_append "REMOVE" "$pkg_id" "$version" "$release" "$status" "$kv_msg"
+}
+
+adm_db_history_upgrade() {
+    # Registra evento de upgrade/downgrade planejado ou realizado.
+    #
+    # Uso:
+    #   adm_db_history_upgrade pkg_id old_ver old_rel new_ver new_rel status direction [reason] [msg_livre...]
+    #
+    # direction: "upgrade" ou "downgrade"
+    if [[ $# -lt 7 ]]; then
+        adm_log_fatal "adm_db_history_upgrade: uso: adm_db_history_upgrade pkg_id old_ver old_rel new_ver new_rel status direction [reason] [msg...]"
+    fi
+
+    local pkg_id="$1"
+    local old_ver="$2"
+    local old_rel="$3"
+    local new_ver="$4"
+    local new_rel="$5"
+    local status="$6"
+    local direction="$7"
+    shift 7 || true
+
+    local reason="${1:-}"
+    if [[ -n "${1:-}" ]]; then
+        shift 1 || true
+    fi
+    local extra_msg="$*"
+
+    local version_for_line="$new_ver"
+    local release_for_line="$new_rel"
+
+    local kv_msg
+    kv_msg="type=${direction} from=${old_ver}-${old_rel} to=${new_ver}-${new_rel}"
+    if [[ -n "$reason" ]]; then
+        kv_msg="${kv_msg} reason=${reason}"
+    fi
+    if [[ -n "$extra_msg" ]]; then
+        kv_msg="${kv_msg} :: ${extra_msg}"
+    fi
+
+    adm_db_history_append "UPGRADE" "$pkg_id" "$version_for_line" "$release_for_line" "$status" "$kv_msg"
+}
+
+adm_db_history_snapshot() {
+    # Registra eventos relacionados a snapshots (create/diff/restore).
+    #
+    # Uso:
+    #   adm_db_history_snapshot action snapshot_name status [msg_livre...]
+    #
+    # Onde "action" pode ser:
+    #   SNAPSHOT_CREATE, SNAPSHOT_DIFF, SNAPSHOT_RESTORE, etc.
+    if [[ $# -lt 3 ]]; then
+        adm_log_fatal "adm_db_history_snapshot: uso: adm_db_history_snapshot action snapshot_name status [msg...]"
+    fi
+
+    local action="$1"
+    local snap_name="$2"
+    local status="$3"
+    shift 3 || true
+    local extra_msg="$*"
+
+    local kv_msg
+    kv_msg="type=snapshot name=${snap_name}"
+    if [[ -n "$extra_msg" ]]; then
+        kv_msg="${kv_msg} :: ${extra_msg}"
+    fi
+
+    # pkg_id é o snapshot, version/release ficam "-"
+    adm_db_history_append "$action" "$snap_name" "-" "-" "$status" "$kv_msg"
+}
+
+# =========
 # Upgrade-list
 # =========
 
@@ -396,6 +543,11 @@ adm_db_upgrade_add() {
 
     adm_log_ok "Adicionada entrada na upgrade-list: $pkg_id $old_ver-$old_rel -> $new_ver-$new_rel ($reason)"
     adm_event_pkg "UPGRADE_LIST_ADD" "$pkg_id" "from=$old_ver-$old_rel to=$new_ver-$new_rel reason=$reason"
+
+    # Novo: histórico rico de upgrade planejado
+    local direction="upgrade"
+    # Se quiser, você pode tentar detectar downgrade aqui comparando versões.
+    adm_db_history_upgrade "$pkg_id" "$old_ver" "$old_rel" "$new_ver" "$new_rel" "PLANNED" "$direction" "$reason" "source=upgrade-list"
 }
 
 adm_db_upgrade_list() {
