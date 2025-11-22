@@ -1,0 +1,37 @@
+name: musl
+version: 1.2.5
+release: 1
+
+# Mesmo “piso” da glibc final: base do sistema
+category: base
+license: MIT
+url: https://musl.libc.org/
+
+# Aqui dizemos explicitamente ao ADM que esta libc é musl
+libc: musl
+
+summary: musl 1.2.5 libc alternativa para LFS/ADM 2.0
+description: >
+  musl 1.2.5 construída como implementação alternativa da libc para Linux,
+  seguindo a recomendação oficial: ./configure --prefix=/usr, make e
+  make DESTDIR=<dir> install. Integrada ao ADM 2.0 com profiles de libc,
+  cache, métricas e snapshots, permitindo selecionar musl como libc alvo
+  em builds de toolchain e da base.
+
+# Dependências de build: toolchain final + headers
+# (ajuste conforme seu fluxo; aqui pressuponho que você já tem gcc-pass2,
+# binutils-pass2, linux-headers e coreutils/make/etc. disponíveis)
+build_deps: toolchain/gcc-pass2 toolchain/binutils-pass2 toolchain/linux-headers base/man-pages base/iana-etc toolchain/make-temp toolchain/coreutils-temp toolchain/sed-temp toolchain/bash-temp
+
+# Como libc, outras libs não são dependências obrigatórias
+run_deps:
+opt_deps:
+
+# Grupos: ajuda build-group, report, snapshot, etc.
+groups: base libc musl alt-libc
+
+# Fonte oficial (último stable segundo o site do musl) 
+source_uri: https://musl.libc.org/releases/musl-1.2.5.tar.gz
+
+# Você disse que pode deixar o sha em branco; pode preencher depois
+source_checksum:
