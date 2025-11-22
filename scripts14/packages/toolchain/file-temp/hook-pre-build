@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# hook-pre-build para toolchain/file-temp (LFS 6.7 + ADM 2.0)
+#
+# Reproduz os passos do LFS:
+#   mkdir build
+#   pushd build
+#     ../configure --disable-bzlib      \
+#                  --disable-libseccomp \
+#                  --disable-xzlib      \
+#                  --disable-zlib
+#     make
+#   popd
+#
+#   ./configure --prefix=/usr --host=$LFS_TGT --build=$(./config.guess)
+#   make FILE_COMPILE=$(pwd)/build/src/file
+#   make DESTDIR=$LFS install
+#   rm -v $LFS/usr/lib/libmagic.la
+#
+# Adaptado para o ADM:
+#   - Usa ADM_BUILD_DIR_CURRENT como raiz do source
+#   - Usa ADM_DESTDIR no lugar de $LFS
+#   - Descobre HOST/BUILD (LFS_TGT/ADM_CROSS_TARGET/config.guess)
+#   - Depois neutraliza 'all' e 'install' no Makefile para o adm-build
+#     não tentar reconstruir nada.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/file-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+src_dir="$ADM_BUILD_DIR_CURRENT"
+destdir="$ADM_DESTDIR"
+
+cd "$src_dir"
+
+echo "[hook-pre-build][$pkg_id] Iniciando fluxo LFS/ADM para File-5.46"
+echo "[hook-pre-build][$pkg_id] src_dir = $src_dir"
+echo "[hook-pre-build][$pkg_id] DESTDIR = $destdir"
+
+# =====================================
+# 1) Construir 'file' nativo em build/
+# =====================================
+
+if [[ ! -f ".adm-file-host-built.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Construindo 'file' nativo em build/..." >&2
+
+    mkdir -p build
+    pushd build >/dev/null
+
+    ../configure \
+        --disable-bzlib \
+        --disable-libseccomp \
+        --disable-xzlib \
+        --disable-zlib
+
+    make
+
+    popd >/dev/null
+
+    touch ".adm-file-host-built.stamp"
+    echo "[hook-pre-build][$pkg_id] 'file' nativo construído em build/src/file." >&2
+else
+    echo "[hook-pre-build][$pkg_id] 'file' nativo já foi construído anteriormente; pulando." >&2
+fi
+
+# Caminho do binário 'file' nativo
+FILE_COMPILE="$src_dir/build/src/file"
+
+if [[ ! -x "$FILE_COMPILE" ]]; then
+    echo "[hook-pre-build][$pkg_id] ERRO: build/src/file não encontrado ou não executável em $FILE_COMPILE" >&2
+    exit 1
+fi
+
+# =====================================
+# 2) Descobrir HOST e BUILD para configure cross
+# =====================================
+
+# HOST: preferir ambiente LFS/ADM
+host="${LFS_TGT:-${ADM_CROSS_TARGET:-}}"
+
+if [[ -z "$host" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+        host="$(gcc -dumpmachine 2>/dev/null || true)"
+    fi
+fi
+
+if [[ -z "$host" ]]; then
+    if [[ -x "$src_dir/config.guess" ]]; then
+        host="$("$src_dir/config.guess")"
+    elif [[ -x "$src_dir/build-aux/config.guess" ]]; then
+        host="$("$src_dir/build-aux/config.guess")"
+    else
+        echo "[hook-pre-build][$pkg_id] ERRO: não consegui determinar HOST (LFS_TGT/ADM_CROSS_TARGET/gcc/config.guess)." >&2
+        exit 1
+    fi
+fi
+
+# BUILD: normalmente ./config.guess
+if [[ -x "$src_dir/config.guess" ]]; then
+    build_triplet="$("$src_dir/config.guess")"
+elif [[ -x "$src_dir/build-aux/config.guess" ]]; then
+    build_triplet="$("$src_dir/build-aux/config.guess")"
+else
+    if command -v gcc >/dev/null 2>&1; then
+        build_triplet="$(gcc -dumpmachine 2>/dev/null || echo "$host")"
+    else
+        build_triplet="$host"
+    fi
+fi
+
+echo "[hook-pre-build][$pkg_id] HOST  = $host"
+echo "[hook-pre-build][$pkg_id] BUILD = $build_triplet"
+
+# =====================================
+# 3) Configure cross para File-5.46
+# =====================================
+
+if [[ ! -f ".adm-file-cross-configured.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Rodando ./configure cross para File-5.46..." >&2
+
+    ./configure \
+        --prefix=/usr \
+        --host="$host" \
+        --build="$build_triplet"
+
+    touch ".adm-file-cross-configured.stamp"
+else
+    echo "[hook-pre-build][$pkg_id] Configuração cross já feita anteriormente; pulando configure." >&2
+fi
+
+# =====================================
+# 4) make FILE_COMPILE=... && make DESTDIR=... install
+# =====================================
+
+if [[ ! -f ".adm-file-cross-built.stamp" ]]; then
+    echo "[hook-pre-build][$pkg_id] Compilando File-5.46 com FILE_COMPILE=$FILE_COMPILE..." >&2
+
+    make FILE_COMPILE="$FILE_COMPILE"
+
+    echo "[hook-pre-build][$pkg_id] Instalando em DESTDIR=$destdir..." >&2
+    make DESTDIR="$destdir" install
+
+    # Remover libmagic.la, como no LFS:
+    #   rm -v $LFS/usr/lib/libmagic.la
+    if [[ -f "$destdir/usr/lib/libmagic.la" ]]; then
+        echo "[hook-pre-build][$pkg_id] Removendo $destdir/usr/lib/libmagic.la (danoso para cross)..." >&2
+        rm -v "$destdir/usr/lib/libmagic.la"
+    fi
+
+    touch ".adm-file-cross-built.stamp"
+else
+    echo "[hook-pre-build][$pkg_id] File-5.46 já foi construído/instalado anteriormente; pulando make/install." >&2
+fi
+
+# =====================================
+# 5) Neutralizar Makefile para o restante do fluxo do ADM
+# =====================================
+
+makefile_path="$src_dir/Makefile"
+
+if [[ -f "$makefile_path" ]]; then
+    # Evita duplicar blocos se rodar mais de uma vez
+    if ! grep -q "ADM file-temp: alvo 'all' ignorado" "$makefile_path" 2>/dev/null; then
+        echo "[hook-pre-build][$pkg_id] Neutralizando alvos 'all' e 'install' no Makefile..." >&2
+        cat >> "$makefile_path" << 'EOF'
+
+# Alvos adicionados pelo ADM (toolchain/file-temp)
+.PHONY: all install
+
+all:
+	@echo "ADM file-temp: alvo 'all' ignorado (File-5.46 já construído pelo hook-pre-build)."
+
+install:
+	@echo "ADM file-temp: alvo 'install' ignorado (File-5.46 já instalado pelo hook-pre-build)."
+
+EOF
+    else
+        echo "[hook-pre-build][$pkg_id] Makefile já contém stubs ADM; não vou repetir." >&2
+    fi
+else
+    echo "[hook-pre-build][$pkg_id] AVISO: Makefile não encontrado em $src_dir; nada para neutralizar." >&2
+fi
+
+echo "[hook-pre-build][$pkg_id] hook-pre-build de File-5.46 concluído com sucesso."
