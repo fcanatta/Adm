@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/binutils-pass2 (LFS 6.17 + ADM 2.0)
+#
+# LFS:
+#   sed '6009s/$add_dir//' -i ltmain.sh
+#
+#   mkdir -v build
+#   cd       build
+#
+#   ../configure                   \
+#       --prefix=/usr              \
+#       --build=$(../config.guess) \
+#       --host=$LFS_TGT            \
+#       --disable-nls              \
+#       --enable-shared            \
+#       --enable-gprofng=no        \
+#       --disable-werror           \
+#       --enable-64-bit-bfd        \
+#       --enable-new-dtags         \
+#       --enable-default-hash-style=gnu
+#
+# No ADM 2.0:
+#   - O build_dir recebido já é o source_dir do .plan (adm-scan)
+#   - O adm-build chamará ./configure --prefix=/usr
+#   - Aqui transformamos ./configure num wrapper que:
+#       * aplica o sed na ltmain.sh (no source root)
+#       * injeta host/build/flags do LFS
+#       * ignora opções conflitantes vindas do adm-build
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/binutils-pass2}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+src_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$src_dir"
+
+# 1) Ajuste em ltmain.sh (somente uma vez)
+if [[ -f "ltmain.sh" ]]; then
+    # Evita aplicar sed repetidas vezes (checando se a linha já foi alterada)
+    if ! grep -q '6009s/\$add_dir//' ltmain.sh 2>/dev/null; then
+        echo "[hook-pre-configure][$pkg_id] Aplicando sed em ltmain.sh (workaround LFS)..." >&2
+        sed '6009s/$add_dir//' -i ltmain.sh || {
+            echo "[hook-pre-configure][$pkg_id] Falha ao aplicar sed em ltmain.sh" >&2
+            exit 1
+        }
+    else
+        echo "[hook-pre-configure][$pkg_id] sed em ltmain.sh já aplicado anteriormente; pulando." >&2
+    fi
+else
+    echo "[hook-pre-configure][$pkg_id] ltmain.sh não encontrado em $src_dir; seguindo mesmo assim." >&2
+fi
+
+# 2) Wrapper de ./configure
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $src_dir; nada a fazer." >&2
+    exit 0
+fi
+
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando criação." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure para Binutils Pass 2 (LFS 6.17 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/binutils-pass2}"
+build_dir="$(pwd)"
+
+# ===== Determinar HOST =====
+# ordem:
+#   1) LFS_TGT
+#   2) ADM_CROSS_TARGET
+#   3) gcc -dumpmachine
+#   4) ./config.guess
+host="${LFS_TGT:-${ADM_CROSS_TARGET:-}}"
+
+if [[ -z "$host" ]]; then
+    if command -v gcc >/dev/null 2>&1; then
+        host="$(gcc -dumpmachine 2>/dev/null || true)"
+    fi
+fi
+
+if [[ -z "$host" ]]; then
+    if [[ -x "$build_dir/config.guess" ]]; then
+        host="$("$build_dir/config.guess")"
+    else
+        printf 'ADM-ERROR[%s]: não consegui determinar HOST (LFS_TGT/ADM_CROSS_TARGET/gcc/config.guess).\n' \
+            "$pkg_id" >&2
+        exit 1
+    fi
+fi
+
+# ===== Determinar BUILD =====
+if [[ -x "$build_dir/config.guess" ]]; then
+    build="$("$build_dir/config.guess")"
+else
+    if command -v gcc >/dev/null 2>&1; then
+        build="$(gcc -dumpmachine 2>/dev/null || echo "$host")"
+    else
+        build="$host"
+    fi
+fi
+
+# ===== Filtrar args vindos do adm-build =====
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--host=*|--build=*|--disable-nls|--enable-nls|\
+        --enable-shared|--disable-shared|--enable-gprofng=*|\
+        --enable-64-bit-bfd|--disable-64-bit-bfd|\
+        --enable-new-dtags|--disable-new-dtags|\
+        --enable-default-hash-style=*|--disable-werror|--enable-werror)
+            # Vamos sobrescrever esses
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+# ===== Montar comando final alinhado com o LFS =====
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--build=${build}"
+  "--host=${host}"
+  "--disable-nls"
+  "--enable-shared"
+  "--enable-gprofng=no"
+  "--disable-werror"
+  "--enable-64-bit-bfd"
+  "--enable-new-dtags"
+  "--enable-default-hash-style=gnu"
+)
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Binutils-2.43.1 (Pass 2, LFS/ADM 2.0)." >&2
