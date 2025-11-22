@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# hook-pre-configure para toolchain/gettext-temp (LFS 7.7 + ADM 2.0)
+#
+# LFS:
+#   ./configure --disable-shared
+#
+# O adm-build normalmente faz:
+#   ./configure --prefix=/usr
+#
+# Aqui viramos ./configure em wrapper que força --disable-shared e
+# ignora prefix/flags conflitantes.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gettext-temp}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$build_dir"
+
+if [[ ! -x "./configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ./configure não encontrado em $build_dir; nada a fazer." >&2
+    exit 0
+fi
+
+# não recria wrapper se já existir
+if [[ -x "./configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper de configure já existe; pulando." >&2
+    exit 0
+fi
+
+mv ./configure ./configure.orig
+
+cat > ./configure << 'EOF'
+#!/usr/bin/env bash
+# Wrapper de ./configure para Gettext temporário (LFS 7.7 / ADM 2.0)
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-toolchain/gettext-temp}"
+build_dir="$(pwd)"
+
+# Filtrar args vindos do adm-build
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--disable-shared|--enable-shared)
+            # vamos sobrescrever estes
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="./configure.orig"
+if [[ ! -x "$real_conf" ]]; then
+    printf 'ADM-ERROR[%s]: configure.orig não encontrado em %s\n' "$pkg_id" "$build_dir" >&2
+    exit 1
+fi
+
+args=(
+  "$real_conf"
+  "--disable-shared"
+)
+
+# se quiser passar mais alguma flag, ela vai depois
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+    args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+chmod +x ./configure
+
+echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado para Gettext-0.24 (--disable-shared)." >&2
