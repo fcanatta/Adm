@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
-# hook-pre-configure para toolchain/perl-temp
+# hook-pre-configure para toolchain/perl-temp (LFS 7.9 + ADM 2.0)
 #
-# Executado pelo adm-build ANTES do passo de build (adm_build_do_*),
-# logo depois do fetch+scan e da criação do DESTDIR.
+# LFS:
+#   sh Configure -des                                        \
+#      -Dprefix=/usr                                         \
+#      -Dvendorprefix=/usr                                   \
+#      -Dprivlib=/usr/lib/perl5/5.36/core_perl               \
+#      -Darchlib=/usr/lib/perl5/5.36/core_perl               \
+#      -Dsitelib=/usr/lib/perl5/5.36/site_perl               \
+#      -Dsitearch=/usr/lib/perl5/5.36/site_perl              \
+#      -Dvendorlib=/usr/lib/perl5/5.36/vendor_perl           \
+#      -Dvendorarch=/usr/lib/perl5/5.36/vendor_perl
 #
-# Ambiente exportado pelo adm_build_run_hook:
-#   ADM_PKG_ID
-#   ADM_BUILD_DIR_CURRENT  -> diretório de source extraído (ADM_PLAN_SOURCE_DIR)
-#   ADM_DESTDIR            -> DESTDIR usado no make install
-#   ADM_BUILD_SYSTEM       -> valor de build_system do .plan (aqui será "unknown")
+# Depois:
+#   make
+#   make install
 #
-# Objetivo:
-# - Rodar "sh Configure -des ..." exatamente como no LFS Chapter 7.9 (Perl 5.42.0)
-# - Gerar o Makefile no diretório de build
-# - Deixar o resto (make / make install DESTDIR=...) por conta do adm-build,
-#   que vai cair em build_system=unknown -> adm_build_do_unknown -> plain-make
-#
-# Obs:
-# - Não rodamos "make" nem "make install" aqui. Isso será feito pelo adm-build.
-# - O DESTDIR é respeitado apenas na fase de "make install", que o adm-build
-#   faz via "make DESTDIR=$ADM_DESTDIR prefix=/usr install".
+# No ADM 2.0:
+#   - aqui rodamos o Configure e geramos o Makefile
+#   - o adm-build (build_system=plain-make ou unknown) depois faz:
+#       make
+#       make DESTDIR="$ADM_DESTDIR" prefix=/usr install
+#   - Resultado: igual ao LFS, mas instalado em DESTDIR.
 
 set -o errexit
 set -o nounset
@@ -27,34 +29,57 @@ set -o pipefail
 
 : "${ADM_PKG_ID:=toolchain/perl-temp}"
 : "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
-: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
 
-cd "$ADM_BUILD_DIR_CURRENT"
+pkg_id="$ADM_PKG_ID"
+build_dir="$ADM_BUILD_DIR_CURRENT"
 
-echo "[hook-pre-configure][$ADM_PKG_ID] Preparando Perl (LFS 7.9 / 5.42.0) com sh Configure..."
+cd "$build_dir"
 
-# Se já foi configurado (config.sh + Makefile presentes), evitamos rodar de novo.
-if [[ -f config.sh && -f Makefile ]]; then
-    echo "[hook-pre-configure][$ADM_PKG_ID] Encontrado config.sh e Makefile; aparentemente Configure já foi executado. Pulando."
+# Evita rodar Configure mais de uma vez
+if [[ -f ".adm-perl-configured.stamp" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Perl já foi configurado (stamp encontrado); pulando Configure." >&2
     exit 0
 fi
 
-# Comando exatamente como no LFS:
-#   sh Configure -des \
-#        -D prefix=/usr \
-#        -D vendorprefix=/usr \
-#        -D useshrplib \
-#        -D privlib=/usr/lib/perl5/5.42/core_perl \
-#        -D archlib=/usr/lib/perl5/5.42/core_perl \
-#        -D sitelib=/usr/lib/perl5/5.42/site_perl \
-#        -D sitearch=/usr/lib/perl5/5.42/site_perl \
-#        -D vendorlib=/usr/lib/perl5/5.42/vendor_perl \
-#        -D vendorarch=/usr/lib/perl5/5.42/vendor_perl
-#
-# (O DESTDIR é aplicado depois, via make DESTDIR=... install pelo adm-build.)
+if [[ ! -x "./Configure" ]]; then
+    echo "[hook-pre-configure][$pkg_id] ERRO: script ./Configure não encontrado ou não executável em $build_dir" >&2
+    exit 1
+fi
 
-sh Configure -des \
-    -D prefix=/usr \
-    -D vendorprefix=/usr \
-    -D useshrplib \
-    -D privlib=/usr/lib/perl5/5.42/core_perl
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    cat <<EOF >&2
+[hook-pre-configure][$pkg_id][DRY-RUN] Rodaria:
+  sh Configure -des \\
+    -Dprefix=/usr \\
+    -Dvendorprefix=/usr \\
+    -Dprivlib=/usr/lib/perl5/5.36/core_perl \\
+    -Darchlib=/usr/lib/perl5/5.36/core_perl \\
+    -Dsitelib=/usr/lib/perl5/5.36/site_perl \\
+    -Dsitearch=/usr/lib/perl5/5.36/site_perl \\
+    -Dvendorlib=/usr/lib/perl5/5.36/vendor_perl \\
+    -Dvendorarch=/usr/lib/perl5/5.36/vendor_perl
+EOF
+    exit 0
+fi
+
+echo "[hook-pre-configure][$pkg_id] Rodando Configure do Perl 5.36.0 (LFS 7.9)..." >&2
+
+sh Configure -des                                        \
+    -Dprefix=/usr                                        \
+    -Dvendorprefix=/usr                                  \
+    -Dprivlib=/usr/lib/perl5/5.36/core_perl              \
+    -Darchlib=/usr/lib/perl5/5.36/core_perl              \
+    -Dsitelib=/usr/lib/perl5/5.36/site_perl              \
+    -Dsitearch=/usr/lib/perl5/5.36/site_perl             \
+    -Dvendorlib=/usr/lib/perl5/5.36/vendor_perl          \
+    -Dvendorarch=/usr/lib/perl5/5.36/vendor_perl
+
+# Aqui o Configure gera o Makefile na raiz do source.
+# Isso permite que o adm-build, com build_system=plain-make/unknown,
+# use adm_build_do_plain_make:
+#   make
+#   make DESTDIR="$ADM_DESTDIR" prefix=/usr install
+
+touch ".adm-perl-configured.stamp"
+
+echo "[hook-pre-configure][$pkg_id] Configure do Perl concluído; Makefile pronto para o adm-build." >&2
