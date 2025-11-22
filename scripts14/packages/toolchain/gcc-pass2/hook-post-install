@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# hook-post-install para toolchain/gcc-pass2 (LFS 6.18 + ADM 2.0)
+#
+# LFS:
+#   make DESTDIR=$LFS install
+#   ln -sv gcc $LFS/usr/bin/cc
+#
+# Aqui fazemos o equivalente usando ADM_DESTDIR.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/gcc-pass2}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+destdir="$ADM_DESTDIR"
+
+bin_dir="$destdir/usr/bin"
+gcc_bin="$bin_dir/gcc"
+cc_link="$bin_dir/cc"
+
+if [[ ! -x "$gcc_bin" ]]; then
+    echo "[hook-post-install][$pkg_id] Aviso: $gcc_bin não existe ou não é executável; não criando cc." >&2
+    exit 0
+fi
+
+mkdir -p "$bin_dir"
+
+if [[ -e "$cc_link" && ! -L "$cc_link" ]]; then
+    echo "[hook-post-install][$pkg_id] Aviso: $cc_link já existe e não é link; não sobrescrevendo." >&2
+    exit 0
+fi
+
+if [[ "${ADM_DRY_RUN:-0}" -eq 1 ]]; then
+    echo "[hook-post-install][$pkg_id][DRY-RUN] Criaria link simbólico cc -> gcc em $bin_dir" >&2
+else
+    if [[ -L "$cc_link" || -e "$cc_link" ]]; then
+        echo "[hook-post-install][$pkg_id] Removendo link/arquivo antigo $cc_link" >&2
+        rm -f "$cc_link"
+    fi
+    echo "[hook-post-install][$pkg_id] Criando link cc -> gcc em $bin_dir" >&2
+    ln -sv gcc "$cc_link"
+fi
