@@ -3,7 +3,7 @@
 #
 # Lê:
 #   - db/metrics (arquivos metrics-YYYYMMDD.log)
-#   - db/history.log (ou caminho definido em ADM_DB_HISTORY_FILE)
+#   - db/history/history-YYYYMMDD.log (ou caminho definido em ADM_DB_HISTORY_FILE)
 #
 # Comandos:
 #
@@ -13,32 +13,19 @@
 #   2) Pacotes que mais falham:
 #      adm-report top-fail [N]
 #
-#   3) Estatísticas gerais de uso:
+#   3) Estatísticas gerais de uso (métricas + history):
 #      adm-report usage
 #
-#     - A partir de métricas:
-#         * total de registros
-#         * pacotes distintos
-#         * contagem por op (BUILD, FETCH, SCAN, CHECK, UPDATE, etc.)
-#         * top 5 pacotes em BUILD por nº de execuções
-#     - A partir de history (rico):
-#         * total de entradas
-#         * contagem por tipo: install / upgrade / downgrade / remove / snapshot / other
-#         * top 5 pacotes mais:
-#               - instalados
-#               - upgradados
-#               - downgrades
-#         * contagem de snapshots: create / restore / outros
-#
 # Formato de métricas (adm-metrics):
-#   ts<TAB>pid<TAB>op<TAB>pkg<TAB>metric<TAB>value<TAB>unit<TAB>extra
+#   ts  pid  op  pkg  metric  value  unit  extra
 #
-# Formato de history (adm-db):
-#   ts<TAB>pid<TAB>action<TAB>pkg_id<TAB>version<TAB>release<TAB>status<TAB>msg
+# Formato de history 2.0 (adm-db):
+#   ts  pid  action  pkg_id  version  release  status  msg
 #
 # Onde msg (rico) recomenda-se:
 #   key1=val1 key2=val2 ... :: texto livre
-# Ex:
+#
+# Exemplos de msg:
 #   type=install profile=glibc/extreme libc=glibc build_id=xyz files=120 :: instalação concluída
 
 set -o errexit
@@ -51,6 +38,7 @@ set -o pipefail
 
 _adm_report_script_dir() {
     local src="${BASH_SOURCE[0]:-$0}"
+
     while [ -L "$src" ]; do
         local target
         target=$(readlink "$src") || break
@@ -60,6 +48,7 @@ _adm_report_script_dir() {
             src="$(dirname "$src")/$target"
         fi
     done
+
     cd "$(dirname "$src")" >/dev/null 2>&1 || {
         printf 'ADM-ERROR: Não foi possível entrar no diretório do script adm-report.\n' >&2
         exit 1
@@ -80,7 +69,9 @@ source "$_ADM_REPORT_DIR/adm-metrics"
 # shellcheck disable=SC1090
 source "$_ADM_REPORT_DIR/adm-db"
 
-ADM_DB_HISTORY_FILE="${ADM_DB_HISTORY_FILE:-${ADM_DB_DIR}/history.log}"
+# Se o usuário quiser forçar um único arquivo de history, ele define ADM_DB_HISTORY_FILE.
+# Caso contrário, usaremos TODOS os history-*.log em ADM_DB_HISTORY_DIR.
+ADM_DB_HISTORY_FILE="${ADM_DB_HISTORY_FILE:-}"
 
 # =========
 # Utilidades: arquivos de métricas
@@ -91,7 +82,6 @@ adm_report_metrics_files() {
     if [[ ! -d "$ADM_DB_METRICS_DIR" ]]; then
         return 0
     fi
-
     ls "$ADM_DB_METRICS_DIR"/metrics-*.log 2>/dev/null | sort || true
 }
 
@@ -100,6 +90,35 @@ adm_report_require_metrics() {
     files="$(adm_report_metrics_files || true)"
     if [[ -z "$files" ]]; then
         adm_log_warn "Nenhum arquivo de métricas encontrado em '$ADM_DB_METRICS_DIR'."
+        return 1
+    fi
+    return 0
+}
+
+# =========
+# Utilidades: arquivos de history
+# =========
+
+adm_report_history_files() {
+    # 1) Se ADM_DB_HISTORY_FILE estiver definido e existir, usa apenas ele.
+    if [[ -n "${ADM_DB_HISTORY_FILE:-}" && -f "$ADM_DB_HISTORY_FILE" ]]; then
+        printf '%s\n' "$ADM_DB_HISTORY_FILE"
+        return 0
+    fi
+
+    # 2) Caso contrário, usa db/history/history-*.log
+    if [[ ! -d "$ADM_DB_HISTORY_DIR" ]]; then
+        return 0
+    fi
+
+    ls "$ADM_DB_HISTORY_DIR"/history-*.log 2>/dev/null | sort || true
+}
+
+adm_report_require_history() {
+    local files
+    files="$(adm_report_history_files || true)"
+    if [[ -z "$files" ]]; then
+        adm_log_warn "Nenhum arquivo de histórico encontrado em '$ADM_DB_HISTORY_DIR' (ou ADM_DB_HISTORY_FILE)."
         return 1
     fi
     return 0
@@ -126,17 +145,17 @@ adm_report_top_time() {
 
     adm_log_phase_header "Relatório: Pacotes que mais demoram (top $limit por tempo médio)"
 
-    # Formato:
-    #   ts pid op pkg metric value unit extra
+    # Formato métricas:
+    # ts pid op pkg metric value unit extra
     # metric == "duration" em segundos
     local tmp
     tmp="$(mktemp "$ADM_TMP_DIR/report-top-time-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para top-time."
 
     awk -F '\t' '
         NF >= 8 && $5 == "duration" {
-            pkg=$4
-            val=$6
-            if (val+0 == val) {
+            pkg = $4
+            val = $6
+            if (val + 0 == val) {
                 sum[pkg] += val
                 count[pkg] += 1
             }
@@ -192,24 +211,26 @@ adm_report_top_fail() {
 
     adm_log_phase_header "Relatório: Pacotes que mais falham (top $limit por número de falhas)"
 
-    # Considera duration + extra com rc=...
+    # Considera métricas de duração e extra com rc=...
     local tmp
     tmp="$(mktemp "$ADM_TMP_DIR/report-top-fail-XXXXXX")" || adm_log_fatal "Falha ao criar tmp para top-fail."
 
     awk -F '\t' '
         NF >= 8 && $5 == "duration" {
-            pkg=$4
-            extra=$8
-            rc=""
+            pkg   = $4
+            extra = $8
+            rc    = ""
+
             n = split(extra, a, " ")
-            for (i=1; i<=n; i++) {
+            for (i = 1; i <= n; i++) {
                 if (a[i] ~ /^rc=/) {
-                    rc=a[i]
+                    rc = a[i]
                     sub(/^rc=/, "", rc)
                     sub(/[^0-9-].*/, "", rc)
                 }
             }
-            if (rc == "") rc=0
+
+            if (rc == "") rc = 0
             total[pkg] += 1
             if (rc != 0) fails[pkg] += 1
         }
@@ -269,10 +290,10 @@ adm_report_usage_metrics() {
     awk -F '\t' '
         NF >= 8 {
             total_lines++
-            pkg=$4
-            op=$3
+            pkg = $4
+            op  = $3
             if (pkg != "") {
-                pkgs[pkg]=1
+                pkgs[pkg] = 1
             }
             ops[op]++
             if ($5 == "duration" && op == "BUILD") {
@@ -280,8 +301,10 @@ adm_report_usage_metrics() {
             }
         }
         END {
-            n_pkgs=0
-            for (p in pkgs) { n_pkgs++ }
+            n_pkgs = 0
+            for (p in pkgs) {
+                n_pkgs++
+            }
             printf "%d\t%d\n", total_lines, n_pkgs
             for (o in ops) {
                 printf "OP\t%s\t%d\n", o, ops[o]
@@ -296,23 +319,23 @@ adm_report_usage_metrics() {
     IFS=$'\t' read -r total_lines total_pkgs <"$tmp_summary"
 
     adm_log_info "Total de registros de métricas : $total_lines"
-    adm_log_info "Número de pacotes distintos    : $total_pkgs"
+    adm_log_info "Número de pacotes distintos   : $total_pkgs"
     adm_log_info ""
 
     adm_log_info "Contagem de operações por tipo (op):"
     awk -F '\t' '
         $1 == "OP" {
-            printf "  - %-10s : %d\n", $2, $3
+            printf " - %-10s : %d\n", $2, $3
         }
     ' "$tmp_summary" | sort
 
     adm_log_info ""
     adm_log_info "Top 5 pacotes por número de builds (op=BUILD):"
 
-    awk -F '\t' '$1 == "BUILD" {print $2 "\t" $3}' "$tmp_summary" >"$tmp_build"
+    awk -F '\t' '$1 == "BUILD" { print $2 "\t" $3 }' "$tmp_summary" >"$tmp_build"
 
     if [[ ! -s "$tmp_build" ]]; then
-        adm_log_info "  (nenhum build registrado)"
+        adm_log_info " (nenhum build registrado)"
     else
         local rank=0
         printf '%-4s %-40s %10s\n' "Rank" "Pacote" "builds"
@@ -330,29 +353,39 @@ adm_report_usage_metrics() {
 }
 
 # =========
-# Relatório: estatísticas de uso (history rico)
+# Relatório: estatísticas de uso (history rico 2.0)
 # =========
 
 adm_report_usage_history() {
     adm_log_info ""
-    adm_log_phase_header "Resumo do histórico (db/history)"
+    adm_log_phase_header "Resumo do histórico (db/history 2.0)"
 
-    if [[ ! -f "$ADM_DB_HISTORY_FILE" ]]; then
-        adm_log_info "  Arquivo de histórico não encontrado: $ADM_DB_HISTORY_FILE"
+    if ! adm_report_require_history; then
+        adm_log_info " Sem arquivos de history em '$ADM_DB_HISTORY_DIR' (e ADM_DB_HISTORY_FILE não definido/inesistente)."
         return 0
     fi
 
-    local lines size
-    lines=$(wc -l <"$ADM_DB_HISTORY_FILE" 2>/dev/null || echo 0)
-    size=$(wc -c <"$ADM_DB_HISTORY_FILE" 2>/dev/null || echo 0)
+    local files
+    files=$(adm_report_history_files)
 
-    adm_log_info "Arquivo : $ADM_DB_HISTORY_FILE"
-    adm_log_info "Linhas  : $lines"
-    adm_log_info "Tamanho : $size bytes"
+    # Estatísticas de tamanho/linhas gerais (todos os arquivos)
+    local lines size n_files
+    n_files=$(printf '%s\n' $files | wc -l | awk '{print $1}')
+    lines=$(cat $files 2>/dev/null | wc -l | awk '{print $1}')
+    size=$(cat $files 2>/dev/null | wc -c | awk '{print $1}')
+
+    if [[ -n "${ADM_DB_HISTORY_FILE:-}" && -f "$ADM_DB_HISTORY_FILE" ]]; then
+        adm_log_info "Origem : arquivo único $ADM_DB_HISTORY_FILE"
+    else
+        adm_log_info "Origem : arquivos $ADM_DB_HISTORY_DIR/history-*.log"
+        adm_log_info "Arquivos considerados : $n_files"
+    fi
+    adm_log_info "Linhas totais : $lines"
+    adm_log_info "Tamanho total : $size bytes"
     adm_log_info ""
 
     # Agora, faz parsing rico do history:
-    #   ts pid action pkg_id version release status msg
+    # ts pid action pkg_id version release status msg
     #
     # msg com key=value ... :: texto
     local tmp
@@ -361,43 +394,40 @@ adm_report_usage_history() {
     awk -F '\t' '
         NF >= 8 {
             total++
+            action = $3
+            pkg    = $4
+            msg    = $8
+            type   = ""
+            dir    = ""
 
-            action=$3
-            pkg=$4
-            msg=$8
-
-            type=""
-            dir=""
-
-            # parse key=value
+            # parse key=value dentro de msg
             n = split(msg, a, " ")
-            for (i=1; i<=n; i++) {
+            for (i = 1; i <= n; i++) {
                 if (a[i] ~ /^type=/) {
                     split(a[i], kv, "=")
-                    type=kv[2]
+                    type = kv[2]
                 } else if (a[i] ~ /^direction=/) {
                     split(a[i], kv, "=")
-                    dir=kv[2]
+                    dir = kv[2]
                 }
             }
 
             # inferência se type vazio (retrocompat)
             if (type == "") {
                 if (action == "INSTALL") {
-                    type="install"
+                    type = "install"
                 } else if (action == "REMOVE") {
-                    type="remove"
+                    type = "remove"
                 } else if (action == "UPGRADE") {
-                    # se direção não veio, assume upgrade
                     if (dir == "downgrade") {
-                        type="downgrade"
+                        type = "downgrade"
                     } else {
-                        type="upgrade"
+                        type = "upgrade"
                     }
                 } else if (action ~ /^SNAPSHOT/) {
-                    type="snapshot"
+                    type = "snapshot"
                 } else {
-                    type="other"
+                    type = "other"
                 }
             }
 
@@ -420,21 +450,24 @@ adm_report_usage_history() {
         END {
             # SUMMARY
             printf "SUMMARY\tlines\t%d\n", total
+
             # tipos
             for (t in count_type) {
                 printf "TYPE\t%s\t%d\n", t, count_type[t]
             }
+
             # pacotes por tipo
-            for (p in inst_pkg)   printf "INST_PKG\t%s\t%d\n", p, inst_pkg[p]
-            for (p in upg_pkg)    printf "UPG_PKG\t%s\t%d\n", p, upg_pkg[p]
-            for (p in down_pkg)   printf "DOWN_PKG\t%s\t%d\n", p, down_pkg[p]
-            for (p in rem_pkg)    printf "REM_PKG\t%s\t%d\n", p, rem_pkg[p]
+            for (p in inst_pkg) printf "INST_PKG\t%s\t%d\n", p, inst_pkg[p]
+            for (p in upg_pkg)  printf "UPG_PKG\t%s\t%d\n",  p, upg_pkg[p]
+            for (p in down_pkg) printf "DOWN_PKG\t%s\t%d\n", p, down_pkg[p]
+            for (p in rem_pkg)  printf "REM_PKG\t%s\t%d\n",  p, rem_pkg[p]
+
             # snapshots
             printf "SNAPS\tcreate\t%d\n", (snaps_create+0)
             printf "SNAPS\trestore\t%d\n", (snaps_restore+0)
             printf "SNAPS\tother\t%d\n", (snaps_other+0)
         }
-    ' "$ADM_DB_HISTORY_FILE" >"$tmp"
+    ' $files >"$tmp"
 
     if [[ ! -s "$tmp" ]]; then
         adm_log_info "History vazio."
@@ -445,26 +478,22 @@ adm_report_usage_history() {
     # Ler SUMMARY
     local total_hist
     total_hist=$(awk -F '\t' '$1=="SUMMARY"{print $3}' "$tmp" 2>/dev/null || echo 0)
+
     adm_log_info "Entradas totais no history: $total_hist"
     adm_log_info ""
 
     adm_log_info "Contagem por tipo (type=...):"
     awk -F '\t' '
-        $1=="TYPE" {
-            printf "  - %-10s : %d\n", $2, $3
-        }
+        $1=="TYPE" { printf " - %-10s : %d\n", $2, $3 }
     ' "$tmp" | sort
 
     adm_log_info ""
     adm_log_info "Snapshots:"
     awk -F '\t' '
-        $1=="SNAPS" {
-            printf "  - %-8s : %d\n", $2, $3
-        }
+        $1=="SNAPS" { printf " - %-8s : %d\n", $2, $3 }
     ' "$tmp" | sort
 
     # Top 5 por install/upgrade/downgrade
-
     adm_log_info ""
     adm_log_info "Top 5 pacotes mais instalados:"
     local rank
@@ -473,10 +502,8 @@ adm_report_usage_history() {
         | sort -t $'\t' -k2,2nr \
         | while IFS=$'\t' read -r pkg count; do
             rank=$((rank + 1))
-            printf "  %2d. %-40s %6d installs\n" "$rank" "$pkg" "$count"
-            if [[ "$rank" -ge 5 ]]; then
-                break
-            fi
+            printf " %2d. %-40s %6d installs\n" "$rank" "$pkg" "$count"
+            if [[ "$rank" -ge 5 ]]; then break; fi
         done
 
     adm_log_info ""
@@ -486,10 +513,8 @@ adm_report_usage_history() {
         | sort -t $'\t' -k2,2nr \
         | while IFS=$'\t' read -r pkg count; do
             rank=$((rank + 1))
-            printf "  %2d. %-40s %6d upgrades\n" "$rank" "$pkg" "$count"
-            if [[ "$rank" -ge 5 ]]; then
-                break
-            fi
+            printf " %2d. %-40s %6d upgrades\n" "$rank" "$pkg" "$count"
+            if [[ "$rank" -ge 5 ]]; then break; fi
         done
 
     adm_log_info ""
@@ -499,17 +524,15 @@ adm_report_usage_history() {
         | sort -t $'\t' -k2,2nr \
         | while IFS=$'\t' read -r pkg count; do
             rank=$((rank + 1))
-            printf "  %2d. %-40s %6d downgrades\n" "$rank" "$pkg" "$count"
-            if [[ "$rank" -ge 5 ]]; then
-                break
-            fi
+            printf " %2d. %-40s %6d downgrades\n" "$rank" "$pkg" "$count"
+            if [[ "$rank" -ge 5 ]]; then break; fi
         done
 
     rm -f "$tmp" || true
 
     adm_log_info ""
-    adm_log_info "Últimas 5 entradas do history:"
-    tail -n 5 "$ADM_DB_HISTORY_FILE" 2>/dev/null | sed 's/^/    /'
+    adm_log_info "Últimas 5 entradas do history (ordenadas por arquivo):"
+    cat $files 2>/dev/null | tail -n 5 | sed 's/^/ /'
 }
 
 # =========
@@ -526,49 +549,33 @@ adm_report_usage() {
 # =========
 
 adm_report_usage_text() {
-    cat <<EOF
-adm-report - Relatórios de métricas e histórico do ADM 2.0
+    cat <<'EOF'
+Uso: adm-report <comando> [opções]
 
-Uso:
+Comandos:
 
-  Pacotes que mais demoram (por tempo médio, top N):
-    adm-report top-time [N]
+  top-time [N]
+      Mostra os N pacotes com maior tempo médio de build,
+      usando métricas (adm-metrics, metric=duration, op=BUILD).
 
-      - Usa métricas "duration" de todos os ops.
-      - Mostra: Rank, Pacote, tempo médio, tempo total, número de execuções.
+  top-fail [N]
+      Mostra os N pacotes com maior número de falhas,
+      usando métricas de duração + rc!=0 em extra.
 
-  Pacotes que mais falham (top N por falhas):
-    adm-report top-fail [N]
-
-      - Usa "duration" + campo extra com "rc=..." do adm-metrics.
-      - Mostra: Rank, Pacote, número de falhas, número de execuções, taxa de falha (%).
-
-  Estatísticas gerais de uso (métricas + history):
-    adm-report usage
-
-      - A partir de métricas:
-          * total de registros
-          * número de pacotes distintos
-          * contagem por op (BUILD, FETCH, SCAN, CHECK, UPDATE, etc.)
-          * top 5 pacotes com mais BUILD
-
-      - A partir de history:
-          * total de entradas
-          * contagem por tipo:
-                install / upgrade / downgrade / remove / snapshot / other
-          * top 5 pacotes:
-                - mais instalados
-                - mais upgradados
-                - mais downgrades
-          * contagem de snapshots:
-                - create
-                - restore
-                - outros
-          * últimas 5 linhas do history para inspeção rápida.
-
-  Ajuda:
-    adm-report --help
-
+  usage
+      Mostra estatísticas de uso gerais:
+        - A partir de métricas:
+            * total de registros
+            * pacotes distintos
+            * contagem por op (BUILD, FETCH, SCAN, CHECK, UPDATE, ...)
+            * top 5 pacotes por número de builds
+        - A partir de history (rico 2.0):
+            * total de entradas
+            * contagem por tipo: install / upgrade / downgrade / remove / snapshot / other
+            * top 5 pacotes mais instalados
+            * top 5 pacotes mais upgradados
+            * top 5 pacotes com mais downgrades
+            * contagem de snapshots (create / restore / other)
 EOF
 }
 
@@ -584,11 +591,10 @@ adm_report_main() {
             shift || true
             adm_report_top_fail "${1:-10}"
             ;;
-        usage)
-            shift || true
+        usage|"")
             adm_report_usage
             ;;
-        --help|-h|"")
+        --help|-h)
             adm_report_usage_text
             ;;
         *)
@@ -600,5 +606,3 @@ adm_report_main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     adm_report_main "$@"
 fi
-
-# Fim do adm-report
