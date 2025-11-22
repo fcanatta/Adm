@@ -1,0 +1,36 @@
+name: perl-temp
+version: 5.42.0
+release: 1
+
+category: toolchain
+license: Artistic-1.0-Perl OR GPL-1.0-or-later
+url: https://www.perl.org/
+
+# Ajuda o adm-build/adm-profile a escolher o profile correto
+# Aqui marcamos glibc porque esse Perl temporário é para o sistema LFS glibc.
+libc: glibc
+
+summary: Perl temporário (Chapter 7) para o ambiente LFS dentro do chroot
+description: >
+  Perl 5.42.0 conforme LFS Chapter 7 (Additional Temporary Tools),
+  instalado em /usr dentro do ambiente chroot, usado por outros
+  pacotes durante o build do sistema base.
+
+# Lidos por adm-deps / adm-build
+# Você pode ir preenchendo os deps conforme for refinando o grafo.
+# Na prática, esse Perl depende de já existir o toolchain temporário e
+# os utilitários básicos (bash, coreutils, sed, etc).
+build_deps:
+run_deps:
+opt_deps:
+
+# groups: usado pela heurística de "kind" (toolchain) e por build-group, relatórios etc
+groups: toolchain-temp lfs-temp perl
+
+# Fonte oficial (alinhado com LFS "development" 7.9 / Perl 5.42.0)
+# Veja LFS capítulo 3 – lista de pacotes.
+source_uri: https://www.cpan.org/src/5.0/perl-5.42.0.tar.xz
+
+# SHA256 puro (sem prefixo), para o adm-fetch:
+# Pode deixar em branco por enquanto como você pediu.
+source_checksum:
