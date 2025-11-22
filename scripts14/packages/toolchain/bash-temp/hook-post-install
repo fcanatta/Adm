@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# /root/usr/src/adm/packages/toolchain/bash-temp/hook-post-install
+# hook-post-install para toolchain/bash-temp
+#
+# Executado pelo adm-build DEPOIS de instalar o pacote (copiar DESTDIR para /)
+# e registrar no DB.
+#
+# Objetivo:
+#   - Criar o symlink "sh" -> "bash" no binário temporário:
+#       ln -sv bash $LFS/bin/sh
+#     adaptado para:
+#       - ADM_DESTDIR/bin/sh (staging do ADM)
+#       - e opcionalmente $LFS/bin/sh, se LFS estiver definido.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=toolchain/bash-temp}"
+: "${ADM_DESTDIR:?ADM_DESTDIR não definido}"
+
+pkg_id="$ADM_PKG_ID"
+dest="$ADM_DESTDIR"
+
+# ===== Symlink em ADM_DESTDIR/bin =====
+
+bindir_dest="$dest/bin"
+
+if [[ -d "$bindir_dest" ]]; then
+    if [[ -x "$bindir_dest/bash" || -f "$bindir_dest/bash" || -L "$bindir_dest/bash" ]]; then
+        echo "[hook-post-install][$pkg_id] Criando symlink sh -> bash em $bindir_dest (DESTDIR)..."
+        (
+            cd "$bindir_dest"
+            # remove sh antigo se já existir
+            if [[ -L "sh" || -f "sh" ]]; then
+                rm -f sh
+            fi
+            ln -sv bash sh
+        )
+    else
+        echo "[hook-post-install][$pkg_id] AVISO: bash não encontrado em $bindir_dest; não criei sh (DESTDIR)." >&2
+    fi
+else
+    echo "[hook-post-install][$pkg_id] AVISO: $bindir_dest não existe; nada para fazer no DESTDIR." >&2
+fi
+
+# ===== Symlink no chroot LFS real (opcional) =====
+# Se o usuário estiver realmente montando um LFS com $LFS definido e
+# já copiou DESTDIR->/mnt/lfs, garantimos o link lá também, como o livro pede.
+
+if [[ -n "${LFS:-}" ]]; then
+    lfs_bindir="${LFS%/}/bin"
+    if [[ -d "$lfs_bindir" ]]; then
+        if [[ -x "$lfs_bindir/bash" || -f "$lfs_bindir/bash" || -L "$lfs_bindir/bash" ]]; then
+            echo "[hook-post-install][$pkg_id] Garantindo symlink sh -> bash em $lfs_bindir (LFS)..."
+            (
+                cd "$lfs_bindir"
+                if [[ -L "sh" || -f "sh" ]]; then
+                    rm -f sh
+                fi
+                ln -sv bash sh
+            )
+        else
+            echo "[hook-post-install][$pkg_id] AVISO: bash não encontrado em $lfs_bindir; não criei sh no LFS." >&2
+        fi
+    else
+        echo "[hook-post-install][$pkg_id] AVISO: diretório $lfs_bindir não existe; pulando symlink no LFS." >&2
+    fi
+fi
+
+echo "[hook-post-install][$pkg_id] hook-post-install de Bash temporário concluído."
