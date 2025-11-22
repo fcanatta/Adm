@@ -1,0 +1,30 @@
+name: binutils-pass2
+version: 2.43.1
+release: 1
+
+category: toolchain
+license: GPL-3.0-or-later
+url: https://www.gnu.org/software/binutils/
+
+libc: glibc
+
+summary: Binutils 2.43.1 - Pass 2 temporário (cross) para LFS (cap. 6.17)
+description: >
+  Binutils 2.43.1 construído como ferramenta temporária (pass 2),
+  seguindo o capítulo 6.17 do LFS 12.2. Usa host=$LFS_TGT, build=$(config.guess),
+  shared libs ativadas, NLS desabilitado e ajustes de hash/new-dtags, integrado
+  ao pipeline ADM 2.0 com DESTDIR e profiles de toolchain.
+
+# Ferramentas temporárias anteriores + toolchain básica
+build_deps: toolchain/binutils-pass1 toolchain/gcc-pass1 toolchain/glibc toolchain/linux-headers toolchain/xz-temp toolchain/tar-temp toolchain/sed-temp toolchain/make-temp toolchain/coreutils-temp toolchain/bash-temp toolchain/grep-temp toolchain/gawk-temp toolchain/findutils-temp toolchain/diffutils-temp toolchain/file-temp toolchain/patch-temp toolchain/gzip-temp toolchain/sed-temp
+run_deps:
+opt_deps:
+
+# Grupos para build-group e relatórios
+groups: toolchain temp-tools cross-temp binutils
+
+# Fonte oficial (mesma versão do LFS 12.2)
+source_uri: https://ftp.gnu.org/gnu/binutils/binutils-2.43.1.tar.xz
+
+# Pode preencher depois com o sha256 oficial
+source_checksum:
