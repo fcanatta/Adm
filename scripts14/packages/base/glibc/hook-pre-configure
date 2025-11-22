@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# hook-pre-configure para base/glibc (LFS 8.x + ADM 2.0)
+#
+# Faz:
+#   - aplica o patch FHS (glibc-2.40-fhs-1.patch), se existir
+#   - cria diretório de build separado: build/
+#   - cria wrapper ./configure na raiz que:
+#       * entra em build/
+#       * roda ../configure com os flags do LFS
+#   - cria Makefile proxy na raiz que delega para build/
+#
+# Depois disso, o adm-build roda:
+#   ./configure --prefix=/usr     (chama o wrapper)
+#   make                          (Makefile proxy -> make -C build)
+#   make DESTDIR="$ADM_DESTDIR" install
+#
+# E o resultado é equivalente ao do LFS.
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+: "${ADM_PKG_ID:=base/glibc}"
+: "${ADM_BUILD_DIR_CURRENT:?ADM_BUILD_DIR_CURRENT não definido}"
+
+pkg_id="$ADM_PKG_ID"
+src_dir="$ADM_BUILD_DIR_CURRENT"
+
+cd "$src_dir"
+
+echo "[hook-pre-configure][$pkg_id] src_dir = $src_dir" >&2
+
+# ---------- 1) Aplicar patch FHS, se disponível ----------
+
+# Tentamos achar o patch na raiz do source ou um nível acima
+patch_file=""
+for p in \
+    "glibc-2.40-fhs-1.patch" \
+    "../glibc-2.40-fhs-1.patch" \
+    *.patch \
+    ../glibc-*-fhs-*.patch
+do
+    if [[ -f "$p" ]]; then
+        patch_file="$p"
+        break
+    fi
+done
+
+if [[ -n "$patch_file" ]]; then
+    if [[ -f ".adm-glibc-fhs-patched.stamp" ]]; then
+        echo "[hook-pre-configure][$pkg_id] Patch FHS já aplicado (stamp encontrado); pulando." >&2
+    else
+        echo "[hook-pre-configure][$pkg_id] Aplicando patch FHS: $patch_file" >&2
+        # -p1 é o que a maioria dos patches da glibc usa; ajuste se necessário
+        patch -Np1 -i "$patch_file"
+        touch ".adm-glibc-fhs-patched.stamp"
+    fi
+else
+    echo "[hook-pre-configure][$pkg_id] Aviso: patch FHS não encontrado; seguindo sem aplicar." >&2
+fi
+
+# ---------- 2) Criar diretório de build separado ----------
+
+build_glibc_dir="$src_dir/build"
+
+if [[ ! -d "$build_glibc_dir" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Criando diretório de build: $build_glibc_dir" >&2
+    mkdir -p "$build_glibc_dir"
+else
+    echo "[hook-pre-configure][$pkg_id] Diretório de build já existe; ok." >&2
+fi
+
+# Criar configparms básico (rootsbindir, etc). Ajuste se quiser algo extra.
+configparms="$build_glibc_dir/configparms"
+{
+    echo "rootsbindir=/usr/sbin"
+    # se quiser forçar slibdir:
+    # echo "slibdir=/usr/lib"
+} > "$configparms"
+
+echo "[hook-pre-configure][$pkg_id] Arquivo configparms criado em $configparms" >&2
+
+# ---------- 3) Criar wrapper ./configure na raiz ----------
+
+wrapper="$src_dir/configure"
+
+# Se já existe configure.orig, assumimos que o wrapper já foi criado antes
+if [[ -x "$wrapper" && -x "$src_dir/configure.orig" ]]; then
+    echo "[hook-pre-configure][$pkg_id] Wrapper ./configure já existe; pulando criação." >&2
+else
+    # Se existe um configure real, renomeia para configure.orig (para diagnóstico apenas)
+    if [[ -x "$wrapper" && ! -x "$src_dir/configure.orig" ]]; then
+        mv "$wrapper" "$src_dir/configure.orig"
+    fi
+
+    cat > "$wrapper" << 'EOF'
+#!/usr/bin/env bash
+# Wrapper ./configure para base/glibc (LFS/ADM 2.0)
+# Executado em $ADM_BUILD_DIR_CURRENT (raiz dos sources da glibc).
+set -o errexit
+set -o nounset
+set -o pipefail
+
+pkg_id="${ADM_PKG_ID:-base/glibc}"
+src_dir="${ADM_BUILD_DIR_CURRENT:-$(pwd)}"
+build_dir="$src_dir/build"
+
+mkdir -p "$build_dir"
+
+# Flags padrão do LFS para glibc final (ajuste se usar outro livro/versão)
+#   --prefix=/usr
+#   --disable-werror
+#   --enable-kernel=4.19
+#   --enable-stack-protector=strong
+#   --with-headers=/usr/include
+#   (opcional: --enable-multi-arch em x86_64)
+extra_flags=()
+
+# Se x86_64, muitos livros habilitam multi-arch
+if [[ "$(uname -m)" == "x86_64" ]]; then
+    extra_flags+=( "--enable-multi-arch" )
+fi
+
+# Filtrar args vindos do adm-build
+filtered_args=()
+for a in "$@"; do
+    case "$a" in
+        --prefix=*|--disable-werror|--enable-werror|\
+        --enable-kernel=*|--enable-stack-protector=*|\
+        --with-headers=*|--enable-multi-arch|--disable-multi-arch)
+            # vamos sobrescrever estes
+            ;;
+        *)
+            filtered_args+=("$a")
+            ;;
+    esac
+done
+
+real_conf="$src_dir/configure"
+if [[ ! -x "$real_conf" ]]; then
+    # Em várias releases o configure real é na raiz mesmo
+    # Se não tiver, abortamos com erro legível
+    printf 'ADM-ERROR[%s]: configure real não encontrado em %s\n' "$pkg_id" "$real_conf" >&2
+    exit 1
+fi
+
+cd "$build_dir"
+
+args=(
+  "$real_conf"
+  "--prefix=/usr"
+  "--disable-werror"
+  "--enable-kernel=4.19"
+  "--enable-stack-protector=strong"
+  "--with-headers=/usr/include"
+)
+
+if [[ ${#extra_flags[@]} -gt 0 ]]; then
+  args+=("${extra_flags[@]}")
+fi
+
+if [[ ${#filtered_args[@]} -gt 0 ]]; then
+  args+=("${filtered_args[@]}")
+fi
+
+printf 'ADM-INFO[%s]: chamando configure real: %s\n' "$pkg_id" "${args[*]}" >&2
+exec "${args[@]}"
+EOF
+
+    chmod +x "$wrapper"
+    echo "[hook-pre-configure][$pkg_id] Wrapper ./configure criado em $wrapper" >&2
+fi
+
+# ---------- 4) Makefile proxy na raiz ----------
+
+makefile="$src_dir/Makefile"
+
+if [[ ! -f "$makefile" ]]; then
+    cat > "$makefile" << 'EOF'
+# Makefile proxy para base/glibc (ADM 2.0)
+# Delega targets para o diretório build/ criado pelo hook-pre-configure.
+
+all:
+	$(MAKE) -C build all
+
+check:
+	$(MAKE) -C build check
+
+install:
+	$(MAKE) -C build DESTDIR="$(DESTDIR)" install
+EOF
+    echo "[hook-pre-configure][$pkg_id] Makefile proxy criado em $makefile" >&2
+else
+    echo "[hook-pre-configure][$pkg_id] Makefile já existe em $makefile; mantendo." >&2
+fi
+
+echo "[hook-pre-configure][$pkg_id] Preparação da Glibc final concluída." >&2
