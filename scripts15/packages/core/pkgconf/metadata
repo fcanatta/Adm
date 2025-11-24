@@ -1,0 +1,74 @@
+# /usr/src/packages/core/pkgconf/metadata
+name="pkgconf"
+category="core"
+version="2.5.1"
+release="1"
+
+sources=(
+  "https://distfiles.ariadne.space/pkgconf/pkgconf-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "sed"
+  "sqlite"   # LFS chama "Sqlite"; ajuste para o nome do seu pacote
+)
+
+sha256sums=(
+  "pkgconf-${version}.tar.xz="
+)
+
+upstream_latest_version() {
+  local url="https://distfiles.ariadne.space/pkgconf/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*pkgconf-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Pkgconf-2.5.1 (LFS 8.19) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "pkgconf-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório pkgconf-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (LFS 8.19.1)
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --docdir=/usr/share/doc/pkgconf-${version}
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  # Symlinks de compatibilidade com pkg-config
+  ln -sv pkgconf   "${DESTDIR}/usr/bin/pkg-config"
+  ln -sv pkgconf.1 "${DESTDIR}/usr/share/man/man1/pkg-config.1"
+}
