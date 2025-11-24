@@ -1,0 +1,126 @@
+# /usr/src/packages/core/bash/metadata
+
+name="bash"
+category="core"
+version="5.3"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46
+# (Chapter 3 – All Packages aponta para bash-5.3.tar.gz em ftp.gnu.org) 0
+sources=(
+  "https://ftp.gnu.org/gnu/bash/bash-${version}.tar.gz"
+)
+
+# Appendix C – Bash (Installation depends on) 1
+# Bash, Binutils, Bison, Coreutils, Diffutils, Gawk, GCC, Glibc, Grep,
+# Make, Ncurses, Patch, Readline, Sed, and Texinfo
+depends=(
+  "bash"
+  "binutils"
+  "bison"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "ncurses"
+  "patch"
+  "readline"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do bash-5.3.tar.gz
+# Hash calculado e publicado por distros (Buildroot / FreeBSD ports) para o tarball
+# https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz 2
+sha256sums=(
+  "https___ftp.gnu.org_gnu_bash_bash-5.3.tar.gz=0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
+)
+
+# Descobre versão mais nova no diretório oficial do GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/bash/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*bash-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Bash-5.3 (LFS r12.4-46, seção 8.37) 3
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "bash-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório bash-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (exatamente como no livro)
+  #
+  #   ./configure --prefix=/usr             \
+  #               --without-bash-malloc     \
+  #               --with-installed-readline \
+  #               --docdir=/usr/share/doc/bash-5.3
+  ###################################
+  ./configure --prefix=/usr             \
+              --without-bash-malloc     \
+              --with-installed-readline \
+              --docdir=/usr/share/doc/bash-${version}
+
+  ###################################
+  # Compilação
+  #
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes (o LFS roda como usuário tester via Expect)
+  # Aqui deixo opcional e simplificado. Se você quiser algo
+  # fiel ao livro, crie o usuário 'tester', instale expect e
+  # exporte RUN_TESTS=1 antes do build.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    if id tester >/dev/null 2>&1 && command -v expect >/dev/null 2>&1; then
+      chown -R tester .
+
+      # Versão adaptada do bloco do livro (roda make tests como tester)
+      su -s /usr/bin/expect tester << "EOF"
+set timeout -1
+cd "$(pwd)"
+spawn make tests
+expect eof
+lassign [wait] _ _ _ value
+exit $value
+EOF
+    else
+      echo "[bash] RUN_TESTS=1 mas usuário 'tester' ou 'expect' não existem; pulando testes." >&2
+    fi
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #
+  #   make install
+  #
+  # No LFS, depois é feito:
+  #   exec /usr/bin/bash --login
+  # para trocar o shell atual. Aqui isso NÃO é feito, para não
+  # matar o processo de empacotamento.
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
