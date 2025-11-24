@@ -1,0 +1,101 @@
+# /usr/src/packages/core/intltool/metadata
+
+name="intltool"
+category="core"
+version="0.51.0"
+release="1"
+
+# Fonte oficial usada pelo LFS (All Packages):
+# Download: https://launchpad.net/intltool/trunk/0.51.0/+download/intltool-0.51.0.tar.gz
+sources=(
+  "https://launchpad.net/intltool/trunk/${version}/+download/intltool-${version}.tar.gz"
+)
+
+# Appendix C – Intltool (Installation depends on):
+#   Bash, Gawk, Glibc, Make, Perl, Sed, and XML::Parser
+depends=(
+  "bash"
+  "gawk"
+  "glibc"
+  "make"
+  "perl"
+  "sed"
+  "xml-parser"
+)
+
+# SHA256 real do intltool-0.51.0.tar.gz
+# (hash usado por várias distros/buildsystems para o mesmo tarball)
+sha256sums=(
+  "https___launchpad.net_intltool_trunk_0.51.0_+download_intltool-0.51.0.tar.gz=67c74d94196b153b774ab9f89b2fa6c6ba79352407037c8c14d5aeb334e959cd"
+)
+
+# Descobre versão mais nova em Launchpad
+upstream_latest_version() {
+  local url="https://launchpad.net/intltool/+download"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*intltool-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Intltool-0.51.0 (LFS r12.4-46, seção 8.44)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório intltool-0.51.0
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "intltool-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório intltool-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Fix do LFS para warning com Perl 5.22+:
+  #   sed -i 's:\${:\$\{:' intltool-update.in
+  # No livro isso aparece com escapes adicionais:
+  #   sed -i 's:\\\${:\\\$\\{:' intltool-update.in
+  ###################################
+  sed -i 's:\\\${:\\\$\\{:' intltool-update.in
+
+  ###################################
+  # Configuração (exatamente como no livro):
+  #   ./configure --prefix=/usr
+  ###################################
+  ./configure --prefix=/usr
+
+  ###################################
+  # Compilação:
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes:
+  #   make check
+  # Deixo opcional via RUN_TESTS pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação (adaptada para DESTDIR):
+  #   make install
+  #   install -v -Dm644 doc/I18N-HOWTO \
+  #       /usr/share/doc/intltool-0.51.0/I18N-HOWTO
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  install -v -Dm644 doc/I18N-HOWTO \
+    "${DESTDIR}/usr/share/doc/intltool-${version}/I18N-HOWTO"
+}
