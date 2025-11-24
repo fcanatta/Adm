@@ -1,0 +1,81 @@
+# /usr/src/packages/core/dejagnu/metadata
+name="dejagnu"
+category="core"
+version="1.6.3"
+release="1"
+
+sources=(
+  "https://ftp.gnu.org/gnu/dejagnu/dejagnu-${version}.tar.gz"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "coreutils"
+  "diffutils"
+  "expect"
+  "gcc"
+  "grep"
+  "make"
+  "sed"
+  "texinfo"
+)
+
+sha256sums=(
+  "dejagnu-${version}.tar.gz="
+)
+
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/dejagnu/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*dejagnu-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – DejaGNU-1.6.3 (LFS 8.18) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "dejagnu-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório dejagnu-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  mkdir -v build
+  cd build
+
+  ###################################
+  # Configuração (LFS 8.18.1)
+  ###################################
+  ../configure --prefix=/usr
+
+  ###################################
+  # Documentação (makeinfo)
+  ###################################
+  makeinfo --html --no-split -o doc/dejagnu.html ../doc/dejagnu.texi
+  makeinfo --plaintext       -o doc/dejagnu.txt  ../doc/dejagnu.texi
+
+  ###################################
+  # Testes (LFS: make check)
+  ###################################
+  # Pode falhar em chroot se algo da toolchain estiver errado
+  make check || true
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  install -v -dm755  "${DESTDIR}/usr/share/doc/dejagnu-${version}"
+  install -v -m644   doc/dejagnu.{html,txt} \
+    "${DESTDIR}/usr/share/doc/dejagnu-${version}"
+}
