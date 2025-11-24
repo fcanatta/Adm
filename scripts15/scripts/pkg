@@ -414,11 +414,12 @@ prepare_build_dirs() {
     local destdir="$buildroot/destdir"
     local srcroot="$buildroot/src"
 
-    rm -rf "$buildroot"
+    if (( ! DRY_RUN )); then
+        rm -rf -- "$buildroot"
+    fi
     run mkdir -p "$buildroot" "$destdir" "$srcroot"
     echo "$buildroot" "$destdir" "$srcroot"
 }
-
 unpack_sources_into() {
     local category="$1" name="$2" srcroot="$3"
     local src
@@ -1355,32 +1356,32 @@ install_from_destdir() {
 # - pega a tag "mais alta" em sort -V e, se for diferente da versão atual,
 #   atualiza a linha version= no metadado.
 
-find_git_source() {
-    local s
-    for s in "${META_SOURCES[@]}"; do
-        case "$s" in
-            git+*) echo "$s"; return 0 ;;
-        esac
-    done
-    return 1
-}
+# find_git_source() {
+#    local s
+#    for s in "${META_SOURCES[@]}"; do
+#        case "$s" in
+#           git+*) echo "$s"; return 0 ;;
+#        esac
+#    done
+#    return 1
+#}
 
-get_latest_git_tag() {
-    local src="$1"
-    local url="${src#git+}"
-    local key
-    key="$(cache_key_for_source "$src")"
-    local mirror="$PKG_CACHE_SOURCES/$key"
+#get_latest_git_tag() {
+#    local src="$1"
+#    local url="${src#git+}"
+#    local key
+#    key="$(cache_key_for_source "$src")"
+#    local mirror="$PKG_CACHE_SOURCES/$key"
 
-    ensure_dirs
-    if [[ ! -d "$mirror" ]]; then
-        log "Mirror git não encontrado, buscando..."
-        fetch_one_source "$src" "$mirror"
-    fi
+#    ensure_dirs
+#    if [[ ! -d "$mirror" ]]; then
+#        log "Mirror git não encontrado, buscando..."
+#        fetch_one_source "$src" "$mirror"
+#    fi
 
     # lista tags, ordena, pega a última
-    ( cd "$mirror" && git tag ) | sort -V | tail -n1
-}
+#    ( cd "$mirror" && git tag ) | sort -V | tail -n1
+#}
 
 ########################################
 # UPDATE (buscar versão nova no upstream)
