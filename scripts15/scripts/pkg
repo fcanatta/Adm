@@ -141,6 +141,7 @@ Comandos principais:
   upgrade [--force] <cat> <nome>   - build + install versão nova ou rebuild
   deps   <categoria> <nome>...     - mostra ordem de deps (Kahn)
   repo-index                       - lista todos os pacotes binários no cache
+  repo-prune                       - limpa caches de sources, binários e builds
 
 Opções:
   --dry-run  - não executa nada de fato, só mostra o que faria
@@ -1142,6 +1143,179 @@ repo_index() {
 }
 
 ########################################
+# REPO PRUNE - limpar caches de forma "inteligente"
+########################################
+
+repo_prune() {
+    ensure_dirs
+
+    ##############################
+    # 1) LIMPAR CACHE DE SOURCES #
+    ##############################
+    log "==> Limpando cache de sources em $PKG_CACHE_SOURCES ..."
+
+    declare -A NEEDED_SRC=()
+
+    # varre todos os metadados e coleta as keys de cache necessárias
+    if [[ -d "$PKG_META_ROOT" ]]; then
+        while IFS= read -r -d '' meta; do
+            local prog_dir cat name
+            prog_dir="$(dirname "$meta")"
+            name="$(basename "$prog_dir")"
+            cat="$(basename "$(dirname "$prog_dir")")"
+
+            # limpa variáveis do metadado
+            unset sources
+
+            # shellcheck disable=SC1090
+            . "$meta"
+
+            local src key
+            for src in "${sources[@]:-}"; do
+                key="$(cache_key_for_source "$src")"
+                NEEDED_SRC["$key"]=1
+            done
+        done < <(find "$PKG_META_ROOT" -type f -name metadata -print0 2>/dev/null)
+    fi
+
+    if [[ -d "$PKG_CACHE_SOURCES" ]]; then
+        local f base
+        for f in "$PKG_CACHE_SOURCES"/*; do
+            [[ -e "$f" ]] || continue
+            base="$(basename "$f")"
+            if [[ -n "${NEEDED_SRC[$base]:-}" ]]; then
+                log "Mantendo source usado: $f"
+            else
+                log "Removendo source órfão: $f"
+                if (( ! DRY_RUN )); then
+                    rm -f -- "$f"
+                fi
+            fi
+        done
+    fi
+
+    ################################
+    # 2) LIMPAR CACHE DE BINÁRIOS  #
+    ################################
+    log "==> Limpando cache de binários em $PKG_CACHE_PACKAGES ..."
+
+    if [[ ! -d "$PKG_CACHE_PACKAGES" ]]; then
+        log "Diretório de pacotes binários inexistente, pulando."
+    else
+        local tmp_pkgs tmp_sorted tmp_latest
+        tmp_pkgs="$(mktemp)"
+        tmp_sorted="$(mktemp)"
+        tmp_latest="$(mktemp)"
+
+        # lista todos os pkg binários: name ver rel path
+        local files=()
+        mapfile -t files < <(find "$PKG_CACHE_PACKAGES" -maxdepth 1 -type f \( -name "*.tar.xz" -o -name "*.tar.zst" \) 2>/dev/null | sort)
+
+        if ((${#files[@]} == 0)); then
+            log "Nenhum pacote binário no cache."
+        else
+            local f base ext rest name ver_rel ver rel
+
+            for f in "${files[@]}"; do
+                base="$(basename "$f")"
+                case "$base" in
+                    *.tar.xz)  ext=".tar.xz" ;;
+                    *.tar.zst) ext=".tar.zst" ;;
+                    *)         ext="" ;;
+                esac
+
+                rest="${base%$ext}"
+
+                # formato esperado: name-version-release
+                # pega name = tudo antes dos dois últimos '-'
+                name="${rest%-*-*}"
+                ver_rel="${rest#${name}-}"
+                ver="${ver_rel%-*}"
+                rel="${ver_rel##*-}"
+
+                printf '%s %s %s %s\n' "$name" "$ver" "$rel" "$f" >> "$tmp_pkgs"
+            done
+
+            # mapa de combos instalados: "name ver rel"
+            declare -A INSTALLED_COMBO=()
+            local d info
+            for d in "$PKG_DB"/*; do
+                [[ -d "$d" ]] || continue
+                info="$d/pkginfo"
+                [[ -r "$info" ]] || continue
+                unset name category version release
+                # shellcheck disable=SC1090
+                . "$info"
+                if [[ -n "$name" && -n "$version" && -n "$release" ]]; then
+                    INSTALLED_COMBO["$name $version $release"]=1
+                fi
+            done
+
+            # calcula a última versão por name (usando sort -V)
+            sort -k1,1 -k2,2V -k3,3V "$tmp_pkgs" > "$tmp_sorted"
+
+            awk '
+            {
+                name=$1; ver=$2; rel=$3; path=$4
+                if (name!=prev_name) {
+                    if (prev_name!="") {
+                        print prev_line
+                    }
+                    prev_name=name
+                }
+                prev_line=$0
+            }
+            END {
+                if (prev_name!="")
+                    print prev_line
+            }' "$tmp_sorted" > "$tmp_latest"
+
+            declare -A LATEST_COMBO=()
+            while read -r name ver rel path; do
+                LATEST_COMBO["$name $ver $rel"]=1
+            done < "$tmp_latest"
+
+            # decide o que manter/remover
+            while read -r name ver rel path; do
+                local key="$name $ver $rel"
+                local keep_reason=""
+                if [[ -n "${INSTALLED_COMBO[$key]:-}" ]]; then
+                    keep_reason="(instalado)"
+                elif [[ -n "${LATEST_COMBO[$key]:-}" ]]; then
+                    keep_reason="(última versão)"
+                fi
+
+                if [[ -n "$keep_reason" ]]; then
+                    log "Mantendo binário $path $keep_reason"
+                else
+                    log "Removendo binário antigo/órfão: $path"
+                    if (( ! DRY_RUN )); then
+                        rm -f -- "$path"
+                    fi
+                fi
+            done < "$tmp_pkgs"
+        fi
+
+        rm -f "$tmp_pkgs" "$tmp_sorted" "$tmp_latest"
+    fi
+
+    ########################################
+    # 3) LIMPAR DIRETÓRIOS DE BUILD/DESTDIR
+    ########################################
+    log "==> Limpando diretórios de build em $PKG_CACHE_BUILDS ..."
+
+    if [[ -d "$PKG_CACHE_BUILDS" ]]; then
+        if (( DRY_RUN )); then
+            log "(dry-run) removeria todo conteúdo de $PKG_CACHE_BUILDS"
+        else
+            rm -rf "${PKG_CACHE_BUILDS:?}/"*
+        fi
+    fi
+
+    log "repo-prune concluído."
+}
+
+########################################
 # INSTALAÇÃO DO PACOTE (a partir do DESTDIR)
 ########################################
 
@@ -1361,6 +1535,9 @@ main() {
             ;;
         repo-index)
             repo_index
+            ;;
+        repo-prune)
+            repo_prune
             ;;
         remove)
             [[ $# -eq 1 ]] || die "Uso: pkg remove <nome>"
