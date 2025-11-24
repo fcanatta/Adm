@@ -1,0 +1,86 @@
+# /usr/src/packages/core/libcap/metadata
+name="libcap"
+category="core"
+version="2.77"
+release="1"
+
+sources=(
+  "https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-${version}.tar.xz"
+)
+
+# cache_key_for_source(): sed 's#[/:]#_#g'
+# https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/libcap-2.77.tar.xz
+# vira:
+# https___www.kernel.org_pub_linux_libs_security_linux-privs_libcap2_libcap-2.77.tar.xz
+sha256sums=(
+  "https___www.kernel.org_pub_linux_libs_security_linux-privs_libcap2_libcap-2.77.tar.xz=897bc18b44afc26c70e78cead3dbb31e154acc24bee085a5a09079a88dbf6f52"
+)
+
+# Appendix C – Installation depends on:
+# Libcap:
+#   Attr, Bash, Binutils, Coreutils, GCC, Glibc, Perl, Make, Sed
+depends=(
+  "attr"
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "glibc"
+  "perl"
+  "make"
+  "sed"
+)
+
+upstream_latest_version() {
+  local url="https://www.kernel.org/pub/linux/libs/security/linux-privs/libcap2/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*libcap-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Libcap-2.77 (LFS r12.4-46, capítulo 8.27)
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "libcap-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório libcap-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Nota do LFS sobre GOLANG
+  ###################################
+  # Se estiver atualizando em um sistema com Go instalado:
+  #   export GOLANG=no
+  # antes do build (o livro cita isso). Aqui só deixo a nota.
+
+  ###################################
+  # Remover instalação de libs estáticas (como no livro)
+  ###################################
+  sed -i '/install -m.*STA/d' libcap/Makefile
+
+  ###################################
+  # Compilação
+  ###################################
+  make prefix=/usr lib=lib
+
+  ###################################
+  # Testes
+  ###################################
+  make test
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make prefix=/usr lib=lib DESTDIR="${DESTDIR}" install
+}
