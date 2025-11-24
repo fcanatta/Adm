@@ -1,0 +1,127 @@
+# /usr/src/packages/core/perl/metadata
+
+name="perl"
+category="core"
+version="5.42.0"
+release="1"
+
+# Fonte oficial usada pelo LFS 12.4 (CPAN src/5.0)
+sources=(
+  "https://www.cpan.org/src/5.0/perl-${version}.tar.xz"
+)
+
+# Appendix C – Perl (Installation depends on):
+#   Bash, Binutils, Coreutils, Gawk, GCC, GDBM, Glibc, Grep, Libxcrypt, Make, Sed, and Zlib
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gawk"
+  "gcc"
+  "gdbm"
+  "glibc"
+  "grep"
+  "libxcrypt"
+  "make"
+  "sed"
+  "zlib"
+)
+
+# SHA256 real do perl-5.42.0.tar.xz (CPAN src/5.0/perl-5.42.0.tar.xz.sha256.txt)
+sha256sums=(
+  "https___www.cpan.org_src_5.0_perl-5.42.0.tar.xz=73cf6cc1ea2b2b1c110a18c14bbbc73a362073003893ffcedc26d22ebdbdd0c3"
+)
+
+# Descobre versão mais nova no diretório oficial do Perl (CPAN src/5.0)
+upstream_latest_version() {
+  local url="https://www.cpan.org/src/5.0/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*perl-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Perl-5.42.0 (LFS r12.4-46, seção 8.44)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório perl-5.42.0
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "perl-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório perl-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  # LFS manda usar as bibliotecas do sistema em vez das cópias internas
+  export BUILD_ZLIB=False
+  export BUILD_BZIP2=0
+
+  # Série usada nos paths (/usr/lib/perl5/5.42/…)
+  local series="${version%.*}"
+
+  ###################################
+  # Configuração – exatamente como no livro
+  #
+  # sh Configure -des \
+  #   -D prefix=/usr \
+  #   -D vendorprefix=/usr \
+  #   -D privlib=/usr/lib/perl5/5.42/core_perl \
+  #   -D archlib=/usr/lib/perl5/5.42/core_perl \
+  #   -D sitelib=/usr/lib/perl5/5.42/site_perl \
+  #   -D sitearch=/usr/lib/perl5/5.42/site_perl \
+  #   -D vendorlib=/usr/lib/perl5/5.42/vendor_perl \
+  #   -D vendorarch=/usr/lib/perl5/5.42/vendor_perl \
+  #   -D man1dir=/usr/share/man/man1 \
+  #   -D man3dir=/usr/share/man/man3 \
+  #   -D pager="/usr/bin/less -isR" \
+  #   -D useshrplib \
+  #   -D usethreads
+  ###################################
+  sh Configure -des \
+    -D prefix=/usr \
+    -D vendorprefix=/usr \
+    -D privlib=/usr/lib/perl5/${series}/core_perl \
+    -D archlib=/usr/lib/perl5/${series}/core_perl \
+    -D sitelib=/usr/lib/perl5/${series}/site_perl \
+    -D sitearch=/usr/lib/perl5/${series}/site_perl \
+    -D vendorlib=/usr/lib/perl5/${series}/vendor_perl \
+    -D vendorarch=/usr/lib/perl5/${series}/vendor_perl \
+    -D man1dir=/usr/share/man/man1 \
+    -D man3dir=/usr/share/man/man3 \
+    -D pager="/usr/bin/less -isR" \
+    -D useshrplib \
+    -D usethreads
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes – LFS: TEST_JOBS=$(nproc) make test_harness
+  # Aqui deixo opcional via RUN_TESTS pra não travar builds automáticos.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    TEST_JOBS="${TEST_JOBS:-$(nproc 2>/dev/null || echo 1)}" \
+      make test_harness
+  fi
+
+  ###################################
+  # Instalação em DESTDIR (adaptação p/ pkg)
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  # Limpar variáveis de ambiente
+  unset BUILD_ZLIB BUILD_BZIP2
+}
+```0
