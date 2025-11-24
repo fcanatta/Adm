@@ -164,6 +164,7 @@ META_VERSION=
 META_RELEASE=
 META_SOURCES=()
 META_DEPENDS=()
+META_SHA256=()
 
 meta_path() {
     local category="$1" name="$2"
@@ -176,9 +177,9 @@ load_metadata() {
     path="$(meta_path "$category" "$name")"
     [[ -r "$path" ]] || die "Metadado não encontrado: $path"
 
-    # limpar variáveis anteriores
-    unset name category version release sources depends
-    unset build
+    # limpar variáveis anteriores do metadado
+    unset name category version release sources depends sha256sums
+    unset build upstream_latest_version
 
     # shellcheck source=/dev/null
     . "$path"
@@ -189,6 +190,7 @@ load_metadata() {
     META_RELEASE="${release:-1}"
     META_SOURCES=("${sources[@]:-}")
     META_DEPENDS=("${depends[@]:-}")
+    META_SHA256=("${sha256sums[@]:-}")
 
     [[ -n "$META_NAME" ]] || die "Metadado $path: variável 'name' vazia"
     [[ -n "$META_CATEGORY" ]] || die "Metadado $path: variável 'category' vazia"
@@ -269,6 +271,83 @@ fetch_one_source() {
     esac
 }
 
+########################################
+# VERIFICAÇÃO DE SHA256
+########################################
+
+expected_sha_for_cachefile() {
+    # Entrada: caminho completo do arquivo no cache
+    # Sai: imprime hash esperado (se existir) ou nada se não tiver
+    local cachefile="$1"
+    local base
+    base="$(basename "$cachefile")"
+
+    local entry key val
+    for entry in "${META_SHA256[@]:-}"; do
+        key="${entry%%=*}"
+        val="${entry#*=}"
+        if [[ "$key" == "$base" ]]; then
+            printf '%s\n' "$val"
+            return 0
+        fi
+    done
+    return 1
+}
+
+verify_sha256_for_all_sources() {
+    # Usa META_SOURCES e META_SHA256 (carregados por load_metadata)
+    # Verifica sha256 dos arquivos em PKG_CACHE_SOURCES, se houver hash definido.
+    ensure_dirs
+
+    # se não tiver sha256s, apenas avisa
+    if ((${#META_SHA256[@]:-0} == 0)); then
+        log "Nenhuma sha256 declarada em sha256sums para ${META_NAME:-desconhecido}; pulando verificação."
+        return 0
+    fi
+
+    # checa se sha256sum existe
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        die "sha256sum não encontrado no PATH; não posso verificar integridade dos sources."
+    fi
+
+    local src key cachefile expected actual
+    for src in "${META_SOURCES[@]:-}"; do
+        key="$(cache_key_for_source "$src")"
+        cachefile="$PKG_CACHE_SOURCES/$key"
+
+        if [[ ! -e "$cachefile" ]]; then
+            die "Arquivo de cache não encontrado para verificação: $cachefile"
+        fi
+
+        # nome real usado no hash é o basename (ex: glibc-2.42.tar.xz)
+        local base
+        base="$(basename "$cachefile")"
+
+        if ! expected="$(expected_sha_for_cachefile "$cachefile" || true)"; then
+            log "Sem sha256 configurado para $base; pulando verificação deste arquivo."
+            continue
+        fi
+
+        if (( DRY_RUN )); then
+            log "(dry-run) verificaria SHA256 de $base contra $expected"
+            continue
+        fi
+
+        actual="$(sha256sum "$cachefile" | awk '{print $1}')"
+
+        if [[ "$actual" != "$expected" ]]; then
+            log "FALHA DE SHA256 em $base"
+            log "  Esperado: $expected"
+            log "  Obtido : $actual"
+            # limpa do cache para não ser usado depois
+            rm -f "$cachefile"
+            die "Checksum incorreto para $base; arquivo removido do cache."
+        else
+            log "SHA256 OK para $base"
+        fi
+    done
+}
+
 fetch_sources() {
     local category="$1" name="$2"
     local src
@@ -281,7 +360,6 @@ fetch_sources() {
 
     log "Baixando fontes para $category/$name (paralelo: $PKG_FETCH_JOBS)..."
 
-    # Comando que será alimentado no xargs
     local tmp_list
     tmp_list="$(mktemp)"
     for src in "${META_SOURCES[@]}"; do
@@ -290,9 +368,7 @@ fetch_sources() {
         printf '%s\0%s\0' "$src" "$PKG_CACHE_SOURCES/$key" >> "$tmp_list"
     done
 
-    # xargs com 2 argumentos por vez: src e cachefile
     if (( DRY_RUN )); then
-        # em dry-run só mostra
         while IFS= read -r -d '' src && IFS= read -r -d '' cf; do
             log "(dry-run) iria baixar: $src -> $cf"
         done < "$tmp_list"
@@ -305,6 +381,9 @@ fetch_sources() {
     fi
 
     rm -f "$tmp_list"
+
+    # NOVO: verificar SHA256 de todos os sources, se sha256sums[] estiver definido no metadado
+    verify_sha256_for_all_sources
 }
 
 ########################################
