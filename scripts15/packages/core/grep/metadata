@@ -1,0 +1,102 @@
+# /usr/src/packages/core/grep/metadata
+
+name="grep"
+category="core"
+version="3.12"
+release="1"
+
+# Fonte oficial usada pelo LFS (Chapter 3 – All Packages)
+# grep-3.12.tar.xz em ftp.gnu.org 0
+sources=(
+  "https://ftp.gnu.org/gnu/grep/grep-${version}.tar.xz"
+)
+
+# Appendix C – Installation depends on (Grep) 1
+# Bash, Binutils, Coreutils, Diffutils, GCC, Gettext, Glibc, Grep,
+# Make, Patch, Pcre2, Sed, Texinfo
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gcc"
+  "gettext"
+  "glibc"
+  "grep"     # bootstrap / host
+  "make"
+  "patch"
+  "pcre2"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do grep-3.12.tar.xz
+# Confirmado por mirror com arquivo grep-3.12.tar.xz.sha256sum 2
+sha256sums=(
+  "https___ftp.gnu.org_gnu_grep_grep-3.12.tar.xz=2649b27c0e90e632eadcd757be06c6e9a4f48d941de51e7c0f83ff76408a07b9"
+)
+
+# Descobre versão mais nova no diretório oficial do GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/grep/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*grep-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Grep-3.12 (LFS r12.4-46, seção 8.35) 3
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório grep-3.12
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "grep-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório grep-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Patch do LFS: silenciar aviso de egrep/fgrep
+  #  sed -i "s/echo/#echo/" src/egrep.sh
+  ###################################
+  sed -i "s/echo/#echo/" src/egrep.sh
+
+  ###################################
+  # Configuração (igual ao livro)
+  #   ./configure --prefix=/usr
+  ###################################
+  ./configure --prefix=/usr
+
+  ###################################
+  # Compilação
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes
+  #   make check
+  # Aqui deixo opcional via RUN_TESTS, pra não travar empacotamento
+  # em ambiente de build sem intenção de rodar test-suite.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR (adaptação p/ pkg)
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
