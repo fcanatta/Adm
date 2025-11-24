@@ -1,0 +1,88 @@
+# /usr/src/packages/core/libxcrypt/metadata
+name="libxcrypt"
+category="core"
+version="4.5.1"
+release="1"
+
+sources=(
+  # LFS Chapter 3 – All Packages
+  # https://github.com/besser82/libxcrypt/releases/download/v4.5.1/libxcrypt-4.5.1.tar.xz
+  "https://github.com/besser82/libxcrypt/releases/download/v${version}/libxcrypt-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C – Libxcrypt)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "perl"
+  "sed"
+)
+
+sha256sums=(
+  # From upstream/Buildroot import of upstream .sha256sum
+  "libxcrypt-${version}.tar.xz=e9b46a62397c15372935f6a75dc3929c62161f2620be7b7f57f03d69102c1a86"
+)
+
+upstream_latest_version() {
+  # Pega a última versão estável a partir das releases do GitHub
+  local url="https://github.com/besser82/libxcrypt/releases"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*libxcrypt-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Libxcrypt-4.5.1 (LFS 8.28) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "libxcrypt-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório libxcrypt-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (LFS 8.28.1)
+  ###################################
+  ./configure --prefix=/usr                \
+              --enable-hashes=strong,glibc \
+              --enable-obsolete-api=no     \
+              --disable-static             \
+              --disable-failure-tokens
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (opcional, como no livro)
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check || return 1
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  # Nota do livro: se você precisar da ABI antiga libcrypt.so.1,
+  # tem que recompilar com --enable-obsolete-api=glibc manualmente.
+}
