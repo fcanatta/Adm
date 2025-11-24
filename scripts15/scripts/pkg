@@ -68,6 +68,59 @@ ensure_dirs() {
         "$PKG_CACHE_PACKAGES"
 }
 
+########################################
+# SYNC COM REPO GIT DE METADADOS
+########################################
+
+sync_metadata_repo() {
+    ensure_dirs
+
+    [[ -n "$PKG_META_REPO" ]] || die "PKG_META_REPO não definido em /etc/pkg.conf"
+
+    if [[ -d "$PKG_META_ROOT/.git" ]]; then
+        log "Metadados já são um repo git, fazendo pull de $PKG_META_REPO ($PKG_META_BRANCH)..."
+        if (( DRY_RUN )); then
+            log "(dry-run) git -C $PKG_META_ROOT pull origin $PKG_META_BRANCH"
+        else
+            git -C "$PKG_META_ROOT" pull --ff-only origin "$PKG_META_BRANCH"
+        fi
+    else
+        # se diretório existe e não é git, pode ser que tenha coisas dentro
+        if [[ -d "$PKG_META_ROOT" && "$(ls -A "$PKG_META_ROOT" 2>/dev/null)" != "" ]]; then
+            die "$PKG_META_ROOT não é repo git e não está vazio (não vou sobrescrever automaticamente)."
+        fi
+        if (( DRY_RUN )); then
+            log "(dry-run) git clone $PKG_META_REPO -b $PKG_META_BRANCH $PKG_META_ROOT"
+        else
+            run rm -rf "$PKG_META_ROOT"
+            run git clone "$PKG_META_REPO" -b "$PKG_META_BRANCH" "$PKG_META_ROOT"
+        fi
+    fi
+}
+
+# opcional: comando para commitar e dar push nas alterações locais
+sync_push_metadata_repo() {
+    ensure_dirs
+    [[ -d "$PKG_META_ROOT/.git" ]] || die "$PKG_META_ROOT não é um repo git."
+
+    if (( DRY_RUN )); then
+        log "(dry-run) iria rodar: git -C $PKG_META_ROOT add -A"
+        log "(dry-run) iria rodar: git -C $PKG_META_ROOT commit ..."
+        log "(dry-run) iria rodar: git -C $PKG_META_ROOT push origin $PKG_META_BRANCH"
+        return 0
+    fi
+
+    git -C "$PKG_META_ROOT" add -A
+    if ! git -C "$PKG_META_ROOT" diff --cached --quiet; then
+        log "Comitando alterações de metadados..."
+        git -C "$PKG_META_ROOT" commit -m "Update metadata $(date '+%F %T')" || true
+        log "Dando push para $PKG_META_REPO ($PKG_META_BRANCH)..."
+        git -C "$PKG_META_ROOT" push origin "$PKG_META_BRANCH"
+    else
+        log "Sem alterações em metadados para commitar."
+    fi
+}
+
 usage() {
     cat <<EOF
 Uso: pkg [--dry-run] <comando> [args]
@@ -704,33 +757,81 @@ get_latest_git_tag() {
     ( cd "$mirror" && git tag ) | sort -V | tail -n1
 }
 
+########################################
+# UPDATE (buscar versão nova no upstream)
+########################################
+
+find_git_source() {
+    local s
+    for s in "${META_SOURCES[@]}"; do
+        case "$s" in
+            git+*) echo "$s"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+get_latest_git_tag() {
+    local src="$1"
+    local url="${src#git+}"
+    local key
+    key="$(cache_key_for_source "$src")"
+    local mirror="$PKG_CACHE_SOURCES/$key"
+
+    ensure_dirs
+    if [[ ! -d "$mirror" ]]; then
+        log "Mirror git não encontrado, buscando..."
+        fetch_one_source "$src" "$mirror"
+    fi
+
+    ( cd "$mirror" && git fetch --tags >/dev/null 2>&1 || true )
+
+    # lista tags, ordena, pega a última
+    ( cd "$mirror" && git tag ) | sort -V | tail -n1
+}
+
 update_metadata_version() {
     local category="$1" name="$2"
     ensure_dirs
     load_metadata "$category" "$name"
 
-    local git_src
-    if ! git_src="$(find_git_source)"; then
-        die "Metadado $META_NAME não tem fonte git, update automático não suportado."
-    fi
-
-    local latest
-    latest="$(get_latest_git_tag "$git_src" || true)"
-    [[ -n "$latest" ]] || die "Nenhuma tag encontrada no repositório git."
-
-    # remover prefixo comum tipo v1.2.3
     local ver_cur="$META_VERSION"
-    local ver_new="$latest"
-    if [[ "$ver_new" == v* ]]; then
-        ver_new="${ver_new#v}"
+    local ver_new=""
+    local source_type=""
+
+    # 1) Se metadado define função upstream_latest_version(), ela manda
+    if declare -F upstream_latest_version >/dev/null 2>&1; then
+        log "Usando upstream_latest_version() do metadado para $META_NAME"
+        ver_new="$(upstream_latest_version || true)"
+        source_type="custom"
+    else
+        # 2) Caso contrário, se houver fonte git, usar tags
+        local git_src
+        if git_src="$(find_git_source)"; then
+            log "Usando tags git do upstream para detectar versão de $META_NAME"
+            local latest_tag
+            latest_tag="$(get_latest_git_tag "$git_src" || true)"
+            [[ -n "$latest_tag" ]] || die "Nenhuma tag encontrada no repositório git."
+
+            ver_new="$latest_tag"
+            # remover prefixo tipo v1.2.3
+            if [[ "$ver_new" == v* ]]; then
+                ver_new="${ver_new#v}"
+            fi
+            source_type="git"
+        else
+            die "Metadado não define upstream_latest_version() nem usa fonte git; update automático não é suportado para $META_NAME."
+        fi
     fi
+
+    [[ -n "$ver_new" ]] || die "upstream_latest_version() não retornou versão válida."
 
     if [[ "$ver_new" == "$ver_cur" ]]; then
-        log "Já está na versão mais recente (tag $latest)."
+        log "Já está na versão mais recente: $ver_cur (tipo=$source_type)."
         return 0
     fi
 
-    log "Atualizando versão em metadado: $ver_cur -> $ver_new (tag $latest)"
+    log "Atualizando versão em metadado: $ver_cur -> $ver_new (tipo=$source_type)"
 
     local path
     path="$(meta_path "$category" "$name")"
@@ -738,7 +839,6 @@ update_metadata_version() {
     if (( DRY_RUN )); then
         log "(dry-run) sed -i 's/^version=.*/version=\"$ver_new\"/' $path"
     else
-        # backup simples
         run cp "$path" "${path}.bak.$(date +%s)"
         run sed -i "s/^version=.*/version=\"$ver_new\"/" "$path"
     fi
@@ -831,6 +931,14 @@ main() {
             build_package "$1" "$2"
             package_built "$1" "$2"
             install_from_destdir "$1" "$2"
+            ;;
+        sync)
+            # sync pull metadados do git
+            sync_metadata_repo
+            ;;
+        sync-push)
+            # commita e faz push das mudanças de metadados
+            sync_push_metadata_repo
             ;;
         update)
             [[ $# -eq 2 ]] || die "Uso: pkg update <categoria> <nome>"
