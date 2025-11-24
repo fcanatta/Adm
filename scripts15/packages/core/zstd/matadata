@@ -1,0 +1,91 @@
+# /usr/src/packages/core/zstd/metadata
+
+name="zstd"
+category="core"
+version="1.5.7"
+release="1"
+
+# Fonte conforme LFS 12.4 (pacote oficial do livro)
+# Você pode usar qualquer mirror do LFS, este é o lfs-matrix:
+sources=(
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/zstd-${version}.tar.gz"
+)
+
+# Deixado em branco de propósito (sem verificação de hash).
+# Quando quiser ativar, é só colocar:
+# sha256sums=( "zstd-${version}.tar.gz=<hash-aqui>" )
+sha256sums=()
+
+# Dependências mínimas para compilar (todas já existem no LFS base)
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+)
+
+# (Opcional) Descobre a última versão estável no GitHub
+upstream_latest_version() {
+    local api="https://api.github.com/repos/facebook/zstd/releases/latest"
+    local json
+
+    if command -v curl >/dev/null 2>&1; then
+        json="$(curl -fsSL "$api")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        json="$(wget -qO- "$api")" || return 1
+    else
+        echo "Nem curl nem wget disponíveis para upstream_latest_version" >&2
+        return 1
+    fi
+
+    # Pega o tag_name (ex: v1.5.7), remove 'v' e imprime
+    printf '%s\n' "$json" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed 's/^v//' \
+        | head -n1
+}
+
+# Build real seguindo o LFS 12.4 (8.10 Zstd-1.5.7), adaptado para DESTDIR
+# Livro:
+#   make prefix=/usr
+#   make check
+#   make prefix=/usr install
+#   rm -v /usr/lib/libzstd.a
+build() {
+    # O teu pkg exporta DESTDIR antes de chamar build()
+    : "${DESTDIR:=/}"
+
+    local sdir
+
+    # Acha o diretório zstd-1.5.7 dentro do srcroot
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "zstd-${version}" | head -n1)"
+    if [ -z "$sdir" ]; then
+        echo "Diretório fonte zstd-${version} não encontrado" >&2
+        return 1
+    fi
+
+    cd "$sdir"
+
+    ########################################
+    # Compilação (LFS: make prefix=/usr)
+    ########################################
+    make prefix=/usr
+
+    ########################################
+    # Testes (LFS: make check)
+    ########################################
+    # No livro eles avisam que aparecem 'failed' no log, mas só 'FAIL' é erro real.
+    make check
+
+    ########################################
+    # Instalação em DESTDIR
+    # LFS: make prefix=/usr install
+    ########################################
+    make prefix=/usr DESTDIR="${DESTDIR}" install
+
+    ########################################
+    # Remover biblioteca estática
+    # LFS: rm -v /usr/lib/libzstd.a
+    ########################################
+    rm -v "${DESTDIR}/usr/lib/libzstd.a" || true
+}
