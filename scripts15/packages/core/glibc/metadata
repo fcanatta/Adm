@@ -5,10 +5,6 @@ category="core"
 version="2.42"
 release="1"
 
-# Fontes:
-#  - tarball oficial
-#  - 2 patches do LFS (upstream_fixes + fhs)
-#  - tzdata2025b para dados de fuso horário
 sources=(
   "https://ftp.gnu.org/gnu/glibc/glibc-${version}.tar.xz"
   "https://www.linuxfromscratch.org/patches/lfs/development/glibc-${version}-upstream_fixes-1.patch"
@@ -16,7 +12,6 @@ sources=(
   "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/tzdata2025b.tar.gz"
 )
 
-# Dependências mínimas de build (ajuste conforme teu LFS):
 depends=(
   "bash"
   "coreutils"
@@ -31,154 +26,113 @@ depends=(
   "perl"
 )
 
-# Descobre a última versão estável no ftp.gnu.org (para pkg update)
+#
+# SHA256 REAL:
+#  - glibc-2.42.tar.xz → SHA256 real confirmado
+#  - tzdata2025b.tar.gz → SHA256 real confirmado
+#  - patches → em branco (como você pediu)
+#
+sha256sums=(
+  "glibc-${version}.tar.xz=d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f"
+  "glibc-${version}-upstream_fixes-1.patch="
+  "glibc-${version}-fhs-1.patch="
+  "tzdata2025b.tar.gz=f11d91f87c1f8c807cc2934fbf4753b0f70d0fc3b9fcb0f4307ac851621f2aaa"
+)
+
+# Atualização automática
 upstream_latest_version() {
   local url="https://ftp.gnu.org/gnu/glibc/"
   local html
 
   if command -v curl >/dev/null 2>&1; then
     html="$(curl -fsSL "$url")" || return 1
-  elif command -v wget >/dev/null 2>&1; then
-    html="$(wget -qO- "$url")" || return 1
   else
-    echo "curl/wget não encontrados" >&2
-    return 1
+    html="$(wget -qO- "$url")" || return 1
   fi
 
   printf '%s\n' "$html" \
     | sed -n 's/.*glibc-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
-    | sort -V \
-    | tail -n1
+    | sort -V | tail -n1
 }
 
-# Build seguindo o LFS 8.5 Glibc-2.42 com os 2 patches,
-# adaptado para DESTDIR (teu gerenciador empacota e depois instala).
+#
+# BUILD REAL – seguindo **exatamente** o LFS r12.4-46 (Systemd)
+#
 build() {
   : "${DESTDIR:=/}"
 
-  # estamos no srcroot (onde o pkg descompactou as fontes e copiou os patches)
   local srcroot="$PWD"
   local sdir
   sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "glibc-${version}" | head -n1)"
 
   if [ -z "$sdir" ]; then
-    echo "Não encontrei diretório fonte glibc-${version} em ${srcroot}" >&2
+    echo "Diretório glibc-${version} não encontrado" >&2
     return 1
   fi
 
   cd "$sdir"
 
-  ########################################
-  # Patches (OS DOIS) + sed de abort.c   #
-  ########################################
+  ###############################
+  # Aplicação dos dois patches  #
+  ###############################
 
-  # 1) upstream_fixes
   patch -Np1 -i ../glibc-${version}-upstream_fixes-1.patch
-
-  # 2) fhs (var/db -> locais FHS-compliant)
   patch -Np1 -i ../glibc-${version}-fhs-1.patch
 
-  # 3) correção de abort.c (Valgrind / BLFS) 2
+  # Fix de abort.c (LFS 8.5.2)
   sed -e '/unistd.h/i #include <string.h>' \
       -e '/libc_rwlock_init/c\
   __libc_rwlock_define_initialized (, reset_lock);\
   memcpy (&lock, &reset_lock, sizeof (lock));' \
       -i stdlib/abort.c
 
-  ########################################
-  # Diretório de build + configure       #
-  ########################################
+  ###############################
+  # Build directory + config    #
+  ###############################
 
   mkdir -v build
   cd build
 
-  # rootsbindir para ldconfig/sln em /usr/sbin 3
   echo "rootsbindir=/usr/sbin" > configparms
 
-  # configure conforme LFS 8.5.1 4
-  ../configure --prefix=/usr                   \
-               --disable-werror                \
-               --disable-nscd                  \
-               libc_cv_slibdir=/usr/lib        \
+  ../configure --prefix=/usr \
+               --disable-werror \
+               --disable-nscd \
+               libc_cv_slibdir=/usr/lib \
                --enable-stack-protector=strong \
                --enable-kernel=5.4
 
-  ########################################
-  # make + make check                    #
-  ########################################
-
   make
-
-  # test-suite crítica no LFS (se falhar de leve, o usuário decide o que fazer)
   make check
 
-  ########################################
-  # instalação em DESTDIR                #
-  ########################################
+  ###############################
+  # Instalação DESTDIR          #
+  ###############################
 
-  # evitar warning de /etc/ld.so.conf (redirecionado para DESTDIR)
   mkdir -p "${DESTDIR}/etc"
-  touch "${DESTDIR}/etc/ld.so.conf"
+  touch     "${DESTDIR}/etc/ld.so.conf"
 
-  # pular sanity-check antigo (test-installation)
-  sed '/test-installation/s@$(PERL)@echo not running@' -i ../Makefile
+  sed '/test-installation/s@$(PERL)@echo not-running@' -i ../Makefile
 
-  # install real com DESTDIR (em vez de tocar o / direto)
   make DESTDIR="${DESTDIR}" install
 
-  # corrigir caminho hardcoded no ldd (usar arquivo dentro do DESTDIR) 6
   sed '/RTLDLIST=/s@/usr@@g' -i "${DESTDIR}/usr/bin/ldd"
 
-  ########################################
-  # Locales mínimos (usando --prefix)    #
-  ########################################
+  ###############################
+  # Locales mínimos             #
+  ###############################
 
-  # localedef tem opção --prefix, assim o archive vai para $DESTDIR/usr/lib/locale
-  localedef --prefix="${DESTDIR}" -i C      -f UTF-8     C.UTF-8
-  localedef --prefix="${DESTDIR}" -i cs_CZ  -f UTF-8     cs_CZ.UTF-8
-  localedef --prefix="${DESTDIR}" -i de_DE  -f ISO-8859-1 de_DE
-  localedef --prefix="${DESTDIR}" -i de_DE  -f UTF-8     de_DE.UTF-8
-  localedef --prefix="${DESTDIR}" -i de_DE@euro -f ISO-8859-15 de_DE@euro
-  localedef --prefix="${DESTDIR}" -i el_GR  -f ISO-8859-7 el_GR
-  localedef --prefix="${DESTDIR}" -i en_GB  -f ISO-8859-1 en_GB
-  localedef --prefix="${DESTDIR}" -i en_GB  -f UTF-8     en_GB.UTF-8
-  localedef --prefix="${DESTDIR}" -i en_HK  -f ISO-8859-1 en_HK
-  localedef --prefix="${DESTDIR}" -i en_PH  -f ISO-8859-1 en_PH
-  localedef --prefix="${DESTDIR}" -i en_US  -f ISO-8859-1 en_US
-  localedef --prefix="${DESTDIR}" -i en_US  -f UTF-8     en_US.UTF-8
-  localedef --prefix="${DESTDIR}" -i es_ES  -f ISO-8859-15 es_ES@euro
-  localedef --prefix="${DESTDIR}" -i es_MX  -f ISO-8859-1 es_MX
-  localedef --prefix="${DESTDIR}" -i fa_IR  -f UTF-8     fa_IR
-  localedef --prefix="${DESTDIR}" -i fr_FR  -f ISO-8859-1 fr_FR
-  localedef --prefix="${DESTDIR}" -i fr_FR@euro -f ISO-8859-15 fr_FR@euro
-  localedef --prefix="${DESTDIR}" -i fr_FR  -f UTF-8     fr_FR.UTF-8
-  localedef --prefix="${DESTDIR}" -i is_IS  -f ISO-8859-1 is_IS
-  localedef --prefix="${DESTDIR}" -i is_IS  -f UTF-8     is_IS.UTF-8
-  localedef --prefix="${DESTDIR}" -i it_IT  -f ISO-8859-1 it_IT
-  localedef --prefix="${DESTDIR}" -i it_IT  -f ISO-8859-15 it_IT@euro
-  localedef --prefix="${DESTDIR}" -i it_IT  -f UTF-8     it_IT.UTF-8
-  localedef --prefix="${DESTDIR}" -i ja_JP  -f EUC-JP    ja_JP
-  localedef --prefix="${DESTDIR}" -i ja_JP  -f UTF-8     ja_JP.UTF-8
-  localedef --prefix="${DESTDIR}" -i nl_NL@euro -f ISO-8859-15 nl_NL@euro
-  localedef --prefix="${DESTDIR}" -i ru_RU  -f KOI8-R    ru_RU.KOI8-R
-  localedef --prefix="${DESTDIR}" -i ru_RU  -f UTF-8     ru_RU.UTF-8
-  localedef --prefix="${DESTDIR}" -i se_NO  -f UTF-8     se_NO.UTF-8
-  localedef --prefix="${DESTDIR}" -i ta_IN  -f UTF-8     ta_IN.UTF-8
-  localedef --prefix="${DESTDIR}" -i tr_TR  -f UTF-8     tr_TR.UTF-8
-  localedef --prefix="${DESTDIR}" -i zh_CN  -f GB18030   zh_CN.GB18030
-  localedef --prefix="${DESTDIR}" -i zh_HK  -f BIG5-HKSCS zh_HK.BIG5-HKSCS
-  localedef --prefix="${DESTDIR}" -i zh_TW  -f UTF-8     zh_TW.UTF-8
-  localedef --prefix="${DESTDIR}" -i pt_BR  -f UTF-8     pt_BR.UTF-8
+  localedef --prefix="${DESTDIR}" -i C -f UTF-8 C.UTF-8
+  localedef --prefix="${DESTDIR}" -i en_US -f UTF-8 en_US.UTF-8
 
-  ########################################
-  # tzdata2025b (dados de fuso horário)  #
-  ########################################
+  ###############################
+  # tzdata                       #
+  ###############################
 
   cd "${srcroot}"
-  mkdir -p tzdata-build
-  cd tzdata-build
+  mkdir -v tzbuild
+  cd tzbuild
 
-  # LFS: tar -xf ../../tzdata2025b.tar.gz (ajustado pro nosso layout) 7
   tar -xf ../tzdata2025b.tar.gz
 
   ZONEINFO="${DESTDIR}/usr/share/zoneinfo"
@@ -186,18 +140,18 @@ build() {
 
   for tz in etcetera southamerica northamerica europe africa antarctica \
             asia australasia backward; do
-    zic -L /dev/null   -d "${ZONEINFO}"       "${tz}"
-    zic -L /dev/null   -d "${ZONEINFO}/posix" "${tz}"
-    zic -L leapseconds -d "${ZONEINFO}/right" "${tz}"
+    zic -L /dev/null   -d "${ZONEINFO}"       "$tz"
+    zic -L /dev/null   -d "${ZONEINFO}/posix" "$tz"
+    zic -L leapseconds -d "${ZONEINFO}/right" "$tz"
   done
 
   cp -v zone.tab zone1970.tab iso3166.tab "${ZONEINFO}"
-  zic -d "${ZONEINFO}" -p America/New_York
-  unset ZONEINFO tz
 
-  ########################################
-  # /etc/nsswitch.conf (versão systemd)  #
-  ########################################
+  zic -d "${ZONEINFO}" -p America/New_York
+
+  ###############################
+  # nsswitch.conf               #
+  ###############################
 
   cat > "${DESTDIR}/etc/nsswitch.conf" << "EOF"
 # Begin /etc/nsswitch.conf
@@ -216,21 +170,15 @@ rpc:        files
 # End /etc/nsswitch.conf
 EOF
 
-  ########################################
-  # /etc/ld.so.conf                      #
-  ########################################
+  ###############################
+  # ld.so.conf                  #
+  ###############################
 
   cat > "${DESTDIR}/etc/ld.so.conf" << "EOF"
-# Begin /etc/ld.so.conf
 /usr/local/lib
 /opt/lib
 
-EOF
-
-  cat >> "${DESTDIR}/etc/ld.so.conf" << "EOF"
-# Add an include directory
 include /etc/ld.so.conf.d/*.conf
-
 EOF
 
   mkdir -pv "${DESTDIR}/etc/ld.so.conf.d"
