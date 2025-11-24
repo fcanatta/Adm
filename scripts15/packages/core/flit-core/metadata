@@ -1,0 +1,97 @@
+# /usr/src/packages/core/flit-core/metadata
+
+name="flit-core"
+category="core"
+version="3.12.0"
+release="1"
+
+# Fonte oficial (sdist do PyPI)
+# Mesmo tarball usado por distros (Slackware, openSUSE, etc.)
+sources=(
+  "https://files.pythonhosted.org/packages/69/59/b6fc2188dfc7ea4f936cd12b49d707f66a1cb7a1d2c16172963534db741b/flit_core-${version}.tar.gz"
+)
+
+# Appendix C – Flit-Core:
+#   Installation depends on: Python
+depends=(
+  "python"
+)
+
+# SHA256 real do flit_core-3.12.0.tar.gz (PyPI)
+sha256sums=(
+  "https___files.pythonhosted.org_packages_69_59_b6fc2188dfc7ea4f936cd12b49d707f66a1cb7a1d2c16172963534db741b_flit_core-3.12.0.tar.gz=18f63100d6f94385c6ed57a72073443e1a71a4acb4339491615d0f16d6ff01b2"
+)
+
+# Descobre versão mais nova do flit-core no PyPI
+upstream_latest_version() {
+  local url="https://pypi.org/project/flit-core/#files"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  # Extrai versões de "flit_core-x.y.z.tar.gz"
+  printf '%s\n' "$html" \
+    | sed -n 's/.*flit_core-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Flit-Core-3.12.0 (LFS r12.4-46, seção 8.54)
+# Livro faz:
+#   pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps $PWD
+#   pip3 install --no-index --find-links dist flit_core
+#
+# Aqui adaptei para DESTDIR para empacotamento limpo.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Descobrir python/pip
+  local pybin pipcmd
+  if command -v python3 >/dev/null 2>&1; then
+    pybin="python3"
+  else
+    pybin="python"
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    pipcmd="pip3"
+  else
+    pipcmd="$pybin -m pip"
+  fi
+
+  # Diretório do sdist (flit_core-3.12.0)
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "flit_core-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório flit_core-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Build da wheel (igual ao LFS)
+  ###################################
+  $pipcmd wheel -w dist \
+    --no-cache-dir \
+    --no-build-isolation \
+    --no-deps \
+    "$PWD"
+
+  ###################################
+  # Instalação via pip, mas dentro de DESTDIR
+  #
+  # Usamos:
+  #   --prefix=/usr  -> layout de sistema
+  #   --root=DESTDIR -> redireciona para árvore de staging
+  ###################################
+  $pipcmd install \
+    --no-index \
+    --find-links dist \
+    flit_core \
+    --prefix=/usr \
+    --root="${DESTDIR}"
+}
