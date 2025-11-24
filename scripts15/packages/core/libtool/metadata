@@ -1,0 +1,99 @@
+# /usr/src/packages/core/libtool/metadata
+
+name="libtool"
+category="core"
+version="2.5.4"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46 (Chapter 3 – All Packages)
+# Download: https://ftp.gnu.org/gnu/libtool/libtool-2.5.4.tar.xz 0
+sources=(
+  "https://ftp.gnu.org/gnu/libtool/libtool-${version}.tar.xz"
+)
+
+# Appendix C – Libtool (Installation depends on) 1
+#   Bash, Binutils, Coreutils, Diffutils, Gawk, GCC, Glibc, Grep, Make, Sed, Texinfo
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do libtool-2.5.4.tar.xz
+# Confirmado por Fossies e FreeBSD ports (distinfo) para o mesmo tarball. 2
+sha256sums=(
+  "https___ftp.gnu.org_gnu_libtool_libtool-2.5.4.tar.xz=f81f5860666b0bc7d84baddefa60d1cb9fa6fceb2398cc3baca6afaa60266675"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/libtool/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*libtool-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Libtool-2.5.4 (LFS r12.4-46, seção 8.38) 3
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório libtool-2.5.4
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "libtool-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório libtool-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  #   ./configure --prefix=/usr
+  ###################################
+  ./configure --prefix=/usr
+
+  ###################################
+  # Compilação
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes – LFS: make check
+  # Aqui deixo opcional pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  ###################################
+  # Passo extra do LFS:
+  #   rm -fv /usr/lib/libltdl.a
+  #
+  # Adaptado para DESTDIR pra não sujar o host.
+  ###################################
+  rm -fv "${DESTDIR}/usr/lib/libltdl.a" || true
+}
