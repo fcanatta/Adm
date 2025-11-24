@@ -8,61 +8,61 @@ release="1"
 # Fonte oficial para esta versão
 # (o esquema de data facilita o update futuro com upstream_latest_version)
 sources=(
-  "https://github.com/Mic92/iana-etc/releases/download/${version}/iana-etc-${version}.tar.gz"
+    "https://github.com/Mic92/iana-etc/releases/download/${version}/iana-etc-${version}.tar.gz"
 )
 
 # Dependências mínimas:
-#  - bash: shell para o build()
-#  - coreutils: cp, mkdir, etc.
+# - bash: shell para o build()
+# - coreutils: cp, mkdir, etc.
 depends=(
-  "bash"
-  "coreutils"
+    "bash"
+    "coreutils"
 )
 
 # (Opcional) Descobrir versão mais nova no upstream para 'pkg update'
 # Usa a API de releases do GitHub e pega o tag_name, que é um número tipo 20251022
 upstream_latest_version() {
-  local api="https://api.github.com/repos/Mic92/iana-etc/releases/latest"
-  local json
+    local api="https://api.github.com/repos/Mic92/iana-etc/releases/latest"
+    local json
 
-  if command -v curl >/dev/null 2>&1; then
-    json="$(curl -fsSL "$api")" || return 1
-  elif command -v wget >/dev/null 2>&1; then
-    json="$(wget -qO- "$api")" || return 1
-  else
-    echo "curl/wget não encontrados" >&2
-    return 1
-  fi
+    if command -v curl >/dev/null 2>&1; then
+        json="$(curl -fsSL "$api")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        json="$(wget -qO- "$api")" || return 1
+    else
+        echo "curl/wget não encontrados" >&2
+        return 1
+    fi
 
-  # Extrai o tag_name, remove aspas e qualquer prefixo não numérico
-  printf '%s\n' "$json" \
-    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    | sed 's/^[^0-9]*//' \
-    | head -n1
+    # Extrai o tag_name, remove aspas e qualquer prefixo não numérico
+    printf '%s\n' "$json" \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+        | sed 's/^[^0-9]*//' \
+        | head -n1
 }
 
 # Build seguindo exatamente o LFS:
 #   cp services protocols /etc
 # Adaptado para DESTDIR para funcionar com o seu gerenciador (pkg).
 build() {
-  # DESTDIR é injetado pelo gerenciador; se não vier, instala em /
-  : "${DESTDIR:=/}"
+    # DESTDIR é injetado pelo gerenciador; se não vier, instala em /
+    : "${DESTDIR:=/}"
 
-  # Encontrar diretório extraído: iana-etc-${version}
-  local sdir
-  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "iana-etc-${version}" | head -n1)"
+    # Encontrar diretório extraído: iana-etc-${version}
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "iana-etc-${version}" | head -n1)"
 
-  if [ -z "$sdir" ]; then
-    echo "Não encontrei diretório fonte iana-etc-${version}" >&2
-    return 1
-  fi
+    if [ -z "$sdir" ]; then
+        echo "Não encontrei diretório fonte iana-etc-${version}" >&2
+        return 1
+    fi
 
-  cd "$sdir"
+    cd "$sdir"
 
-  # Garantir /etc dentro do DESTDIR
-  mkdir -p "${DESTDIR}/etc"
+    # Garantir /etc dentro do DESTDIR
+    mkdir -p "${DESTDIR}/etc"
 
-  # Comando do livro, mas apontando para o DESTDIR:
-  #   cp services protocols /etc
-  cp -v services protocols "${DESTDIR}/etc"
+    # Comando do livro, mas apontando para o DESTDIR:
+    # cp services protocols /etc
+    cp -v services protocols "${DESTDIR}/etc"
 }
