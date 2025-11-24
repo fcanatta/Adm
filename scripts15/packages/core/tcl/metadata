@@ -1,0 +1,110 @@
+# /usr/src/packages/core/tcl/metadata
+
+name="tcl"
+category="core"
+version="8.6.17"
+release="1"
+
+sources=(
+    "https://downloads.sourceforge.net/tcl/tcl${version}-src.tar.gz"
+    "https://downloads.sourceforge.net/tcl/tcl${version}-html.tar.gz"
+)
+
+sha256sums=()
+
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+    "zlib"
+)
+
+upstream_latest_version() {
+    local url="https://downloads.sourceforge.net/project/tcl/Tcl/"
+    local html
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "curl/wget não encontrados" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*Tcl\/\([0-9][0-9.]*\)\/.*/\1/p' \
+        | sort -V | tail -n1
+}
+
+# LFS ml-12.4:
+#   SRCDIR=$(pwd); cd unix
+#   ./configure --prefix=/usr --mandir=/usr/share/man --disable-rpath
+#   make
+#   sed ... tclConfig.sh, tdbc, itcl
+#   make test
+#   make install
+#   chmod 644 /usr/lib/libtclstub8.6.a
+#   chmod -v u+w /usr/lib/libtcl8.6.so
+#   make install-private-headers
+#   ln -sfv tclsh8.6 /usr/bin/tclsh
+#   mv /usr/share/man/man3/{Thread,Tcl_Thread}.3
+#   docs: tar -xf ../tcl8.6.17-html.tar.gz ...
+build() {
+    : "${DESTDIR:=/}"
+
+    local top sdir
+    top="$PWD"
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "tcl${version}" -o -name "tcl8.6.17" | head -n1)"
+    [ -z "$sdir" ] && { echo "Diretório tcl${version} não encontrado" >&2; return 1; }
+
+    cd "$sdir"
+
+    SRCDIR="$(pwd)"
+    cd unix
+
+    ./configure --prefix=/usr           \
+                --mandir=/usr/share/man \
+                --disable-rpath
+
+    make
+
+    sed -e "s|$SRCDIR/unix|/usr/lib|" \
+        -e "s|$SRCDIR|/usr/include|"  \
+        -i tclConfig.sh
+
+    sed -e "s|$SRCDIR/unix/pkgs/tdbc1.1.12|/usr/lib/tdbc1.1.12|" \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12/generic|/usr/include|"     \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12/library|/usr/lib/tcl8.6|"  \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12|/usr/include|"             \
+        -i pkgs/tdbc1.1.12/tdbcConfig.sh
+
+    sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.4|/usr/lib/itcl4.3.4|" \
+        -e "s|$SRCDIR/pkgs/itcl4.3.4/generic|/usr/include|"    \
+        -e "s|$SRCDIR/pkgs/itcl4.3.4|/usr/include|"            \
+        -i pkgs/itcl4.3.4/itclConfig.sh
+
+    unset SRCDIR
+
+    LC_ALL=C.UTF-8 make test
+
+    make DESTDIR="${DESTDIR}" install
+
+    chmod 644 "${DESTDIR}/usr/lib/libtclstub8.6.a" || true
+    chmod -v u+w "${DESTDIR}/usr/lib/libtcl8.6.so" || true
+
+    make DESTDIR="${DESTDIR}" install-private-headers
+
+    ln -sfv tclsh8.6 "${DESTDIR}/usr/bin/tclsh"
+
+    if [ -e "${DESTDIR}/usr/share/man/man3/Thread.3" ]; then
+        mv "${DESTDIR}/usr/share/man/man3/Thread.3" \
+           "${DESTDIR}/usr/share/man/man3/Tcl_Thread.3"
+    fi
+
+    # Documentação HTML
+    cd ..
+    tar -xf "../tcl${version}-html.tar.gz" --strip-components=1
+    mkdir -p "${DESTDIR}/usr/share/doc/tcl-${version}"
+    cp -v -r ./html/* "${DESTDIR}/usr/share/doc/tcl-${version}"
+}
