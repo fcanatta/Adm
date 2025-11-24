@@ -1,0 +1,85 @@
+# /usr/src/packages/core/psmisc/metadata
+
+name="psmisc"
+category="core"
+version="23.7"
+release="1"
+
+# Fonte oficial usada pelo LFS (Chapter 3 – All Packages)
+sources=(
+  "https://sourceforge.net/projects/psmisc/files/psmisc/psmisc-${version}.tar.xz"
+)
+
+# Appendix C – Installation depends on:
+# Bash, Binutils, Coreutils, GCC, Gettext, Glibc, Grep, Make, Ncurses, and Sed 0
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "gettext"
+  "glibc"
+  "grep"
+  "make"
+  "ncurses"
+  "sed"
+)
+
+# SHA256 real do psmisc-23.7.tar.xz
+# Confirmado em distros (Ubuntu/Guix) para psmisc_23.7.orig.tar.xz, que é o mesmo tarball. 1
+sha256sums=(
+  "https___sourceforge.net_projects_psmisc_files_psmisc_psmisc-23.7.tar.xz=58c55d9c1402474065adae669511c191de374b0871eec781239ab400b907c327"
+)
+
+# Descobre versão mais nova em SourceForge
+upstream_latest_version() {
+  local url="https://sourceforge.net/projects/psmisc/files/psmisc/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*psmisc-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Psmisc-23.7 (LFS 8.34) 2
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório psmisc-23.7
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "psmisc-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório psmisc-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao LFS)
+  ###################################
+  ./configure --prefix=/usr
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (opcional – LFS mostra 'make check')
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
