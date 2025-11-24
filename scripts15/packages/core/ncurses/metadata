@@ -1,0 +1,115 @@
+# /usr/src/packages/core/ncurses/metadata
+name="ncurses"
+category="core"
+version="6.5-20250809"
+release="1"
+
+sources=(
+  # LFS Chapter 3 – All Packages / anúncio oficial
+  # https://invisible-mirror.net/archives/ncurses/current/ncurses-6.5-20250809.tgz
+  "https://invisible-mirror.net/archives/ncurses/current/ncurses-${version}.tgz"
+)
+
+# Dependências reais (Installation depends on, Appendix C – Ncurses)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "patch"
+  "sed"
+)
+
+sha256sums=(
+  # sha256 do tarball (gsrc / mirrors GNU)
+  "ncurses-${version}.tgz=3b27ad1a570f9fba71690b8ea7988ffa392b135b2f2bf383c3661eb3b7db1d0e"
+)
+
+upstream_latest_version() {
+  # Último snapshot "current" com data (6.x-yyyyMMDD)
+  local url="https://invisible-mirror.net/archives/ncurses/current/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*ncurses-\([0-9][0-9.]*-[0-9]\{8\}\)\.tgz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Ncurses-6.5-20250809 (LFS 8.31) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "ncurses-6.5-20250809" -o -name "ncurses-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório ncurses-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (LFS 8.31.1)
+  ###################################
+  ./configure --prefix=/usr           \
+              --mandir=/usr/share/man \
+              --with-shared           \
+              --without-debug         \
+              --without-normal        \
+              --with-cxx-shared       \
+              --enable-pc-files       \
+              --with-pkg-config-libdir=/usr/lib/pkgconfig
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Instalação staged + cópia (como no livro)
+  ###################################
+  rm -rf dest
+  make DESTDIR="$PWD/dest" install
+
+  # Forçar uso da ABI wide-char em curses.h (igual ao capítulo 8)
+  sed -e 's/^#if.*XOPEN.*$/#if 1/' \
+      -i dest/usr/include/curses.h
+
+  # Copiar para o DESTDIR real
+  cp --remove-destination -av dest/* "${DESTDIR}/"
+
+  ###################################
+  # Symlinks de compatibilidade (wide -> non-wide)
+  ###################################
+  (
+    cd "${DESTDIR}/usr/lib" || exit 0
+    for lib in ncurses form panel menu ; do
+      ln -sfv "lib${lib}w.so" "lib${lib}.so"
+    done
+  )
+
+  (
+    cd "${DESTDIR}/usr/lib/pkgconfig" || exit 0
+    for lib in ncurses form panel menu ; do
+      ln -sfv "${lib}w.pc" "${lib}.pc"
+    done
+  )
+
+  # Compatibilidade com -lcurses
+  ln -sfv libncursesw.so "${DESTDIR}/usr/lib/libcurses.so"
+
+  ###################################
+  # Documentação (opcional, mas igual ao livro)
+  ###################################
+  mkdir -p "${DESTDIR}/usr/share/doc"
+  cp -v -R doc -T "${DESTDIR}/usr/share/doc/ncurses-${version}"
+}
