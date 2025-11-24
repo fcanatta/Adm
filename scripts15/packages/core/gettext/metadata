@@ -1,0 +1,86 @@
+# /usr/src/packages/core/gettext/metadata
+
+name="gettext"
+category="core"
+version="0.26"
+release="1"
+
+# Fonte oficial do GNU Gettext
+sources=(
+  "https://ftp.gnu.org/gnu/gettext/gettext-${version}.tar.xz"
+)
+
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "gettext"    # talvez exigido para bootstrap
+  "glibc"
+  "grep"
+  "m4"
+  "make"
+  "perl"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do gettext-0.26.tar.xz
+sha256sums=(
+  "https___ftp.gnu.org_gnu_gettext_gettext-0.26.tar.xz=d1fb86e260cfe7da6031f94d2e44c0da55903dbae0a2fa0fae78c91ae1b56f00"
+)
+
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/gettext/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*gettext-\([0-9][0-9.]*\)\.tar\.\(xz\|gz\).*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Gettext-0.26 (LFS 8.33)  
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "gettext-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório gettext-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração 
+  ###################################
+  ./configure --prefix=/usr             \
+              --disable-static          \
+              --docdir=/usr/share/doc/gettext-${version}
+
+  #####################################################
+  # Compilação
+  #####################################################
+  make
+
+  ###################################
+  # Checking
+  ###################################
+  make check
+
+  ###################################
+  # Instalação 
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  ###################################
+  # Configuração pós install
+  ###################################
+  chmod -v 0755 "${DESTDIR}/usr/lib/preloadable_libintl.so"
+}
