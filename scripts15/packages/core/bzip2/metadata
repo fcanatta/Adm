@@ -1,0 +1,114 @@
+# /usr/src/packages/core/bzip2/metadata
+
+name="bzip2"
+category="core"
+version="1.0.8"
+release="1"
+
+# Fonte oficial + patch de documentação do LFS
+sources=(
+  "https://www.sourceware.org/pub/bzip2/bzip2-${version}.tar.gz"
+  "https://www.linuxfromscratch.org/patches/lfs/development/bzip2-${version}-install_docs-1.patch"
+)
+
+depends=(
+  "bash"
+  "gcc"
+  "make"
+  "coreutils"
+  "sed"
+  "patch"
+)
+
+# SHA256 real do tarball (patch deixei sem hash, se quiser depois preenche)
+sha256sums=(
+  "bzip2-${version}.tar.gz=ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
+  "bzip2-${version}-install_docs-1.patch="
+)
+
+# Detecta versão mais nova no diretório oficial
+upstream_latest_version() {
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "https://www.sourceware.org/pub/bzip2/")" || return 1
+  else
+    html="$(wget -qO- "https://www.sourceware.org/pub/bzip2/")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*bzip2-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+build() {
+  : "${DESTDIR:=/}"
+
+  # achar diretório bzip2-1.0.8
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "bzip2-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório bzip2-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ########################################
+  # PATCH + SED (igual LFS)
+  ########################################
+
+  # O patch vem como segundo "source". O nome real no srcroot pode ser
+  # bzip2-1.0.8-install_docs-1.patch ou um nome sanetizado da URL.
+  local patchfile="../bzip2-${version}-install_docs-1.patch"
+  if [ ! -f "$patchfile" ]; then
+    # tenta achar qualquer arquivo com esse nome na pasta de cima
+    patchfile="$(ls ../*bzip2-${version}-install_docs-1.patch* 2>/dev/null | head -n1 || true)"
+  fi
+
+  if [ -n "$patchfile" ] && [ -f "$patchfile" ]; then
+    patch -Np1 -i "$patchfile"
+  else
+    echo "AVISO: patch bzip2-${version}-install_docs-1.patch não encontrado; seguindo sem aplicar." >&2
+  fi
+
+  # links simbólicos relativos
+  sed -i 's@\(ln -s -f \)$(PREFIX)/bin/@\1@' Makefile
+
+  # man pages em /usr/share/man
+  sed -i "s@(PREFIX)/man@(PREFIX)/share/man@g" Makefile
+
+  ########################################
+  # COMPILAÇÃO (igual LFS)
+  ########################################
+
+  make -f Makefile-libbz2_so
+  make clean
+  make
+
+  ########################################
+  # INSTALAÇÃO EM DESTDIR
+  ########################################
+
+  # make PREFIX=/usr install
+  make PREFIX=/usr DESTDIR="${DESTDIR}" install
+
+  mkdir -p "${DESTDIR}/usr/lib" "${DESTDIR}/usr/bin"
+
+  # cp -av libbz2.so.* /usr/lib
+  cp -av libbz2.so.* "${DESTDIR}/usr/lib/"
+
+  # ln -sv libbz2.so.1.0.8 /usr/lib/libbz2.so
+  ln -sfv libbz2.so.1.0.8 "${DESTDIR}/usr/lib/libbz2.so"
+
+  # cp -v bzip2-shared /usr/bin/bzip2
+  cp -v bzip2-shared "${DESTDIR}/usr/bin/bzip2"
+
+  # for i in /usr/bin/{bzcat,bunzip2}; do ln -sfv bzip2 $i; done
+  for i in "${DESTDIR}"/usr/bin/{bzcat,bunzip2}; do
+    ln -sfv bzip2 "$i"
+  done
+
+  # rm -fv /usr/lib/libbz2.a
+  rm -fv "${DESTDIR}/usr/lib/libbz2.a"
+}
