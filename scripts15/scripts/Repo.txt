@@ -1,0 +1,36 @@
+# /etc/pkg.conf
+
+# Repositório git onde ficam os metadados /usr/src/packages
+PKG_META_REPO="git@github.com:SEU-USUARIO/seu-repo-metadados.git"
+
+# Branch padrão
+PKG_META_BRANCH="main"
+
+# Para configurar no pkg se quiser
+set -Eeuo pipefail
+
+########################################
+# CONFIGURAÇÃO
+########################################
+
+PKG_META_ROOT="/usr/src/packages"          # metadados
+PKG_ROOT="/var/lib/pkg"                    # banco de dados
+PKG_DB="$PKG_ROOT/db"
+PKG_LOG_DIR="$PKG_ROOT/logs"
+PKG_CACHE_ROOT="/var/cache/pkg"
+PKG_CACHE_SOURCES="$PKG_CACHE_ROOT/sources"
+PKG_CACHE_BUILDS="$PKG_CACHE_ROOT/builds"
+PKG_CACHE_PACKAGES="$PKG_CACHE_ROOT/packages"
+
+PKG_FETCH_JOBS="${PKG_FETCH_JOBS:-4}"      # downloads paralelos
+DRY_RUN=0
+
+# Config extra lida de /etc/pkg.conf (se existir)
+PKG_META_REPO=""
+PKG_META_BRANCH="main"
+
+if [[ -r /etc/pkg.conf ]]; then
+    # shellcheck source=/etc/pkg.conf
+    . /etc/pkg.conf
+fi
+
