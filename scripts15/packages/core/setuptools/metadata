@@ -1,0 +1,93 @@
+# /usr/src/packages/core/setuptools/metadata
+
+name="setuptools"
+category="core"
+version="80.9.0"
+release="1"
+
+# Fonte oficial usada pelo LFS 12.4 (All Packages / capítulo do Setuptools)
+sources=(
+  "https://pypi.org/packages/source/s/setuptools/setuptools-${version}.tar.gz"
+)
+
+# Appendix C – Setuptools:
+#   Installation depends on: Python and Wheel
+depends=(
+  "python"
+  "wheel"
+)
+
+# SHA256 real do setuptools-80.9.0.tar.gz (PyPI)
+sha256sums=(
+  "https___pypi.org_packages_source_s_setuptools_setuptools-80.9.0.tar.gz=f36b47402ecde768dbfafc46e8e4207b4360c654f1f3bb84475f0a28628fb19c"
+)
+
+# Descobre versão mais nova do setuptools no PyPI
+upstream_latest_version() {
+  local url="https://pypi.org/project/setuptools/#files"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*setuptools-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Setuptools-80.9.0 (LFS 12.4, seção 8.55)
+# Livro:
+#   pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps $PWD
+#   pip3 install --no-index --find-links dist setuptools
+# Aqui adaptado para DESTDIR/prefix para empacotamento limpo.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Detecta python/pip
+  local pybin pipcmd
+  if command -v python3 >/dev/null 2>&1; then
+    pybin="python3"
+  else
+    pybin="python"
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    pipcmd="pip3"
+  else
+    pipcmd="$pybin -m pip"
+  fi
+
+  # Diretório do sdist: setuptools-80.9.0
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "setuptools-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório setuptools-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Build da wheel – igual ao LFS
+  ###################################
+  "$pipcmd" wheel -w dist \
+    --no-cache-dir \
+    --no-build-isolation \
+    --no-deps \
+    "$PWD"
+
+  ###################################
+  # Instalação via pip dentro de DESTDIR
+  #   --prefix=/usr  -> layout de sistema
+  #   --root=DESTDIR -> árvore de staging do pacote
+  ###################################
+  "$pipcmd" install \
+    --no-index \
+    --find-links dist \
+    setuptools \
+    --prefix=/usr \
+    --root="${DESTDIR}"
+}
