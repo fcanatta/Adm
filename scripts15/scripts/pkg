@@ -414,6 +414,7 @@ prepare_build_dirs() {
     local destdir="$buildroot/destdir"
     local srcroot="$buildroot/src"
 
+    rm -rf "$buildroot"
     run mkdir -p "$buildroot" "$destdir" "$srcroot"
     echo "$buildroot" "$destdir" "$srcroot"
 }
