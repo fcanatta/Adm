@@ -6,180 +6,177 @@ version="2.42"
 release="1"
 
 sources=(
-  "https://ftp.gnu.org/gnu/glibc/glibc-${version}.tar.xz"
-  "https://www.linuxfromscratch.org/patches/lfs/development/glibc-${version}-upstream_fixes-1.patch"
-  "https://www.linuxfromscratch.org/patches/lfs/development/glibc-${version}-fhs-1.patch"
-  "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/tzdata2025b.tar.gz"
+    "https://ftp.gnu.org/gnu/glibc/glibc-${version}.tar.xz"
+    "https://www.linuxfromscratch.org/patches/lfs/development/glibc-${version}-upstream_fixes-1.patch"
+    "https://www.linuxfromscratch.org/patches/lfs/development/glibc-${version}-fhs-1.patch"
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/tzdata2025b.tar.gz"
+)
+
+sha256sums=(
+    # glibc-2.42.tar.xz – hash oficial
+    "glibc-${version}.tar.xz=d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f"
+
+    # patches: se quiser checar, adicione os hashes aqui
+    # "glibc-${version}-upstream_fixes-1.patch=..."
+    # "glibc-${version}-fhs-1.patch=..."
+
+    # tzdata2025b – usando hash do tarball orig das distros
+    "tzdata2025b.tar.gz=11810413345fc7805017e27ea9fa4885fd74cd61b2911711ad038f5d28d71474"
 )
 
 depends=(
-  "bash"
-  "coreutils"
-  "gawk"
-  "sed"
-  "make"
-  "gcc"
-  "binutils"
-  "findutils"
-  "grep"
-  "gzip"
-  "perl"
+    "bash"
+    "coreutils"
+    "gawk"
+    "sed"
+    "make"
+    "gcc"
+    "binutils"
+    "findutils"
+    "grep"
+    "gzip"
+    "perl"
 )
 
-#
-# SHA256 REAL:
-#  - glibc-2.42.tar.xz → SHA256 real confirmado
-#  - tzdata2025b.tar.gz → SHA256 real confirmado
-#  - patches → em branco (como você pediu)
-#
-sha256sums=(
-  "glibc-${version}.tar.xz=d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f"
-  "glibc-${version}-upstream_fixes-1.patch="
-  "glibc-${version}-fhs-1.patch="
-  "tzdata2025b.tar.gz=f11d91f87c1f8c807cc2934fbf4753b0f70d0fc3b9fcb0f4307ac851621f2aaa"
-)
-
-# Atualização automática
+# Descobre a última versão disponível em https://ftp.gnu.org/gnu/glibc/
 upstream_latest_version() {
-  local url="https://ftp.gnu.org/gnu/glibc/"
-  local html
+    local url="https://ftp.gnu.org/gnu/glibc/"
+    local html
 
-  if command -v curl >/dev/null 2>&1; then
-    html="$(curl -fsSL "$url")" || return 1
-  else
-    html="$(wget -qO- "$url")" || return 1
-  fi
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "Nem curl nem wget disponíveis para upstream_latest_version" >&2
+        return 1
+    fi
 
-  printf '%s\n' "$html" \
-    | sed -n 's/.*glibc-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
-    | sort -V | tail -n1
+    printf '%s\n' "$html" \
+        | sed -n 's/.*glibc-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+        | sort -V \
+        | tail -n1
 }
 
-#
-# BUILD REAL – seguindo **exatamente** o LFS r12.4-46 (Systemd)
-#
+# Build seguindo LFS 12.4 (systemd), adaptado para DESTDIR
 build() {
-  : "${DESTDIR:=/}"
+    : "${DESTDIR:=/}"
 
-  local srcroot="$PWD"
-  local sdir
-  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "glibc-${version}" | head -n1)"
+    local srcroot="$PWD"
+    local sdir
 
-  if [ -z "$sdir" ]; then
-    echo "Diretório glibc-${version} não encontrado" >&2
-    return 1
-  fi
+    # Encontrar diretório glibc-${version}
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "glibc-${version}" | head -n1)"
+    if [ -z "$sdir" ]; then
+        echo "Diretório glibc-${version} não encontrado" >&2
+        return 1
+    fi
 
-  cd "$sdir"
+    cd "$sdir"
 
-  ###############################
-  # Aplicação dos dois patches  #
-  ###############################
+    ###############################
+    # Aplicação dos patches LFS   #
+    ###############################
+    patch -Np1 -i ../glibc-${version}-upstream_fixes-1.patch
+    patch -Np1 -i ../glibc-${version}-fhs-1.patch
 
-  patch -Np1 -i ../glibc-${version}-upstream_fixes-1.patch
-  patch -Np1 -i ../glibc-${version}-fhs-1.patch
-
-  # Fix de abort.c (LFS 8.5.2)
-  sed -e '/unistd.h/i #include <string.h>' \
-      -e '/libc_rwlock_init/c\
+    # Fix de abort.c (LFS 8.5.1)
+    sed -e '/unistd.h/i #include <string.h>' \
+        -e '/libc_rwlock_init/c\
   __libc_rwlock_define_initialized (, reset_lock);\
   memcpy (&lock, &reset_lock, sizeof (lock));' \
-      -i stdlib/abort.c
+        -i stdlib/abort.c
 
-  ###############################
-  # Build directory + config    #
-  ###############################
+    ###############################
+    # Diretório de build          #
+    ###############################
+    mkdir -v build
+    cd       build
 
-  mkdir -v build
-  cd build
+    echo "rootsbindir=/usr/sbin" > configparms
 
-  echo "rootsbindir=/usr/sbin" > configparms
+    ../configure --prefix=/usr                   \
+                 --disable-werror                \
+                 --disable-nscd                  \
+                 libc_cv_slibdir=/usr/lib        \
+                 --enable-stack-protector=strong \
+                 --enable-kernel=5.4
 
-  ../configure --prefix=/usr \
-               --disable-werror \
-               --disable-nscd \
-               libc_cv_slibdir=/usr/lib \
-               --enable-stack-protector=strong \
-               --enable-kernel=5.4
+    make
+    make check
 
-  make
-  make check
+    ###############################
+    # Instalação em DESTDIR       #
+    ###############################
+    mkdir -p "${DESTDIR}/etc"
+    touch "${DESTDIR}/etc/ld.so.conf"
 
-  ###############################
-  # Instalação DESTDIR          #
-  ###############################
+    sed '/test-installation/s@$(PERL)@echo not running@' -i ../Makefile
 
-  mkdir -p "${DESTDIR}/etc"
-  touch     "${DESTDIR}/etc/ld.so.conf"
+    make DESTDIR="${DESTDIR}" install
 
-  sed '/test-installation/s@$(PERL)@echo not-running@' -i ../Makefile
+    # Ajuste do ldd (remove /usr do RTLDLIST)
+    sed '/RTLDLIST=/s@/usr@@g' -i "${DESTDIR}/usr/bin/ldd"
 
-  make DESTDIR="${DESTDIR}" install
+    ###############################
+    # Locales mínimos             #
+    ###############################
+    localedef --prefix="${DESTDIR}" -i C     -f UTF-8 C.UTF-8
+    localedef --prefix="${DESTDIR}" -i en_US -f UTF-8 en_US.UTF-8
 
-  sed '/RTLDLIST=/s@/usr@@g' -i "${DESTDIR}/usr/bin/ldd"
+    ###############################
+    # tzdata 2025b                #
+    ###############################
+    cd "${srcroot}"
+    mkdir -v tzbuild
+    cd tzbuild
 
-  ###############################
-  # Locales mínimos             #
-  ###############################
+    tar -xf ../tzdata2025b.tar.gz
 
-  localedef --prefix="${DESTDIR}" -i C -f UTF-8 C.UTF-8
-  localedef --prefix="${DESTDIR}" -i en_US -f UTF-8 en_US.UTF-8
+    ZONEINFO="${DESTDIR}/usr/share/zoneinfo"
+    mkdir -pv "${ZONEINFO}"/{posix,right}
 
-  ###############################
-  # tzdata                       #
-  ###############################
+    for tz in \
+        etcetera southamerica northamerica europe africa antarctica \
+        asia australasia backward
+    do
+        zic -L /dev/null   -d "${ZONEINFO}"       "${tz}"
+        zic -L /dev/null   -d "${ZONEINFO}/posix" "${tz}"
+        zic -L leapseconds -d "${ZONEINFO}/right" "${tz}"
+    done
 
-  cd "${srcroot}"
-  mkdir -v tzbuild
-  cd tzbuild
+    cp -v zone.tab zone1970.tab iso3166.tab "${ZONEINFO}"
+    zic -d "${ZONEINFO}" -p America/New_York
 
-  tar -xf ../tzdata2025b.tar.gz
-
-  ZONEINFO="${DESTDIR}/usr/share/zoneinfo"
-  mkdir -pv "${ZONEINFO}"/{posix,right}
-
-  for tz in etcetera southamerica northamerica europe africa antarctica \
-            asia australasia backward; do
-    zic -L /dev/null   -d "${ZONEINFO}"       "$tz"
-    zic -L /dev/null   -d "${ZONEINFO}/posix" "$tz"
-    zic -L leapseconds -d "${ZONEINFO}/right" "$tz"
-  done
-
-  cp -v zone.tab zone1970.tab iso3166.tab "${ZONEINFO}"
-
-  zic -d "${ZONEINFO}" -p America/New_York
-
-  ###############################
-  # nsswitch.conf               #
-  ###############################
-
-  cat > "${DESTDIR}/etc/nsswitch.conf" << "EOF"
+    ###############################
+    # nsswitch.conf               #
+    ###############################
+    cat > "${DESTDIR}/etc/nsswitch.conf" << "EOF"
 # Begin /etc/nsswitch.conf
 
 passwd: files systemd
 group:  files systemd
 shadow: files systemd
 
-hosts:      mymachines resolve [!UNAVAIL=return] files myhostname dns
-networks:   files
-protocols:  files
-services:   files
-ethers:     files
-rpc:        files
+hosts:    mymachines resolve [!UNAVAIL=return] files myhostname dns
+networks: files
+
+protocols: files
+services:  files
+ethers:    files
+rpc:       files
 
 # End /etc/nsswitch.conf
 EOF
 
-  ###############################
-  # ld.so.conf                  #
-  ###############################
-
-  cat > "${DESTDIR}/etc/ld.so.conf" << "EOF"
+    ###############################
+    # ld.so.conf                  #
+    ###############################
+    cat > "${DESTDIR}/etc/ld.so.conf" << "EOF"
 /usr/local/lib
 /opt/lib
-
 include /etc/ld.so.conf.d/*.conf
 EOF
 
-  mkdir -pv "${DESTDIR}/etc/ld.so.conf.d"
+    mkdir -pv "${DESTDIR}/etc/ld.so.conf.d"
 }
