@@ -11,6 +11,10 @@ sources=(
     "https://github.com/Mic92/iana-etc/releases/download/${version}/iana-etc-${version}.tar.gz"
 )
 
+sha256sums=(
+    "iana-etc-${version}.tar.gz=c5f31bdfa905a603a7fbb3f99d3eba4fbc5ea38137e5680c758224a5a2eb1a17"
+)
+
 # Dependências mínimas:
 # - bash: shell para o build()
 # - coreutils: cp, mkdir, etc.
