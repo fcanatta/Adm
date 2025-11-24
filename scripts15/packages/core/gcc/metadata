@@ -1,0 +1,175 @@
+# /usr/src/packages/core/gcc/metadata
+name="gcc"
+category="core"
+version="15.2.0"
+release="1"
+
+sources=(
+  # LFS / GNU
+  # https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
+  "https://ftp.gnu.org/gnu/gcc/gcc-${version}/gcc-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C – GCC)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "findutils"
+  "gawk"
+  "gcc"       # bootstrap / host
+  "gettext"
+  "glibc"
+  "gmp"
+  "grep"
+  "m4"
+  "make"
+  "mpc"
+  "mpfr"
+  "patch"
+  "perl"
+  "sed"
+  "tar"
+  "texinfo"
+  "zstd"
+)
+
+sha256sums=(
+  # sha256 de mirrors oficiais / distros (FreeBSD, Phoronix, etc.)
+  "gcc-${version}.tar.xz=438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
+)
+
+upstream_latest_version() {
+  # Varre diretório oficial do GNU
+  local url="https://ftp.gnu.org/gnu/gcc/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*gcc-\([0-9][0-9.]*\)\/.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – GCC-15.2.0 (LFS 8.30) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "gcc-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório gcc-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Ajuste para x86_64 (LFS 8.30.1)
+  ###################################
+  case "$(uname -m)" in
+    x86_64)
+      sed -e '/m64=/s/lib64/lib/' \
+          -i.orig gcc/config/i386/t-linux64
+      ;;
+  esac
+
+  ###################################
+  # Diretório de build separado
+  ###################################
+  mkdir -v build
+  cd build
+
+  ###################################
+  # Configuração (igual ao livro)
+  ###################################
+  ../configure --prefix=/usr            \
+               LD=ld                    \
+               --enable-languages=c,c++ \
+               --enable-default-pie     \
+               --enable-default-ssp     \
+               --enable-host-pie        \
+               --disable-multilib       \
+               --disable-bootstrap      \
+               --disable-fixincludes    \
+               --with-system-zlib
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (muito demorados – opcional)
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    # Ajuste de stack (como no livro)
+    ulimit -s -H unlimited || true
+
+    # Remover falhas conhecidas de plugin cpython
+    sed -e '/cpython/d' -i ../gcc/testsuite/gcc.dg/plugin/plugin.exp || true
+
+    # Rodar testes como usuário "tester", se existir
+    if id tester >/dev/null 2>&1; then
+      chown -R tester .
+      su tester -c "PATH=\$PATH make -k check" || true
+      ( cd .. && ./contrib/test_summary ) || true
+    else
+      echo "[gcc] Usuário 'tester' não existe, pulando testes completos." >&2
+    fi
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  ###################################
+  # Ajustes pós-instalação (adaptados ao DESTDIR)
+  ###################################
+  local triplet
+  triplet="$(gcc -dumpmachine)"
+
+  # Corrigir owner dos headers instalados
+  chown -v -R root:root \
+    "${DESTDIR}/usr/lib/gcc/${triplet}/${version}/include" \
+    "${DESTDIR}/usr/lib/gcc/${triplet}/${version}/include-fixed" 2>/dev/null || true
+
+  # Symlink /usr/lib/cpp (FHS, histórico)
+  ln -svr /usr/bin/cpp "${DESTDIR}/usr/lib" || true
+
+  # Manpage para 'cc'
+  mkdir -p "${DESTDIR}/usr/share/man/man1"
+  ln -sv gcc.1 "${DESTDIR}/usr/share/man/man1/cc.1" || true
+
+  # liblto_plugin -> bfd-plugins
+  mkdir -p "${DESTDIR}/usr/lib/bfd-plugins"
+  ln -sfv "../../libexec/gcc/${triplet}/${version}/liblto_plugin.so" \
+          "${DESTDIR}/usr/lib/bfd-plugins/liblto_plugin.so" || true
+
+  # Arquivos Python do gdb em local correto
+  mkdir -pv "${DESTDIR}/usr/share/gdb/auto-load/usr/lib"
+  if ls "${DESTDIR}/usr/lib/"*gdb.py >/dev/null 2>&1; then
+    mv -v "${DESTDIR}/usr/lib/"*gdb.py \
+       "${DESTDIR}/usr/share/gdb/auto-load/usr/lib" || true
+  fi
+
+  ###################################
+  # Sanity checks – apenas loga, não falha build
+  ###################################
+  cat <<'EOF'
+[gcc] Sanity checks recomendados pelo LFS:
+  echo 'int main(){}' | cc -x c - -v -Wl,--verbose &> dummy.log
+  readelf -l a.out | grep ': /lib'
+  grep -E -o '/usr/lib.*/S?crt[1in].*succeeded' dummy.log
+  grep -B4 '^ /usr/include' dummy.log
+  grep 'SEARCH.*/usr/lib' dummy.log | sed 's|; |\n|g'
+  grep "/lib.*/libc.so.6 " dummy.log
+  grep 'found ld-linux' dummy.log
+  rm -v a.out dummy.log
+Verifique manualmente se a saída bate com o livro.
+EOF
+}
