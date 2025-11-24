@@ -30,6 +30,10 @@ PKG_CACHE_PACKAGES="$PKG_CACHE_ROOT/packages"
 PKG_FETCH_JOBS="${PKG_FETCH_JOBS:-4}"      # downloads paralelos
 DRY_RUN=0
 
+# Globais usadas na resolução de dependências
+RESOLVED_ORDER=()
+declare -A RESOLVED_CAT_OF
+
 ########################################
 # LOG / ERRO / EXECUÇÃO
 ########################################
@@ -196,6 +200,17 @@ load_metadata() {
     [[ -n "$META_CATEGORY" ]] || die "Metadado $path: variável 'category' vazia"
 
     log "Metadado carregado: $META_CATEGORY/$META_NAME $META_VERSION-$META_RELEASE"
+}
+
+# Descobre a categoria de um pacote só pelo nome, procurando em:
+#   $PKG_META_ROOT/<categoria>/<nome>/metadata
+find_category_for_name() {
+    local pkg_name="$1"
+    local path
+    path="$(find "$PKG_META_ROOT" -mindepth 2 -maxdepth 2 -type f -name metadata \
+              -path "*/${pkg_name}/metadata" 2>/dev/null | head -n1 || true)"
+    [[ -n "$path" ]] || return 1
+    basename "$(dirname "$path")"
 }
 
 ########################################
@@ -526,6 +541,28 @@ info_installed() {
     ((found)) || die "Pacote não encontrado: $name"
 }
 
+# Retorna 0 se *alguma* versão do pacote já está instalada
+is_installed() {
+    ensure_dirs
+    local query="$1"
+    local d info pkg_name
+
+    for d in "$PKG_DB"/*; do
+        [[ -d "$d" ]] || continue
+        info="$d/pkginfo"
+        [[ -r "$info" ]] || continue
+        unset name category version release install_time
+        # shellcheck disable=SC1090
+        . "$info"
+        pkg_name="$name"
+        if [[ "$pkg_name" == "$query" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 ########################################
 # REMOÇÃO DE PACOTES
 ########################################
@@ -653,6 +690,125 @@ print_dep_order() {
     fi
     rm -f "$tmp"
 }
+
+# Resolve o *fecho de dependências* de um pacote (nome) e gera:
+#  - RESOLVED_ORDER: lista de nomes em ordem de instalação (deps antes dos dependentes)
+#  - RESOLVED_CAT_OF["nome"] = categoria
+resolve_deps_install_order() {
+    local root_category="$1"
+    local root_name="$2"
+
+    ensure_dirs
+
+    RESOLVED_ORDER=()
+    RESOLVED_CAT_OF=()
+
+    declare -A seen
+    declare -A cat_of
+    declare -A deps_of
+
+    local queue=("$root_name")
+
+    while ((${#queue[@]})); do
+        local name="${queue[0]}"
+        queue=("${queue[@]:1}")
+
+        [[ -n "${seen[$name]:-}" ]] && continue
+        seen["$name"]=1
+
+        # Descobre categoria (usa a passada no comando ou procura no disco)
+        local category="${cat_of[$name]:-}"
+        if [[ -z "$category" ]]; then
+            if [[ "$name" == "$root_name" && -n "$root_category" ]]; then
+                category="$root_category"
+            else
+                category="$(find_category_for_name "$name")" \
+                    || die "Metadado não encontrado para pacote/dependência '$name'"
+            fi
+            cat_of["$name"]="$category"
+        fi
+
+        # Carrega depends desse pacote
+        load_metadata "$category" "$name"
+        deps_of["$name"]="${META_DEPENDS[*]:-}"
+
+        local dep
+        for dep in "${META_DEPENDS[@]:-}"; do
+            [[ -n "$dep" ]] || continue
+            queue+=("$dep")
+        done
+    done
+
+    # Monta entrada para o toposort_kahn: "pkg dep1 dep2 ..."
+    local tmp
+    tmp="$(mktemp)"
+    local n
+    for n in "${!seen[@]}"; do
+        printf '%s %s\n' "$n" "${deps_of[$n]}" >> "$tmp"
+    done
+
+    # Usa o toposort já existente para pegar a ordem
+    mapfile -t RESOLVED_ORDER < <(toposort_kahn < "$tmp") || {
+        rm -f "$tmp"
+        die "Detectado ciclo de dependências ao resolver $root_name"
+    }
+    rm -f "$tmp"
+
+    # Copia mapeamento de categorias para a global RESOLVED_CAT_OF
+    RESOLVED_CAT_OF=()
+    for n in "${!cat_of[@]}"; do
+        RESOLVED_CAT_OF["$n"]="${cat_of[$n]}"
+    done
+}
+
+# Instala um pacote e TODAS as dependências:
+#  - se categoria for vazia, descobre sozinho no disco
+#  - resolve deps e instala na ordem correta
+install_with_deps() {
+    local category="$1"
+    local name="$2"
+
+    ensure_root
+    ensure_dirs
+
+    if [[ -z "$name" ]]; then
+        die "install_with_deps: nome do pacote não informado"
+    fi
+
+    # Se categoria não veio (caso 'pkg install firefox'), descobre
+    if [[ -z "$category" ]]; then
+        category="$(find_category_for_name "$name")" \
+            || die "Metadado não encontrado para pacote '$name'"
+    fi
+
+    log "Resolvendo dependências para $name (categoria $category)..."
+    resolve_deps_install_order "$category" "$name"
+
+    log "Ordem de instalação (deps primeiro): ${RESOLVED_ORDER[*]}"
+
+    local pkg cat
+    for pkg in "${RESOLVED_ORDER[@]}"; do
+        cat="${RESOLVED_CAT_OF[$pkg]}"
+
+        if is_installed "$pkg"; then
+            log "Pacote já instalado, pulando: $pkg"
+            continue
+        fi
+
+        log "=== Construindo e instalando: ${cat}/${pkg} ==="
+
+        if (( DRY_RUN )); then
+            log "(dry-run) build_package ${cat} ${pkg}"
+            log "(dry-run) package_built ${cat} ${pkg}"
+            log "(dry-run) install_from_destdir ${cat} ${pkg}"
+        else
+            build_package   "$cat" "$pkg"
+            package_built   "$cat" "$pkg"
+            install_from_destdir "$cat" "$pkg"
+        fi
+    done
+}
+
 ########################################
 # BUILD DO PACOTE (DESTDIR)
 ########################################
@@ -1006,10 +1162,16 @@ main() {
             package_built "$1" "$2"
             ;;
         install)
-            [[ $# -eq 2 ]] || die "Uso: pkg install <categoria> <nome>"
-            build_package "$1" "$2"
-            package_built "$1" "$2"
-            install_from_destdir "$1" "$2"
+            # Formatos aceitos:
+            #   pkg install <programa>
+            #   pkg install <categoria> <programa>
+            if [[ $# -eq 1 ]]; then
+                install_with_deps "" "$1"
+            elif [[ $# -eq 2 ]]; then
+                install_with_deps "$1" "$2"
+            else
+                die "Uso: pkg install [<categoria>] <nome>"
+            fi
             ;;
         sync)
             # sync pull metadados do git
