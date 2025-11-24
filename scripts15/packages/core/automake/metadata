@@ -1,0 +1,101 @@
+# /usr/src/packages/core/automake/metadata
+
+name="automake"
+category="core"
+version="1.18.1"
+release="1"
+
+# Fonte oficial usada pelo LFS r12.4-46 (Chapter 3 – All Packages)
+# Tarball: automake-1.18.1.tar.xz em ftp.gnu.org 0
+sources=(
+  "https://ftp.gnu.org/gnu/automake/automake-${version}.tar.xz"
+)
+
+# Appendix C – Automake (Installation depends on) 1
+#   Autoconf, Bash, Coreutils, Gettext, Grep, M4, Make, Perl, Sed, Texinfo
+depends=(
+  "autoconf"
+  "bash"
+  "coreutils"
+  "gettext"
+  "grep"
+  "m4"
+  "make"
+  "perl"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do automake-1.18.1.tar.xz
+# (hash do tarball oficial, conferido em Slackware e Homebrew) 2
+sha256sums=(
+  "https___ftp.gnu.org_gnu_automake_automake-1.18.1.tar.xz=168aa363278351b89af56684448f525a5bce5079d0b6842bd910fdd3f1646887"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/automake/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*automake-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Automake-1.18.1 (LFS r12.4-46, seção 8.48) 3
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório automake-1.18.1
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "automake-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório automake-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ##########################################################
+  # Configuração (igual ao livro)
+  #   ./configure --prefix=/usr \
+  #               --docdir=/usr/share/doc/automake-1.18.1
+  ##########################################################
+  ./configure --prefix=/usr \
+              --docdir=/usr/share/doc/automake-${version}"
+
+  ##########################################################
+  # Compilação
+  #   make
+  ##########################################################
+  make
+
+  ##########################################################
+  # Testes
+  #   make -j$(($(nproc)>4?$(nproc):4)) check
+  # Aqui deixo opcional via RUN_TESTS.
+  ##########################################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    local nprocs=1
+    if command -v nproc >/dev/null 2>&1; then
+      nprocs="$(nproc)"
+    fi
+    local jobs=4
+    if [ "$nprocs" -gt 4 ]; then
+      jobs="$nprocs"
+    fi
+    make -j"${jobs}" check
+  fi
+
+  ##########################################################
+  # Instalação em DESTDIR
+  #   make install
+  ##########################################################
+  make DESTDIR="${DESTDIR}" install
+}
