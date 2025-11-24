@@ -1,0 +1,101 @@
+# /usr/src/packages/core/libffi/metadata
+
+name="libffi"
+category="core"
+version="3.5.2"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46
+# (Chapter 3 – All Packages aponta para o tarball em github.com/libffi/libffi) 
+sources=(
+  "https://github.com/libffi/libffi/releases/download/v${version}/libffi-${version}.tar.gz"
+)
+
+# Appendix C – Libffi (Installation depends on): 
+#   Bash, Binutils, Coreutils, GCC, Glibc, Make, and Sed
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "glibc"
+  "make"
+  "sed"
+)
+
+# SHA256 real do libffi-3.5.2.tar.gz
+# Hash do tarball oficial, conferido em Homebrew (mesmo URL de origem). 
+sha256sums=(
+  "https___github.com_libffi_libffi_releases_download_v3.5.2_libffi-3.5.2.tar.gz=f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
+)
+
+# Descobre versão mais nova nos releases oficiais do GitHub
+upstream_latest_version() {
+  local url="https://github.com/libffi/libffi/releases"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*libffi \([0-9][0-9.]*\).*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Libffi-3.5.2 (LFS r12.4-46, seção 8.51) 
+build() {
+  : "${DESTDIR:=/}"
+
+  # Diretório de build: libffi-3.5.2
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "libffi-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório libffi-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração – exatamente como no livro:
+  #
+  #   ./configure --prefix=/usr    \
+  #               --disable-static \
+  #               --with-gcc-arch=native
+  #
+  # OBS: se você for usar este libffi em outra máquina/CPU,
+  # ajuste o --with-gcc-arch= para algo seguro para as duas,
+  # ou use --without-gcc-arch para lib genérica.
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --with-gcc-arch=native
+
+  ###################################
+  # Compilação
+  #
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes
+  #
+  #   make check
+  # LFS roda testes aqui; deixo opcional via RUN_TESTS
+  # pra não travar builds automáticos.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
