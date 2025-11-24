@@ -1,0 +1,115 @@
+# /usr/src/packages/core/openssl/metadata
+
+name="openssl"
+category="core"
+version="3.6.0"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46 (Chapter 3 – All Packages) 0
+sources=(
+  "https://github.com/openssl/openssl/releases/download/openssl-${version}/openssl-${version}.tar.gz"
+)
+
+# Appendix C – OpenSSL (Installation depends on) 1
+#   Binutils, Coreutils, GCC, Make, Perl
+depends=(
+  "binutils"
+  "coreutils"
+  "gcc"
+  "make"
+  "perl"
+)
+
+# SHA256 real do openssl-3.6.0.tar.gz
+# (hash do tarball oficial, conferido em FreeBSD ports e Homebrew) 2
+sha256sums=(
+  "https___github.com_openssl_openssl_releases_download_openssl-3.6.0_openssl-3.6.0.tar.gz=b6a5f44b7eb69e3fa35dbf15524405b44837a481d43d81daddde3ff21fcbb8e9"
+)
+
+# Descobre versão mais nova a partir da página oficial de downloads (openssl-library.org) 3
+upstream_latest_version() {
+  local url="https://openssl-library.org/source/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*openssl-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – OpenSSL-3.6.0 (LFS r12.4-46, seção 8.49) 4
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório openssl-3.6.0
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "openssl-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório openssl-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###########################################
+  # Configuração – exatamente como no livro:
+  #   ./config --prefix=/usr         \
+  #            --openssldir=/etc/ssl \
+  #            --libdir=lib          \
+  #            shared                \
+  #            zlib-dynamic
+  ###########################################
+  ./config --prefix=/usr         \
+           --openssldir=/etc/ssl \
+           --libdir=lib          \
+           shared                \
+           zlib-dynamic
+
+  ##########################################
+  # Compilação
+  #   make
+  ##########################################
+  make
+
+  ##########################################
+  # Testes – LFS:
+  #   HARNESS_JOBS=$(nproc) make test
+  # Aqui deixo opcional via RUN_TESTS pra não travar build automático.
+  ######################################################################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    HARNESS_JOBS="${HARNESS_JOBS:-$(nproc 2>/dev/null || echo 1)}" \
+      make test || echo "[openssl] Alguns testes podem falhar dependendo do suporte de crypto no kernel."
+  fi
+
+  #######################################################################################
+  # Instalação – LFS:
+  #   sed -i '/INSTALL_LIBS/s/libcrypto.a libssl.a//' Makefile
+  #   make MANSUFFIX=ssl install
+  #   mv -v /usr/share/doc/openssl /usr/share/doc/openssl-3.6.0
+  #   cp -vfr doc/* /usr/share/doc/openssl-3.6.0
+  # Aqui tudo adaptado para DESTDIR pra não sujar o host.
+  ########################################################################################
+
+  # Não instalar as estáticas libcrypto.a e libssl.a
+  sed -i '/INSTALL_LIBS/s/libcrypto.a libssl.a//' Makefile
+
+  # Instalação em DESTDIR com sufixo de man igual ao livro
+  make MANSUFFIX=ssl DESTDIR="${DESTDIR}" install
+
+  # Ajustar diretório de documentação dentro de DESTDIR
+  if [ -d "${DESTDIR}/usr/share/doc/openssl" ]; then
+    mkdir -p "${DESTDIR}/usr/share/doc"
+    mv -v "${DESTDIR}/usr/share/doc/openssl" \
+          "${DESTDIR}/usr/share/doc/openssl-${version}"
+  else
+    mkdir -p "${DESTDIR}/usr/share/doc/openssl-${version}"
+  fi
+
+  # Copiar documentação extra da árvore de fontes
+  cp -vfr doc/* "${DESTDIR}/usr/share/doc/openssl-${version}/"
+}
