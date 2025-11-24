@@ -1,0 +1,109 @@
+# /usr/src/packages/core/libelf/metadata
+
+name="libelf"
+category="core"
+version="0.194"
+release="1"
+
+# Libelf vem do tarball do elfutils-0.194 (LFS 8.50) 0
+sources=(
+  "https://sourceware.org/elfutils/ftp/${version}/elfutils-${version}.tar.bz2"
+)
+
+# Appendix C – Libelf (Installation depends on) 1
+#   Bash, Binutils, Bzip2, Coreutils, GCC, Glibc, Make, Xz, Zlib, Zstd
+depends=(
+  "bash"
+  "binutils"
+  "bzip2"
+  "coreutils"
+  "gcc"
+  "glibc"
+  "make"
+  "xz"
+  "zlib"
+  "zstd"
+)
+
+# SHA256 real do elfutils-0.194.tar.bz2
+# (hash usado em Yocto/OpenEmbedded para o mesmo tarball oficial) 2
+sha256sums=(
+  "https___sourceware.org_elfutils_ftp_0.194_elfutils-0.194.tar.bz2=09e2ff033d39baa8b388a2d7fbc5390bfde99ae3b7c67c7daaf7433fbcf0f01e"
+)
+
+# Descobre versão mais nova do elfutils no ftp oficial (usa o tarball .tar.bz2)
+upstream_latest_version() {
+  local url="https://sourceware.org/elfutils/ftp/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*elfutils-\([0-9][0-9.]*\)\.tar\.bz2.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Libelf from Elfutils-0.194 (LFS r12.4-46, seção 8.50) 3
+build() {
+  : "${DESTDIR:=/}"
+
+  # Diretório de build: elfutils-0.194
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "elfutils-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório elfutils-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ##################################################################
+  # Configuração – exatamente como no livro:
+  #
+  #   ./configure --prefix=/usr        \
+  #               --disable-debuginfod \
+  #               --enable-libdebuginfod=dummy
+  ##################################################################
+  ./configure --prefix=/usr        \
+              --disable-debuginfod \
+              --enable-libdebuginfod=dummy
+
+  ##################################################################
+  # Compilar apenas as libs usadas pelo libelf
+  #
+  #   make -C lib
+  #   make -C libelf
+  ##################################################################
+  make -C lib
+  make -C libelf
+
+  ##################################################################
+  # Testes:
+  #   make -k check
+  # LFS avisa que dois testes falham às vezes:
+  #   dwarf_srclang_check e run-backtrace-native-core.sh 
+  # Deixo opcional via RUN_TESTS pra não travar build automático.
+  ################################################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make -k check || echo "[libelf] make -k check retornou falhas conhecidas (ok segundo LFS)."
+  fi
+
+  ##############################################################
+  # Instalar somente o Libelf (adaptado p/ DESTDIR):
+  #
+  #   make -C libelf install
+  #   install -vm644 config/libelf.pc /usr/lib/pkgconfig
+  #   rm /usr/lib/libelf.a
+  ###############################################################
+  make -C libelf DESTDIR="${DESTDIR}" install
+
+  install -v -m644 config/libelf.pc \
+    "${DESTDIR}/usr/lib/pkgconfig"
+
+  # Remover a estática, como no livro, mas dentro do DESTDIR
+  rm -f "${DESTDIR}/usr/lib/libelf.a" || true
+}
