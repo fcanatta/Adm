@@ -1,0 +1,163 @@
+# /usr/src/packages/core/python/metadata
+
+name="python"
+category="core"
+version="3.14.0"
+release="1"
+
+# Fontes oficiais exatamente como no LFS r12.4-46:
+# - Código:   Python-3.14.0.tar.xz
+# - Docs:     python-3.14.0-docs-html.tar.bz2 0
+sources=(
+  "https://www.python.org/ftp/python/${version}/Python-${version}.tar.xz"
+  "https://www.python.org/ftp/python/doc/${version}/python-${version}-docs-html.tar.bz2"
+)
+
+# Appendix C – Dependencies de Python (LFS 12.4): 
+#   Installation depends on:
+#     Bash, Binutils, Coreutils, Expat, GCC, Gdbm, Gettext, Glibc, Grep,
+#     Libffi, Libxcrypt, Make, Ncurses, OpenSSL, Pkgconf, Sed, and Util-linux
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "expat"
+  "gcc"
+  "gdbm"
+  "gettext"
+  "glibc"
+  "grep"
+  "libffi"
+  "libxcrypt"
+  "make"
+  "ncurses"
+  "openssl"
+  "pkgconf"
+  "sed"
+  "util-linux"
+)
+
+# SHA256 REAL do Python-3.14.0.tar.xz (tarball oficial)
+# conferido em FreshPorts / ports de FreeBSD: 
+#   SHA256 (python/Python-3.14.0.tar.xz) =
+#   2299dae542d395ce3883aca00d3c910307cd68e0b2f7336098c8e7b7eee9f3e9
+#
+# Para o tarball de documentação, o LFS só publica MD5; deixo SHA256 vazio
+# para o teu script automático preencher. MD5 (LFS zh_CN): 658b4f9a0f720f161cf6b3f5798a8139 3
+sha256sums=(
+  "https___www.python.org_ftp_python_3.14.0_Python-3.14.0.tar.xz=2299dae542d395ce3883aca00d3c910307cd68e0b2f7336098c8e7b7eee9f3e9"
+  "https___www.python.org_ftp_python_doc_3.14.0_python-3.14.0-docs-html.tar.bz2="
+)
+
+# Descobre a última versão 3.x estável olhando o índice oficial do FTP do Python.
+# Retorna algo como "3.14.0".
+upstream_latest_version() {
+  local url="https://www.python.org/ftp/python/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  # Pega nomes de tarball Python-3.xx.yy.tar.xz e extrai o número.
+  printf '%s\n' "$html" \
+    | sed -n 's/.*Python-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Python-3.14.0 (LFS r12.4-46, seção 8.53) 
+#
+# LFS faz:
+#   ./configure --prefix=/usr          \
+#               --enable-shared        \
+#               --with-system-expat    \
+#               --enable-optimizations \
+#               --without-static-libpython
+#
+#   make
+#   make test TESTOPTS="--timeout 120"
+#   make install
+#
+#   # opcional – docs:
+#   install -v -dm755 /usr/share/doc/python-3.14.0/html
+#   tar --strip-components=1  \
+#       --no-same-owner       \
+#       --no-same-permissions \
+#       -C /usr/share/doc/python-3.14.0/html \
+#       -xvf ../python-3.14.0-docs-html.tar.bz2
+#
+# Aqui adaptei para DESTDIR e para não explodir se as docs não estiverem presentes.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Diretório de build: normalmente "Python-3.14.0" (com P maiúsculo)
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "Python-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório Python-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ##################################################################################
+  # Configuração – exatamente como no livro
+  ##################################################################################
+  ./configure --prefix=/usr          \
+              --enable-shared        \
+              --with-system-expat    \
+              --enable-optimizations \
+              --without-static-libpython
+
+  #################################################################################
+  # Compilação
+  #################################################################################
+  make
+
+  #################################################################################
+  # Testes – LFS recomenda:
+  #   make test TESTOPTS=\"--timeout 120\"
+  # Aqui só roda se RUN_TESTS=1 estiver setado no ambiente.
+  ################################################################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    local timeout="${PYTHON_TEST_TIMEOUT:-120}"
+    make test TESTOPTS="--timeout ${timeout}"
+  fi
+
+  ###############################################################################
+  # Instalação – adaptada pra DESTDIR
+  ###############################################################################
+  make install DESTDIR="${DESTDIR}"
+
+  ###############################################################################
+  # Instalação opcional da documentação HTML
+  # Segue o LFS, mas respeitando DESTDIR.
+  # Tenta achar o tarball um nível acima (como no livro) ou no diretório atual.
+  ###############################################################################
+  local doc_tar=""
+  if [ -f "../python-${version}-docs-html.tar.bz2" ]; then
+    doc_tar="../python-${version}-docs-html.tar.bz2"
+  elif [ -f "python-${version}-docs-html.tar.bz2" ]; then
+    doc_tar="python-${version}-docs-html.tar.bz2"
+  fi
+
+  if [ -n "$doc_tar" ]; then
+    install -v -dm755 "${DESTDIR}/usr/share/doc/python-${version}/html"
+
+    tar --strip-components=1  \
+        --no-same-owner       \
+        --no-same-permissions \
+        -C "${DESTDIR}/usr/share/doc/python-${version}/html" \
+        -xvf "${doc_tar}"
+  fi
+
+  ##########################################################################
+  # NOTA (igual ao LFS, mas não forço no build):
+  # Se quiser, você pode criar /etc/pip.conf pra silenciar os warnings
+  # do pip rodando como root, exatamente como no texto do livro.
+  # Isso é mais “configuração do sistema” do que parte do pacote,
+  # então deixei de fora do build() de propósito.
+  ##########################################################################
+}
