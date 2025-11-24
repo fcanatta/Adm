@@ -1,0 +1,17 @@
+# baixar fontes
+pkg fetch core man-pages
+
+# compilar + empacotar + instalar, com registro
+pkg install core man-pages
+
+# ver info
+pkg info man-pages
+
+# remover se precisar
+pkg remove man-pages
+
+# procurar versão nova no upstream e atualizar o metadado
+pkg update core man-pages
+
+# upgrade (build + install da nova versão)
+pkg upgrade core man-pages
