@@ -1,0 +1,116 @@
+# /usr/src/packages/core/ninja/metadata
+
+name="ninja"
+category="core"
+version="1.13.1"
+release="1"
+
+# Fonte oficial seguindo o LFS r12.4-46 (Chapter 3 – All Packages)
+# Ninja (1.13.1) - Download: https://github.com/ninja-build/ninja/archive/v1.13.1/ninja-1.13.1.tar.gz 0
+sources=(
+  "https://github.com/ninja-build/ninja/archive/v${version}/ninja-${version}.tar.gz"
+)
+
+# Appendix C – Ninja:
+#   Installation depends on: Binutils, Coreutils, GCC, and Python 
+depends=(
+  "binutils"
+  "coreutils"
+  "gcc"
+  "python"
+)
+
+# SHA256 real do ninja-1.13.1.tar.gz (mesmo tarball do GitHub, ver distinfo do FreeBSD) 
+sha256sums=(
+  "https___github.com_ninja-build_ninja_archive_v1.13.1_ninja-1.13.1.tar.gz=f0055ad0369bf2e372955ba55128d000cfcc21777057806015b45e4accbebf23"
+)
+
+# Descobre a versão mais nova olhando o wget-list oficial do LFS ou diretamente no GitHub
+upstream_latest_version() {
+  # Tenta primeiro o wget-list do LFS (mais estável pro teu fluxo)
+  local url="https://lfs.freding.no/lfs/downloads/development/wget-list.txt"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url" 2>/dev/null)" || html=""
+  else
+    html="$(wget -qO- "$url" 2>/dev/null)" || html=""
+  fi
+
+  # Se não conseguir baixar o wget-list, tenta direto na página de refs do mirror
+  if [ -n "$html" ]; then
+    printf '%s\n' "$html" \
+      | sed -n 's@.*github.com/ninja-build/ninja/archive/v\([0-9][0-9.]*\)/ninja-.*@\1@p' \
+      | sort -V | tail -n1
+  else
+    # fallback: mirror de tags com Ninja-<versão>.tar.gz 3
+    if command -v curl >/dev/null 2>&1; then
+      html="$(curl -fsSL "https://service.techsat.com/oss-git/Ninja.git/refs/?id=HEAD" 2>/dev/null)" || return 1
+    else
+      html="$(wget -qO- "https://service.techsat.com/oss-git/Ninja.git/refs/?id=HEAD" 2>/dev/null)" || return 1
+    fi
+    printf '%s\n' "$html" \
+      | sed -n 's/.*Ninja-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+      | sort -V | tail -n1
+  fi
+}
+
+# BUILD REAL – Ninja-1.13.1 (LFS r12.4-46, seção 8.58) 4
+build() {
+  : "${DESTDIR:=/}"
+
+  # Diretório de build (do tarball do GitHub ele vem como ninja-1.13.1)
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "ninja-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório ninja-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Patch opcional para NINJAJOBS (como no livro)
+  # LFS: sed -i '/int Guess/a \ ... ' src/ninja.cc
+  # Ativo só se ENABLE_NINJAJOBS=1 (pra manter fiel ao “If desired”).
+  ###################################
+  if [ "${ENABLE_NINJAJOBS:-0}" = 1 ]; then
+    sed -i '/int Guess/a \
+      int   j = 0;\
+      char* jobs = getenv( "NINJAJOBS" );\
+      if ( jobs != NULL ) j = atoi( jobs );\
+      if ( j > 0 ) return j;\
+    ' src/ninja.cc
+  fi
+
+  ###################################
+  # Build – exatamente o comando do LFS:
+  #   python3 configure.py --bootstrap --verbose
+  ###################################
+  if command -v python3 >/dev/null 2>&1; then
+    python3 configure.py --bootstrap --verbose
+  else
+    python configure.py --bootstrap --verbose
+  fi
+
+  ###################################
+  # Testes
+  # LFS: “The package tests cannot run in the chroot environment…”
+  # ou seja, não roda testes aqui.
+  ###################################
+
+  ###################################
+  # Instalação (adaptada para DESTDIR)
+  # LFS:
+  #   install -vm755 ninja /usr/bin/
+  #   install -vDm644 misc/bash-completion /usr/share/bash-completion/completions/ninja
+  #   install -vDm644 misc/zsh-completion  /usr/share/zsh/site-functions/_ninja
+  ###################################
+  install -vm755 ninja "${DESTDIR}/usr/bin/"
+
+  install -vDm644 misc/bash-completion \
+    "${DESTDIR}/usr/share/bash-completion/completions/ninja"
+
+  install -vDm644 misc/zsh-completion \
+    "${DESTDIR}/usr/share/zsh/site-functions/_ninja"
+}
