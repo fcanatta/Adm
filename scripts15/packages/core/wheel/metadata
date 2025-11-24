@@ -1,0 +1,94 @@
+# /usr/src/packages/core/wheel/metadata
+
+name="wheel"
+category="core"
+version="0.46.1"
+release="1"
+
+# Fonte oficial usada pelo LFS r12.4-46:
+#   Download: https://pypi.org/packages/source/w/wheel/wheel-0.46.1.tar.gz
+sources=(
+  "https://pypi.org/packages/source/w/wheel/wheel-${version}.tar.gz"
+)
+
+# Appendix C (Wheel) – instalação depende apenas de Python
+depends=(
+  "python"
+)
+
+# SHA256 real do wheel-0.46.1.tar.gz (wheel_0.46.1.orig.tar.gz)
+# conferido em distros debian-like que usam o tarball original.
+sha256sums=(
+  "https___pypi.org_packages_source_w_wheel_wheel-0.46.1.tar.gz=fd477efb5da0f7df1d3c76c73c14394002c844451bd63229d8570f376f5e6a38"
+)
+
+# Descobre versão mais nova do Wheel no PyPI
+upstream_latest_version() {
+  local url="https://pypi.org/project/wheel/#files"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*wheel-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Wheel-0.46.1 (LFS r12.4-46, seção 8.56)
+# LFS faz:
+#   pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps $PWD
+#   pip3 install --no-index --find-links dist wheel
+#
+# Aqui adaptado para DESTDIR/prefix para empacotamento limpo com o pkg.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Descobrir python/pip
+  local pybin pipcmd
+  if command -v python3 >/dev/null 2>&1; then
+    pybin="python3"
+  else
+    pybin="python"
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    pipcmd="pip3"
+  else
+    pipcmd="$pybin -m pip"
+  fi
+
+  # Diretório do sdist: wheel-0.46.1
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "wheel-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório wheel-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Build da wheel – igual ao LFS
+  ###################################
+  "$pipcmd" wheel -w dist \
+    --no-cache-dir \
+    --no-build-isolation \
+    --no-deps \
+    "$PWD"
+
+  ###################################
+  # Instalação via pip, mas dentro de DESTDIR:
+  #   --prefix=/usr  -> layout de sistema
+  #   --root=DESTDIR -> árvore de staging do pacote
+  ###################################
+  "$pipcmd" install \
+    --no-index \
+    --find-links dist \
+    wheel \
+    --prefix=/usr \
+    --root="${DESTDIR}"
+}
