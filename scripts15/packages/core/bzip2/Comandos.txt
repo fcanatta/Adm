@@ -1,0 +1,3 @@
+pkg fetch core bzip2
+pkg install core bzip2       # ou só: pkg install bzip2 (se já fez auto-deps)
+pkg info bzip2
