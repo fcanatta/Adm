@@ -1,0 +1,114 @@
+# /usr/src/packages/core/sqlite/metadata
+
+name="sqlite"
+category="core"
+version="3.51.0"
+# código numérico usado nos tarballs oficiais
+sqlite_vernum="3510000"
+release="1"
+
+# Fontes oficiais conforme LFS r12.4-46
+# - código: sqlite-autoconf-3510000.tar.gz (site oficial do SQLite)
+# - docs:   sqlite-doc-3510000.tar.xz (tarball gerado pelo LFS) 0
+sources=(
+  "https://sqlite.org/2025/sqlite-autoconf-${sqlite_vernum}.tar.gz"
+  "https://anduin.linuxfromscratch.org/LFS/sqlite-doc-${sqlite_vernum}.tar.xz"
+)
+
+# Dependências básicas, compatíveis com o padrão do LFS para libs desse tipo
+# (similar a Expat/GDBM, etc.) 
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "sed"
+)
+
+# SHA256 REAL do sqlite-autoconf-3510000.tar.gz (usado por distros como Buildroot, MacPorts, etc.) 2
+# Para o tarball de documentação gerado pelo LFS só temos MD5 no livro; o SHA256 pode ser
+# preenchido depois pelo teu script automático.
+sha256sums=(
+  "https___sqlite.org_2025_sqlite-autoconf-3510000.tar.gz=42e26dfdd96aa2e6b1b1be5c88b0887f9959093f650d693cb02eb9c36d146ca5"
+  "https___anduin.linuxfromscratch.org_LFS_sqlite-doc-3510000.tar.xz="
+)
+
+# Descobre a versão mais nova olhando a página oficial de downloads do SQLite.
+# OBS: aqui retorno o "vernum" (3510000, 3500400, etc.). Se quiser transformar em
+# 3.xx.yy é só fazer a conversão fora.
+upstream_latest_version() {
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "https://sqlite.org/download.html")" || return 1
+  else
+    html="$(wget -qO- "https://sqlite.org/download.html")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*sqlite-autoconf-\([0-9]\+\)\.tar\.gz.*/\1/p' \
+    | sort -n | tail -n1
+}
+
+# BUILD real – seguindo o LFS r12.4-46 (8.52. Sqlite-3510000) 
+# LFS:
+#   tar -xf ../sqlite-doc-3510000.tar.xz
+#   ./configure --prefix=/usr --disable-static --enable-fts{4,5} \
+#       CPPFLAGS=" -D SQLITE_ENABLE_COLUMN_METADATA=1
+#                  -D SQLITE_ENABLE_UNLOCK_NOTIFY=1
+#                  -D SQLITE_ENABLE_DBSTAT_VTAB=1
+#                  -D SQLITE_SECURE_DELETE=1"
+#   make LDFLAGS.rpath=""
+#   make install
+#   install -v -m755 -d /usr/share/doc/sqlite-3.51.0
+#   cp -v -R sqlite-doc-3510000/* /usr/share/doc/sqlite-3.51.0
+#
+# Aqui adaptado para DESTDIR, empacotamento e detecção automática do diretório.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Tenta achar o diretório de build:
+  # dependendo do teu pkg ele pode descompactar como sqlite-autoconf-3510000
+  # ou como sqlite-3.51.0 – cobrimos os dois.
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d \( -name "sqlite-autoconf-${sqlite_vernum}" -o -name "sqlite-${version}" \) | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório sqlite-autoconf-${sqlite_vernum} (ou sqlite-${version}) não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  # Desempacota a documentação se o tarball estiver disponível num nível acima,
+  # igual ao livro, mas sem quebrar o build se não existir.
+  if [ -f "../sqlite-doc-${sqlite_vernum}.tar.xz" ]; then
+    tar -xf "../sqlite-doc-${sqlite_vernum}.tar.xz"
+  fi
+
+  # Configuração exata do livro r12.4-46 
+  ./configure --prefix=/usr     \
+              --disable-static  \
+              --enable-fts{4,5} \
+              CPPFLAGS="-D SQLITE_ENABLE_COLUMN_METADATA=1 \
+                        -D SQLITE_ENABLE_UNLOCK_NOTIFY=1   \
+                        -D SQLITE_ENABLE_DBSTAT_VTAB=1     \
+                        -D SQLITE_SECURE_DELETE=1"
+
+  # Compila sem gravar rpath na lib (LDFLAGS.rpath="")
+  make LDFLAGS.rpath=""
+
+  # Sem test-suite (o próprio LFS diz que não tem teste) 
+
+  # Instala dentro do DESTDIR para empacotamento
+  make install DESTDIR="$DESTDIR"
+
+  # Instala a documentação se ela tiver sido extraída
+  if [ -d "sqlite-doc-${sqlite_vernum}" ]; then
+    install -v -m755 -d "${DESTDIR}/usr/share/doc/sqlite-${version}"
+    cp -v -R "sqlite-doc-${sqlite_vernum}/"* "${DESTDIR}/usr/share/doc/sqlite-${version}"
+  fi
+}
