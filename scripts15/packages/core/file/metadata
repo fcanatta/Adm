@@ -1,0 +1,61 @@
+# /usr/src/packages/core/file/metadata
+
+name="file"
+category="core"
+version="5.46"
+release="1"
+
+sources=(
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/file-${version}.tar.gz"
+)
+
+sha256sums=()
+
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+    "zlib"
+    "xz"
+    "zstd"
+)
+
+upstream_latest_version() {
+    local url="https://astron.com/pub/file/"
+    local html
+
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "curl/wget ausentes" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*file-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+        | sort -V \
+        | tail -n1
+}
+
+# Build real (LFS 12.4 – 8.11) adaptado para DESTDIR:
+#   ./configure --prefix=/usr
+#   make
+#   make check
+#   make install
+build() {
+    : "${DESTDIR:=/}"
+
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "file-${version}" | head -n1)"
+    [ -z "$sdir" ] && echo "Diretório file-${version} não encontrado" >&2 && return 1
+
+    cd "$sdir"
+
+    ./configure --prefix=/usr
+    make
+    make check
+    make DESTDIR="${DESTDIR}" install
+}
