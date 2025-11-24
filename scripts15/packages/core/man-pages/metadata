@@ -1,0 +1,72 @@
+# /usr/src/packages/core/man-pages/metadata
+
+name="man-pages"
+category="core"
+version="6.16"
+release="1"
+
+# Fonte oficial (com variável ${version} para facilitar update)
+# Lista de releases: https://www.kernel.org/pub/linux/docs/man-pages/
+sources=(
+  "https://www.kernel.org/pub/linux/docs/man-pages/man-pages-${version}.tar.xz"
+)
+
+# Dependências de build:
+# - bash, coreutils, make, gawk: ferramentas básicas do sistema
+# - pcre2: fornece pcre2grep, que é um dos novos deps de build do man-pages 6.16 2
+depends=(
+  "bash"
+  "coreutils"
+  "gawk"
+  "make"
+  "pcre2"
+)
+
+# (Opcional) Descobrir versão mais nova no upstream para 'pkg update'
+# Usa curl ou wget para ler o índice de kernel.org e pegar o maior man-pages-*.tar.xz
+upstream_latest_version() {
+  local url="https://www.kernel.org/pub/linux/docs/man-pages/"
+  local html
+
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  elif command -v wget >/dev/null 2>&1; then
+    html="$(wget -qO- "$url")" || return 1
+  else
+    echo "curl/wget não encontrados" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*href="man-pages-\([0-9][0-9.]*\)\.tar\.xz".*/\1/p' \
+    | sort -V \
+    | tail -n1
+}
+
+# Função de build seguindo o livro LFS r12.4-46:
+#   rm -v man3/crypt*
+#   make -R GIT=false prefix=/usr install  (aqui adaptado para DESTDIR)
+build() {
+  # DESTDIR é injetado pelo gerenciador (pkg). Se não vier, cai em /
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório extraído: man-pages-<version>
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "man-pages-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Não encontrei diretório fonte man-pages-${version}" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  # Passo extra do LFS:
+  # Remover páginas de man de crypt*, pois o LFS usa as do libxcrypt em vez dessas 3
+  rm -v man3/crypt* || true
+
+  # Instalação conforme o LFS:
+  #   make -R GIT=false prefix=/usr install
+  # Aqui adicionamos DESTDIR para a instalação ir pro “root fake”
+  make -R GIT=false prefix=/usr DESTDIR="$DESTDIR" install
+}
