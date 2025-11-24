@@ -1,0 +1,102 @@
+# /usr/src/packages/core/expat/metadata
+
+name="expat"
+category="core"
+version="2.7.3"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46 (Chapter 3 – All Packages)
+# Baixa o tarball diretamente do release R_2_7_3 no GitHub do projeto.
+sources=(
+  "https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-${version}.tar.xz"
+)
+
+# Appendix C – Expat (Installation depends on):
+#   Bash, Binutils, Coreutils, Gawk, GCC, Glibc, Grep, Make, and Sed
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "sed"
+)
+
+# SHA256 real do expat-2.7.3.tar.xz
+sha256sums=(
+  "https___github.com_libexpat_libexpat_releases_download_R_2_7_3_expat-2.7.3.tar.xz=71df8f40706a7bb0a80a5367079ea75d91da4f8c65c58ec59bcdfbf7decdab9f"
+)
+
+# Descobre versão mais nova procurando tar.xz nos releases do GitHub
+upstream_latest_version() {
+  local url="https://github.com/libexpat/libexpat/releases"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*expat-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Expat-2.7.3 (LFS r12.4-46, seção 8.41)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório expat-2.7.3
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "expat-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório expat-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  #
+  #   ./configure --prefix=/usr    \
+  #               --disable-static \
+  #               --docdir=/usr/share/doc/expat-2.7.3
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --docdir=/usr/share/doc/expat-${version}
+
+  ###################################
+  # Compilação
+  #
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes (make check)
+  # Deixo opcional via RUN_TESTS para não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  ###################################
+  # Instalação da documentação em HTML/CSS (adaptado para DESTDIR)
+  #
+  #   install -v -m644 doc/*.{html,css} /usr/share/doc/expat-2.7.3
+  ###################################
+  install -v -m644 doc/*.{html,css} "${DESTDIR}/usr/share/doc/expat-${version}"
+}
