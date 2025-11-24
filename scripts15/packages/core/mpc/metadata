@@ -1,0 +1,80 @@
+# /usr/src/packages/core/mpc/metadata
+name="mpc"
+category="core"
+version="1.3.1"
+release="1"
+
+sources=(
+  "https://ftp.gnu.org/gnu/mpc/mpc-${version}.tar.gz"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "gmp"
+  "make"
+  "mpfr"
+  "sed"
+  "texinfo"
+)
+
+sha256sums=(
+  "mpc-${version}.tar.gz="
+)
+
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/mpc/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*mpc-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – MPC-1.3.1 (LFS 8.23) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "mpc-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório mpc-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --docdir=/usr/share/doc/mpc-${version}
+
+  ###################################
+  # Compilação + HTML
+  ###################################
+  make
+  make html
+
+  ###################################
+  # Testes
+  ###################################
+  make check || true
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+  make DESTDIR="${DESTDIR}" install-html
+}
