@@ -1,0 +1,66 @@
+# /usr/src/packages/core/flex/metadata
+
+name="flex"
+category="core"
+version="2.6.4"
+release="1"
+
+sources=(
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/flex-${version}.tar.gz"
+)
+
+sha256sums=()
+
+# m4 é dependência real (flex chama m4)
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+    "m4"
+)
+
+upstream_latest_version() {
+    local url="https://github.com/westes/flex/releases"
+    local html
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "curl/wget não encontrados" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*flex-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+        | sort -V | tail -n1
+}
+
+# LFS:
+#   ./configure --prefix=/usr --docdir=/usr/share/doc/flex-2.6.4 --disable-static
+#   make ; make check ; make install
+#   ln -sv flex /usr/bin/lex
+#   ln -sv flex.1 /usr/share/man/man1/lex.1
+build() {
+    : "${DESTDIR:=/}"
+
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "flex-${version}" | head -n1)"
+    [ -z "$sdir" ] && { echo "Diretório flex-${version} não encontrado" >&2; return 1; }
+
+    cd "$sdir"
+
+    ./configure --prefix=/usr \
+                --docdir=/usr/share/doc/flex-${version} \
+                --disable-static
+
+    make
+    make check
+
+    make DESTDIR="${DESTDIR}" install
+
+    # links lex dentro do DESTDIR
+    ln -sv flex   "${DESTDIR}/usr/bin/lex"
+    ln -sv flex.1 "${DESTDIR}/usr/share/man/man1/lex.1"
+}
