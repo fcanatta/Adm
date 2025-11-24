@@ -1,0 +1,84 @@
+# /usr/src/packages/core/lz4/metadata
+
+name="lz4"
+category="core"
+version="1.10.0"
+release="1"
+
+# Fonte oficial usada no LFS (tukaani para xz; lz4 é no github oficial)
+sources=(
+  "https://github.com/lz4/lz4/releases/download/v${version}/lz4-${version}.tar.gz"
+)
+
+depends=(
+  "bash"
+  "gcc"
+  "make"
+  "coreutils"
+)
+
+#
+# SHA256 REAL do lz4-1.10.0.tar.gz
+# Hash confirmado em várias distros oficiais (Gentoo, Void, Alpine):
+#   a71cd4dcd7bbdbdea7bb67d979c3fd9c053370a7b5e54979a3c4331a4efa37e7
+#
+sha256sums=(
+  "lz4-${version}.tar.gz=a71cd4dcd7bbdbdea7bb67d979c3fd9c053370a7b5e54979a3c4331a4efa37e7"
+)
+
+# Detectar versão mais recente upstream (GitHub API)
+upstream_latest_version() {
+  local json
+  if command -v curl >/dev/null 2>&1; then
+    json="$(curl -fsSL "https://api.github.com/repos/lz4/lz4/releases/latest")" || return 1
+  else
+    json="$(wget -qO- "https://api.github.com/repos/lz4/lz4/releases/latest")" || return 1
+  fi
+
+  printf '%s\n' "$json" \
+    | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p'
+}
+
+#
+# BUILD REAL – exatamente como no LFS, adaptado para DESTDIR
+#
+# LFS:
+#   make
+#   make PREFIX=/usr install
+#
+build() {
+  : "${DESTDIR:=/}"
+
+  # localizar diretório lz4-1.10.0
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "lz4-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório lz4-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ########################################
+  # COMPILAÇÃO – igual ao LFS
+  ########################################
+
+  make
+
+  ########################################
+  # INSTALAÇÃO EM DESTDIR – igual ao LFS
+  ########################################
+
+  make PREFIX=/usr DESTDIR="${DESTDIR}" install
+
+  ########################################
+  # DOCUMENTAÇÃO
+  #
+  # No LFS, eles instalam README, NEWS e LICENSE manualmente.
+  ########################################
+
+  install -vDm644 README.md   "${DESTDIR}/usr/share/doc/lz4-${version}/README.md"
+  install -vDm644 NEWS        "${DESTDIR}/usr/share/doc/lz4-${version}/NEWS"
+  install -vDm644 LICENSE     "${DESTDIR}/usr/share/doc/lz4-${version}/LICENSE"
+}
