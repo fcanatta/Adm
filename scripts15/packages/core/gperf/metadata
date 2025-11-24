@@ -1,0 +1,94 @@
+# /usr/src/packages/core/gperf/metadata
+
+name="gperf"
+category="core"
+version="3.3"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46
+# LFS lista gperf-3.3 com download em ftp.gnu.org 0
+sources=(
+  "https://ftp.gnu.org/gnu/gperf/gperf-${version}.tar.gz"
+)
+
+# Appendix C – Gperf (Installation depends on) 
+#   Bash, Binutils, Coreutils, Diffutils, Gawk, GCC, Glibc,
+#   Grep, Make, Sed, Texinfo
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do gperf-3.3.tar.gz
+# Confirmado em Homebrew core e FreeBSD ports para o mesmo tarball oficial
+sha256sums=(
+  "https___ftp.gnu.org_gnu_gperf_gperf-3.3.tar.gz=fd87e0aba7e43ae054837afd6cd4db03a3f2693deb3619085e6ed9d8d9604ad8"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/gperf/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*gperf-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Gperf-3.3 (LFS r12.4-46, seção 8.40)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório gperf-3.3
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "gperf-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório gperf-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  #   ./configure --prefix=/usr --docdir=/usr/share/doc/gperf-3.3
+  ###################################
+  ./configure --prefix=/usr \
+              --docdir=/usr/share/doc/gperf-${version}
+
+  ###################################
+  # Compilação
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes
+  #   make -j1 check
+  # O LFS recomenda -j1; aqui deixo opcional via RUN_TESTS.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make -j1 check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
