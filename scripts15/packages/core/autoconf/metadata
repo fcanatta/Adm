@@ -1,0 +1,88 @@
+# /usr/src/packages/core/autoconf/metadata
+
+name="autoconf"
+category="core"
+version="2.72"
+release="1"
+
+# Fonte oficial usada pelo LFS 12.4
+# Download: https://ftp.gnu.org/gnu/autoconf/autoconf-2.72.tar.xz
+sources=(
+  "https://ftp.gnu.org/gnu/autoconf/autoconf-${version}.tar.xz"
+)
+
+# Appendix C – Autoconf (Installation depends on):
+#   Bash, Coreutils, Grep, M4, Make, Perl, Sed, Texinfo
+depends=(
+  "bash"
+  "coreutils"
+  "grep"
+  "m4"
+  "make"
+  "perl"
+  "sed"
+  "texinfo"
+)
+
+# SHA256 real do autoconf-2.72.tar.xz
+# (hash do tarball oficial, conferido em distros que usam o .orig.tar.xz)
+sha256sums=(
+  "https___ftp.gnu.org_gnu_autoconf_autoconf-2.72.tar.xz=ba885c1319578d6c94d46e9b0dceb4014caafe2490e437a0dbca3f270a223f5a"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/autoconf/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*autoconf-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Autoconf-2.72 (LFS 12.4, seção 8.46)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório autoconf-2.72
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "autoconf-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório autoconf-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  #   ./configure --prefix=/usr
+  ###################################
+  ./configure --prefix=/usr
+
+  ###################################
+  # Compilação
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes – LFS: make check
+  # Aqui deixo opcional via RUN_TESTS pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
