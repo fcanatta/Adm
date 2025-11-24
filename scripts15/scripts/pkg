@@ -1,0 +1,857 @@
+#!/usr/bin/env bash
+# pkg - gerenciador de pacotes simples para LFS
+# Recursos:
+#  - Metadados em /usr/src/packages/<categoria>/<programa>/metadata
+#  - Build em DESTDIR, empacota em .tar.xz e .tar.zst
+#  - Registro de arquivos para remoção
+#  - Cache, logs
+#  - update/upgrade com suporte básico a git
+#  - dependências com Kahn (detecção de ciclo)
+#
+# Requer:
+#  - bash, tar, xz, zstd (tar com suporte a zstd), git, rsync (se for usar)
+#  - LFS ou sistema sem gerenciador, uso root para instalar/remover
+
+set -Eeuo pipefail
+
+########################################
+# CONFIGURAÇÃO
+########################################
+
+PKG_META_ROOT="/usr/src/packages"          # metadados
+PKG_ROOT="/var/lib/pkg"                    # banco de dados
+PKG_DB="$PKG_ROOT/db"
+PKG_LOG_DIR="$PKG_ROOT/logs"
+PKG_CACHE_ROOT="/var/cache/pkg"
+PKG_CACHE_SOURCES="$PKG_CACHE_ROOT/sources"
+PKG_CACHE_BUILDS="$PKG_CACHE_ROOT/builds"
+PKG_CACHE_PACKAGES="$PKG_CACHE_ROOT/packages"
+
+PKG_FETCH_JOBS="${PKG_FETCH_JOBS:-4}"      # downloads paralelos
+DRY_RUN=0
+
+########################################
+# LOG / ERRO / EXECUÇÃO
+########################################
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" >&2
+}
+
+die() {
+    log "ERRO: $*"
+    exit 1
+}
+
+run() {
+    # wrapper de comando respeitando dry-run
+    if (( DRY_RUN )); then
+        log "(dry-run) $*"
+    else
+        log "exec: $*"
+        "$@"
+    fi
+}
+
+ensure_root() {
+    if [[ $EUID -ne 0 ]]; then
+        die "Este comando precisa ser executado como root."
+    fi
+}
+
+ensure_dirs() {
+    run mkdir -p \
+        "$PKG_DB" \
+        "$PKG_LOG_DIR" \
+        "$PKG_CACHE_SOURCES" \
+        "$PKG_CACHE_BUILDS" \
+        "$PKG_CACHE_PACKAGES"
+}
+
+usage() {
+    cat <<EOF
+Uso: pkg [--dry-run] <comando> [args]
+
+Comandos principais:
+  build   <categoria> <nome>       - compila e gera DESTDIR + pacotes
+  install <categoria> <nome>       - build + instala e registra
+  remove  <nome>                   - remove pacote instalado
+  list                             - lista pacotes instalados
+  info   <nome>                    - mostra info do pacote instalado
+  fetch  <categoria> <nome>        - baixa fontes para cache
+  update <categoria> <nome>        - atualiza metadado para versão nova (git)
+  upgrade [--force] <cat> <nome>   - build + install versão nova ou rebuild
+  deps   <categoria> <nome>...     - mostra ordem de deps (Kahn)
+
+Opções:
+  --dry-run  - não executa nada de fato, só mostra o que faria
+
+Metadados:
+  /usr/src/packages/<categoria>/<programa>/metadata
+
+EOF
+}
+
+########################################
+# MANIPULAÇÃO DE METADADOS
+########################################
+
+# metadata define variáveis como:
+#   name="bash"
+#   category="core"
+#   version="5.3"
+#   release="1"
+#   sources=( "https://exemplo.org/$name-$version.tar.xz" "git+https://github.com/user/proj.git" )
+#   depends=( "zlib" "ncurses" )
+#   build() { ... }   # opcional (função de build customizada)
+
+META_NAME=
+META_CATEGORY=
+META_VERSION=
+META_RELEASE=
+META_SOURCES=()
+META_DEPENDS=()
+
+meta_path() {
+    local category="$1" name="$2"
+    printf '%s/%s/%s/metadata' "$PKG_META_ROOT" "$category" "$name"
+}
+
+load_metadata() {
+    local category="$1" name="$2"
+    local path
+    path="$(meta_path "$category" "$name")"
+    [[ -r "$path" ]] || die "Metadado não encontrado: $path"
+
+    # limpar variáveis anteriores
+    unset name category version release sources depends
+    unset build
+
+    # shellcheck source=/dev/null
+    . "$path"
+
+    META_NAME="${name:-$name}"
+    META_CATEGORY="${category:-$category}"
+    META_VERSION="${version:?metadado precisa de 'version'}"
+    META_RELEASE="${release:-1}"
+    META_SOURCES=("${sources[@]:-}")
+    META_DEPENDS=("${depends[@]:-}")
+
+    [[ -n "$META_NAME" ]] || die "Metadado $path: variável 'name' vazia"
+    [[ -n "$META_CATEGORY" ]] || die "Metadado $path: variável 'category' vazia"
+
+    log "Metadado carregado: $META_CATEGORY/$META_NAME $META_VERSION-$META_RELEASE"
+}
+
+########################################
+# APLICAÇÃO DE PATCHES
+########################################
+
+apply_patches_if_any() {
+    local category="$1" name="$2" srcdir="$3"
+    local meta_dir="$PKG_META_ROOT/$category/$name"
+    if [[ -d "$meta_dir/patches" ]]; then
+        log "Aplicando patches em $srcdir a partir de $meta_dir/patches"
+        local p
+        for p in "$meta_dir"/patches/*.patch; do
+            [[ -e "$p" ]] || continue
+            log "Patch: $(basename "$p")"
+            ( cd "$srcdir" && run patch -p1 < "$p" )
+        done
+    fi
+}
+
+########################################
+# DOWNLOADS (cache, paralelo)
+########################################
+
+# Normalizamos nomes de arquivos no cache para evitar conflitos
+cache_key_for_source() {
+    local src="$1"
+    # troca / por _ e remove caracteres estranhos
+    echo "$src" | sed 's#[/:]#_#g'
+}
+
+fetch_one_source() {
+    local src="$1"
+    local cachefile="$2"
+
+    if [[ -e "$cachefile" ]]; then
+        log "Fonte já em cache: $src -> $cachefile"
+        return 0
+    fi
+
+    case "$src" in
+        git+*)
+            local url="${src#git+}"
+            log "Clonando git: $url"
+            # para git, em vez de arquivo, guardamos um clone bare
+            run git clone --mirror "$url" "$cachefile"
+            ;;
+        rsync://*|*::*)
+            log "Baixando via rsync: $src"
+            run rsync -a "$src" "$cachefile"
+            ;;
+        file://*)
+            local path="${src#file://}"
+            [[ -e "$path" ]] || die "Arquivo local não encontrado: $path"
+            log "Copiando de file://: $path"
+            run cp -a "$path" "$cachefile"
+            ;;
+        /*)
+            [[ -e "$src" ]] || die "Arquivo local não encontrado: $src"
+            log "Copiando de diretório local: $src"
+            run cp -a "$src" "$cachefile"
+            ;;
+        *)
+            log "Baixando via curl/wget: $src"
+            if command -v curl >/dev/null 2>&1; then
+                run curl -L -o "$cachefile" "$src"
+            elif command -v wget >/dev/null 2>&1; then
+                run wget -O "$cachefile" "$src"
+            else
+                die "Nem curl nem wget disponíveis para baixar $src"
+            fi
+            ;;
+    esac
+}
+
+fetch_sources() {
+    local category="$1" name="$2"
+    local src
+    ensure_dirs
+
+    if ((${#META_SOURCES[@]}==0)); then
+        log "Nenhuma fonte declarada em 'sources' no metadado de $name"
+        return 0
+    fi
+
+    log "Baixando fontes para $category/$name (paralelo: $PKG_FETCH_JOBS)..."
+
+    # Comando que será alimentado no xargs
+    local tmp_list
+    tmp_list="$(mktemp)"
+    for src in "${META_SOURCES[@]}"; do
+        local key
+        key="$(cache_key_for_source "$src")"
+        printf '%s\0%s\0' "$src" "$PKG_CACHE_SOURCES/$key" >> "$tmp_list"
+    done
+
+    # xargs com 2 argumentos por vez: src e cachefile
+    if (( DRY_RUN )); then
+        # em dry-run só mostra
+        while IFS= read -r -d '' src && IFS= read -r -d '' cf; do
+            log "(dry-run) iria baixar: $src -> $cf"
+        done < "$tmp_list"
+    else
+        xargs -0 -n2 -P"$PKG_FETCH_JOBS" bash -c '
+            src="$1"; cachefile="$2"
+            '"$(declare -f log fetch_one_source)"'
+            fetch_one_source "$src" "$cachefile"
+        ' _ < "$tmp_list"
+    fi
+
+    rm -f "$tmp_list"
+}
+
+########################################
+# PREPARO DO BUILD (DESTDIR/BUILD/SRC)
+########################################
+
+prepare_build_dirs() {
+    local category="$1" name="$2"
+    local buildroot="$PKG_CACHE_BUILDS/$category-$name-$META_VERSION"
+    local destdir="$buildroot/destdir"
+    local srcroot="$buildroot/src"
+
+    run mkdir -p "$buildroot" "$destdir" "$srcroot"
+    echo "$buildroot" "$destdir" "$srcroot"
+}
+
+unpack_sources_into() {
+    local category="$1" name="$2" srcroot="$3"
+    local src
+
+    if ((${#META_SOURCES[@]}==0)); then
+        log "Nenhuma fonte para desempacotar."
+        return 0
+    fi
+
+    for src in "${META_SOURCES[@]}"; do
+        local key cachefile
+        key="$(cache_key_for_source "$src")"
+        cachefile="$PKG_CACHE_SOURCES/$key"
+
+        [[ -e "$cachefile" ]] || die "Fonte não encontrada no cache: $cachefile (rode 'pkg fetch' antes)"
+
+        case "$src" in
+            git+*)
+                local url="${src#git+}"
+                local workdir="$srcroot/git-$(cache_key_for_source "$url")"
+                if [[ -d "$workdir" ]]; then
+                    log "Reutilizando clone de trabalho: $workdir"
+                else
+                    log "Criando clone de trabalho a partir do mirror: $cachefile -> $workdir"
+                    run git clone "$cachefile" "$workdir"
+                fi
+                apply_patches_if_any "$category" "$name" "$workdir"
+                ;;
+            *.tar.*|*.tgz|*.txz|*.tar)
+                log "Desempacotando tarball $cachefile em $srcroot"
+                ( cd "$srcroot" && run tar xf "$cachefile" )
+                ;;
+            *)
+                # diretório ou arquivo simples copiado
+                log "Copiando fonte $cachefile para $srcroot"
+                run cp -a "$cachefile" "$srcroot/"
+                ;;
+        esac
+    done
+}
+
+########################################
+# REGISTRO DE PACOTES INSTALADOS
+########################################
+
+pkg_id() {
+    # gera identificador único nome-versão-release
+    local name="$1" version="$2" release="$3"
+    printf '%s-%s-%s' "$name" "$version" "$release"
+}
+
+db_entry_dir() {
+    local name="$1" version="$2" release="$3"
+    printf '%s/%s' "$PKG_DB" "$(pkg_id "$name" "$version" "$release")"
+}
+
+record_install() {
+    local name="$1" version="$2" release="$3" destdir="$4" category="$5" meta_path="$6"
+
+    local id dir
+    id="$(pkg_id "$name" "$version" "$release")"
+    dir="$(db_entry_dir "$name" "$version" "$release")"
+
+    run mkdir -p "$dir"
+
+    local files_list="$dir/files.list"
+    local info_file="$dir/pkginfo"
+    local meta_copy="$dir/metadata"
+
+    # registra lista de arquivos
+    ( cd "$destdir" && find . -mindepth 1 -print | sed 's#^\.#/#' ) > "$files_list"
+
+    # info básico
+    {
+        echo "name=$name"
+        echo "category=$category"
+        echo "version=$version"
+        echo "release=$release"
+        echo "install_time=$(date '+%F %T')"
+    } > "$info_file"
+
+    # cópia do metadado
+    run cp "$meta_path" "$meta_copy"
+
+    log "Pacote registrado: $id"
+}
+
+list_installed() {
+    ensure_dirs
+    local d
+    for d in "$PKG_DB"/*; do
+        [[ -d "$d" ]] || continue
+        local info="$d/pkginfo"
+        if [[ -r "$info" ]]; then
+            # shellcheck disable=SC1090
+            . "$info"
+            printf '%s %s-%s-%s (%s)\n' "$category" "$name" "$version" "$release" "$d"
+        fi
+    done
+}
+
+info_installed() {
+    ensure_dirs
+    local name="$1"
+    local d
+    local found=0
+    for d in "$PKG_DB"/*; do
+        [[ -d "$d" ]] || continue
+        local info="$d/pkginfo"
+        [[ -r "$info" ]] || continue
+        unset name category version release install_time
+        # shellcheck disable=SC1090
+        . "$info"
+        if [[ "$name" == "$1" ]]; then
+            found=1
+            echo "Pacote: $name"
+            echo "Categoria: $category"
+            echo "Versão: $version"
+            echo "Release: $release"
+            echo "Instalado em: ${install_time:-desconhecido}"
+            echo "DB dir: $d"
+        fi
+    done
+    ((found)) || die "Pacote não encontrado: $name"
+}
+
+########################################
+# REMOÇÃO DE PACOTES
+########################################
+
+remove_package() {
+    ensure_root
+    ensure_dirs
+    local name="$1"
+    local d
+    local found=0
+
+    for d in "$PKG_DB"/*; do
+        [[ -d "$d" ]] || continue
+        local info="$d/pkginfo"
+        [[ -r "$info" ]] || continue
+        unset name category version release
+        # shellcheck disable=SC1090
+        . "$info"
+        if [[ "$name" == "$1" ]]; then
+            found=1
+            log "Removendo pacote: $name-$version-$release"
+            local files="$d/files.list"
+            if [[ -r "$files" ]]; then
+                while IFS= read -r f; do
+                    [[ -z "$f" ]] && continue
+                    if [[ -e "$f" || -L "$f" ]]; then
+                        run rm -f "$f"
+                    else
+                        log "Aviso: arquivo já não existe: $f"
+                    fi
+                done < "$files"
+            fi
+            # tentar limpar diretórios vazios (não destrutivo)
+            # (apenas se não for dry-run)
+            if (( ! DRY_RUN )); then
+                awk -F/ '{NF--;print "/"$2; for(i=3;i<=NF;i++){printf "/%s",$i};print ""}' "$files" \
+                    | sort -u | tac | while read -r dir; do
+                        [[ -d "$dir" ]] || continue
+                        rmdir "$dir" 2>/dev/null || true
+                    done
+            fi
+            run rm -rf "$d"
+        fi
+    done
+
+    ((found)) || die "Pacote não encontrado para remoção: $name"
+}
+
+########################################
+# DEPENDÊNCIAS / KAHN
+########################################
+
+# Lê depends de um conjunto de pacotes
+load_dep_metadata() {
+    local category="$1" name="$2"
+    load_metadata "$category" "$name"
+    # imprima: pkg dep1 dep2...
+    printf '%s %s\n' "$META_NAME" "${META_DEPENDS[*]:-}"
+}
+
+# topo sort simples com algoritmo de Kahn
+toposort_kahn() {
+    # Entrada na stdin:
+    #   pkg dep1 dep2 ...
+    #
+    # Saída:
+    #   ordem de instalação (deps antes de dependentes)
+    #
+    awk '
+    {
+        pkg=$1
+        if (!(pkg in seen)) {
+            seen[pkg]=1
+        }
+        for (i=2; i<=NF; i++) {
+            dep=$i
+            if (!(dep in seen)) {
+                seen[dep]=1
+            }
+            edge[dep,pkg]=1
+            indeg[pkg]++
+        }
+    }
+    END {
+        # inicializa fila com nós de grau 0
+        for (n in seen) {
+            if (!(n in indeg)) {
+                queue[++qtail]=n
+            }
+        }
+        while (qhead<qtail) {
+            n=queue[++qhead]
+            print n
+            for (m in seen) {
+                if (edge[n,m]) {
+                    indeg[m]--
+                    if (indeg[m]==0) {
+                        queue[++qtail]=m
+                    }
+                }
+            }
+        }
+        # verifica ciclos
+        count=0
+        for (n in seen) count++
+        if (qtail != count) {
+            print "CICLO_DE_DEPENDENCIAS" > "/dev/stderr"
+            exit 1
+        }
+    }'
+}
+
+print_dep_order() {
+    # args: <categoria> <nome>...
+    local category="$1"; shift
+    local name
+    local tmp
+    tmp="$(mktemp)"
+    for name in "$@"; do
+        load_dep_metadata "$category" "$name" >> "$tmp"
+    done
+    echo "Ordem de dependências (Kahn):"
+    if ! toposort_kahn < "$tmp"; then
+        die "Detectado ciclo de dependências."
+    fi
+    rm -f "$tmp"
+}
+########################################
+# BUILD DO PACOTE (DESTDIR)
+########################################
+
+do_generic_build() {
+    # Build “genérico” para pacotes autotools simples
+    local srcroot="$1" destdir="$2"
+    local name="$3" version="$4"
+
+    # tentar achar diretório fonte (primeiro nível com configure ou meson.build etc.)
+    local sdir
+    sdir="$(find "$srcroot" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+    [[ -n "$sdir" ]] || die "Não foi possível localizar diretório fonte em $srcroot"
+
+    log "Usando diretório fonte: $sdir"
+
+    if [[ -x "$sdir/configure" ]]; then
+        ( cd "$sdir" && \
+          run ./configure --prefix=/usr && \
+          run make && \
+          run make DESTDIR="$destdir" install )
+    else
+        die "Build genérico não sabe compilar $name-$version (configure não encontrado). Defina função build() no metadado."
+    fi
+}
+
+build_package() {
+    local category="$1" name="$2"
+    ensure_dirs
+    load_metadata "$category" "$name"
+
+    fetch_sources "$category" "$name"
+
+    # preparar dirs
+    local buildroot destdir srcroot
+    read -r buildroot destdir srcroot < <(prepare_build_dirs "$category" "$name")
+
+    # desempacotar
+    unpack_sources_into "$category" "$name" "$srcroot"
+
+    # log do build
+    local log_file="$PKG_LOG_DIR/build-${META_NAME}-${META_VERSION}-${META_RELEASE}.log"
+    log "Iniciando build, log em: $log_file"
+
+    if (( DRY_RUN )); then
+        log "(dry-run) pular execução real do build"
+        return 0
+    fi
+
+    {
+        echo "=== Build de $META_NAME $META_VERSION-$META_RELEASE ==="
+        echo "Categoria: $META_CATEGORY"
+        echo "Sources: ${META_SOURCES[*]}"
+        echo "Buildroot: $buildroot"
+        echo "Destdir: $destdir"
+        echo "Srcroot: $srcroot"
+        echo "Data: $(date)"
+        echo
+    } > "$log_file"
+
+    # exportar ambiente padrão
+    export DESTDIR="$destdir"
+
+    # Se o metadado definir função build(), usamos ela; senão, build genérico
+    if declare -F build >/dev/null 2>&1; then
+        log "Usando função build() definida no metadado."
+        (
+            cd "$srcroot"
+            build >> "$log_file" 2>&1
+        )
+    else
+        log "Usando build genérico."
+        do_generic_build "$srcroot" "$destdir" "$META_NAME" "$META_VERSION" >> "$log_file" 2>&1
+    fi
+
+    log "Build concluído de $META_NAME-$META_VERSION-$META_RELEASE"
+}
+
+########################################
+# EMPACOTAMENTO (.tar.xz e .tar.zst)
+########################################
+
+package_built() {
+    local category="$1" name="$2"
+    load_metadata "$category" "$name"
+
+    local buildroot destdir srcroot
+    read -r buildroot destdir srcroot < <(prepare_build_dirs "$category" "$name")
+
+    [[ -d "$destdir" ]] || die "DESTDIR não encontrado para $name-$META_VERSION: $destdir (rode 'pkg build' antes)"
+
+    ensure_dirs
+
+    local base="${META_NAME}-${META_VERSION}-${META_RELEASE}"
+    local pkg_xz="$PKG_CACHE_PACKAGES/${base}.tar.xz"
+    local pkg_zst="$PKG_CACHE_PACKAGES/${base}.tar.zst"
+
+    if (( DRY_RUN )); then
+        log "(dry-run) empacotaria $destdir como:"
+        log "  $pkg_xz"
+        log "  $pkg_zst"
+        return 0
+    fi
+
+    ( cd "$destdir" && \
+      log "Criando pacote .tar.xz: $pkg_xz" && \
+      tar -cJf "$pkg_xz" . )
+
+    ( cd "$destdir" && \
+      log "Criando pacote .tar.zst: $pkg_zst" && \
+      tar --zstd -cf "$pkg_zst" . )
+
+    log "Pacotes criados:"
+    log "  $pkg_xz"
+    log "  $pkg_zst"
+}
+
+########################################
+# INSTALAÇÃO DO PACOTE (a partir do DESTDIR)
+########################################
+
+install_from_destdir() {
+    local category="$1" name="$2"
+    ensure_root
+    ensure_dirs
+    load_metadata "$category" "$name"
+
+    local buildroot destdir srcroot
+    read -r buildroot destdir srcroot < <(prepare_build_dirs "$category" "$name")
+
+    [[ -d "$destdir" ]] || die "DESTDIR não encontrado: $destdir (rode 'pkg build' primeiro)"
+
+    local meta_file
+    meta_file="$(meta_path "$category" "$name")"
+
+    # instalar no sistema raiz
+    if (( DRY_RUN )); then
+        log "(dry-run) instalaria conteúdo de $destdir em /"
+    else
+        log "Instalando arquivos de $destdir em /"
+        ( cd "$destdir" && tar cf - . ) | ( cd / && tar xpf - )
+    fi
+
+    # registrar
+    record_install "$META_NAME" "$META_VERSION" "$META_RELEASE" "$destdir" "$META_CATEGORY" "$meta_file"
+}
+
+########################################
+# UPDATE (buscar versão nova no upstream git)
+########################################
+
+# Implementação simplificada:
+# - só funciona para fontes git (git+URL)
+# - pega a tag "mais alta" em sort -V e, se for diferente da versão atual,
+#   atualiza a linha version= no metadado.
+
+find_git_source() {
+    local s
+    for s in "${META_SOURCES[@]}"; do
+        case "$s" in
+            git+*) echo "$s"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+get_latest_git_tag() {
+    local src="$1"
+    local url="${src#git+}"
+    local key
+    key="$(cache_key_for_source "$src")"
+    local mirror="$PKG_CACHE_SOURCES/$key"
+
+    ensure_dirs
+    if [[ ! -d "$mirror" ]]; then
+        log "Mirror git não encontrado, buscando..."
+        fetch_one_source "$src" "$mirror"
+    fi
+
+    # lista tags, ordena, pega a última
+    ( cd "$mirror" && git tag ) | sort -V | tail -n1
+}
+
+update_metadata_version() {
+    local category="$1" name="$2"
+    ensure_dirs
+    load_metadata "$category" "$name"
+
+    local git_src
+    if ! git_src="$(find_git_source)"; then
+        die "Metadado $META_NAME não tem fonte git, update automático não suportado."
+    fi
+
+    local latest
+    latest="$(get_latest_git_tag "$git_src" || true)"
+    [[ -n "$latest" ]] || die "Nenhuma tag encontrada no repositório git."
+
+    # remover prefixo comum tipo v1.2.3
+    local ver_cur="$META_VERSION"
+    local ver_new="$latest"
+    if [[ "$ver_new" == v* ]]; then
+        ver_new="${ver_new#v}"
+    fi
+
+    if [[ "$ver_new" == "$ver_cur" ]]; then
+        log "Já está na versão mais recente (tag $latest)."
+        return 0
+    fi
+
+    log "Atualizando versão em metadado: $ver_cur -> $ver_new (tag $latest)"
+
+    local path
+    path="$(meta_path "$category" "$name")"
+
+    if (( DRY_RUN )); then
+        log "(dry-run) sed -i 's/^version=.*/version=\"$ver_new\"/' $path"
+    else
+        # backup simples
+        run cp "$path" "${path}.bak.$(date +%s)"
+        run sed -i "s/^version=.*/version=\"$ver_new\"/" "$path"
+    fi
+}
+
+########################################
+# UPGRADE (update + build + install)
+########################################
+
+upgrade_package() {
+    local force=0
+    if [[ "${1:-}" == "--force" ]]; then
+        force=1
+        shift
+    fi
+    local category="$1" name="$2"
+
+    ensure_dirs
+    load_metadata "$category" "$name"
+    local old_version="$META_VERSION"
+
+    # tenta update metadado (se tiver git)
+    if ! update_metadata_version "$category" "$name"; then
+        log "Update de metadado falhou ou não necessário, seguindo com versão atual."
+    fi
+
+    # recarregar metadado (pode ter mudado versão)
+    load_metadata "$category" "$name"
+    local new_version="$META_VERSION"
+
+    if (( ! force )) && [[ "$new_version" == "$old_version" ]]; then
+        log "Versão não mudou e --force não foi usado; nada a fazer."
+        return 0
+    fi
+
+    log "Upgrade de $name: $old_version -> $new_version (force=$force)"
+
+    build_package "$category" "$name"
+    package_built "$category" "$name"
+    install_from_destdir "$category" "$name"
+}
+
+########################################
+# CLI
+########################################
+
+main() {
+    local cmd
+
+    if [[ "${1:-}" == "--dry-run" ]]; then
+        DRY_RUN=1
+        shift
+        log "Modo dry-run ATIVADO (nenhuma alteração real será feita)."
+    fi
+
+    cmd="${1:-}"
+    [[ -n "$cmd" ]] || { usage; exit 1; }
+    shift || true
+
+    case "$cmd" in
+        help|-h|--help)
+            usage
+            ;;
+        list)
+            list_installed
+            ;;
+        info)
+            [[ $# -eq 1 ]] || die "Uso: pkg info <nome>"
+            info_installed "$1"
+            ;;
+        remove)
+            [[ $# -eq 1 ]] || die "Uso: pkg remove <nome>"
+            remove_package "$1"
+            ;;
+        fetch)
+            [[ $# -eq 2 ]] || die "Uso: pkg fetch <categoria> <nome>"
+            load_metadata "$1" "$2"
+            fetch_sources "$1" "$2"
+            ;;
+        build)
+            [[ $# -eq 2 ]] || die "Uso: pkg build <categoria> <nome>"
+            build_package "$1" "$2"
+            ;;
+        pack|package)
+            [[ $# -eq 2 ]] || die "Uso: pkg package <categoria> <nome>"
+            package_built "$1" "$2"
+            ;;
+        install)
+            [[ $# -eq 2 ]] || die "Uso: pkg install <categoria> <nome>"
+            build_package "$1" "$2"
+            package_built "$1" "$2"
+            install_from_destdir "$1" "$2"
+            ;;
+        update)
+            [[ $# -eq 2 ]] || die "Uso: pkg update <categoria> <nome>"
+            update_metadata_version "$1" "$2"
+            ;;
+        upgrade)
+            if [[ "${1:-}" == "--force" ]]; then
+                [[ $# -eq 3 ]] || die "Uso: pkg upgrade --force <categoria> <nome>"
+            else
+                [[ $# -eq 2 ]] || die "Uso: pkg upgrade <categoria> <nome>"
+            fi
+            upgrade_package "$@"
+            ;;
+        deps)
+            [[ $# -ge 2 ]] || die "Uso: pkg deps <categoria> <nome>..."
+            print_dep_order "$@"
+            ;;
+        *)
+            die "Comando desconhecido: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
