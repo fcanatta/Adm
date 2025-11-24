@@ -1,0 +1,100 @@
+# /usr/src/packages/core/readline/metadata
+
+name="readline"
+category="core"
+version="8.3"
+release="1"
+
+# Fonte conforme LFS 12.4
+sources=(
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/readline-${version}.tar.gz"
+)
+
+# De propósito sem hash (pode preencher depois)
+sha256sums=()
+
+# Dependências mínimas para compilar conforme o livro:
+# - bash/coreutils/make/gcc: toolchain básica
+# - ncurses: por causa do --with-curses e link com -lncursesw
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+    "ncurses"
+)
+
+# Versão mais recente no FTP oficial do readline
+upstream_latest_version() {
+    local url="https://ftp.gnu.org/gnu/readline/"
+    local html
+
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "Nem curl nem wget disponíveis para upstream_latest_version" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*readline-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+        | sort -V \
+        | tail -n1
+}
+
+# Build REAL seguindo LFS 12.4 (8.12 Readline-8.3), adaptado para DESTDIR:
+#   sed -i '/MV.*old/d' Makefile.in
+#   sed -i '/{OLDSUFF}/c:' support/shlib-install
+#   sed -i 's/-Wl,-rpath,[^ ]*//' support/shobj-conf
+#   ./configure --prefix=/usr --disable-static --with-curses \
+#               --docdir=/usr/share/doc/readline-8.3
+#   make SHLIB_LIBS="-lncursesw"
+#   make install
+#   install -v -m644 doc/*.{ps,pdf,html,dvi} /usr/share/doc/readline-8.3
+build() {
+    : "${DESTDIR:=/}"
+
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "readline-${version}" | head -n1)"
+    if [ -z "$sdir" ]; then
+        echo "Diretório fonte readline-${version} não encontrado" >&2
+        return 1
+    fi
+
+    cd "$sdir"
+
+    ########################################
+    # Ajustes de rebuild / rpath (LFS)
+    ########################################
+    # Evita renomear libs antigas para *.old (potencial problema com ldconfig)
+    sed -i '/MV.*old/d' Makefile.in
+    sed -i '/{OLDSUFF}/c:' support/shlib-install
+
+    # Remove rpath desnecessário (e potencialmente problemático)
+    sed -i 's/-Wl,-rpath,[^ ]*//' support/shobj-conf
+
+    ########################################
+    # Configure (LFS 12.4)
+    ########################################
+    ./configure \
+        --prefix=/usr \
+        --disable-static \
+        --with-curses \
+        --docdir=/usr/share/doc/readline-${version}
+
+    ########################################
+    # Build (linkando com ncursesw)
+    ########################################
+    make SHLIB_LIBS="-lncursesw"
+
+    ########################################
+    # Instalação em DESTDIR
+    ########################################
+    make DESTDIR="${DESTDIR}" install
+
+    # Documentação, também dentro do DESTDIR
+    install -v -m644 doc/*.{ps,pdf,html,dvi} \
+        "${DESTDIR}/usr/share/doc/readline-${version}" || true
+}
