@@ -1,0 +1,82 @@
+# /usr/src/packages/core/acl/metadata
+name="acl"
+category="core"
+version="2.3.2"
+release="1"
+
+sources=(
+  "https://download.savannah.nongnu.org/releases/acl/acl-${version}.tar.xz"
+)
+
+# LFS só publica MD5. Mantemos sha256sums vazio.
+sha256sums=()
+
+# Appendix C – Installation depends on:
+# Acl:
+#   Attr, Bash, Binutils, Coreutils, GCC, Gettext, Grep, M4, Make, Perl, Sed, Texinfo
+depends=(
+  "attr"
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "gettext"
+  "grep"
+  "m4"
+  "make"
+  "perl"
+  "sed"
+  "texinfo"
+)
+
+upstream_latest_version() {
+  local url="https://download.savannah.nongnu.org/releases/acl/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*acl-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Acl-2.3.2 (LFS r12.4-46, capítulo 8.26)
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "acl-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório acl-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --docdir=/usr/share/doc/acl-${version}
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes
+  ###################################
+  # Livro avisa: test/cp.test falha porque Coreutils ainda não tem ACL.
+  # Aqui deixo como no livro (sem mascarar erro); se quiser, troque
+  # por `make check || true` na sua árvore.
+  make check
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
