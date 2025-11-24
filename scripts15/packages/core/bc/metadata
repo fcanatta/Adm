@@ -1,0 +1,58 @@
+# /usr/src/packages/core/bc/metadata
+
+name="bc"
+category="core"
+version="7.0.3"
+release="1"
+
+sources=(
+    "https://github.com/gavinhoward/bc/releases/download/${version}/bc-${version}.tar.xz"
+)
+
+sha256sums=()
+
+# - readline: por causa do -r (usa readline)
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+    "readline"
+)
+
+upstream_latest_version() {
+    local url="https://github.com/gavinhoward/bc/releases"
+    local html
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "curl/wget não encontrados" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*bc-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+        | sort -V | tail -n1
+}
+
+# LFS:
+#   CC='gcc -std=c99' ./configure --prefix=/usr -G -O3 -r
+#   make ; make test ; make install
+build() {
+    : "${DESTDIR:=/}"
+
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "bc-${version}" | head -n1)"
+    [ -z "$sdir" ] && { echo "Diretório bc-${version} não encontrado" >&2; return 1; }
+
+    cd "$sdir"
+
+    CC='gcc -std=c99' ./configure --prefix=/usr -G -O3 -r
+
+    make
+    make test
+
+    make DESTDIR="${DESTDIR}" install
+}
