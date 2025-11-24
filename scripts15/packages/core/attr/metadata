@@ -1,0 +1,81 @@
+# /usr/src/packages/core/attr/metadata
+name="attr"
+category="core"
+version="2.5.2"
+release="1"
+
+sources=(
+  "https://download.savannah.nongnu.org/releases/attr/attr-${version}.tar.gz"
+)
+
+# LFS só fornece MD5, não SHA256. Deixo vazio para o pkg pular verificação.
+sha256sums=()
+
+# Appendix C – Installation depends on:
+# Attr:
+#   Bash, Binutils, Coreutils, GCC, Gettext, Glibc, Grep, M4, Make, Perl, Sed, Texinfo
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "gettext"
+  "glibc"
+  "grep"
+  "m4"
+  "make"
+  "perl"
+  "sed"
+  "texinfo"
+)
+
+upstream_latest_version() {
+  local url="https://download.savannah.nongnu.org/releases/attr/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*attr-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Attr-2.5.2 (LFS r12.4-46, capítulo 8.25)
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "attr-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório attr-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  ###################################
+  ./configure --prefix=/usr     \
+              --disable-static  \
+              --sysconfdir=/etc \
+              --docdir=/usr/share/doc/attr-${version}
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (como no livro)
+  ###################################
+  # Requer FS com xattrs (ext2/3/4, etc)
+  make check
+
+  ###################################
+  # Instalação em DESTDIR (adaptação p/ pkg)
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
