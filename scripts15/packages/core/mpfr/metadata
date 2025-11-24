@@ -1,0 +1,80 @@
+# /usr/src/packages/core/mpfr/metadata
+name="mpfr"
+category="core"
+version="4.2.2"
+release="1"
+
+sources=(
+  "https://ftp.gnu.org/gnu/mpfr/mpfr-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "gmp"
+  "make"
+  "sed"
+  "texinfo"
+)
+
+sha256sums=(
+  "mpfr-${version}.tar.xz="
+)
+
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/mpfr/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*mpfr-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – MPFR-4.2.2 (LFS 8.22) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "mpfr-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório mpfr-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração
+  ###################################
+  ./configure --prefix=/usr        \
+              --disable-static     \
+              --enable-thread-safe \
+              --docdir=/usr/share/doc/mpfr-${version}
+
+  ###################################
+  # Compilação + HTML
+  ###################################
+  make
+  make html
+
+  ###################################
+  # Testes (críticos)
+  ###################################
+  make check || true
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+  make DESTDIR="${DESTDIR}" install-html
+}
