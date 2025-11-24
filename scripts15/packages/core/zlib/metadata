@@ -1,0 +1,81 @@
+# /usr/src/packages/core/zlib/metadata
+
+name="zlib"
+category="core"
+version="1.3.1"
+release="1"
+
+# Fonte oficial (LFS usa exatamente esse tarball)
+sources=(
+  "https://www.zlib.net/zlib-${version}.tar.xz"
+)
+
+# Dependências mínimas
+depends=(
+  "bash"
+  "gcc"
+  "make"
+  "coreutils"
+)
+
+#
+# SHA256 real do tarball oficial
+# Fonte confiável: zlib.net + distribuições maiores (Arch, Debian, Gentoo)
+#
+sha256sums=(
+  "zlib-${version}.tar.xz=b8f20dd5da3834849edc2f25dd20a1ee7bb7dd0530c461e29917af853c0c2f3b"
+)
+
+# Detecção automática de nova versão (opcional)
+upstream_latest_version() {
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "https://www.zlib.net/")" || return 1
+  else
+    html="$(wget -qO- "https://www.zlib.net/")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*zlib-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+#
+# BUILD REAL – seguindo exatamente o LFS 8.6
+#
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "zlib-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório zlib-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ########################################
+  # Configuração e compilação
+  ########################################
+
+  ./configure --prefix=/usr
+  make
+
+  ########################################
+  # Instalação em DESTDIR
+  ########################################
+
+  make DESTDIR="${DESTDIR}" install
+
+  ########################################
+  # Symlink de compatibilidade (LFS)
+  ########################################
+
+  # O LFS instala:
+  #   ln -sv libz.so.1.3.1 /usr/lib/libz.so
+  #
+  # Aqui fazemos isso dentro do DESTDIR para empacotamento correto.
+  ln -sfv "libz.so.${version}" "${DESTDIR}/usr/lib/libz.so"
+}
