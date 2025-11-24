@@ -1,0 +1,90 @@
+# /usr/src/packages/core/less/metadata
+
+name="less"
+category="core"
+version="685"
+release="1"
+
+# Fonte oficial usada pelo LFS r12.4-46 (Chapter 3 – All Packages)
+sources=(
+  "https://www.greenwoodsoftware.com/less/less-${version}.tar.gz"
+)
+
+# Appendix C – Less (Installation depends on):
+#   Bash, Binutils, Coreutils, Diffutils, GCC, Glibc, Grep, Make, Ncurses, Sed
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "ncurses"
+  "sed"
+)
+
+# SHA256 real do less-685.tar.gz
+# (mesmo tarball listado em distros/ports, ex: FreeBSD distinfo)
+sha256sums=(
+  "https___www.greenwoodsoftware.com_less_less-685.tar.gz=2701041e767e697ee420ce0825641cedc8f20b51576abe99d92c1666d332e9dc"
+)
+
+# Descobre versão mais nova na página oficial do Less
+upstream_latest_version() {
+  local url="https://www.greenwoodsoftware.com/less/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*less-\([0-9][0-9]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Less-685 (LFS r12.4-46, seção 8.43)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório less-685
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "less-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório less-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao LFS)
+  #   ./configure --prefix=/usr --sysconfdir=/etc
+  ###################################
+  ./configure --prefix=/usr --sysconfdir=/etc
+
+  ###################################
+  # Compilação
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes
+  #   make check
+  # Deixo opcional via RUN_TESTS pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
