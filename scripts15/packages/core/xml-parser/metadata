@@ -1,0 +1,87 @@
+# /usr/src/packages/core/xml-parser/metadata
+
+name="xml-parser"
+category="core"
+version="2.47"
+release="1"
+
+# Fonte oficial usada pelo LFS para XML::Parser
+sources=(
+  "https://www.cpan.org/modules/by-module/XML/XML-Parser-${version}.tar.gz"
+)
+
+# Appendix C – XML::Parser (Installation depends on):
+#   Bash, Binutils, Coreutils, Expat, GCC, Glibc, Make, and Perl
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "expat"
+  "gcc"
+  "glibc"
+  "make"
+  "perl"
+)
+
+# SHA256 real do XML-Parser-2.47.tar.gz
+sha256sums=(
+  "https___www.cpan.org_modules_by-module_XML_XML-Parser-${version}.tar.gz=ad4aae643ec784f489b956abe952432871a622d4e2b5c619e8855accbfc4d1d8"
+)
+
+# Descobre versão mais nova no CPAN
+upstream_latest_version() {
+  local url="https://www.cpan.org/modules/by-module/XML/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*XML-Parser-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – XML::Parser-2.47 (LFS r12.4-46)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório XML-Parser-2.47
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "XML-Parser-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório XML-Parser-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração – exatamente como no livro:
+  #   perl Makefile.PL
+  ###################################
+  perl Makefile.PL
+
+  ###################################
+  # Compilação:
+  #   make
+  ###################################
+  make
+
+  ###################################
+  # Testes:
+  #   make test
+  # Aqui deixo opcional via RUN_TESTS pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make test
+  fi
+
+  ###################################
+  # Instalação – adaptada para DESTDIR:
+  #   make install
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
