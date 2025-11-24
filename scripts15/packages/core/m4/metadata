@@ -1,0 +1,53 @@
+# /usr/src/packages/core/m4/metadata
+
+name="m4"
+category="core"
+version="1.4.20"
+release="1"
+
+sources=(
+    "https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/m4-${version}.tar.xz"
+)
+
+sha256sums=()
+
+depends=(
+    "bash"
+    "coreutils"
+    "make"
+    "gcc"
+)
+
+upstream_latest_version() {
+    local url="https://ftp.gnu.org/gnu/m4/"
+    local html
+    if command -v curl >/dev/null 2>&1; then
+        html="$(curl -fsSL "$url")" || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        html="$(wget -qO- "$url")" || return 1
+    else
+        echo "curl/wget não encontrados" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$html" \
+        | sed -n 's/.*m4-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+        | sort -V | tail -n1
+}
+
+# LFS: ./configure --prefix=/usr ; make ; make check ; make install
+build() {
+    : "${DESTDIR:=/}"
+
+    local sdir
+    sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "m4-${version}" | head -n1)"
+    [ -z "$sdir" ] && { echo "Diretório m4-${version} não encontrado" >&2; return 1; }
+
+    cd "$sdir"
+
+    ./configure --prefix=/usr
+    make
+    make check
+
+    make DESTDIR="${DESTDIR}" install
+}
