@@ -1,0 +1,96 @@
+# /usr/src/packages/core/packaging/metadata
+
+name="packaging"
+category="core"
+version="25.0"
+release="1"
+
+# Fonte oficial (sdist do PyPI, o mesmo usado pelo LFS – eles só espelham o tarball)
+sources=(
+  "https://files.pythonhosted.org/packages/a1/d4/1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d/packaging-${version}.tar.gz"
+)
+
+# Appendix C do LFS lista Packaging como módulo Python puro que depende só de Python. 
+depends=(
+  "python"
+)
+
+# SHA256 real do packaging-25.0.tar.gz (direto do PyPI) 
+sha256sums=(
+  "https___files.pythonhosted.org_packages_a1_d4_1fc4078c65507b51b96ca8f8c3ba19e6a61c8253c72794544580a7b6c24d_packaging-25.0.tar.gz=d443872c98d677bf60f6a1f2f8c1cb748e8fe762d2bf9d3148b5599295b0fc4f"
+)
+
+# Descobre versão mais nova do Packaging no PyPI
+upstream_latest_version() {
+  local url="https://pypi.org/project/packaging/#files"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*packaging-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Packaging-25.0 (LFS 12.4 / r12.4-46, seção 8.53) 3
+#
+# Livro faz:
+#   pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps $PWD
+#   pip3 install --no-index --find-links dist packaging
+#
+# Aqui adaptado para DESTDIR/prefix para empacotamento limpo.
+build() {
+  : "${DESTDIR:=/}"
+
+  # Descobrir python/pip
+  local pybin pipcmd
+  if command -v python3 >/dev/null 2>&1; then
+    pybin="python3"
+  else
+    pybin="python"
+  fi
+
+  if command -v pip3 >/dev/null 2>&1; then
+    pipcmd="pip3"
+  else
+    pipcmd="$pybin -m pip"
+  fi
+
+  # Diretório do sdist (packaging-25.0)
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "packaging-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório packaging-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Build da wheel – igual ao LFS
+  ###################################
+  $pipcmd wheel -w dist \
+    --no-cache-dir \
+    --no-build-isolation \
+    --no-deps \
+    "$PWD"
+
+  ###################################
+  # Instalação via pip, mas dentro de DESTDIR
+  #
+  # LFS: pip3 install --no-index --find-links dist packaging
+  # Aqui:
+  #   --prefix=/usr  -> layout de sistema
+  #   --root=DESTDIR -> árvore de staging do pacote
+  ###################################
+  $pipcmd install \
+    --no-index \
+    --find-links dist \
+    packaging \
+    --prefix=/usr \
+    --root="${DESTDIR}"
+}
