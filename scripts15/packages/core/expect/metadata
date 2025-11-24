@@ -1,0 +1,93 @@
+# /usr/src/packages/core/expect/metadata
+name="expect"
+category="core"
+version="5.45.4"
+release="1"
+
+sources=(
+  "https://prdownloads.sourceforge.net/expect/expect${version}.tar.gz"
+  "https://www.linuxfromscratch.org/patches/lfs/12.4/expect-${version}-gcc15-1.patch"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "patch"
+  "sed"
+  "tcl"
+)
+
+# SHA256 em branco para você preencher depois
+sha256sums=(
+  "expect${version}.tar.gz="
+  "expect-${version}-gcc15-1.patch="
+)
+
+# Versão mais recente upstream (melhor esforço)
+upstream_latest_version() {
+  local url="https://prdownloads.sourceforge.net/expect/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*expect\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Expect-5.45.4 (LFS 8.17) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local srcroot="$PWD"
+  local sdir
+
+  # O tarball extrai como "expect5.45.4"
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "expect*${version}*" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório Expect não encontrado (expect*${version}*)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Patch para gcc-15 (LFS 8.17.1)
+  ###################################
+  patch -Np1 -i "../expect-${version}-gcc15-1.patch"
+
+  ###################################
+  # Configuração (LFS 8.17.1)
+  ###################################
+  ./configure --prefix=/usr           \
+              --with-tcl=/usr/lib     \
+              --enable-shared         \
+              --disable-rpath         \
+              --mandir=/usr/share/man \
+              --with-tclinclude=/usr/include
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  # Testes (opcional – idêntico ao livro)
+  # make test
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  # Link da biblioteca, ajustado para DESTDIR
+  ln -svf "expect${version}/libexpect${version}.so" \
+    "${DESTDIR}/usr/lib/libexpect${version}.so"
+}
