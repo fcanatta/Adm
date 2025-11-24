@@ -1,0 +1,140 @@
+# /usr/src/packages/core/musl/metadata
+
+name="musl"
+category="core"
+version="1.2.5"
+release="1"
+
+# Fonte oficial + 2 patches da Openwall para CVE-2025-26519
+# (ambos são necessários, em ordem 1/1 depois 1/2)
+sources=(
+  "https://musl.libc.org/releases/musl-${version}.tar.gz"
+  "https://www.openwall.com/lists/musl/2025/02/13/1/1"
+  "https://www.openwall.com/lists/musl/2025/02/13/1/2"
+)
+
+# Dependências mínimas para build
+depends=(
+  "bash"
+  "coreutils"
+  "make"
+  "gcc"
+  "binutils"
+)
+
+# ATENÇÃO: no patch de verificação SHA256 que te passei,
+# a chave é o NOME DO ARQUIVO EM CACHE, que é a URL "sanitizada"
+# ( '/' e ':' viram '_' ).
+#
+# Para o tarball: "https___musl.libc.org_releases_musl-1.2.5.tar.gz"
+# Os patches vão ficar com nomes:
+#   https___www.openwall.com_lists_musl_2025_02_13_1_1
+#   https___www.openwall.com_lists_musl_2025_02_13_1_2
+#
+# SHA256 real do musl-1.2.5.tar.gz:
+#   a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4
+#   (confirmado em múltiplas fontes como Ubuntu/Fossies) 4
+#
+sha256sums=(
+  "https___musl.libc.org_releases_musl-${version}.tar.gz=a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"
+  "https___www.openwall.com_lists_musl_2025_02_13_1_1="
+  "https___www.openwall.com_lists_musl_2025_02_13_1_2="
+)
+
+# (Opcional) descobrir versão mais nova no site oficial para `pkg update`
+upstream_latest_version() {
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "https://musl.libc.org/releases.html")" || return 1
+  else
+    html="$(wget -qO- "https://musl.libc.org/releases.html")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*musl-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD:
+#  - instala musl em /usr/local/musl (padrão recomendado pelo INSTALL)
+#  - aplica os 2 patches do CVE-2025-26519
+#  - cria opcionalmente /lib/ld-musl-$ARCH.so.1 apontando pro loader da instalação
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório fonte: musl-1.2.5
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "musl-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório musl-${version} não encontrado no srcroot" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ########################################
+  # APLICAR OS 2 PATCHES DA OPENWALL
+  ########################################
+  #
+  # Os arquivos de patch foram baixados pelo `pkg fetch` e copiados
+  # para o srcroot com nomes "sanitizados" baseados na URL:
+  #
+  #   https://www.openwall.com/lists/musl/2025/02/13/1/1
+  #   https://www.openwall.com/lists/musl/2025/02/13/1/2
+  #
+  # Esses nomes viram:
+  #   ../https___www.openwall.com_lists_musl_2025_02_13_1_1
+  #   ../https___www.openwall.com_lists_musl_2025_02_13_1_2
+  #
+
+  # 1º patch: corrige validação de entrada na decodificação EUC-KR
+  if [ -f ../https___www.openwall.com_lists_musl_2025_02_13_1_1 ]; then
+    patch -Np1 -i ../https___www.openwall.com_lists_musl_2025_02_13_1_1
+  else
+    echo "AVISO: patch 1/1 (EUC-KR) não encontrado; não será aplicado." >&2
+  fi
+
+  # 2º patch: harden no caminho de saída UTF-8 do iconv
+  if [ -f ../https___www.openwall.com_lists_musl_2025_02_13_1_2 ]; then
+    patch -Np1 -i ../https___www.openwall.com_lists_musl_2025_02_13_1_2
+  else
+    echo "AVISO: patch 2/2 (UTF-8 harden) não encontrado; não será aplicado." >&2
+  fi
+
+  ########################################
+  # CONFIGURE + MAKE + MAKE INSTALL
+  ########################################
+
+  # Prefix padrão recomendado pelo INSTALL: /usr/local/musl
+  # (para não quebrar um sistema glibc existente)
+  ./configure --prefix=/usr/local/musl
+
+  make
+
+  # Instalação no DESTDIR (pkg depois empacota/instala no / real)
+  make DESTDIR="${DESTDIR}" install
+
+  ########################################
+  # LINK DO DYNAMIC LINKER EM /lib
+  #
+  # O INSTALL recomenda que o dynamic linker fique em:
+  #   /lib/ld-musl-$ARCH.so.1 5
+  # Aqui criamos um symlink da instalação em /usr/local/musl/lib.
+  ########################################
+
+  local arch ldname src_loader dst_dir dst_link
+  arch="$(uname -m)"
+  ldname="ld-musl-${arch}.so.1"
+
+  src_loader="${DESTDIR}/usr/local/musl/lib/${ldname}"
+  dst_dir="${DESTDIR}/lib"
+  dst_link="${dst_dir}/${ldname}"
+
+  if [ -e "$src_loader" ]; then
+    mkdir -p "$dst_dir"
+    ln -sfv "../usr/local/musl/lib/${ldname}" "$dst_link"
+  else
+    echo "AVISO: dynamic linker ${src_loader} não encontrado; revise prefix/syslibdir se for usar dynamic linking." >&2
+  fi
+}
