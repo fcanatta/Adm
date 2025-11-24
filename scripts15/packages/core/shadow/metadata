@@ -1,0 +1,117 @@
+# /usr/src/packages/core/shadow/metadata
+name="shadow"
+category="core"
+version="4.18.0"
+release="1"
+
+sources=(
+  # LFS/BLFS: shadow-maint no GitHub
+  # https://github.com/shadow-maint/shadow/releases/download/4.18.0/shadow-4.18.0.tar.xz
+  "https://github.com/shadow-maint/shadow/releases/download/${version}/shadow-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C – Shadow)
+depends=(
+  "acl"
+  "attr"
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "findutils"
+  "gawk"
+  "gcc"
+  "gettext"
+  "glibc"
+  "grep"
+  "libcap"
+  "libxcrypt"
+  "make"
+  "sed"
+)
+
+sha256sums=(
+  # sha256 do tarball oficial (GitHub releases)
+  "shadow-${version}.tar.xz=add4604d3bc410344433122a819ee4154b79dd8316a56298c60417e637c07608"
+)
+
+upstream_latest_version() {
+  # Lê releases do GitHub (shadow-maint)
+  local url="https://github.com/shadow-maint/shadow/releases"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*shadow-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Shadow-4.18.0 (LFS 8.29) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "shadow-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório shadow-${version} não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Ajustes de build (LFS 8.29.1)
+  ###################################
+  # Não instalar 'groups' (Coreutils já fornece) e evitar duplicar manpages
+  sed -i 's/groups$(EXEEXT) //' src/Makefile.in
+  find man -name Makefile.in -exec sed -i 's/groups\.1 / /'   {} \;
+  find man -name Makefile.in -exec sed -i 's/getspnam\.3 / /' {} \;
+  find man -name Makefile.in -exec sed -i 's/passwd\.5 / /'   {} \;
+
+  # YESCRYPT, /var/mail e PATH sem /bin:/sbin (como no livro)
+  sed -e 's:#ENCRYPT_METHOD DES:ENCRYPT_METHOD YESCRYPT:' \
+      -e 's:/var/spool/mail:/var/mail:'                   \
+      -e '/PATH=/{s@/sbin:@@;s@/bin:@@}'                  \
+      -i etc/login.defs
+
+  # O livro cria /usr/bin/passwd antes da instalação
+  # Aqui isso ainda afeta o sistema real; se quiser evitar, rode em chroot.
+  if [ ! -e /usr/bin/passwd ]; then
+    touch /usr/bin/passwd
+  fi
+
+  ###################################
+  # Configuração
+  ###################################
+  ./configure --sysconfdir=/etc   \
+              --disable-static    \
+              --with-{b,yes}crypt \
+              --without-libbsd    \
+              --with-group-name-max-length=32
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make exec_prefix=/usr DESTDIR="${DESTDIR}" install
+  make -C man DESTDIR="${DESTDIR}" install-man
+
+  ###################################
+  # Configuração pós-instalação
+  ###################################
+  cat <<'EOF'
+[shadow] Atenção:
+- As etapas de configuração do LFS (pwconv, grpconv, useradd -D, etc.)
+  NÃO são executadas aqui porque alteram contas reais.
+- Depois de instalar o pacote no sistema final, siga manualmente:
+  * Seção 8.29.2 (Configuring Shadow)
+  * Seção 8.29.3 (Setting the Root Password)
+EOF
+}
