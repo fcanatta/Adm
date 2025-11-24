@@ -1,0 +1,113 @@
+# /usr/src/packages/core/inetutils/metadata
+
+name="inetutils"
+category="core"
+version="2.6"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46
+# (Chapter 3 – All Packages aponta para ftp.gnu.org)
+sources=(
+  "https://ftp.gnu.org/gnu/inetutils/inetutils-${version}.tar.xz"
+)
+
+# Appendix C – Inetutils (Installation depends on):
+# Bash, Binutils, Coreutils, GCC, Glibc, Grep, Make, Ncurses, Patch, Sed, Texinfo, and Zlib
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "ncurses"
+  "patch"
+  "sed"
+  "texinfo"
+  "zlib"
+)
+
+# SHA256 real do inetutils-2.6.tar.xz
+# (mesmo tarball do ftp.gnu.org, hash conferido em mirrors como Fossies)
+sha256sums=(
+  "https___ftp.gnu.org_gnu_inetutils_inetutils-2.6.tar.xz=68bedbfeaf73f7d86be2a7d99bcfbd4093d829f52770893919ae174c0b2357ca"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/inetutils/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*inetutils-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Inetutils-2.6 (LFS r12.4-46, seção 8.42)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório inetutils-2.6
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "inetutils-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório inetutils-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Fix para gcc-14.1+ (como no livro)
+  ###################################
+  sed -i 's/def HAVE_TERMCAP_TGETENT/ 1/' telnet/telnet.c
+
+  ###################################
+  # Configuração (exatamente LFS 8.42.1)
+  ###################################
+  ./configure --prefix=/usr        \
+              --bindir=/usr/bin    \
+              --localstatedir=/var \
+              --disable-logger     \
+              --disable-whois      \
+              --disable-rcp        \
+              --disable-rexec      \
+              --disable-rlogin     \
+              --disable-rsh        \
+              --disable-servers
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (LFS: make check; teste libls.sh às vezes falha)
+  # Deixo opcional via RUN_TESTS pra não travar build automático.
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check || echo "[inetutils] make check retornou erro (libls.sh é conhecido por falhar às vezes)."
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+
+  ###################################
+  # Passo extra do LFS: mover ifconfig para /usr/sbin
+  # LFS faz: mv -v /usr/{,s}bin/ifconfig
+  # Aqui adaptado para DESTDIR pra não sujar o host.
+  ###################################
+  if [ -x "${DESTDIR}/usr/bin/ifconfig" ]; then
+    mkdir -p "${DESTDIR}/usr/sbin"
+    mv -v "${DESTDIR}/usr/bin/ifconfig" "${DESTDIR}/usr/sbin/ifconfig"
+  fi
+}
