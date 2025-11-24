@@ -140,6 +140,7 @@ Comandos principais:
   update <categoria> <nome>        - atualiza metadado para versão nova (git)
   upgrade [--force] <cat> <nome>   - build + install versão nova ou rebuild
   deps   <categoria> <nome>...     - mostra ordem de deps (Kahn)
+  repo-index                       - lista todos os pacotes binários no cache
 
 Opções:
   --dry-run  - não executa nada de fato, só mostra o que faria
@@ -1070,6 +1071,77 @@ install_binary_from_cache_or_build() {
 }
 
 ########################################
+# REPO INDEX - listar pacotes binários em cache
+########################################
+
+repo_index() {
+    ensure_dirs
+
+    if [[ ! -d "$PKG_CACHE_PACKAGES" ]]; then
+        echo "Nenhum diretório de pacotes binários encontrado em $PKG_CACHE_PACKAGES"
+        return 0
+    fi
+
+    # acha todos os .tar.xz / .tar.zst
+    local files
+    mapfile -t files < <(find "$PKG_CACHE_PACKAGES" -maxdepth 1 -type f \( -name "*.tar.xz" -o -name "*.tar.zst" \) | sort)
+
+    if ((${#files[@]} == 0)); then
+        echo "Nenhum pacote binário encontrado em $PKG_CACHE_PACKAGES"
+        return 0
+    fi
+
+    # cabeçalho bonito
+    printf '%-25s %-12s %-7s %-7s %-10s %-10s %-15s\n' \
+        "NAME" "VERSION" "REL" "FMT" "SIZE(KiB)" "INST" "CATEGORY"
+    printf '%-25s %-12s %-7s %-7s %-10s %-10s %-15s\n' \
+        "-------------------------" "------------" "-------" "-------" "----------" "----------" "---------------"
+
+    local f base ext name ver rel rest size_kib fmt installed cat
+
+    for f in "${files[@]}"; do
+        base="$(basename "$f")"
+
+        # extensão / formato
+        case "$base" in
+            *.tar.xz)  ext=".tar.xz"; fmt="txz" ;;
+            *.tar.zst) ext=".tar.zst"; fmt="tzst" ;;
+            *)         ext="";       fmt="??" ;;
+        esac
+
+        # tira a extensão pra pegar name-version-release
+        rest="${base%$ext}"
+
+        # separar name / version / release pela direita
+        # padrão: name-version-release (version pode ter ponto, mas não hífen no LFS normal)
+        name="${rest%-*-*}"          # tudo antes dos dois últimos "-"
+        ver_rel="${rest#${name}-}"   # o que sobrou depois do nome-
+        ver="${ver_rel%-*}"          # tira o último "-release"
+        rel="${ver_rel##*-}"         # release é o último segmento
+
+        # tamanho em KiB
+        size_kib=$(du -k "$f" | awk '{print $1}')
+
+        # instalado?
+        if is_installed "$name"; then
+            installed="yes"
+        else
+            installed="no"
+        fi
+
+        # tenta descobrir categoria pelo metadata
+        if cat="$(find_category_for_name "$name" 2>/dev/null)"; then
+            : # ok
+        else
+            cat="-"
+        fi
+
+        printf '%-25s %-12s %-7s %-7s %-10s %-10s %-15s\n' \
+            "$name" "$ver" "$rel" "$fmt" "$size_kib" "$installed" "$cat"
+    done
+}
+
+########################################
 # INSTALAÇÃO DO PACOTE (a partir do DESTDIR)
 ########################################
 
@@ -1286,6 +1358,9 @@ main() {
         info)
             [[ $# -eq 1 ]] || die "Uso: pkg info <nome>"
             info_installed "$1"
+            ;;
+        repo-index)
+            repo_index
             ;;
         remove)
             [[ $# -eq 1 ]] || die "Uso: pkg remove <nome>"
