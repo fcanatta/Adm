@@ -1347,45 +1347,9 @@ install_from_destdir() {
     record_install "$META_NAME" "$META_VERSION" "$META_RELEASE" "$destdir" "$META_CATEGORY" "$meta_file"
 }
 
-########################################
-# UPDATE (buscar versão nova no upstream git)
-########################################
-
-# Implementação simplificada:
-# - só funciona para fontes git (git+URL)
-# - pega a tag "mais alta" em sort -V e, se for diferente da versão atual,
-#   atualiza a linha version= no metadado.
-
-# find_git_source() {
-#    local s
-#    for s in "${META_SOURCES[@]}"; do
-#        case "$s" in
-#           git+*) echo "$s"; return 0 ;;
-#        esac
-#    done
-#    return 1
-#}
-
-#get_latest_git_tag() {
-#    local src="$1"
-#    local url="${src#git+}"
-#    local key
-#    key="$(cache_key_for_source "$src")"
-#    local mirror="$PKG_CACHE_SOURCES/$key"
-
-#    ensure_dirs
-#    if [[ ! -d "$mirror" ]]; then
-#        log "Mirror git não encontrado, buscando..."
-#        fetch_one_source "$src" "$mirror"
-#    fi
-
-    # lista tags, ordena, pega a última
-#    ( cd "$mirror" && git tag ) | sort -V | tail -n1
-#}
-
-########################################
+##########################################
 # UPDATE (buscar versão nova no upstream)
-########################################
+##########################################
 
 find_git_source() {
     local s
