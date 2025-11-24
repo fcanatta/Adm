@@ -1,0 +1,95 @@
+# /usr/src/packages/core/binutils/metadata
+name="binutils"
+category="core"
+version="2.45.1"
+release="1"
+
+sources=(
+  "https://ftp.gnu.org/gnu/binutils/binutils-${version}.tar.xz"
+)
+
+# Dependências reais (Installation depends on, Appendix C)
+depends=(
+  "bash"
+  "binutils"   # bootstrap / host
+  "coreutils"
+  "diffutils"
+  "file"
+  "flex"
+  "gawk"
+  "gcc"
+  "glibc"
+  "grep"
+  "make"
+  "perl"
+  "pkgconf"
+  "sed"
+  "texinfo"
+  "zlib"
+  "zstd"
+)
+
+sha256sums=(
+  "binutils-${version}.tar.xz="
+)
+
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/binutils/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+  printf '%s\n' "$html" \
+    | sed -n 's/.*binutils-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – Binutils-2.45.x (LFS 8.20) com DESTDIR
+build() {
+  : "${DESTDIR:=/}"
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "binutils-${version%%.1}" -o -name "binutils-${version}" | head -n1)"
+  if [ -z "$sdir" ]; then
+    echo "Diretório binutils-${version} (ou binutils-${version%%.1}) não encontrado" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  mkdir -v build
+  cd build
+
+  ###################################
+  # Configuração (baseado em LFS 8.20.1)
+  ###################################
+  ../configure --prefix=/usr        \
+               --enable-gold        \
+               --enable-ld=default  \
+               --enable-plugins     \
+               --enable-shared      \
+               --disable-werror     \
+               --enable-64-bit-bfd  \
+               --with-system-zlib
+
+  ###################################
+  # Compilação
+  ###################################
+  make tooldir=/usr
+
+  ###################################
+  # Testes
+  ###################################
+  # Testes podem ser longos; manter comportamento do livro
+  make -k check || true
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make tooldir=/usr DESTDIR="${DESTDIR}" install
+
+  # Remoção das libs estáticas e docs gprofng (como LFS)
+  rm -fv "${DESTDIR}"/usr/lib/lib{bfd,ctf,ctf-nobfd,gprofng,opcodes,sframe}.a
+  rm -rfv "${DESTDIR}/usr/share/doc/gprofng"
+}
