@@ -1,0 +1,85 @@
+# /usr/src/packages/core/gdbm/metadata
+
+name="gdbm"
+category="core"
+version="1.26"
+release="1"
+
+# Fonte oficial usada no LFS r12.4-46 (Chapter 3 – All Packages)
+sources=(
+  "https://ftp.gnu.org/gnu/gdbm/gdbm-${version}.tar.gz"
+)
+
+# Appendix C – GDBM (Installation depends on):
+# Bash, Binutils, Coreutils, Diffutils, GCC, Grep, Make, and Sed
+depends=(
+  "bash"
+  "binutils"
+  "coreutils"
+  "diffutils"
+  "gcc"
+  "grep"
+  "make"
+  "sed"
+)
+
+# SHA256 real do gdbm-1.26.tar.gz
+# (hash de gdbm_1.26.orig.tar.gz, que é o mesmo tarball oficial)
+sha256sums=(
+  "https___ftp.gnu.org_gnu_gdbm_gdbm-1.26.tar.gz=6a24504a14de4a744103dcb936be976df6fbe88ccff26065e54c1c47946f4a5e"
+)
+
+# Descobre versão mais nova no diretório oficial GNU
+upstream_latest_version() {
+  local url="https://ftp.gnu.org/gnu/gdbm/"
+  local html
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$url")" || return 1
+  else
+    html="$(wget -qO- "$url")" || return 1
+  fi
+
+  printf '%s\n' "$html" \
+    | sed -n 's/.*gdbm-\([0-9][0-9.]*\)\.tar\.gz.*/\1/p' \
+    | sort -V | tail -n1
+}
+
+# BUILD REAL – GDBM-1.26 (LFS r12.4-46, seção 8.39.1)
+build() {
+  : "${DESTDIR:=/}"
+
+  # Encontrar diretório gdbm-1.26
+  local sdir
+  sdir="$(find . -mindepth 1 -maxdepth 1 -type d -name "gdbm-${version}" | head -n1)"
+
+  if [ -z "$sdir" ]; then
+    echo "Diretório gdbm-${version} não encontrado em $(pwd)" >&2
+    return 1
+  fi
+
+  cd "$sdir"
+
+  ###################################
+  # Configuração (igual ao livro)
+  ###################################
+  ./configure --prefix=/usr    \
+              --disable-static \
+              --enable-libgdbm-compat
+
+  ###################################
+  # Compilação
+  ###################################
+  make
+
+  ###################################
+  # Testes (como no livro)
+  ###################################
+  if [ "${RUN_TESTS:-0}" = 1 ]; then
+    make check
+  fi
+
+  ###################################
+  # Instalação em DESTDIR
+  ###################################
+  make DESTDIR="${DESTDIR}" install
+}
