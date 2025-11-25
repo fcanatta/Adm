@@ -1,0 +1,23 @@
+# Como usar isso na prática
+
+1. Salva o arquivo em:
+
+/var/lib/adm/recipes/cross-toolchain/gcc-pass1.sh
+
+2. Garante que você tem:
+
+binutils-pass1 recipe já criada.
+
+variáveis de ambiente, por exemplo:
+
+export ADM_CROSS_TARGET=x86_64-lfs-linux-gnu
+export LFS=/mnt/lfs              # se você estiver seguindo o LFS “puro”
+# ou ADM_CROSS_SYSROOT=/mnt/lfs  # se preferir usar outra var
+
+3. Constrói:
+
+adm build gcc-pass1
+
+4. Para o grupo inteiro (quando tiver GCC pass2, headers, glibc cross etc):
+
+adm build cross-toolchain
