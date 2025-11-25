@@ -435,6 +435,13 @@ build_pkg() {
 
     if declare -f pkg_build >/dev/null 2>&1; then
       log_info "Etapa: build()"
+
+      # Se ADM_JOBS estiver definido (ex: 8), usa make -j8 via MAKEFLAGS
+      if [[ -n "${ADM_JOBS:-}" ]]; then
+        export MAKEFLAGS="-j${ADM_JOBS}"
+        log_info "Usando MAKEFLAGS=$MAKEFLAGS"
+      fi
+
       PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_build
     else
       die "Recipe $pkg não define função pkg_build()"
@@ -535,6 +542,37 @@ install_from_cache() {
   write_meta "$pkg" "$version" "$release" "${PKG_DEPENDS:-}"
 }
 
+reverse_deps() {
+  local target="$1"
+  local meta name depends dep
+
+  # Lista pacotes que dependem de $target, lendo todos os .meta
+  for meta in "$ADM_META_DIR"/*.meta; do
+    [[ -e "$meta" ]] || continue
+
+    name=""
+    depends=""
+
+    while IFS='=' read -r key value; do
+      case "$key" in
+        name)    name="$value" ;;
+        depends) depends="$value" ;;
+      esac
+    done < "$meta"
+
+    # pula o próprio pacote
+    [[ "$name" == "$target" ]] && continue
+
+    # vê se $target está na lista de depends
+    for dep in $depends; do
+      if [[ "$dep" == "$target" ]]; then
+        echo "$name"
+        break
+      fi
+    done
+  done
+}
+
 # -------------------------------------------------------------
 # Remoção via manifesto
 # -------------------------------------------------------------
@@ -542,6 +580,17 @@ remove_pkg() {
   local pkg="$1"
   local manifest
   manifest="$(manifest_file_for "$pkg")"
+
+ # Segurança: não remover se outros pacotes dependem dele (a menos que force)
+  if [[ "${ADM_REMOVE_FORCE:-0}" != "1" ]]; then
+    local users
+    users="$(reverse_deps "$pkg" || true)"
+    if [[ -n "$users" ]]; then
+      log_error "Não é seguro remover $pkg: os seguintes pacotes dependem dele:"
+      printf '  - %s\n' $users
+      die "Use ADM_REMOVE_FORCE=1 adm remove $pkg para forçar, se tiver certeza."
+    fi
+  fi
 
   [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
 
@@ -871,6 +920,7 @@ Uso:
   adm deps <pacote>            - Mostrar dependências (receta)
   adm resolve <p1> [p2 ...]    - Resolver dependências e listar em ordem (Kahn-like)
   adm list                     - Listar pacotes instalados
+  adm info <pacote>            - Mostra meta + recipe do pacote
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
   adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente  
@@ -973,6 +1023,45 @@ cmd_resolve() {
 
 cmd_list() {
   list_installed
+}
+
+cmd_info() {
+  local pkg="$1"
+
+  log_info "Mostrando informações sobre o pacote '$pkg'"
+
+  local meta="$ADM_META_DIR/$pkg.meta"
+
+  if [[ -f "$meta" ]]; then
+    echo "=== Instalação atual ==="
+    while IFS='=' read -r key value; do
+      case "$key" in
+        name)        echo "Nome instalado:    $value" ;;
+        version)     echo "Versão instalada:  $value" ;;
+        release)     echo "Release instalada: $value" ;;
+        depends)     echo "Depende de:        $value" ;;
+        installed_at)echo "Instalado em:      $value" ;;
+      esac
+    done < "$meta"
+  else
+    echo "Pacote '$pkg' não está registrado como instalado."
+  fi
+
+  echo
+  echo "=== Recipe ==="
+  if load_recipe "$pkg"; then
+    echo "PKG_NAME:        ${PKG_NAME:-}"
+    echo "PKG_VERSION:     ${PKG_VERSION:-}"
+    echo "PKG_RELEASE:     ${PKG_RELEASE:-}"
+    echo "PKG_DESC:        ${PKG_DESC:-}"
+    echo "PKG_URL:         ${PKG_URL:-}"
+    echo "PKG_LICENSE:     ${PKG_LICENSE:-}"
+    echo "PKG_GROUPS:      ${PKG_GROUPS:-}"
+    echo "PKG_DEPENDS:     ${PKG_DEPENDS:-}"
+    echo "PKG_SOURCES:     ${PKG_SOURCES:-}"
+  else
+    echo "Recipe para '$pkg' não encontrada em $ADM_RECIPES_DIR."
+  fi
 }
 
 cmd_list_upgrades() {
@@ -1141,6 +1230,10 @@ main() {
       ;;
     list)
       cmd_list
+      ;;
+    info)
+      [[ $# -eq 1 ]] || die "Uso: adm info <pacote>"
+      cmd_info "$1"
       ;;
     list-upgrades)
       cmd_list_upgrades
