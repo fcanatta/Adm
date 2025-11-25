@@ -771,6 +771,51 @@ build_pkg_if_needed() {
 }
 
 # -------------------------------------------------------------
+# Instalar pacote "do jeito certo":
+# - se já instalado e atualizado -> pula
+# - se instalado mas desatualizado -> rebuild
+# - se não instalado:
+#     - se tiver binário no cache -> instala do cache
+#     - senão -> constrói (build_pkg)
+# -------------------------------------------------------------
+install_pkg_if_needed() {
+  local pkg="$1"
+
+  # Garante que recipe foi carregada (para PKG_VERSION/PKG_RELEASE)
+  load_recipe "$pkg"
+  local version="$PKG_VERSION"
+  local release="${PKG_RELEASE:-1}"
+
+  if is_installed "$pkg"; then
+    if is_pkg_up_to_date "$pkg"; then
+      log_info "[$pkg] já está instalado e na versão mais recente, pulando."
+      return 0
+    else
+      local current latest
+      current="$(get_installed_version "$pkg" || echo "?")"
+      latest="$(upstream_version_for "$pkg" || echo "$version")"
+      log_info "[$pkg] instalado, mas desatualizado (atual=$current, upstream=$latest). Rebuild..."
+      build_pkg "$pkg"
+      return 0
+    fi
+  fi
+
+  # Não instalado ainda
+  local fname_zst fname_xz arch
+  arch="$(uname -m)"
+  fname_zst="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "zst")"
+  fname_xz="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "xz")"
+
+  if [[ -f "$fname_zst" || -f "$fname_xz" ]]; then
+    log_info "[$pkg] não instalado, mas binário encontrado no cache. Instalando do cache..."
+    install_from_cache "$pkg" "$version" "$release"
+  else
+    log_info "[$pkg] não instalado e sem binário no cache. Construindo (build_pkg)..."
+    build_pkg "$pkg"
+  fi
+}
+
+# -------------------------------------------------------------
 # Suporte a chroot
 # -------------------------------------------------------------
 chroot_build_pkg() {
@@ -795,7 +840,7 @@ ${C_CYAN}adm${C_RESET} - Gerenciador simples de programas para Linux From Scratc
 
 Uso:
   adm build <pacote|grupo>     - Construir pacote OU categoria (core, base, etc)
-  adm install <pacote>         - Instalar a partir do cache binário (ou build se não existir)
+  adm install <p1> [p2 ...]    - Instalar pacote(s) + dependências (do cache ou construindo)
   adm remove <pacote>          - Remover pacote usando manifesto
   adm deps <pacote>            - Mostrar dependências (receta)
   adm resolve <p1> [p2 ...]    - Resolver dependências e listar em ordem (Kahn-like)
@@ -856,20 +901,23 @@ cmd_build() {
 }
 
 cmd_install() {
-  local pkg="$1"
-  load_recipe "$pkg"
-  local version="$PKG_VERSION" release="${PKG_RELEASE:-1}"
-  if is_installed "$pkg"; then
-    log_info "Pacote $pkg já instalado (versão $(get_installed_version "$pkg"))."
-    return 0
+  if (( $# < 1 )); then
+    die "Uso: adm install <pacote> [outro_pacote ...]"
   fi
-  if [[ -f "$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "zst")" || \
-        -f "$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "xz")" ]]; then
-    install_from_cache "$pkg" "$version" "$release"
-  else
-    log_info "Pacote binário não encontrado no cache; construindo."
-    build_pkg "$pkg"
-  fi
+
+  local -a req_pkgs=("$@")
+  local -a order=()
+
+  # Resolve dependências de todos os pacotes pedidos
+  # topo_sort_pkgs já inclui deps recursivamente
+  mapfile -t order < <(topo_sort_pkgs "${req_pkgs[@]}")
+
+  log_info "Ordem de instalação (com dependências): ${order[*]}"
+
+  local p
+  for p in "${order[@]}"; do
+    install_pkg_if_needed "$p"
+  done
 }
 
 cmd_remove() {
