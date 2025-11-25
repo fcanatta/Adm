@@ -218,103 +218,120 @@ list_installed() {
 download_one() {
   local url="$1"
   local dest="$2"
+  local sha256="$3"
+  local md5="$4"
 
-  if [[ -f "$dest" ]]; then
-    log_debug "Fonte já em cache: $dest"
-    return 0
-  fi
+  # Tenta no máximo duas vezes: download + (se necessário) redownload
+  local attempt
+  for attempt in 1 2; do
+    if (( attempt == 2 )); then
+      log_warn "Nova tentativa de download para $(basename "$dest")..."
+    fi
 
-  log_info "Baixando fonte: $url -> $dest"
+    if [[ -f "$dest" ]]; then
+      log_debug "Fonte já em cache: $dest"
+    else
+      log_info "Baixando fonte: $url -> $dest"
 
-  case "$url" in
-    git+*|git://*|*.git)
-      ensure_cmd git
-      local tmp_dir="${dest}.git-tmp"
-      rm -rf "$tmp_dir"
-      git clone --depth 1 "${url#git+}" "$tmp_dir"
-      ( cd "$tmp_dir" && git archive --format=tar --output="$dest" HEAD )
-      rm -rf "$tmp_dir"
-      ;;
-    http://*|https://*|ftp://*)
-      if command -v curl >/dev/null 2>&1; then
-        curl -L --fail --retry 3 -o "$dest" "$url"
-      elif command -v wget >/dev/null 2>&1; then
-        wget -O "$dest" "$url"
-      else
-        die "Nem curl nem wget encontrados para baixar: $url"
-      fi
-      ;;
-    rsync://*)
-      ensure_cmd rsync
-      rsync -av "$url" "$dest"
-      ;;
-    *)
-      die "Esquema de URL não suportado: $url"
-      ;;
-  esac
+      case "$url" in
+        git+*|git://*|*.git)
+          ensure_cmd git
+          local tmp_dir="${dest}.git-tmp"
+          rm -rf "$tmp_dir"
+          git clone --depth 1 "${url#git+}" "$tmp_dir"
+          ( cd "$tmp_dir" && git archive --format=tar --output="$dest" HEAD )
+          rm -rf "$tmp_dir"
+          ;;
+        http://*|https://*|ftp://*)
+          if command -v curl >/dev/null 2>&1; then
+            curl -L --fail --retry 3 -o "$dest" "$url"
+          elif command -v wget >/dev/null 2>&1; then
+            wget -O "$dest" "$url"
+          else
+            die "Nem curl nem wget encontrados para baixar: $url"
+          fi
+          ;;
+        rsync://*)
+          ensure_cmd rsync
+          rsync -av "$url" "$dest"
+          ;;
+        *)
+          die "Esquema de URL não suportado: $url"
+          ;;
+      esac
+    fi
 
-# -----------------------------------------
-  # Verificação de checksums, se definidos na recipe
-  # -----------------------------------------
-  if [[ -n "${PKG_SHA256SUM:-}" ]]; then
-    log_info "Verificando SHA256 de $(basename "$dest")"
-    local calc_sha
-    calc_sha="$(sha256sum "$dest" | awk '{print $1}')"
-
-    if [[ "$calc_sha" != "$PKG_SHA256SUM" ]]; then
-      log_warn "SHA256 incorreto para $(basename "$dest"). Esperado: $PKG_SHA256SUM Obtido: $calc_sha"
-      log_warn "Removendo e baixando novamente..."
-      rm -f "$dest"
-      download_one "$url" "$dest"  # baixa de novo
-
-      # Verifica novamente
+    # -----------------------------------------
+    # Verificação de SHA256, se fornecido
+    # -----------------------------------------
+    if [[ -n "$sha256" ]]; then
+      log_info "Verificando SHA256 de $(basename "$dest")"
+      local calc_sha
       calc_sha="$(sha256sum "$dest" | awk '{print $1}')"
-      [[ "$calc_sha" == "$PKG_SHA256SUM" ]] || die "SHA256 incorreto novamente. Abortando."
+
+      if [[ "$calc_sha" != "$sha256" ]]; then
+        log_warn "SHA256 incorreto para $(basename "$dest"). Esperado: $sha256 Obtido: $calc_sha"
+        log_warn "Removendo para tentar baixar novamente..."
+        rm -f "$dest"
+        continue
+      fi
     fi
-  fi
 
-  if [[ -n "${PKG_MD5SUM:-}" ]]; then
-    log_info "Verificando MD5 de $(basename "$dest")"
-    local calc_md5
-    calc_md5="$(md5sum "$dest" | awk '{print $1}')"
-
-    if [[ "$calc_md5" != "$PKG_MD5SUM" ]]; then
-      log_warn "MD5 incorreto para $(basename "$dest"). Esperado: $PKG_MD5SUM Obtido: $calc_md5"
-      log_warn "Removendo e baixando novamente..."
-      rm -f "$dest"
-      download_one "$url" "$dest"
-
-      # Verifica novamente
+    # -----------------------------------------
+    # Verificação de MD5, se fornecido
+    # -----------------------------------------
+    if [[ -n "$md5" ]]; then
+      log_info "Verificando MD5 de $(basename "$dest")"
+      local calc_md5
       calc_md5="$(md5sum "$dest" | awk '{print $1}')"
-      [[ "$calc_md5" == "$PKG_MD5SUM" ]] || die "MD5 incorreto novamente. Abortando."
-    fi
-  fi
 
+      if [[ "$calc_md5" != "$md5" ]]; then
+        log_warn "MD5 incorreto para $(basename "$dest"). Esperado: $md5 Obtido: $calc_md5"
+        log_warn "Removendo para tentar baixar novamente..."
+        rm -f "$dest"
+        continue
+      fi
+    fi
+
+    # Se chegou aqui, passou em todas as checagens
+    return 0
+  done
+
+  die "Falha ao baixar/verificar $(basename "$dest") após duas tentativas."
 }
 
 download_sources_parallel() {
   local -a urls=("$@")
-  local pids=()
+  local -a sha256s md5s
+  local -a pids=()
   local -i running=0
+  local -i idx=0
 
   mkdir -p "$ADM_SRC_CACHE"
 
+  # Transforma PKG_SHA256S / PKG_MD5S (string) em arrays alinhados
+  IFS=' ' read -r -a sha256s <<< "${PKG_SHA256S:-}"
+  IFS=' ' read -r -a md5s    <<< "${PKG_MD5S:-}"
+
   for url in "${urls[@]}"; do
-    [[ -n "$url" ]] || continue
-    local filename dest
+    [[ -n "$url" ]] || { ((idx++)); continue; }
+
+    local filename dest sha md5
     filename="$(basename "${url%%\?*}")"
     dest="$ADM_SRC_CACHE/$filename"
+    sha="${sha256s[$idx]:-}"
+    md5="${md5s[$idx]:-}"
 
     (
       set -e
-      download_one "$url" "$dest"
+      download_one "$url" "$dest" "$sha" "$md5"
     ) &
     pids+=("$!")
     ((running++))
 
     if (( running >= ADM_DL_JOBS )); then
       # Espera todos terminarem antes de continuar
-      local pid status failed=0
+      local pid failed=0
       for pid in "${pids[@]}"; do
         if ! wait "$pid"; then
           failed=1
@@ -324,11 +341,13 @@ download_sources_parallel() {
       running=0
       (( failed == 0 )) || die "Falha em pelo menos um download de fonte."
     fi
+
+    ((idx++))
   done
 
-  # Espera pids restantes
-  if (( ${#pids[@]} > 0 )); then
-    local pid status failed=0
+  # Espera os últimos downloads, se sobrou algo rodando
+  if (( running > 0 )); then
+    local pid failed=0
     for pid in "${pids[@]}"; do
       if ! wait "$pid"; then
         failed=1
