@@ -3,6 +3,7 @@
 
 PKG_NAME="man-pages"
 PKG_VERSION="6.16"
+PKG_GROUPS="core"
 PKG_RELEASE="1"
 
 PKG_DESC="Coleção de páginas de manual do projeto Linux man-pages"
