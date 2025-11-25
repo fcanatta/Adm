@@ -1,3 +1,19 @@
+Novo manifesto com SHA256 (para builds novos):
+
+adm build man-pages
+adm verify man-pages
+
+Verificar todos:
+
+adm verify-all
+
+Upgrade mais esperto:
+
+adm list-upgrades
+adm upgrade           # atualiza todos que precisam
+adm upgrade bash gcc  # só atualiza esses se realmente estiverem desatualizados
+
+
 Como usar o novo modo dry-run
 
 # Ver plano de build (com deps) de um pacote
