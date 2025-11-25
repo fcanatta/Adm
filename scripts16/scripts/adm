@@ -63,6 +63,17 @@ die() {
   exit 1
 }
 
+dry_run_enabled() {
+  case "${ADM_DRY_RUN:-0}" in
+    1|true|yes|on|ON|TRUE)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # -------------------------------------------------------------
 # Inicialização de diretórios
 # -------------------------------------------------------------
