@@ -18,12 +18,6 @@ set -euo pipefail
 
 ADM_VERSION="0.1.0"
 
-# -----------------------------------------
-# Logging global (tudo que aparece na tela vai para log)
-# -----------------------------------------
-exec > >(tee -a "$ADM_LOG_DIR/adm.log") 2>&1
-log_info "Iniciando execução do adm em $(date)"
-
 # -------------------------------------------------------------
 # Configuração básica (pode ser sobrescrita por variáveis de ambiente)
 # -------------------------------------------------------------
@@ -828,7 +822,16 @@ chroot_build_pkg() {
 
   # Assumimos que o script 'adm' está disponível dentro do chroot em /usr/bin/adm
   log_info "Executando build de $pkg em chroot $chroot_dir"
-  chroot "$chroot_dir" /usr/bin/env ADM_PREFIX="$ADM_PREFIX" ADM_STATE_DIR="$ADM_STATE_DIR" ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS" /usr/bin/adm build "$pkg"
+  chroot "$chroot_dir" /usr/bin/env \
+    ADM_PREFIX="$ADM_PREFIX" \
+    ADM_STATE_DIR="$ADM_STATE_DIR" \
+    ADM_CACHE_DIR="$ADM_CACHE_DIR" \
+    ADM_SRC_CACHE="$ADM_SRC_CACHE" \
+    ADM_BIN_CACHE="$ADM_BIN_CACHE" \
+    ADM_BUILD_ROOT="$ADM_BUILD_ROOT" \
+    ADM_LOG_DIR="$ADM_LOG_DIR" \
+    ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS" \
+    /usr/bin/adm build "$pkg"
 }
 
 # -------------------------------------------------------------
@@ -994,17 +997,21 @@ cmd_chroot_build() {
 main() {
   init_dirs
 
+  # Logging global (tudo que aparece na tela também vai para o log)
+  exec > >(tee -a "$ADM_LOG_DIR/adm.log") 2>&1
+  log_info "Iniciando execução do adm em $(date)"
+
   local cmd="${1:-help}"
   shift || true
 
   case "$cmd" in
     build)
-      [[ $# -eq 1 ]] || die "Uso: adm build <pacote>"
+      [[ $# -eq 1 ]] || die "Uso: adm build <pacote|grupo>"
       cmd_build "$1"
       ;;
     install)
-      [[ $# -eq 1 ]] || die "Uso: adm install <pacote>"
-      cmd_install "$1"
+      (( $# >= 1 )) || die "Uso: adm install <pacote> [outro_pacote ...]"
+      cmd_install "$@"
       ;;
     remove)
       [[ $# -eq 1 ]] || die "Uso: adm remove <pacote>"
