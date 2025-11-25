@@ -1,3 +1,26 @@
+Como usar o novo modo dry-run
+
+# Ver plano de build (com deps) de um pacote
+ADM_DRY_RUN=1 adm build gcc-pass1
+
+# Ver plano de build de um grupo (core, cross-toolchain, etc)
+ADM_DRY_RUN=1 adm build cross-toolchain
+
+# Ver o que seria instalado/reconstruído
+ADM_DRY_RUN=1 adm install bash coreutils
+
+# Ver o que seria removido de um pacote
+ADM_DRY_RUN=1 adm remove glibc-pass1
+
+# Ver o que seria atualizado
+ADM_DRY_RUN=1 adm upgrade
+
+E para verificar um pacote instalado:
+
+adm verify binutils-pass1
+adm verify gcc-pass1
+
+
 Pronto: qualquer make chamado dentro de pkg_build (ou do que ela chamar) passa a usar -jN.
 
 Você controla a quantidade de jobs assim:
