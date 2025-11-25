@@ -1,5 +1,5 @@
 # Recipe para adm: man-pages-6.16
-# Caminho sugerido: /var/lib/adm/recipes/man-pages.sh
+# Caminho sugerido: /var/lib/adm/recipes/core/man-pages/man-pages.sh
 
 PKG_NAME="man-pages"
 PKG_VERSION="6.16"
