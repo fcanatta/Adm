@@ -8,7 +8,7 @@ PKG_RELEASE="1"
 PKG_DESC="Linux ${PKG_VERSION} API Headers para o toolchain (expostos em /usr/include)"
 PKG_URL="https://www.kernel.org/"
 PKG_LICENSE="GPL-2.0-only"
-PKG_GROUPS="cross-toolchain"
+PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
 # Fonte conforme capítulo 3.2 (All Packages)
 # Linux (6.17.8) - Download + MD5
