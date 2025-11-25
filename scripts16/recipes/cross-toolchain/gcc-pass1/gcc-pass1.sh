@@ -8,7 +8,7 @@ PKG_RELEASE="1"
 PKG_DESC="GCC (Passo 1 do cross-toolchain temporário)"
 PKG_URL="https://gcc.gnu.org/"
 PKG_LICENSE="GPL-3.0-or-later"
-PKG_GROUPS="cross-toolchain"
+PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
 # Fontes conforme capítulo 3.2 (All Packages) do LFS r12.4-46
 #  - GCC 15.2.0
