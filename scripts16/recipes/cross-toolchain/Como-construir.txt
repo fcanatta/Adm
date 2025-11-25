@@ -21,3 +21,6 @@ adm build gcc-pass1
 4. Para o grupo inteiro (quando tiver GCC pass2, headers, glibc cross etc):
 
 adm build cross-toolchain
+
+# Os headers do kernel vão para
+$LFS/usr/include   (ou $ADM_CROSS_SYSROOT/usr/include)
