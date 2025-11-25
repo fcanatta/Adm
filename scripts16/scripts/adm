@@ -873,8 +873,10 @@ Uso:
   adm list                     - Listar pacotes instalados
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
-  adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente
-  adm chroot-shell <dir>       - Prepara e entra no chroot usando adm-chroot.sh
+  adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente  
+  adm chroot-prepare [dir]     - Prepara o chroot (monta /dev,/proc,/sys,/run, etc.)
+  adm chroot-teardown [dir]    - Desmonta os mounts do chroot
+  adm chroot-shell [dir]       - Entra em um shell dentro do chroot (usa adm-chroot.sh enter)
   adm version                  - Mostrar versão do adm
   adm help                     - Esta ajuda
 
@@ -1016,11 +1018,8 @@ cmd_chroot_build() {
 }
 
 cmd_chroot_shell() {
-    local chroot_dir="$1"
-
-    if [[ -z "$chroot_dir" ]]; then
-        die "Uso: adm chroot-shell <diretório-do-chroot>"
-    fi
+    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
+    local chroot_dir="${1:-}"
 
     # Caminho do helper (ajuste se você instalou em outro lugar)
     local helper="/usr/local/sbin/adm-chroot.sh"
@@ -1029,10 +1028,49 @@ cmd_chroot_shell() {
         die "Helper $helper não encontrado ou não executável. Instale-o antes."
     fi
 
-    log_info "Entrando no chroot-shell usando $helper para $chroot_dir"
+    if [[ -n "$chroot_dir" ]]; then
+        log_info "Entrando no chroot-shell usando $helper para $chroot_dir"
+        "$helper" enter "$chroot_dir"
+    else
+        log_info "Entrando no chroot-shell usando $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
+        "$helper" enter
+    fi
+}
 
-    # Chama o helper no modo 'enter'
-    "$helper" enter "$chroot_dir"
+cmd_chroot_prepare() {
+    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
+    local chroot_dir="${1:-}"
+
+    local helper="/usr/local/sbin/adm-chroot.sh"
+    if [[ ! -x "$helper" ]]; then
+        die "Helper $helper não encontrado ou não executável. Instale-o antes."
+    fi
+
+    if [[ -n "$chroot_dir" ]]; then
+        log_info "Preparando chroot $chroot_dir via $helper"
+        "$helper" prepare "$chroot_dir"
+    else
+        log_info "Preparando chroot via $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
+        "$helper" prepare
+    fi
+}
+
+cmd_chroot_teardown() {
+    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
+    local chroot_dir="${1:-}"
+
+    local helper="/usr/local/sbin/adm-chroot.sh"
+    if [[ ! -x "$helper" ]]; then
+        die "Helper $helper não encontrado ou não executável. Instale-o antes."
+    fi
+
+    if [[ -n "$chroot_dir" ]]; then
+        log_info "Desmontando chroot $chroot_dir via $helper"
+        "$helper" teardown "$chroot_dir"
+    else
+        log_info "Desmontando chroot via $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
+        "$helper" teardown
+    fi
 }
 
 # -------------------------------------------------------------
@@ -1079,12 +1117,20 @@ main() {
       cmd_upgrade "$@"
       ;;
     chroot-build)
-      [[ $# -eq 2 ]] || die "Uso: adm chroot-build <dir_chroot> <pacote>"
+      [[ $# -eq 2 ]] || die "Uso: adm chroot-build <dir> <pacote>"
       cmd_chroot_build "$1" "$2"
       ;;
     chroot-shell)
-      [[ $# -eq 1 ]] || die "Uso: adm chroot-shell <diretório-do-chroot>"
-      cmd_chroot_shell "$1"
+      (( $# <= 1 )) || die "Uso: adm chroot-shell [diretório-do-chroot]"
+      cmd_chroot_shell "${1:-}"
+      ;;
+    chroot-prepare)
+      (( $# <= 1 )) || die "Uso: adm chroot-prepare [diretório-do-chroot]"
+      cmd_chroot_prepare "${1:-}"
+      ;;
+    chroot-teardown)
+      (( $# <= 1 )) || die "Uso: adm chroot-teardown [diretório-do-chroot]"
+      cmd_chroot_teardown "${1:-}"
       ;;
     version)
       printf 'adm versão %s\n' "$ADM_VERSION"
