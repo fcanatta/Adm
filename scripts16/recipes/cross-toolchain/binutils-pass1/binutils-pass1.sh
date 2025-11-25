@@ -1,73 +1,80 @@
-# Recipe para adm: Binutils-2.45.1 - Pass 1
-# Linux From Scratch - Version r12.4-46, seção 5.2
+#!/bin/bash
+
+# Binutils-2.45.1 - Pass 1 (Cross-toolchain)
+# LFS 12.4 - Capítulo 5.2 
 
 PKG_NAME="binutils-pass1"
 PKG_VERSION="2.45.1"
 PKG_RELEASE="1"
 
-PKG_DESC="Binutils (Passo 1 do cross-toolchain temporário)"
+PKG_DESC="Binutils 2.45.1 (Passo 1 do toolchain cruzado LFS)"
 PKG_URL="https://www.gnu.org/software/binutils/"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
-# Fonte e MD5 conforme capítulo 3.2 (All Packages) do LFS r12.4-46
+# Fonte oficial conforme capítulo 3.2 (All Packages) 
 PKG_SOURCES="https://sourceware.org/pub/binutils/releases/binutils-2.45.1.tar.xz"
+
+# MD5 oficial do livro (Binutils 2.45.1) 
 PKG_MD5S="ff59f8dc1431edfa54a257851bea74e7"
+
+# SHA256 opcional (não fornecido no LFS; deixe vazio ou preencha se quiser)
 PKG_SHA256S=""
 
-# Primeiro pacote do cross-toolchain: sem dependências explícitas aqui
+# Pass 1 é sempre o primeiro do cross-toolchain, então sem dependências explícitas
 PKG_DEPENDS=""
 
-# ============================================
-#  Pass 1 do Binutils (cross)
-#  Instalar tudo sob /usr/src/cross-toolchain
-# ============================================
-
-pkg_prepare() {
-  # Nada especial além do diretório de build recomendado
-  mkdir -v build
-}
-
 pkg_build() {
+  log_info "Construindo Binutils Pass 1"
+
+  # Já estamos dentro do diretório de fonte extraído (binutils-2.45.1/)
+  # O LFS manda criar um diretório separado de build: 
+  mkdir -v build
   cd build
 
-  # Raiz onde TODO o cross-toolchain vai morar
-  # Você pode sobrescrever com: ADM_CROSS_ROOT=/algum/lugar adm build binutils-pass1
+  # Raiz do toolchain (onde 'make install' vai instalar binutils)
   local cross_root="${ADM_CROSS_ROOT:-/usr/src/cross-toolchain}"
 
-  # Sysroot do cross; se não quiser separar, usa o próprio cross_root
-  local cross_sysroot="${ADM_CROSS_SYSROOT:-$cross_root}"
+  # Sysroot (equivalente ao $LFS do livro)
+  local sysroot="${ADM_CROSS_SYSROOT:-${LFS:-/mnt/lfs}}"
 
-  # Target do LFS (ex: x86_64-lfs-linux-gnu) – tem que vir de fora
+  # Triplet alvo (equivalente a $LFS_TGT, ex: x86_64-lfs-linux-gnu)
   local tgt="${ADM_CROSS_TARGET:-${LFS_TGT:-}}"
   if [[ -z "$tgt" ]]; then
-    die "Defina ADM_CROSS_TARGET ou LFS_TGT com o triplet alvo (ex: x86_64-lfs-linux-gnu) antes de construir binutils-pass1."
+    die "Defina ADM_CROSS_TARGET ou LFS_TGT (ex: x86_64-lfs-linux-gnu) antes de construir binutils-pass1."
   fi
 
+  log_info "Usando cross_root=$cross_root sysroot=$sysroot target=$tgt"
+
+  # Configure conforme LFS 5.2, adaptado para prefix=/usr/src/cross-toolchain 
   ../configure \
-    --prefix="${cross_root}" \
-    --with-sysroot="${cross_sysroot}" \
-    --target="${tgt}" \
-    --disable-nls \
-    --enable-gprofng=no \
-    --disable-werror \
-    --enable-new-dtags \
+    --prefix="$cross_root"      \
+    --with-sysroot="$sysroot"   \
+    --target="$tgt"             \
+    --disable-nls               \
+    --enable-gprofng=no         \
+    --disable-werror            \
+    --enable-new-dtags          \
     --enable-default-hash-style=gnu
 
+  # Compilar
   make
 }
 
 pkg_install() {
+  log_info "Instalando Binutils Pass 1 em DESTDIR=${PKG_DESTDIR}"
+
+  # Entrar no diretório de build criado em pkg_build()
   cd build
 
-  # Instalando em DESTDIR para o adm empacotar. O prefix já aponta
-  # para /usr/src/cross-toolchain, então o resultado final será
-  # /usr/src/cross-toolchain/bin, /usr/src/cross-toolchain/lib, etc.
-  make DESTDIR="${PKG_DESTDIR}" install
+  # Instalação no DESTDIR do adm; o prefix usado no configure já aponta
+  # para /usr/src/cross-toolchain dentro desse DESTDIR.
+  make DESTDIR="$PKG_DESTDIR" install
 }
 
 pkg_upstream_version() {
-  # Procura a maior versão binutils-X.Y[.Z] no espelho oficial
+  # Descobre a versão mais nova binutils-X.Y[.Z] disponível em sourceware.org
+  # Se der problema de rede ou parsing, volta para PKG_VERSION.
   local url="https://sourceware.org/pub/binutils/releases/"
   local latest=""
 
