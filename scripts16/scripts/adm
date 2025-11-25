@@ -906,8 +906,27 @@ upgrade_list() {
 
 upgrade_pkgs() {
   local -a pkgs=("$@")
+
   if (( ${#pkgs[@]} == 0 )); then
+    # Sem argumentos: usar a lista de upgrades calculada automaticamente
     mapfile -t pkgs < <(upgrade_list)
+  else
+    # Com argumentos: manter apenas os que realmente precisam de upgrade
+    local -a filtered=()
+    local p
+    for p in "${pkgs[@]}"; do
+      [[ -n "$p" ]] || continue
+      if ! is_installed "$p"; then
+        log_warn "[$p] não está instalado; ignorando em upgrade (use 'adm install' se quiser instalar)."
+        continue
+      fi
+      if is_pkg_up_to_date "$p"; then
+        log_info "[$p] já está na versão mais recente; pulando."
+        continue
+      fi
+      filtered+=("$p")
+    done
+    pkgs=("${filtered[@]}")
   fi
 
   if (( ${#pkgs[@]} == 0 )); then
@@ -921,15 +940,10 @@ upgrade_pkgs() {
   local -a order=()
   mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
 
-  if dry_run_enabled; then
-    log_info "DRY-RUN: atualizaria (na ordem): ${order[*]}"
-    return 0
-  fi
-
   local p
   for p in "${order[@]}"; do
     log_info "Atualizando pacote: $p"
-    build_pkg "$p"
+    install_pkg_if_needed "$p"
   done
 }
 
@@ -1059,6 +1073,8 @@ Uso:
   adm list                     - Listar pacotes instalados
   adm info <pacote>            - Mostra meta + recipe do pacote
   adm verify <pacote>          - Verifica se todos os arquivos do pacote ainda existem
+  adm verify <pacote>          - Verifica se arquivos do pacote existem e (se houver) conferem com SHA256
+  adm verify-all               - Verifica todos os pacotes instalados
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
   adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente  
@@ -1442,7 +1458,7 @@ main() {
     resolve)
       (( $# >= 1 )) || die "Uso: adm resolve <p1> [p2 ...]"
       cmd_resolve "$@"
-      ;;
+      ;;    
     list)
       cmd_list
       ;;
@@ -1453,6 +1469,14 @@ main() {
     verify)
       [[ $# -eq 1 ]] || die "Uso: adm verify <pacote>"
       cmd_verify "$1"
+      ;;
+    verify)
+      [[ $# -eq 1 ]] || die "Uso: adm verify <pacote>"
+      cmd_verify "$1"
+      ;;
+    verify-all)
+      [[ $# -eq 0 ]] || die "Uso: adm verify-all"
+      cmd_verify_all
       ;;
     list-upgrades)
       cmd_list_upgrades
