@@ -75,6 +75,11 @@ pkg_build() {
   #  - fallback: usa o próprio cross_root
   local cross_sysroot="${ADM_CROSS_SYSROOT:-${LFS:-$cross_root}}"
 
+  # ADICIONE ESTE BLOCO:
+  # garante que o configure/make do GCC enxergam o binutils-pass1
+  PATH="${cross_root}/bin:${PATH}"
+  export PATH
+
   # Target triplet (igual ao LFS_TGT do livro, ex: x86_64-lfs-linux-gnu)
   local tgt="${ADM_CROSS_TARGET:-${LFS_TGT:-}}"
   if [[ -z "$tgt" ]]; then
