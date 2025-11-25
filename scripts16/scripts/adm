@@ -1014,6 +1014,26 @@ cmd_chroot_build() {
   chroot_build_pkg "$dir" "$pkg"
 }
 
+cmd_chroot_shell() {
+    local chroot_dir="$1"
+
+    if [[ -z "$chroot_dir" ]]; then
+        die "Uso: adm chroot-shell <diretório-do-chroot>"
+    fi
+
+    # Caminho do helper (ajuste se você instalou em outro lugar)
+    local helper="/usr/local/sbin/adm-chroot.sh"
+
+    if [[ ! -x "$helper" ]]; then
+        die "Helper $helper não encontrado ou não executável. Instale-o antes."
+    fi
+
+    log_info "Entrando no chroot-shell usando $helper para $chroot_dir"
+
+    # Chama o helper no modo 'enter'
+    "$helper" enter "$chroot_dir"
+}
+
 # -------------------------------------------------------------
 # Main
 # -------------------------------------------------------------
@@ -1060,6 +1080,10 @@ main() {
     chroot-build)
       [[ $# -eq 2 ]] || die "Uso: adm chroot-build <dir_chroot> <pacote>"
       cmd_chroot_build "$1" "$2"
+      ;;
+    chroot-shell)
+      [[ $# -eq 1 ]] || die "Uso: adm chroot-shell <diretório-do-chroot>"
+      cmd_chroot_shell "$1"
       ;;
     version)
       printf 'adm versão %s\n' "$ADM_VERSION"
