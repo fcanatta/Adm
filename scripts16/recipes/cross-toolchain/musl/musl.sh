@@ -17,7 +17,7 @@ PKG_RELEASE="1"
 PKG_DESC="musl libc ${PKG_VERSION} para o sysroot do cross-toolchain (com patches CVE-2025-26519)"
 PKG_URL="https://musl.libc.org/"
 PKG_LICENSE="MIT"
-PKG_GROUPS="cross-toolchain"
+PKG_GROUPS="cross-toolchain-musl"
 
 # Fonte principal: tarball oficial
 PKG_SOURCES="https://musl.libc.org/releases/musl-1.2.5.tar.gz"
