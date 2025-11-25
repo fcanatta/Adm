@@ -874,6 +874,7 @@ Uso:
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
   adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente
+  adm chroot-shell <dir>       - Prepara e entra no chroot usando adm-chroot.sh
   adm version                  - Mostrar versão do adm
   adm help                     - Esta ajuda
 
