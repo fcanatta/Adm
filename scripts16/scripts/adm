@@ -18,6 +18,12 @@ set -euo pipefail
 
 ADM_VERSION="0.1.0"
 
+# -----------------------------------------
+# Logging global (tudo que aparece na tela vai para log)
+# -----------------------------------------
+exec > >(tee -a "$ADM_LOG_DIR/adm.log") 2>&1
+log_info "Iniciando execução do adm em $(date)"
+
 # -------------------------------------------------------------
 # Configuração básica (pode ser sobrescrita por variáveis de ambiente)
 # -------------------------------------------------------------
@@ -232,6 +238,44 @@ download_one() {
       die "Esquema de URL não suportado: $url"
       ;;
   esac
+
+# -----------------------------------------
+  # Verificação de checksums, se definidos na recipe
+  # -----------------------------------------
+  if [[ -n "${PKG_SHA256SUM:-}" ]]; then
+    log_info "Verificando SHA256 de $(basename "$dest")"
+    local calc_sha
+    calc_sha="$(sha256sum "$dest" | awk '{print $1}')"
+
+    if [[ "$calc_sha" != "$PKG_SHA256SUM" ]]; then
+      log_warn "SHA256 incorreto para $(basename "$dest"). Esperado: $PKG_SHA256SUM Obtido: $calc_sha"
+      log_warn "Removendo e baixando novamente..."
+      rm -f "$dest"
+      download_one "$url" "$dest"  # baixa de novo
+
+      # Verifica novamente
+      calc_sha="$(sha256sum "$dest" | awk '{print $1}')"
+      [[ "$calc_sha" == "$PKG_SHA256SUM" ]] || die "SHA256 incorreto novamente. Abortando."
+    fi
+  fi
+
+  if [[ -n "${PKG_MD5SUM:-}" ]]; then
+    log_info "Verificando MD5 de $(basename "$dest")"
+    local calc_md5
+    calc_md5="$(md5sum "$dest" | awk '{print $1}')"
+
+    if [[ "$calc_md5" != "$PKG_MD5SUM" ]]; then
+      log_warn "MD5 incorreto para $(basename "$dest"). Esperado: $PKG_MD5SUM Obtido: $calc_md5"
+      log_warn "Removendo e baixando novamente..."
+      rm -f "$dest"
+      download_one "$url" "$dest"
+
+      # Verifica novamente
+      calc_md5="$(md5sum "$dest" | awk '{print $1}')"
+      [[ "$calc_md5" == "$PKG_MD5SUM" ]] || die "MD5 incorreto novamente. Abortando."
+    fi
+  fi
+
 }
 
 download_sources_parallel() {
