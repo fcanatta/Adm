@@ -1,0 +1,831 @@
+#!/usr/bin/env bash
+# adm - Simple package manager for Linux From Scratch style systems
+# Features:
+#  - Build/install/remove packages defined as shell recipes
+#  - Binary cache (.tar.zst and .tar.xz)
+#  - Source cache and parallel downloads
+#  - Dependency resolution with Kahn-style topological sort and cycle detection
+#  - DESTDIR support and manifest-based uninstall
+#  - Simple upgrade mechanism based on recipe-provided upstream version
+#  - Optional chroot build helper
+#
+# NOTE:
+#  Este script é um framework genérico. Cada pacote precisa de um "recipe"
+#  em shell que define como baixar, compilar e instalar o programa.
+#  Ver comentários em ADM_RECIPES_DIR mais abaixo.
+
+set -euo pipefail
+
+ADM_VERSION="0.1.0"
+
+# -------------------------------------------------------------
+# Configuração básica (pode ser sobrescrita por variáveis de ambiente)
+# -------------------------------------------------------------
+ADM_PREFIX="${ADM_PREFIX:-/usr}"
+ADM_STATE_DIR="${ADM_STATE_DIR:-/var/lib/adm}"
+ADM_CACHE_DIR="${ADM_CACHE_DIR:-$ADM_STATE_DIR/cache}"
+ADM_SRC_CACHE="${ADM_SRC_CACHE:-$ADM_CACHE_DIR/src}"
+ADM_BIN_CACHE="${ADM_BIN_CACHE:-$ADM_CACHE_DIR/bin}"
+ADM_BUILD_ROOT="${ADM_BUILD_ROOT:-/var/tmp/adm/build}"
+ADM_LOG_DIR="${ADM_LOG_DIR:-/var/log/adm}"
+ADM_DB_DIR="${ADM_DB_DIR:-$ADM_STATE_DIR/db}"
+ADM_MANIFEST_DIR="${ADM_MANIFEST_DIR:-$ADM_DB_DIR/manifests}"
+ADM_META_DIR="${ADM_META_DIR:-$ADM_DB_DIR/meta}"
+ADM_RECIPES_DIR="${ADM_RECIPES_DIR:-$ADM_STATE_DIR/recipes}"
+ADM_DL_JOBS="${ADM_DL_JOBS:-4}"
+ADM_CHROOT_DIR="${ADM_CHROOT_DIR:-}"   # opcional, para builds em chroot
+ADM_DEFAULT_COMPRESS="${ADM_DEFAULT_COMPRESS:-zst}" # zst ou xz
+
+umask 022
+
+# -------------------------------------------------------------
+# Cores
+# -------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_MAGENTA=$'\033[35m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+log_info()  { printf '%s[INFO]%s %s\n'  "$C_GREEN" "$C_RESET" "$*" >&2; }
+log_warn()  { printf '%s[WARN]%s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
+log_error() { printf '%s[ERRO]%s %s\n'  "$C_RED" "$C_RESET" "$*" >&2; }
+log_debug() { [[ -n "${ADM_DEBUG:-}" ]] && printf '%s[DBG ]%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2 || true; }
+
+die() {
+  log_error "$*"
+  exit 1
+}
+
+# -------------------------------------------------------------
+# Inicialização de diretórios
+# -------------------------------------------------------------
+init_dirs() {
+  for d in \
+    "$ADM_STATE_DIR" "$ADM_CACHE_DIR" "$ADM_SRC_CACHE" "$ADM_BIN_CACHE" \
+    "$ADM_BUILD_ROOT" "$ADM_LOG_DIR" "$ADM_DB_DIR" \
+    "$ADM_MANIFEST_DIR" "$ADM_META_DIR" "$ADM_RECIPES_DIR"; do
+    if [[ ! -d "$d" ]]; then
+      mkdir -p "$d" || die "Não foi possível criar diretório: $d"
+    fi
+  done
+}
+
+# -------------------------------------------------------------
+# Tratamento de erros
+# -------------------------------------------------------------
+cleanup_build() {
+  local builddir="${ADM_CURRENT_BUILD_DIR:-}"
+  if [[ -n "$builddir" && -d "$builddir" ]]; then
+    log_debug "Limpando diretório de build temporário: $builddir"
+    rm -rf "$builddir" || log_warn "Falha ao remover $builddir"
+  fi
+}
+
+on_err() {
+  local exit_code=$?
+  log_error "Erro inesperado (code=$exit_code). Veja logs em $ADM_LOG_DIR."
+  cleanup_build
+  exit "$exit_code"
+}
+
+trap on_err ERR
+trap cleanup_build EXIT
+
+# -------------------------------------------------------------
+# Utilidades gerais
+# -------------------------------------------------------------
+ensure_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $cmd"
+}
+
+# Comparação de versões usando sort -V
+ver_gt() {
+  local a="$1"; local b="$2"
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" && "$a" != "$b" ]]
+}
+
+ver_ge() {
+  local a="$1"; local b="$2"
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
+}
+
+timestamp() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+# -------------------------------------------------------------
+# Carregar recipe de pacote
+# -------------------------------------------------------------
+load_recipe() {
+  local pkg="$1"
+  local recipe="$ADM_RECIPES_DIR/$pkg.sh"
+  [[ -f "$recipe" ]] || die "Recipe não encontrado para pacote '$pkg' em $recipe"
+
+  # Limpar variáveis antigas relacionadas a recipe
+  unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
+        PKG_BUILD_DIR PKG_LICENSE PKG_URL
+  unset pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version
+
+  # shellcheck source=/dev/null
+  . "$recipe"
+
+  [[ -n "${PKG_NAME:-}" ]] || die "Recipe $recipe não define PKG_NAME"
+  [[ -n "${PKG_VERSION:-}" ]] || die "Recipe $recipe não define PKG_VERSION"
+  [[ "$(basename "$PKG_NAME")" == "$pkg" ]] ||:
+}
+
+# -------------------------------------------------------------
+# Banco de dados / metadados
+# -------------------------------------------------------------
+meta_file_for() {
+  local pkg="$1"
+  printf '%s/%s.meta' "$ADM_META_DIR" "$pkg"
+}
+
+is_installed() {
+  local pkg="$1"
+  [[ -f "$(meta_file_for "$pkg")" ]]
+}
+
+get_installed_version() {
+  local pkg="$1"
+  local meta
+  meta="$(meta_file_for "$pkg")"
+  [[ -f "$meta" ]] || return 1
+  awk -F= '$1=="version"{print $2}' "$meta"
+}
+
+write_meta() {
+  local pkg="$1" version="$2" release="$3" deps="$4"
+  local meta
+  meta="$(meta_file_for "$pkg")"
+  {
+    printf 'name=%s\n' "$pkg"
+    printf 'version=%s\n' "$version"
+    printf 'release=%s\n' "$release"
+    printf 'depends=%s\n' "$deps"
+    printf 'installed_at=%s\n' "$(timestamp)"
+  } >"$meta.tmp"
+  mv "$meta.tmp" "$meta"
+}
+
+manifest_file_for() {
+  local pkg="$1"
+  printf '%s/%s.manifest' "$ADM_MANIFEST_DIR" "$pkg"
+}
+
+list_installed() {
+  if [[ ! -d "$ADM_META_DIR" ]]; then
+    return 0
+  fi
+  for f in "$ADM_META_DIR"/*.meta; do
+    [[ -e "$f" ]] || continue
+    basename "${f%.meta}"
+  done | sort
+}
+
+# -------------------------------------------------------------
+# Download de fontes (com cache e paralelismo)
+# -------------------------------------------------------------
+download_one() {
+  local url="$1"
+  local dest="$2"
+
+  if [[ -f "$dest" ]]; then
+    log_debug "Fonte já em cache: $dest"
+    return 0
+  fi
+
+  log_info "Baixando fonte: $url -> $dest"
+
+  case "$url" in
+    git+*|git://*|*.git)
+      ensure_cmd git
+      local tmp_dir="${dest}.git-tmp"
+      rm -rf "$tmp_dir"
+      git clone --depth 1 "${url#git+}" "$tmp_dir"
+      ( cd "$tmp_dir" && git archive --format=tar --output="$dest" HEAD )
+      rm -rf "$tmp_dir"
+      ;;
+    http://*|https://*|ftp://*)
+      if command -v curl >/dev/null 2>&1; then
+        curl -L --fail --retry 3 -o "$dest" "$url"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -O "$dest" "$url"
+      else
+        die "Nem curl nem wget encontrados para baixar: $url"
+      fi
+      ;;
+    rsync://*)
+      ensure_cmd rsync
+      rsync -av "$url" "$dest"
+      ;;
+    *)
+      die "Esquema de URL não suportado: $url"
+      ;;
+  esac
+}
+
+download_sources_parallel() {
+  local -a urls=("$@")
+  local pids=()
+  local -i running=0
+
+  mkdir -p "$ADM_SRC_CACHE"
+
+  for url in "${urls[@]}"; do
+    [[ -n "$url" ]] || continue
+    local filename dest
+    filename="$(basename "${url%%\?*}")"
+    dest="$ADM_SRC_CACHE/$filename"
+
+    (
+      set -e
+      download_one "$url" "$dest"
+    ) &
+    pids+=("$!")
+    ((running++))
+
+    if (( running >= ADM_DL_JOBS )); then
+      # Espera todos terminarem antes de continuar
+      local pid status failed=0
+      for pid in "${pids[@]}"; do
+        if ! wait "$pid"; then
+          failed=1
+        fi
+      done
+      pids=()
+      running=0
+      (( failed == 0 )) || die "Falha em pelo menos um download de fonte."
+    fi
+  done
+
+  # Espera pids restantes
+  if (( ${#pids[@]} > 0 )); then
+    local pid status failed=0
+    for pid in "${pids[@]}"; do
+      if ! wait "$pid"; then
+        failed=1
+      fi
+    done
+    (( failed == 0 )) || die "Falha em pelo menos um download de fonte."
+  fi
+}
+
+# -------------------------------------------------------------
+# Extração de fontes
+# -------------------------------------------------------------
+extract_src() {
+  local archive="$1"
+  local dest_dir="$2"
+
+  [[ -f "$archive" ]] || die "Arquivo de fonte não encontrado: $archive"
+
+  mkdir -p "$dest_dir"
+
+  log_info "Extraindo $archive em $dest_dir"
+
+  case "$archive" in
+    *.tar.gz|*.tgz)    tar -xzf "$archive" -C "$dest_dir" ;;
+    *.tar.bz2|*.tbz2)  tar -xjf "$archive" -C "$dest_dir" ;;
+    *.tar.xz)          tar -xJf "$archive" -C "$dest_dir" ;;
+    *.tar.zst|*.tzst)  ensure_cmd zstd; tar --zstd -xf "$archive" -C "$dest_dir" ;;
+    *.tar.lz)          ensure_cmd lzip; tar --lzip -xf "$archive" -C "$dest_dir" ;;
+    *.zip)             ensure_cmd unzip; unzip -q "$archive" -d "$dest_dir" ;;
+    *.gz)              gunzip -c "$archive" | tar -xf - -C "$dest_dir" ;;
+    *.bz2)             bunzip2 -c "$archive" | tar -xf - -C "$dest_dir" ;;
+    *.xz)              xz -dc "$archive" | tar -xf - -C "$dest_dir" ;;
+    *.7z)              ensure_cmd 7z; 7z x "$archive" -o"$dest_dir" ;;
+    *)
+      die "Formato de arquivo não suportado: $archive"
+      ;;
+  esac
+}
+
+# -------------------------------------------------------------
+# Construção do pacote
+# -------------------------------------------------------------
+build_pkg() {
+  local pkg="$1"
+  load_recipe "$pkg"
+
+  local builddir destdir
+  builddir="$ADM_BUILD_ROOT/$pkg-$$"
+  destdir="$builddir/dest"
+  ADM_CURRENT_BUILD_DIR="$builddir"
+
+  mkdir -p "$builddir" "$destdir"
+
+  log_info "Construindo pacote $pkg (versão $PKG_VERSION)"
+
+  # 1) Baixar fontes
+  IFS=' ' read -r -a srcs <<< "${PKG_SOURCES:-}"
+  if (( ${#srcs[@]} > 0 )); then
+    download_sources_parallel "${srcs[@]}"
+  else
+    log_warn "Recipe $pkg não define PKG_SOURCES; assumindo fonte já disponível."
+  fi
+
+  # 2) Extração (assume primeiro arquivo como principal)
+  local src_main src_archive
+  if (( ${#srcs[@]} > 0 )); then
+    src_main="${srcs[0]}"
+    src_archive="$ADM_SRC_CACHE/$(basename "${src_main%%\?*}")"
+    extract_src "$src_archive" "$builddir"
+  fi
+
+  # 3) Encontrar diretório de build (primeiro subdir criado)
+  local srcdir
+  srcdir="$(find "$builddir" -mindepth 1 -maxdepth 1 -type d ! -name dest | head -n1 || true)"
+  [[ -n "$srcdir" ]] || { srcdir="$builddir"; }
+
+  # 4) Executar etapas de build definidas pela recipe
+  (
+    cd "$srcdir"
+    if declare -f pkg_prepare >/dev/null 2>&1; then
+      log_info "Etapa: prepare()"
+      pkg_prepare
+    fi
+    if declare -f pkg_build >/dev/null 2>&1; then
+      log_info "Etapa: build()"
+      PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_build
+    else
+      die "Recipe $pkg não define função pkg_build()"
+    fi
+    if declare -f pkg_check >/dev/null 2>&1; then
+      log_info "Etapa: check()"
+      pkg_check
+    fi
+    if declare -f pkg_install >/dev/null 2>&1; then
+      log_info "Etapa: install() para DESTDIR=$destdir"
+      PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_install
+    else
+      # fallback genérico: tentar "make install"
+      if [[ -f Makefile || -f makefile ]]; then
+        log_warn "pkg_install() não definido; tentando 'make install DESTDIR=$destdir'"
+        make DESTDIR="$destdir" install
+      else
+        die "Sem pkg_install() e sem Makefile para instalar $pkg"
+      fi
+    fi
+  )
+
+  # 5) Criar pacote binário e manifest
+  package_from_destdir "$pkg" "$PKG_VERSION" "${PKG_RELEASE:-1}" "$destdir"
+
+  # 6) Instalar imediatamente
+  install_from_cache "$pkg" "$PKG_VERSION" "${PKG_RELEASE:-1}"
+
+  cleanup_build
+  ADM_CURRENT_BUILD_DIR=""
+}
+
+# -------------------------------------------------------------
+# Empacotamento e cache binário
+# -------------------------------------------------------------
+bin_pkg_filename() {
+  local pkg="$1" version="$2" release="$3" ext="$4"
+  local arch
+  arch="$(uname -m)"
+  printf '%s-%s-%s-%s.tar.%s' "$pkg" "$version" "$release" "$arch" "$ext"
+}
+
+package_from_destdir() {
+  local pkg="$1" version="$2" release="$3" destdir="$4"
+  [[ -d "$destdir" ]] || die "DESTDIR não existe: $destdir"
+
+  mkdir -p "$ADM_BIN_CACHE"
+
+  ensure_cmd zstd
+  ensure_cmd xz
+
+  local fname_zst fname_xz
+  fname_zst="$(bin_pkg_filename "$pkg" "$version" "$release" "zst")"
+  fname_xz="$(bin_pkg_filename "$pkg" "$version" "$release" "xz")"
+
+  ( cd "$destdir" && tar -cf - . ) | zstd -19 -T0 -o "$ADM_BIN_CACHE/$fname_zst"
+  ( cd "$destdir" && tar -cf - . ) | xz -T0 -9 -c > "$ADM_BIN_CACHE/$fname_xz"
+
+  log_info "Pacotes criados:"
+  log_info "  $ADM_BIN_CACHE/$fname_zst"
+  log_info "  $ADM_BIN_CACHE/$fname_xz"
+
+  # Manifesta (a partir de um deles)
+  ( cd "$destdir" && find . -mindepth 1 -printf '/%P\n' | sort ) >"$(manifest_file_for "$pkg")"
+}
+
+# -------------------------------------------------------------
+# Instalação a partir do cache binário
+# -------------------------------------------------------------
+install_from_cache() {
+  local pkg="$1" version="$2" release="$3"
+  local arch
+  arch="$(uname -m)"
+
+  local fname_zst fname_xz
+  fname_zst="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "zst")"
+  fname_xz="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "xz")"
+
+  local chosen=""
+  case "$ADM_DEFAULT_COMPRESS" in
+    zst) [[ -f "$fname_zst" ]] && chosen="$fname_zst" || chosen="$fname_xz" ;;
+    xz)  [[ -f "$fname_xz" ]] && chosen="$fname_xz" || chosen="$fname_zst" ;;
+    *)   chosen="$fname_zst" ;;
+  esac
+
+  [[ -f "$chosen" ]] || die "Pacote binário não encontrado para $pkg versão $version-$release"
+
+  log_info "Instalando $pkg-$version-$release a partir de $chosen"
+
+  case "$chosen" in
+    *.tar.zst|*.tzst) tar --zstd -xf "$chosen" -C / ;;
+    *.tar.xz)         tar -xJf "$chosen" -C / ;;
+    *)                die "Formato de pacote binário desconhecido: $chosen" ;;
+  esac
+
+  write_meta "$pkg" "$version" "$release" "${PKG_DEPENDS:-}"
+}
+
+# -------------------------------------------------------------
+# Remoção via manifesto
+# -------------------------------------------------------------
+remove_pkg() {
+  local pkg="$1"
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+
+  [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
+
+  log_info "Removendo arquivos de $pkg usando manifesto $manifest"
+
+  # Remove arquivos
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    if [[ -e "$f" || -L "$f" ]]; then
+      rm -f "$f" || log_warn "Falha ao remover $f"
+    else
+      log_debug "Arquivo já ausente: $f"
+    fi
+  done <"$manifest"
+
+  # Tenta remover diretórios vazios
+  log_info "Removendo diretórios vazios residuais"
+  tac "$manifest" | while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    local dir
+    dir="$(dirname "$f")"
+    [[ "$dir" == "/" || "$dir" == "." ]] && continue
+    if [[ -d "$dir" ]]; then
+      rmdir "$dir" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$manifest"
+  rm -f "$(meta_file_for "$pkg")"
+
+  log_info "Pacote $pkg removido."
+}
+
+# -------------------------------------------------------------
+# Resolução de dependências e ordenação (Kahn-like)
+# -------------------------------------------------------------
+pkg_deps() {
+  local pkg="$1"
+  load_recipe "$pkg"
+  printf '%s\n' "${PKG_DEPENDS:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u
+}
+
+# Gera ordem topológica de uma lista de pacotes
+topo_sort_pkgs() {
+  local -a input_pkgs=("$@")
+  local -a all_pkgs=()
+  local -A want
+  local p
+
+  # normalizar e único
+  for p in "${input_pkgs[@]}"; do
+    want["$p"]=1
+  done
+
+  # inclui dependências recursivamente
+  local changed=1
+  while (( changed )); do
+    changed=0
+    for p in "${!want[@]}"; do
+      local d
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        if [[ -z "${want[$d]:-}" ]]; then
+          want["$d"]=1
+          changed=1
+        fi
+      done < <(pkg_deps "$p")
+    done
+  done
+
+  # converte para lista
+  for p in "${!want[@]}"; do
+    all_pkgs+=("$p")
+  done
+
+  # Ordenação aproximada por dependência (Kahn-like simplificado)
+  local -a sorted=()
+  local -A done
+  local progress
+
+  while (( ${#sorted[@]} < ${#all_pkgs[@]} )); do
+    progress=0
+    for p in "${all_pkgs[@]}"; do
+      [[ -n "$p" ]] || continue
+      if [[ -n "${done[$p]:-}" ]]; then
+        continue
+      fi
+      local ok=1
+      local d
+      while IFS= read -r d; do
+        [[ -n "$d" ]] || continue
+        # se dependência faz parte do conjunto e ainda não foi feita, não pode ainda
+        if [[ -n "${want[$d]:-}" && -z "${done[$d]:-}" ]]; then
+          ok=0
+          break
+        fi
+      done < <(pkg_deps "$p")
+      if (( ok )); then
+        sorted+=("$p")
+        done["$p"]=1
+        progress=1
+      fi
+    done
+
+    if (( ! progress )); then
+      log_error "Detecção de ciclo de dependências entre pacotes:"
+      log_error "Conjunto envolvido:"
+      for p in "${all_pkgs[@]}"; do
+        [[ -z "${done[$p]:-}" ]] && printf '  %s\n' "$p" >&2
+      done
+      die "Não foi possível resolver dependências (ciclo detectado)."
+    fi
+  done
+
+  printf '%s\n' "${sorted[@]}"
+}
+
+# -------------------------------------------------------------
+# Atualização / upgrade
+# -------------------------------------------------------------
+upstream_version_for() {
+  local pkg="$1"
+  load_recipe "$pkg"
+  if declare -f pkg_upstream_version >/dev/null 2>&1; then
+    pkg_upstream_version
+  else
+    # Se não houver função de upstream, retorna a própria versão do recipe
+    printf '%s\n' "$PKG_VERSION"
+  fi
+}
+
+list_upgrades() {
+  local pkg
+  list_installed | while IFS= read -r pkg; do
+    [[ -n "$pkg" ]] || continue
+    load_recipe "$pkg" || { log_warn "Sem recipe para pacote instalado $pkg"; continue; }
+    local current latest
+    current="$(get_installed_version "$pkg" || echo "")"
+    latest="$(upstream_version_for "$pkg")"
+    if [[ -z "$current" ]]; then
+      continue
+    fi
+    if ver_gt "$latest" "$current"; then
+      printf '%s %s -> %s\n' "$pkg" "$current" "$latest"
+    fi
+  done
+}
+
+upgrade_list() {
+  # retorna apenas nomes de pacotes com upgrade disponível
+  list_upgrades | awk '{print $1}'
+}
+
+upgrade_pkgs() {
+  local -a pkgs=("$@")
+  if (( ${#pkgs[@]} == 0 )); then
+    mapfile -t pkgs < <(upgrade_list)
+  fi
+
+  if (( ${#pkgs[@]} == 0 )); then
+    log_info "Nenhum pacote para atualizar."
+    return 0
+  fi
+
+  log_info "Pacotes a atualizar: ${pkgs[*]}"
+
+  # ordena por dependências
+  local -a order=()
+  mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
+
+  local p
+  for p in "${order[@]}"; do
+    log_info "Atualizando pacote: $p"
+    build_pkg "$p"
+  done
+}
+
+# -------------------------------------------------------------
+# Suporte a chroot
+# -------------------------------------------------------------
+chroot_build_pkg() {
+  local chroot_dir="$1"; shift
+  local pkg="$1"
+
+  [[ -d "$chroot_dir" ]] || die "Diretório de chroot não existe: $chroot_dir"
+
+  ensure_cmd chroot
+
+  # Assumimos que o script 'adm' está disponível dentro do chroot em /usr/bin/adm
+  log_info "Executando build de $pkg em chroot $chroot_dir"
+  chroot "$chroot_dir" /usr/bin/env ADM_PREFIX="$ADM_PREFIX" ADM_STATE_DIR="$ADM_STATE_DIR" ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS" /usr/bin/adm build "$pkg"
+}
+
+# -------------------------------------------------------------
+# Ajuda
+# -------------------------------------------------------------
+usage() {
+  cat <<EOF
+${C_CYAN}adm${C_RESET} - Gerenciador simples de programas para Linux From Scratch
+
+Uso:
+  adm build <pacote>           - Construir e instalar pacote (com cache binário)
+  adm install <pacote>         - Instalar a partir do cache binário (ou build se não existir)
+  adm remove <pacote>          - Remover pacote usando manifesto
+  adm deps <pacote>            - Mostrar dependências (receta)
+  adm resolve <p1> [p2 ...]    - Resolver dependências e listar em ordem (Kahn-like)
+  adm list                     - Listar pacotes instalados
+  adm list-upgrades            - Listar pacotes com upgrades disponíveis
+  adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
+  adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente
+  adm version                  - Mostrar versão do adm
+  adm help                     - Esta ajuda
+
+Diretórios padrão:
+  Recipes:   $ADM_RECIPES_DIR (um arquivo <nome>.sh por pacote)
+  Estado:    $ADM_STATE_DIR
+  Cache src: $ADM_SRC_CACHE
+  Cache bin: $ADM_BIN_CACHE
+
+Cada recipe de pacote é um script shell que deve definir, no mínimo:
+
+  PKG_NAME="foo"
+  PKG_VERSION="1.0.0"
+  PKG_RELEASE="1"
+  PKG_DEPENDS="dep1 dep2"
+  PKG_SOURCES="https://exemplo.org/foo-1.0.0.tar.xz"
+
+  pkg_build() {
+    ./configure --prefix="/usr"
+    make -j\$(nproc)
+  }
+
+  pkg_install() {
+    make DESTDIR="\$PKG_DESTDIR" install
+  }
+
+Opcional:
+  pkg_prepare()        # pré-build (patches, etc)
+  pkg_check()          # testes
+  pkg_upstream_version() { ... }  # ecoar versão mais nova disponível no upstream
+
+EOF
+}
+
+# -------------------------------------------------------------
+# Comandos
+# -------------------------------------------------------------
+cmd_build() {
+  local pkg="$1"
+  build_pkg "$pkg"
+}
+
+cmd_install() {
+  local pkg="$1"
+  load_recipe "$pkg"
+  local version="$PKG_VERSION" release="${PKG_RELEASE:-1}"
+  if is_installed "$pkg"; then
+    log_info "Pacote $pkg já instalado (versão $(get_installed_version "$pkg"))."
+    return 0
+  fi
+  if [[ -f "$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "zst")" || \
+        -f "$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "xz")" ]]; then
+    install_from_cache "$pkg" "$version" "$release"
+  else
+    log_info "Pacote binário não encontrado no cache; construindo."
+    build_pkg "$pkg"
+  fi
+}
+
+cmd_remove() {
+  local pkg="$1"
+  if ! is_installed "$pkg"; then
+    log_warn "Pacote $pkg não está marcado como instalado."
+  fi
+  remove_pkg "$pkg"
+}
+
+cmd_deps() {
+  local pkg="$1"
+  pkg_deps "$pkg"
+}
+
+cmd_resolve() {
+  local -a pkgs=("$@")
+  if (( ${#pkgs[@]} == 0 )); then
+    die "Informe pelo menos um pacote para resolver dependências."
+  fi
+  topo_sort_pkgs "${pkgs[@]}"
+}
+
+cmd_list() {
+  list_installed
+}
+
+cmd_list_upgrades() {
+  list_upgrades
+}
+
+cmd_upgrade() {
+  if (( $# == 0 )); then
+    upgrade_pkgs
+  else
+    upgrade_pkgs "$@"
+  fi
+}
+
+cmd_chroot_build() {
+  local dir="$1" pkg="$2"
+  chroot_build_pkg "$dir" "$pkg"
+}
+
+# -------------------------------------------------------------
+# Main
+# -------------------------------------------------------------
+main() {
+  init_dirs
+
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    build)
+      [[ $# -eq 1 ]] || die "Uso: adm build <pacote>"
+      cmd_build "$1"
+      ;;
+    install)
+      [[ $# -eq 1 ]] || die "Uso: adm install <pacote>"
+      cmd_install "$1"
+      ;;
+    remove)
+      [[ $# -eq 1 ]] || die "Uso: adm remove <pacote>"
+      cmd_remove "$1"
+      ;;
+    deps)
+      [[ $# -eq 1 ]] || die "Uso: adm deps <pacote>"
+      cmd_deps "$1"
+      ;;
+    resolve)
+      (( $# >= 1 )) || die "Uso: adm resolve <p1> [p2 ...]"
+      cmd_resolve "$@"
+      ;;
+    list)
+      cmd_list
+      ;;
+    list-upgrades)
+      cmd_list_upgrades
+      ;;
+    upgrade)
+      cmd_upgrade "$@"
+      ;;
+    chroot-build)
+      [[ $# -eq 2 ]] || die "Uso: adm chroot-build <dir_chroot> <pacote>"
+      cmd_chroot_build "$1" "$2"
+      ;;
+    version)
+      printf 'adm versão %s\n' "$ADM_VERSION"
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      die "Comando desconhecido: $cmd (use 'adm help')"
+      ;;
+  esac
+}
+
+main "$@"
