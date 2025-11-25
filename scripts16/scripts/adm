@@ -128,12 +128,32 @@ timestamp() {
 }
 
 # -------------------------------------------------------------
+# Localizar arquivo de recipe de um pacote em qualquer subdiretório
+# Nome do pacote == nome do arquivo .sh (ex: man-pages -> man-pages.sh)
+# -------------------------------------------------------------
+find_recipe_file() {
+  local pkg="$1"
+  local recipe
+
+  # Procura a primeira ocorrência de <pkg>.sh em qualquer subdiretório
+  recipe="$(find "$ADM_RECIPES_DIR" -type f -name "$pkg.sh" -print | head -n1)"
+
+  if [[ -z "$recipe" ]]; then
+    return 1
+  fi
+
+  printf '%s\n' "$recipe"
+}
+
+# -------------------------------------------------------------
 # Carregar recipe de pacote
 # -------------------------------------------------------------
 load_recipe() {
   local pkg="$1"
-  local recipe="$ADM_RECIPES_DIR/$pkg.sh"
-  [[ -f "$recipe" ]] || die "Recipe não encontrado para pacote '$pkg' em $recipe"
+  local recipe
+
+  # Usa find_recipe_file para suportar subdiretórios
+  recipe="$(find_recipe_file "$pkg")" || die "Recipe não encontrado para pacote '$pkg' em $ADM_RECIPES_DIR"
 
   # Limpar variáveis antigas relacionadas a recipe
   unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
@@ -145,7 +165,7 @@ load_recipe() {
 
   [[ -n "${PKG_NAME:-}" ]] || die "Recipe $recipe não define PKG_NAME"
   [[ -n "${PKG_VERSION:-}" ]] || die "Recipe $recipe não define PKG_VERSION"
-  [[ "$(basename "$PKG_NAME")" == "$pkg" ]] ||:
+  [[ "$(basename "$PKG_NAME")" == "$pkg" ]] || :
 }
 
 # -------------------------------------------------------------
@@ -556,14 +576,13 @@ pkgs_in_group() {
   local group="$1"
   local f
 
-  # espaço antes/depois para evitar matches parciais (ex: "core" vs "coreutils")
   local needle=" $group "
 
-  for f in "$ADM_RECIPES_DIR"/*.sh; do
+  # Procura todas as recipes .sh em qualquer subdiretório
+  while IFS= read -r f; do
     [[ -f "$f" ]] || continue
 
     (
-      # sub-shell p/ não poluir variáveis globais
       unset PKG_NAME PKG_GROUPS
       # shellcheck source=/dev/null
       . "$f"
@@ -573,7 +592,7 @@ pkgs_in_group() {
         printf '%s\n' "$name"
       fi
     )
-  done | sort -u
+  done < <(find "$ADM_RECIPES_DIR" -type f -name '*.sh' | sort) | sort -u
 }
 
 # Gera ordem topológica de uma lista de pacotes
@@ -825,14 +844,14 @@ EOF
 cmd_build() {
   local target="$1"
 
-  # Se existir recipe com esse nome, tratamos como pacote
-  if [[ -f "$ADM_RECIPES_DIR/$target.sh" ]]; then
+  # Se acharmos uma recipe com esse nome em qualquer subdiretório, tratamos como pacote
+  if find_recipe_file "$target" >/dev/null 2>&1; then
     build_pkg "$target"
     return 0
   fi
 
   # Caso contrário, tentamos tratar como grupo/categoria
-  log_info "'$target' não é uma recipe; tentando como categoria/grupo..."
+  log_info "'$target' não é uma recipe direta; tentando como categoria/grupo..."
   cmd_build_group "$target"
 }
 
