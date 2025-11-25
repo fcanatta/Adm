@@ -605,6 +605,13 @@ remove_pkg() {
 
   [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
 
+  if dry_run_enabled; then
+    log_info "DRY-RUN: removeria pacote $pkg"
+    log_info "DRY-RUN: arquivos que seriam removidos (manifesto: $manifest):"
+    sed 's/^/  - /' "$manifest"
+    return 0
+  fi
+
   log_info "Removendo arquivos de $pkg usando manifesto $manifest"
 
   # Remove arquivos
@@ -800,6 +807,11 @@ upgrade_pkgs() {
   local -a order=()
   mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
 
+  if dry_run_enabled; then
+    log_info "DRY-RUN: atualizaria (na ordem): ${order[*]}"
+    return 0
+  fi
+
   local p
   for p in "${order[@]}"; do
     log_info "Atualizando pacote: $p"
@@ -932,6 +944,7 @@ Uso:
   adm resolve <p1> [p2 ...]    - Resolver dependências e listar em ordem (Kahn-like)
   adm list                     - Listar pacotes instalados
   adm info <pacote>            - Mostra meta + recipe do pacote
+  adm verify <pacote>          - Verifica se todos os arquivos do pacote ainda existem
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
   adm chroot-build <dir> <pkg> - Fazer build dentro de um chroot existente  
@@ -980,6 +993,23 @@ EOF
 cmd_build() {
   local target="$1"
 
+  # Modo DRY-RUN: só mostra o plano de build
+  if dry_run_enabled; then
+    if find_recipe_file "$target" >/dev/null 2>&1; then
+      # Trata como pacote único, mas expande deps com topo_sort_pkgs
+      local -a order=()
+      mapfile -t order < <(topo_sort_pkgs "$target")
+      log_info "DRY-RUN: construiria (na ordem): ${order[*]}"
+      return 0
+    fi
+
+    # Não é recipe direta: trata como grupo/categoria
+    log_info "DRY-RUN: construindo categoria/grupo '$target'"
+    cmd_build_group "$target"
+    return 0
+  fi
+
+  # Execução normal
   # Se acharmos uma recipe com esse nome em qualquer subdiretório, tratamos como pacote
   if find_recipe_file "$target" >/dev/null 2>&1; then
     build_pkg "$target"
@@ -1004,6 +1034,25 @@ cmd_install() {
   mapfile -t order < <(topo_sort_pkgs "${req_pkgs[@]}")
 
   log_info "Ordem de instalação (com dependências): ${order[*]}"
+
+  if dry_run_enabled; then
+    local p current latest
+    for p in "${order[@]}"; do
+      if is_installed "$p"; then
+        current="$(get_installed_version "$p" || echo '?')"
+        latest="$(upstream_version_for "$p" || echo "$current")"
+        if ver_gt "$latest" "$current"; then
+          log_info "DRY-RUN: reconstruiria $p (instalado: $current, upstream: $latest)"
+        else
+          log_info "DRY-RUN: já instalado e atualizado: $p ($current)"
+        fi
+      else
+        latest="$(upstream_version_for "$p" || echo '?')"
+        log_info "DRY-RUN: instalaria $p (upstream: $latest)"
+      fi
+    done
+    return 0
+  fi
 
   local p
   for p in "${order[@]}"; do
@@ -1075,6 +1124,42 @@ cmd_info() {
   fi
 }
 
+cmd_verify() {
+  local pkg="$1"
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+  local meta
+  meta="$(meta_file_for "$pkg")"
+
+  if [[ ! -f "$manifest" ]]; then
+    die "Manifesto não encontrado para $pkg em $manifest"
+  fi
+
+  if [[ ! -f "$meta" ]]; then
+    log_warn "Meta de instalação não encontrada para $pkg em $meta"
+  fi
+
+  log_info "Verificando arquivos do pacote $pkg (manifesto: $manifest)"
+
+  local missing=0 line
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    if [[ -e "$line" || -L "$line" ]]; then
+      log_debug "OK: $line"
+    else
+      log_warn "Arquivo ausente: $line"
+      missing=1
+    fi
+  done < "$manifest"
+
+  if (( missing )); then
+    log_warn "Verificação concluída: há arquivos ausentes para $pkg"
+    return 1
+  else
+    log_info "Verificação concluída: todos os arquivos do manifesto existem para $pkg"
+  fi
+}
+
 cmd_list_upgrades() {
   list_upgrades
 }
@@ -1106,6 +1191,11 @@ cmd_build_group() {
   mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
 
   log_info "Ordem de build para grupo '$group': ${order[*]}"
+
+  if dry_run_enabled; then
+    log_info "DRY-RUN: construiria grupo '$group' na ordem acima."
+    return 0
+  fi
 
   local p
   for p in "${order[@]}"; do
@@ -1245,6 +1335,10 @@ main() {
     info)
       [[ $# -eq 1 ]] || die "Uso: adm info <pacote>"
       cmd_info "$1"
+      ;;
+    verify)
+      [[ $# -eq 1 ]] || die "Uso: adm verify <pacote>"
+      cmd_verify "$1"
       ;;
     list-upgrades)
       cmd_list_upgrades
