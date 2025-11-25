@@ -29,3 +29,27 @@ adm install algum-pacote
 
 export ADM_CHROOT=/mnt/lfs
 adm-chroot.sh teardown
+
+Comando final funcionando
+
+Agora você pode rodar:
+
+adm chroot-build-group /mnt/lfs cross-toolchain
+
+Isso faz:
+
+1. Entrar no chroot /mnt/lfs
+
+
+2. Preparar o ambiente
+
+
+3. Rodar lá dentro:
+
+adm build-group cross-toolchain
+
+
+4. Usar automaticamente todas as variáveis ADM_* do host
+
+
+5. Construir somente os pacotes necessários pela lógica de dependências + versão atual
