@@ -403,32 +403,36 @@ build_pkg() {
   # 3) Encontrar diretório de build (primeiro subdir criado)
   local srcdir
   srcdir="$(find "$builddir" -mindepth 1 -maxdepth 1 -type d ! -name dest | head -n1 || true)"
-  [[ -n "$srcdir" ]] || { srcdir="$builddir"; }
+  [[ -n "$srcdir" ]] || srcdir="$builddir"
 
   # 4) Executar etapas de build definidas pela recipe
   (
     cd "$srcdir"
+
     if declare -f pkg_prepare >/dev/null 2>&1; then
       log_info "Etapa: prepare()"
       pkg_prepare
     fi
+
     if declare -f pkg_build >/dev/null 2>&1; then
       log_info "Etapa: build()"
       PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_build
     else
       die "Recipe $pkg não define função pkg_build()"
     fi
+
     if declare -f pkg_check >/dev/null 2>&1; then
       log_info "Etapa: check()"
       pkg_check
     fi
+
     if declare -f pkg_install >/dev/null 2>&1; then
       log_info "Etapa: install() para DESTDIR=$destdir"
       PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_install
     else
       # fallback genérico: tentar "make install"
       if [[ -f Makefile || -f makefile ]]; then
-        log_warn "pkg_install() não definido; tentando 'make install DESTDIR=$destdir'"
+        log_warn "pkg_install() não definido; tentando 'make DESTDIR=$destdir install'"
         make DESTDIR="$destdir" install
       else
         die "Sem pkg_install() e sem Makefile para instalar $pkg"
