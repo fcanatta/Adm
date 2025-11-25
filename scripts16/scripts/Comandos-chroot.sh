@@ -1,3 +1,12 @@
+Pronto: qualquer make chamado dentro de pkg_build (ou do que ela chamar) passa a usar -jN.
+
+Você controla a quantidade de jobs assim:
+
+ADM_JOBS=8 adm build cross-toolchain
+ADM_JOBS=4 adm build gcc-pass1
+
+Se ADM_JOBS não estiver definido, o comportamento é exatamente o mesmo de antes.
+
 Como usar na prática
 
 1. Preparar o chroot
