@@ -517,8 +517,24 @@ package_from_destdir() {
   log_info "  $ADM_BIN_CACHE/$fname_zst"
   log_info "  $ADM_BIN_CACHE/$fname_xz"
 
-  # Manifesta (a partir de um deles)
-  ( cd "$destdir" && find . -mindepth 1 -printf '/%P\n' | sort ) >"$(manifest_file_for "$pkg")"
+  # Gera manifesto com SHA256 (se sha256sum estiver disponível)
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    log_info "Gerando manifesto com SHA256 em $manifest"
+    (
+      cd "$destdir" || exit 1
+      # Apenas arquivos regulares e links simbólicos; diretórios serão tratados via dirname
+      find . -mindepth 1 \( -type f -o -type l \) -print0 \
+        | sort -z \
+        | xargs -0 -r sha256sum \
+        | sed 's#  \./#  /#' >"$manifest"
+    )
+  else
+    log_warn "sha256sum não encontrado; gerando manifesto sem hashes."
+    ( cd "$destdir" && find . -mindepth 1 -printf '/%P\n' | sort ) >"$manifest"
+  fi
 }
 
 # -------------------------------------------------------------
@@ -592,45 +608,47 @@ remove_pkg() {
   local manifest
   manifest="$(manifest_file_for "$pkg")"
 
- # Segurança: não remover se outros pacotes dependem dele (a menos que force)
-  if [[ "${ADM_REMOVE_FORCE:-0}" != "1" ]]; then
-    local users
-    users="$(reverse_deps "$pkg" || true)"
-    if [[ -n "$users" ]]; then
-      log_error "Não é seguro remover $pkg: os seguintes pacotes dependem dele:"
-      printf '  - %s\n' $users
-      die "Use ADM_REMOVE_FORCE=1 adm remove $pkg para forçar, se tiver certeza."
-    fi
-  fi
-
   [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
-
-  if dry_run_enabled; then
-    log_info "DRY-RUN: removeria pacote $pkg"
-    log_info "DRY-RUN: arquivos que seriam removidos (manifesto: $manifest):"
-    sed 's/^/  - /' "$manifest"
-    return 0
-  fi
 
   log_info "Removendo arquivos de $pkg usando manifesto $manifest"
 
   # Remove arquivos
-  local f
-  while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
-    if [[ -e "$f" || -L "$f" ]]; then
-      rm -f "$f" || log_warn "Falha ao remover $f"
+  local line path
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+
+    # Manifesto pode ter formato:
+    #   /caminho
+    # ou
+    #   SHA256  /caminho
+    set -- $line
+    if [[ "$1" == /* ]]; then
+      path="$1"
     else
-      log_debug "Arquivo já ausente: $f"
+      path="$2"
+    fi
+
+    if [[ -e "$path" || -L "$path" ]]; then
+      rm -f "$path" || log_warn "Falha ao remover $path"
+    else
+      log_debug "Arquivo já ausente: $path"
     fi
   done <"$manifest"
 
   # Tenta remover diretórios vazios
   log_info "Removendo diretórios vazios residuais"
-  tac "$manifest" | while IFS= read -r f; do
-    [[ -n "$f" ]] || continue
+  tac "$manifest" | while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+
+    set -- $line
+    if [[ "$1" == /* ]]; then
+      path="$1"
+    else
+      path="$2"
+    fi
+
     local dir
-    dir="$(dirname "$f")"
+    dir="$(dirname "$path")"
     [[ "$dir" == "/" || "$dir" == "." ]] && continue
     if [[ -d "$dir" ]]; then
       rmdir "$dir" 2>/dev/null || true
@@ -641,6 +659,102 @@ remove_pkg() {
   rm -f "$(meta_file_for "$pkg")"
 
   log_info "Pacote $pkg removido."
+}
+
+cmd_verify() {
+  local pkg="$1"
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+  local meta
+  meta="$(meta_file_for "$pkg")"
+
+  if [[ ! -f "$manifest" ]]; then
+    die "Manifesto não encontrado para $pkg em $manifest"
+  fi
+
+  if [[ ! -f "$meta" ]]; then
+    log_warn "Meta de instalação não encontrada para $pkg em $meta"
+  fi
+
+  log_info "Verificando arquivos do pacote $pkg (manifesto: $manifest)"
+
+  local missing=0 mismatched=0
+  local line path hash
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+
+    # Linha pode ser:
+    #   /caminho
+    #   SHA256  /caminho
+    set -- $line
+    hash=""
+    if [[ "$1" == /* ]]; then
+      path="$1"
+    elif [[ "$1" =~ ^[0-9a-fA-F]{64}$ && "$2" == /* ]]; then
+      hash="$1"
+      path="$2"
+    else
+      # formato inesperado; assume linha inteira como caminho
+      path="$line"
+    fi
+
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+      log_warn "Arquivo ausente: $path"
+      missing=1
+      continue
+    fi
+
+    if [[ -n "$hash" ]] && command -v sha256sum >/dev/null 2>&1; then
+      local calc
+      calc="$(sha256sum "$path" | awk '{print $1}')"
+      if [[ "$calc" != "$hash" ]]; then
+        log_warn "SHA256 divergente para $path (esperado=$hash, calculado=$calc)"
+        mismatched=1
+      else
+        log_debug "OK (hash): $path"
+      fi
+    else
+      log_debug "OK (existência): $path"
+    fi
+  done <"$manifest"
+
+  if (( missing == 0 && mismatched == 0 )); then
+    log_info "Verificação concluída: todos os arquivos de $pkg existem e (quando disponível) SHA256 confere."
+    return 0
+  else
+    log_warn "Verificação concluída: problemas detectados em $pkg (missing=$missing, mismatched=$mismatched)"
+    return 1
+  fi
+}
+
+cmd_verify_all() {
+  log_info "Verificando todos os pacotes instalados..."
+
+  local -a pkgs=()
+  mapfile -t pkgs < <(list_installed)
+
+  if (( ${#pkgs[@]} == 0 )); then
+    log_info "Nenhum pacote instalado para verificar."
+    return 0
+  fi
+
+  local pkg failed=0
+  for pkg in "${pkgs[@]}"; do
+    [[ -n "$pkg" ]] || continue
+    log_info "=== $pkg ==="
+    if ! cmd_verify "$pkg"; then
+      failed=1
+    fi
+  done
+
+  if (( failed == 0 )); then
+    log_info "Verificação geral concluída: todos os pacotes passaram."
+  else
+    log_warn "Verificação geral concluída: existem pacotes com problemas."
+  fi
+
+  return $failed
 }
 
 # -------------------------------------------------------------
