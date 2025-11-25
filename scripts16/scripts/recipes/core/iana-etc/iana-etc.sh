@@ -40,5 +40,22 @@ pkg_install() {
 # Opcional: por enquanto, upstream == versão da recipe.
 # Se quiser, você pode implementar depois algo que leia o site/projeto eache a data mais nova.
 pkg_upstream_version() {
+  local url="https://github.com/Mic92/iana-etc/releases"
+  local latest
+
+  latest="$(
+    curl -fsSL "$url" \
+      | sed -n 's/.*iana-etc-\([0-9]\{8\}\)\.tar\.gz.*/\1/p' \
+      | sort -V \
+      | tail -n1
+  )"
+
+  # Se extraiu corretamente, devolve a versão
+  if [[ -n "$latest" ]]; then
+    printf '%s\n' "$latest"
+    return 0
+  fi
+
+  # Fallback seguro: se o GitHub falhar, retorna a versão atual da recipe
   printf '%s\n' "$PKG_VERSION"
 }
