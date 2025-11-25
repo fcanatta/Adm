@@ -877,6 +877,7 @@ Uso:
   adm chroot-prepare [dir]     - Prepara o chroot (monta /dev,/proc,/sys,/run, etc.)
   adm chroot-teardown [dir]    - Desmonta os mounts do chroot
   adm chroot-shell [dir]       - Entra em um shell dentro do chroot (usa adm-chroot.sh enter)
+  adm chroot-build-group <dir> <grupo>   - Constrói um grupo inteiro *dentro* do chroot
   adm version                  - Mostrar versão do adm
   adm help                     - Esta ajuda
 
@@ -1073,6 +1074,37 @@ cmd_chroot_teardown() {
     fi
 }
 
+cmd_chroot_build_group() {
+    local chroot_dir="$1"
+    local group="$2"
+
+    if [[ -z "$chroot_dir" || -z "$group" ]]; then
+        die "Uso: adm chroot-build-group <dir> <grupo>"
+    fi
+
+    local helper="/usr/local/sbin/adm-chroot.sh"
+
+    if [[ ! -x "$helper" ]]; then
+        die "Helper $helper não encontrado ou não executável."
+    fi
+
+    log_info "Executando build-group '$group' no chroot $chroot_dir"
+
+    # Passa todas as variáveis ADM_* para dentro do chroot
+    "$helper" enter "$chroot_dir" <<EOF
+export ADM_PREFIX="$ADM_PREFIX"
+export ADM_STATE_DIR="$ADM_STATE_DIR"
+export ADM_CACHE_DIR="$ADM_CACHE_DIR"
+export ADM_SRC_CACHE="$ADM_SRC_CACHE"
+export ADM_BIN_CACHE="$ADM_BIN_CACHE"
+export ADM_BUILD_ROOT="$ADM_BUILD_ROOT"
+export ADM_LOG_DIR="$ADM_LOG_DIR"
+export ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS"
+
+adm build-group "$group"
+EOF
+}
+
 # -------------------------------------------------------------
 # Main
 # -------------------------------------------------------------
@@ -1131,6 +1163,10 @@ main() {
     chroot-teardown)
       (( $# <= 1 )) || die "Uso: adm chroot-teardown [diretório-do-chroot]"
       cmd_chroot_teardown "${1:-}"
+      ;;
+    chroot-build-group)
+      [[ $# -eq 2 ]] || die "Uso: adm chroot-build-group <dir> <grupo>"
+      cmd_chroot_build_group "$1" "$2"
       ;;
     version)
       printf 'adm versão %s\n' "$ADM_VERSION"
