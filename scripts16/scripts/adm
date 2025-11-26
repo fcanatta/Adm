@@ -1408,7 +1408,7 @@ export ADM_BUILD_ROOT="$ADM_BUILD_ROOT"
 export ADM_LOG_DIR="$ADM_LOG_DIR"
 export ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS"
 
-adm build-group "$group"
+adm build "$group"
 EOF
 }
 
