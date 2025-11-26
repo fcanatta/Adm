@@ -1,95 +1,84 @@
-#!/bin/bash
-
-# Binutils-2.45.1 - Pass 1 (Cross-toolchain)
-# LFS 12.4 - Capítulo 5.2 
+# Binutils-2.45.1 - Pass 1 (cross-toolchain)
+# LFS r12.4.46 - Capítulo 5.2
+# https://www.linuxfromscratch.org/lfs/view/development/chapter05/binutils-pass1.html
 
 PKG_NAME="binutils-pass1"
 PKG_VERSION="2.45.1"
 PKG_RELEASE="1"
+PKG_DESC="GNU Binutils (Passo 1 do toolchain cruzado)"
+PKG_GROUPS="cross-toolchain"
 
-PKG_DESC="Binutils 2.45.1 (Passo 1 do toolchain cruzado LFS)"
-PKG_URL="https://www.gnu.org/software/binutils/"
-PKG_LICENSE="GPL-3.0-or-later"
-PKG_GROUPS="cross-toolchain cross-toolchain-musl"
-
-# Fonte oficial conforme capítulo 3.2 (All Packages) 
-PKG_SOURCES="https://sourceware.org/pub/binutils/releases/binutils-2.45.1.tar.xz"
-
-# MD5 oficial do livro (Binutils 2.45.1) 
-PKG_MD5S="ff59f8dc1431edfa54a257851bea74e7"
-
-# SHA256 opcional (não fornecido no LFS; deixe vazio ou preencha se quiser)
-PKG_SHA256S=""
-
-# Pass 1 é sempre o primeiro do cross-toolchain, então sem dependências explícitas
+# Para o Pass 1, não há dependências explícitas além do ambiente LFS/LFS_TGT já preparado
 PKG_DEPENDS=""
 
-pkg_build() {
-  log_info "Construindo Binutils Pass 1"
+PKG_URL="https://www.gnu.org/software/binutils/"
+PKG_LICENSE="GPL-3+ e outras licenças GNU associadas"
 
-  # Já estamos dentro do diretório de fonte extraído (binutils-2.45.1/)
-  # O LFS manda criar um diretório separado de build: 
+# LFS usa este tarball e checksum:
+# Download: https://sourceware.org/pub/binutils/releases/binutils-2.45.1.tar.xz
+# MD5: ff59f8dc1431edfa54a257851bea74e7
+PKG_SOURCES="https://sourceware.org/pub/binutils/releases/binutils-${PKG_VERSION}.tar.xz"
+PKG_MD5SUM="ff59f8dc1431edfa54a257851bea74e7"
+
+# --------------------------------------------------------------------
+# IMPORTANTE:
+#  - Esta recipe assume que as variáveis de ambiente LFS e LFS_TGT
+#    já estão exportadas (como no livro LFS).
+#  - O adm vai extrair o binutils-2.45.1 em $builddir/binutils-2.45.1
+#    e chamar pkg_build/pkg_install a partir desse diretório.
+#  - No LFS, instala-se em $LFS/tools; aqui fazemos isso via DESTDIR,
+#    para que o pacote do adm instale sob ${LFS}/tools quando extraído.
+# --------------------------------------------------------------------
+
+pkg_prepare() {
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+  : "${LFS_TGT:?Variável LFS_TGT não definida. Exporte LFS_TGT antes de construir $PKG_NAME}"
+
+  # Nada específico além da checagem de ambiente
+  :
+}
+
+pkg_build() {
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+  : "${LFS_TGT:?Variável LFS_TGT não definida. Exporte LFS_TGT antes de construir $PKG_NAME}"
+
+  # Estamos em $srcdir = binutils-2.45.1 (o adm já fez cd pra cá)
   mkdir -v build
   cd build
 
-  # Raiz do toolchain (onde 'make install' vai instalar binutils)
-  local cross_root="${ADM_CROSS_ROOT:-/usr/src/cross-toolchain}"
+  ../configure --prefix=/tools       \
+               --with-sysroot="$LFS" \
+               --target="$LFS_TGT"   \
+               --disable-nls         \
+               --enable-gprofng=no   \
+               --disable-werror      \
+               --enable-new-dtags    \
+               --enable-default-hash-style=gnu
 
-  # Sysroot (equivalente ao $LFS do livro)
-  local sysroot="${ADM_CROSS_SYSROOT:-${LFS:-/mnt/lfs}}"
-
-  # Triplet alvo (equivalente a $LFS_TGT, ex: x86_64-lfs-linux-gnu)
-  local tgt="${ADM_CROSS_TARGET:-${LFS_TGT:-}}"
-  if [[ -z "$tgt" ]]; then
-    die "Defina ADM_CROSS_TARGET ou LFS_TGT (ex: x86_64-lfs-linux-gnu) antes de construir binutils-pass1."
-  fi
-
-  log_info "Usando cross_root=$cross_root sysroot=$sysroot target=$tgt"
-
-  # Configure conforme LFS 5.2, adaptado para prefix=/usr/src/cross-toolchain 
-  ../configure \
-    --prefix="$cross_root"      \
-    --with-sysroot="$sysroot"   \
-    --target="$tgt"             \
-    --disable-nls               \
-    --enable-gprofng=no         \
-    --disable-werror            \
-    --enable-new-dtags          \
-    --enable-default-hash-style=gnu
-
-  # Compilar
+  # Compilar Binutils Pass 1
   make
 }
 
-pkg_install() {
-  log_info "Instalando Binutils Pass 1 em DESTDIR=${PKG_DESTDIR}"
-
-  # Entrar no diretório de build criado em pkg_build()
-  cd build
-
-  # Instalação no DESTDIR do adm; o prefix usado no configure já aponta
-  # para /usr/src/cross-toolchain dentro desse DESTDIR.
-  make DESTDIR="$PKG_DESTDIR" install
+pkg_check() {
+  # LFS não roda testes em Binutils Pass 1
+  :
 }
 
+pkg_install() {
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+
+  # Ainda em binutils-2.45.1/build
+  #
+  # Livro manda: make install           (instalando em $LFS/tools)
+  # Aqui: usamos DESTDIR para encaixar no esquema de pacotes do adm.
+  #
+  # Resultado final depois de empacotar + instalar via adm:
+  #   ${LFS}/tools/bin, ${LFS}/tools/lib, etc.
+  make DESTDIR="${PKG_DESTDIR}${LFS}" install
+}
+
+# Versão upstream para o mecanismo de upgrade do adm.
+# Para toolchain cross, é mais seguro manter fixo.
 pkg_upstream_version() {
-  # Descobre a versão mais nova binutils-X.Y[.Z] disponível em sourceware.org
-  # Se der problema de rede ou parsing, volta para PKG_VERSION.
-  local url="https://sourceware.org/pub/binutils/releases/"
-  local latest=""
-
-  if command -v curl >/dev/null 2>&1; then
-    latest="$(
-      curl -fsSL "$url" \
-        | sed -n 's/.*binutils-\([0-9][0-9.]*\)\.tar\.xz.*/\1/p' \
-        | sort -V \
-        | tail -n1
-    )"
-  fi
-
-  if [[ -n "$latest" ]]; then
-    printf '%s\n' "$latest"
-  else
-    printf '%s\n' "$PKG_VERSION"
-  fi
+  printf '%s\n' "${PKG_VERSION}"
 }
