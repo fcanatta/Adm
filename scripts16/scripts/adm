@@ -121,6 +121,34 @@ ensure_cmd() {
   command -v "$cmd" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $cmd"
 }
 
+check_runtime_deps() {
+  # Comandos essenciais para o funcionamento do adm
+  local cmds=(
+    tee tar find xargs sort tac
+    sha256sum
+  )
+
+  # Comandos muito recomendados (mas não fatais se não existirem em todos os fluxos)
+  local optional_cmds=(
+    md5sum
+    make
+    curl wget
+    unzip bunzip2 gunzip 7z
+  )
+
+  local c
+  for c in "${cmds[@]}"; do
+    ensure_cmd "$c"
+  done
+
+  # Optional: só loga aviso se faltar
+  for c in "${optional_cmds[@]}"; do
+    if ! command -v "$c" >/dev/null 2>&1; then
+      log_warn "Comando opcional não encontrado: $c (algumas recipes podem falhar)"
+    fi
+  done
+}
+
 # Comparação de versões usando sort -V
 ver_gt() {
   local a="$1"; local b="$2"
@@ -667,7 +695,7 @@ remove_pkg() {
     return 0
   fi
 
-  log_info "Removendo arquivos de $pkg usando manifesto $manifest"
+  log_info "Removendo arquivos de $pkg usando manifesto $manifest"  
 
   # Remove arquivos
   local line path
@@ -687,6 +715,14 @@ remove_pkg() {
       # Formato inesperado; melhor tentar a linha inteira
       path="$line"
     fi
+
+    # >>> SANITY EXTRA AQUI <<<
+    # Nunca remove raiz, diretório atual ou caminho vazio
+    if [[ -z "$path" || "$path" == "/" || "$path" == "." ]]; then
+      log_warn "Entrada de manifesto suspeita para $pkg: '$line' (ignorando)"
+      continue
+    fi
+    # >>> FIM DA ADIÇÃO <<<
 
     if [[ -e "$path" || -L "$path" ]]; then
       rm -f "$path"
@@ -1355,10 +1391,20 @@ adm_chroot_prepare_mounts() {
     fi
   done
 
-  # Garante que /usr/bin/adm exista dentro do chroot
-  if [[ -x /usr/bin/adm && ! -x "$dir/usr/bin/adm" ]]; then
-    mkdir -p "$dir/usr/bin"
-    cp /usr/bin/adm "$dir/usr/bin/adm"
+ # Garante que o binário do adm exista dentro do chroot
+  # Usa o caminho real do executável em vez de assumir /usr/bin/adm
+  local self
+  self="$(command -v adm || echo "$0")"
+
+  # Normaliza para caminho absoluto se possível
+  if [[ "$self" != /* ]]; then
+    self="$(readlink -f "$self" 2>/dev/null || realpath "$self" 2>/dev/null || echo "$self")"
+  fi
+
+  local chroot_self="$dir$self"
+  if [[ -x "$self" && ! -x "$chroot_self" ]]; then
+    mkdir -p "$(dirname "$chroot_self")"
+    cp "$self" "$chroot_self"
   fi
 }
 
@@ -1697,8 +1743,18 @@ cmd_chroot_build_group() {
 # -------------------------------------------------------------
 # Main
 # -------------------------------------------------------------
-main() {
+main() {  
   init_dirs
+
+  # Verifica dependências de runtime antes de redirecionar logs
+  check_runtime_deps
+
+  # Lock global para evitar mais de uma instância do adm
+  exec 9> "$ADM_STATE_DIR/adm.lock"
+  if ! flock -n 9; then
+    echo "Outro processo 'adm' já está em execução. Tente novamente mais tarde." >&2
+    exit 1
+  fi  
 
   # Logging global (tudo que aparece na tela também vai para o log)
   exec > >(tee -a "$ADM_LOG_DIR/adm.log") 2>&1
