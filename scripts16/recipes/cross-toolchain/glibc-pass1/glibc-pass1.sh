@@ -17,8 +17,8 @@ PKG_GROUPS="cross-toolchain"
 PKG_DEPENDS="binutils-pass1 gcc-pass1 linux-headers"
 
 # Usando os mesmos mirrors do LFS (pacotes 12.4)
-PKG_SOURCES="https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/glibc-2.42.tar.xz \
-https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/glibc-2.42-fhs-1.patch"
+PKG_SOURCES="https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/glibc-${PKG_VERSION}.tar.xz \
+https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/glibc-${PKG_VERSION}-fhs-1.patch"
 
 # Mesma ordem que em PKG_SOURCES
 PKG_MD5S="23c6f5a27932b435cae94e087cb8b1f5 \
@@ -49,7 +49,7 @@ pkg_build() {
   # Estamos em $srcdir = glibc-2.42 (o adm já fez cd pra cá)
 
   # Patch FHS (var/db -> locais FHS-compliant), como no livro
-  patch -Np1 -i "${ADM_SRC_CACHE}/glibc-2.42-fhs-1.patch"
+  patch -Np1 -i "${ADM_SRC_CACHE}/glibc-${PKG_VERSION}-fhs-1.patch"
 
   # Diretório de build separado
   mkdir -v build
