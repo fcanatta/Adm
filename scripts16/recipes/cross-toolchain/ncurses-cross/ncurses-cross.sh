@@ -13,7 +13,7 @@ PKG_URL="https://invisible-island.net/ncurses/"
 PKG_GROUPS="cross-toolchain"
 
 # Dependências: precisa do basic toolchain e do m4
-PKG_DEPENDS="binutils-pass1 gcc-pass1 linux-headers glibc-cross gcc-libstdc++ m4-cross"
+PKG_DEPENDS="binutils-pass1 gcc-pass1 linux-headers glibc-pass1 gcc-libstdc++ m4-cross"
 
 # Fonte e MD5 oficial listado na página do LFS packages
 PKG_SOURCES="https://ftp.gnu.org/gnu/ncurses/ncurses-${PKG_VERSION}.tar.gz"
