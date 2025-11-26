@@ -178,6 +178,40 @@ load_recipe() {
   [[ "$(basename "$PKG_NAME")" == "$pkg" ]] || :
 }
 
+load_recipe_soft() {
+  local pkg="$1"
+  local recipe
+
+  # Tenta encontrar a recipe sem abortar o programa
+  if ! recipe="$(find_recipe_file "$pkg")"; then
+    log_warn "Recipe não encontrado para pacote '$pkg' em $ADM_RECIPES_DIR"
+    return 1
+  fi
+
+  # Limpa variáveis e funções de recipes anteriores
+  unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
+        PKG_BUILD_DIR PKG_LICENSE PKG_URL PKG_SHA256S PKG_MD5S PKG_GROUPS
+  unset -f pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version 2>/dev/null || true
+
+  # shellcheck source=/dev/null
+  if ! . "$recipe"; then
+    log_warn "Falha ao carregar recipe '$recipe' para pacote '$pkg'"
+    return 1
+  fi
+
+  if [[ -z "${PKG_NAME:-}" || -z "${PKG_VERSION:-}" ]]; then
+    log_warn "Recipe '$recipe' inválido (PKG_NAME/PKG_VERSION ausentes)"
+    return 1
+  fi
+
+  # Mantém a mesma semântica de nome, mas não mata o processo se divergir
+  if [[ "$(basename "$PKG_NAME")" != "$pkg" ]]; then
+    log_warn "PKG_NAME='$PKG_NAME' difere do nome solicitado '$pkg' em '$recipe'"
+  fi
+
+  return 0
+}
+
 # -------------------------------------------------------------
 # Banco de dados / metadados
 # -------------------------------------------------------------
@@ -897,8 +931,9 @@ topo_sort_pkgs() {
 upstream_version_for() {
   local pkg="$1"
 
-  if ! load_recipe "$pkg"; then
-    log_warn "Não foi possível carregar a recipe de '$pkg' para checar upstream."
+  # Usa loader “soft” para não derrubar o processo em list-upgrades, etc.
+  if ! load_recipe_soft "$pkg"; then
+    # Já foi logado dentro de load_recipe_soft()
     return 1
   fi
 
@@ -925,13 +960,20 @@ list_upgrades() {
   local pkg
   list_installed | while IFS= read -r pkg; do
     [[ -n "$pkg" ]] || continue
-    load_recipe "$pkg" || { log_warn "Sem recipe para pacote instalado $pkg"; continue; }
+
     local current latest
     current="$(get_installed_version "$pkg" || echo "")"
-    latest="$(upstream_version_for "$pkg")"
     if [[ -z "$current" ]]; then
       continue
     fi
+
+    # upstream_version_for pode falhar; não queremos abortar por causa de um pacote
+    latest="$(upstream_version_for "$pkg" 2>/dev/null || echo "")"
+    if [[ -z "$latest" ]]; then
+      log_warn "Não foi possível determinar upstream para '$pkg'; ignorando em list-upgrades."
+      continue
+    fi
+
     if ver_gt "$latest" "$current"; then
       printf '%s %s -> %s\n' "$pkg" "$current" "$latest"
     fi
@@ -980,7 +1022,13 @@ upgrade_pkgs() {
   mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
 
   if dry_run_enabled; then
-    log_info "DRY-RUN: atualizaria (na ordem): ${order[*]}"
+    log_info "DRY-RUN: ordem de upgrade calculada: ${order[*]}"
+    local p current latest
+    for p in "${order[@]}"; do
+      current="$(get_installed_version "$p" || echo 'não instalado')"
+      latest="$(upstream_version_for "$p" 2>/dev/null || echo 'desconhecido')"
+      log_info "DRY-RUN: $p (instalado=$current, upstream=$latest)"
+    done
     return 0
   fi
 
@@ -989,6 +1037,8 @@ upgrade_pkgs() {
     log_info "Atualizando pacote: $p"
     install_pkg_if_needed "$p"
   done
+
+  log_info "Upgrade concluído para os pacotes: ${order[*]}"
 }
 
 # -------------------------------------------------------------
@@ -1005,7 +1055,9 @@ is_pkg_up_to_date() {
 
   local current latest
   current="$(get_installed_version "$pkg" || echo "")"
-  latest="$(upstream_version_for "$pkg")"
+
+  # Protege contra falha em upstream_version_for com set -e
+  latest="$(upstream_version_for "$pkg" 2>/dev/null || echo "")"
 
   # Se algo der errado, preferimos reconstruir
   if [[ -z "$current" || -z "$latest" ]]; then
