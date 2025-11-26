@@ -274,7 +274,31 @@ phase_cross_toolchain() {
 # Aqui deixo as funções declaradas, você cola o bloco do livro em cada uma.
 ###############################################################################
 
-build_m4()         { run_as_lfs '# COLE AQUI os comandos da seção 6.2 M4-1.4.20'; }
+build_m4() {
+  run_as_lfs '
+    set -e
+
+    echo "=== M4-1.4.20: extraindo fonte ==="
+    tar -xf m4-1.4.20.tar.xz
+    cd m4-1.4.20
+
+    echo "=== M4-1.4.20: configurando (host -> target cross) ==="
+    ./configure \
+        --prefix=/usr \
+        --host=$LFS_TGT \
+        --build=$(./config.guess)
+
+    echo "=== M4-1.4.20: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== M4-1.4.20: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== M4-1.4.20: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf m4-1.4.20
+  '
+}
 build_ncurses()    { run_as_lfs '# COLE AQUI os comandos da seção 6.3 Ncurses-6.5-20250809'; }
 build_bash()       { run_as_lfs '# COLE AQUI os comandos da seção 6.4 Bash-5.3'; }
 build_coreutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.5 Coreutils-9.9'; }
@@ -447,6 +471,89 @@ phase_enter_chroot_shell() {
 }
 
 ###############################################################################
+# FASE DOWNLOAD SOURCES – FAZ DOWNLOAD DE TODOS OS SOURCES
+###############################################################################
+
+download_sources() {
+    need_root
+
+    echo "=== DOWNLOAD: Preparando diretório $LFS/sources ==="
+    mkdir -pv "$LFS/sources"
+    chmod -v a+wt "$LFS/sources"
+
+    cd "$LFS/sources"
+
+    echo "=== DOWNLOAD: Obtendo wget-list-sysv ==="
+    wget -O wget-list-sysv \
+      https://www.linuxfromscratch.org/lfs/view/development/wget-list-sysv
+
+    echo "=== DOWNLOAD: Obtendo lista de md5sums oficial ==="
+    wget -O md5sums \
+      https://www.linuxfromscratch.org/lfs/view/development/md5sums
+
+    echo "=== DOWNLOAD: Baixando todos os sources ==="
+    wget --input-file=wget-list-sysv \
+         --continue \
+         --directory-prefix="$LFS/sources"
+
+    echo "=== DOWNLOAD: Verificando integridade com md5sum ==="
+
+    # Arquivos válidos (presentes no md5sums)
+    local files_expected
+    files_expected=$(awk '{print $2}' md5sums)
+
+    # Checagem completa
+    md5sum -c md5sums > md5sum.log 2>&1 || true
+
+    echo
+    echo "==============================================================="
+    echo "Resultado da verificação MD5 - veja $LFS/sources/md5sum.log"
+    echo "==============================================================="
+    echo
+
+    # Reportar arquivos OK, FAIL e MISSING
+    local ok fail missing count_ok count_fail count_missing
+
+    ok=$(grep -E ": OK$" md5sum.log || true)
+    fail=$(grep -E ": FAILED$" md5sum.log || true)
+
+    count_ok=$(printf "%s" "$ok" | grep -c . || true)
+    count_fail=$(printf "%s" "$fail" | grep -c . || true)
+
+    # Arquivos que deveriam existir mas não existem
+    missing=""
+    count_missing=0
+    for f in $files_expected; do
+        if [ ! -f "$f" ]; then
+            missing="$missing $f"
+            count_missing=$((count_missing+1))
+        fi
+    done
+
+    echo "=== MD5: Arquivos OK: $count_ok"
+    echo "=== MD5: Arquivos com falha: $count_fail"
+    echo "=== MD5: Arquivos faltando: $count_missing"
+
+    if [ "$count_fail" -gt 0 ] || [ "$count_missing" -gt 0 ]; then
+        echo "==============================================================="
+        echo "ERROS DETECTADOS:"
+        [ "$count_fail" -gt 0 ] && echo "- Arquivos com checksum incorreto:"
+        [ "$count_fail" -gt 0 ] && echo "$fail"
+        echo
+        [ "$count_missing" -gt 0 ] && echo "- Arquivos faltando:"
+        [ "$count_missing" -gt 0 ] && echo "$missing"
+        echo
+        echo "Reexecute esta função após corrigir problemas ou baixar novamente."
+        echo "==============================================================="
+        return 1
+    fi
+
+    echo "==============================================================="
+    echo "Todos os sources estão íntegros e prontos!"
+    echo "==============================================================="
+}
+
+###############################################################################
 # DISPATCH
 ###############################################################################
 
@@ -477,6 +584,7 @@ EOF
 main() {
   local phase="${1:-}"
   case "$phase" in
+    download-sources) download_sources ;;
     init-host)       phase_init_host ;;
     cross-toolchain) phase_cross_toolchain ;;
     temp-tools)      phase_temp_tools ;;
@@ -488,6 +596,7 @@ main() {
     enter-chroot)    phase_enter_chroot_shell ;;
     all)
       phase_init_host
+      download_sources 
       phase_cross_toolchain
       phase_temp_tools
       phase_chroot_setup
