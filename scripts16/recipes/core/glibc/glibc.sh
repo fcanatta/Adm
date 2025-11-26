@@ -1,4 +1,4 @@
-# glibc-2.42 - GNU C Library (LFS 12.4 r12.4.46)
+# glibc-${PKG_VERSION} - GNU C Library (LFS 12.4 r12.4.46)
 
 PKG_NAME="glibc"
 PKG_VERSION="2.42"
@@ -7,17 +7,17 @@ PKG_RELEASE="1"
 # Ajuste grupos conforme sua organização
 PKG_GROUPS="core toolchain"
 
-PKG_DESC="GNU C Library (glibc) 2.42 conforme LFS 12.4, capítulo 8.5"
+PKG_DESC="GNU C Library (glibc) ${PKG_VERSION} conforme LFS 12.4, capítulo 8.5"
 PKG_URL="https://www.gnu.org/software/libc/"
 PKG_LICENSE="GPL-2.0-or-later AND LGPL-2.1-or-later"
 
 # Fontes:
-#  - glibc-2.42
+#  - glibc-${PKG_VERSION}
 #  - patch FHS do LFS
 #  - tzdata2025b (para zona horária, usado em 8.5.2.2)
 PKG_SOURCES="\
-https://ftp.gnu.org/gnu/libc/glibc-2.42.tar.xz \
-https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/glibc-2.42-fhs-1.patch \
+https://ftp.gnu.org/gnu/libc/glibc-${PKG_VERSION}.tar.xz \
+https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/glibc-${PKG_VERSION}-fhs-1.patch \
 https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/tzdata2025b.tar.gz"
 
 # MD5s oficiais do bundle LFS 12.4
@@ -36,11 +36,11 @@ PKG_DEPENDS="linux-headers"
 ###############################################################################
 
 pkg_prepare() {
-  # Estamos em $srcdir = glibc-2.42
+  # Estamos em $srcdir = glibc-${PKG_VERSION}
 
   # 1. Patch FHS: faz programas da glibc usarem diretórios compatíveis com FHS
-  #    Em LFS: patch -Np1 -i ../glibc-2.42-fhs-1.patch
-  patch -Np1 -i "$ADM_SRC_CACHE/glibc-2.42-fhs-1.patch"
+  #    Em LFS: patch -Np1 -i ../glibc-${PKG_VERSION}-fhs-1.patch
+  patch -Np1 -i "$ADM_SRC_CACHE/glibc-${PKG_VERSION}-fhs-1.patch"
 
   # 2. Fix para abort.c (compat com Valgrind em BLFS)
   #    Em LFS:
@@ -246,13 +246,13 @@ EOF
 # Opcional: se quiser integrar com mecanismo de checagem de versão upstream
 # pkg_upstream_version() {
   # Simplesmente imprime a versão LFS-alinhada
-  # echo "2.42"
+  # echo "${PKG_VERSION}"
 # }
 # Integra com o mecanismo genérico do adm para descobrir a maior versão
 # disponível no diretório de fontes (ftp.gnu.org/gnu/libc/).
 #
 # O adm_generic_upstream_version:
-#   - usa o primeiro URL de PKG_SOURCES (glibc-2.42.tar.xz),
+#   - usa o primeiro URL de PKG_SOURCES (glibc-${PKG_VERSION}.tar.xz),
 #   - descobre o diretório (https://ftp.gnu.org/gnu/libc/),
 #   - procura arquivos no formato glibc-<versão>.tar.xz
 #   - e imprime a MAIOR versão encontrada.
