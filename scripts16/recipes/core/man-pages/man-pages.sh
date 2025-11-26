@@ -13,7 +13,7 @@ PKG_LICENSE="various-free-licenses"
 
 # Fonte principal, conforme capítulo 3.2 do LFS r12.4-46
 # Download e MD5 tirados direto da tabela de pacotes.
-PKG_SOURCES="https://www.kernel.org/pub/linux/docs/man-pages/man-pages-$PKG_VERSION.tar.xz"
+PKG_SOURCES="https://www.kernel.org/pub/linux/docs/man-pages/man-pages-${PKG_VERSION}.tar.xz"
 PKG_MD5S="4394eac3258137c8b549febeb04a7c33"
 
 # Dependências lógicas (para uso das manpages).
