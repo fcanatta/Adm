@@ -28,16 +28,19 @@ PKG_DEPENDS="glibc"
 ###############################################################################
 
 pkg_prepare() {
-  # Diretório fonte: busybox-1.36.1/
-
-  # Gera um .config padrão (defconfig). Se quiser um conjunto custom de applets,
-  # você pode trocar isso por um "cp" de um .config seu antes do build.
+  # Gera defconfig “bem completo”
   make defconfig
 
-  # Dica (opcional): se você quiser garantir suporte a "busybox --install -s"
-  # em runtime, certifique-se que a opção
-  #   CONFIG_FEATURE_INSTALLER=y
-  # esteja habilitada no .config (pode ser ajustado com make menuconfig).
+  # Ajustes pro adm / rootfs geral
+  sed -i 's/^# CONFIG_FEATURE_PREFER_APPLETS is not set/CONFIG_FEATURE_PREFER_APPLETS=y/' .config
+  sed -i 's/^# CONFIG_FEATURE_SH_STANDALONE is not set/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+  sed -i 's/^# CONFIG_INSTALL_APPLET_SYMLINKS is not set/CONFIG_INSTALL_APPLET_SYMLINKS=y/' .config
+  sed -i 's/^CONFIG_INSTALL_APPLET_HARDLINKS=y/# CONFIG_INSTALL_APPLET_HARDLINKS is not set/' .config
+  sed -i 's/^CONFIG_INSTALL_APPLET_SCRIPT_WRAPPERS=y/# CONFIG_INSTALL_APPLET_SCRIPT_WRAPPERS is not set/' .config
+  sed -i 's/^CONFIG_STATIC=y/# CONFIG_STATIC is not set/' .config
+
+  # Se quiser garantir consistência
+  make oldconfig
 }
 
 pkg_build() {
