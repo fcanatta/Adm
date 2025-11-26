@@ -67,6 +67,7 @@ pkg_install() {
   log_info "Instalados: /etc/services e /etc/protocols"
 }
 
+# PKG_VERSION e escolhe o maior entre os dois.
 pkg_upstream_version() {
-  echo "$PKG_VERSION"
+  adm_generic_upstream_version
 }
