@@ -3,7 +3,7 @@
 # LFS r12.4-46 - 6.2. M4-1.4.20
 # https://www.linuxfromscratch.org/lfs/view/12.4/chapter06/m4.html
 
-PKG_NAME="m4-cross"
+PKG_NAME="m4-pass1"
 PKG_VERSION="1.4.20"
 PKG_RELEASE="1"
 
