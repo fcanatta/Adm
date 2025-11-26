@@ -937,23 +937,46 @@ upstream_version_for() {
     return 1
   fi
 
+  local base upstream chosen
+  base="${PKG_VERSION}"
+
+  upstream=""
+
   if declare -f pkg_upstream_version >/dev/null 2>&1; then
-    local v
-    if ! v="$(pkg_upstream_version 2>/dev/null)"; then
-      log_warn "pkg_upstream_version() falhou para '$pkg'; usando PKG_VERSION local."
-      printf '%s\n' "$PKG_VERSION"
-      return 0
+    # Tenta obter a versão do upstream, mas nunca deixa erro daqui matar o fluxo
+    if ! upstream="$(pkg_upstream_version 2>/dev/null || true)"; then
+      upstream=""
     fi
-    if [[ -z "$v" ]]; then
-      log_warn "pkg_upstream_version() retornou vazio para '$pkg'; usando PKG_VERSION local."
-      printf '%s\n' "$PKG_VERSION"
-      return 0
+
+    # Remove espaços em branco nas pontas (se xargs existir, quase sempre em LFS)
+    if command -v xargs >/dev/null 2>&1; then
+      upstream="$(printf '%s' "$upstream" | xargs || true)"
     fi
-    printf '%s\n' "$v"
-  else
-    # Se não houver função de upstream, retorna a própria versão do recipe
-    printf '%s\n' "$PKG_VERSION"
+
+    # Trata tags tipo "v1.2.3" / "V1.2.3" -> "1.2.3"
+    if [[ "$upstream" =~ ^[vV][0-9] ]]; then
+      upstream="${upstream:1}"
+    fi
   fi
+
+  # Se não conseguimos uma versão upstream confiável, cai pro recipe
+  if [[ -z "$upstream" ]]; then
+    log_debug "upstream_version_for($pkg): sem upstream confiável; usando PKG_VERSION=$base"
+    printf '%s\n' "$base"
+    return 0
+  fi
+
+  # Escolhe o maior entre base (PKG_VERSION) e upstream
+  if ver_gt "$upstream" "$base"; then
+    chosen="$upstream"
+  else
+    if ver_gt "$base" "$upstream"; then
+      log_debug "upstream_version_for($pkg): PKG_VERSION ($base) > upstream ($upstream); mantendo PKG_VERSION."
+    fi
+    chosen="$base"
+  fi
+
+  printf '%s\n' "$chosen"
 }
 
 list_upgrades() {
