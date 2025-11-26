@@ -6,13 +6,13 @@ PKG_NAME="gcc-pass1"
 PKG_VERSION="15.2.0"
 PKG_RELEASE="1"
 
-PKG_DESC="GCC 15.2.0 - Pass 1 (cross-compiler C/C++ para LFS)"
+PKG_DESC="GCC ${PKG_VERSION} - Pass 1 (cross-compiler C/C++ para LFS)"
 PKG_LICENSE="GPL-3.0-or-later"
 PKG_URL="https://gcc.gnu.org/"
 PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
 # Fontes principais + GMP/MPFR/MPC embutidos no source tree
-PKG_SOURCES="https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz \
+PKG_SOURCES="https://ftp.gnu.org/gnu/gcc/gcc-${PKG_VERSION}/gcc-${PKG_VERSION}.tar.xz \
 https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.2.tar.xz \
 https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz \
 https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz"
