@@ -6,7 +6,7 @@ PKG_NAME="binutils-pass1"
 PKG_VERSION="2.45.1"
 PKG_RELEASE="1"
 PKG_DESC="GNU Binutils (Passo 1 do toolchain cruzado)"
-PKG_GROUPS="cross-toolchain"
+PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
 # Para o Pass 1, não há dependências explícitas além do ambiente LFS/LFS_TGT já preparado
 PKG_DEPENDS=""
