@@ -925,6 +925,97 @@ topo_sort_pkgs() {
   printf '%s\n' "${sorted[@]}"
 }
 
+# Função genérica para descobrir versão upstream a partir de PKG_SOURCES
+# Usa o primeiro URL de PKG_SOURCES, deduz prefixo/sufixo do nome do arquivo,
+# baixa o índice do diretório e pega a maior versão.
+adm_generic_upstream_version() {
+  # Requer PKG_VERSION e PKG_SOURCES definidos pela recipe
+  if [[ -z "${PKG_VERSION:-}" || -z "${PKG_SOURCES:-}" ]]; then
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: PKG_VERSION/PKG_SOURCES não definidos; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  local src dir file prefix suffix html versions latest
+
+  # Expande PKG_SOURCES (suporta ${PKG_VERSION} etc) e pega só o primeiro URL
+  src="$(eval "printf '%s' \"$PKG_SOURCES\"")"
+  src="${src%% *}"
+
+  if [[ -z "$src" ]]; then
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: PKG_SOURCES vazio; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  # Se o usuário quiser forçar outro diretório para upstream, pode definir PKG_UPSTREAM_URL
+  if [[ -n "${PKG_UPSTREAM_URL:-}" ]]; then
+    dir="$PKG_UPSTREAM_URL"
+  else
+    dir="${src%/*}/"
+  fi
+
+  file="${src##*/}"
+
+  # Tenta decompor o nome em: prefixo + versão + sufixo
+  # Ex:  bash-5.2.21.tar.gz -> prefixo="bash-" vers="5.2.21" sufixo=".tar.gz"
+  local tripla rest
+  tripla="$(printf '%s\n' "$file" | sed -n 's/^\([^0-9]*\)\([0-9][0-9.]*\)\(.*\)$/\1|\2|\3/p')"
+  if [[ -z "$tripla" ]]; then
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: não consegui extrair padrão de versão de '$file'; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  prefix="${tripla%%|*}"
+  rest="${tripla#*|}"
+  # vers_orig="${rest%%|*}"  # a versão da própria recipe, se quiser usar
+  suffix="${rest#*|}"
+
+  # Baixa o índice do diretório upstream
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$dir" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    html="$(wget -qO- "$dir" 2>/dev/null || true)"
+  else
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: nem curl nem wget encontrados; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  if [[ -z "$html" ]]; then
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: falha ao obter índice de '$dir'; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  # Extrai todas as versões no padrão prefixo + <versão> + sufixo
+  versions="$(
+    printf '%s\n' "$html" \
+      | sed -n "s/.*${prefix}\([0-9][0-9.]*\)${suffix}.*/\1/p" \
+      | sort -Vu
+  )"
+
+  if [[ -z "$versions" ]]; then
+    [[ "$(type -t log_warn)" == "function" ]] && \
+      log_warn "adm_generic_upstream_version: não encontrei versões em '$dir' com padrão ${prefix}<ver>${suffix}; usando PKG_VERSION."
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  latest="$(printf '%s\n' "$versions" | tail -n1)"
+
+  [[ "$(type -t log_debug)" == "function" ]] && \
+    log_debug "adm_generic_upstream_version: PKG=$PKG_NAME base=$PKG_VERSION upstream=$latest dir=$dir prefix=$prefix suffix=$suffix"
+
+  printf '%s\n' "$latest"
+}
+
 # -------------------------------------------------------------
 # Atualização / upgrade
 # -------------------------------------------------------------
