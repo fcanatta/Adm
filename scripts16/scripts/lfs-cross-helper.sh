@@ -567,13 +567,13 @@ download_sources() {
     cd "$LFS/sources"
 
     echo "=== DOWNLOAD: Obtendo wget-list-sysv ==="
-    wget -q -O wget-list-sysv \
-      https://www.linuxfromscratch.org/lfs/view/development/wget-list-sysv
+    wget -q -O wget-list \
+      https://www.linuxfromscratch.org/lfs/downloads/development/wget-list
 
     echo "=== DOWNLOAD: Obtendo lista de md5sums oficial ==="
-    # md5sums "cru" (ajuste para stable / versão específica se preferir)
+    # md5sums "cru" (ajuste para development / versão específica se preferir)
     wget -q -O md5sums \
-      https://www.linuxfromscratch.org/lfs/downloads/stable/md5sums
+      https://www.linuxfromscratch.org/lfs/downloads/development/md5sums
 
     echo
     echo "=== DOWNLOAD: Baixando todos os sources com barra de progresso ==="
@@ -583,7 +583,7 @@ download_sources() {
     #   --show-progress           -> mostra barra mesmo em stdout
     #   --progress=bar:force:noscroll -> barra contínua tipo apt
     wget \
-      --input-file=wget-list-sysv \
+      --input-file=wget-list \
       --continue \
       --directory-prefix="$LFS/sources" \
       --show-progress \
