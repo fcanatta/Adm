@@ -1,0 +1,5 @@
+export LFS=/mnt/lfs
+export LFS_TGT=$(uname -m)-lfs-linux-gnu   # ou o que você estiver usando
+
+adm build linux-headers
+adm build cross-toolchain
