@@ -14,7 +14,7 @@ PKG_GROUPS="cross-toolchain"
 
 # Para compilar M4 em Chapter 6 precisamos do toolchain cross pronto
 # (binutils-pass1, gcc-pass1) e da glibc/headers já instalados em $LFS.
-PKG_DEPENDS="binutils-pass1 gcc-pass1 linux-headers glibc gcc-libstdc++"
+PKG_DEPENDS="binutils-pass1 gcc-pass1 linux-headers glibc-pass1 gcc-libstdc++"
 
 # Fonte e MD5 conforme a lista de pacotes do LFS 12.4
 # Download: https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz
