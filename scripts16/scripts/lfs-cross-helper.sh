@@ -47,6 +47,11 @@ phase_init_host() {
     x86_64) mkdir -pv "$LFS/lib64" ;;
   esac
 
+  # RECOMENDADO: symlink /tools -> $LFS/tools (host)
+  if [ ! -e /tools ]; then
+    ln -sv "$LFS/tools" /tools
+  fi
+
   log "Criando usuário/grupo $LFS_USER..."
   getent group "$LFS_GROUP" >/dev/null 2>&1 || groupadd -g 1001 "$LFS_GROUP"
   if ! id "$LFS_USER" >/dev/null 2>&1; then
@@ -442,10 +447,21 @@ phase_chroot_dirs_files() {
     mkdir -pv /{boot,home,mnt,opt,srv}
     mkdir -pv /etc /media
     mkdir -pv /usr/{bin,lib,sbin,local}
+    # Symlinks estilo FHS/merged-usr
+    ln -sv usr/bin /bin
+    ln -sv usr/sbin /sbin
+    ln -sv usr/lib /lib
+    case "$(uname -m)" in
+      x86_64) ln -sv lib /lib64 ;;
+    esac
     mkdir -pv /var/{log,mail,spool,run,cache,lib/{misc,locate}}
     mkdir -pv /root
     chmod 0750 /root
 
+    # IMPORTANTE: /tmp e /var/tmp com sticky bit
+    mkdir -pv /tmp /var/tmp
+    chmod 1777 /tmp /var/tmp
+    
     cat > /etc/passwd << "EOF"
 root:x:0:0:root:/root:/bin/bash
 bin:x:1:1:bin:/dev/null:/usr/bin/false
@@ -555,8 +571,9 @@ download_sources() {
       https://www.linuxfromscratch.org/lfs/view/development/wget-list-sysv
 
     echo "=== DOWNLOAD: Obtendo lista de md5sums oficial ==="
+    # md5sums "cru" (ajuste para stable / versão específica se preferir)
     wget -q -O md5sums \
-      https://www.linuxfromscratch.org/lfs/view/development/md5sums
+      https://www.linuxfromscratch.org/lfs/downloads/stable/md5sums
 
     echo
     echo "=== DOWNLOAD: Baixando todos os sources com barra de progresso ==="
@@ -645,7 +662,9 @@ usage() {
 Uso: $0 <fase>
 
 Fases:
-  init-host       – cria layout \$LFS, usuário lfs, env (cap. 4)
+  init-host       – cria layout $LFS, usuário lfs, env (cap. 4)
+  download-sources – baixa wget-list-sysv e todos os sources
+  verify-sources   – verifica md5 dos sources em $LFS/sources
   cross-toolchain – Binutils/GCC/Linux headers/Glibc/Libstdc++ (cap. 5)
   temp-tools      – temporary tools cross (cap. 6) – precisa colar comandos
   chroot-setup    – ownership + mounts + diretórios + arquivos essenciais (cap. 7.2–7.6)
