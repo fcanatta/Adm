@@ -1,82 +1,81 @@
-# Recipe para adm: Linux-6.17.8 API Headers
-# Linux From Scratch - Version r12.4-46, seção 5.4 (Linux-6.17.8 API Headers)
+#!/usr/bin/env bash
+# Linux-6.17.8 API Headers (cross-toolchain)
+# LFS r12.4-46 - Capítulo 5.4
+# https://www.linuxfromscratch.org/lfs/view/development/chapter05/linux-headers.html
 
 PKG_NAME="linux-headers"
 PKG_VERSION="6.17.8"
 PKG_RELEASE="1"
 
-PKG_DESC="Linux ${PKG_VERSION} API Headers para o toolchain (expostos em /usr/include)"
-PKG_URL="https://www.kernel.org/"
+PKG_DESC="Linux ${PKG_VERSION} API Headers para o toolchain do LFS"
 PKG_LICENSE="GPL-2.0-only"
+PKG_URL="https://www.kernel.org/"
 PKG_GROUPS="cross-toolchain cross-toolchain-musl"
 
-# Fonte conforme capítulo 3.2 (All Packages)
-# Linux (6.17.8) - Download + MD5
-PKG_SOURCES="https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz"
-PKG_MD5S="74c34fafb5914d05447863cdc304ab55"
-PKG_SHA256S=""
+# Ordem no livro: binutils-pass1 -> gcc-pass1 -> linux-headers -> glibc
+# Tecnicamente os headers não precisam de gcc/binutils, mas manter a ordem ajuda o topo sort.
+PKG_DEPENDS="binutils-pass1 gcc-pass1"
 
-# Ordem lógica dentro do cross-toolchain:
-# No livro a sequência é Binutils-pass1 -> GCC-pass1 -> Linux headers -> Glibc.
-# Aqui fazemos linux-headers depender de gcc-pass1 para manter essa ordem.
-PKG_DEPENDS="gcc-pass1"
+# Pacote do kernel usado no LFS:
+# Download e MD5 conforme página de pacotes do LFS:
+#   https://www.kernel.org/pub/linux/kernel/v6.x/linux-6.17.8.tar.xz
+#   MD5 sum: 74c34fafb5914d05447863cdc304ab55
+PKG_SOURCES="https://www.kernel.org/pub/linux/kernel/v6.x/linux-${PKG_VERSION}.tar.xz"
+PKG_MD5SUM="74c34fafb5914d05447863cdc304ab55"
 
-pkg_prepare() {
-  # 5.4.1: garantir que não há arquivos velhos no tarball
-  # make mrproper
-  make mrproper
+# Para o toolchain cross, não queremos upgrades automáticos
+pkg_upstream_version() {
+  printf '%s\n' "${PKG_VERSION}"
 }
 
+# -------------------------------------------------------------
+# prepare(): apenas valida o ambiente
+# -------------------------------------------------------------
+pkg_prepare() {
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+}
+
+# -------------------------------------------------------------
+# build(): segue exatamente o livro:
+#   make mrproper
+#   make headers
+#   find usr/include -type f ! -name '*.h' -delete
+# -------------------------------------------------------------
 pkg_build() {
-  # 5.4.1: extrair os headers "user-visible" para ./usr
-  # make headers
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+
+  # Estamos em $srcdir = linux-6.17.8 (adm já fez cd pra cá)
+
+  # Limpa qualquer sujeira no source
+  make mrproper
+
+  # Gera headers "user-visible" em usr/include
   make headers
 
-  # Remover tudo que não for arquivo .h em usr/include
-  # find usr/include -type f ! -name '*.h' -delete
+  # Remove arquivos que não sejam .h dentro de usr/include
   find usr/include -type f ! -name '*.h' -delete
 }
 
-pkg_install() {
-  # No LFS: cp -rv usr/include $LFS/usr
-  # Aqui adaptamos para um sysroot configurável:
-  #
-  #   - ADM_CROSS_SYSROOT: preferido (ex: /mnt/lfs)
-  #   - LFS: fallback, como no livro
-  #   - /mnt/lfs: fallback final, se nada estiver definido
-  #
-  local cross_sysroot="${ADM_CROSS_SYSROOT:-${LFS:-/mnt/lfs}}"
-
-  # Instalar os headers em:
-  #   <sysroot>/usr/include
-  #
-  # via PKG_DESTDIR, para o adm empacotar e depois instalar no sistema real.
-  local destdir="${PKG_DESTDIR}${cross_sysroot}/usr"
-
-  mkdir -pv "${destdir}"
-
-  # Copia a árvore usr/include gerada pelo make headers
-  cp -rv usr/include "${destdir}/"
+# -------------------------------------------------------------
+# check(): livro não manda rodar testes aqui
+# -------------------------------------------------------------
+pkg_check() {
+  :
 }
 
-pkg_upstream_version() {
-  # Pega a última versão linux-6.* disponível em kernel.org (série 6.x).
-  # Se der erro de rede, volta pra versão da própria recipe.
-  local url="https://www.kernel.org/pub/linux/kernel/v6.x/"
-  local latest=""
+# -------------------------------------------------------------
+# install(): cp -rv usr/include $LFS/usr
+# adaptado para PKG_DESTDIR do adm:
+#   destino final => ${LFS}/usr/include/...
+#   staging       => ${PKG_DESTDIR}${LFS}/usr/include/...
+# -------------------------------------------------------------
+pkg_install() {
+  : "${LFS:?Variável LFS não definida. Exporte LFS antes de construir $PKG_NAME}"
+  : "${PKG_DESTDIR:?PKG_DESTDIR não definido}"
 
-  if command -v curl >/dev/null 2>&1; then
-    latest="$(
-      curl -fsSL "$url" \
-        | sed -n 's/.*linux-\(6\.[0-9.]*\)\.tar\.xz.*/\1/p' \
-        | sort -V \
-        | tail -n1
-    )"
-  fi
+  # Garante que o destino exista dentro do staging
+  mkdir -p "${PKG_DESTDIR}${LFS}/usr"
 
-  if [[ -n "$latest" ]]; then
-    printf '%s\n' "$latest"
-  else
-    printf '%s\n' "$PKG_VERSION"
-  fi
+  # Copia os headers para o prefixo do LFS dentro do staging
+  cp -rv usr/include "${PKG_DESTDIR}${LFS}/usr"
 }
