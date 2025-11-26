@@ -160,10 +160,11 @@ load_recipe() {
   # Usa find_recipe_file para suportar subdiretórios
   recipe="$(find_recipe_file "$pkg")" || die "Recipe não encontrado para pacote '$pkg' em $ADM_RECIPES_DIR"
 
-  # Limpar variáveis antigas relacionadas a recipe
   unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
         PKG_BUILD_DIR PKG_LICENSE PKG_URL PKG_SHA256S PKG_MD5S PKG_GROUPS
-  unset pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version
+
+  # Limpa funções de recipes anteriores (se existirem)
+  unset -f pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version 2>/dev/null || true
 
   # shellcheck source=/dev/null
   . "$recipe"
@@ -610,6 +611,24 @@ remove_pkg() {
 
   [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
 
+  # Segurança: não remover se outros pacotes dependem dele (a menos que ADM_REMOVE_FORCE=1)
+  if [[ "${ADM_REMOVE_FORCE:-0}" != "1" ]]; then
+    local users
+    users="$(reverse_deps "$pkg" || true)"
+    if [[ -n "$users" ]]; then
+      log_error "Não é seguro remover $pkg; outros pacotes dependem dele:"
+      printf '  - %s\n' $users >&2
+      die "Use ADM_REMOVE_FORCE=1 adm remove $pkg para forçar, se tiver certeza."
+    fi
+  fi
+
+  if dry_run_enabled; then
+    log_info "DRY-RUN: removeria pacote $pkg"
+    log_info "DRY-RUN: arquivos que seriam removidos (manifesto: $manifest):"
+    sed 's/^/  - /' "$manifest"
+    return 0
+  fi
+
   log_info "Removendo arquivos de $pkg usando manifesto $manifest"
 
   # Remove arquivos
@@ -940,6 +959,11 @@ upgrade_pkgs() {
   local -a order=()
   mapfile -t order < <(topo_sort_pkgs "${pkgs[@]}")
 
+  if dry_run_enabled; then
+    log_info "DRY-RUN: atualizaria (na ordem): ${order[*]}"
+    return 0
+  fi
+
   local p
   for p in "${order[@]}"; do
     log_info "Atualizando pacote: $p"
@@ -1072,8 +1096,7 @@ Uso:
   adm resolve <p1> [p2 ...]    - Resolver dependências e listar em ordem (Kahn-like)
   adm list                     - Listar pacotes instalados
   adm info <pacote>            - Mostra meta + recipe do pacote
-  adm verify <pacote>          - Verifica se todos os arquivos do pacote ainda existem
-  adm verify <pacote>          - Verifica se arquivos do pacote existem e (se houver) conferem com SHA256
+  adm verify <pacote>          - Verifica existência + SHA256 (se manifesto tiver hash)
   adm verify-all               - Verifica todos os pacotes instalados
   adm list-upgrades            - Listar pacotes com upgrades disponíveis
   adm upgrade [p1 ...]         - Atualizar todos ou lista de pacotes
@@ -1251,42 +1274,6 @@ cmd_info() {
     echo "PKG_SOURCES:     ${PKG_SOURCES:-}"
   else
     echo "Recipe para '$pkg' não encontrada em $ADM_RECIPES_DIR."
-  fi
-}
-
-cmd_verify() {
-  local pkg="$1"
-  local manifest
-  manifest="$(manifest_file_for "$pkg")"
-  local meta
-  meta="$(meta_file_for "$pkg")"
-
-  if [[ ! -f "$manifest" ]]; then
-    die "Manifesto não encontrado para $pkg em $manifest"
-  fi
-
-  if [[ ! -f "$meta" ]]; then
-    log_warn "Meta de instalação não encontrada para $pkg em $meta"
-  fi
-
-  log_info "Verificando arquivos do pacote $pkg (manifesto: $manifest)"
-
-  local missing=0 line
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    if [[ -e "$line" || -L "$line" ]]; then
-      log_debug "OK: $line"
-    else
-      log_warn "Arquivo ausente: $line"
-      missing=1
-    fi
-  done < "$manifest"
-
-  if (( missing )); then
-    log_warn "Verificação concluída: há arquivos ausentes para $pkg"
-    return 1
-  else
-    log_info "Verificação concluída: todos os arquivos do manifesto existem para $pkg"
   fi
 }
 
@@ -1469,11 +1456,7 @@ main() {
     verify)
       [[ $# -eq 1 ]] || die "Uso: adm verify <pacote>"
       cmd_verify "$1"
-      ;;
-    verify)
-      [[ $# -eq 1 ]] || die "Uso: adm verify <pacote>"
-      cmd_verify "$1"
-      ;;
+      ;;    
     verify-all)
       [[ $# -eq 0 ]] || die "Uso: adm verify-all"
       cmd_verify_all
