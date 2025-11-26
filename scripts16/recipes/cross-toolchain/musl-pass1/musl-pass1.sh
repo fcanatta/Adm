@@ -9,7 +9,7 @@
 # (CVE-2025-26519), recomendação do próprio Rich Felker:
 #   https://www.openwall.com/lists/musl/2025/05/29/2
 
-PKG_NAME="musl"
+PKG_NAME="musl-pass1"
 PKG_VERSION="1.2.5"
 PKG_RELEASE="1"
 
