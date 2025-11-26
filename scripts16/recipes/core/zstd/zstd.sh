@@ -10,10 +10,6 @@ PKG_DESC="Zstandard: biblioteca e ferramentas de compressão de alta taxa, em te
 PKG_URL="https://facebook.github.io/zstd/"
 PKG_LICENSE="BSD-3-Clause"
 
-# LFS 12.4 (development / r12.4-xx): 3
-#   Home page: https://facebook.github.io/zstd/
-#   Download:  https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
-#   MD5:       780fc1896922b1bc52a4e90980cdda48
 PKG_SOURCES="https://github.com/facebook/zstd/releases/download/v${PKG_VERSION}/zstd-${PKG_VERSION}.tar.gz"
 PKG_MD5S="780fc1896922b1bc52a4e90980cdda48"
 
@@ -25,7 +21,6 @@ PKG_DEPENDS="glibc"
 
 pkg_prepare() {
   # Diretório fonte: zstd-1.5.7/
-  # Build padrão é direto com make, sem ./configure pro caso LFS.
   :
 }
 
@@ -35,21 +30,34 @@ pkg_build() {
 }
 
 pkg_check() {
-  # LFS: make check (e ignorar 'failed' que não sejam 'FAIL' no output)
+  # LFS: make check
   make check
+
+  ###########################################################################
+  # CHECK EXTRA: garantir que a lib compartilhada libzstd.so foi gerada
+  ###########################################################################
+
+  # As libs ficam em lib/libzstd.so*
+  if ! ls lib/libzstd.so* >/dev/null 2>&1; then
+    die "FALHA: Nenhuma biblioteca compartilhada libzstd.so foi gerada (lib/libzstd.so* ausente)!"
+  fi
+
+  # Verificação mais forte: arquivo de versão específica
+  if [[ ! -f "lib/libzstd.so.${PKG_VERSION}" ]]; then
+    die "FALHA: lib/libzstd.so.${PKG_VERSION} não existe — build incompleto!"
+  fi
+
+  log_info "Check OK: libzstd.so foi gerada corretamente."
 }
 
 pkg_install() {
   # LFS: make prefix=/usr install
-  # Aqui fazemos staging com DESTDIR.
   make prefix=/usr DESTDIR="$PKG_DESTDIR" install
 
   # LFS: rm -v /usr/lib/libzstd.a
   rm -v "$PKG_DESTDIR/usr/lib/libzstd.a" || true
 }
 
-# Usa helper genérico do adm para descobrir última versão em
-# https://github.com/facebook/zstd/releases (zstd-*.tar.*).
 pkg_upstream_version() {
   adm_generic_upstream_version
 }
