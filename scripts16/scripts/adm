@@ -53,10 +53,14 @@ else
   C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
 fi
 
-log_info()  { printf '%s[INFO]%s %s\n'  "$C_GREEN" "$C_RESET" "$*" >&2; }
-log_warn()  { printf '%s[WARN]%s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
-log_error() { printf '%s[ERRO]%s %s\n'  "$C_RED" "$C_RESET" "$*" >&2; }
-log_debug() { [[ -n "${ADM_DEBUG:-}" ]] && printf '%s[DBG ]%s %s\n' "$C_CYAN" "$C_RESET" "$*" >&2 || true; }
+log_ts() {
+  date '+%Y-%m-%d %H:%M:%S'
+}
+
+log_info()  { printf '%s[%s] [INFO]%s %s\n'  "$C_GREEN"  "$(log_ts)" "$C_RESET" "$*" >&2; }
+log_warn()  { printf '%s[%s] [WARN]%s %s\n'  "$C_YELLOW" "$(log_ts)" "$C_RESET" "$*" >&2; }
+log_error() { printf '%s[%s] [ERRO]%s %s\n'  "$C_RED"    "$(log_ts)" "$C_RESET" "$*" >&2; }
+log_debug() { [[ -n "${ADM_DEBUG:-}" ]] && printf '%s[%s] [DBG ]%s %s\n' "$C_CYAN" "$(log_ts)" "$C_RESET" "$*" >&2 || true; }
 
 die() {
   log_error "$*"
@@ -892,9 +896,25 @@ topo_sort_pkgs() {
 # -------------------------------------------------------------
 upstream_version_for() {
   local pkg="$1"
-  load_recipe "$pkg"
+
+  if ! load_recipe "$pkg"; then
+    log_warn "Não foi possível carregar a recipe de '$pkg' para checar upstream."
+    return 1
+  fi
+
   if declare -f pkg_upstream_version >/dev/null 2>&1; then
-    pkg_upstream_version
+    local v
+    if ! v="$(pkg_upstream_version 2>/dev/null)"; then
+      log_warn "pkg_upstream_version() falhou para '$pkg'; usando PKG_VERSION local."
+      printf '%s\n' "$PKG_VERSION"
+      return 0
+    fi
+    if [[ -z "$v" ]]; then
+      log_warn "pkg_upstream_version() retornou vazio para '$pkg'; usando PKG_VERSION local."
+      printf '%s\n' "$PKG_VERSION"
+      return 0
+    fi
+    printf '%s\n' "$v"
   else
     # Se não houver função de upstream, retorna a própria versão do recipe
     printf '%s\n' "$PKG_VERSION"
