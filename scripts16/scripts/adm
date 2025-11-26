@@ -676,32 +676,34 @@ remove_pkg() {
 
     # Manifesto pode ter formato:
     #   /caminho
-    # ou
     #   SHA256  /caminho
-    set -- $line
-    if [[ "$1" == /* ]]; then
-      path="$1"
+    if [[ "$line" == /* ]]; then
+      # Manifesto sem hash
+      path="$line"
+    elif [[ "$line" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]]/ ]]; then
+      # Manifesto com hash (sha256sum usa "HASH␣␣/caminho")
+      path="${line#*  }"
     else
-      path="$2"
+      # Formato inesperado; melhor tentar a linha inteira
+      path="$line"
     fi
 
     if [[ -e "$path" || -L "$path" ]]; then
-      rm -f "$path" || log_warn "Falha ao remover $path"
-    else
-      log_debug "Arquivo já ausente: $path"
+      rm -f "$path"
     fi
   done <"$manifest"
 
-  # Tenta remover diretórios vazios
+  # # Tenta remover diretórios vazios residuais
   log_info "Removendo diretórios vazios residuais"
   tac "$manifest" | while IFS= read -r line; do
     [[ -n "$line" ]] || continue
 
-    set -- $line
-    if [[ "$1" == /* ]]; then
-      path="$1"
+    if [[ "$line" == /* ]]; then
+      path="$line"
+    elif [[ "$line" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]]/ ]]; then
+      path="${line#*  }"
     else
-      path="$2"
+      path="$line"
     fi
 
     local dir
@@ -744,13 +746,14 @@ cmd_verify() {
     # Linha pode ser:
     #   /caminho
     #   SHA256  /caminho
-    set -- $line
     hash=""
-    if [[ "$1" == /* ]]; then
-      path="$1"
-    elif [[ "$1" =~ ^[0-9a-fA-F]{64}$ && "$2" == /* ]]; then
-      hash="$1"
-      path="$2"
+    if [[ "$line" == /* ]]; then
+      # Manifesto sem hash
+      path="$line"
+    elif [[ "$line" =~ ^([0-9a-fA-F]{64})[[:space:]][[:space:]](/.*)$ ]]; then
+      # Manifesto com hash (captura hash e caminho completo, inclusive com espaços)
+      hash="${BASH_REMATCH[1]}"
+      path="${BASH_REMATCH[2]}"
     else
       # formato inesperado; assume linha inteira como caminho
       path="$line"
@@ -1268,6 +1271,124 @@ chroot_build_pkg() {
 }
 
 # -------------------------------------------------------------
+# Helper interno para operações de chroot (substitui adm-chroot.sh)
+# -------------------------------------------------------------
+adm_chroot_require_root() {
+  if (( EUID != 0 )); then
+    die "Operações de chroot precisam ser executadas como root (EUID=$EUID)."
+  fi
+}
+
+adm_chroot_get_dir() {
+  # Ordem:
+  #   1. argumento explícito
+  #   2. ADM_CHROOT
+  #   3. LFS
+  #   4. /mnt/lfs (default)
+  local dir="${1:-}"
+
+  if [[ -n "$dir" ]]; then
+    printf '%s\n' "$dir"
+  elif [[ -n "${ADM_CHROOT:-}" ]]; then
+    printf '%s\n' "$ADM_CHROOT"
+  elif [[ -n "${LFS:-}" ]]; then
+    printf '%s\n' "$LFS"
+  else
+    printf '%s\n' "/mnt/lfs"
+  fi
+}
+
+adm_chroot_prepare_mounts() {
+  local dir="$1"
+
+  adm_chroot_require_root
+
+  ensure_cmd mount
+  ensure_cmd mountpoint
+  ensure_cmd chroot
+
+  mkdir -p "$dir"
+
+  # Diretórios básicos
+  for d in dev dev/pts proc sys run dev/shm; do
+    mkdir -p "$dir/$d"
+  done
+
+  # /dev (bind)
+  if ! mountpoint -q "$dir/dev"; then
+    mount --bind /dev "$dir/dev"
+  fi
+
+  # /dev/pts
+  if ! mountpoint -q "$dir/dev/pts"; then
+    mount -t devpts devpts "$dir/dev/pts"
+  fi
+
+  # /proc
+  if ! mountpoint -q "$dir/proc"; then
+    mount -t proc proc "$dir/proc"
+  fi
+
+  # /sys
+  if ! mountpoint -q "$dir/sys"; then
+    mount -t sysfs sysfs "$dir/sys"
+  fi
+
+  # /run
+  if ! mountpoint -q "$dir/run"; then
+    mount -t tmpfs tmpfs "$dir/run"
+  fi
+
+  # /dev/shm
+  if ! mountpoint -q "$dir/dev/shm"; then
+    mount -t tmpfs -o mode=1777,nosuid,nodev shm "$dir/dev/shm"
+  fi
+
+  # Compartilha diretórios do adm com o chroot via bind-mount
+  # (usa os caminhos absolutos reais: /var/lib/adm, /var/log/adm, /var/tmp/adm/build)
+  local src target
+  for src in "$ADM_STATE_DIR" "$ADM_LOG_DIR" "$ADM_BUILD_ROOT"; do
+    target="$dir$src"
+    mkdir -p "$target"
+    if ! mountpoint -q "$target"; then
+      mount --bind "$src" "$target"
+    fi
+  done
+
+  # Garante que /usr/bin/adm exista dentro do chroot
+  if [[ -x /usr/bin/adm && ! -x "$dir/usr/bin/adm" ]]; then
+    mkdir -p "$dir/usr/bin"
+    cp /usr/bin/adm "$dir/usr/bin/adm"
+  fi
+}
+
+adm_chroot_teardown_mounts() {
+  local dir="$1"
+
+  adm_chroot_require_root
+  ensure_cmd umount
+  ensure_cmd mountpoint
+
+  # Ordem reversa para evitar dependências de montagem
+  local p
+  for p in \
+    "$dir/dev/shm" \
+    "$dir/run" \
+    "$dir/sys" \
+    "$dir/proc" \
+    "$dir/dev/pts" \
+    "$dir/dev" \
+    "$dir$ADM_BUILD_ROOT" \
+    "$dir$ADM_LOG_DIR" \
+    "$dir$ADM_STATE_DIR"
+  do
+    if mountpoint -q "$p"; then
+      umount "$p" 2>/dev/null || log_warn "Falha ao desmontar $p (talvez já desmontado)"
+    fi
+  done
+}
+
+# -------------------------------------------------------------
 # Ajuda
 # -------------------------------------------------------------
 usage() {
@@ -1512,90 +1633,65 @@ cmd_chroot_build() {
 }
 
 cmd_chroot_shell() {
-    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
-    local chroot_dir="${1:-}"
+  # Argumento opcional: se vazio, ADM_CHROOT/LFS ou /mnt/lfs
+  local chroot_dir
+  chroot_dir="$(adm_chroot_get_dir "${1:-}")"
 
-    # Caminho do helper (ajuste se você instalou em outro lugar)
-    local helper="/usr/local/sbin/adm-chroot.sh"
+  adm_chroot_prepare_mounts "$chroot_dir"
 
-    if [[ ! -x "$helper" ]]; then
-        die "Helper $helper não encontrado ou não executável. Instale-o antes."
-    fi
+  log_info "Entrando em shell dentro do chroot $chroot_dir"
 
-    if [[ -n "$chroot_dir" ]]; then
-        log_info "Entrando no chroot-shell usando $helper para $chroot_dir"
-        "$helper" enter "$chroot_dir"
-    else
-        log_info "Entrando no chroot-shell usando $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
-        "$helper" enter
-    fi
+  chroot "$chroot_dir" /usr/bin/env -i \
+    HOME=/root \
+    TERM="${TERM:-xterm-256color}" \
+    PS1='(adm-chroot)\u:\w$ ' \
+    PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+    /bin/bash --login
 }
 
 cmd_chroot_prepare() {
-    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
-    local chroot_dir="${1:-}"
+  # Argumento opcional: se vazio, ADM_CHROOT/LFS ou /mnt/lfs
+  local chroot_dir
+  chroot_dir="$(adm_chroot_get_dir "${1:-}")"
 
-    local helper="/usr/local/sbin/adm-chroot.sh"
-    if [[ ! -x "$helper" ]]; then
-        die "Helper $helper não encontrado ou não executável. Instale-o antes."
-    fi
-
-    if [[ -n "$chroot_dir" ]]; then
-        log_info "Preparando chroot $chroot_dir via $helper"
-        "$helper" prepare "$chroot_dir"
-    else
-        log_info "Preparando chroot via $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
-        "$helper" prepare
-    fi
+  log_info "Preparando chroot em $chroot_dir"
+  adm_chroot_prepare_mounts "$chroot_dir"
 }
 
 cmd_chroot_teardown() {
-    # Argumento opcional: se vazio, helper decide via ADM_CHROOT/LFS ou /mnt/lfs
-    local chroot_dir="${1:-}"
+  # Argumento opcional: se vazio, ADM_CHROOT/LFS ou /mnt/lfs
+  local chroot_dir
+  chroot_dir="$(adm_chroot_get_dir "${1:-}")"
 
-    local helper="/usr/local/sbin/adm-chroot.sh"
-    if [[ ! -x "$helper" ]]; then
-        die "Helper $helper não encontrado ou não executável. Instale-o antes."
-    fi
-
-    if [[ -n "$chroot_dir" ]]; then
-        log_info "Desmontando chroot $chroot_dir via $helper"
-        "$helper" teardown "$chroot_dir"
-    else
-        log_info "Desmontando chroot via $helper (DIR via ADM_CHROOT/LFS ou /mnt/lfs)"
-        "$helper" teardown
-    fi
+  log_info "Desmontando chroot em $chroot_dir"
+  adm_chroot_teardown_mounts "$chroot_dir"
 }
 
 cmd_chroot_build_group() {
-    local chroot_dir="$1"
-    local group="$2"
+  local chroot_dir="$1"
+  local group="$2"
 
-    if [[ -z "$chroot_dir" || -z "$group" ]]; then
-        die "Uso: adm chroot-build-group <dir> <grupo>"
-    fi
+  if [[ -z "$chroot_dir" || -z "$group" ]]; then
+    die "Uso: adm chroot-build-group <dir> <grupo>"
+  fi
 
-    local helper="/usr/local/sbin/adm-chroot.sh"
+  # Permite ainda ADM_CHROOT/LFS se você quiser
+  chroot_dir="$(adm_chroot_get_dir "$chroot_dir")"
 
-    if [[ ! -x "$helper" ]]; then
-        die "Helper $helper não encontrado ou não executável."
-    fi
+  adm_chroot_prepare_mounts "$chroot_dir"
 
-    log_info "Executando build-group '$group' no chroot $chroot_dir"
+  log_info "Executando build do grupo '$group' dentro do chroot $chroot_dir"
 
-    # Passa todas as variáveis ADM_* para dentro do chroot
-    "$helper" enter "$chroot_dir" <<EOF
-export ADM_PREFIX="$ADM_PREFIX"
-export ADM_STATE_DIR="$ADM_STATE_DIR"
-export ADM_CACHE_DIR="$ADM_CACHE_DIR"
-export ADM_SRC_CACHE="$ADM_SRC_CACHE"
-export ADM_BIN_CACHE="$ADM_BIN_CACHE"
-export ADM_BUILD_ROOT="$ADM_BUILD_ROOT"
-export ADM_LOG_DIR="$ADM_LOG_DIR"
-export ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS"
-
-adm build "$group"
-EOF
+  chroot "$chroot_dir" /usr/bin/env \
+    ADM_PREFIX="$ADM_PREFIX" \
+    ADM_STATE_DIR="$ADM_STATE_DIR" \
+    ADM_CACHE_DIR="$ADM_CACHE_DIR" \
+    ADM_SRC_CACHE="$ADM_SRC_CACHE" \
+    ADM_BIN_CACHE="$ADM_BIN_CACHE" \
+    ADM_BUILD_ROOT="$ADM_BUILD_ROOT" \
+    ADM_LOG_DIR="$ADM_LOG_DIR" \
+    ADM_DEFAULT_COMPRESS="$ADM_DEFAULT_COMPRESS" \
+    /usr/bin/adm build "$group"
 }
 
 # -------------------------------------------------------------
