@@ -1,0 +1,17 @@
+export LFS=/mnt/lfs
+
+# 0) preparar host e usuário lfs
+sudo ./lfs-cross-helper.sh init-host
+
+# 1) baixar tudo com barra de progresso
+sudo ./lfs-cross-helper.sh download-sources
+
+# 2) conferir md5
+sudo ./lfs-cross-helper.sh verify-sources
+
+# 3) construir cross-toolchain + temp tools + chroot
+sudo ./lfs-cross-helper.sh cross-toolchain
+sudo ./lfs-cross-helper.sh temp-tools
+sudo ./lfs-cross-helper.sh chroot-setup
+sudo ./lfs-cross-helper.sh chroot-tools
+sudo ./lfs-cross-helper.sh enter-chroot
