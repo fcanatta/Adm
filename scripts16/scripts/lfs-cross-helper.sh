@@ -299,8 +299,75 @@ build_m4() {
     rm -rf m4-1.4.20
   '
 }
-build_ncurses()    { run_as_lfs '# COLE AQUI os comandos da seção 6.3 Ncurses-6.5-20250809'; }
-build_bash()       { run_as_lfs '# COLE AQUI os comandos da seção 6.4 Bash-5.3'; }
+build_ncurses() {
+  run_as_lfs '
+    set -e
+    echo "=== NCURSES-6.5-20250809: extraindo fonte ==="
+    tar -xf ncurses-6.5-20250809.tar.xz
+    cd ncurses-6.5-20250809
+
+    # Evita depender de mawk em alguns hosts
+    sed -i s/mawk// configure
+
+    mkdir -v build
+    cd build
+
+    echo "=== NCURSES-6.5-20250809: configurando (temporary, wide-char, shared) ==="
+    ../configure \
+      --prefix=/usr \
+      --host="$LFS_TGT" \
+      --build="$(../config.guess)" \
+      --mandir=/usr/share/man \
+      --with-manpage-format=normal \
+      --with-shared \
+      --without-debug \
+      --without-normal \
+      --without-cxx-binding \
+      --enable-widec \
+      --enable-pc-files \
+      --with-pkg-config-libdir=/usr/lib/pkgconfig
+
+    echo "=== NCURSES-6.5-20250809: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== NCURSES-6.5-20250809: instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    # Ajuste simples: pkg-config aponta pra ncursesw (wide)
+    echo "=== NCURSES-6.5-20250809: ajuste de .pc para wide ==="
+    sed -i "s@/usr/include@/usr/include/ncursesw@g" "$LFS/usr/lib/pkgconfig/ncursesw.pc"
+
+    echo "=== NCURSES-6.5-20250809: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf ncurses-6.5-20250809
+  '
+}
+build_bash() {
+  run_as_lfs '
+    set -e
+    echo "=== BASH-5.3: extraindo fonte ==="
+    tar -xf bash-5.3.tar.gz
+    cd bash-5.3
+
+    echo "=== BASH-5.3: configurando (temporary tool) ==="
+    ./configure \
+      --prefix=/usr \
+      --host="$LFS_TGT" \
+      --build="$(support/config.guess)" \
+      --without-bash-malloc
+
+    echo "=== BASH-5.3: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== BASH-5.3: instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    # Não mexemos em /bin/sh aqui; o link é criado depois, já dentro do chroot.
+    echo "=== BASH-5.3: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf bash-5.3
+  '
+}
 build_coreutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.5 Coreutils-9.9'; }
 build_diffutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.6 Diffutils-3.12'; }
 build_file_6()     { run_as_lfs '# COLE AQUI os comandos da seção 6.7 File-5.46'; }
@@ -484,34 +551,43 @@ download_sources() {
     cd "$LFS/sources"
 
     echo "=== DOWNLOAD: Obtendo wget-list-sysv ==="
-    wget -O wget-list-sysv \
+    wget -q -O wget-list-sysv \
       https://www.linuxfromscratch.org/lfs/view/development/wget-list-sysv
 
     echo "=== DOWNLOAD: Obtendo lista de md5sums oficial ==="
-    wget -O md5sums \
+    wget -q -O md5sums \
       https://www.linuxfromscratch.org/lfs/view/development/md5sums
 
-    echo "=== DOWNLOAD: Baixando todos os sources ==="
-    wget --input-file=wget-list-sysv \
-         --continue \
-         --directory-prefix="$LFS/sources"
+    echo
+    echo "=== DOWNLOAD: Baixando todos os sources com barra de progresso ==="
+    echo
 
-    echo "=== DOWNLOAD: Verificando integridade com md5sum ==="
+    # Barra de progresso “bonita” do próprio wget
+    #   --show-progress           -> mostra barra mesmo em stdout
+    #   --progress=bar:force:noscroll -> barra contínua tipo apt
+    wget \
+      --input-file=wget-list-sysv \
+      --continue \
+      --directory-prefix="$LFS/sources" \
+      --show-progress \
+      --progress=bar:force:noscroll
 
-    # Arquivos válidos (presentes no md5sums)
-    local files_expected
-    files_expected=$(awk '{print $2}' md5sums)
+    echo
+    echo "=== DOWNLOAD: Concluído. Agora rode: helper verify-sources ==="
+}
 
-    # Checagem completa
+verify_sources() {
+    need_root
+
+    cd "$LFS/sources" || die "Diretório $LFS/sources não existe."
+
+    if [ ! -f md5sums ]; then
+        die "Arquivo md5sums não encontrado em $LFS/sources. Rode primeiro: download-sources"
+    fi
+
+    echo "=== VERIFY: Verificando integridade com md5sum ==="
     md5sum -c md5sums > md5sum.log 2>&1 || true
 
-    echo
-    echo "==============================================================="
-    echo "Resultado da verificação MD5 - veja $LFS/sources/md5sum.log"
-    echo "==============================================================="
-    echo
-
-    # Reportar arquivos OK, FAIL e MISSING
     local ok fail missing count_ok count_fail count_missing
 
     ok=$(grep -E ": OK$" md5sum.log || true)
@@ -520,7 +596,10 @@ download_sources() {
     count_ok=$(printf "%s" "$ok" | grep -c . || true)
     count_fail=$(printf "%s" "$fail" | grep -c . || true)
 
-    # Arquivos que deveriam existir mas não existem
+    # Descobrir quais arquivos o md5sums espera
+    local files_expected
+    files_expected=$(awk "{print \$2}" md5sums)
+
     missing=""
     count_missing=0
     for f in $files_expected; do
@@ -530,27 +609,31 @@ download_sources() {
         fi
     done
 
-    echo "=== MD5: Arquivos OK: $count_ok"
-    echo "=== MD5: Arquivos com falha: $count_fail"
-    echo "=== MD5: Arquivos faltando: $count_missing"
+    echo
+    echo "================ RESULTADO MD5 ================"
+    echo "OK       : $count_ok"
+    echo "FALHOU   : $count_fail"
+    echo "FALTANDO : $count_missing"
+    echo "Log completo: $LFS/sources/md5sum.log"
+    echo "==============================================="
+    echo
 
     if [ "$count_fail" -gt 0 ] || [ "$count_missing" -gt 0 ]; then
-        echo "==============================================================="
-        echo "ERROS DETECTADOS:"
-        [ "$count_fail" -gt 0 ] && echo "- Arquivos com checksum incorreto:"
-        [ "$count_fail" -gt 0 ] && echo "$fail"
-        echo
-        [ "$count_missing" -gt 0 ] && echo "- Arquivos faltando:"
-        [ "$count_missing" -gt 0 ] && echo "$missing"
-        echo
-        echo "Reexecute esta função após corrigir problemas ou baixar novamente."
-        echo "==============================================================="
+        [ "$count_fail" -gt 0 ] && {
+            echo "Arquivos com checksum incorreto:"
+            echo "$fail"
+            echo
+        }
+        [ "$count_missing" -gt 0 ] && {
+            echo "Arquivos faltando:"
+            echo "$missing"
+            echo
+        }
+        echo "Corrija (apagando e baixando de novo) e rode 'verify-sources' novamente."
         return 1
     fi
 
-    echo "==============================================================="
-    echo "Todos os sources estão íntegros e prontos!"
-    echo "==============================================================="
+    echo "Todos os sources conferem com os md5sums oficiais. 👍"
 }
 
 ###############################################################################
@@ -583,20 +666,22 @@ EOF
 
 main() {
   local phase="${1:-}"
-  case "$phase" in
-    download-sources) download_sources ;;
-    init-host)       phase_init_host ;;
-    cross-toolchain) phase_cross_toolchain ;;
-    temp-tools)      phase_temp_tools ;;
-    chroot-setup)
+  case "${1:-}" in
+  init-host)        phase_init_host ;;
+  download-sources) download_sources ;;
+  verify-sources)   verify_sources ;;
+  cross-toolchain)  phase_cross_toolchain ;;
+  temp-tools)       phase_temp_tools ;;
+  chroot-setup)
       phase_chroot_setup
       phase_chroot_dirs_files
       ;;
-    chroot-tools)    phase_chroot_tools ;;
-    enter-chroot)    phase_enter_chroot_shell ;;
-    all)
+  chroot-tools)     phase_chroot_tools ;;
+  enter-chroot)     phase_enter_chroot_shell ;;
+  all)
       phase_init_host
-      download_sources 
+      download_sources
+      verify_sources
       phase_cross_toolchain
       phase_temp_tools
       phase_chroot_setup
@@ -604,8 +689,11 @@ main() {
       phase_chroot_tools
       phase_enter_chroot_shell
       ;;
-    *) usage; exit 1 ;;
-  esac
+  *)
+      usage
+      exit 1
+      ;;
+esac
 }
 
 main "$@"
