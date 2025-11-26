@@ -114,6 +114,7 @@ pkg_install() {
 
   localedef $_ld_prefix -i C      -f UTF-8      C.UTF-8
   localedef $_ld_prefix -i cs_CZ  -f UTF-8      cs_CZ.UTF-8
+  localedef $_ld_prefix -i pt_BR  -f UTF-8      pt_BR.UTF-8 
   localedef $_ld_prefix -i de_DE  -f ISO-8859-1 de_DE
   localedef $_ld_prefix -i de_DE@euro -f ISO-8859-15 de_DE@euro
   localedef $_ld_prefix -i de_DE  -f UTF-8      de_DE.UTF-8
@@ -243,7 +244,21 @@ EOF
 }
 
 # Opcional: se quiser integrar com mecanismo de checagem de versão upstream
-pkg_upstream_version() {
+# pkg_upstream_version() {
   # Simplesmente imprime a versão LFS-alinhada
-  echo "2.42"
+  # echo "2.42"
+# }
+# Integra com o mecanismo genérico do adm para descobrir a maior versão
+# disponível no diretório de fontes (ftp.gnu.org/gnu/libc/).
+#
+# O adm_generic_upstream_version:
+#   - usa o primeiro URL de PKG_SOURCES (glibc-2.42.tar.xz),
+#   - descobre o diretório (https://ftp.gnu.org/gnu/libc/),
+#   - procura arquivos no formato glibc-<versão>.tar.xz
+#   - e imprime a MAIOR versão encontrada.
+#
+# Depois, o core do adm (upstream_version_for) ainda compara isso com
+# PKG_VERSION e escolhe o maior entre os dois.
+pkg_upstream_version() {
+  adm_generic_upstream_version
 }
