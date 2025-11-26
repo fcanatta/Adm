@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux-6.17.8 API Headers (cross-toolchain)
+# Linux-${PKG_VERSION} API Headers (cross-toolchain)
 # LFS r12.4-46 - Capítulo 5.4
 # https://www.linuxfromscratch.org/lfs/view/development/chapter05/linux-headers.html
 
