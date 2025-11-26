@@ -51,9 +51,55 @@ pkg_install() {
     install
 }
 
-# Opcional: função de upstream simples, caso queira
+# Opcional: função de upstream, caso queira
 # que o "adm list-upgrades" funcione apenas com a versão da recipe.
 # Se não quiser, pode remover essa função e o adm usará PKG_VERSION.
 pkg_upstream_version() {
-  printf '%s\n' "$PKG_VERSION"
+  local base_url="https://www.kernel.org/pub/linux/docs/man-pages/"
+  local html versions latest
+
+  # Tenta usar curl ou wget; se não tiver, volta para PKG_VERSION
+  if command -v curl >/dev/null 2>&1; then
+    html="$(curl -fsSL "$base_url" 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    html="$(wget -qO- "$base_url" 2>/dev/null || true)"
+  else
+    # Nem curl nem wget: não dá pra buscar upstream automaticamente
+    if command -v log_warn >/dev/null 2>&1; then
+      log_warn "man-pages: nem curl nem wget encontrados; usando PKG_VERSION como upstream."
+    fi
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  # Se não conseguiu baixar o índice, usa PKG_VERSION
+  if [[ -z "$html" ]]; then
+    if command -v log_warn >/dev/null 2>&1; then
+      log_warn "man-pages: falha ao obter índice de $base_url; usando PKG_VERSION como upstream."
+    fi
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  # Extrai versões de man-pages-<versão>.tar.xz ou .tar.gz
+  versions="$(
+    printf '%s\n' "$html" \
+      | sed -n 's/.*man-pages-\([0-9][0-9.]*\)\.tar\.[gx]z.*/\1/p' \
+      | sort -Vu
+  )"
+
+  # Se nada foi encontrado, volta para PKG_VERSION
+  if [[ -z "$versions" ]]; then
+    if command -v log_warn >/dev/null 2>&1; then
+      log_warn "man-pages: não encontrei versões em $base_url; usando PKG_VERSION como upstream."
+    fi
+    printf '%s\n' "$PKG_VERSION"
+    return 0
+  fi
+
+  # Maior versão encontrada
+  latest="$(printf '%s\n' "$versions" | tail -n1)"
+
+  # Última linha: essa é a versão que o adm vai enxergar como "upstream"
+  printf '%s\n' "$latest"
 }
