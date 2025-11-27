@@ -15,6 +15,10 @@ Exemplos:
   adm-recipe generate core bash 5.2.32
   adm-recipe generate cross-toolchain gcc-pass1 15.2.0
   adm-recipe generate libs zlib       # pergunta a versão e usa 1.0.0 se vazio
+
+Notas:
+  - <grupo> vira subdiretório em: \$ADM_RECIPES_DIR/<grupo>/<nome>.sh
+  - O template gerado já é compatível com o adm (PKG_SOURCES, PKG_SHA256S, PKG_MD5S).
 EOF
 }
 
@@ -29,7 +33,7 @@ cmd_generate() {
   name="${2:-}"
   version="${3:-}"
 
-  [[ -n "$group" ]] || die "Informe o grupo (ex.: core, cross-toolchain)."
+  [[ -n "$group" ]] || die "Informe o grupo (ex.: core, cross-toolchain, libs)."
   [[ -n "$name"  ]] || die "Informe o nome do pacote (ex.: gcc, bash, zlib)."
 
   # Se a versão não foi passada na linha de comando, pergunta interativamente
@@ -55,7 +59,7 @@ cmd_generate() {
 #!/usr/bin/env bash
 # Recipe gerado automaticamente por adm-recipe em $now
 # Grupo: $group
-# Pacote: $name (${version})
+# Pacote: $name ($version)
 
 PKG_NAME="$name"
 PKG_VERSION="$version"
@@ -70,16 +74,26 @@ PKG_GROUPS="$group"
 PKG_DEPENDS=""
 
 # Fontes (URLs, separados por espaço se houver mais de um)
+# Exemplo:
+# PKG_SOURCES="https://ftp.gnu.org/gnu/$name/$name-\$PKG_VERSION.tar.xz"
 PKG_SOURCES=""
 
-# Checksums opcionais (preencha se quiser validação forte de download)
-PKG_SHA256SUM=""
-PKG_MD5SUM=""
+# Checksums opcionais (listas alinhadas com PKG_SOURCES).
+# Exemplo:
+# PKG_SHA256S="hash1 hash2"
+# PKG_MD5S="md5_1 md5_2"
+PKG_SHA256S=""
+PKG_MD5S=""
 
 # Versão upstream para o mecanismo de upgrade do adm.
-# Por padrão, retorna a própria PKG_VERSION. Edite se quiser algo mais esperto.
+# Por padrão, tenta usar adm_generic_upstream_version (implementado no adm),
+# caindo para a própria PKG_VERSION se ela não existir ou falhar.
 pkg_upstream_version() {
-  printf '%s\n' "\$PKG_VERSION"
+  if command -v adm_generic_upstream_version >/dev/null 2>&1; then
+    adm_generic_upstream_version
+  else
+    printf '%s\n' "\$PKG_VERSION"
+  fi
 }
 
 # -------------------------------------------------------------
@@ -92,6 +106,9 @@ pkg_prepare() {
 }
 
 # Compilar o pacote
+# Use sempre as variáveis:
+#   - \$PKG_DESTDIR: raiz de instalação temporária (DESTDIR)
+#   - \$PKG_PREFIX:  prefixo lógico de instalação (normalmente /usr)
 pkg_build() {
   :
 }
@@ -102,11 +119,13 @@ pkg_check() {
 }
 
 # Instalar no DESTDIR do adm.
-# Use sempre DESTDIR="\${PKG_DESTDIR}" ou "\${PKG_DESTDIR}\$algum_prefixo".
+# Use sempre DESTDIR="\${PKG_DESTDIR}" e respeite \$PKG_PREFIX.
 pkg_install() {
   : "\${PKG_DESTDIR:?PKG_DESTDIR não definido}"
 
   # Exemplo para autotools:
+  # ./configure --prefix="\$PKG_PREFIX"
+  # make
   # make DESTDIR="\${PKG_DESTDIR}" install
 }
 EOF
