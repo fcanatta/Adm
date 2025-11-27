@@ -2,6 +2,7 @@
 # Recipe man-pages-6.16 para o adm
 # Baseado em LFS r12.4-46, capítulo 8.3 (Man-pages-6.16)
 # https://www.linuxfromscratch.org/lfs/view/development/chapter08/man-pages.html
+# Comando para construir em chroot# adm chroot-build $LFS man-pages
 
 PKG_NAME="man-pages"
 PKG_VERSION="6.16"
