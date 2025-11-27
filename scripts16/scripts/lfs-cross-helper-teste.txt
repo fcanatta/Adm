@@ -1,0 +1,390 @@
+Beleza, vamos transformar esse script em algo que você consegue confiar porque sabe testar tudo.
+Vou montar um check-list por fase e depois um bloco só sobre validação do cross-toolchain com “hello world”, readelf, etc.
+
+Vou assumir:
+
+LFS=/mnt/lfs
+LFS_TGT=$(uname -m)-lfs-linux-gnu   # ex: x86_64-lfs-linux-gnu
+./lfs-cross-helper.sh               # script já está executável
+
+
+---
+
+0. Antes de tudo – checar ambiente do host
+
+0.1. Ver se o host tem as ferramentas básicas
+
+Como root:
+
+for t in bash binutils bison coreutils diff find gawk gcc g++ grep gzip \
+         m4 make patch perl python3 sed tar xz wget; do
+  command -v "$t" >/dev/null || echo "FALTA: $t"
+done
+
+Se aparecer algum FALTA, instala pela distro antes de continuar.
+
+0.2. Testar o script rapidamente
+
+bash -n lfs-cross-helper.sh   # não deve imprimir nada (sintaxe ok)
+./lfs-cross-helper.sh         # deve mostrar o usage
+
+
+---
+
+1. Testes depois de init-host
+
+1.1. Rodar fase
+
+sudo ./lfs-cross-helper.sh init-host
+
+1.2. Conferir estado
+
+sudo ./lfs-cross-helper.sh status
+
+Saída esperada (algo assim):
+
+[OK]   init-host
+[....] download-sources
+[....] verify-sources
+...
+
+1.3. Conferir layout e permissões
+
+ls -ld /mnt/lfs /mnt/lfs/{tools,usr,var,etc,sources}
+id lfs
+getent group lfs
+
+Esperado:
+
+/mnt/lfs e subdiretórios existem.
+
+Dono: lfs:lfs.
+
+Usuário lfs existe.
+
+
+1.4. Testar ambiente do usuário lfs
+
+su - lfs -c 'echo "LFS=$LFS  LFS_TGT=$LFS_TGT"; echo "PATH=$PATH"'
+
+Esperado:
+
+LFS=/mnt/lfs
+
+PATH começa com /mnt/lfs/tools/bin: (ou o valor de $LFS/tools/bin).
+
+
+
+---
+
+2. Testes de download-sources e verify-sources
+
+2.1. Rodar download
+
+sudo ./lfs-cross-helper.sh download-sources
+
+Depois:
+
+ls $LFS/sources | head
+
+Tem que ter um monte de .tar.xz, .tar.gz, etc.
+
+2.2. Verificar checksums
+
+sudo ./lfs-cross-helper.sh verify-sources
+
+Se tudo ok:
+
+No final ele mostra FALHOU: 0 e FALTANDO: 0.
+
+status mostra verify-sources como [OK]:
+
+
+sudo ./lfs-cross-helper.sh status
+
+
+---
+
+3. Check-list de testes do CROSS-TOOLCHAIN
+
+Rodar:
+
+sudo ./lfs-cross-helper.sh cross-toolchain
+
+Isso vai passar por:
+
+1. Binutils pass 1
+
+
+2. GCC pass 1
+
+
+3. Linux headers
+
+
+4. Glibc ou Musl (dependendo de USE_MUSL)
+
+
+5. Libstdc++ cross
+
+
+
+Se falhar, ele para onde der erro (bom p/ debug).
+
+3.1. Testes específicos (como root ou como lfs)
+
+3.1.1. Testar Binutils pass1
+
+Como lfs:
+
+su - lfs
+
+which "$LFS_TGT-as"
+which "$LFS_TGT-ld"
+"$LFS_TGT-as" --version
+"$LFS_TGT-ld" --version
+exit
+
+Esperado:
+
+which mostra algo em /mnt/lfs/tools/bin/….
+
+--version imprime algo tipo GNU assembler (GNU Binutils) 2.45.1 (ou sua versão).
+
+
+3.1.2. Testar GCC pass1
+
+Ainda como lfs:
+
+su - lfs
+
+which "$LFS_TGT-gcc"
+"$LFS_TGT-gcc" --version
+
+# onde está o sysroot?
+"$LFS_TGT-gcc" -print-sysroot
+
+# diretórios de busca
+"$LFS_TGT-gcc" -print-search-dirs
+exit
+
+Esperado:
+
+which → /mnt/lfs/tools/bin/$LFS_TGT-gcc
+
+-print-sysroot → $LFS (ou $LFS + algo), não /.
+
+Nenhum erro de “command not found”.
+
+
+3.1.3. Verificar Linux headers
+
+Como root:
+
+ls -R $LFS/usr/include | head
+
+E confirmar que só tem .h (sem arquivos estranhos):
+
+find $LFS/usr/include -type f ! -name '*.h'
+
+Esperado: nenhuma linha nessa última; só .h.
+
+3.1.4. Verificar glibc/musl cross
+
+Se estiver usando Glibc (padrão):
+
+ls $LFS/usr/lib | egrep "crt1.o|crti.o|crtn.o"   # arquivos de start
+ls $LFS/lib                                  # deve ter libc.so, etc. (ou /usr/lib)
+
+Se estiver usando Musl:
+
+ls $LFS/lib | grep "libc.so"
+
+3.1.5. Verificar libstdc++ cross
+
+ls $LFS/usr/lib | grep "libstdc++"
+ls $LFS/usr/include/c++/$GCC_VER
+
+(de dentro do script, $GCC_VER = 15.2.0; na shell, substitui direto)
+
+
+---
+
+3.2. Teste “Hello World” com o cross-compiler
+
+Esse é o teste mais importante 💥
+
+Como lfs:
+
+su - lfs
+
+cat > hello.c << 'EOF'
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello LFS cross-toolchain!\n");
+    return 0;
+}
+EOF
+
+"$LFS_TGT-gcc" hello.c -o hello
+file hello
+"$LFS_TGT-readelf" -l hello | grep 'Requesting program interpreter' || readelf -l hello | grep 'Requesting program interpreter'
+exit
+
+O que olhar:
+
+file hello deve dizer algo como:
+
+ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, ...
+
+
+A linha do readelf mostra qual interpretador (linker dinâmico) está sendo usado – você quer algo compatível com a glibc/musl que está em $LFS, não coisas do host.
+
+
+> Se você copiar o hello pra dentro do chroot depois (quando ele existir), ele deve rodar lá normalmente.
+
+
+
+
+---
+
+4. Check-list de testes das TEMPORARY TOOLS (Cap. 6)
+
+Depois de rodar:
+
+sudo ./lfs-cross-helper.sh temp-tools
+sudo ./lfs-cross-helper.sh status   # temp-tools deve estar [OK]
+
+4.1. Verificar se as ferramentas estão instaladas em $LFS
+
+Como root:
+
+ls $LFS/usr/bin | egrep 'bash|m4|grep|gawk|sed|tar|xz|gzip|make|patch|find|file'
+
+4.2. Testar algumas delas pelo cross-ambiente (ainda como lfs)
+
+su - lfs
+
+# importantes
+$LFS_TGT-gcc --version       # já vimos
+bash --version               # precisa pegar /usr/bin/bash do $LFS via PATH?
+grep --version
+sed --version
+tar --version
+xz --version
+
+exit
+
+Esses comandos, rodados como lfs, vão usar o PATH configurado no .bashrc (com $LFS/tools/bin:/usr/bin:/bin).
+Como as temporary tools foram instaladas com DESTDIR=$LFS, elas estarão em $LFS/usr/bin, e quando você entrar no chroot, se tornam /usr/bin.
+
+
+---
+
+5. Testes após chroot-setup
+
+Rodar:
+
+sudo ./lfs-cross-helper.sh chroot-setup
+sudo ./lfs-cross-helper.sh status   # chroot-setup deve estar [OK]
+
+5.1. Conferir mounts
+
+mount | egrep "$LFS"
+
+Você deve ver coisas como:
+
+/dev → $LFS/dev
+
+proc → $LFS/proc
+
+sysfs → $LFS/sys
+
+tmpfs → $LFS/run
+
+devpts → $LFS/dev/pts
+
+
+5.2. Tentar entrar manualmente no chroot
+
+sudo chroot $LFS /usr/bin/env -i \
+    HOME=/root TERM=$TERM PS1='(test) \u:\w\$ ' \
+    PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+    /usr/bin/bash --login
+
+Dentro do chroot:
+
+echo "Estou no chroot, pwd = $(pwd)"
+ls /
+ls /usr/bin | head
+cat /etc/passwd
+cat /etc/group
+ls -l /bin /sbin /lib
+exit
+
+Esperado:
+
+/bin, /sbin, /lib são symlinks para /usr/bin, /usr/sbin, /usr/lib.
+
+/etc/passwd e /etc/group com o conteúdo mínimo criado pelo script.
+
+/root, /tmp, /var/tmp existem com as permissões corretas.
+
+
+
+---
+
+6. Testes após chroot-tools (Cap. 7)
+
+Rodar:
+
+sudo ./lfs-cross-helper.sh chroot-tools
+sudo ./lfs-cross-helper.sh status   # chroot-tools deve estar [OK]
+
+6.1. Validar dentro do chroot
+
+Entre no chroot (como acima ou com enter-chroot):
+
+sudo ./lfs-cross-helper.sh enter-chroot
+
+Dentro:
+
+# gettext
+which msgfmt && msgfmt --version
+
+# bison
+which bison && bison --version
+
+# perl
+which perl && perl -v
+
+# python
+which python3 && python3 --version
+
+# texinfo
+which makeinfo && makeinfo --version
+
+# util-linux (exemplos)
+which fdisk && fdisk --version
+which mount && mount --version
+
+exit
+
+Se tudo responder com versões “normais” (sem erro de “command not found”), as ferramentas do cap. 7 estão ok.
+
+
+---
+
+7. Final – desmontar chroot com segurança
+
+Quando terminar:
+
+sudo ./lfs-cross-helper.sh umount-chroot
+mount | egrep "$LFS"   # não deve sobrar nada
+
+Se reclamar de “target is busy”, verifique se ainda tem shell/processo no chroot:
+
+ps aux | grep "$LFS" | grep -v grep
+
+Feche o que estiver preso e rode umount-chroot de novo.
