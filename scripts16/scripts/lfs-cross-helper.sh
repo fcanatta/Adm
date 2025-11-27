@@ -280,8 +280,127 @@ build_gcc_pass1() {
   '
 }
 
-# (demais funções de CAP. 5: build_linux_headers, build_glibc_cross,
-#  build_libstdcpp_cross etc. permanecem como no seu script original)
+build_linux_headers() {
+  run_as_lfs '
+    echo "=== LINUX-6.17.8: extraindo fonte (API headers) ==="
+    tar -xf linux-6.17.8.tar.xz
+    cd linux-6.17.8
+
+    echo "=== LINUX-6.17.8: mrproper + headers ==="
+    make mrproper
+    make headers
+
+    echo "=== LINUX-6.17.8: limpando arquivos que não são .h em usr/include ==="
+    # Versão do livro LFS: remove tudo que não é .h, mas preserva diretórios
+    find usr/include -type f ! -name '"'"'*.h'"'"' -delete
+
+    echo "=== LINUX-6.17.8: copiando usr/include para $LFS/usr ==="
+    mkdir -p "$LFS/usr"
+    cp -rv usr/include "$LFS/usr"
+
+    echo "=== LINUX-6.17.8: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf linux-6.17.8
+  '
+}
+
+build_glibc_cross() {
+  run_as_lfs '
+    echo "=== GLIBC-2.42 (cross): extraindo fonte ==="
+    tar -xf glibc-2.42.tar.xz
+    cd glibc-2.42
+
+    echo "=== GLIBC-2.42 (cross): criando diretório build ==="
+    mkdir -v build
+    cd build
+
+    echo "=== GLIBC-2.42 (cross): configurando ==="
+    ../configure \
+      --prefix=/usr \
+      --host="$LFS_TGT" \
+      --build="$(../scripts/config.guess)" \
+      --enable-kernel=4.19 \
+      --with-headers="$LFS/usr/include" \
+      libc_cv_slibdir=/usr/lib
+
+    echo "=== GLIBC-2.42 (cross): compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== GLIBC-2.42 (cross): instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    echo "=== GLIBC-2.42 (cross): limpeza ==="
+    cd "$LFS/sources"
+    rm -rf glibc-2.42
+  '
+}
+
+build_libstdcpp_cross() {
+  run_as_lfs '
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): extraindo fonte ==="
+    tar -xf gcc-15.2.0.tar.xz
+    cd gcc-15.2.0
+
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): criando diretório build-libstdc++ ==="
+    mkdir -v build-libstdc++
+    cd build-libstdc++
+
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): configurando libstdc++-v3 ==="
+    ../libstdc++-v3/configure \
+      --host="$LFS_TGT" \
+      --build="$(../config.guess)" \
+      --prefix=/usr \
+      --disable-multilib \
+      --disable-nls \
+      --disable-libstdcxx-pch \
+      --with-gxx-include-dir=/tools/$LFS_TGT/include/c++/15.2.0
+
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    echo "=== LIBSTDC++ (GCC-15.2.0 cross): limpeza ==="
+    cd "$LFS/sources"
+    rm -rf gcc-15.2.0
+  '
+}
+
+build_musl_cross() {
+  run_as_lfs '
+    set -e
+
+    echo "=== MUSL-1.2.5 (cross): extraindo fonte ==="
+    tar -xf musl-1.2.5.tar.gz
+    cd musl-1.2.5
+
+    echo "=== MUSL-1.2.5 (cross): aplicando patches de segurança do iconv ==="
+    # Assumindo que os patches estão em /sources com esses nomes:
+    #   musl-1.2.5-iconv-euckr.patch  -> https://www.openwall.com/lists/musl/2025/02/13/1/1
+    #   musl-1.2.5-iconv-utf8-harden.patch -> https://www.openwall.com/lists/musl/2025/02/13/1/2
+    patch -Np1 -i ../musl-1.2.5-iconv-euckr.patch
+    patch -Np1 -i ../musl-1.2.5-iconv-utf8-harden.patch
+
+    echo "=== MUSL-1.2.5 (cross): configurando para alvo $LFS_TGT ==="
+    # Segue o estilo do CLFS para musl: CROSS_COMPILE + --target, usando DESTDIR como sysroot
+    CROSS_COMPILE="$LFS_TGT-" \
+    ./configure \
+      --prefix=/usr \
+      --target="$LFS_TGT" \
+      --syslibdir=/lib
+
+    echo "=== MUSL-1.2.5 (cross): compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== MUSL-1.2.5 (cross): instalando no sysroot $LFS ==="
+    make DESTDIR="$LFS" install
+
+    echo "=== MUSL-1.2.5 (cross): limpeza ==="
+    cd "$LFS/sources"
+    rm -rf musl-1.2.5
+  '
+}
 
 phase_cross_toolchain() {
   need_root
