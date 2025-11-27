@@ -716,10 +716,169 @@ build_sed() {
     rm -rf sed-4.9
   '
 }
-build_tar()        { run_as_lfs '# COLE AQUI os comandos da seção 6.15 Tar-1.35'; }
-build_xz()         { run_as_lfs '# COLE AQUI os comandos da seção 6.16 Xz-5.8.1'; }
-build_binutils_p2(){ run_as_lfs '# COLE AQUI os comandos da seção 6.17 Binutils-2.45.1 Pass 2'; }
-build_gcc_p2()     { run_as_lfs '# COLE AQUI os comandos da seção 6.18 GCC-15.2.0 Pass 2'; }
+build_tar() {
+  run_as_lfs '
+    set -e
+
+    echo "=== TAR-1.35: extraindo fonte ==="
+    tar -xf tar-1.35.tar.xz
+    cd tar-1.35
+
+    echo "=== TAR-1.35: configurando (temporary tool) ==="
+    ./configure \
+      --prefix=/usr \
+      --host=$LFS_TGT \
+      --build=$(build-aux/config.guess)
+
+    echo "=== TAR-1.35: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== TAR-1.35: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== TAR-1.35: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf tar-1.35
+  '
+}
+build_xz() {
+  run_as_lfs '
+    set -e
+
+    echo "=== XZ-5.8.1: extraindo fonte ==="
+    tar -xf xz-5.8.1.tar.xz
+    cd xz-5.8.1
+
+    echo "=== XZ-5.8.1: configurando (temporary tool, shared, sem .la) ==="
+    ./configure \
+      --prefix=/usr \
+      --host=$LFS_TGT \
+      --build=$(build-aux/config.guess) \
+      --disable-static \
+      --docdir=/usr/share/doc/xz-5.8.1
+
+    echo "=== XZ-5.8.1: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== XZ-5.8.1: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== XZ-5.8.1: removendo libtool archive (liblzma.la) ==="
+    rm -v "$LFS/usr/lib/liblzma.la"
+
+    echo "=== XZ-5.8.1: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf xz-5.8.1
+  '
+}
+build_binutils_p2() {
+  run_as_lfs '
+    set -e
+
+    echo "=== BINUTILS-2.45.1 (pass 2): extraindo fonte ==="
+    tar -xf binutils-2.45.1.tar.xz
+    cd binutils-2.45.1
+
+    echo "=== BINUTILS-2.45.1 (pass 2): ajustando ltmain/libtool ==="
+    sed '"'"'6031s/$add_dir//'"'"' -i ltmain.sh
+
+    echo "=== BINUTILS-2.45.1 (pass 2): criando build dir ==="
+    mkdir -v build
+    cd build
+
+    echo "=== BINUTILS-2.45.1 (pass 2): configurando ==="
+    ../configure \
+      --prefix=/usr \
+      --build=$(../config.guess) \
+      --host=$LFS_TGT \
+      --disable-nls \
+      --enable-shared \
+      --enable-gprofng=no \
+      --disable-werror \
+      --enable-64-bit-bfd \
+      --enable-new-dtags \
+      --enable-default-hash-style=gnu
+
+    echo "=== BINUTILS-2.45.1 (pass 2): compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== BINUTILS-2.45.1 (pass 2): instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== BINUTILS-2.45.1 (pass 2): removendo libs estáticas e .la ==="
+    rm -v "$LFS/usr/lib/lib"{bfd,ctf,ctf-nobfd,opcodes,sframe}"."{a,la}
+
+    echo "=== BINUTILS-2.45.1 (pass 2): limpeza ==="
+    cd "$LFS/sources"
+    rm -rf binutils-2.45.1
+  '
+}
+build_gcc_p2() {
+  run_as_lfs '
+    set -e
+
+    echo "=== GCC-15.2.0 (pass 2): extraindo fonte ==="
+    tar -xf gcc-15.2.0.tar.xz
+    cd gcc-15.2.0
+
+    echo "=== GCC-15.2.0 (pass 2): integrando MPFR/GMP/MPC ==="
+    tar -xf ../mpfr-4.2.2.tar.xz
+    mv -v mpfr-4.2.2 mpfr
+    tar -xf ../gmp-6.3.0.tar.xz
+    mv -v gmp-6.3.0 gmp
+    tar -xf ../mpc-1.3.1.tar.gz
+    mv -v mpc-1.3.1 mpc
+
+    echo "=== GCC-15.2.0 (pass 2): ajuste lib64 -> lib em x86_64 ==="
+    case $(uname -m) in
+      x86_64)
+        sed -e '"'"'/m64=/s/lib64/lib/'"'"' \
+            -i.orig gcc/config/i386/t-linux64
+      ;;
+    esac
+
+    echo "=== GCC-15.2.0 (pass 2): habilitando headers com threads POSIX ==="
+    sed '"'"'/thread_header =/s/@.*@/gthr-posix.h/'"'"' \
+      -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+
+    echo "=== GCC-15.2.0 (pass 2): criando build dir ==="
+    mkdir -v build
+    cd build
+
+    echo "=== GCC-15.2.0 (pass 2): configurando (cross -> temporary) ==="
+    ../configure \
+      --build=$(../config.guess) \
+      --host=$LFS_TGT \
+      --target=$LFS_TGT \
+      --prefix=/usr \
+      --with-build-sysroot=$LFS \
+      --enable-default-pie \
+      --enable-default-ssp \
+      --disable-nls \
+      --disable-multilib \
+      --disable-libatomic \
+      --disable-libgomp \
+      --disable-libquadmath \
+      --disable-libsanitizer \
+      --disable-libssp \
+      --disable-libvtv \
+      --enable-languages=c,c++ \
+      LDFLAGS_FOR_TARGET=-L$PWD/$LFS_TGT/libgcc
+
+    echo "=== GCC-15.2.0 (pass 2): compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== GCC-15.2.0 (pass 2): instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== GCC-15.2.0 (pass 2): criando symlink cc -> gcc dentro de \$LFS ==="
+    ln -sv gcc "$LFS/usr/bin/cc" || true
+
+    echo "=== GCC-15.2.0 (pass 2): limpeza ==="
+    cd "$LFS/sources"
+    rm -rf gcc-15.2.0
+  '
+}
 
 phase_temp_tools() {
   need_root
@@ -939,10 +1098,10 @@ download_sources() {
       https://www.linuxfromscratch.org/lfs/downloads/development/md5sums
 
     echo
-    echo "=== DOWNLOAD: Baixando todos os sources com barra de progresso ==="
+    echo "=== DOWNLOAD: Baixando todos os sources ==="
     echo
 
-    # Barra de progresso “bonita” do próprio wget
+    # Barra de progresso do próprio wget
     #   --show-progress           -> mostra barra mesmo em stdout
     #   --progress=bar:force:noscroll -> barra contínua tipo apt
     wget \
