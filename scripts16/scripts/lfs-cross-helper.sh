@@ -437,10 +437,133 @@ build_bash() {
     rm -rf bash-5.3
   '
 }
-build_coreutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.5 Coreutils-9.9'; }
-build_diffutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.6 Diffutils-3.12'; }
-build_file_6()     { run_as_lfs '# COLE AQUI os comandos da seção 6.7 File-5.46'; }
-build_findutils()  { run_as_lfs '# COLE AQUI os comandos da seção 6.8 Findutils-4.10.0'; }
+build_coreutils() {
+  run_as_lfs '
+    set -e
+    echo "=== COREUTILS-9.9: extraindo ==="
+    tar -xf coreutils-9.9.tar.xz
+    cd coreutils-9.9
+
+    echo "=== COREUTILS-9.9: configurando (temporary tools) ==="
+    ./configure \
+      --prefix=/usr \
+      --host="$LFS_TGT" \
+      --build="$(build-aux/config.guess)" \
+      --enable-install-program=hostname \
+      --enable-no-install-program=kill,uptime
+
+    echo "=== COREUTILS-9.9: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== COREUTILS-9.9: instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    echo "=== COREUTILS-9.9: ajustando localização do chroot ==="
+    mv -v "$LFS/usr/bin/chroot"              "$LFS/usr/sbin"
+    mkdir -pv "$LFS/usr/share/man/man8"
+    mv -v "$LFS/usr/share/man/man1/chroot.1" "$LFS/usr/share/man/man8/chroot.8"
+    sed -i '"'s/\"1\"/\"8\"/'"' "$LFS/usr/share/man/man8/chroot.8"
+
+    echo "=== COREUTILS-9.9: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf coreutils-9.9
+  '
+}
+build_diffutils() {
+  run_as_lfs '
+    set -e
+    echo "=== DIFFUTILS-3.12: extraindo ==="
+    tar -xf diffutils-3.12.tar.xz
+    cd diffutils-3.12
+
+    echo "=== DIFFUTILS-3.12: configurando (temporary tools) ==="
+    ./configure \
+      --prefix=/usr \
+      --host="$LFS_TGT" \
+      gl_cv_func_strcasecmp_works=y \
+      --build="$(./build-aux/config.guess)"
+
+    echo "=== DIFFUTILS-3.12: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== DIFFUTILS-3.12: instalando no sysroot do LFS ==="
+    make DESTDIR="$LFS" install
+
+    echo "=== DIFFUTILS-3.12: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf diffutils-3.12
+  '
+}
+build_file_6() {
+  run_as_lfs '
+    set -e
+
+    echo "=== FILE-5.46 (temp tools): extraindo fonte ==="
+    tar -xf file-5.46.tar.gz
+    cd file-5.46
+
+    echo "=== FILE-5.46: construindo file temporário no host (mesma versão) ==="
+    mkdir build
+    cd build
+
+    ../configure \
+      --disable-bzlib      \
+      --disable-libseccomp \
+      --disable-xzlib      \
+      --disable-zlib
+
+    echo "=== FILE-5.46: compilando cópia temporária (host) ==="
+    make -j'"$JOBS"'
+
+    echo "=== FILE-5.46: voltando para árvore principal ==="
+    cd ..
+
+    echo "=== FILE-5.46: configurando para cross (LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr \
+      --host=$LFS_TGT \
+      --build=$(./config.guess)
+
+    echo "=== FILE-5.46: compilando (usando FILE_COMPILE da cópia host) ==="
+    make -j'"$JOBS"' FILE_COMPILE=$(pwd)/build/src/file
+
+    echo "=== FILE-5.46: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== FILE-5.46: removendo libmagic.la (ruim p/ cross) ==="
+    rm -v $LFS/usr/lib/libmagic.la || true
+
+    echo "=== FILE-5.46: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf file-5.46
+  '
+}
+build_findutils() {
+  run_as_lfs '
+    set -e
+
+    echo "=== FINDUTILS-4.10.0 (temp tools): extraindo fonte ==="
+    tar -xf findutils-4.10.0.tar.xz
+    cd findutils-4.10.0
+
+    echo "=== FINDUTILS-4.10.0: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr                   \
+      --localstatedir=/var/lib/locate \
+      --host=$LFS_TGT                 \
+      --build=$(build-aux/config.guess)
+
+    echo "=== FINDUTILS-4.10.0: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== FINDUTILS-4.10.0: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== FINDUTILS-4.10.0: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf findutils-4.10.0
+  '
+}
 build_gawk()       { run_as_lfs '# COLE AQUI os comandos da seção 6.9 Gawk-5.3.2'; }
 build_grep()       { run_as_lfs '# COLE AQUI os comandos da seção 6.10 Grep-3.12'; }
 build_gzip()       { run_as_lfs '# COLE AQUI os comandos da seção 6.11 Gzip-1.14'; }
