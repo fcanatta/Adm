@@ -312,6 +312,13 @@ build_libstdcpp_cross() {
 }
 
 phase_cross_toolchain() {
+  need_root
+
+  if phase_done cross-toolchain; then
+    log "Fase cross-toolchain já foi concluída, pulando."
+    return 0
+  fi
+
   log ">>> CAP. 5: Binutils pass 1..."
   build_binutils_pass1
 
@@ -327,7 +334,8 @@ phase_cross_toolchain() {
   log ">>> CAP. 5: Libstdc++ (GCC 15.2) ..."
   build_libstdcpp_cross
 
-  log "Cross-toolchain concluída (Cap. 5)."
+  log ">>> Cross-toolchain concluída (Cap. 5)."
+  mark_phase_done cross-toolchain
 }
 
 ###############################################################################
@@ -445,6 +453,13 @@ build_binutils_p2(){ run_as_lfs '# COLE AQUI os comandos da seção 6.17 Binutil
 build_gcc_p2()     { run_as_lfs '# COLE AQUI os comandos da seção 6.18 GCC-15.2.0 Pass 2'; }
 
 phase_temp_tools() {
+  need_root
+
+  if phase_done temp-tools; then
+    log "Fase temp-tools já foi concluída, pulando."
+    return 0
+  fi  
+
   log ">>> CAP. 6: Temporary tools (você precisa completar os blocos de build)."
 
   build_m4
@@ -465,7 +480,8 @@ phase_temp_tools() {
   build_binutils_p2
   build_gcc_p2
 
-  log "Temporary tools do Cap. 6 concluídos."
+  log "Temporary tools do Cap. 6 concluídos."  
+  mark_phase_done temp-tools
 }
 
 ###############################################################################
