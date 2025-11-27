@@ -564,12 +564,158 @@ build_findutils() {
     rm -rf findutils-4.10.0
   '
 }
-build_gawk()       { run_as_lfs '# COLE AQUI os comandos da seção 6.9 Gawk-5.3.2'; }
-build_grep()       { run_as_lfs '# COLE AQUI os comandos da seção 6.10 Grep-3.12'; }
-build_gzip()       { run_as_lfs '# COLE AQUI os comandos da seção 6.11 Gzip-1.14'; }
-build_make()       { run_as_lfs '# COLE AQUI os comandos da seção 6.12 Make-4.4.1'; }
-build_patch()      { run_as_lfs '# COLE AQUI os comandos da seção 6.13 Patch-2.8'; }
-build_sed()        { run_as_lfs '# COLE AQUI os comandos da seção 6.14 Sed-4.9'; }
+build_gawk() {
+  run_as_lfs '
+    set -e
+
+    echo "=== GAWK-5.3.2 (temp tools): extraindo fonte ==="
+    tar -xf gawk-5.3.2.tar.xz
+    cd gawk-5.3.2
+
+    echo "=== GAWK-5.3.2: removendo extras do Makefile ==="
+    sed -i "s/extras//" Makefile.in
+
+    echo "=== GAWK-5.3.2: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr   \
+      --host=$LFS_TGT \
+      --build=$(build-aux/config.guess)
+
+    echo "=== GAWK-5.3.2: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== GAWK-5.3.2: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== GAWK-5.3.2: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf gawk-5.3.2
+  '
+}
+build_grep() {
+  run_as_lfs '
+    set -e
+
+    echo "=== GREP-3.12 (temp tools): extraindo fonte ==="
+    tar -xf grep-3.12.tar.xz
+    cd grep-3.12
+
+    echo "=== GREP-3.12: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr   \
+      --host=$LFS_TGT \
+      --build=$(./build-aux/config.guess)
+
+    echo "=== GREP-3.12: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== GREP-3.12: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== GREP-3.12: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf grep-3.12
+  '
+}
+build_gzip() {
+  run_as_lfs '
+    set -e
+
+    echo "=== GZIP-1.14 (temp tools): extraindo fonte ==="
+    tar -xf gzip-1.14.tar.xz
+    cd gzip-1.14
+
+    echo "=== GZIP-1.14: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr \
+      --host=$LFS_TGT
+
+    echo "=== GZIP-1.14: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== GZIP-1.14: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== GZIP-1.14: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf gzip-1.14
+  '
+}
+build_make() {
+  run_as_lfs '
+    set -e
+
+    echo "=== MAKE-4.4.1 (temp tools): extraindo fonte ==="
+    tar -xf make-4.4.1.tar.gz
+    cd make-4.4.1
+
+    echo "=== MAKE-4.4.1: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr   \
+      --host=$LFS_TGT \
+      --build=$(build-aux/config.guess)
+
+    echo "=== MAKE-4.4.1: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== MAKE-4.4.1: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== MAKE-4.4.1: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf make-4.4.1
+  '
+}
+build_patch() {
+  run_as_lfs '
+    set -e
+
+    echo "=== PATCH-2.8 (temp tools): extraindo fonte ==="
+    tar -xf patch-2.8.tar.xz
+    cd patch-2.8
+
+    echo "=== PATCH-2.8: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr   \
+      --host=$LFS_TGT \
+      --build=$(build-aux/config.guess)
+
+    echo "=== PATCH-2.8: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== PATCH-2.8: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== PATCH-2.8: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf patch-2.8
+  '
+}
+build_sed() {
+  run_as_lfs '
+    set -e
+
+    echo "=== SED-4.9 (temp tools): extraindo fonte ==="
+    tar -xf sed-4.9.tar.xz
+    cd sed-4.9
+
+    echo "=== SED-4.9: configurando (cross, LFS_TGT) ==="
+    ./configure \
+      --prefix=/usr   \
+      --host=$LFS_TGT \
+      --build=$(./build-aux/config.guess)
+
+    echo "=== SED-4.9: compilando ==="
+    make -j'"$JOBS"'
+
+    echo "=== SED-4.9: instalando no sysroot do LFS ==="
+    make DESTDIR=$LFS install
+
+    echo "=== SED-4.9: limpeza ==="
+    cd "$LFS/sources"
+    rm -rf sed-4.9
+  '
+}
 build_tar()        { run_as_lfs '# COLE AQUI os comandos da seção 6.15 Tar-1.35'; }
 build_xz()         { run_as_lfs '# COLE AQUI os comandos da seção 6.16 Xz-5.8.1'; }
 build_binutils_p2(){ run_as_lfs '# COLE AQUI os comandos da seção 6.17 Binutils-2.45.1 Pass 2'; }
