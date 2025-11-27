@@ -191,7 +191,7 @@ run_in_chroot() {
   chroot "$LFS" /usr/bin/env -i \
     HOME=/root TERM="$TERM" PS1='(lfs chroot) \u:\w\$ ' \
     PATH=/usr/bin:/usr/sbin:/bin:/sbin \
-    /bin/bash -c "set -e; umask 022; cd /sources; $cmd"
+    /usr/bin/bash -c "set -e; umask 022; cd /sources; $cmd"
 }
 
 #########################################################################
@@ -798,14 +798,15 @@ cdrom:x:11:
 tape:x:13:
 video:x:14:
 audio:x:17:
+utmp:x:22:
 users:x:999:
 nogroup:x:65534:
 EOF
 
     # logindb básico
-    touch /var/log/wtmp /var/log/btmp
+    touch /var/log/{wtmp,btmp,lastlog}
     chgrp -v utmp /var/log/lastlog || true
-    chmod -v 664 /var/log/lastlog
+    chmod -v 664 /var/log/lastlog || true
 
     # link /bin/sh -> bash (temporary tools já instalaram bash)
     ln -sfv bash /bin/sh
