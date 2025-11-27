@@ -18,6 +18,54 @@ set -euo pipefail
 : "${JOBS:=$(nproc)}"
 : "${LFS_TGT:=$(uname -m)-lfs-linux-gnu}"  # ex: x86_64-lfs-linux-gnu
 
+# Arquivo de estado para saber quais fases já foram concluídas
+STATE_FILE="${STATE_FILE:-$LFS/.lfs-helper.state}"
+
+phase_done() {
+  local phase="$1"
+  [ -f "$STATE_FILE" ] && grep -qx "$phase" "$STATE_FILE"
+}
+
+mark_phase_done() {
+  local phase="$1"
+  mkdir -p "$(dirname "$STATE_FILE")"
+  touch "$STATE_FILE"
+  # evita duplicata
+  if ! grep -qx "$phase" "$STATE_FILE"; then
+    echo "$phase" >> "$STATE_FILE"
+  fi
+}
+
+show_status() {
+  local phases=(
+    init-host
+    download-sources
+    verify-sources
+    cross-toolchain
+    temp-tools
+    chroot-setup
+    chroot-tools
+  )
+
+  echo "=== Estado das fases (arquivo: $STATE_FILE) ==="
+  for p in "${phases[@]}"; do
+    if phase_done "$p"; then
+      printf "  [OK]   %s\n" "$p"
+    else
+      printf "  [....] %s\n" "$p"
+    fi
+  done
+}
+
+reset_state() {
+  if [ -f "$STATE_FILE" ]; then
+    rm -f "$STATE_FILE"
+    echo "Estado resetado (removido $STATE_FILE)."
+  else
+    echo "Nenhum arquivo de estado para remover."
+  fi
+}
+
 # Diretório onde você coloca TODOS os tarballs do LFS
 SRC_DIR="$LFS/sources"
 
@@ -38,6 +86,11 @@ need_root() {
 phase_init_host() {
   need_root
 
+  if phase_done init-host; then
+    log "Fase init-host já foi concluída (marcada em $STATE_FILE), pulando."
+    return 0
+  fi
+   
   log "Criando layout básico em $LFS..."
   mkdir -pv "$LFS"
   mkdir -pv "$SRC_DIR"
@@ -79,6 +132,9 @@ export PATH
 EOF
 
   chown "$LFS_USER":"$LFS_GROUP" /home/"$LFS_USER"/.bash_profile /home/"$LFS_USER"/.bashrc
+
+  log "Fase init-host concluída."
+  mark_phase_done init-host
 
   log "INIT-HOST pronto. Agora copie os tarballs para $SRC_DIR (cap. 3)."
 }
@@ -558,8 +614,13 @@ phase_enter_chroot_shell() {
 ###############################################################################
 
 download_sources() {
-    need_root
+  need_root
 
+  if phase_done download-sources; then
+    log "Fase download-sources já foi concluída, pulando."
+    return 0
+  fi
+  
     echo "=== DOWNLOAD: Preparando diretório $LFS/sources ==="
     mkdir -pv "$LFS/sources"
     chmod -v a+wt "$LFS/sources"
@@ -590,11 +651,19 @@ download_sources() {
       --progress=bar:force:noscroll
 
     echo
+    log "Fase download-sources concluída."
+    mark_phase_done download-sources
     echo "=== DOWNLOAD: Concluído. Agora rode: helper verify-sources ==="
 }
 
 verify_sources() {
-    need_root
+  need_root
+
+  if phase_done verify-sources; then
+    log "Fase verify-sources já foi concluída, pulando."
+    return 0
+  fi  
+
 
     cd "$LFS/sources" || die "Diretório $LFS/sources não existe."
 
@@ -650,7 +719,11 @@ verify_sources() {
         return 1
     fi
 
-    echo "Todos os sources conferem com os md5sums oficiais. 👍"
+    # Se tudo OK no final:
+  log "Todos os sources conferem com os md5sums oficiais."
+  mark_phase_done verify-sources
+
+    echo "Todos os sources estão verificados e estão íntegros ✔️ "
 }
 
 ###############################################################################
