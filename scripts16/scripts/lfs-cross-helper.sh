@@ -496,9 +496,6 @@ phase_chroot_setup() {
     return 0
   fi
 
-  # Agora chama os diretórios/arquivos essenciais
-  phase_chroot_dirs_files  
-
   log ">>> 7.2 Changing Ownership..."
   chown -R root:root "$LFS"/{usr,lib,var,etc,bin,sbin,tools}
   case "$(uname -m)" in
@@ -517,10 +514,12 @@ phase_chroot_setup() {
   if [ -h "$LFS/dev/shm" ]; then
     mkdir -pv "$LFS/$(readlink "$LFS/dev/shm")"
   fi
-  
+
+  # Agora entra no chroot e cria diretórios/arquivos essenciais
+  phase_chroot_dirs_files
+
   log "Chroot setup (ownership + mounts + diretórios/arquivos essenciais) concluído."
   mark_phase_done chroot-setup
-  log ">>> 7.4 Entering chroot (para criar dirs/arquivos e compilar ferramentas de chroot)..."
 }
 
 phase_chroot_dirs_files() {
@@ -614,6 +613,13 @@ build_utillinux_chroot() {
 }
 
 phase_chroot_tools() {
+  need_root
+
+  if phase_done chroot-tools; then
+    log "Fase chroot-tools já foi concluída, pulando."
+    return 0
+  fi
+
   log ">>> CAP. 7: ferramentas adicionais dentro do chroot..."
 
   build_gettext_chroot
@@ -624,6 +630,7 @@ phase_chroot_tools() {
   build_utillinux_chroot
 
   log "Ferramentas adicionais de chroot (cap. 7) concluídas."
+  mark_phase_done chroot-tools
 }
 
 ###############################################################################
@@ -761,23 +768,28 @@ usage() {
 Uso: $0 <fase>
 
 Fases:
-  init-host       – cria layout $LFS, usuário lfs, env (cap. 4)
-  download-sources – baixa wget-list-sysv e todos os sources
-  verify-sources   – verifica md5 dos sources em $LFS/sources
-  cross-toolchain – Binutils/GCC/Linux headers/Glibc/Libstdc++ (cap. 5)
-  temp-tools      – temporary tools cross (cap. 6) – precisa colar comandos
-  chroot-setup    – ownership + mounts + diretórios + arquivos essenciais (cap. 7.2–7.6)
-  chroot-tools    – gettext/bison/perl/python/texinfo/util-linux (cap. 7) – colar comandos
-  enter-chroot    – entra em /bin/bash --login dentro do chroot
-  all             – roda tudo na ordem (init-host → cross-toolchain → temp-tools → chroot-setup → chroot-tools → enter-chroot)
+  init-host        – cria layout \$LFS, usuário lfs, env (cap. 4)
+  download-sources – baixa a wget-list e todos os sources para \$LFS/sources
+  verify-sources   – verifica md5 dos sources em \$LFS/sources
+  cross-toolchain  – Binutils/GCC/Linux headers/Glibc/Libstdc++ (cap. 5)
+  temp-tools       – temporary tools cross (cap. 6) – precisa colar comandos
+  chroot-setup     – ownership + mounts + diretórios + arquivos essenciais (cap. 7.2–7.6)
+  chroot-tools     – gettext/bison/perl/python/texinfo/util-linux (cap. 7) – colar comandos
+  enter-chroot     – entra em /bin/bash --login dentro do chroot
+  status           – mostra quais fases já foram concluídas (arquivo de estado)
+  reset-state      – apaga o arquivo de estado para refazer fases
+  all              – roda tudo na ordem (init-host → download-sources → verify-sources → cross-toolchain → temp-tools → chroot-setup → chroot-tools → enter-chroot)
 
 Exemplos:
   sudo $0 init-host
+  sudo $0 download-sources
+  sudo $0 verify-sources
   sudo $0 cross-toolchain
   sudo $0 temp-tools
   sudo $0 chroot-setup
   sudo $0 chroot-tools
   sudo $0 enter-chroot
+  sudo $0 status
   sudo $0 all
 EOF
 }
@@ -785,33 +797,31 @@ EOF
 main() {
   local phase="${1:-}"
   case "${1:-}" in
-  init-host)        phase_init_host ;;
-  download-sources) download_sources ;;
-  verify-sources)   verify_sources ;;
-  cross-toolchain)  phase_cross_toolchain ;;
-  temp-tools)       phase_temp_tools ;;
-  chroot-setup)
-      phase_chroot_setup
-      phase_chroot_dirs_files
-      ;;
-  chroot-tools)     phase_chroot_tools ;;
-  enter-chroot)     phase_enter_chroot_shell ;;
-  all)
+    init-host)        phase_init_host ;;
+    download-sources) download_sources ;;
+    verify-sources)   verify_sources ;;
+    cross-toolchain)  phase_cross_toolchain ;;
+    temp-tools)       phase_temp_tools ;;
+    chroot-setup)     phase_chroot_setup ;;
+    chroot-tools)     phase_chroot_tools ;;
+    enter-chroot)     phase_enter_chroot_shell ;;
+    status)           show_status ;;
+    reset-state)      reset_state ;;
+    all)
       phase_init_host
       download_sources
       verify_sources
       phase_cross_toolchain
       phase_temp_tools
       phase_chroot_setup
-      phase_chroot_dirs_files
       phase_chroot_tools
       phase_enter_chroot_shell
       ;;
-  *)
+    *)
       usage
       exit 1
       ;;
-esac
+  esac
 }
 
 main "$@"
