@@ -1,0 +1,36 @@
+Como usar dentro do fluxo do lfs-cross-toolchain.sh
+
+1. Se você quer usar musl no lugar do glibc cross, na tua phase_cross_toolchain() você pode trocar:
+
+
+
+log ">>> CAP. 5: Glibc (cross) ..."
+  build_glibc_cross
+
+por:
+
+log ">>> CAP. 5: Musl-1.2.5 (cross) com patches de segurança iconv ..."
+  build_musl_cross
+
+2. O restante do fluxo (binutils pass1, gcc pass1, libstdc++ etc.) permanece igual, só muda a libc usada.
+
+
+
+
+---
+
+Check-list mental desse bloco
+
+Antes de rodar a função build_musl_cross (direto ou via phase_cross_toolchain):
+
+Ver se os arquivos existem:
+
+
+ls $LFS/sources/musl-1.2.5.tar.gz
+ls $LFS/sources/musl-1.2.5-iconv-euckr.patch
+ls $LFS/sources/musl-1.2.5-iconv-utf8-harden.patch
+
+Ver se o toolchain cross já está pronto (binutils/gcc pass1 e headers do kernel), e se o LFS_TGT-gcc está no path do usuário lfs:
+
+
+su - lfs -c 'echo $LFS_TGT; command -v "$LFS_TGT-gcc"'
