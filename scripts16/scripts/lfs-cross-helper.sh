@@ -419,7 +419,7 @@ phase_cross_toolchain() {
   log ">>> CAP. 5: Linux API headers..."
   build_linux_headers
 
-  log ">>> CAP. 5: Glibc (cross) ..."
+  log ">>> CAP. 5: Glibc (cross) ..." #se quiser musl troque por build_musl_cross
   build_glibc_cross
 
   log ">>> CAP. 5: Libstdc++ (GCC 15.2) ..."
