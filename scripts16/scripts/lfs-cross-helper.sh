@@ -491,6 +491,14 @@ phase_temp_tools() {
 phase_chroot_setup() {
   need_root
 
+  if phase_done chroot-setup; then
+    log "Fase chroot-setup já foi concluída, pulando."
+    return 0
+  fi
+
+  # Agora chama os diretórios/arquivos essenciais
+  phase_chroot_dirs_files  
+
   log ">>> 7.2 Changing Ownership..."
   chown -R root:root "$LFS"/{usr,lib,var,etc,bin,sbin,tools}
   case "$(uname -m)" in
@@ -509,7 +517,9 @@ phase_chroot_setup() {
   if [ -h "$LFS/dev/shm" ]; then
     mkdir -pv "$LFS/$(readlink "$LFS/dev/shm")"
   fi
-
+  
+  log "Chroot setup (ownership + mounts + diretórios/arquivos essenciais) concluído."
+  mark_phase_done chroot-setup
   log ">>> 7.4 Entering chroot (para criar dirs/arquivos e compilar ferramentas de chroot)..."
 }
 
