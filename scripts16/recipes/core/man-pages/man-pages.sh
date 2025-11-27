@@ -1,68 +1,65 @@
-# man-pages-6.16 - Linux man-pages (LFS r12.4-46, cap. 8.3)
+#!/usr/bin/env bash
+# Recipe man-pages-6.16 para o adm
+# Baseado em LFS r12.4-46, capítulo 8.3 (Man-pages-6.16)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/man-pages.html
 
 PKG_NAME="man-pages"
 PKG_VERSION="6.16"
 PKG_RELEASE="1"
 
-# Grupos de conveniência – ajuste ao seu esquema
+PKG_DESC="Collection of over 2,400 Linux man pages (sections 2,3,4,5,7)"
+PKG_LICENSE="Various (see individual pages)"
+PKG_URL="https://www.kernel.org/pub/linux/docs/man-pages/"
 PKG_GROUPS="core docs"
 
-PKG_DESC="Coleção principal de man pages do Linux (sections 2,3,4,5,7)"
-PKG_URL="https://www.kernel.org/doc/man-pages/"
-PKG_LICENSE="various-free-licenses"
+# man-pages não tem dependência binária forte; são só arquivos de documentação.
+# Se quiser, você pode adicionar 'man-db' aqui, mas no LFS ele vem depois.
+PKG_DEPENDS=""
 
-# Fonte principal, conforme capítulo 3.2 do LFS r12.4-46
-# Download e MD5 tirados direto da tabela de pacotes.
-PKG_SOURCES="https://www.kernel.org/pub/linux/docs/man-pages/man-pages-${PKG_VERSION}.tar.xz"
-PKG_MD5S="4394eac3258137c8b549febeb04a7c33"
+# Fonte oficial (tar.xz) – usamos \$PKG_VERSION para facilitar upgrades
+PKG_SOURCES="https://www.kernel.org/pub/linux/docs/man-pages/man-pages-\$PKG_VERSION.tar.xz"
 
-# Dependências lógicas (para uso das manpages).
-# Ajuste o nome conforme o seu recipe de man viewer (por ex. 'man-db').
-PKG_DEPENDS="man-db"
+# SHA256 alinhado com o tar.xz acima
+# man-pages-6.16.tar.xz
+PKG_SHA256S="8e247abd75cd80809cfe08696c81b8c70690583b045749484b242fb43631d7a3"
 
-###############################################################################
-# Etapas conforme LFS 8.3 Man-pages-6.16
-# LFS manda:
-#   rm -v man3/crypt*
-#   make -R GIT=false prefix=/usr install
-###############################################################################
+# Não vamos usar MD5; o adm já valida SHA256 se disponível
+PKG_MD5S=""
 
+# -------------------------------------------------------------
+# Etapas de build seguindo o livro LFS
+# -------------------------------------------------------------
+
+# 8.3.1: antes de instalar, remover as páginas de crypt* (libxcrypt fornece melhores)
 pkg_prepare() {
-  # Aqui o adm já deve ter extraído o tarball e cd para o diretório fonte,
-  # algo como: $PWD = man-pages-6.16
-
-  # Remover as páginas de man de crypt*, pois o libxcrypt fornece versões melhores
-  # (LFS 8.3.1) 
-  rm -v man3/crypt*
+  # Estamos dentro do diretório de origem (man-pages-6.16)
+  rm -v man3/crypt* || true
 }
 
+# man-pages não precisa de compilação real, só instalação
 pkg_build() {
-  # man-pages não precisa de etapa de compilação; é basicamente instalação de arquivos.
   :
 }
 
+# Pacote não vem com suite de testes
 pkg_check() {
-  # Não há suite de testes no LFS para esse pacote.
   :
 }
 
+# 8.3.1 LFS: make -R GIT=false prefix=/usr install
+# Adaptado para DESTDIR do adm:
+#   - prefix  -> \$PKG_PREFIX  (normalmente /usr)
+#   - DESTDIR -> \$PKG_DESTDIR (raiz temporária do pacote)
 pkg_install() {
-  # O LFS usa:
-  #   make -R GIT=false prefix=/usr install
-  # Aqui adaptamos para usar DESTDIR do adm, mantendo -R e GIT=false.
-  #
-  # -R       : desativa variáveis built-in do make, necessárias porque o build
-  #            system do man-pages não lida bem com elas.
-  # GIT=false: evita spam de "git: command not found".
-  #
-  # prefix=/usr             → instala em /usr/share/man etc.
-  # DESTDIR="$PKG_DESTDIR"  → faz instalação “staged” dentro do root do pacote.
-  make -R GIT=false prefix=/usr DESTDIR="$PKG_DESTDIR" install
+  : "${PKG_DESTDIR:?PKG_DESTDIR não definido}"
+  : "${PKG_PREFIX:=/usr}"
+
+  make -R GIT=false \
+       prefix="$PKG_PREFIX" \
+       DESTDIR="$PKG_DESTDIR" \
+       install
 }
 
-# Usa o helper genérico do adm para achar a MAIOR versão disponível em kernel.org
-# com padrão man-pages-*.tar.{xz,gz}.  O core do adm depois compara com PKG_VERSION
-# e escolhe a maior para decidir upgrades.
-pkg_upstream_version() {
-  adm_generic_upstream_version
-}
+# Opcional: se o teu adm tiver adm_generic_upstream_version(),
+# ele já consegue descobrir versões novas só com PKG_SOURCES/PKG_VERSION,
+# então não é obrigatório definir pkg_upstream_version() aqui.
