@@ -388,3 +388,848 @@ Se reclamar de “target is busy”, verifique se ainda tem shell/processo no ch
 ps aux | grep "$LFS" | grep -v grep
 
 Feche o que estiver preso e rode umount-chroot de novo.
+
+################################# Debug e soluções #################
+
+Boa, agora a gente entra no modo “playbook de incidentes”:
+se falhar em X, eu vou dizer:
+
+Sintomas típicos
+
+Causas prováveis
+
+Comandos pra investigar (onde olhar)
+
+O que fazer pra corrigir
+
+
+Vou seguir a ordem do script:
+
+1. init-host
+
+
+2. download-sources
+
+
+3. verify-sources
+
+
+4. cross-toolchain (com sub-blocos: binutils, gcc, headers, glibc/musl, libstdc++)
+
+
+5. temp-tools
+
+
+6. chroot-setup + phase_chroot_dirs_files
+
+
+7. chroot-tools
+
+
+8. enter-chroot / umount-chroot
+
+
+
+Quando eu falar “rodar fase X”, é sempre algo como:
+
+sudo ./lfs-cross-helper.sh NOME-DA-FASE
+
+
+---
+
+1. Falhas em init-host
+
+1.1. “Precisa rodar como root.”
+
+Sintoma
+
+Mensagem no começo: Precisa rodar como root.
+
+
+Causa provável
+
+Rodou o script sem sudo/root.
+
+
+Onde olhar
+
+Nada especial, é só o começo do script.
+
+Como corrigir
+
+sudo ./lfs-cross-helper.sh init-host
+
+
+---
+
+1.2. “Seu sistema host está faltando algumas ferramentas...”
+
+Sintoma
+
+Lista de ferramentas faltando: Falta: gcc, Falta: make, etc.
+
+
+Causa provável
+
+Você está em uma distro minimalista (ou container) sem os pacotes de desenvolvimento.
+
+
+Onde olhar
+
+Teste manual:
+
+for t in bash binutils bison coreutils diff find gawk gcc g++ grep gzip \
+         m4 make patch perl python3 sed tar xz wget; do
+  command -v "$t" >/dev/null || echo "FALTA: $t"
+done
+
+Como corrigir
+
+Instalar os dev-packages equivalentes da sua distro (build-essential, binutils, bison, gawk, etc.).
+
+Depois:
+
+
+sudo ./lfs-cross-helper.sh init-host
+
+
+---
+
+1.3. Erros ao criar usuário/grupo lfs
+
+Sintoma
+
+Mensagens de useradd / groupadd reclamando, ou falha depois.
+
+
+Causas prováveis
+
+Usuário lfs já existe, mas com home/uid estranhos.
+
+Grupo lfs já existe com outro GID, mas isso normalmente não é fatal.
+
+
+Onde olhar
+
+id lfs   # ver UID/GID
+getent group lfs
+ls -ld /home/lfs
+
+Como corrigir
+
+Se estiver muito zoado:
+
+sudo userdel -r lfs 2>/dev/null || true
+sudo groupdel lfs 2>/dev/null || true
+sudo ./lfs-cross-helper.sh init-host
+
+(Cuidado se esse lfs antigo tiver coisas que você quer guardar.)
+
+
+---
+
+2. Falhas em download-sources
+
+2.1. wget não consegue baixar (DNS/internet)
+
+Sintoma
+
+wget: unable to resolve host address.
+
+Ou timeouts.
+
+
+Causas prováveis
+
+Sem internet, DNS quebrado, firewall.
+
+
+Onde olhar
+
+ping -c 3 www.linuxfromscratch.org
+ping -c 3 google.com
+
+Como corrigir
+
+Arrumar conectividade.
+
+Depois:
+
+
+sudo ./lfs-cross-helper.sh download-sources
+
+
+---
+
+2.2. Arquivos faltando na wget-list
+
+Sintoma
+
+wget dá erro 404 ou “Not Found” para alguns arquivos.
+
+
+Causa provável
+
+Mudança no espelho da LFS, ou versão “development” diferente do script.
+
+
+Onde olhar
+
+Abra o arquivo de lista:
+
+
+sed -n '1,40p' $LFS/sources/wget-list
+
+Veja quais URLs estão quebrando (pelo output do wget).
+
+
+Como corrigir
+
+Baixar manualmente o tarball faltando de outro mirror e colocar em $LFS/sources.
+
+(Em caso extremo: ajustar a versão nas variáveis do topo do script e dar match com os novos nomes da wget-list.)
+
+
+
+---
+
+3. Falhas em verify-sources
+
+3.1. md5sums não encontrado
+
+Sintoma
+
+Mensagem: Arquivo md5sums não encontrado em $LFS/sources. Rode primeiro: download-sources
+
+
+Causa provável
+
+Não rodou download-sources, ou ele falhou.
+
+
+Onde olhar
+
+ls $LFS/sources/md5sums
+
+Como corrigir
+
+sudo ./lfs-cross-helper.sh download-sources
+sudo ./lfs-cross-helper.sh verify-sources
+
+
+---
+
+3.2. FALHOU > 0 ou FALTANDO > 0
+
+Sintoma
+
+No final da verificação, o script mostra FALHOU ou FALTANDO > 0.
+
+
+Causas prováveis
+
+Download corrompido.
+
+Arquivo não foi baixado.
+
+
+Onde olhar
+
+grep FAILED $LFS/sources/md5sum.log || echo "Sem FAILED"
+awk '{print $2}' $LFS/sources/md5sums | while read f; do
+  [ -f "$LFS/sources/$f" ] || echo "FALTANDO: $f"
+done
+
+Como corrigir
+
+Para arquivos com FAILED: apagar e baixar de novo:
+
+
+cd $LFS/sources
+rm -f NOME-DO-ARQUIVO.tar.xz
+# rodar download-sources ou baixar manual
+sudo ./lfs-cross-helper.sh download-sources
+sudo ./lfs-cross-helper.sh verify-sources
+
+Para arquivos faltando: mesma coisa.
+
+
+
+---
+
+4. Falhas em cross-toolchain
+
+Essa é a mais sensível. Vou quebrar em sub-blocos.
+
+4.1. Falhas em build_binutils_pass1
+
+Sintomas comuns
+
+configure: error: C compiler cannot create executables
+
+No acceptable C compiler found in $PATH
+
+Erros esquisitos logo após ../configure em binutils.
+
+
+Causas prováveis
+
+GCC do host quebrado.
+
+PATH do lfs não está como o script espera.
+
+tar -xf binutils-... não achou o arquivo.
+
+
+Onde olhar
+
+Como lfs:
+
+su - lfs
+echo "PATH=$PATH"
+gcc --version
+ls $LFS/sources/binutils-*.tar.xz
+exit
+
+Como corrigir
+
+Se gcc não existe ou falha:
+
+Instalar gcc + toolchain da distro.
+
+
+Se não tem o tarball:
+
+Baixar de novo o binutils-$BINUTILS_VER.tar.xz pra $LFS/sources.
+
+
+
+Depois, como root:
+
+sudo ./lfs-cross-helper.sh cross-toolchain
+
+(Sim, ele vai passar por tudo de novo. Se já existirem restos, o script limpa o diretório do pacote no final.)
+
+
+---
+
+4.2. Falhas em build_gcc_pass1
+
+Sintomas comuns
+
+Reclama de MPFR, GMP, MPC: configure: error: ... mpfr ...
+
+Erro em sed do t-linux64 (alguma mensagem tipo “No such file or directory”).
+
+
+Causas prováveis
+
+Tarballs de mpfr, gmp, mpc não existem no $LFS/sources.
+
+Versões diferentes das que estão nas variáveis do topo.
+
+Estrutura do GCC diferente daquela que o sed espera (mudou de versão).
+
+
+Onde olhar
+
+ls $LFS/sources | egrep 'gcc-|mpfr-|gmp-|mpc-'
+
+Verque estão com os nomes:
+
+gcc-$GCC_VER.tar.xz
+
+mpfr-$MPFR_VER.tar.xz
+
+gmp-$GMP_VER.tar.xz
+
+mpc-$MPC_VER.tar.gz
+
+
+Como corrigir
+
+Garantir que os nomes batem com as variáveis do topo do script.
+
+Se baixou versões diferentes, ou:
+
+Ajusta as variáveis (GCC_VER, MPFR_VER, etc.)
+
+Ou renomeia os arquivos para o padrão esperado.
+
+
+Se o sed der erro em gcc/config/i386/t-linux64, ver se o caminho existe:
+
+
+tar -tf $LFS/sources/gcc-$GCC_VER.tar.xz | grep 'gcc/config/i386/t-linux64'
+
+Se não existir (mudança de layout no GCC), pode comentar o bloco case x86_64) temporariamente.
+
+
+---
+
+4.3. Falhas em build_linux_headers
+
+Sintomas
+
+make headers falha.
+
+tar -xf linux-... reclamando de “arquivo não encontrado”.
+
+
+Causas prováveis
+
+Tarball do kernel ausente ou corrompido.
+
+make/toolchain do host com problema.
+
+
+Onde olhar
+
+ls $LFS/sources/linux-$LINUX_VER.tar.xz
+
+Dentro do build (se quiser depurar):
+
+su - lfs
+cd $LFS/sources
+tar -xf linux-$LINUX_VER.tar.xz
+cd linux-$LINUX_VER
+make mrproper
+make headers
+# ver erros
+
+Como corrigir
+
+Se o tarball estiver quebrado: apagar e baixar de novo.
+
+Se make headers der erro de compilação, normalmente é bug do kernel/versão; validar se está usando a versão certa e se o host tem toolchain OK.
+
+
+
+---
+
+4.4. Falhas em build_glibc_cross (quando USE_MUSL=0)
+
+Sintomas
+
+configure: error: ... sobre ld, gcc, headers.
+
+Mensagens envolvendo __stack_chk_fail, ld-linux, etc.
+
+
+Causas prováveis
+
+build_linux_headers não rodou corretamente (sem includes em $LFS/usr/include).
+
+binutils/gcc pass1 não estão no PATH do lfs.
+
+Erro de versão incompatível.
+
+
+Onde olhar
+
+ls $LFS/usr/include | head
+su - lfs -c 'echo $PATH; which "$LFS_TGT-gcc"; which "$LFS_TGT-ld"'
+
+No diretório de build da glibc (se quiser depurar):
+
+su - lfs
+cd $LFS/sources
+tar -xf glibc-$GLIBC_VER.tar.xz
+cd glibc-$GLIBC_VER
+mkdir build && cd build
+../configure ...   # repetir os args que estão no script
+
+Como corrigir
+
+Garantir que linux_headers rodou OK (headers .h estão em $LFS/usr/include).
+
+Ver se LFS_TGT-gcc e LFS_TGT-ld estão no PATH do lfs.
+
+Confirmar que a versão do tarball bate com GLIBC_VER.
+
+
+
+---
+
+4.5. Falhas em build_musl_cross (quando USE_MUSL=1)
+
+Sintomas
+
+Erro ao aplicar patch (patch: ****) se os arquivos de patch não existem.
+
+./configure falha reclamando do CROSS_COMPILE ou do target.
+
+
+Causas prováveis
+
+Não baixou os patches de segurança, mas eles estão referenciados (hoje o script trata isso e só aplica se existir, então NÃO deveria quebrar).
+
+LFS_TGT-gcc não está funcional.
+
+Tarball musl-$MUSL_VER.tar.gz não existe.
+
+
+Onde olhar
+
+ls $LFS/sources | egrep 'musl-1.2.5|iconv'
+su - lfs -c 'which "$LFS_TGT-gcc"; "$LFS_TGT-gcc" --version'
+
+Como corrigir
+
+Se o tarball musl estiver faltando, baixar para $LFS/sources.
+
+Se o gcc cross ainda não está OK, resolver problemas em binutils/gcc_pass1 primeiro (ver se cross-toolchain já andou até aí).
+
+
+
+---
+
+4.6. Falhas em build_libstdcpp_cross
+
+Sintomas
+
+configure: error: C++ compiler cannot create executables ou algo sobre includes.
+
+tar -xf gcc-... não acha o arquivo (porque já foi apagado numa tentativa anterior).
+
+
+Causas prováveis
+
+Tarball do GCC foi removido e não baixou de novo.
+
+LFS_TGT-gcc + glibc/musl ainda não estão OK.
+
+--with-gxx-include-dir apontando para um caminho que não existe.
+
+
+Onde olhar
+
+ls $LFS/sources/gcc-$GCC_VER.tar.xz
+su - lfs -c 'which "$LFS_TGT-gcc"; "$LFS_TGT-gcc" --version'
+ls $LFS/tools/$LFS_TGT/include/c++/$GCC_VER
+
+Como corrigir
+
+Garantir que o tarball gcc-$GCC_VER.tar.xz está em $LFS/sources.
+
+Confirmar que LFS_TGT-gcc funciona (hello world da seção 3.2).
+
+Se tools/$LFS_TGT/include/c++/$GCC_VER não existir, talvez GCC pass1 não instalou direito → revisar erros anteriores.
+
+
+
+---
+
+5. Falhas em temp-tools
+
+Aqui normalmente quebra em:
+
+tar -xf (arquivo faltando)
+
+./configure (layout diferente, host sem toolchain, falta de dependências)
+
+
+5.1. “Arquivo não encontrado” ao extrair tarball
+
+Sintomas
+
+tar: arquivo.tar.xz: Cannot open: No such file or directory
+
+
+Causa provável
+
+wget-list tinha outra versão; você ajustou as variáveis mas não o nome do arquivo, ou vice-versa.
+
+
+Onde olhar
+
+ls $LFS/sources | egrep 'm4-|ncurses-|bash-|coreutils-|diffutils-|file-|findutils-|gawk-|grep-|gzip-|make-|patch-|sed-|tar-|xz-'
+
+Como corrigir
+
+Garantir que as versões nas variáveis do topo batem com os arquivos em $LFS/sources, ou renomear manualmente os arquivos.
+
+Exemplo:
+
+
+mv m4-1.4.21.tar.xz m4-1.4.20.tar.xz   # se a variável ainda estiver 1.4.20
+
+(Ideal é sempre ajustar as variáveis se mudar a versão.)
+
+
+---
+
+5.2. ./configure reclama de host/build
+
+Sintomas
+
+configure: error: cannot guess build type; you must specify one
+
+build-aux/config.guess: No such file or directory
+
+
+Causas prováveis
+
+Versão do pacote diferente; o caminho build-aux/config.guess não existe.
+
+O script usa ./config.guess e a versão mudou.
+
+
+Onde olhar
+
+Dentro do pacote (exemplo m4):
+
+su - lfs
+cd $LFS/sources
+tar -xf m4-$M4_VER.tar.xz
+cd m4-$M4_VER
+find . -name 'config.guess'
+exit
+
+Como corrigir
+
+Ajustar a linha do script que chama config.guess pro caminho correto daquela versão.
+
+Se hoje está build-aux/config.guess e o arquivo está em ./config.guess, trocar.
+
+
+Re-executar temp-tools.
+
+
+
+---
+
+5.3. “permission denied” instalando em $LFS
+
+Sintomas
+
+make DESTDIR=$LFS install falha com Permission denied escrevendo em $LFS/usr/....
+
+
+Causas prováveis
+
+chroot-setup foi rodado cedo demais (root virou dono de tudo antes de terminar temp-tools).
+
+
+Onde olhar
+
+ls -ld $LFS $LFS/usr $LFS/tools
+
+Se o dono for root:root antes da hora, é isso.
+
+Como corrigir
+
+Se ainda está em fase de build (antes do chroot setup):
+
+sudo chown -R lfs:lfs $LFS
+sudo ./lfs-cross-helper.sh temp-tools
+
+
+---
+
+6. Falhas em chroot-setup / phase_chroot_dirs_files
+
+6.1. Erros de mount (já montado, etc.)
+
+Sintomas
+
+mount: /mnt/lfs/dev: mount point does not exist
+ou
+
+mount: /mnt/lfs/dev: already mounted (se fizesse manual)
+
+
+Causas prováveis
+
+$LFS não existe.
+
+Você já montou algo manualmente.
+
+
+Onde olhar
+
+ls -ld $LFS $LFS/dev $LFS/proc $LFS/sys $LFS/run
+mount | egrep "$LFS"
+
+Como corrigir
+
+Garantir que $LFS existe (init-host).
+
+Se tiver montagens antigas zoadas, pode desmontar com:
+
+
+sudo ./lfs-cross-helper.sh umount-chroot
+
+e rodar chroot-setup de novo.
+
+
+---
+
+6.2. Falha dentro do chroot na criação de diretórios ou arquivos (7.5/7.6)
+
+Sintomas
+
+Erro em phase_chroot_dirs_files, algo como:
+
+ln: failed to create symbolic link '/bin': File exists
+
+rm: cannot remove '/bin': Device or resource busy
+
+
+
+Causas prováveis
+
+Você já entrou no chroot e criou coisas manualmente.
+
+/bin, /sbin, /lib não são diretórios esperados (por exemplo, já são symlinks).
+
+
+Onde olhar
+
+Dentro do chroot (manual):
+
+sudo chroot $LFS /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+  /usr/bin/bash -c 'ls -ld /bin /sbin /lib'
+
+Como corrigir
+
+Se for safe: remover manualmente /bin, /sbin, /lib dentro do chroot e rodar chroot-setup de novo:
+
+
+sudo chroot $LFS /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+  /usr/bin/bash -c 'rm -rf /bin /sbin /lib'
+sudo ./lfs-cross-helper.sh chroot-setup
+
+(Só faça isso se tiver certeza que está mexendo no sistema LFS, não no host!)
+
+
+---
+
+7. Falhas em chroot-tools
+
+7.1. Tarball não encontrado dentro do chroot
+
+Sintoma
+
+tar: gettext-0.26.tar.xz: Cannot open: No such file or directory.
+
+
+Causa provável
+
+Arquivo não está em $LFS/sources.
+
+Nome diferente da versão nas variáveis.
+
+
+Onde olhar
+
+ls $LFS/sources | egrep 'gettext-|bison-|perl-|Python-|texinfo-|util-linux-'
+
+Como corrigir
+
+Nomear/baixar os arquivos corretos em $LFS/sources conforme as variáveis GETTEXT_VER, BISON_VER, etc.
+
+Rodar:
+
+
+sudo ./lfs-cross-helper.sh chroot-tools
+
+
+---
+
+7.2. configure falha por falta de toolchain
+
+Sintoma
+
+Dentro de algum pacote no chroot: configure: error: C compiler cannot create executables etc.
+
+
+Causas prováveis
+
+Cross-toolchain ou temp-tools incompletos.
+
+PATH dentro do chroot não contém /usr/bin e /bin corretamente.
+
+
+Onde olhar
+
+Dentro do chroot:
+
+sudo chroot $LFS /usr/bin/env -i HOME=/root PATH=/usr/bin:/bin \
+  /usr/bin/bash -c 'cc --version; ld --version; echo PATH=$PATH'
+
+Como corrigir
+
+Conferir se as fases cross-toolchain e temp-tools estão [OK]:
+
+
+sudo ./lfs-cross-helper.sh status
+
+Se não, resolver os erros dessas fases primeiro (ver seções acima).
+
+
+
+---
+
+8. Falhas em enter-chroot / umount-chroot
+
+8.1. enter-chroot falha: /bin/bash: No such file or directory
+
+Sintoma
+
+chroot: failed to run command '/bin/bash': No such file or directory
+
+
+Causas prováveis
+
+chroot-setup não rodou por completo.
+
+bash não foi instalado (problema em temp-tools / bash).
+
+Symlinks /bin → /usr/bin não existem.
+
+
+Onde olhar
+
+ls -ld $LFS/bin $LFS/usr/bin/bash
+
+Como corrigir
+
+Garanta que temp-tools e chroot-setup estão [OK]:
+
+
+sudo ./lfs-cross-helper.sh status
+
+Se faltarem symlinks, rodar chroot-setup de novo.
+
+
+
+---
+
+8.2. umount-chroot falha: target is busy
+
+Sintoma
+
+umount: /mnt/lfs/dev: target is busy (ou qualquer um dos pontos)
+
+
+Causas prováveis
+
+Shell ou processo ainda usando $LFS (por exemplo, você ainda está dentro do chroot em outro terminal).
+
+
+Onde olhar
+
+ps aux | grep "$LFS" | grep -v grep
+lsof | grep "$LFS"   # se tiver lsof instalado no host
+
+Como corrigir
+
+Fechar todos os terminais/shells que estejam dentro do chroot.
+
+Matar qualquer processo pendurado.
+
+Rodar de novo:
+
+
+sudo ./lfs-cross-helper.sh umount-chroot
