@@ -6,7 +6,7 @@ PKG_RELEASE=1
 
 # Único source (com múltiplos mirrors separados por "|")
 PKG_SOURCE_URLS=(
-  "https://www.kernel.org/pub/linux/docs/man-pages/man-pages-6.16.tar.xz|https://mirror.umd.edu/kernel.org/linux/docs/man-pages/man-pages-6.16.tar.xz|https://ftp.naist.jp/pub/linux/docs/man-pages/man-pages-6.16.tar.xz"
+  "https://www.kernel.org/pub/linux/docs/man-pages/man-pages-${PKG_VERSION}.tar.xz|https://mirror.umd.edu/kernel.org/linux/docs/man-pages/man-pages-6.16.tar.xz|https://ftp.naist.jp/pub/linux/docs/man-pages/man-pages-6.16.tar.xz"
 )
 
 # SHA256 para o source 0 (tarball)
