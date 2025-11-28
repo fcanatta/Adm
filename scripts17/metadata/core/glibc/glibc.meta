@@ -1,0 +1,129 @@
+# ===== glibc-2.42 - LFS 12.4 / capítulo 8.5 =====
+
+PKG_NAME="glibc"
+PKG_VERSION="2.42"
+PKG_RELEASE="1"
+
+# Grupo para instalação em lote (ex.: adm install-group core)
+PKG_GROUPS=( "core" )
+
+# Dependências lógicas (ordem de construção)
+# Ajuste os nomes de acordo com os pacotes que você cadastrou no adm.
+PKG_DEPENDS=(
+  "man-pages"   # 8.3 - já deve estar instalado
+  "iana-etc"    # 8.4
+)
+
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/glibc/"
+# Regex simples para check_upstream_version (tarballs .tar.xz)
+PKG_UPSTREAM_REGEX='glibc-([0-9.]+)\.tar\.xz'
+
+# Fontes: tarball + patch FHS
+PKG_SOURCE_URLS=(
+  # 0: tarball oficial
+  "https://ftp.gnu.org/gnu/glibc/glibc-${PKG_VERSION}.tar.xz|https://ftpmirror.gnu.org/glibc/glibc-2.42.tar.xz|https://ftp.lfs-matrix.net/pub/lfs/lfs-packages/12.4/glibc-2.42.tar.xz"
+
+  # 1: patch FHS do LFS
+  "https://www.linuxfromscratch.org/patches/lfs/12.4/glibc-${PKG_VERSION}-fhs-1.patch|https://lfs.it-privat.dk/patches/lfs/development/glibc-2.42-fhs-1.patch"
+)
+
+# SHA256 (só para o tarball; para o patch deixo vazio e o adm só checa MD5)
+PKG_SHA256S=(
+  # glibc-2.42.tar.xz (fossies)
+  "d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f"
+
+  # glibc-2.42-fhs-1.patch (usar só MD5)
+  ""
+)
+
+# MD5 (do livro LFS 12.4)
+PKG_MD5S=(
+  # glibc-2.42.tar.xz
+  "23c6f5a27932b435cae94e087cb8b1f5"
+
+  # glibc-2.42-fhs-1.patch
+  "9a5997c3452909b1769918c759eff8a2"
+)
+
+# --------------------------------------------------------------------
+#  BUILD: LFS 12.4 – 8.5.1 Installation of Glibc (parte de build)
+# --------------------------------------------------------------------
+PKG_BUILD() {
+    set -e
+
+    # Estamos no diretório de fontes (…/glibc-2.42)
+    # 1. Aplicar patch FHS (8.5.1)
+    patch -Np1 -i ../glibc-${PKG_VERSION}-fhs-1.patch
+
+    # 2. Fix Valgrind / abort.c (8.5.1)
+    sed -e '/unistd.h/i #include <string.h>' \
+        -e '/libc_rwlock_init/c\
+ __libc_rwlock_define_initialized (, reset_lock);\
+ memcpy (&lock, &reset_lock, sizeof (lock));' \
+        -i stdlib/abort.c
+
+    # 3. Build em diretório separado (8.5.1)
+    mkdir -v build
+    cd build
+
+    # Garantir instalação de ldconfig e sln em /usr/sbin (8.5.1)
+    echo "rootsbindir=/usr/sbin" > configparms
+
+    # 4. Configure conforme LFS 12.4 (8.5.1)
+    ../configure --prefix=/usr \
+                 --disable-werror \
+                 --disable-nscd \
+                 libc_cv_slibdir=/usr/lib \
+                 --enable-stack-protector=strong \
+                 --enable-kernel=5.4
+
+    # 5. Compilar (8.5.1)
+    make
+
+    # Opcional: rodar testes se você quiser via variável global
+    # (o adm.sh não define isso, mas você pode exportar antes do build)
+    if [[ "${ADM_RUN_TESTS:-0}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+# --------------------------------------------------------------------
+#  INSTALL: LFS 12.4 – 8.5.1 + ajustes mínimos
+#  Observação importante:
+#    - Esta função está escrita para funcionar tanto com DESTDIR vazio
+#      (instalação direta em /) quanto com DESTDIR apontando para
+#      um diretório de staging (para empacotamento).
+#    - Configurações mais “de sistema” (nsswitch.conf, tzdata, locales)
+#      NÃO são tratadas aqui, para não sujar a máquina host durante
+#      um build com DESTDIR. Você pode fazer um metadata separado
+#      para tzdata e um script de configuração pós-instalação.
+# --------------------------------------------------------------------
+PKG_INSTALL() {
+    set -e
+
+    # O adm entra neste metadata no diretório de fontes (…/glibc-2.42)
+    # Precisamos ir para o diretório de build criado em PKG_BUILD.
+    cd build
+
+    # Raiz de instalação (DESTDIR ou /)
+    local root="${DESTDIR:-/}"
+
+    # Evitar warning chato de /etc/ld.so.conf ausente (8.5.1)
+    mkdir -p "${root}/etc"
+    : > "${root}/etc/ld.so.conf"
+
+    # Desabilitar sanity check antigo que falha com config moderna (8.5.1)
+    sed '/test-installation/s@$(PERL)@echo not running@' -i ../Makefile
+
+    # Instalar dentro de DESTDIR (ou / se DESTDIR vazio)
+    make DESTDIR="${DESTDIR:-}" install
+
+    # Ajustar /usr/bin/ldd para não depender de /usr prefixado (8.5.1)
+    sed '/RTLDLIST=/s@/usr@@g' -i "${root}/usr/bin/ldd"
+
+    # IMPORTANTE:
+    #  - nsswitch.conf (8.5.2.1) e timezone data (8.5.2.2)
+    #    não são tratados aqui para não quebrar o empacotamento.
+    #  - Você pode criar um metadata separado de "glibc-config"
+    #    ou "tzdata" que rode apenas fora de DESTDIR.
+}
