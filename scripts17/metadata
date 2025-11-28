@@ -1,0 +1,27 @@
+# bash.meta
+PKG_NAME="bash"
+PKG_VERSION="5.2.32"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/bash/bash-5.2.32.tar.gz"
+)
+PKG_SHA256S=(
+  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+)
+# Ou PKG_MD5S=()
+
+PKG_DEPENDS=( "ncurses" "readline" )
+
+PKG_BUILD() {
+  ./configure --prefix=/usr
+  make -j"$(nproc)"
+}
+
+PKG_INSTALL() {
+  make DESTDIR="$DESTDIR" install
+}
+
+# Opcional, para update automático
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/bash/"
+PKG_UPSTREAM_REGEX='bash-([0-9\.]+)\.tar\.gz'
