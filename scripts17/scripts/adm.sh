@@ -60,6 +60,20 @@ log_debug() {
     printf "%s[DEBUG]%s %s\n" "$C_DEBUG" "$C_RESET" "$*"
 }
 
+validate_source_arrays() {
+    local nsources=${#PKG_SOURCE_URLS[@]}
+
+    # sha256, se usado, tem que ter mesmo tamanho que SOURCES
+    if [[ ${#PKG_SHA256S[@]:-0} -gt 0 && ${#PKG_SHA256S[@]} -ne $nsources ]]; then
+        die "[$PKG_NAME] PKG_SHA256S precisa ter o mesmo número de elementos que PKG_SOURCE_URLS (ou ser vazio)."
+    fi
+
+    # md5, se usado, tem que ter mesmo tamanho que SOURCES
+    if [[ ${#PKG_MD5S[@]:-0} -gt 0 && ${#PKG_MD5S[@]} -ne $nsources ]]; then
+        die "[$PKG_NAME] PKG_MD5S precisa ter o mesmo número de elementos que PKG_SOURCE_URLS (ou ser vazio)."
+    fi
+}
+
 # =========================
 # Utilidades gerais
 # =========================
@@ -141,104 +155,151 @@ clear_pkg_stage() {
 # =========================
 
 download_one_source() {
-    local pkg="$1" idx="$2" url="$3" out="$4" sha256="$5" md5="$6"
-    local attempts=3
-    local i
+    local pkg="$1" idx="$2" urlspec="$3" out="$4" sha256="$5" md5="$6"
 
-    for (( i=1; i<=attempts; i++ )); do
-        log_info "[$pkg] Download ($i/$attempts): $url -> $out"
+    # urlspec pode ter múltiplos espelhos separados por '|'
+    local -a mirrors=()
+    IFS='|' read -r -a mirrors <<<"$urlspec"
+    if ((${#mirrors[@]} == 0)); then
+        die "[$pkg] Nenhuma URL válida em PKG_SOURCE_URLS[$idx]"
+    fi
 
-        # Se já existe, vamos verificar checksum antes de baixar
-        if [[ -f "$out" ]]; then
-            if [[ -n "$sha256" ]]; then
-                if echo "$sha256  $out" | sha256sum -c - >/dev/null 2>&1; then
-                    log_info "[$pkg] Cache OK (sha256) para $out"
-                    return 0
-                else
-                    log_warn "[$pkg] Cache inválido (sha256) para $out, removendo"
-                    rm -f "$out"
-                fi
-            elif [[ -n "$md5" ]]; then
-                if echo "$md5  $out" | md5sum -c - >/dev/null 2>&1; then
-                    log_info "[$pkg] Cache OK (md5) para $out"
-                    return 0
-                else
-                    log_warn "[$pkg] Cache inválido (md5) para $out, removendo"
-                    rm -f "$out"
-                fi
-            else
-                log_info "[$pkg] Usando cache sem checksum para $out"
-                return 0
+    local attempts_per_mirror=3
+    local have_checksum=0
+    [[ -n "$sha256" ]] && have_checksum=1
+    [[ -n "$md5" ]] && have_checksum=1
+
+    # Se já existe no cache, verifica checksum ANTES de qualquer coisa
+    if [[ -f "$out" && $have_checksum -eq 1 ]]; then
+        local ok=1
+        if [[ -n "$sha256" ]]; then
+            if ! echo "$sha256  $out" | sha256sum -c - >/dev/null 2>&1; then
+                ok=0
             fi
         fi
+        if [[ -n "$md5" ]]; then
+            if ! echo "$md5  $out" | md5sum -c - >/dev/null 2>&1; then
+                ok=0
+            fi
+        fi
+        if (( ok == 1 )); then
+            log_info "[$pkg] Cache OK (checksums) para $out"
+            return 0
+        else
+            log_warn "[$pkg] Cache inválido para $out, removendo"
+            rm -f "$out"
+        fi
+    fi
 
-        # Escolher método de download
+    # Função interna para fazer download de UMA url
+    _do_download_url() {
+        local url="$1" tmpout="$2"
+
         if [[ "$url" == git://* || "$url" == *.git || "$url" == git+* ]]; then
             require_cmd git
-            local tmpdir="${out}.tmp.git"
+            local tmpdir="${tmpout}.gitclone"
             rm -rf "$tmpdir"
             mkdir -p "$tmpdir"
             log_info "[$pkg] Clonando repositório git: $url"
-            if ! git clone --depth=1 "${url#git+}" "$tmpdir" 2>>"$LOG_FILE"; then
-                log_warn "[$pkg] Falha no git clone, tentativa $i"
+            if git clone --depth=1 "${url#git+}" "$tmpdir" >>"$LOG_FILE" 2>&1; then
+                tar -cf "$tmpout" -C "$tmpdir" . >>"$LOG_FILE" 2>&1
                 rm -rf "$tmpdir"
+                return 0
             else
-                # Empacota o repositório em tar para cache
-                tar -cf "$out" -C "$tmpdir" .
+                log_warn "[$pkg] Falha ao clonar git: $url"
                 rm -rf "$tmpdir"
+                return 1
             fi
+
         elif [[ "$url" == rsync://* ]]; then
             require_cmd rsync
             log_info "[$pkg] Baixando via rsync: $url"
-            rsync -av "$url" "$out" >>"$LOG_FILE" 2>&1 || true
+            if rsync -av "$url" "$tmpout" >>"$LOG_FILE" 2>&1; then
+                return 0
+            else
+                log_warn "[$pkg] Falha no rsync: $url"
+                return 1
+            fi
+
         else
             # HTTP/HTTPS/FTP etc
             if command -v curl >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via curl: $url"
-                curl -L --fail --progress-bar -o "$out" "$url" 2>>"$LOG_FILE" || true
+                if curl -L --fail --progress-bar -o "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
+                    return 0
+                else
+                    log_warn "[$pkg] Falha no curl: $url"
+                    return 1
+                fi
             elif command -v wget >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via wget: $url"
-                wget --progress=bar:force -O "$out" "$url" >>"$LOG_FILE" 2>&1 || true
+                if wget --progress=bar:force -O "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
+                    return 0
+                else
+                    log_warn "[$pkg] Falha no wget: $url"
+                    return 1
+                fi
             else
                 die "Nem curl nem wget encontrados para download."
             fi
         fi
+    }
 
-        # Verifica se baixou
-        if [[ ! -f "$out" ]]; then
-            log_warn "[$pkg] Download não gerou arquivo: $out"
-            continue
-        fi
+    local mirror
+    for mirror in "${mirrors[@]}"; do
+        mirror="${mirror//[[:space:]]/}"  # tira espaços acidentais
+        [[ -z "$mirror" ]] && continue
 
-        # Verificação de checksum
-        if [[ -n "$sha256" ]]; then
-            if echo "$sha256  $out" | sha256sum -c - >/dev/null 2>&1; then
-                log_info "[$pkg] sha256 OK para $out"
+        log_info "[$pkg] Usando mirror: $mirror -> $out"
+        local attempt
+        for (( attempt=1; attempt<=attempts_per_mirror; attempt++ )); do
+            log_info "[$pkg] Download tentativa $attempt/$attempts_per_mirror: $mirror"
+
+            local tmpout="${out}.part"
+            rm -f "$tmpout"
+
+            if !_do_download_url "$mirror" "$tmpout"; then
+                log_warn "[$pkg] Falha ao baixar de $mirror (tentativa $attempt)"
+                continue
+            fi
+
+            if [[ ! -f "$tmpout" ]]; then
+                log_warn "[$pkg] Download não produziu arquivo: $tmpout"
+                continue
+            fi
+
+            # Verificar checksums se fornecidos
+            local ok=1
+            if [[ -n "$sha256" ]]; then
+                if ! echo "$sha256  $tmpout" | sha256sum -c - >/dev/null 2>&1; then
+                    log_warn "[$pkg] sha256 inválido para arquivo baixado de $mirror"
+                    ok=0
+                fi
+            fi
+            if [[ -n "$md5" ]]; then
+                if ! echo "$md5  $tmpout" | md5sum -c - >/dev/null 2>&1; then
+                    log_warn "[$pkg] md5 inválido para arquivo baixado de $mirror"
+                    ok=0
+                fi
+            fi
+
+            if (( ok == 1 || have_checksum == 0 )); then
+                mv "$tmpout" "$out"
+                log_info "[$pkg] Download concluído e válido: $out"
                 return 0
             else
-                log_warn "[$pkg] sha256 inválido para $out (tentativa $i)"
-                rm -f "$out"
+                rm -f "$tmpout"
             fi
-        elif [[ -n "$md5" ]]; then
-            if echo "$md5  $out" | md5sum -c - >/dev/null 2>&1; then
-                log_info "[$pkg] md5 OK para $out"
-                return 0
-            else
-                log_warn "[$pkg] md5 inválido para $out (tentativa $i)"
-                rm -f "$out"
-            fi
-        else
-            log_info "[$pkg] Sem checksum configurado para $out, aceitando como está"
-            return 0
-        fi
+        done
     done
 
-    die "[$pkg] Falha ao baixar/verificar $url depois de $attempts tentativas"
+    die "[$pkg] Falha ao baixar/verificar source $idx depois de tentar todos os mirrors."
 }
 
 download_sources_parallel() {
     local pkg="$1"
     load_metadata "$pkg"
+    validate_source_arrays   # <<< usa a função nova
 
     local urls=("${PKG_SOURCE_URLS[@]}")
     local sha256s=()
@@ -255,16 +316,20 @@ download_sources_parallel() {
 
     local pids=()
     local i=0
-    for url in "${urls[@]}"; do
+    local urlspec
+    for urlspec in "${urls[@]}"; do
+        # Usamos a PRIMEIRA URL (antes do '|') só para nomear o arquivo
+        local first_url="${urlspec%%|*}"
         local base
-        base="$(basename "${url%%\?*}")"
+        base="$(basename "${first_url%%\?*}")"
         [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-src-$i.tar"
+
         local out="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-$i-$base"
         local sha="${sha256s[$i]:-}"
         local md="${md5s[$i]:-}"
 
         (
-            download_one_source "$PKG_NAME" "$i" "$url" "$out" "$sha" "$md"
+            download_one_source "$PKG_NAME" "$i" "$urlspec" "$out" "$sha" "$md"
         ) &
         pids+=($!)
         (( i++ ))
@@ -275,14 +340,14 @@ download_sources_parallel() {
         done
     done
 
-    # Espera todos
     local fail=0
+    local pid
     for pid in "${pids[@]}"; do
         if ! wait "$pid"; then
             fail=1
-        }
+        fi
     done
-    (( fail == 0 )) || die "[$PKG_NAME] Falha em algum download"
+    (( fail == 0 )) || die "[$PKG_NAME] Falha em algum download (um ou mais sources não foram baixados corretamente)."
 }
 
 # =========================
@@ -354,11 +419,27 @@ run_in_chroot() {
 
     if [[ -n "$CHROOT_DIR" ]]; then
         require_cmd chroot
-        log_info "[chroot] Executando em chroot: $cmd"
-        # Assumimos que workdir está dentro de CHROOT_DIR ou é montado lá fora
-        chroot "$CHROOT_DIR" /bin/bash -lc "cd \"$workdir\" && $cmd"
+
+        if [[ ! -x "$CHROOT_DIR/bin/bash" ]]; then
+            die "[chroot] $CHROOT_DIR não parece um chroot válido (faltando /bin/bash executável)."
+        fi
+
+        # Garantir que workdir está dentro do chroot
+        case "$workdir" in
+            "$CHROOT_DIR"/*)
+                # converte /host/path -> /path dentro do chroot
+                local inner_dir="${workdir#"$CHROOT_DIR"}"
+                [[ -z "$inner_dir" ]] && inner_dir="/"
+                ;;
+            *)
+                die "[chroot] workdir '$workdir' não está dentro de CHROOT_DIR='$CHROOT_DIR'. Ajuste BUILD_ROOT ou CHROOT_DIR."
+                ;;
+        esac
+
+        log_info "[chroot] Executando em $CHROOT_DIR (dir: $inner_dir): $cmd"
+        chroot "$CHROOT_DIR" /bin/bash -lc "cd \"$inner_dir\" && $cmd"
     else
-        log_info "[host] Executando: $cmd (wd=$workdir)"
+        log_info "[host] Executando (dir: $workdir): $cmd"
         ( cd "$workdir" && /bin/bash -lc "$cmd" )
     fi
 }
@@ -427,6 +508,10 @@ register_install() {
 get_pkg_depends() {
     local pkg="$1"
     load_metadata "$pkg"
+    # Garante que PKG_DEPENDS existe como array, mesmo se vazio
+    if [[ ${#PKG_DEPENDS[@]:-0} -eq 0 ]]; then
+        return 0
+    fi
     printf "%s\n" "${PKG_DEPENDS[@]}"
 }
 
@@ -441,15 +526,19 @@ resolve_deps_recursive() {
         return
     fi
     if [[ "${visiting[$pkg]:-}" == "1" ]]; then
-        die "Ciclo de dependências detectado envolvendo '$pkg'"
+        die "Ciclo de dependências detectado envolvendo '$pkg'. Verifique PKG_DEPENDS dos pacotes envolvidos."
     fi
+
+    # Garante que há metadata pro pacote
+    ensure_metadata_exists "$pkg" || die "Metadata não encontrado para dependência '$pkg'."
 
     visiting["$pkg"]=1
 
     local dep
-    for dep in $(get_pkg_depends "$pkg"); do
+    while read -r dep; do
+        [[ -z "$dep" ]] && continue
         resolve_deps_recursive "$dep" outlist visiting visited
-    done
+    done < <(get_pkg_depends "$pkg")
 
     visiting["$pkg"]=0
     visited["$pkg"]=1
