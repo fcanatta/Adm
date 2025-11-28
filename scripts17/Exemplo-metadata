@@ -8,6 +8,13 @@ PKG_NAME="example"
 PKG_VERSION="1.0.0"
 PKG_RELEASE=1
 
+PKG_CFLAGS="-O2 -pipe -march=native"
+PKG_CONFIGURE_FLAGS=(
+  "--prefix=/usr"
+  "--enable-wayland"
+  "--disable-debug"
+)
+
 # =====================================
 # 1) Múltiplos SOURCES
 # Cada source pode ter vários mirrors separados por "|"
