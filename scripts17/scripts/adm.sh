@@ -1080,7 +1080,10 @@ rebuild_all() {
 
 usage() {
     cat <<EOF
-Uso: $0 <comando> [args]
+Uso: $0 [opções_globais] <comando> [args]
+
+Opções globais:
+  --no-chroot         - força build fora de qualquer chroot (ignora \$CHROOT_DIR do ambiente)
 
 Comandos principais:
   build <pkg>         - Construir pacote (com retomada)
@@ -1152,6 +1155,30 @@ info_pkg() {
         fi
     fi
 }
+
+# Parseia opções globais antes do comando
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --no-chroot)
+            # Força build fora de chroot para esta execução
+            CHROOT_DIR=""
+            shift
+            ;;
+        --|-h|--help|help)
+            # Deixa o comando / ajuda serem tratados normalmente abaixo
+            break
+            ;;
+        -*)
+            log_error "Opção global desconhecida: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            # Primeiro argumento que não é opção => comando
+            break
+            ;;
+    esac
+done
 
 cmd="${1:-}"
 case "$cmd" in
