@@ -14,6 +14,21 @@ PKG_RELEASE=1
 # A ordem é importante — tenta na sequência
 # =====================================
 
+exemplo para entendimento
+PKG_SOURCE_URLS=(
+  "gcc.tar.xz|mirror1|mirror2"   → SHA256S[0]
+  "gmp.tar.xz|mirror1"           → SHA256S[1]
+  "mpfr.tar.xz"                  → SHA256S[2]
+  "mpc.tar.gz|mirror1|mirror2"   → SHA256S[3]
+)
+
+PKG_SHA256S=(
+  "HASH_GCC"
+  "HASH_GMP"
+  "HASH_MPFR"
+  "HASH_MPC"
+)
+
 PKG_SOURCE_URLS=(
   # SOURCE 0 → tarball principal com mirrors
   "https://example.org/releases/example-1.0.0.tar.gz|https://mirror1.example.net/example-1.0.0.tar.gz|https://backup-mirror.example.com/example-1.0.0.tar.gz"
