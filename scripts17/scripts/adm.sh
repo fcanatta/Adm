@@ -62,6 +62,19 @@ log_debug() {
     printf "%s[DEBUG]%s %s\n" "$C_DEBUG" "$C_RESET" "$*"
 }
 
+# Lista de variáveis de metadata (PKG_*) a exportar para o ambiente de build/chroot
+ADM_META_VARS=()
+
+metadata_export_snippet() {
+    # Gera declarações 'declare ...' para todas as variáveis PKG_*
+    if [[ ${#ADM_META_VARS[@]:-0} -eq 0 ]]; then
+        return
+    fi
+    # declare -p imprime algo como: declare -- PKG_FOO="bar"
+    # Isso é seguro de ser avaliado numa shell bash.
+    declare -p "${ADM_META_VARS[@]}" 2>/dev/null || true
+}
+
 validate_source_arrays() {
     local nsources=${#PKG_SOURCE_URLS[@]}
 
@@ -102,7 +115,23 @@ require_cmd tar gzip xz zstd sha256sum md5sum sed awk sort grep file tac
 
 meta_path_for_pkg() {
     local pkg="$1"
-    echo "$META_DIR/$pkg.meta"
+    local path=""
+
+    # Se o nome já contém '/', tratamos como caminho relativo dentro de META_DIR
+    if [[ "$pkg" == */* ]]; then
+        path="$META_DIR/$pkg.meta"
+        echo "$path"
+        return
+    fi
+
+    # Primeiro tenta encontrar recursivamente em qualquer subdiretório
+    path=$(find "$META_DIR" -type f -name "$pkg.meta" -print -quit 2>/dev/null || true)
+    if [[ -n "$path" ]]; then
+        echo "$path"
+    else
+        # Fallback: comportamento antigo (direto na raiz)
+        echo "$META_DIR/$pkg.meta"
+    fi
 }
 
 ensure_metadata_exists() {
@@ -117,7 +146,7 @@ load_metadata() {
     ensure_metadata_exists "$pkg"
     # Limpar variáveis de metadata anteriores (evitar vazamento)
     unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_SOURCE_URLS PKG_SHA256S PKG_MD5S PKG_DEPENDS \
-          PKG_BUILD PKG_INSTALL PKG_UPSTREAM_URL PKG_UPSTREAM_REGEX
+          PKG_BUILD PKG_INSTALL PKG_UPSTREAM_URL PKG_UPSTREAM_REGEX PKG_GROUPS
     # shellcheck source=/dev/null
     source "$(meta_path_for_pkg "$pkg")"
 
@@ -126,6 +155,13 @@ load_metadata() {
     : "${PKG_RELEASE:=1}"
     : "${PKG_SOURCE_URLS:?PKG_SOURCE_URLS não definido em metadata de $pkg}"
     : "${PKG_DEPENDS:=()}"
+    : "${PKG_GROUPS:=()}"
+
+    # Registrar todas as variáveis PKG_* conhecidas para exportar no ambiente de build/chroot
+    ADM_META_VARS=()
+    while IFS= read -r varname; do
+        ADM_META_VARS+=("$varname")
+    done < <(compgen -v PKG_ || true)
 }
 
 # =========================
@@ -679,51 +715,62 @@ resolve_deps_order() {
 # Reverse deps para uninstall / órfãos
 reverse_deps_of() {
     local target="$1"
-    local pkg
-    for pkgpath in "$DB_DIR"/*; do
+    local pkg pkgpath
+
+    while IFS= read -r -d '' pkgpath; do
         [[ -d "$pkgpath" ]] || continue
+        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgpath")"
         # carrega metadata salvo na instalação
         unset PKG_NAME PKG_DEPENDS
         # shellcheck source=/dev/null
-        if [[ -f "$pkgpath/metadata.meta" ]]; then
-            source "$pkgpath/metadata.meta"
-            for d in "${PKG_DEPENDS[@]:-}"; do
-                if [[ "$d" == "$target" ]]; then
-                    echo "$pkg"
-                fi
-            done
-        fi
-    done
+        source "$pkgpath/metadata.meta"
+        local d
+        for d in "${PKG_DEPENDS[@]:-}"; do
+            if [[ "$d" == "$target" ]]; then
+                echo "$pkg"
+            fi
+        done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 }
 
 # Detectar órfãos: pacotes que ninguém depende (e que não são base listados)
 list_orphans() {
     local base_pkgs=() # você pode adicionar base aqui se quiser preservar
     declare -A has_revdep
-    local pkg
+    local pkg pkgpath
 
-    for pkgpath in "$DB_DIR"/*; do
+    # Inicializa todos como sem reverse deps
+    while IFS= read -r -d '' pkgpath; do
         [[ -d "$pkgpath" ]] || continue
+        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgpath")"
         has_revdep["$pkg"]=0
-    done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
-    for pkgpath in "$DB_DIR"/*; do
+    # Marca quem possui reverse deps
+    while IFS= read -r -d '' pkgpath; do
         [[ -d "$pkgpath" ]] || continue
+        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgpath")"
         unset PKG_DEPENDS
         # shellcheck source=/dev/null
-        if [[ -f "$pkgpath/metadata.meta" ]]; then
-            source "$pkgpath/metadata.meta"
-            for d in "${PKG_DEPENDS[@]:-}"; do
-                has_revdep["$d"]=1
-            done
-        fi
-    done
+        source "$pkgpath/metadata.meta"
+        local d
+        for d in "${PKG_DEPENDS[@]:-}"; do
+            has_revdep["$d"]=1
+        done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
     for pkg in "${!has_revdep[@]}"; do
         local keep=0
+        local b
         for b in "${base_pkgs[@]}"; do
             [[ "$pkg" == "$b" ]] && keep=1 && break
         done
@@ -775,7 +822,8 @@ build_package() {
     if (( stage < 3 )); then
         log_info "[$pkg] Iniciando build"
         if declare -F PKG_BUILD >/dev/null 2>&1; then
-            run_in_chroot "$builddir" "PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR=''; $(declare -f PKG_BUILD); PKG_BUILD"
+            # Exporta variáveis PKG_* do metadata e executa a função de build
+            run_in_chroot "$builddir" "$(metadata_export_snippet); PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR=''; $(declare -f PKG_BUILD); PKG_BUILD"
         else
             log_warn "[$pkg] PKG_BUILD não definido, pulando build (assumindo build manual no metadata)"
         fi
@@ -792,10 +840,12 @@ build_package() {
     if (( stage < 4 )); then
         log_info "[$pkg] Instalando em DESTDIR: $destdir"
         if declare -F PKG_INSTALL >/dev/null 2>&1; then
-            run_in_chroot "$builddir" "PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR='$destdir'; $(declare -f PKG_INSTALL); PKG_INSTALL"
+            # Exporta variáveis PKG_* do metadata e executa a função de instalação
+            run_in_chroot "$builddir" "$(metadata_export_snippet); PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR='$destdir'; $(declare -f PKG_INSTALL); PKG_INSTALL"
         else
             log_warn "[$pkg] PKG_INSTALL não definido, nenhum arquivo instalado em DESTDIR"
         fi
+        # (restante do bloco, empacotamento, permanece como está)
 
         # Empacotar DESTDIR
         mkdir -p "$PKG_DIR"
@@ -851,6 +901,47 @@ build_and_install_with_deps() {
             build_package "$dep"
             install_package_root "$dep"
         fi
+    done
+}
+
+packages_in_group() {
+    local group="$1"
+    local meta
+    while IFS= read -r -d '' meta; do
+        (
+            unset PKG_NAME PKG_GROUPS
+            # shellcheck source=/dev/null
+            source "$meta"
+            : "${PKG_NAME:=$(basename "$meta" .meta)}"
+            : "${PKG_GROUPS:=()}"
+            local g
+            for g in "${PKG_GROUPS[@]}"; do
+                if [[ "$g" == "$group" ]]; then
+                    printf '%s\n' "$PKG_NAME"
+                    break
+                fi
+            done
+        )
+    done < <(find "$META_DIR" -type f -name '*.meta' -print0 2>/dev/null)
+}
+
+install_group() {
+    local group="$1"
+
+    log_info "Procurando pacotes do grupo '$group' em $META_DIR"
+    local pkgs=()
+    mapfile -t pkgs < <(packages_in_group "$group" | sort -u)
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        die "Nenhum pacote encontrado com grupo '$group'."
+    fi
+
+    log_info "Pacotes no grupo '$group': ${pkgs[*]}"
+
+    local pkg
+    for pkg in "${pkgs[@]}"; do
+        log_info "[grupo:$group] Instalando pacote '$pkg'"
+        build_and_install_with_deps "$pkg"
     done
 }
 
@@ -949,12 +1040,15 @@ verify_package_integrity() {
 }
 
 verify_all() {
-    local pkg
-    for pkgdir in "$DB_DIR"/*; do
+    local pkg pkgdir
+    while IFS= read -r -d '' pkgdir; do
         [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" && ! -f "$pkgdir/files.list" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgdir")"
         verify_package_integrity "$pkg" || true
-    done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 }
 
 # =========================
@@ -1049,24 +1143,28 @@ rebuild_all() {
     declare -A seen
     local ordered=()
 
-    # Monta uma ordem global de rebuild respeitando dependências,
-    # apenas para pacotes que estão instalados.
-    local pkg
-    for pkgdir in "$DB_DIR"/*; do
+    log_info "Calculando ordem de rebuild global com base nas dependências..."
+
+    local pkg pkgdir
+
+    # Para cada pacote instalado (diretório com metadata.meta)
+    while IFS= read -r -d '' pkgdir; do
         [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgdir")"
 
         local order
         order=$(resolve_deps_order "$pkg")
         local p
         for p in $order; do
-            # Só rebuildamos pacotes que estão instalados
-            if [[ -d "$DB_DIR/$p" && -z "${seen[$p]:-}" ]]; then
+            if [[ -d "$(db_pkg_dir "$p")" && -z "${seen[$p]:-}" ]]; then
                 ordered+=("$p")
                 seen["$p"]=1
             fi
         done
-    done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
     local p
     for p in "${ordered[@]}"; do
@@ -1088,6 +1186,7 @@ Opções globais:
 Comandos principais:
   build <pkg>         - Construir pacote (com retomada)
   install <pkg>       - Construir + instalar com dependências
+  install-group <grupo> - Instalar todos os pacotes marcados com esse grupo (core, x11, etc.)
   uninstall <pkg>     - Desinstalar pacote (se não tiver reverse deps)
   remove-orphans      - Remover pacotes órfãos
   verify <pkg>        - Verificar integridade de um pacote instalado
@@ -1103,8 +1202,11 @@ EOF
 
 list_installed() {
     local pkg
-    for pkgdir in "$DB_DIR"/*; do
+    while IFS= read -r -d '' pkgdir; do
         [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" && ! -f "$pkgdir/files.list" ]]; then
+            continue
+        fi
         pkg="$(basename "$pkgdir")"
 
         # Tentar ler metadata salvo no DB primeiro, sem abortar o script inteiro
@@ -1123,7 +1225,7 @@ list_installed() {
         fi
 
         printf "%-20s %s-%s\n" "$pkg" "${PKG_VERSION:-?}" "${PKG_RELEASE:-?}"
-    done
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 }
 
 info_pkg() {
@@ -1191,6 +1293,11 @@ case "$cmd" in
         shift || true
         [[ $# -ge 1 ]] || { usage; exit 1; }
         build_and_install_with_deps "$1"
+        ;;
+    install-group)
+        shift || true
+        [[ $# -ge 1 ]] || { usage; exit 1; }
+        install_group "$1"
         ;;
     uninstall)
         shift || true
