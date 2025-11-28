@@ -1,0 +1,187 @@
+# ===== GCC-15.2.0 - LFS r12.4-46 / capítulo 8.30 =====
+# Este metadata é para o GCC “final” dentro do chroot do LFS,
+# com apenas C e C++ habilitados, como no livro.
+#
+# Notas:
+# - Usa bibliotecas de sistema: zlib, gmp, mpfr, mpc, isl.
+# - PKG_BUILD segue a seção 8.30.1.
+# - PKG_INSTALL segue a parte de instalação + ajustes + sanity checks,
+#   mas os sanity checks só rodam quando DESTDIR estiver vazio
+#   (ou seja, instalação direta em /).
+
+PKG_NAME="gcc"
+PKG_VERSION="15.2.0"
+PKG_RELEASE="1"
+
+# Grupo (para adm install-group core)
+PKG_GROUPS=( "core" )
+
+# Dependências lógicas (ajuste os nomes conforme seus outros metadados)
+PKG_DEPENDS=(
+  "zlib"      # --with-system-zlib
+  "gmp"
+  "mpfr"
+  "mpc"
+  "isl"       # se você estiver usando graphite / otimizações extras
+  "binutils"  # já instalado em /usr, usado via LD=ld
+  "glibc"     # toolchain final já com glibc-2.42
+)
+
+# Página oficial / upstream pro check_upstream_version do adm
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/gcc/"
+PKG_UPSTREAM_REGEX='gcc-([0-9.]+)\.tar\.xz'
+
+# --------------------------------------------------------------------
+# Fontes
+# --------------------------------------------------------------------
+# Tarball oficial + alguns mirrors grandes.
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/gcc/gcc-${PKG_VERSION}/gcc-${PKG_VERSION}.tar.xz|https://ftpmirror.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz|https://mirrorservice.org/sites/sourceware.org/pub/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz|https://ftp.gwdg.de/pub/misc/gcc/releases/gcc-15.2.0/gcc-15.2.0.tar.xz"
+)
+
+# SHA256 conhecido para gcc-15.2.0.tar.xz (usado por vários projetos)
+PKG_SHA256S=(
+  "438fd996826b0c82485a29da03a72d71d6e3541a83ec702df4271f6fe025d24e"
+)
+
+# MD5 do LFS/BLFS para gcc-15.2.0.tar.xz
+PKG_MD5S=(
+  "b861b092bf1af683c46a8aa2e689a6fd"
+)
+
+# --------------------------------------------------------------------
+# BUILD: LFS 12.4 r12.4-46 – 8.30.1 Installation of GCC
+#  - Apenas C e C++ (c,c++) pra combinar com o livro.
+#  - Testes opcionais controlados por ADM_RUN_TESTS=1.
+# --------------------------------------------------------------------
+PKG_BUILD() {
+    set -e
+
+    # Estamos no diretório de fontes: .../gcc-15.2.0
+
+    # 1. Ajuste de lib64 -> lib em x86_64 (LFS 8.30.1)
+    case "$(uname -m)" in
+        x86_64)
+            sed -e '/m64=/s/lib64/lib/' \
+                -i.orig gcc/config/i386/t-linux64
+            ;;
+    esac
+
+    # 2. Diretório de build separado
+    mkdir -v build
+    cd build
+
+    # 3. Configure (LFS 8.30.1)
+    ../configure --prefix=/usr            \
+                 LD=ld                    \
+                 --enable-languages=c,c++ \
+                 --enable-default-pie     \
+                 --enable-default-ssp     \
+                 --enable-host-pie        \
+                 --disable-multilib       \
+                 --disable-bootstrap      \
+                 --disable-fixincludes    \
+                 --with-system-zlib
+
+    # 4. Compilação
+    make
+
+    # 5. Testes (opcionais)
+    #
+    #   - Ative com: export ADM_RUN_TESTS=1
+    #   - Em LFS o livro roda com usuário "tester".
+    #     Aqui só rodamos se esse usuário existir, pra não quebrar.
+    if [[ "${ADM_RUN_TESTS:-0}" -eq 1 ]]; then
+        echo ">> [GCC] Rodando suite de testes (se usuário 'tester' existir)..."
+        ulimit -s -H unlimited || true
+
+        # Remover testes problemáticos conhecidos (LFS 8.30.1)
+        sed -e '/cpython/d' -i ../gcc/testsuite/gcc.dg/plugin/plugin.exp
+
+        if id tester >/dev/null 2>&1; then
+            chown -R tester .
+            # Não abortar se os testes falharem
+            su tester -c "PATH=\$PATH make -k check" || true
+            # Resumo (se existir)
+            ../contrib/test_summary | grep -A7 Summ || true
+        else
+            echo ">> [GCC] Usuário 'tester' não existe, pulando testes." >&2
+        fi
+    fi
+}
+
+# --------------------------------------------------------------------
+# INSTALL: LFS 12.4 r12.4-46 – 8.30.1 + sanity checks
+#
+#  - Usa DESTDIR se definido (para empacotamento).
+#  - Ajusta permissões, symlinks e arquivos gdb.py.
+#  - Sanity checks só rodam quando DESTDIR está vazio
+#    (instalação real em /).
+# --------------------------------------------------------------------
+PKG_INSTALL() {
+    set -e
+
+    # Dentro do diretório de fontes: .../gcc-15.2.0
+    cd build
+
+    # Raiz lógica da instalação (DESTDIR ou /)
+    local root="${DESTDIR:-/}"
+
+    # 1. make install com suporte a DESTDIR
+    make DESTDIR="${DESTDIR:-}" install
+
+    # 2. Ajuste de owner do include (LFS 8.30.1)
+    #    Usamos gcc -dumpmachine para localizar o triplet.
+    local triplet
+    triplet="$(gcc -dumpmachine)"
+
+    chown -v -R root:root \
+        "${root}/usr/lib/gcc/${triplet}/15.2.0/include" \
+        "${root}/usr/lib/gcc/${triplet}/15.2.0/include-fixed"
+
+    # 3. Symlink cpp em /usr/lib (FHS / "historical reasons")
+    ln -svr /usr/bin/cpp "${root}/usr/lib"
+
+    # 4. Manpage cc.1 -> gcc.1 (LFS 8.30.1)
+    ln -sv gcc.1 "${root}/usr/share/man/man1/cc.1"
+
+    # 5. Symlink liblto_plugin.so em /usr/lib/bfd-plugins (LFS 8.30.1)
+    mkdir -pv "${root}/usr/lib/bfd-plugins"
+    ln -sfv "../../libexec/gcc/${triplet}/15.2.0/liblto_plugin.so" \
+             "${root}/usr/lib/bfd-plugins/"
+
+    # 6. Mover *gdb.py para o local correto (como em BLFS)
+    mkdir -pv "${root}/usr/share/gdb/auto-load/usr/lib"
+    if compgen -G "${root}/usr/lib/*gdb.py" >/dev/null 2>&1; then
+        mv -v "${root}/usr/lib/"*gdb.py \
+              "${root}/usr/share/gdb/auto-load/usr/lib"
+    fi
+
+    # 7. Sanity checks do toolchain final
+    #    Só faz sentido quando instalando direto em / (sem DESTDIR).
+    if [[ -z "${DESTDIR:-}" ]]; then
+        echo ">> [GCC] Rodando sanity checks do LFS (toolchain)..."
+
+        echo 'int main(){}' | cc -x c - -v -Wl,--verbose &> dummy.log
+
+        # Confere o carregador dinâmico
+        readelf -l a.out | grep ': /lib'
+
+        # Start files (crt*.o)
+        grep -E -o '/usr/lib.*/S?crt[1in].*succeeded' dummy.log
+
+        # Includes padrão
+        grep -B4 '^ /usr/include' dummy.log
+
+        # Caminhos de busca do ld
+        grep 'SEARCH.*/usr/lib' dummy.log | sed 's|; |\n|g'
+
+        # libc correta
+        grep "/lib.*/libc.so.6 " dummy.log
+
+        # dynamic linker correto
+        grep found dummy.log
+
+        rm -v a.out dummy.log
+    fi
+}
