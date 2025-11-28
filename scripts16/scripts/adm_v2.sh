@@ -1,276 +1,197 @@
 #!/usr/bin/env bash
-# adm - Simple package manager for Linux From Scratch style systems
-# Features:
-#  - Build/install/remove packages defined as shell recipes
-#  - Binary cache (.tar.zst and .tar.xz)
-#  - Source cache and parallel downloads
-#  - Dependency resolution with Kahn-style topological sort and cycle detection
-#  - DESTDIR support and manifest-based uninstall
-#  - Simple upgrade mechanism based on recipe-provided upstream version
-#
-# NOTE:
-#  Este script é um framework genérico. Cada pacote precisa de um "recipe"
-#  em shell que define como baixar, compilar e instalar o programa.
-#  Ver comentários em ADM_RECIPES_DIR mais abaixo.
+# adm-lib.sh - núcleo do gerenciador de pacotes "adm"
 
 set -euo pipefail
-set -E
+set -E  # garante que trap ERR funcione também em funções
 
-ADM_VERSION="0.1.1"   # bump de versão do framework
+#######################################
+# CONFIGURAÇÃO
+#######################################
 
-# -------------------------------------------------------------
-# Configuração básica (pode ser sobrescrita por variáveis de ambiente)
-# -------------------------------------------------------------
-ADM_PREFIX="${ADM_PREFIX:-/usr}"
+# Raiz do chroot (LFS). Se não existir, cai para "/".
+ADM_CHROOT_DIR="${ADM_CHROOT_DIR:-/mnt/lfs}"
+if [[ -d "$ADM_CHROOT_DIR" ]]; then
+  ADM_ROOT="$ADM_CHROOT_DIR"
+else
+  ADM_ROOT="/"
+fi
+
 ADM_STATE_DIR="${ADM_STATE_DIR:-/var/lib/adm}"
-ADM_CACHE_DIR="${ADM_CACHE_DIR:-$ADM_STATE_DIR/cache}"
+ADM_CACHE_DIR="${ADM_CACHE_DIR:-/var/cache/adm}"
 ADM_SRC_CACHE="${ADM_SRC_CACHE:-$ADM_CACHE_DIR/src}"
-ADM_BIN_CACHE="${ADM_BIN_CACHE:-$ADM_CACHE_DIR/bin}"
+ADM_BIN_CACHE="${ADM_BIN_CACHE:-$ADM_CACHE_DIR/pkg}"
 ADM_BUILD_ROOT="${ADM_BUILD_ROOT:-/var/tmp/adm/build}"
 ADM_LOG_DIR="${ADM_LOG_DIR:-/var/log/adm}"
 ADM_DB_DIR="${ADM_DB_DIR:-$ADM_STATE_DIR/db}"
-ADM_MANIFEST_DIR="${ADM_MANIFEST_DIR:-$ADM_DB_DIR/manifests}"
-ADM_META_DIR="${ADM_META_DIR:-$ADM_DB_DIR/meta}"
-ADM_RECIPES_DIR="${ADM_RECIPES_DIR:-$ADM_STATE_DIR/recipes}"
+ADM_MANIFEST_DIR="${ADM_MANIFEST_DIR:-$ADM_STATE_DIR/manifest}"
+ADM_META_DIR="${ADM_META_DIR:-$ADM_STATE_DIR/meta}"
+ADM_RECIPES_DIR="${ADM_RECIPES_DIR:-/usr/share/adm/recipes}"
+
+ADM_DEFAULT_COMPRESS="${ADM_DEFAULT_COMPRESS:-zstd}"   # zstd|xz
 ADM_DL_JOBS="${ADM_DL_JOBS:-4}"
-ADM_CHROOT_DIR="${ADM_CHROOT_DIR:-}"   # opcional, para builds em chroot
-ADM_DEFAULT_COMPRESS="${ADM_DEFAULT_COMPRESS:-zst}" # zst ou xz
 
-umask 022
+ADM_DRY_RUN="${ADM_DRY_RUN:-0}"
+ADM_FORCE_REINSTALL="${ADM_FORCE_REINSTALL:-0}"  # usado em reinstall / rebuild-system
 
-# -------------------------------------------------------------
-# Cores
-# -------------------------------------------------------------
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
-  C_RESET=$'\033[0m'
-  C_RED=$'\033[31m'
-  C_GREEN=$'\033[32m'
-  C_YELLOW=$'\033[33m'
-  C_BLUE=$'\033[34m'
-  C_MAGENTA=$'\033[35m'
-  C_CYAN=$'\033[36m'
-else
-  C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_MAGENTA=""; C_CYAN=""
-fi
+ADM_CURRENT_BUILD_DIR=""
 
-log_ts() {
-  date '+%Y-%m-%d %H:%M:%S'
+#######################################
+# LOG / ERROS
+#######################################
+
+_color() {
+  local code="$1"; shift
+  printf "\033[%sm%s\033[0m" "$code" "$*"
 }
 
-log_info()  { printf '%s[%s] [INFO]%s %s\n'  "$C_GREEN"  "$(log_ts)" "$C_RESET" "$*" >&2; }
-log_warn()  { printf '%s[%s] [WARN]%s %s\n'  "$C_YELLOW" "$(log_ts)" "$C_RESET" "$*" >&2; }
-log_error() { printf '%s[%s] [ERRO]%s %s\n'  "$C_RED"    "$(log_ts)" "$C_RESET" "$*" >&2; }
-log_debug() { [[ -n "${ADM_DEBUG:-}" ]] && printf '%s[%s] [DBG ]%s %s\n' "$C_CYAN" "$(log_ts)" "$C_RESET" "$*" >&2 || true; }
+log_ts() { date +"%Y-%m-%d %H:%M:%S"; }
+
+log_info()  { echo "[$(log_ts)] $(_color '32;1' INFO)  $*"; }
+log_warn()  { echo "[$(log_ts)] $(_color '33;1' WARN)  $*" >&2; }
+log_error() { echo "[$(log_ts)] $(_color '31;1' ERROR) $*" >&2; }
+log_debug() {
+  if [[ "${ADM_DEBUG:-0}" -eq 1 ]]; then
+    echo "[$(log_ts)] $(_color '36;1' DEBUG) $*" >&2
+  fi
+}
 
 die() {
   log_error "$*"
   exit 1
 }
 
-dry_run_enabled() {
-  case "${ADM_DRY_RUN:-0}" in
-    1|true|yes|on|ON|TRUE)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
-  esac
+on_err() {
+  local status="$?"
+  log_error "Erro inesperado (exit=$status). Veja logs em: $ADM_LOG_DIR"
+  exit "$status"
+}
+trap on_err ERR
+
+cleanup_build() {
+  local d="$ADM_CURRENT_BUILD_DIR"
+  if [[ -n "${d:-}" && -d "$d" ]]; then
+    log_debug "Removendo diretório de build temporário: $d"
+    rm -rf -- "$d"
+  fi
+}
+trap cleanup_build EXIT
+
+#######################################
+# UTILITÁRIOS / PATH ROOT DO CHROOT
+#######################################
+
+# Converte um caminho absoluto /foo/bar para o caminho físico dentro do ADM_ROOT
+root_path() {
+  local p="$1"
+  [[ "$p" == /* ]] || die "root_path requer caminho absoluto: $p"
+  if [[ "$ADM_ROOT" == "/" ]]; then
+    printf "%s\n" "$p"
+  else
+    printf "%s%s\n" "$ADM_ROOT" "$p"
+  fi
 }
 
-# -------------------------------------------------------------
-# Inicialização de diretórios
-# -------------------------------------------------------------
+ensure_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Requer comando: $cmd"
+}
+
 init_dirs() {
+  local d
   for d in \
     "$ADM_STATE_DIR" "$ADM_CACHE_DIR" "$ADM_SRC_CACHE" "$ADM_BIN_CACHE" \
     "$ADM_BUILD_ROOT" "$ADM_LOG_DIR" "$ADM_DB_DIR" \
-    "$ADM_MANIFEST_DIR" "$ADM_META_DIR" "$ADM_RECIPES_DIR"; do
-    if [[ ! -d "$d" ]]; then
-      mkdir -p "$d" || die "Não foi possível criar diretório: $d"
-    fi
+    "$ADM_MANIFEST_DIR" "$ADM_META_DIR" "$ADM_RECIPES_DIR"
+  do
+    mkdir -p -m 0755 "$d"
   done
-}
-
-# -------------------------------------------------------------
-# Tratamento de erros
-# -------------------------------------------------------------
-cleanup_build() {
-  local builddir="${ADM_CURRENT_BUILD_DIR:-}"
-  if [[ -n "$builddir" && -d "$builddir" ]]; then
-    log_debug "Limpando diretório de build temporário: $builddir"
-    rm -rf "$builddir" || log_warn "Falha ao remover $builddir"
-  fi
-}
-
-on_err() {
-  local exit_code=$?
-  log_error "Erro inesperado (code=$exit_code). Veja logs em $ADM_LOG_DIR."
-  cleanup_build
-  exit "$exit_code"
-}
-
-trap on_err ERR
-trap cleanup_build EXIT
-
-# -------------------------------------------------------------
-# Utilidades gerais
-# -------------------------------------------------------------
-ensure_cmd() {
-  local cmd="$1"
-  command -v "$cmd" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $cmd"
 }
 
 check_runtime_deps() {
-  # Comandos essenciais para o funcionamento do adm
-  local cmds=(
-    tee tar find xargs sort tac
-    sha256sum
+  local required_cmds=(
+    bash find sort tac sha256sum tar
+  )
+  local optional_cmds=(
+    md5sum
+    make
+    curl
+    wget
+    unzip
+    bzip2
+    gunzip
+    7z
+    git
+    rsync
+    zstd
+    xz
+    lzip
   )
 
-  # Comandos muito recomendados (mas não fatais se não existirem em todos os fluxos)
-  local optional_cmds=(
-  md5sum
-  make
-  curl
-  wget
-  unzip
-  bunzip2
-  gunzip
-  7z
-  git
-  rsync
-  zstd
-  xz
-  lzip
-)
-
   local c
-  for c in "${cmds[@]}"; do
-    ensure_cmd "$c"
+  for c in "${required_cmds[@]}"; do
+    command -v "$c" >/dev/null 2>&1 || die "Comando obrigatório não encontrado: $c"
   done
 
-  # Optional: só loga aviso se faltar
   for c in "${optional_cmds[@]}"; do
     if ! command -v "$c" >/dev/null 2>&1; then
-      log_warn "Comando opcional não encontrado: $c (algumas operações/recipes podem falhar): $c"
+      log_warn "Comando opcional ausente: $c"
     fi
   done
 }
 
-# Comparação de versões usando sort -V
-ver_gt() {
-  local a="$1"; local b="$2"
-  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" && "$a" != "$b" ]]
+#######################################
+# RECIPE LOADING
+#######################################
+
+unset_recipe_symbols() {
+  unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_URL
+  unset PKG_LICENSE PKG_DEPENDS PKG_GROUPS PKG_SOURCES
+  unset PKG_SHA256S PKG_MD5S PKG_BUILD_DIR PKG_PREFIX
+  unset PKG_HOST PKG_BUILD PKG_TARGET
+  unset -f pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version || true
 }
 
-ver_ge() {
-  local a="$1"; local b="$2"
-  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" ]]
-}
-
-timestamp() {
-  date '+%Y-%m-%d %H:%M:%S'
-}
-
-# -------------------------------------------------------------
-# Localizar arquivo de recipe de um pacote em qualquer subdiretório
-# Nome do pacote == nome do arquivo .sh (ex: man-pages -> man-pages.sh)
-# -------------------------------------------------------------
 find_recipe_file() {
-  local pkg="$1"
-  local recipe
-
-  # Se ainda não existe recipes dir, evita erro de find
-  if [[ ! -d "$ADM_RECIPES_DIR" ]]; then
-    return 1
-  fi
-
-  # Procura a primeira ocorrência de <pkg>.sh em qualquer subdiretório
-  recipe="$(find "$ADM_RECIPES_DIR" -type f -name "$pkg.sh" -print | head -n1)"
-
-  if [[ -z "$recipe" ]]; then
-    return 1
-  fi
-
-  printf '%s\n' "$recipe"
+  local name="$1"
+  find "$ADM_RECIPES_DIR" -maxdepth 5 -type f -name "${name}.sh" | head -n1
 }
 
-# -------------------------------------------------------------
-# Carregar recipe de pacote
-# -------------------------------------------------------------
 load_recipe() {
   local pkg="$1"
-  local recipe
-
-  recipe="$(find_recipe_file "$pkg")" || die "Recipe não encontrado para pacote '$pkg' em $ADM_RECIPES_DIR"
-
-  unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
-        PKG_BUILD_DIR PKG_LICENSE PKG_URL PKG_SHA256S PKG_MD5S PKG_GROUPS
-
-  # Limpa funções de recipes anteriores (se existirem)
-  unset -f pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version 2>/dev/null || true
-
+  unset_recipe_symbols
+  local f
+  f="$(find_recipe_file "$pkg")" || true
+  [[ -n "$f" ]] || die "Recipe para pacote '$pkg' não encontrada em $ADM_RECIPES_DIR"
   # shellcheck source=/dev/null
-  . "$recipe"
-
-  [[ -n "${PKG_NAME:-}" ]] || die "Recipe $recipe não define PKG_NAME"
-  [[ -n "${PKG_VERSION:-}" ]] || die "Recipe $recipe não define PKG_VERSION"
-  [[ "$(basename "$PKG_NAME")" == "$pkg" ]] || :
+  source "$f"
+  [[ -n "${PKG_NAME:-}" && -n "${PKG_VERSION:-}" ]] || die "Recipe $f inválida (PKG_NAME/PKG_VERSION ausentes)"
+  PKG_RELEASE="${PKG_RELEASE:-1}"
+  PKG_PREFIX="${PKG_PREFIX:-/usr}"
 }
 
 load_recipe_soft() {
   local pkg="$1"
-  local recipe
-
-  if ! recipe="$(find_recipe_file "$pkg")"; then
-    log_warn "Recipe não encontrado para pacote '$pkg' em $ADM_RECIPES_DIR"
-    return 1
-  fi
-
-  unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DESC PKG_DEPENDS PKG_SOURCES \
-        PKG_BUILD_DIR PKG_LICENSE PKG_URL PKG_SHA256S PKG_MD5S PKG_GROUPS
-  unset -f pkg_prepare pkg_build pkg_check pkg_install pkg_upstream_version 2>/dev/null || true
-
-  # Desliga -e temporariamente para evitar acionar o trap ERR aqui
-  local old_opts="$-"
-  if [[ "$old_opts" == *e* ]]; then
-    set +e
-  fi
-
+  unset_recipe_symbols
+  local f
+  f="$(find_recipe_file "$pkg")" || true
+  [[ -n "$f" ]] || return 1
   # shellcheck source=/dev/null
-  . "$recipe"
-  local status=$?
-
-  # Restaura -e se estava ligado
-  if [[ "$old_opts" == *e* ]]; then
-    set -e
-  fi
-
-  if (( status != 0 )); then
-    log_warn "Falha ao carregar recipe '$recipe' para pacote '$pkg' (status=$status)"
+  if ! source "$f"; then
+    log_warn "Falha ao carregar recipe para '$pkg': $f"
     return 1
   fi
-
-  if [[ -z "${PKG_NAME:-}" || -z "${PKG_VERSION:-}" ]]; then
-    log_warn "Recipe '$recipe' inválido (PKG_NAME/PKG_VERSION ausentes)"
-    return 1
-  fi
-
-  if [[ "$(basename "$PKG_NAME")" != "$pkg" ]]; then
-    log_warn "PKG_NAME='$PKG_NAME' difere do nome solicitado '$pkg' em '$recipe'"
-  fi
-
+  [[ -n "${PKG_NAME:-}" && -n "${PKG_VERSION:-}" ]] || return 1
+  PKG_RELEASE="${PKG_RELEASE:-1}"
+  PKG_PREFIX="${PKG_PREFIX:-/usr}"
   return 0
 }
 
-# -------------------------------------------------------------
-# Banco de dados / metadados
-# -------------------------------------------------------------
-meta_file_for() {
-  local pkg="$1"
-  printf '%s/%s.meta' "$ADM_META_DIR" "$pkg"
-}
+#######################################
+# DB / META / MANIFEST
+#######################################
+
+meta_file_for() { printf "%s/%s.meta\n" "$ADM_META_DIR" "$1"; }
+manifest_file_for() { printf "%s/%s.manifest\n" "$ADM_MANIFEST_DIR" "$1"; }
 
 is_installed() {
   local pkg="$1"
@@ -279,1050 +200,874 @@ is_installed() {
 
 get_installed_version() {
   local pkg="$1"
-  local meta
-  meta="$(meta_file_for "$pkg")"
-  [[ -f "$meta" ]] || return 1
-  awk -F= '$1=="version"{print $2}' "$meta"
+  local mf
+  mf="$(meta_file_for "$pkg")"
+  [[ -f "$mf" ]] || return 1
+  awk -F= '$1=="version"{print $2}' "$mf"
 }
 
 write_meta() {
-  local pkg="$1" version="$2" release="$3" deps="$4"
-  local meta
-  meta="$(meta_file_for "$pkg")"
+  local pkg="$1" ver="$2" rel="$3" deps="$4"
+  local mf
+  mf="$(meta_file_for "$pkg")"
   {
-    printf 'name=%s\n' "$pkg"
-    printf 'version=%s\n' "$version"
-    printf 'release=%s\n' "$release"
-    printf 'depends=%s\n' "$deps"
-    printf 'installed_at=%s\n' "$(timestamp)"
-  } >"$meta.tmp"
-  mv "$meta.tmp" "$meta"
-}
-
-manifest_file_for() {
-  local pkg="$1"
-  printf '%s/%s.manifest' "$ADM_MANIFEST_DIR" "$pkg"
+    echo "name=$pkg"
+    echo "version=$ver"
+    echo "release=$rel"
+    echo "depends=$deps"
+    echo "installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "root=$ADM_ROOT"
+  } >"$mf"
 }
 
 list_installed() {
-  if [[ ! -d "$ADM_META_DIR" ]]; then
-    return 0
-  fi
+  local f
   for f in "$ADM_META_DIR"/*.meta; do
     [[ -e "$f" ]] || continue
-    basename "${f%.meta}"
+    basename "$f" .meta
   done | sort
-}
-
-# -------------------------------------------------------------
-# Download de fontes (com cache e paralelismo)
-# -------------------------------------------------------------
-download_one() {
-  local url="$1"
-  local dest="$2"
-  local sha256="$3"
-  local md5="$4"
-
-  # Tenta no máximo duas vezes: download + (se necessário) redownload
-  local attempt
-  for attempt in 1 2; do
-    if (( attempt == 2 )); then
-      log_warn "Nova tentativa de download para $(basename "$dest")..."
-    fi
-
-    if [[ -f "$dest" ]]; then
-      log_debug "Fonte já em cache: $dest"
-    else
-      log_info "Baixando fonte: $url -> $dest"
-
-      case "$url" in
-        git+*|git://*|*.git)
-          ensure_cmd git
-          local tmp_dir="${dest}.git-tmp"
-          rm -rf "$tmp_dir"
-          git clone --depth 1 "${url#git+}" "$tmp_dir"
-          ( cd "$tmp_dir" && git archive --format=tar --output="$dest" HEAD )
-          rm -rf "$tmp_dir"
-          ;;
-        http://*|https://*|ftp://*)
-          if command -v curl >/dev/null 2>&1; then
-            curl -L --fail --retry 3 -o "$dest" "$url"
-          elif command -v wget >/dev/null 2>&1; then
-            wget -O "$dest" "$url"
-          else
-            die "Nem curl nem wget encontrados para baixar: $url"
-          fi
-          ;;
-        rsync://*)
-          ensure_cmd rsync
-          rsync -av "$url" "$dest"
-          ;;
-        *)
-          die "Esquema de URL não suportado: $url"
-          ;;
-      esac
-    fi
-
-    # Verificação de SHA256, se fornecido
-    if [[ -n "$sha256" ]]; then
-      log_info "Verificando SHA256 de $(basename "$dest")"
-      local calc_sha
-      calc_sha="$(sha256sum "$dest" | awk '{print $1}')"
-
-      if [[ "$calc_sha" != "$sha256" ]]; then
-        log_warn "SHA256 incorreto para $(basename "$dest"). Esperado: $sha256 Obtido: $calc_sha"
-        log_warn "Removendo para tentar baixar novamente..."
-        rm -f "$dest"
-        continue
-      fi
-    fi
-
-    # Verificação de MD5, se fornecido (só se md5sum existir)
-    if [[ -n "$md5" ]]; then
-      if ! command -v md5sum >/dev/null 2>&1; then
-        log_warn "MD5 fornecido mas md5sum não está disponível; pulando verificação MD5 de $(basename "$dest")"
-      else
-        log_info "Verificando MD5 de $(basename "$dest")"
-        local calc_md5
-        calc_md5="$(md5sum "$dest" | awk '{print $1}')"
-
-        if [[ "$calc_md5" != "$md5" ]]; then
-          log_warn "MD5 incorreto para $(basename "$dest"). Esperado: $md5 Obtido: $calc_md5"
-          log_warn "Removendo para tentar baixar novamente..."
-          rm -f "$dest"
-          continue
-        fi
-      fi
-    fi
-
-    # Se chegou aqui, passou em todas as checagens
-    return 0
-  done
-
-  die "Falha ao baixar/verificar $(basename "$dest") após duas tentativas."
-}
-
-download_sources_parallel() {
-  local -a urls=("$@")
-  local -a sha256s md5s
-  local -a pids=()
-  local -i running=0
-  local -i idx=0
-
-  mkdir -p "$ADM_SRC_CACHE"
-
-  # Transforma PKG_SHA256S / PKG_MD5S (string) em arrays alinhados
-  IFS=' ' read -r -a sha256s <<< "${PKG_SHA256S:-}"
-  IFS=' ' read -r -a md5s    <<< "${PKG_MD5S:-}"
-
-  for url in "${urls[@]}"; do
-    [[ -n "$url" ]] || { ((idx++)); continue; }
-
-    local filename dest sha md5
-    filename="$(basename "${url%%\?*}")"
-    dest="$ADM_SRC_CACHE/$filename"
-    sha="${sha256s[$idx]:-}"
-    md5="${md5s[$idx]:-}"
-
-    (
-      set -e
-      download_one "$url" "$dest" "$sha" "$md5"
-    ) &
-    pids+=("$!")
-    ((running++))
-
-    if (( running >= ADM_DL_JOBS )); then
-      local pid failed=0
-      for pid in "${pids[@]}"; do
-        if ! wait "$pid"; then
-          failed=1
-        fi
-      done
-      pids=()
-      running=0
-      (( failed == 0 )) || die "Falha em pelo menos um download de fonte."
-    fi
-
-    ((idx++))
-  done
-
-  # Espera os últimos downloads
-  if (( running > 0 )); then
-    local pid failed=0
-    for pid in "${pids[@]}"; do
-      if ! wait "$pid"; then
-        failed=1
-      fi
-    done
-    (( failed == 0 )) || die "Falha em pelo menos um download de fonte."
-  fi
-}
-
-# -------------------------------------------------------------
-# Extração de fontes
-# -------------------------------------------------------------
-extract_src() {
-  local archive="$1"
-  local dest_dir="$2"
-
-  [[ -f "$archive" ]] || die "Arquivo de fonte não encontrado: $archive"
-
-  mkdir -p "$dest_dir"
-
-  log_info "Extraindo $archive em $dest_dir"
-
-  case "$archive" in
-    *.tar.gz|*.tgz)    tar -xzf "$archive" -C "$dest_dir" ;;
-    *.tar.bz2|*.tbz2)  tar -xjf "$archive" -C "$dest_dir" ;;
-    *.tar.xz)          tar -xJf "$archive" -C "$dest_dir" ;;
-    *.tar.zst|*.tzst)  ensure_cmd zstd; tar --zstd -xf "$archive" -C "$dest_dir" ;;
-    *.tar.lz)          ensure_cmd lzip; tar --lzip -xf "$archive" -C "$dest_dir" ;;
-    *.zip)             ensure_cmd unzip; unzip -q "$archive" -d "$dest_dir" ;;
-    *.gz)              gunzip -c "$archive" | tar -xf - -C "$dest_dir" ;;
-    *.bz2)             bunzip2 -c "$archive" | tar -xf - -C "$dest_dir" ;;
-    *.xz)              xz -dc "$archive" | tar -xf - -C "$dest_dir" ;;
-    *.7z)              ensure_cmd 7z; 7z x "$archive" -o"$dest_dir" ;;
-    *)
-      die "Formato de arquivo não suportado: $archive"
-      ;;
-  esac
-}
-
-# -------------------------------------------------------------
-# Construção do pacote
-# -------------------------------------------------------------
-build_pkg() {
-  local pkg="$1"
-  load_recipe "$pkg"
-
-  local builddir destdir
-  builddir="$ADM_BUILD_ROOT/$pkg-$$"
-  destdir="$builddir/dest"
-  ADM_CURRENT_BUILD_DIR="$builddir"
-
-  mkdir -p "$builddir" "$destdir"
-
-  log_info "Construindo pacote $pkg (versão $PKG_VERSION)"
-
-  # 1) Baixar fontes
-  IFS=' ' read -r -a srcs <<< "${PKG_SOURCES:-}"
-  if (( ${#srcs[@]} > 0 )); then
-    download_sources_parallel "${srcs[@]}"
-  else
-    log_warn "Recipe $pkg não define PKG_SOURCES; assumindo fonte já disponível."
-  fi
-
-  # 2) Extração (assume primeiro arquivo como principal)
-  local src_main src_archive
-  if (( ${#srcs[@]} > 0 )); then
-    src_main="${srcs[0]}"
-    src_archive="$ADM_SRC_CACHE/$(basename "${src_main%%\?*}")"
-    extract_src "$src_archive" "$builddir"
-  fi
-
-  # 3) Encontrar diretório de build (primeiro subdir criado)
-  local srcdir
-  srcdir="$(find "$builddir" -mindepth 1 -maxdepth 1 -type d ! -name dest | head -n1 || true)"
-  [[ -n "$srcdir" ]] || srcdir="$builddir"
-
-  # 4) Executar etapas de build definidas pela recipe
-  (
-    cd "$srcdir"
-
-    if declare -f pkg_prepare >/dev/null 2>&1; then
-      log_info "Etapa: prepare()"
-      pkg_prepare
-    fi
-
-    if declare -f pkg_build >/dev/null 2>&1; then
-      log_info "Etapa: build()"
-
-      # Se ADM_JOBS estiver definido (ex: 8), usa make -j8 via MAKEFLAGS
-      if [[ -n "${ADM_JOBS:-}" ]]; then
-        export MAKEFLAGS="-j${ADM_JOBS}"
-        log_info "Usando MAKEFLAGS=$MAKEFLAGS"
-      fi
-
-      PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_build
-    else
-      die "Recipe $pkg não define função pkg_build()"
-    fi
-
-    if declare -f pkg_check >/dev/null 2>&1; then
-      log_info "Etapa: check()"
-      pkg_check
-    fi
-
-    if declare -f pkg_install >/dev/null 2>&1; then
-      log_info "Etapa: install() para DESTDIR=$destdir"
-      PKG_DESTDIR="$destdir" PKG_PREFIX="$ADM_PREFIX" pkg_install
-    else
-      # fallback genérico: tentar "make install"
-      if [[ -f Makefile || -f makefile ]]; then
-        log_warn "pkg_install() não definido; tentando 'make DESTDIR=$destdir install'"
-        make DESTDIR="$destdir" install
-      else
-        die "Sem pkg_install() e sem Makefile para instalar $pkg"
-      fi
-    fi
-  )
-
-  # 5) Criar pacote binário e manifest
-  package_from_destdir "$pkg" "$PKG_VERSION" "${PKG_RELEASE:-1}" "$destdir"
-
-  # 6) Instalar imediatamente (exceto se DRY-RUN)
-  if dry_run_enabled; then
-    log_info "DRY-RUN: pacote $pkg-$PKG_VERSION-${PKG_RELEASE:-1} foi construído, mas NÃO será instalado."
-  else
-    install_from_cache "$pkg" "$PKG_VERSION" "${PKG_RELEASE:-1}"
-  fi
-
-  cleanup_build
-  ADM_CURRENT_BUILD_DIR=""
-}
-
-# -------------------------------------------------------------
-# Empacotamento e cache binário
-# -------------------------------------------------------------
-bin_pkg_filename() {
-  local pkg="$1" version="$2" release="$3" ext="$4"
-  local arch
-  arch="$(uname -m)"
-  printf '%s-%s-%s-%s.tar.%s' "$pkg" "$version" "$release" "$arch" "$ext"
-}
-
-package_from_destdir() {
-  local pkg="$1" version="$2" release="$3" destdir="$4"
-  [[ -d "$destdir" ]] || die "DESTDIR não existe: $destdir"
-
-  mkdir -p "$ADM_BIN_CACHE"
-
-  ensure_cmd zstd
-  ensure_cmd xz
-
-  local fname_zst fname_xz
-  fname_zst="$(bin_pkg_filename "$pkg" "$version" "$release" "zst")"
-  fname_xz="$(bin_pkg_filename "$pkg" "$version" "$release" "xz")"
-
-  ( cd "$destdir" && tar -cf - . ) | zstd -19 -T0 -o "$ADM_BIN_CACHE/$fname_zst"
-  ( cd "$destdir" && tar -cf - . ) | xz -T0 -9 -c > "$ADM_BIN_CACHE/$fname_xz"
-
-  log_info "Pacotes criados:"
-  log_info "  $ADM_BIN_CACHE/$fname_zst"
-  log_info "  $ADM_BIN_CACHE/$fname_xz"
-
-  # Gera manifesto com SHA256 (se sha256sum estiver disponível)
-  local manifest
-  manifest="$(manifest_file_for "$pkg")"
-
-  if command -v sha256sum >/dev/null 2>&1; then
-    log_info "Gerando manifesto com SHA256 em $manifest"
-    (
-      cd "$destdir" || exit 1
-      # Apenas arquivos regulares e links simbólicos; diretórios serão tratados via dirname
-      find . -mindepth 1 \( -type f -o -type l \) -print0 \
-        | sort -z \
-        | xargs -0 -r sha256sum \
-        | sed 's#  \./#  /#' >"$manifest"
-    )
-  else
-    log_warn "sha256sum não encontrado; gerando manifesto sem hashes."
-    ( cd "$destdir" && find . -mindepth 1 -printf '/%P\n' | sort ) >"$manifest"
-  fi
-}
-
-# -------------------------------------------------------------
-# Instalação a partir do cache binário
-# -------------------------------------------------------------
-install_from_cache() {
-  local pkg="$1" version="$2" release="$3"
-  local arch
-  arch="$(uname -m)"
-
-  local fname_zst fname_xz
-  fname_zst="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "zst")"
-  fname_xz="$ADM_BIN_CACHE/$(bin_pkg_filename "$pkg" "$version" "$release" "xz")"
-
-  local chosen=""
-  case "$ADM_DEFAULT_COMPRESS" in
-    zst) [[ -f "$fname_zst" ]] && chosen="$fname_zst" || chosen="$fname_xz" ;;
-    xz)  [[ -f "$fname_xz" ]] && chosen="$fname_xz" || chosen="$fname_zst" ;;
-    *)   chosen="$fname_zst" ;;
-  esac
-
-  [[ -f "$chosen" ]] || die "Pacote binário não encontrado para $pkg versão $version-$release"
-
-  if dry_run_enabled; then
-    log_info "DRY-RUN: instalaria $pkg-$version-$release a partir de $chosen"
-    return 0
-  fi
-
-  log_info "Instalando $pkg-$version-$release a partir de $chosen"
-
-  case "$chosen" in
-    *.tar.zst|*.tzst) tar --zstd -xf "$chosen" -C / ;;
-    *.tar.xz)         tar -xJf "$chosen" -C / ;;
-    *)                die "Formato de pacote binário desconhecido: $chosen" ;;
-  esac
-
-  write_meta "$pkg" "$version" "$release" "${PKG_DEPENDS:-}"
 }
 
 reverse_deps() {
   local target="$1"
-  local meta name depends dep
-
-  # Lista pacotes que dependem de $target, lendo todos os .meta
-  for meta in "$ADM_META_DIR"/*.meta; do
-    [[ -e "$meta" ]] || continue
-
-    name=""
-    depends=""
-
-    while IFS='=' read -r key value; do
-      case "$key" in
-        name)    name="$value" ;;
-        depends) depends="$value" ;;
-      esac
-    done < "$meta"
-
-    # pula o próprio pacote
-    [[ "$name" == "$target" ]] && continue
-
-    # vê se $target está na lista de depends
-    for dep in $depends; do
-      if [[ "$dep" == "$target" ]]; then
-        echo "$name"
+  local f deps pkg
+  for f in "$ADM_META_DIR"/*.meta; do
+    [[ -e "$f" ]] || continue
+    pkg="$(basename "$f" .meta)"
+    deps="$(awk -F= '$1=="depends"{print $2}' "$f")"
+    for d in $deps; do
+      if [[ "$d" == "$target" ]]; then
+        echo "$pkg"
         break
       fi
     done
   done
 }
 
-# -------------------------------------------------------------
-# Remoção via manifesto
-# -------------------------------------------------------------
+#######################################
+# DOWNLOAD
+#######################################
+
+download_one() {
+  local url="$1" dest="$2" sha="$3" md5="$4"
+  local tmp="${dest}.part"
+  local tries=0 max_tries=2
+
+  while (( tries < max_tries )); do
+    ((tries++))
+    log_info "Baixando $url (tentativa $tries/$max_tries)"
+
+    rm -f -- "$tmp"
+    if [[ "$url" == git+* || "$url" == *.git ]]; then
+      ensure_cmd git
+      rm -rf -- "$tmp"
+      git clone --depth 1 "$url" "$tmp"
+      tar -C "$tmp" -cf "$tmp.tar" .
+      mv "$tmp.tar" "$tmp"
+      rm -rf -- "$tmp.gitdir" || true
+    elif [[ "$url" == http://* || "$url" == https://* || "$url" == ftp://* ]]; then
+      if command -v curl >/dev/null 2>&1; then
+        curl -L --fail -o "$tmp" "$url"
+      elif command -v wget >/dev/null 2>&1; then
+        wget -O "$tmp" "$url"
+      else
+        die "Nenhum downloader disponível (curl ou wget)"
+      fi
+    elif [[ "$url" == rsync://* ]]; then
+      ensure_cmd rsync
+      rsync -av "$url" "$tmp"
+    else
+      die "URL de fonte não suportada: $url"
+    fi
+
+    if [[ -n "$sha" ]]; then
+      if ! echo "$sha  $tmp" | sha256sum -c -; then
+        log_warn "SHA256 incorreta para $url"
+        rm -f -- "$tmp"
+        continue
+      fi
+    fi
+
+    if [[ -n "$md5" && "$(command -v md5sum || true)" != "" ]]; then
+      if ! echo "$md5  $tmp" | md5sum -c -; then
+        log_warn "MD5 incorreta para $url"
+        rm -f -- "$tmp"
+        continue
+      fi
+    fi
+
+    mv "$tmp" "$dest"
+    return 0
+  done
+
+  die "Falha ao baixar $url após $max_tries tentativas"
+}
+
+download_sources_parallel() {
+  local -n _urls="$1"
+  local -n _sha="$2"
+  local -n _md5="$3"
+
+  mkdir -p "$ADM_SRC_CACHE"
+
+  local i url dest s m pids=()
+  for i in "${!_urls[@]}"; do
+    url="${!_urls[$i]}"
+    [[ -n "$url" ]] || continue
+    s="${_sha[$i]:-}"
+    m="${_md5[$i]:-}"
+    dest="$ADM_SRC_CACHE/$(basename "$url")"
+    if [[ -f "$dest" ]]; then
+      log_info "Usando fonte em cache: $dest"
+      continue
+    fi
+    (
+      download_one "$url" "$dest" "$s" "$m"
+    ) &
+    pids+=("$!")
+    # Limita jobs simultâneos
+    if (( ${#pids[@]} >= ADM_DL_JOBS )); then
+      wait -n || die "Download falhou"
+      # remove um PID da lista (não precisamos dos específicos)
+      pids=("${pids[@]:1}")
+    fi
+  done
+
+  # espera o resto
+  if ((${#pids[@]} > 0)); then
+    wait "${pids[@]}" || die "Download falhou"
+  fi
+}
+
+#######################################
+# EXTRAÇÃO
+#######################################
+
+extract_src() {
+  local archive="$1" dest="$2"
+  mkdir -p "$dest"
+
+  case "$archive" in
+    *.tar.gz|*.tgz)    tar -C "$dest" -xzf "$archive" ;;
+    *.tar.bz2|*.tbz2)  tar -C "$dest" -xjf "$archive" ;;
+    *.tar.xz)          tar -C "$dest" -xJf "$archive" ;;
+    *.tar.zst)         ensure_cmd zstd; tar -C "$dest" --zstd -xf "$archive" ;;
+    *.tar.lz)          ensure_cmd lzip; lzip -dc "$archive" | tar -C "$dest" -xf - ;;
+    *.zip)             ensure_cmd unzip; unzip -d "$dest" "$archive" ;;
+    *.7z)              ensure_cmd 7z; 7z x "$archive" -o"$dest" ;;
+    *.gz)              gunzip -c "$archive" | tar -C "$dest" -xf - ;;
+    *.bz2)             bzip2 -dc "$archive" | tar -C "$dest" -xf - ;;
+    *.xz)              xz -dc "$archive" | tar -C "$dest" -xf - ;;
+    *)                 die "Formato de arquivo não suportado: $archive" ;;
+  esac
+}
+
+#######################################
+# PACKAGING / INSTALL
+#######################################
+
+package_from_destdir() {
+  local pkg="$1" ver="$2" rel="$3" destdir="$4"
+  local arch
+  arch="$(uname -m)"
+
+  mkdir -p "$ADM_BIN_CACHE" "$ADM_MANIFEST_DIR"
+
+  local base="${pkg}-${ver}-${rel}-${arch}"
+  local tarfile_zst="$ADM_BIN_CACHE/${base}.tar.zst"
+  local tarfile_xz="$ADM_BIN_CACHE/${base}.tar.xz"
+
+  pushd "$destdir" >/dev/null
+
+  # Manifesto
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+  : >"$manifest"
+
+  find . -mindepth 1 -print0 | sort -z | while IFS= read -r -d '' f; do
+    local rp="/${f#./}"
+    if [[ -f "$f" || -L "$f" ]]; then
+      local hash
+      hash="$(sha256sum "$f" | awk '{print $1}')"
+      printf "SHA256 %s %s\n" "$hash" "$rp" >>"$manifest"
+    elif [[ -d "$f" ]]; then
+      printf "%s\n" "$rp" >>"$manifest"
+    fi
+  done
+
+  # pacotes binários
+  case "$ADM_DEFAULT_COMPRESS" in
+    zstd)
+      ensure_cmd zstd
+      tar --zstd -cf "$tarfile_zst" .
+      if command -v xz >/dev/null 2>&1; then
+        tar -cJf "$tarfile_xz" .
+      fi
+      ;;
+    xz)
+      ensure_cmd xz
+      tar -cJf "$tarfile_xz" .
+      if command -v zstd >/dev/null 2>&1; then
+        tar --zstd -cf "$tarfile_zst" .
+      fi
+      ;;
+    *)
+      die "ADM_DEFAULT_COMPRESS deve ser 'zstd' ou 'xz'"
+      ;;
+  esac
+
+  popd >/dev/null
+
+  log_info "Pacotes gerados em: $ADM_BIN_CACHE"
+}
+
+install_from_cache() {
+  local pkg="$1" ver="$2" rel="$3"
+  local arch
+  arch="$(uname -m)"
+
+  local base="${pkg}-${ver}-${rel}-${arch}"
+  local tarfile
+
+  if [[ "$ADM_DEFAULT_COMPRESS" == "zstd" ]]; then
+    tarfile="$ADM_BIN_CACHE/${base}.tar.zst"
+    if [[ ! -f "$tarfile" ]]; then
+      tarfile="$ADM_BIN_CACHE/${base}.tar.xz"
+    fi
+  else
+    tarfile="$ADM_BIN_CACHE/${base}.tar.xz"
+    if [[ ! -f "$tarfile" ]]; then
+      tarfile="$ADM_BIN_CACHE/${base}.tar.zst"
+    fi
+  fi
+
+  [[ -f "$tarfile" ]] || die "Pacote binário não encontrado: $tarfile"
+
+  if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY-RUN] Instalaria pacote $pkg a partir de $tarfile em $ADM_ROOT"
+    return 0
+  fi
+
+  log_info "Instalando $pkg em $ADM_ROOT a partir de $tarfile"
+  case "$tarfile" in
+    *.tar.zst) tar --zstd -C "$ADM_ROOT" -xf "$tarfile" ;;
+    *.tar.xz)  tar -C "$ADM_ROOT" -xJf "$tarfile" ;;
+    *)         die "Formato de pacote inesperado: $tarfile" ;;
+  esac
+
+  local deps="${PKG_DEPENDS:-}"
+  write_meta "$pkg" "$ver" "$rel" "$deps"
+}
+
+#######################################
+# BUILD
+#######################################
+
+find_build_srcdir() {
+  local builddir="$1"
+  local candidate
+  candidate="$(find "$builddir" -mindepth 1 -maxdepth 1 -type d ! -name dest | sort | head -n1 || true)"
+  [[ -n "$candidate" ]] || candidate="$builddir"
+  printf "%s\n" "$candidate"
+}
+
+build_pkg_internal() {
+  local pkg="$1" do_install="$2" # 1 instala, 0 só gera pacote (ou só compila)
+  load_recipe "$pkg"
+
+  log_info "Iniciando build de $PKG_NAME-$PKG_VERSION-$PKG_RELEASE"
+
+  local builddir="$ADM_BUILD_ROOT/${pkg}-$$"
+  ADM_CURRENT_BUILD_DIR="$builddir"
+  mkdir -p "$builddir"
+  mkdir -p "$builddir/dest"
+
+  # Arrays de fontes/hashes se existirem
+  local -a urls sha md5
+  if [[ -n "${PKG_SOURCES:-}" ]]; then
+    read -r -a urls <<<"$PKG_SOURCES"
+  fi
+  if [[ -n "${PKG_SHA256S:-}" ]]; then
+    read -r -a sha <<<"$PKG_SHA256S"
+  fi
+  if [[ -n "${PKG_MD5S:-}" ]]; then
+    read -r -a md5 <<<"$PKG_MD5S"
+  fi
+
+  if ((${#urls[@]} > 0)); then
+    download_sources_parallel urls sha md5
+  fi
+
+  local srcdir="$builddir"
+  if ((${#urls[@]} > 0)); then
+    local first="$ADM_SRC_CACHE/$(basename "${urls[0]}")"
+    [[ -f "$first" ]] || die "Fonte principal não encontrada: $first"
+    extract_src "$first" "$builddir"
+    srcdir="$(find_build_srcdir "$builddir")"
+  fi
+
+  log_debug "Diretório de build: $srcdir"
+
+  local destdir="$builddir/dest"
+  local prefix="$PKG_PREFIX"
+
+  (
+    cd "$srcdir"
+
+    export PKG_DESTDIR="$destdir"
+    export PKG_PREFIX="$prefix"
+    export PKG_HOST="${PKG_HOST:-}"
+    export PKG_BUILD="${PKG_BUILD:-}"
+    export PKG_TARGET="${PKG_TARGET:-}"
+
+    if declare -F pkg_prepare >/dev/null 2>&1; then
+      log_info "Executando pkg_prepare para $pkg"
+      pkg_prepare
+    fi
+
+    if ! declare -F pkg_build >/dev/null 2>&1; then
+      die "Recipe de $pkg não implementa pkg_build"
+    fi
+    log_info "Executando pkg_build para $pkg"
+    pkg_build
+
+    if declare -F pkg_check >/dev/null 2>&1; then
+      log_info "Executando pkg_check para $pkg"
+      pkg_check
+    fi
+
+    if (( do_install )); then
+      if declare -F pkg_install >/dev/null 2>&1; then
+        log_info "Executando pkg_install para $pkg"
+        pkg_install
+      else
+        if command -v make >/dev/null 2>&1; then
+          log_info "Executando 'make DESTDIR=$destdir install'"
+          make DESTDIR="$destdir" install
+        else
+          die "pkg_install não definido e 'make' não disponível"
+        fi
+      fi
+    fi
+  )
+
+  if (( do_install )); then
+    package_from_destdir "$PKG_NAME" "$PKG_VERSION" "$PKG_RELEASE" "$destdir"
+    install_from_cache "$PKG_NAME" "$PKG_VERSION" "$PKG_RELEASE"
+  else
+    # modo "build" apenas: gera pacote, mas não instala
+    package_from_destdir "$PKG_NAME" "$PKG_VERSION" "$PKG_RELEASE" "$destdir"
+    log_info "Build de teste concluído (pacote em cache, não instalado)."
+  fi
+
+  ADM_CURRENT_BUILD_DIR=""
+  rm -rf -- "$builddir"
+}
+
+build_pkg() { build_pkg_internal "$1" 1; }
+build_pkg_noinstall() { build_pkg_internal "$1" 0; }
+
+#######################################
+# REMOVE
+#######################################
+
 remove_pkg() {
   local pkg="$1"
-  local manifest
-  manifest="$(manifest_file_for "$pkg")"
 
-  [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
-
-  # Segurança: não remover se outros pacotes dependem dele (a menos que ADM_REMOVE_FORCE=1)
-  if [[ "${ADM_REMOVE_FORCE:-0}" != "1" ]]; then
-    local users
-    users="$(reverse_deps "$pkg" || true)"
-    if [[ -n "$users" ]]; then
-      log_error "Não é seguro remover $pkg; outros pacotes dependem dele:"
-      printf '  - %s\n' $users >&2
-      die "Use ADM_REMOVE_FORCE=1 adm remove $pkg para forçar, se tiver certeza."
-    fi
-  fi
-
-  if dry_run_enabled; then
-    log_info "DRY-RUN: removeria pacote $pkg"
-    log_info "DRY-RUN: arquivos que seriam removidos (manifesto: $manifest):"
-    sed 's/^/  - /' "$manifest"
+  if ! is_installed "$pkg"; then
+    log_warn "Pacote $pkg não está instalado"
     return 0
   fi
 
-  log_info "Removendo arquivos de $pkg usando manifesto $manifest"
+  # checa dependentes reversos
+  local rdeps
+  rdeps="$(reverse_deps "$pkg" | xargs || true)"
+  if [[ -n "$rdeps" && "${ADM_REMOVE_FORCE:-0}" -ne 1 ]]; then
+    die "Não é possível remover $pkg: outros pacotes dependem dele: $rdeps"
+  fi
 
-  # Remove arquivos
-  local line path
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-
-    # Manifesto pode ter formato:
-    #   /caminho
-    #   SHA256  /caminho
-    if [[ "$line" == /* ]]; then
-      # Manifesto sem hash
-      path="$line"
-    elif [[ "$line" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]]/ ]]; then
-      # Manifesto com hash (sha256sum usa "HASH␣␣/caminho")
-      path="${line#*  }"
-    else
-      # Formato inesperado; melhor tentar a linha inteira
-      path="$line"
-    fi
-
-    # Sanity extra: nunca remover raiz, diretório atual ou caminho vazio
-    if [[ -z "$path" || "$path" == "/" || "$path" == "." ]]; then
-      log_warn "Entrada de manifesto suspeita para $pkg: '$line' (ignorando)"
-      continue
-    fi
-
-    if [[ -e "$path" || -L "$path" ]]; then
-      rm -f -- "$path"
-    fi
-  done <"$manifest"
-
-  # Tenta remover diretórios vazios residuais
-  log_info "Removendo diretórios vazios residuais"
-  tac "$manifest" | while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-
-    if [[ "$line" == /* ]]; then
-      path="$line"
-    elif [[ "$line" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]]/ ]]; then
-      path="${line#*  }"
-    else
-      path="$line"
-    fi
-
-    local dir
-    dir="$(dirname "$path")"
-    [[ "$dir" == "/" || "$dir" == "." ]] && continue
-    if [[ -d "$dir" ]]; then
-      rmdir "$dir" 2>/dev/null || true
-    fi
-  done
-
-  rm -f "$manifest"
-  rm -f "$(meta_file_for "$pkg")"
-
-  log_info "Pacote $pkg removido."
-}
-
-cmd_verify() {
-  local pkg="$1"
   local manifest
   manifest="$(manifest_file_for "$pkg")"
-  local meta
-  meta="$(meta_file_for "$pkg")"
+  [[ -f "$manifest" ]] || die "Manifesto para $pkg não encontrado: $manifest"
 
-  if [[ ! -f "$manifest" ]]; then
-    die "Manifesto não encontrado para $pkg em $manifest"
-  fi
+  log_info "Removendo arquivos de $pkg em $ADM_ROOT"
 
-  if [[ ! -f "$meta" ]]; then
-    log_warn "Meta de instalação não encontrada para $pkg em $meta"
-  fi
-
-  log_info "Verificando arquivos do pacote $pkg (manifesto: $manifest)"
-
-  local missing=0 mismatched=0
-  local line path hash
-
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-
-    # Linha pode ser:
-    #   /caminho
-    #   SHA256  /caminho
-    hash=""
-    if [[ "$line" == /* ]]; then
-      # Manifesto sem hash
-      path="$line"
-    elif [[ "$line" =~ ^([0-9a-fA-F]{64})[[:space:]][[:space:]](/.*)$ ]]; then
-      # Manifesto com hash (captura hash e caminho completo, inclusive com espaços)
-      hash="${BASH_REMATCH[1]}"
-      path="${BASH_REMATCH[2]}"
+  local line type hash path real
+  # Remoção em ordem inversa para diretórios
+  tac "$manifest" | while read -r line; do
+    [[ -z "$line" ]] && continue
+    set +u
+    type="${line%% *}"
+    set -u
+    if [[ "$type" == SHA256 ]]; then
+      # linha: SHA256 hash /caminho
+      hash="${line#SHA256 }"
+      hash="${hash%% *}"
+      path="${line##* }"
     else
-      # formato inesperado; assume linha inteira como caminho
+      # diretório: /caminho
       path="$line"
     fi
+    real="$(root_path "$path")"
 
-    if [[ ! -e "$path" && ! -L "$path" ]]; then
-      log_warn "Arquivo ausente: $path"
-      missing=1
-      continue
-    fi
-
-    if [[ -n "$hash" ]] && command -v sha256sum >/dev/null 2>&1; then
-      local calc
-      calc="$(sha256sum "$path" | awk '{print $1}')"
-      if [[ "$calc" != "$hash" ]]; then
-        log_warn "SHA256 divergente para $path (esperado=$hash, calculado=$calc)"
-        mismatched=1
+    if [[ "$type" == SHA256 ]]; then
+      if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+        log_info "[DRY-RUN] Removeria arquivo $real"
       else
-        log_debug "OK (hash): $path"
+        rm -f -- "$real" || true
       fi
     else
-      log_debug "OK (existência): $path"
-    fi
-  done <"$manifest"
-
-  if (( missing == 0 && mismatched == 0 )); then
-    log_info "Verificação concluída: todos os arquivos de $pkg existem e (quando disponível) SHA256 confere."
-    return 0
-  else
-    log_warn "Verificação concluída: problemas detectados em $pkg (missing=$missing, mismatched=$mismatched)"
-    return 1
-  fi
-}
-
-cmd_verify_all() {
-  log_info "Verificando todos os pacotes instalados..."
-
-  local -a pkgs=()
-  mapfile -t pkgs < <(list_installed)
-
-  if (( ${#pkgs[@]} == 0 )); then
-    log_info "Nenhum pacote instalado para verificar."
-    return 0
-  fi
-
-  local pkg failed=0
-  for pkg in "${pkgs[@]}"; do
-    [[ -n "$pkg" ]] || continue
-    log_info "=== $pkg ==="
-    if ! cmd_verify "$pkg"; then
-      failed=1
+      if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+        log_info "[DRY-RUN] Tentaria remover diretório $real (se vazio)"
+      else
+        rmdir --ignore-fail-on-non-empty "$real" 2>/dev/null || true
+      fi
     fi
   done
 
-  if (( failed == 0 )); then
-    log_info "Verificação geral concluída: todos os pacotes passaram."
+  if [[ "$ADM_DRY_RUN" -eq 1 ]]; then
+    log_info "[DRY-RUN] Não apagará manifest/meta de $pkg"
   else
-    log_warn "Verificação geral concluída: existem pacotes com problemas."
+    rm -f -- "$manifest" "$(meta_file_for "$pkg")"
   fi
-
-  return $failed
 }
 
-# -------------------------------------------------------------
-# Resolução de dependências e ordenação (Kahn-like)
-# -------------------------------------------------------------
+#######################################
+# VERIFY
+#######################################
+
+verify_pkg() {
+  local pkg="$1"
+  if ! is_installed "$pkg"; then
+    log_warn "Pacote $pkg não está instalado"
+    return 1
+  fi
+  local manifest
+  manifest="$(manifest_file_for "$pkg")"
+  [[ -f "$manifest" ]] || die "Manifesto não encontrado: $manifest"
+
+  local has_err=0 line type hash path real
+  while read -r line; do
+    [[ -z "$line" ]] && continue
+    set +u
+    type="${line%% *}"
+    set -u
+    if [[ "$type" == SHA256 ]]; then
+      hash="${line#SHA256 }"
+      hash="${hash%% *}"
+      path="${line##* }"
+      real="$(root_path "$path")"
+      if [[ ! -e "$real" ]]; then
+        log_error "$pkg: arquivo ausente: $path"
+        has_err=1
+        continue
+      fi
+      local cur
+      cur="$(sha256sum "$real" | awk '{print $1}')"
+      if [[ "$cur" != "$hash" ]]; then
+        log_error "$pkg: hash incorreta: $path"
+        has_err=1
+      fi
+    else
+      path="$line"
+      real="$(root_path "$path")"
+      if [[ ! -e "$real" ]]; then
+        log_warn "$pkg: diretório ausente: $path"
+      fi
+    fi
+  done <"$manifest"
+
+  if ((has_err)); then
+    log_error "Verificação de $pkg falhou"
+    return 1
+  fi
+
+  log_info "Verificação de $pkg OK"
+  return 0
+}
+
+verify_all() {
+  local pkg
+  local rc=0
+  for pkg in $(list_installed); do
+    if ! verify_pkg "$pkg"; then
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+#######################################
+# DEPENDÊNCIAS / GRUPOS / TOPOLOGIA
+#######################################
+
 pkg_deps() {
   local pkg="$1"
   load_recipe "$pkg"
-  printf '%s\n' "${PKG_DEPENDS:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u
+  for d in ${PKG_DEPENDS:-}; do
+    [[ -n "$d" ]] && echo "$d"
+  done
 }
 
-# Listar pacotes que pertencem a um grupo/categoria (usa PKG_GROUPS em cada recipe)
 pkgs_in_group() {
   local group="$1"
-  local f
-
-  local needle=" $group "
-
-  # Procura todas as recipes .sh em qualquer subdiretório
-  while IFS= read -r f; do
-    [[ -f "$f" ]] || continue
-
-    (
-      unset PKG_NAME PKG_GROUPS
-      # shellcheck source=/dev/null
-      . "$f"
-      local name="${PKG_NAME:-}"
-      local groups=" ${PKG_GROUPS:-} "
-      if [[ -n "$name" && "$groups" == *"$needle"* ]]; then
-        printf '%s\n' "$name"
+  local f pkg
+  for f in "$ADM_RECIPES_DIR"/*.sh "$ADM_RECIPES_DIR"/*/*.sh "$ADM_RECIPES_DIR"/*/*/*.sh; do
+    [[ -e "$f" ]] || continue
+    unset_recipe_symbols
+    # shellcheck source=/dev/null
+    source "$f" || continue
+    pkg="${PKG_NAME:-}"
+    [[ -n "$pkg" ]] || pkg="$(basename "$f" .sh)"
+    for g in ${PKG_GROUPS:-}; do
+      if [[ "$g" == "$group" ]]; then
+        echo "$pkg"
+        break
       fi
-    )
-  done < <(find "$ADM_RECIPES_DIR" -type f -name '*.sh' 2>/dev/null | sort) | sort -u
+    done
+  done | sort -u
 }
 
-# Gera ordem topológica de uma lista de pacotes
 topo_sort_pkgs() {
-  local -a input_pkgs=("$@")
-  local -a all_pkgs=()
-  local -A want
-  local p
+  # entrada: lista de pacotes
+  local input_pkgs=("$@")
 
-  # normalizar e único
-  for p in "${input_pkgs[@]}"; do
-    want["$p"]=1
-  done
+  # fecha dependências
+  local queue=("${input_pkgs[@]}")
+  local all=()
+  local seen=()
 
-  # inclui dependências recursivamente
-  local changed=1
-  while (( changed )); do
-    changed=0
-    for p in "${!want[@]}"; do
-      local d
-      while IFS= read -r d; do
-        [[ -n "$d" ]] || continue
-        if [[ -z "${want[$d]:-}" ]]; then
-          want["$d"]=1
-          changed=1
-        fi
-      done < <(pkg_deps "$p")
-    done
-  done
+  contains() {
+    local x="$1"; shift
+    local i
+    for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done
+    return 0  # bug proposital? não, isso está errado, arrumar já
+  }
 
-  # converte para lista
-  for p in "${!want[@]}"; do
-    all_pkgs+=("$p")
-  done
+  contains_strict() {
+    local x="$1"; shift
+    local i
+    for i in "$@"; do [[ "$i" == "$x" ]] && return 0; done
+    return 1
+  }
 
-  # Ordenação aproximada por dependência (Kahn-like simplificado)
-  local -a sorted=()
-  local -A done
-  local progress
-
-  while (( ${#sorted[@]} < ${#all_pkgs[@]} )); do
-    progress=0
-    for p in "${all_pkgs[@]}"; do
-      [[ -n "$p" ]] || continue
-      if [[ -n "${done[$p]:-}" ]]; then
-        continue
+  local q
+  while ((${#queue[@]} > 0)); do
+    q="${queue[0]}"
+    queue=("${queue[@]:1}")
+    if contains_strict "$q" "${seen[@]}"; then
+      continue
+    fi
+    seen+=("$q")
+    all+=("$q")
+    local d
+    while read -r d; do
+      [[ -n "$d" ]] || continue
+      if ! contains_strict "$d" "${seen[@]}"; then
+        queue+=("$d")
       fi
-      local ok=1
-      local d
-      while IFS= read -r d; do
+    done < <(pkg_deps "$q")
+  done
+
+  # ordenação topológica
+  local done=()
+  local result=()
+  local changed
+  while ((${#all[@]} > 0)); do
+    changed=0
+    local next=()
+    local p
+    for p in "${all[@]}"; do
+      local ok=1 d
+      while read -r d; do
         [[ -n "$d" ]] || continue
-        # se dependência faz parte do conjunto e ainda não foi feita, não pode ainda
-        if [[ -n "${want[$d]:-}" && -z "${done[$d]:-}" ]]; then
+        # só consideramos dependências que fazem parte do conjunto "all+done"
+        if contains_strict "$d" "${all[@]}" && ! contains_strict "$d" "${done[@]}"; then
           ok=0
           break
         fi
       done < <(pkg_deps "$p")
-      if (( ok )); then
-        sorted+=("$p")
-        done["$p"]=1
-        progress=1
+      if ((ok)); then
+        result+=("$p")
+        done+=("$p")
+        changed=1
+      else
+        next+=("$p")
       fi
     done
-
-    if (( ! progress )); then
-      log_error "Detecção de ciclo de dependências entre pacotes:"
-      log_error "Conjunto envolvido:"
-      for p in "${all_pkgs[@]}"; do
-        [[ -z "${done[$p]:-}" ]] && printf '  %s\n' "$p" >&2
-      done
-      die "Não foi possível resolver dependências (ciclo detectado)."
+    all=("${next[@]}")
+    if (( !changed )) && ((${#all[@]} > 0)); then
+      die "Ciclo de dependências detectado: ${all[*]}"
     fi
   done
 
-  printf '%s\n' "${sorted[@]}"
+  printf "%s\n" "${result[@]}"
 }
-# -------------------------------------------------------------
-# Função genérica para descobrir versão upstream a partir de PKG_SOURCES
-# Usa o primeiro URL de PKG_SOURCES, deduz prefixo/sufixo do nome do arquivo,
-# baixa o índice do diretório e pega a maior versão.
-# -------------------------------------------------------------
+
+#######################################
+# UPGRADE CHECK (melhorado)
+#######################################
+
+escape_regex() {
+  # escapa caracteres especiais de regex básica
+  sed -e 's/[.[\*^$()+?{}|]/\\&/g'
+}
+
 adm_generic_upstream_version() {
-  # Requer PKG_VERSION e PKG_SOURCES definidos pela recipe
-  if [[ -z "${PKG_VERSION:-}" || -z "${PKG_SOURCES:-}" ]]; then
-    die "adm_generic_upstream_version() requer PKG_VERSION e PKG_SOURCES definidos."
-  fi
+  # Usa o primeiro item de PKG_SOURCES; tenta descobrir versão mais nova a partir de listing de diretório
+  local url
+  read -r url _ <<<"$PKG_SOURCES"
+  [[ -n "$url" ]] || return 1
+  [[ "$url" == http://* || "$url" == https://* || "$url" == ftp://* ]] || return 1
 
-  local first_url filename base_url prefix suffix ver_pattern
-  first_url="${PKG_SOURCES%% *}"
-  filename="$(basename "${first_url%%\?*}")"
+  local base
+  base="$(basename "$url")"
+  # tenta achar prefixo/sufixo em torno de PKG_VERSION
+  local ver="$PKG_VERSION"
+  local pre="${base%%$ver*}"
+  local suf="${base#*${ver}}"
 
-  # Tenta deduzir prefix/suffix a partir de PKG_VERSION presente no nome do arquivo
-  if [[ "$filename" == *"$PKG_VERSION"* ]]; then
-    prefix="${filename%%$PKG_VERSION*}"
-    suffix="${filename#*$PKG_VERSION}"
-  else
-    # fallback: tudo até o primeiro dígito que aparece em sequência
-    prefix="${filename%%-[0-9]*}"
-    suffix="${filename#$prefix}"
-    suffix="${suffix#*-}"   # remove '-' inicial
-    suffix="${suffix#*$PKG_VERSION}"
-  fi
+  # escapa para regex
+  local pre_re suf_re
+  pre_re="$(printf "%s" "$pre" | escape_regex)"
+  suf_re="$(printf "%s" "$suf" | escape_regex)"
 
-  if [[ -z "$prefix" || -z "$suffix" ]]; then
-    log_warn "Não foi possível inferir prefix/suffix de '$filename'; usando padrão simples."
-    prefix="${filename%%-[0-9]*}-"
-    suffix=".tar.gz"
-  fi
-
-  base_url="${first_url%/*}/"
-
-  log_info "Verificando versões upstream em: $base_url (prefix='$prefix', suffix='$suffix')"
-
-  local index
+  local listing
   if command -v curl >/dev/null 2>&1; then
-    index="$(curl -fsSL "$base_url" || true)"
+    listing="$(curl -fsSL "${url%/*}/" || true)"
   elif command -v wget >/dev/null 2>&1; then
-    index="$(wget -qO- "$base_url" || true)"
-  else
-    die "Nem curl nem wget disponíveis para adm_generic_upstream_version()."
+    listing="$(wget -qO- "${url%/*}/" || true)"
   fi
 
-  if [[ -z "$index" ]]; then
-    die "Não foi possível baixar índice de $base_url"
-  fi
+  [[ -n "$listing" ]] || return 1
 
-  # Extrai candidatos do tipo prefix + versão + suffix
-  # Ex: grep algo como foo-1.2.3.tar.xz
-  local candidates
-  candidates=$(grep -Eo "${prefix}[0-9][0-9A-Za-z\.\-_]*${suffix}" <<<"$index" | sort -u) || true
+  local versions
+  versions="$(printf "%s\n" "$listing" | \
+    grep -Eo "${pre_re}[0-9A-Za-z._-]+${suf_re}" | \
+    sed -e "s/^${pre_re}//" -e "s/${suf_re}$//" | sort -V | uniq)"
 
-  if [[ -z "$candidates" ]]; then
-    die "Nenhum candidato encontrado em $base_url para padrão ${prefix}*${suffix}"
-  fi
-
-  local v name versions=()
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    v="${name#$prefix}"
-    v="${v%$suffix}"
-    versions+=("$v")
-  done <<<"$candidates"
-
-  if (( ${#versions[@]} == 0 )); then
-    die "Nenhuma versão extraída a partir dos candidatos em $base_url"
-  fi
-
-  # Escolhe a maior versão segundo sort -V
-  printf '%s\n' "${versions[@]}" | sort -V | tail -n1
+  [[ -n "$versions" ]] || return 1
+  echo "$versions" | tail -n1
 }
 
-# -------------------------------------------------------------
-# Funções de upgrade (baseadas em pkg_upstream_version() das recipes)
-# -------------------------------------------------------------
 pkg_upstream_version_or_generic() {
-  # Usada quando recipe está carregada
-  if declare -f pkg_upstream_version >/dev/null 2>&1; then
+  if declare -F pkg_upstream_version >/dev/null 2>&1; then
     pkg_upstream_version
   else
-    adm_generic_upstream_version
+    adm_generic_upstream_version || return 1
   fi
 }
 
-cmd_upgrade_check_pkg() {
+upgrade_check_pkg() {
   local pkg="$1"
-
-  if ! load_recipe_soft "$pkg"; then
-    die "Não foi possível carregar recipe de $pkg para upgrade-check."
-  fi
-
   if ! is_installed "$pkg"; then
-    log_info "$pkg não está instalado; nada para comparar."
-    return 0
+    log_warn "$pkg não está instalado"
+    return 1
   fi
+  load_recipe_soft "$pkg" || { log_warn "Não foi possível carregar recipe de $pkg para upgrade-check"; return 1; }
 
-  local cur ver_up
-  cur="$(get_installed_version "$pkg")" || {
-    die "Não foi possível obter versão instalada de $pkg"
-  }
+  local cur upstream
+  cur="$(get_installed_version "$pkg" || true)"
+  [[ -n "$cur" ]] || return 1
 
-  ver_up="$(pkg_upstream_version_or_generic)" || {
-    die "Falha ao descobrir versão upstream de $pkg"
-  }
+  upstream="$(pkg_upstream_version_or_generic || true)"
+  [[ -n "$upstream" ]] || return 1
 
-  if ver_gt "$ver_up" "$cur"; then
-    printf '%s %s -> %s\n' "$pkg" "$cur" "$ver_up"
-    return 0
-  else
-    log_info "$pkg está atualizado ($cur). Upstream: $ver_up"
-    return 0
+  if [[ "$upstream" != "$cur" ]]; then
+    printf "%s %s -> %s\n" "$pkg" "$cur" "$upstream"
   fi
 }
 
-cmd_upgrade_check_all() {
-  log_info "Verificando pacotes com novas versões upstream..."
+upgrade_check_all() {
+  local p
+  for p in $(list_installed); do
+    upgrade_check_pkg "$p" || true
+  done
+}
+
+#######################################
+# REINSTALL / REBUILD-SYSTEM / BUILD
+#######################################
+
+install_pkgs_ordered() {
+  # recebe lista de pacotes alvo
+  local targets=("$@")
   local pkgs
-  pkgs="$(list_installed)"
+  mapfile -t pkgs < <(topo_sort_pkgs "${targets[@]}")
 
-  if [[ -z "$pkgs" ]]; then
-    log_info "Nenhum pacote instalado."
-    return 0
-  fi
-
-  local pkg
-  while IFS= read -r pkg; do
-    [[ -n "$pkg" ]] || continue
-    cmd_upgrade_check_pkg "$pkg" || true
-  done <<<"$pkgs"
+  local p
+  for p in "${pkgs[@]}"; do
+    if is_installed "$p" && [[ "$ADM_FORCE_REINSTALL" -ne 1 ]]; then
+      log_info "Pacote $p já instalado, pulando"
+      continue
+    fi
+    build_pkg "$p"
+  done
 }
 
-# -------------------------------------------------------------
-# CLI de alto nível
-# -------------------------------------------------------------
+build_pkgs_noinstall_ordered() {
+  local targets=("$@")
+  local pkgs
+  mapfile -t pkgs < <(topo_sort_pkgs "${targets[@]}")
+
+  local p
+  for p in "${pkgs[@]}"; do
+    log_info "Build (teste) de $p"
+    build_pkg_noinstall "$p"
+  done
+}
+
+reinstall_pkg_and_deps() {
+  local pkg="$1"
+  ADM_FORCE_REINSTALL=1 install_pkgs_ordered "$pkg"
+}
+
+rebuild_system() {
+  local all
+  mapfile -t all < <(list_installed)
+  [[ ${#all[@]} -gt 0 ]] || { log_warn "Nenhum pacote instalado para rebuild"; return 0; }
+  ADM_FORCE_REINSTALL=1 install_pkgs_ordered "${all[@]}"
+}
+
+#######################################
+# COMANDOS DE ALTO NÍVEL / CLI
+#######################################
 
 usage() {
   cat <<EOF
-adm $ADM_VERSION - Package manager para sistemas estilo LFS
+adm - gerenciador de pacotes simples
 
 Uso:
   adm list
   adm files <pkg>
   adm info <pkg>
   adm deps <pkg>
-  adm group <grupo>
-  adm install <pkg>...
-  adm install-order <pkg>...
+  adm group <nome-grupo>
+
+  adm install <pkg...>
+  adm install-order <pkg...>
+  adm build <pkg...>           # só compila e gera pacote, não instala
+  adm reinstall <pkg>          # rebuild + reinstall de pkg e deps
+  adm rebuild-system           # rebuild de todos os pacotes instalados
+
   adm remove <pkg>
   adm verify <pkg>
   adm verify-all
+
   adm upgrade-check <pkg>
   adm upgrade-check-all
 
-Variáveis de ambiente:
-  ADM_PREFIX=/usr           Prefix de instalação padrão das recipes
-  ADM_STATE_DIR=/var/lib/adm
-  ADM_DRY_RUN=1             Mostra o que faria sem alterar o sistema
-  ADM_DL_JOBS=4             Paralelismo nos downloads
-  ADM_DEFAULT_COMPRESS=zst  zst ou xz
-
-Exemplos:
-  adm list
-  adm install zlib
-  ADM_DRY_RUN=1 adm remove zlib
-  adm install-order bash coreutils grep
-  adm upgrade-check bash
+Variáveis úteis:
+  ADM_CHROOT_DIR   raiz do "sistema" (default: /mnt/lfs se existir)
+  ADM_DRY_RUN=1    mostra o que faria sem modificar nada
 EOF
 }
 
-cmd_list() {
-  list_installed
-}
+cmd_list() { list_installed; }
 
 cmd_files() {
   local pkg="$1"
-  local manifest
-  manifest="$(manifest_file_for "$pkg")"
-  [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg"
-  cat "$manifest"
+  local mf
+  mf="$(manifest_file_for "$pkg")"
+  [[ -f "$mf" ]] || die "Manifesto de $pkg não encontrado"
+  awk '{print $NF}' "$mf"
 }
 
 cmd_info() {
   local pkg="$1"
-  local meta recipe
-  meta="$(meta_file_for "$pkg")"
-  recipe="$(find_recipe_file "$pkg" || true)"
-
-  echo "Pacote: $pkg"
-  if [[ -f "$meta" ]]; then
-    echo "== Meta =="
-    cat "$meta"
-  else
-    echo "Meta: (não instalado)"
-  fi
-
-  if [[ -n "$recipe" ]]; then
-    echo
-    echo "Recipe: $recipe"
-    unset PKG_NAME PKG_DESC PKG_VERSION PKG_RELEASE PKG_DEPENDS PKG_GROUPS
-    # shellcheck source=/dev/null
-    . "$recipe"
-    echo "== Recipe =="
-    echo "  PKG_NAME    = ${PKG_NAME:-}"
-    echo "  PKG_VERSION = ${PKG_VERSION:-}"
-    echo "  PKG_RELEASE = ${PKG_RELEASE:-}"
-    echo "  PKG_DESC    = ${PKG_DESC:-}"
-    echo "  PKG_DEPENDS = ${PKG_DEPENDS:-}"
-    echo "  PKG_GROUPS  = ${PKG_GROUPS:-}"
-  else
-    echo "Recipe: não encontrado em $ADM_RECIPES_DIR"
-  fi
+  local mf
+  mf="$(meta_file_for "$pkg")"
+  [[ -f "$mf" ]] || die "Meta de $pkg não encontrada"
+  cat "$mf"
+  echo
+  echo "Arquivos:"
+  cmd_files "$pkg"
 }
 
 cmd_deps() {
   local pkg="$1"
-  pkg_deps "$pkg"
+  load_recipe "$pkg"
+  for d in ${PKG_DEPENDS:-}; do
+    echo "$d"
+  done
 }
 
 cmd_group() {
-  local group="$1"
-  pkgs_in_group "$group"
+  local g="$1"
+  pkgs_in_group "$g"
 }
 
 cmd_install() {
   local pkgs=("$@")
-  if (( ${#pkgs[@]} == 0 )); then
-    die "Use: adm install <pkg>..."
-  fi
-
-  # Gera ordem topológica incluindo dependências
-  local -a ordered
-  mapfile -t ordered < <(topo_sort_pkgs "${pkgs[@]}")
-
-  log_info "Ordem de instalação (com dependências):"
-  printf '  %s\n' "${ordered[@]}"
-
-  local p
-  for p in "${ordered[@]}"; do
-    if is_installed "$p"; then
-      log_info "Pulando $p (já instalado)."
-      continue
-    fi
-    log_info "Instalando pacote: $p"
-    build_pkg "$p"
-  done
+  install_pkgs_ordered "${pkgs[@]}"
 }
 
 cmd_install_order() {
   local pkgs=("$@")
-  if (( ${#pkgs[@]} == 0 )); then
-    die "Use: adm install-order <pkg>..."
-  fi
   topo_sort_pkgs "${pkgs[@]}"
 }
 
-cmd_remove_wrap() {
+cmd_build() {
+  local pkgs=("$@")
+  build_pkgs_noinstall_ordered "${pkgs[@]}"
+}
+
+cmd_reinstall() {
+  local pkg="$1"
+  reinstall_pkg_and_deps "$pkg"
+}
+
+cmd_rebuild_system() {
+  rebuild_system
+}
+
+cmd_remove() {
   local pkg="$1"
   remove_pkg "$pkg"
 }
 
-# -------------------------------------------------------------
-# Main
-# -------------------------------------------------------------
-main() {
-  local cmd="${1:-}"
+cmd_verify() {
+  local pkg="$1"
+  verify_pkg "$pkg"
+}
 
-  if [[ -z "$cmd" ]]; then
-    usage
-    exit 1
-  fi
+cmd_verify_all() {
+  verify_all
+}
 
-  # Garante diretórios e checa comandos essenciais antes de qualquer coisa
+cmd_upgrade_check() {
+  local pkg="$1"
+  upgrade_check_pkg "$pkg"
+}
+
+cmd_upgrade_check_all() {
+  upgrade_check_all
+}
+
+adm_main() {
   init_dirs
   check_runtime_deps
 
+  local cmd="${1:-}"
+  shift || true
+
   case "$cmd" in
-    list)
-      cmd_list
-      ;;
-    files)
-      [[ $# -ge 2 ]] || die "Use: adm files <pkg>"
-      cmd_files "$2"
-      ;;
-    info)
-      [[ $# -ge 2 ]] || die "Use: adm info <pkg>"
-      cmd_info "$2"
-      ;;
-    deps)
-      [[ $# -ge 2 ]] || die "Use: adm deps <pkg>"
-      cmd_deps "$2"
-      ;;
-    group)
-      [[ $# -ge 2 ]] || die "Use: adm group <grupo>"
-      cmd_group "$2"
-      ;;
-    install)
-      shift
-      cmd_install "$@"
-      ;;
-    install-order)
-      shift
-      cmd_install_order "$@"
-      ;;
-    remove)
-      [[ $# -ge 2 ]] || die "Use: adm remove <pkg>"
-      cmd_remove_wrap "$2"
-      ;;
-    verify)
-      [[ $# -ge 2 ]] || die "Use: adm verify <pkg>"
-      cmd_verify "$2"
-      ;;
-    verify-all)
-      cmd_verify_all
-      ;;
-    upgrade-check)
-      [[ $# -ge 2 ]] || die "Use: adm upgrade-check <pkg>"
-      cmd_upgrade_check_pkg "$2"
-      ;;
-    upgrade-check-all)
-      cmd_upgrade_check_all
-      ;;
-    -h|--help|help)
-      usage
-      ;;
-    *)
-      log_error "Comando desconhecido: $cmd"
-      usage
-      exit 1
-      ;;
+    list)             cmd_list "$@" ;;
+    files)            cmd_files "$@" ;;
+    info)             cmd_info "$@" ;;
+    deps)             cmd_deps "$@" ;;
+    group)            cmd_group "$@" ;;
+    install)          cmd_install "$@" ;;
+    install-order)    cmd_install_order "$@" ;;
+    build)            cmd_build "$@" ;;
+    reinstall)        cmd_reinstall "$@" ;;
+    rebuild-system)   cmd_rebuild_system "$@" ;;
+    remove)           cmd_remove "$@" ;;
+    verify)           cmd_verify "$@" ;;
+    verify-all)       cmd_verify_all "$@" ;;
+    upgrade-check)    cmd_upgrade_check "$@" ;;
+    upgrade-check-all) cmd_upgrade_check_all "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "Comando inválido: $cmd" ;;
   esac
 }
-
-main "$@"
