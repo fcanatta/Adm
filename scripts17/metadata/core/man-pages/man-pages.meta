@@ -3,6 +3,7 @@
 PKG_NAME="man-pages"
 PKG_VERSION="6.16"
 PKG_RELEASE=1
+PKG_GROUPS=( "core" )
 
 # Único source (com múltiplos mirrors separados por "|")
 PKG_SOURCE_URLS=(
