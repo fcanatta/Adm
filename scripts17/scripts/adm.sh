@@ -6,20 +6,21 @@ set -euo pipefail
 # =========================
 # Configuração geral
 # =========================
-: "${LFS_PKG_ROOT:=/var/lib/adm}"             # raiz do sistema de pacotes
-: "${LFS:=$LFS_PKG_ROOT/chroot}"              # raiz chroot
-: "${META_DIR:=$LFS_PKG_ROOT/metadata}"       # onde ficam os metadatas
-: "${CACHE_DIR:=$LFS_PKG_ROOT/cache}"         # cache de downloads / git
-: "${BUILD_ROOT:=$LFS_PKG_ROOT/build}"        # área de build
-: "${PKG_DIR:=$LFS_PKG_ROOT/packages}"        # pacotes .tar.zst / .tar.xz
-: "${DB_DIR:=$LFS_PKG_ROOT/db}"               # info de instalados
-: "${STATE_DIR:=$LFS_PKG_ROOT/state}"         # estado de construção (retomada)
-: "${LOG_DIR:=$LFS_PKG_ROOT/log}"             # logs
-: "${LOG_FILE:=$LOG_DIR/lfs-pkg.log}"         # log sem cores
-: "${CHROOT_DIR:=$LFS}"                       # se definido, builds em chroot
-: "${PARALLEL_JOBS:=4}"                       # downloads paralelos
+: "${LFS_PKG_ROOT:=/var/lib/adm}"                 # raiz do sistema de pacotes (lado host)
+: "${CHROOT_DIR:=$LFS_PKG_ROOT/chroot}"           # raiz chroot onde o build roda
+: "${LFS:=$CHROOT_DIR}"                           # alias, se você quiser usar LFS em metadatas
+: "${META_DIR:=$LFS_PKG_ROOT/metadata}"           # metadatas ficam fora do chroot
+: "${CACHE_DIR:=$LFS_PKG_ROOT/cache}"             # cache de downloads / git (host)
+: "${BUILD_ROOT:=$CHROOT_DIR/build}"              # área de build DENTRO do chroot
+: "${PKG_DIR:=$LFS_PKG_ROOT/packages}"            # pacotes .tar.zst / .tar.xz (host)
+: "${DB_DIR:=$LFS_PKG_ROOT/db}"                   # info de instalados (host)
+: "${STATE_DIR:=$LFS_PKG_ROOT/state}"             # estado de construção (retomada) (host)
+: "${LOG_DIR:=$LFS_PKG_ROOT/log}"                 # logs (host)
+: "${LOG_FILE:=$LOG_DIR/lfs-pkg.log}"             # log sem cores
+: "${PARALLEL_JOBS:=4}"                           # downloads paralelos
 
-mkdir -p "$META_DIR" "$CACHE_DIR" "$BUILD_ROOT" "$PKG_DIR" "$DB_DIR" "$STATE_DIR" "$LOG_DIR"
+# Garante toda a hierarquia necessária
+mkdir -p "$META_DIR" "$CACHE_DIR" "$BUILD_ROOT" "$PKG_DIR" "$DB_DIR" "$STATE_DIR" "$LOG_DIR" "$CHROOT_DIR"
 
 # =========================
 # Cores para saída na tela
@@ -515,11 +516,17 @@ chroot_teardown_mounts() {
 ensure_chroot_ready() {
     [[ -z "$CHROOT_DIR" ]] && return 0
 
+    # Garante existência do diretório do chroot
     if [[ ! -d "$CHROOT_DIR" ]]; then
-        die "[chroot] CHROOT_DIR '$CHROOT_DIR' não existe."
+        log_info "[chroot] Criando CHROOT_DIR em '$CHROOT_DIR'"
+        if ! mkdir -p "$CHROOT_DIR"; then
+            die "[chroot] Falha ao criar CHROOT_DIR em '$CHROOT_DIR'"
+        fi
     fi
 
     # Aqui apenas avisamos, não derrubamos tudo – quem cria /bin/bash é você.
+    # Se quiser copiar /bin/bash do host, essa lógica poderia ser ampliada, mas
+    # é mais seguro manter separado como no LFS.
     if [[ ! -x "$CHROOT_DIR/bin/bash" ]]; then
         log_warn "[chroot] $CHROOT_DIR não tem /bin/bash executável ainda. Algumas builds podem falhar."
     fi
