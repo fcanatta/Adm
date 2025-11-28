@@ -1,0 +1,45 @@
+# Metadata real para Man-pages-6.16 (LFS r12.4-46)
+
+PKG_NAME="man-pages"
+PKG_VERSION="6.16"
+PKG_RELEASE=1
+
+# Único source (com múltiplos mirrors separados por "|")
+PKG_SOURCE_URLS=(
+  "https://www.kernel.org/pub/linux/docs/man-pages/man-pages-6.16.tar.xz|https://mirror.umd.edu/kernel.org/linux/docs/man-pages/man-pages-6.16.tar.xz|https://ftp.naist.jp/pub/linux/docs/man-pages/man-pages-6.16.tar.xz"
+)
+
+# SHA256 para o source 0 (tarball)
+PKG_SHA256S=(
+  "8e247abd75cd80809cfe08696c81b8c70690583b045749484b242fb43631d7a3"
+)
+
+# MD5 para o source 0 (tarball) – do índice de pacotes do LFS
+PKG_MD5S=(
+  "4394eac3258137c8b549febeb04a7c33"
+)
+
+# Man-pages não tem dependências de build explícitas no livro
+PKG_DEPENDS=()
+
+# Build: não há etapa de compilação separada para man-pages
+PKG_BUILD() {
+  :
+}
+
+# Instalação seguindo o LFS, adaptada para DESTDIR
+PKG_INSTALL() {
+  set -e
+
+  # 1. Remover as páginas de crypt* (libxcrypt fornece melhores páginas)
+  #    rm -v man3/crypt*
+  rm -v man3/crypt* || true
+
+  # 2. Instalar usando DESTDIR para o empacotamento
+  #    make -R GIT=false prefix=/usr install
+  make -R GIT=false prefix=/usr DESTDIR="${DESTDIR:-/}" install
+}
+
+# Info para o mecanismo de update
+PKG_UPSTREAM_URL="https://www.kernel.org/doc/man-pages/"
+PKG_UPSTREAM_REGEX='man-pages-([0-9.]+)\.tar\.xz'
