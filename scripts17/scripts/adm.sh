@@ -1092,7 +1092,17 @@ check_upstream_version() {
     oldmeta="$(meta_path_for_pkg "$pkg")"
     local newmeta="${oldmeta%.meta}-${newest}.meta"
 
+    # copia o metadata antigo trocando apenas a versão
     sed -E "s/^(PKG_VERSION=).*$/\1\"$newest\"/" "$oldmeta" >"$newmeta"
+
+    # zera hashes no metadata novo, para você preencher depois manualmente
+    {
+        echo ""
+        echo "# ATENÇÃO: checksums resetados automaticamente pelo adm upgrade."
+        echo "# Preencha PKG_SHA256S e/ou PKG_MD5S com os hashes corretos da versão $newest."
+        echo "PKG_SHA256S=()"
+        echo "PKG_MD5S=()"
+    } >>"$newmeta"
 
     log_info "[$pkg] Novo metadata criado: $newmeta"
     echo "$newmeta"
