@@ -1,27 +1,92 @@
-# bash.meta
-PKG_NAME="bash"
-PKG_VERSION="5.2.32"
+# ==========================
+# METADATA DE EXEMPLO
+# Pacote: example
+# Demonstra múltiplos sources, mirrors, sha256 e md5
+# ==========================
+
+PKG_NAME="example"
+PKG_VERSION="1.0.0"
 PKG_RELEASE=1
 
-PKG_SOURCE_URLS=(
-  "https://ftp.gnu.org/gnu/bash/bash-5.2.32.tar.gz"
-)
-PKG_SHA256S=(
-  "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-)
-# Ou PKG_MD5S=()
+# =====================================
+# 1) Múltiplos SOURCES
+# Cada source pode ter vários mirrors separados por "|"
+# A ordem é importante — tenta na sequência
+# =====================================
 
-PKG_DEPENDS=( "ncurses" "readline" )
+PKG_SOURCE_URLS=(
+  # SOURCE 0 → tarball principal com mirrors
+  "https://example.org/releases/example-1.0.0.tar.gz|https://mirror1.example.net/example-1.0.0.tar.gz|https://backup-mirror.example.com/example-1.0.0.tar.gz"
+
+  # SOURCE 1 → patch adicional com mirrors
+  "https://example.org/patches/fix-issue.patch|https://mirror.example.net/patches/fix-issue.patch"
+
+  # SOURCE 2 → repositório git como fallback
+  "git+https://github.com/example/example.git"
+)
+
+# =====================================
+# 2) SHA256 PARA CADA SOURCE
+# Estes hashes são **falsos** mas válidos no formato!
+# Substitua pelos reais quando usar.
+# =====================================
+
+PKG_SHA256S=(
+  # SHA256 do source 0 (tarball)
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+  # SHA256 do source 1 (patch)
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+  # SHA256 do source 2 (repo git TAR)
+  ""   # vazio = não usar SHA256 neste source
+)
+
+# =====================================
+# 3) MD5 PARA CADA SOURCE
+# Também falsos mas válidos no formato md5.
+# =====================================
+
+PKG_MD5S=(
+  ""  # SHA usado para source 0 (sem MD5)
+  ""  # SHA usado para source 1 (sem MD5)
+
+  # MD5 do source 2 (git)
+  "cccccccccccccccccccccccccccccccc"
+)
+
+# =====================================
+# 4) Dependências
+# =====================================
+
+PKG_DEPENDS=(
+  "zlib"
+  "openssl"
+  "libxml2"
+)
+
+# =====================================
+# 5) Função de build
+# =====================================
 
 PKG_BUILD() {
-  ./configure --prefix=/usr
+  # Se o tarball criou um subdiretório único, ele já entra lá automaticamente.
+  ./configure --prefix=/usr --sysconfdir=/etc
   make -j"$(nproc)"
 }
+
+# =====================================
+# 6) Função de instalação
+# =====================================
 
 PKG_INSTALL() {
   make DESTDIR="$DESTDIR" install
 }
 
-# Opcional, para update automático
-PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/bash/"
-PKG_UPSTREAM_REGEX='bash-([0-9\.]+)\.tar\.gz'
+# =====================================
+# 7) UPDATE / UPGRADE Automático
+#     O script usa regex para extrair versões do upstream
+# =====================================
+
+PKG_UPSTREAM_URL="https://example.org/releases/"
+PKG_UPSTREAM_REGEX='example-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz'
