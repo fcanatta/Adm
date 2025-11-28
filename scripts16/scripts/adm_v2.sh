@@ -14,6 +14,7 @@
 #  Ver comentários em ADM_RECIPES_DIR mais abaixo.
 
 set -euo pipefail
+set -E
 
 ADM_VERSION="0.1.1"   # bump de versão do framework
 
@@ -129,13 +130,20 @@ check_runtime_deps() {
 
   # Comandos muito recomendados (mas não fatais se não existirem em todos os fluxos)
   local optional_cmds=(
-    md5sum
-    make
-    curl wget
-    unzip bunzip2 gunzip 7z
-    git rsync
-    zstd xz lzip
-  )
+  md5sum
+  make
+  curl
+  wget
+  unzip
+  bunzip2
+  gunzip
+  7z
+  git
+  rsync
+  zstd
+  xz
+  lzip
+)
 
   local c
   for c in "${cmds[@]}"; do
