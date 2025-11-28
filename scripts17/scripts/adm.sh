@@ -6,7 +6,8 @@ set -euo pipefail
 # =========================
 # Configuração geral
 # =========================
-: "${LFS_PKG_ROOT:=/var/lib/lfs-pkg}"          # raiz do sistema de pacotes
+: "${LFS_PKG_ROOT:=/var/lib/adm}"             # raiz do sistema de pacotes
+: "${LFS:=$LFS_PKG_ROOT/chroot}"              # raiz chroot
 : "${META_DIR:=$LFS_PKG_ROOT/metadata}"       # onde ficam os metadatas
 : "${CACHE_DIR:=$LFS_PKG_ROOT/cache}"         # cache de downloads / git
 : "${BUILD_ROOT:=$LFS_PKG_ROOT/build}"        # área de build
@@ -15,7 +16,7 @@ set -euo pipefail
 : "${STATE_DIR:=$LFS_PKG_ROOT/state}"         # estado de construção (retomada)
 : "${LOG_DIR:=$LFS_PKG_ROOT/log}"             # logs
 : "${LOG_FILE:=$LOG_DIR/lfs-pkg.log}"         # log sem cores
-: "${CHROOT_DIR:=}"                           # se definido, builds em chroot
+: "${CHROOT_DIR:=$LFS}"                       # se definido, builds em chroot
 : "${PARALLEL_JOBS:=4}"                       # downloads paralelos
 
 mkdir -p "$META_DIR" "$CACHE_DIR" "$BUILD_ROOT" "$PKG_DIR" "$DB_DIR" "$STATE_DIR" "$LOG_DIR"
@@ -91,7 +92,8 @@ require_cmd() {
 }
 
 # Checamos alguns comandos base
-require_cmd tar gzip xz zstd sha256sum md5sum sed awk sort grep
+# (file e tac são usados mais à frente; unzip é usado se você tiver fontes .zip)
+require_cmd tar gzip xz zstd sha256sum md5sum sed awk sort grep file tac
 
 # =========================
 # Carregar metadata
@@ -225,7 +227,8 @@ download_one_source() {
             # HTTP/HTTPS/FTP etc
             if command -v curl >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via curl: $url"
-                if curl -L --fail --progress-bar -o "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
+                # Barra de progresso na tela e saída também no LOG_FILE
+                if curl -L --fail --progress-bar -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
                     return 0
                 else
                     log_warn "[$pkg] Falha no curl: $url"
@@ -233,7 +236,8 @@ download_one_source() {
                 fi
             elif command -v wget >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via wget: $url"
-                if wget --progress=bar:force -O "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
+                # Barra de progresso na tela e saída também no LOG_FILE
+                if wget --progress=bar:force -O "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
                     return 0
                 else
                     log_warn "[$pkg] Falha no wget: $url"
@@ -364,9 +368,13 @@ extract_sources() {
     log_info "[$pkg] Extraindo fontes para $builddir"
 
     local i=0
-    for url in "${PKG_SOURCE_URLS[@]}"; do
+    local urlspec
+    for urlspec in "${PKG_SOURCE_URLS[@]}"; do
+        # Usa apenas a primeira URL (antes do '|') para nomear o arquivo no cache,
+        # igual na função download_sources_parallel
+        local first_url="${urlspec%%|*}"
         local base
-        base="$(basename "${url%%\?*}")"
+        base="$(basename "${first_url%%\?*}")"
         [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-$i.src"
         local src="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-$i-$base"
 
@@ -413,16 +421,123 @@ extract_sources() {
 # Chroot / execução de build
 # =========================
 
+# Flag para saber se já montamos o ambiente do chroot nesta execução
+CHROOT_MOUNTED=0
+
+chroot_setup_mounts() {
+    [[ -z "$CHROOT_DIR" ]] && return 0
+
+    require_cmd mount umount mountpoint
+
+    # Garante diretórios básicos dentro do chroot
+    mkdir -p "$CHROOT_DIR"/{dev,dev/pts,proc,sys,run,etc}
+    mkdir -p "$CHROOT_DIR/tmp"
+    chmod 1777 "$CHROOT_DIR/tmp" 2>/dev/null || true
+
+    # /etc/resolv.conf para DNS
+    if [[ -f /etc/resolv.conf ]]; then
+        if [[ ! -e "$CHROOT_DIR/etc/resolv.conf" ]]; then
+            touch "$CHROOT_DIR/etc/resolv.conf"
+        fi
+        if ! mountpoint -q "$CHROOT_DIR/etc/resolv.conf"; then
+            if ! mount --bind /etc/resolv.conf "$CHROOT_DIR/etc/resolv.conf"; then
+                log_warn "[chroot] Falha ao bind /etc/resolv.conf em $CHROOT_DIR/etc/resolv.conf"
+            fi
+        fi
+    fi
+
+    # /dev
+    if ! mountpoint -q "$CHROOT_DIR/dev"; then
+        if ! mount --bind /dev "$CHROOT_DIR/dev"; then
+            log_warn "[chroot] Falha ao bind /dev em $CHROOT_DIR/dev"
+        fi
+    fi
+
+    # /dev/pts
+    if ! mountpoint -q "$CHROOT_DIR/dev/pts"; then
+        if ! mount --bind /dev/pts "$CHROOT_DIR/dev/pts"; then
+            log_warn "[chroot] Falha ao bind /dev/pts em $CHROOT_DIR/dev/pts"
+        fi
+    fi
+
+    # /proc
+    if ! mountpoint -q "$CHROOT_DIR/proc"; then
+        if ! mount -t proc proc "$CHROOT_DIR/proc"; then
+            log_warn "[chroot] Falha ao montar proc em $CHROOT_DIR/proc"
+        fi
+    fi
+
+    # /sys
+    if ! mountpoint -q "$CHROOT_DIR/sys"; then
+        if ! mount -t sysfs sysfs "$CHROOT_DIR/sys"; then
+            log_warn "[chroot] Falha ao montar sysfs em $CHROOT_DIR/sys"
+        fi
+    fi
+
+    # /run (opcional)
+    if [[ -d /run ]]; then
+        if ! mountpoint -q "$CHROOT_DIR/run"; then
+            if ! mount --bind /run "$CHROOT_DIR/run"; then
+                log_warn "[chroot] Falha ao bind /run em $CHROOT_DIR/run"
+            fi
+        fi
+    fi
+
+    CHROOT_MOUNTED=1
+}
+
+chroot_teardown_mounts() {
+    [[ -z "$CHROOT_DIR" ]] && return 0
+    [[ "${CHROOT_MOUNTED:-0}" -eq 0 ]] && return 0
+
+    # Desmonta em ordem reversa
+    local targets=(
+        "$CHROOT_DIR/run"
+        "$CHROOT_DIR/sys"
+        "$CHROOT_DIR/proc"
+        "$CHROOT_DIR/dev/pts"
+        "$CHROOT_DIR/dev"
+        "$CHROOT_DIR/etc/resolv.conf"
+    )
+
+    local t
+    for t in "${targets[@]}"; do
+        if mountpoint -q "$t"; then
+            if ! umount "$t"; then
+                log_warn "[chroot] Falha ao desmontar $t (pode estar em uso)."
+            fi
+        fi
+    done
+
+    CHROOT_MOUNTED=0
+}
+
+ensure_chroot_ready() {
+    [[ -z "$CHROOT_DIR" ]] && return 0
+
+    if [[ ! -d "$CHROOT_DIR" ]]; then
+        die "[chroot] CHROOT_DIR '$CHROOT_DIR' não existe."
+    fi
+
+    # Aqui apenas avisamos, não derrubamos tudo – quem cria /bin/bash é você.
+    if [[ ! -x "$CHROOT_DIR/bin/bash" ]]; then
+        log_warn "[chroot] $CHROOT_DIR não tem /bin/bash executável ainda. Algumas builds podem falhar."
+    fi
+
+    if [[ "${CHROOT_MOUNTED:-0}" -eq 0 ]]; then
+        chroot_setup_mounts
+        # Garante desmontagem na saída do script inteiro
+        trap chroot_teardown_mounts EXIT
+    fi
+}
+
 run_in_chroot() {
     local workdir="$1"; shift
     local cmd="$*"
 
     if [[ -n "$CHROOT_DIR" ]]; then
         require_cmd chroot
-
-        if [[ ! -x "$CHROOT_DIR/bin/bash" ]]; then
-            die "[chroot] $CHROOT_DIR não parece um chroot válido (faltando /bin/bash executável)."
-        fi
+        ensure_chroot_ready
 
         # Garantir que workdir está dentro do chroot
         case "$workdir" in
@@ -924,11 +1039,31 @@ rebuild_one() {
 }
 
 rebuild_all() {
+    declare -A seen
+    local ordered=()
+
+    # Monta uma ordem global de rebuild respeitando dependências,
+    # apenas para pacotes que estão instalados.
     local pkg
     for pkgdir in "$DB_DIR"/*; do
         [[ -d "$pkgdir" ]] || continue
         pkg="$(basename "$pkgdir")"
-        rebuild_one "$pkg"
+
+        local order
+        order=$(resolve_deps_order "$pkg")
+        local p
+        for p in $order; do
+            # Só rebuildamos pacotes que estão instalados
+            if [[ -d "$DB_DIR/$p" && -z "${seen[$p]:-}" ]]; then
+                ordered+=("$p")
+                seen["$p"]=1
+            fi
+        done
+    done
+
+    local p
+    for p in "${ordered[@]}"; do
+        rebuild_one "$p"
     done
 }
 
@@ -961,7 +1096,22 @@ list_installed() {
     for pkgdir in "$DB_DIR"/*; do
         [[ -d "$pkgdir" ]] || continue
         pkg="$(basename "$pkgdir")"
-        load_metadata "$pkg" || true
+
+        # Tentar ler metadata salvo no DB primeiro, sem abortar o script inteiro
+        unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DEPENDS
+        local meta_db
+        meta_db="$pkgdir/metadata.meta"
+        if [[ -f "$meta_db" ]]; then
+            # shellcheck source=/dev/null
+            source "$meta_db"
+        elif [[ -f "$(meta_path_for_pkg "$pkg")" ]]; then
+            # shellcheck source=/dev/null
+            source "$(meta_path_for_pkg "$pkg")"
+        else
+            PKG_VERSION="?"
+            PKG_RELEASE="?"
+        fi
+
         printf "%-20s %s-%s\n" "$pkg" "${PKG_VERSION:-?}" "${PKG_RELEASE:-?}"
     done
 }
