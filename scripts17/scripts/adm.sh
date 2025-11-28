@@ -117,19 +117,44 @@ meta_path_for_pkg() {
     local pkg="$1"
     local path=""
 
-    # Se o nome já contém '/', tratamos como caminho relativo dentro de META_DIR
+    # Caso 1: o nome do pacote já veio no formato "grupo/programa"
     if [[ "$pkg" == */* ]]; then
+        local group="${pkg%/*}"
+        local name="${pkg##*/}"
+
+        # Novo layout preferido: $META_DIR/grupo/programa/programa.meta
+        if [[ -f "$META_DIR/$group/$name/$name.meta" ]]; then
+            echo "$META_DIR/$group/$name/$name.meta"
+            return
+        fi
+
+        # Layout antigo: $META_DIR/grupo/programa.meta
+        if [[ -f "$META_DIR/$group/$name.meta" ]]; then
+            echo "$META_DIR/$group/$name.meta"
+            return
+        fi
+
+        # Fallback genérico: $META_DIR/$pkg.meta
         path="$META_DIR/$pkg.meta"
         echo "$path"
         return
     fi
 
-    # Primeiro tenta encontrar recursivamente em qualquer subdiretório
+    # Caso 2: nome simples ("programa")
+    # Primeiro tentamos o layout de subdiretório padrão: $META_DIR/core/programa/programa.meta, etc.
+    # Ou qualquer $META_DIR/*/programa/programa.meta
+    path=$(find "$META_DIR" -mindepth 2 -maxdepth 3 -type f -name "$pkg.meta" -print -quit 2>/dev/null || true)
+    if [[ -n "$path" ]]; then
+        echo "$path"
+        return
+    fi
+
+    # Fallback: procurar em qualquer lugar (como antes)
     path=$(find "$META_DIR" -type f -name "$pkg.meta" -print -quit 2>/dev/null || true)
     if [[ -n "$path" ]]; then
         echo "$path"
     else
-        # Fallback: comportamento antigo (direto na raiz)
+        # Último fallback: raiz direta
         echo "$META_DIR/$pkg.meta"
     fi
 }
@@ -1291,6 +1316,13 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Se CHROOT_DIR foi esvaziado (ex: --no-chroot), ajusta BUILD_ROOT para ficar fora do chroot
+if [[ -z "${CHROOT_DIR:-}" ]]; then
+    : "${LFS_PKG_ROOT:=/var/lib/adm}"
+    BUILD_ROOT="${LFS_PKG_ROOT}/build"
+    mkdir -p "$BUILD_ROOT"
+fi
 
 cmd="${1:-}"
 case "$cmd" in
