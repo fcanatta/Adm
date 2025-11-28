@@ -14,6 +14,7 @@
 PKG_NAME="iana-etc"
 PKG_VERSION="20251022"
 PKG_RELEASE=1
+PKG_GROUPS=( "core" "base" )
 
 # Fonte único (pode adicionar mirrors com | se quiser)
 PKG_SOURCE_URLS=(
