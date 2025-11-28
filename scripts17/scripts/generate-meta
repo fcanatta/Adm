@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+# Gerador de metadata para o adm
+# Uso:
+#   generate-meta <grupo> <pacote> <versao> <url1> [url2 url3 ...]
+
+set -euo pipefail
+
+# Diretório padrão de metadata (mesmo padrão do adm.sh)
+: "${META_DIR:=/var/lib/adm/metadata}"
+
+usage() {
+    cat <<EOF
+Uso: $(basename "$0") <grupo> <pacote> <versao> <url1> [url2 url3 ...]
+
+Exemplo:
+  $(basename "$0") core gcc 15.2.0 \\
+      https://ftp.gnu.org/gnu/gcc/gcc-15.2.0/gcc-15.2.0.tar.xz
+
+URLs adicionais serão tratados como espelhos (mirrors) do mesmo source:
+  PKG_SOURCE_URLS=(
+    "url1|url2|url3"
+  )
+EOF
+}
+
+require_cmd() {
+    local c
+    for c in "$@"; do
+        if ! command -v "$c" >/dev/null 2>&1; then
+            echo "ERRO: comando obrigatório não encontrado: $c" >&2
+            exit 1
+        fi
+    done
+}
+
+if [[ $# -lt 4 ]]; then
+    usage
+    exit 1
+fi
+
+group="$1"; shift
+pkg="$1";   shift
+version="$1"; shift
+
+if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
+fi
+
+urls=("$@")
+
+# Verificações básicas
+require_cmd sha256sum md5sum
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    echo "ERRO: é necessário ter curl OU wget instalado para baixar o source." >&2
+    exit 1
+fi
+
+# Monta o caminho do metadata: $META_DIR/grupo/pacote/pacote.meta
+meta_dir="${META_DIR}/${group}/${pkg}"
+meta_path="${meta_dir}/${pkg}.meta"
+
+mkdir -p "$meta_dir"
+
+# Cria diretório temporário em /tmp
+TMPDIR="$(mktemp -d /tmp/generate-meta.XXXXXX)"
+trap 'rm -rf "$TMPDIR"' EXIT
+
+primary_url="${urls[0]}"
+
+# Nome de arquivo baseado no URL
+base_name="$(basename "${primary_url%%\?*}")"
+[[ -z "$base_name" ]] && base_name="${pkg}-${version}.src"
+
+tmp_file="${TMPDIR}/${base_name}"
+
+echo ">> Baixando ${primary_url} para ${tmp_file}..."
+
+_download() {
+    local url="$1"
+    local out="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail -o "$out" "$url"
+    else
+        wget -O "$out" "$url"
+    fi
+}
+
+_download "$primary_url" "$tmp_file"
+
+if [[ ! -s "$tmp_file" ]]; then
+    echo "ERRO: download falhou ou arquivo vazio: $tmp_file" >&2
+    exit 1
+fi
+
+echo ">> Calculando SHA256 e MD5 de ${tmp_file}..."
+sha256="$(sha256sum "$tmp_file" | awk '{print $1}')"
+md5="$(md5sum "$tmp_file" | awk '{print $1}')"
+
+echo "   SHA256 = $sha256"
+echo "   MD5    = $md5"
+
+# Junta as URLs como um único source com múltiplos mirrors
+joined_urls="$(printf '%s|' "${urls[@]}")"
+joined_urls="${joined_urls%|}"
+
+# ---------------------------
+# Carregar metadata antigo (se existir)
+# ---------------------------
+# Se existir, carregamos para preservar PKG_DEPENDS, PKG_BUILD, PKG_INSTALL, PKG_UPSTREAM_*
+old_depends=()
+old_release="1"
+old_upstream_url=""
+old_upstream_regex=""
+old_build_def=""
+old_install_def=""
+
+if [[ -f "$meta_path" ]]; then
+    echo ">> Atualizando metadata existente: $meta_path"
+
+    # Usar um subshell para não poluir o ambiente principal
+    # e capturar os dados que queremos preservar.
+    eval "$(
+        set +u
+        (
+            # subshell
+            set +u
+            # shellcheck source=/dev/null
+            source "$meta_path"
+
+            # PKG_RELEASE
+            echo "old_release=\"\${PKG_RELEASE:-1}\""
+
+            # PKG_UPSTREAM_URL / PKG_UPSTREAM_REGEX
+            echo "old_upstream_url=\"\${PKG_UPSTREAM_URL:-}\""
+            echo "old_upstream_regex=\"\${PKG_UPSTREAM_REGEX:-}\""
+
+            # PKG_DEPENDS (array)
+            echo "old_depends=("
+            if [[ \${#PKG_DEPENDS[@]:-0} -gt 0 ]]; then
+                for d in "\${PKG_DEPENDS[@]}"; do
+                    printf '  "%s"\n' "$d"
+                done
+            fi
+            echo ")"
+
+            # Funções PKG_BUILD / PKG_INSTALL, se existirem
+            if declare -F PKG_BUILD >/dev/null 2>&1; then
+                printf 'old_build_def=$(cat <<'"'EOF_BUILD'"\n'
+                declare -f PKG_BUILD
+                printf '\nEOF_BUILD\n)\n'
+            fi
+
+            if declare -F PKG_INSTALL >/dev/null 2>&1; then
+                printf 'old_install_def=$(cat <<'"'EOF_INST'"\n'
+                declare -f PKG_INSTALL
+                printf '\nEOF_INST\n)\n'
+            fi
+        )
+    )"
+else
+    echo ">> Criando novo metadata: $meta_path"
+fi
+
+# Se não havia definição de build/install, cria stubs básicos
+if [[ -z "${old_build_def:-}" ]]; then
+    old_build_def='PKG_BUILD() {
+    # TODO: implemente o passo de compilação para '"$pkg"'.
+    # Exemplo:
+    #   ./configure --prefix=/usr ...
+    #   make -j"$(nproc)"
+    :
+}'
+fi
+
+if [[ -z "${old_install_def:-}" ]]; then
+    old_install_def='PKG_INSTALL() {
+    # TODO: implemente o passo de instalação para '"$pkg"'.
+    # Use a variável DESTDIR para instalação em staging:
+    #   make DESTDIR="${DESTDIR:-/}" install
+    :
+}'
+fi
+
+# ---------------------------
+# Escrever metadata novo/atualizado
+# ---------------------------
+tmp_meta="${meta_path}.new"
+
+{
+    echo "# Metadata para $pkg gerado por $(basename "$0") em $(date -Iseconds)"
+    echo "# Edite PKG_DEPENDS, PKG_BUILD e PKG_INSTALL conforme necessário."
+    echo
+
+    printf 'PKG_NAME="%s"\n' "$pkg"
+    printf 'PKG_VERSION="%s"\n' "$version"
+    printf 'PKG_RELEASE="%s"\n' "$old_release"
+    echo
+
+    # Grupo principal vindo da linha de comando
+    echo "PKG_GROUPS=("
+    printf '  "%s"\n' "$group"
+    echo ")"
+    echo
+
+    echo "PKG_SOURCE_URLS=("
+    printf '  "%s"\n' "$joined_urls"
+    echo ")"
+    echo
+
+    echo "PKG_SHA256S=("
+    printf '  "%s"\n' "$sha256"
+    echo ")"
+    echo
+
+    echo "PKG_MD5S=("
+    printf '  "%s"\n' "$md5"
+    echo ")"
+    echo
+
+    echo "PKG_DEPENDS=("
+    if [[ ${#old_depends[@]:-0} -gt 0 ]]; then
+        for d in "${old_depends[@]}"; do
+            printf '  "%s"\n' "$d"
+        done
+    fi
+    echo ")"
+    echo
+
+    printf 'PKG_UPSTREAM_URL="%s"\n' "$old_upstream_url"
+    printf 'PKG_UPSTREAM_REGEX="%s"\n' "$old_upstream_regex"
+    echo
+
+    # Definições de build/install preservadas ou stubs
+    printf '%s\n\n' "$old_build_def"
+    printf '%s\n' "$old_install_def"
+
+} > "$tmp_meta"
+
+mv -f "$tmp_meta" "$meta_path"
+
+echo ">> Metadata atualizado em: $meta_path"
+echo "Pronto. Agora você pode editar PKG_DEPENDS/PKG_BUILD/PKG_INSTALL se precisar."
