@@ -1,0 +1,52 @@
+# ==========================
+# Iana-Etc-${PKG_VERSION}
+# LFS r12.4-46 - Chapter 8.4
+# ==========================
+#
+# Livro (instalação):
+#   cp services protocols /etc
+# 
+#
+# Pacote na tabela de packages:
+#   Download: https://github.com/Mic92/iana-etc/releases/download/${PKG_VERSION}/iana-etc-${PKG_VERSION}.tar.gz
+#   MD5:      6d3bd72a4ffa0a2cab2065c25677a9b8 
+
+PKG_NAME="iana-etc"
+PKG_VERSION="20251022"
+PKG_RELEASE=1
+
+# Fonte único (pode adicionar mirrors com | se quiser)
+PKG_SOURCE_URLS=(
+  "https://github.com/Mic92/iana-etc/releases/download/${PKG_VERSION}/iana-etc-${PKG_VERSION}.tar.gz"
+)
+
+# Não temos SHA256 publicado oficialmente no LFS para esse snapshot,
+# então usamos só MD5 (o adm suporta isso normalmente).
+PKG_SHA256S=()
+
+PKG_MD5S=(
+  "6d3bd72a4ffa0a2cab2065c25677a9b8"
+)
+
+# Não há dependências de build específicas no livro
+PKG_DEPENDS=()
+
+# Não há passo de build – apenas dados
+PKG_BUILD() {
+  :
+}
+
+# Instalação seguindo o LFS, mas respeitando DESTDIR do adm:
+#   LFS diz: cp services protocols /etc
+#   Aqui:   instalamos em DESTDIR/etc e o adm depois copia pra /
+PKG_INSTALL() {
+  set -e
+
+  # Garante que os diretórios existem e instala com permissões padrão de dados
+  install -D -m644 services  "${DESTDIR}/etc/services"
+  install -D -m644 protocols "${DESTDIR}/etc/protocols"
+}
+
+# Informações para o mecanismo de update/upgrade do adm (se você estiver usando)
+PKG_UPSTREAM_URL="https://www.iana.org/protocols"
+PKG_UPSTREAM_REGEX='iana-etc-([0-9]{8})\.tar\.gz'
