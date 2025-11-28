@@ -1,0 +1,137 @@
+# ===== tzdata-2025b + configuração básica do Glibc =====
+# Segue o LFS 12.4:
+#  - Cap. 3.2 (Time Zone Data 2025b)
+#  - Cap. 8.5.2.1 /etc/nsswitch.conf
+#  - Cap. 8.5.2.2 Time Zone Data
+#  - Cap. 8.5.2.3 /etc/ld.so.conf
+
+PKG_NAME="tzdata"
+PKG_VERSION="2025b"
+PKG_RELEASE="1"
+
+# Grupo principal
+PKG_GROUPS=( "core" )
+
+# Precisamos do glibc já instalado (zic, localedef, etc.)
+PKG_DEPENDS=( "glibc" )
+
+# Upstream para o check_upstream_version do adm
+PKG_UPSTREAM_URL="https://www.iana.org/time-zones"
+PKG_UPSTREAM_REGEX='tzdata([0-9]{4}[a-z])\.tar\.gz'
+
+# Fonte oficial do LFS 12.4
+PKG_SOURCE_URLS=(
+  "https://www.iana.org/time-zones/repository/releases/tzdata${PKG_VERSION}.tar.gz"
+)
+
+# SHA256 não informado oficialmente no livro; deixamos vazio
+PKG_SHA256S=(
+  ""
+)
+
+# MD5 do livro (3.2 All Packages – Time Zone Data 2025b)
+# ad65154c48c74a9b311fe84778c5434f
+PKG_MD5S=(
+  "ad65154c48c74a9b311fe84778c5434f"
+)
+
+# --------------------------------------------------------------------
+# BUILD
+# --------------------------------------------------------------------
+# Não há etapa real de "compilação" para o tzdata – é só dado.
+# O adm vai:
+#   - baixar o tarball
+#   - extrair em $BUILD_ROOT/tzdata-2025b
+# E nós usamos tudo isso na PKG_INSTALL.
+#
+# Podemos deixar sem PKG_BUILD: o adm apenas dá um aviso e segue.
+# Se preferir, pode usar um stub vazio:
+#
+# PKG_BUILD() {
+#     :
+# }
+
+# --------------------------------------------------------------------
+# INSTALL
+#  - Gera /usr/share/zoneinfo (posix, right)
+#  - Cria /etc/nsswitch.conf
+#  - Cria /etc/ld.so.conf + include
+#  - Define /etc/localtime (America/Sao_Paulo por padrão)
+# --------------------------------------------------------------------
+PKG_INSTALL() {
+    set -e
+
+    # O adm garante que estamos no diretório de fontes:
+    #   $BUILD_ROOT/tzdata-2025b
+    #
+    # DESTDIR é passado pelo adm; se estiver vazio, instalamos direto em /
+    local root="${DESTDIR:-/}"
+
+    # ---------------------------
+    # 1. Instalar Time Zone Data
+    # ---------------------------
+    # LFS 8.5.2.2 (adaptado para DESTDIR)
+    #
+    # Espera encontrar os arquivos do tzdata já extraídos aqui.
+    # Se for necessário por algum motivo, você pode descomentar o tar:
+    #
+    # tar -xf tzdata2025b.tar.gz
+
+    local ZONEINFO="${root}/usr/share/zoneinfo"
+    mkdir -pv "${ZONEINFO}"/{posix,right}
+
+    for tz in etcetera southamerica northamerica europe africa antarctica \
+              asia australasia backward; do
+        zic -L /dev/null   -d "${ZONEINFO}"       "${tz}"
+        zic -L /dev/null   -d "${ZONEINFO}/posix" "${tz}"
+        zic -L leapseconds -d "${ZONEINFO}/right" "${tz}"
+    done
+
+    cp -v zone.tab zone1970.tab iso3166.tab "${ZONEINFO}"
+    # POSIX rules (LFS usa America/New_York)
+    zic -d "${ZONEINFO}" -p America/New_York
+
+    # Timezone local: como você está no Brasil, vamos usar America/Sao_Paulo.
+    # Se quiser outro, é só trocar aqui.
+    mkdir -pv "${root}/etc"
+    ln -sfv "/usr/share/zoneinfo/America/Sao_Paulo" "${root}/etc/localtime"
+
+    # ---------------------------
+    # 2. /etc/nsswitch.conf
+    # ---------------------------
+    # LFS 8.5.2.1
+    cat > "${root}/etc/nsswitch.conf" << "EOF"
+# Begin /etc/nsswitch.conf
+
+passwd: files
+group:  files
+shadow: files
+
+hosts:   files dns
+networks: files
+
+protocols: files
+services:  files
+ethers:    files
+rpc:       files
+
+# End /etc/nsswitch.conf
+EOF
+
+    # ---------------------------
+    # 3. /etc/ld.so.conf + include
+    # ---------------------------
+    # LFS 8.5.2.3 (juntando o conteúdo dos dois blocos em um só arquivo)
+    cat > "${root}/etc/ld.so.conf" << "EOF"
+# Begin /etc/ld.so.conf
+/usr/local/lib
+/opt/lib
+
+# Add an include directory
+include /etc/ld.so.conf.d/*.conf
+
+# End /etc/ld.so.conf
+EOF
+
+    mkdir -pv "${root}/etc/ld.so.conf.d"
+}
