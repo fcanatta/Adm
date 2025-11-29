@@ -1,0 +1,38 @@
+# Pkgconf-2.5.1 - LFS r12.4 (8.20)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/pkgconf.html (mesmas opções do livro multilib)
+
+PKG_NAME="pkgconf"
+PKG_VERSION="2.5.1"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://distfiles.ariadne.space/pkgconf/pkgconf-2.5.1.tar.xz"
+)
+
+# From LFS r12.4-dev packages list
+# MD5: 3291128c917fdb8fccd8c9e7784b643b
+PKG_MD5S=(
+  "3291128c917fdb8fccd8c9e7784b643b"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("devel" "tools")
+
+PKG_UPSTREAM_URL="https://github.com/pkgconf/pkgconf"
+PKG_UPSTREAM_REGEX='pkgconf-([0-9.]+)\.tar\.xz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr    \
+                --disable-static \
+                --docdir=/usr/share/doc/pkgconf-2.5.1
+
+    make
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+
+    # Compatibilidade com o pkg-config original
+    ln -sv pkgconf   "$DESTDIR/usr/bin/pkg-config"
+    ln -sv pkgconf.1 "$DESTDIR/usr/share/man/man1/pkg-config.1"
+}
