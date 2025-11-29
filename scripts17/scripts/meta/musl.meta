@@ -1,0 +1,85 @@
+# musl-1.2.5 como libc alternativa dentro de $LFS
+# com patches de segurança (CVE-2025-26519)
+#
+# Patches esperados em:
+#   $LFS/sources/musl-1.2.5-cve-2025-26519-1.patch
+#   $LFS/sources/musl-1.2.5-cve-2025-26519-2.patch
+#
+# URLs de referência:
+#   https://www.openwall.com/lists/musl/2025/02/13/1/1
+#   https://www.openwall.com/lists/musl/2025/02/13/1/2
+
+PKG_NAME="musl"
+
+PKG_BUILD() {
+    set -e
+
+    local MUSL_VER="1.2.5"
+
+    cd "$LFS/sources"
+
+    # Verificações básicas dos arquivos necessários
+    [[ -f "musl-${MUSL_VER}.tar.gz" ]] || [[ -f "musl-${MUSL_VER}.tar.xz" ]] || {
+        echo "ERRO: tarball musl-${MUSL_VER}.tar.* não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    [[ -f "musl-${MUSL_VER}-cve-2025-26519-1.patch" ]] || {
+        echo "ERRO: patch musl-${MUSL_VER}-cve-2025-26519-1.patch não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    [[ -f "musl-${MUSL_VER}-cve-2025-26519-2.patch" ]] || {
+        echo "ERRO: patch musl-${MUSL_VER}-cve-2025-26519-2.patch não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    # Extrair o tarball (independe se é .gz ou .xz)
+    tar -xf "musl-${MUSL_VER}.tar."*
+    cd "musl-${MUSL_VER}"
+
+    # Aplicar os dois patches de segurança
+    echo ">> Aplicando patch 1 (CVE-2025-26519) ..."
+    patch -Np1 -i "../musl-${MUSL_VER}-cve-2025-26519-1.patch"
+
+    echo ">> Aplicando patch 2 (CVE-2025-26519) ..."
+    patch -Np1 -i "../musl-${MUSL_VER}-cve-2025-26519-2.patch"
+
+    # Configure como libc alternativa (não mexe no glibc do LFS)
+    ./configure \
+        --prefix="$LFS/tools/musl" \
+        --exec-prefix="$LFS/tools" \
+        --syslibdir="$LFS/tools/musl/lib"
+
+    make
+    make install
+
+    # (Opcional) Criar um arquivo de path pro dynamic linker do musl dentro do LFS
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64) arch="x86_64" ;;
+        i?86)   arch="i386" ;;
+        aarch64) arch="aarch64" ;;
+        *) : ;; # deixa como está se não reconhecer
+    esac
+
+    mkdir -pv "$LFS/etc"
+    cat > "$LFS/etc/ld-musl-${arch}.path" << "EOF"
+# Caminhos de exemplo para libs ligadas ao musl dentro do LFS
+/tools/musl/lib
+/usr/local/musl/lib
+EOF
+
+    # Limpeza da árvore de fontes
+    cd "$LFS/sources"
+    rm -rf "musl-${MUSL_VER}"
+}
+
+PKG_CHECK() {
+    # Verifica se o wrapper musl-gcc existe e responde
+    if "$LFS/tools/bin/musl-gcc" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
