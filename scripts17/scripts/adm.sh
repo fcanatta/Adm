@@ -313,10 +313,10 @@ clear_pkg_stage() {
     # hashes esperados: aceitamos múltiplos separados por "|" ou espaço
     local -a sha256_list=() md5_list=()
     if [[ -n "$sha256_spec" ]]; then
-        IFS='| ' read -r - a sha256_list <<<"$sha256_spec"
+        IFS='| ' read -r -a sha256_list <<<"$sha256_spec"
     fi
     if [[ -n "$md5_spec" ]]; then
-        IFS='| ' read -r - a md5_list <<<"$md5_spec"
+        IFS='| ' read -r -a md5_list <<<"$md5_spec"
     fi
 
     local have_checksum=0
