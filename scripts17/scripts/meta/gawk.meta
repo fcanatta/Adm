@@ -1,0 +1,37 @@
+# Gawk-5.3.2 - LFS 6.9
+PKG_NAME="gawk"
+
+PKG_BUILD() {
+    set -e
+
+    : "${GAWK_VER:?GAWK_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "gawk-${GAWK_VER}.tar.xz" ]] || [[ -f "gawk-${GAWK_VER}.tar.gz" ]] || {
+        echo "ERRO: gawk-${GAWK_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "gawk-${GAWK_VER}.tar."*
+    cd "gawk-${GAWK_VER}"
+
+    # não instalar extras
+    sed -i 's/extras//' Makefile.in
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "gawk-${GAWK_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/gawk" ]]
+}
