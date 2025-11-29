@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-<desconhecido>}"
+phase="${2:-post_install}"
+
+echo "[$pkg] [$phase] Executando ldconfig para atualizar cache de bibliotecas compartilhadas..."
+
+if command -v ldconfig >/dev/null 2>&1; then
+    ldconfig
+    echo "[$pkg] [$phase] ldconfig executado com sucesso."
+else
+    echo "[$pkg] [$phase] Aviso: ldconfig não encontrado; cache de libs não foi atualizado."
+fi
