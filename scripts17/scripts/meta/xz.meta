@@ -1,4 +1,7 @@
 # Xz-5.8.1 - LFS 6.16
+# -------------------
+# Variáveis: XZ_VER, LFS, LFS_TGT
+
 PKG_NAME="xz"
 
 PKG_BUILD() {
@@ -18,22 +21,39 @@ PKG_BUILD() {
     tar -xf "xz-${XZ_VER}.tar."*
     cd "xz-${XZ_VER}"
 
-    ./configure --prefix=/usr                     \
-                --host="$LFS_TGT"                 \
-                --build="$(build-aux/config.guess)" \
-                --disable-static                  \
+    ./configure --prefix=/usr                        \
+                --host="$LFS_TGT"                    \
+                --build="$(build-aux/config.guess)"  \
+                --disable-static                     \
                 --docdir="/usr/share/doc/xz-${XZ_VER}"
 
     make
     make DESTDIR="$LFS" install
 
-    # remove .la perigoso pro cross
-    rm -v "$LFS/usr/lib/liblzma.la"
+    # remove .la pra não poluir o toolchain
+    rm -v "$LFS/usr/lib/liblzma.la" || true
 
     cd "$LFS/sources"
     rm -rf "xz-${XZ_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/xz" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/xz"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/unxz"
+  "/usr/bin/xzcat"
+)
+
+PKG_CHECK_LIBS=(
+  "/usr/lib/liblzma.so"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/xz --version"
+)
