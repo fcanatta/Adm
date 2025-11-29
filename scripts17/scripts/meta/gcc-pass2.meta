@@ -1,0 +1,88 @@
+# GCC-15.2.0 - Pass 2 (LFS 6.18)
+PKG_NAME="gcc-pass2"
+
+PKG_BUILD() {
+    set -e
+
+    : "${GCC_VER:?GCC_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "gcc-${GCC_VER}.tar.xz" ]] || [[ -f "gcc-${GCC_VER}.tar.gz" ]] || {
+        echo "ERRO: gcc-${GCC_VER}.tar.[xz|gz] não encontrado." >&2
+        exit 1
+    }
+
+    # Versões fixas do LFS
+    local MPFR_VER="4.2.2"
+    local GMP_VER="6.3.0"
+    local MPC_VER="1.3.1"
+
+    # Extrair GCC
+    tar -xf "gcc-${GCC_VER}.tar."*
+    cd "gcc-${GCC_VER}"
+
+    # Unpack MPFR/GMP/MPC
+    tar -xf "../mpfr-${MPFR_VER}.tar."*
+    mv -v "mpfr-${MPFR_VER}" mpfr
+
+    tar -xf "../gmp-${GMP_VER}.tar."*
+    mv -v "gmp-${GMP_VER}" gmp
+
+    tar -xf "../mpc-${MPC_VER}.tar."*
+    mv -v "mpc-${MPC_VER}" mpc
+
+    # Ajuste lib64→lib apenas para x86_64 (LFS 6.18.1)
+    case "$(uname -m)" in
+        x86_64)
+            sed -e '/m64=/s/lib64/lib/' \
+                -i.orig gcc/config/i386/t-linux64
+            ;;
+    esac
+
+    # Criar diretório de build
+    mkdir -v build
+    cd build
+
+    # Configure Pass2 (LFS 6.18.1)
+    ../configure                           \
+        --prefix=/usr                      \
+        --build="$(../config.guess)"       \
+        --host="$LFS_TGT"                  \
+        --enable-default-pie               \
+        --enable-default-ssp               \
+        --enable-languages=c,c++           \
+        --disable-multilib                 \
+        --disable-bootstrap                \
+        --disable-libgomp                  \
+        --disable-libatomic                \
+        --disable-libquadmath              \
+        --disable-libsanitizer             \
+        --disable-libvtv                   \
+        --disable-nls
+
+    make
+    make DESTDIR="$LFS" install
+
+    # Ajuste do linker specs para usar /usr/lib e /lib corretos
+    # (trecho baseado no livro, mas adaptado para garantir segurança)
+    "$LFS_TGT-gcc" -dumpspecs \
+        | sed -e "s@/tools@@g" \
+        > specs
+
+    install -v -m644 specs "$LFS/usr/lib/gcc/$LFS_TGT/$GCC_VER/specs"
+    rm -v specs
+
+    cd "$LFS/sources"
+    rm -rf "gcc-${GCC_VER}"
+}
+
+PKG_CHECK() {
+    # Verificação básica Pass 2
+    if "$LFS_TGT-gcc" --version >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
