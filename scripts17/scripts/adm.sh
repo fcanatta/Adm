@@ -326,15 +326,13 @@ download_one_source() {
 
     local attempts_per_mirror=3
 
-    # Função auxiliar para validar checksums de um arquivo
-    # Função auxiliar para validar checksums de um arquivo
+    # ---------- Validação de checksums (AGORA CORRETA) ----------
     _check_file_checksums() {
         local file="$1"
         local failed=0
 
         if ((${#sha256_list[@]} > 0)); then
-            local expected_s
-            local got_s
+            local expected_s got_s
             got_s=$(sha256sum "$file" | awk '{print $1}')
             local match=0
             for expected_s in "${sha256_list[@]}"; do
@@ -351,8 +349,7 @@ download_one_source() {
         fi
 
         if ((${#md5_list[@]} > 0)); then
-            local expected_m
-            local got_m
+            local expected_m got_m
             got_m=$(md5sum "$file" | awk '{print $1}')
             local match=0
             for expected_m in "${md5_list[@]}"; do
@@ -368,13 +365,117 @@ download_one_source() {
             fi
         fi
 
-        if (( failed == 0 )); then
-            log_debug "[$pkg] Checksums OK para $file"
+        return "$failed"   # 0 = OK, 1 = FALHOU
+    }
+
+    mkdir -p "$(dirname "$out")"
+
+    # Se já existe no cache, verifica checksum ANTES de qualquer coisa
+    if [[ -f "$out" && $have_checksum -eq 1 ]]; then
+        log_info "[$pkg] Source já no cache: $out, verificando checksums..."
+        if _check_file_checksums "$out"; then
+            log_info "[$pkg] Arquivo em cache válido, reaproveitando."
             return 0
         else
-            return 1
+            log_warn "[$pkg] Arquivo em cache com checksum inválido, removendo: $out"
+            rm -f "$out"
+        fi
+    elif [[ -f "$out" && $have_checksum -eq 0 ]]; then
+        log_info "[$pkg] Source já no cache: $out (sem checksums definidos)."
+        return 0
+    fi
+
+    # ---------- Download de uma única URL para tmpout ----------
+    _do_download_url() {
+        local url="$1" tmpout="$2"
+
+        if [[ "$url" == git://* || "$url" == *.git || "$url" == git+* ]]; then
+            require_cmd git
+            local tmpdir
+            tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/adm-git-XXXXXX")"
+            log_info "[$pkg] Clonando repositório git: $url"
+            if git clone --depth=1 "${url#git+}" "$tmpdir" >>"$LOG_FILE" 2>&1; then
+                ( cd "$tmpdir" && tar -cf "$tmpout" . ) >>"$LOG_FILE" 2>&1
+                rm -rf "$tmpdir"
+                return 0
+            else
+                log_warn "[$pkg] Falha ao clonar git: $url"
+                rm -rf "$tmpdir"
+                return 1
+            fi
+
+        elif [[ "$url" == rsync://* ]]; then
+            require_cmd rsync
+            log_info "[$pkg] Baixando via rsync: $url"
+            if rsync -av "$url" "$tmpout" >>"$LOG_FILE" 2>&1; then
+                return 0
+            else
+                log_warn "[$pkg] Falha no rsync: $url"
+                return 1
+            fi
+
+        else
+            # HTTP/HTTPS/FTP etc
+            if command -v curl >/dev/null 2>&1; then
+                log_info "[$pkg] Baixando via curl: $url"
+                if curl -L --fail --connect-timeout 15 --max-time 0 -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
+                    return 0
+                else
+                    log_warn "[$pkg] Falha no download via curl: $url"
+                    return 1
+                fi
+            elif command -v wget >/dev/null 2>&1; then
+                log_info "[$pkg] Baixando via wget: $url"
+                if wget -O "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
+                    return 0
+                else
+                    log_warn "[$pkg] Falha no download via wget: $url"
+                    return 1
+                fi
+            else
+                die "[$pkg] Nem curl nem wget encontrados para download HTTP/FTP."
+            fi
         fi
     }
+
+    # ---------- Tenta cada mirror com algumas tentativas ----------
+    local mirror
+    for mirror in "${mirrors[@]}"; do
+        [[ -z "$mirror" ]] && continue
+        log_info "[$pkg] Usando mirror: $mirror -> $out"
+
+        local attempt
+        for (( attempt=1; attempt<=attempts_per_mirror; attempt++ )); do
+            log_info "[$pkg] Download tentativa $attempt/$attempts_per_mirror: $mirror"
+
+            local tmpout="${out}.part"
+            rm -f "$tmpout"
+
+            if _do_download_url "$mirror" "$tmpout"; then
+                # Se temos checksums, valida ANTES de mover
+                if (( have_checksum == 1 )); then
+                    if _check_file_checksums "$tmpout"; then
+                        mv -f "$tmpout" "$out"
+                        log_info "[$pkg] Download concluído e checksum OK: $out"
+                        return 0
+                    else
+                        log_warn "[$pkg] Checksum inválido para arquivo baixado de $mirror (tentativa $attempt)."
+                        rm -f "$tmpout"
+                        continue
+                    fi
+                else
+                    mv -f "$tmpout" "$out"
+                    log_info "[$pkg] Download concluído (sem checksum): $out"
+                    return 0
+                fi
+            else
+                log_warn "[$pkg] Falha na tentativa $attempt de $mirror"
+            fi
+        done
+    done
+
+    die "[$pkg] Falha ao baixar source (todas URLs/tentativas esgotadas) para índice $idx -> $out"
+}
 
     mkdir -p "$(dirname "$out")"
 
@@ -789,9 +890,15 @@ is_installed() {
 
 register_install() {
     local pkg="$1" destdir="$2"
-    if [[ -z "$destdir" || "$destdir" == "/" ]]; then
-        die "[$pkg] register_install chamado com DESTDIR inválido: '$destdir'"
+
+    # Segurança extra com DESTDIR
+    if [[ -z "${destdir:-}" || "$destdir" == "/" ]]; then
+        die "[$pkg] DESTDIR inválido em register_install: '$destdir'"
     fi
+    if [[ ! -d "$destdir" ]]; then
+        die "[$pkg] DESTDIR não encontrado em register_install: $destdir"
+    fi
+
     mkdir -p "$(db_pkg_dir "$pkg")"
     local listfile
     listfile="$(db_files_list "$pkg")"
@@ -801,9 +908,9 @@ register_install() {
     : >"$listfile"
     : >"$manifest"
 
-    log_info "[$pkg] Registrando arquivos instalados"
+    log_info "[$pkg] Registrando arquivos instalados a partir de $destdir"
     (
-        cd "$destdir"
+        cd "$destdir" || die "[$pkg] Falha ao entrar em DESTDIR: $destdir"
         find . -type f -o -type l -o -type d | sed 's|^\./||' | while read -r path; do
             echo "/$path" >>"$listfile"
             if [[ -f "$path" ]]; then
