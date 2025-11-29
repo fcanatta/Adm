@@ -141,7 +141,7 @@ export_version_vars() {
   export BINUTILS_VER GCC_VER LINUX_VER GLIBC_VER LIBSTDCXX_VER
   export M4_VER NCURSES_VER BASH_VER COREUTILS_VER DIFFUTILS_VER
   export FILE_VER FINDUTILS_VER GAWK_VER GREP_VER GZIP_VER
-  export MAKE_VER PATCH_VER SED_VER TAR_VER XZ_VER
+  export MAKE_VER PATCH_VER SED_VER TAR_VER XZ_VER MUSL_VER
   export LFS
 }
 
@@ -294,6 +294,48 @@ cmd_build_one() {
   run_pkg "$pkg"
 }
 
+# Remove flag .done e log de um pacote, para permitir rebuild limpo
+cmd_clean_one() {
+  local pkg="$1"
+  local flag
+  flag="$(pkg_done_flag "$pkg")"
+
+  # Remove flag de concluído
+  if [[ -f "$flag" ]]; then
+    rm -f "$flag"
+    log INFO "Removido flag de conclusão: $flag"
+  else
+    log WARN "Flag de conclusão não existe para '$pkg' ($flag)"
+  fi
+
+  # Remove log específico do pacote
+  local pkg_log="$LOG_DIR/${pkg}.log"
+  if [[ -f "$pkg_log" ]]; then
+    rm -f "$pkg_log"
+    log INFO "Removido log de pacote: $pkg_log"
+  else
+    log WARN "Log do pacote '$pkg' não existe ($pkg_log)"
+  fi
+}
+
+# Rebuild = clean + build de um pacote
+cmd_rebuild_one() {
+  local pkg="$1"
+  cmd_clean_one "$pkg"
+  run_pkg "$pkg"
+}
+
+# Checagem rápida do toolchain via meta/toolchain-check.meta
+cmd_check_toolchain() {
+  # Usa verify_pkg para reaproveitar PKG_CHECK do meta
+  if verify_pkg "toolchain-check"; then
+    log INFO "Toolchain OK de acordo com meta toolchain-check."
+  else
+    log ERROR "Toolchain com problemas (veja logs e meta toolchain-check)."
+    return 1
+  fi
+}
+
 cmd_verify_all() {
   local failures=0
   local pkg
@@ -330,14 +372,20 @@ usage() {
 Uso: $(basename "$0") <comando> [pacote]
 
 Comandos:
-  build-all          - constrói todos os pacotes na ordem LFS até gcc-pass2
-  build <pacote>     - constrói um pacote específico (usa meta/<pacote>.meta)
-  verify-all         - roda PKG_CHECK (ou verificação simples) em todos
-  status             - mostra o que já foi concluído
+  build-all              - constrói todos os pacotes na ordem do BUILD_ORDER
+  build <pacote>         - constrói um pacote específico (usa meta/<pacote>.meta)
+  clean <pacote>         - apaga flag .done e log do pacote (para rebuild limpo)
+  rebuild <pacote>       - clean + build do pacote
+  verify-all             - roda PKG_CHECK (ou verificação simples) em todos
+  check-toolchain        - roda apenas a checagem do meta 'toolchain-check'
+  status                 - mostra o que já foi concluído
 
 Exemplos:
   LFS=/mnt/lfs $(basename "$0") build-all
   LFS=/mnt/lfs $(basename "$0") build gcc-pass1
+  LFS=/mnt/lfs $(basename "$0") clean gcc-pass1
+  LFS=/mnt/lfs $(basename "$0") rebuild gcc-pass1
+  LFS=/mnt/lfs $(basename "$0") check-toolchain
   LFS=/mnt/lfs $(basename "$0") verify-all
 EOF
 }
@@ -358,8 +406,19 @@ main() {
       [[ $# -ge 1 ]] || die "Informe o nome do pacote. Ex: $0 build gcc-pass1"
       cmd_build_one "$1"
       ;;
+    clean)
+      [[ $# -ge 1 ]] || die "Informe o nome do pacote. Ex: $0 clean gcc-pass1"
+      cmd_clean_one "$1"
+      ;;
+    rebuild)
+      [[ $# -ge 1 ]] || die "Informe o nome do pacote. Ex: $0 rebuild gcc-pass1"
+      cmd_rebuild_one "$1"
+      ;;
     verify-all)
       cmd_verify_all
+      ;;
+    check-toolchain)
+      cmd_check_toolchain
       ;;
     status)
       cmd_status
