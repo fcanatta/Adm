@@ -1,13 +1,31 @@
 # Binutils-2.45.1 - Pass 1 (LFS cross-toolchain)
+# ------------------------------------------------
+# Usa:
+#   - BINUTILS_VER   (do mini-adm)
+#   - LFS            (raiz do sistema em construção)
+#   - LFS_TGT        (triplet do target, ex: x86_64-lfs-linux-gnu)
+#
+# E a checagem de integridade usa o novo esquema genérico:
+#   PKG_MAIN_BIN, PKG_CHECK_BINS, PKG_CHECK_CMDS
+
 PKG_NAME="binutils-pass1"
 
-# Você pode usar BINUTILS_VER e LFS que vêm do mini-adm
 PKG_BUILD() {
     set -e
 
+    : "${BINUTILS_VER:?BINUTILS_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
     cd "$LFS/sources"
 
-    tar -xf "binutils-${BINUTILS_VER}.tar."* 
+    # Aceita .tar.xz ou .tar.gz
+    [[ -f "binutils-${BINUTILS_VER}.tar.xz" ]] || [[ -f "binutils-${BINUTILS_VER}.tar.gz" ]] || {
+        echo "ERRO: binutils-${BINUTILS_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "binutils-${BINUTILS_VER}.tar."*
     cd "binutils-${BINUTILS_VER}"
 
     mkdir -v build
@@ -15,21 +33,42 @@ PKG_BUILD() {
 
     ../configure --prefix="$LFS/tools" \
                  --with-sysroot="$LFS" \
-                 --target="$LFS_TGT" \
-                 --disable-nls \
+                 --target="$LFS_TGT"   \
+                 --disable-nls        \
                  --disable-werror
 
     make
     make install
 
+    # Limpeza dos fontes
     cd "$LFS/sources"
     rm -rf "binutils-${BINUTILS_VER}"
 }
 
-# Opcional: verificação mínima
-PKG_CHECK() {
-    # Verifica se o linker do cross-toolchain existe
-    if [[ -x "$LFS/tools/bin/${LFS_TGT}-ld" ]]; then
-        "$LFS/tools/bin/${LFS_TGT}-ld" --version >/dev/null 2>&1
-    fi
-}
+#######################################################
+# Checagem genérica (usa o run_generic_pkg_checks
+# que você adicionou no mini-adm)
+#
+# Paths são relativos à raiz $LFS.
+#######################################################
+
+# Binário principal: o linker do cross-toolchain
+PKG_MAIN_BIN="/tools/bin/${LFS_TGT}-ld"
+
+# Bins extras que queremos garantir:
+PKG_CHECK_BINS=(
+  "/tools/bin/${LFS_TGT}-as"
+  "/tools/bin/${LFS_TGT}-ar"
+  "/tools/bin/${LFS_TGT}-nm"
+)
+
+# Comandos de teste (rodados no HOST, não em chroot):
+# (o helper genérico vai chamar /bin/sh -lc "comando")
+PKG_CHECK_CMDS=(
+  "$LFS/tools/bin/${LFS_TGT}-ld --version"
+  "$LFS/tools/bin/${LFS_TGT}-as --version"
+  "$LFS/tools/bin/${LFS_TGT}-ar --version"
+)
+
+# Não precisamos definir PKG_CHECK():
+# o mini-adm vai usar apenas a checagem genérica acima.
