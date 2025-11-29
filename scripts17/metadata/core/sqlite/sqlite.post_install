@@ -1,0 +1,18 @@
+#!/bin/bash
+# sqlite.post_install – hook executado após a instalação do pacote
+set -euo pipefail
+
+pkgname="$1"
+hooktype="$2"
+
+echo "[HOOK] Executando $pkgname.$hooktype"
+
+# Atualiza cache de libs — necessário porque o sqlite instala libsqlite3.so
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig..."
+    ldconfig
+else
+    echo "[HOOK] ldconfig não encontrado; ignorando."
+fi
+
+echo "[HOOK] $pkgname.$hooktype concluído."
