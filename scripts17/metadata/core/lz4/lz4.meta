@@ -1,0 +1,47 @@
+# Lz4-1.10.0 — Linux From Scratch r12.4-46, Capítulo 8.9
+
+PKG_NAME="lz4"
+PKG_VERSION="1.10.0"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="Lz4 is a lossless compression algorithm with extremely fast compression and decompression."  # LFS 8.9
+
+PKG_HOMEPAGE="https://lz4.org/"
+PKG_SOURCE_URLS=(
+    "https://github.com/lz4/lz4/releases/download/v${PKG_VERSION}/lz4-${PKG_VERSION}.tar.gz"
+)
+
+# De 3.2 All Packages (Lz4 (1.10.0))
+PKG_MD5S=(
+    "dead9f5f1966d9ae56e1e32761e4e675"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+# Opcional: suporte a upgrade automático
+PKG_UPSTREAM_URL="https://github.com/lz4/lz4/releases"
+PKG_UPSTREAM_REGEX='lz4-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # LFS 8.9.1 — compile:
+    #   make BUILD_STATIC=no PREFIX=/usr
+    make BUILD_STATIC=no PREFIX=/usr
+
+    # Testes (LFS: make -j1 check)
+    make -j1 check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # LFS: make BUILD_STATIC=no PREFIX=/usr install
+    # Adaptado pro DESTDIR do adm:
+    make BUILD_STATIC=no PREFIX=/usr DESTDIR="${DESTDIR}" install
+}
