@@ -1,0 +1,86 @@
+# OpenSSL-3.6.0 — Linux From Scratch r12.4-46, Capítulo 8.49
+
+PKG_NAME="openssl"
+PKG_VERSION="3.6.0"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The OpenSSL package contains management tools and libraries relating to cryptography."
+
+# Conforme 3.2 All Packages
+PKG_HOMEPAGE="https://www.openssl-library.org/"
+PKG_SOURCE_URLS=(
+    "https://github.com/openssl/openssl/releases/download/openssl-${PKG_VERSION}/openssl-${PKG_VERSION}.tar.gz"
+)
+
+# MD5 exato da tabela 3.2 (OpenSSL 3.6.0)
+# MD5 sum: 77ab78417082f22a2ce809898bd44da0
+PKG_MD5S=(
+    "77ab78417082f22a2ce809898bd44da0"
+)
+
+# O capítulo 8.49 assume o toolchain básico já instalado;
+# não declara dependências extras específicas aqui.
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+# Opcional: usado pelo adm pra checar upstream
+PKG_UPSTREAM_URL="https://github.com/openssl/openssl/releases"
+PKG_UPSTREAM_REGEX='openssl-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # 8.49.1. Installation of OpenSSL (LFS)
+    # ./config --prefix=/usr         \
+    #          --openssldir=/etc/ssl \
+    #          --libdir=lib          \
+    #          shared                \
+    #          zlib-dynamic
+    ./config --prefix=/usr         \
+             --openssldir=/etc/ssl \
+             --libdir=lib          \
+             shared                \
+             zlib-dynamic
+
+    # Compilar
+    make
+
+    # Testes (opcional mas recomendado pelo livro):
+    # HARNESS_JOBS=$(nproc) make test
+    HARNESS_JOBS="$(nproc)" make test
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # Estamos no diretório de build do OpenSSL.
+    # O adm já exporta DESTDIR apontando para o root temporário.
+
+    # Passo do LFS:
+    #   sed -i '/INSTALL_LIBS/s/libcrypto.a libssl.a//' Makefile
+    sed -i '/INSTALL_LIBS/s/libcrypto.a libssl.a//' Makefile
+
+    # LFS:
+    #   make MANSUFFIX=ssl install
+    # Aqui adaptado para DESTDIR:
+    make MANSUFFIX=ssl DESTDIR="${DESTDIR}" install
+
+    # LFS:
+    #   mv -v /usr/share/doc/openssl /usr/share/doc/openssl-3.6.0
+    # Adaptado para DESTDIR:
+    if [[ -d "${DESTDIR}/usr/share/doc/openssl" ]]; then
+        mv -v "${DESTDIR}/usr/share/doc/openssl" \
+              "${DESTDIR}/usr/share/doc/openssl-${PKG_VERSION}"
+    fi
+
+    # LFS:
+    #   cp -vfr doc/* /usr/share/doc/openssl-3.6.0
+    # Adaptado para DESTDIR:
+    if [[ -d "${DESTDIR}/usr/share/doc/openssl-${PKG_VERSION}" ]]; then
+        cp -vfr doc/* "${DESTDIR}/usr/share/doc/openssl-${PKG_VERSION}"
+    fi
+}
