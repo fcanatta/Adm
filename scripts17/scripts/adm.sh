@@ -186,7 +186,7 @@ load_metadata() {
     : "${PKG_NAME:=$pkg}"
     : "${PKG_VERSION:?PKG_VERSION não definido em metadata de $pkg}"
     : "${PKG_RELEASE:=1}"
-    : "${PKG_SOURCE_URLS:?PKG_SOURCE_URLS não definido em metadata de $pkg}"
+    : "${PKG_SOURCE_URLS:=()}"
     : "${PKG_DEPENDS:=()}"
     : "${PKG_GROUPS:=()}"
 
@@ -593,9 +593,17 @@ extract_sources() {
                     unzip -q "$src" -d "$builddir"
                     ;;
                 *)
-                    if [[ "$mime" == application/x-tar* || "$mime" == application/x-xz* || "$mime" == application/zstd* ]]; then
+                    if [[ "$mime" == application/x-tar* || "$mime" == application/x-xz* ]]; then
                         log_info "[$pkg] Extraindo via tar (mime: $mime): $src"
                         tar -xf "$src" -C "$builddir"
+                    elif [[ "$mime" == application/zstd* ]]; then
+                        log_info "[$pkg] Extraindo via tar+zstd (mime: $mime): $src"
+                        if tar --help 2>/dev/null | grep -q -- '--zstd'; then
+                            tar -xf "$src" -C "$builddir"
+                        else
+                            require_cmd zstd
+                            zstd -d -c "$src" | tar -xf - -C "$builddir"
+                        fi
                     else
                         log_warn "[$pkg] Formato desconhecido, copiando bruto: $src"
                         cp "$src" "$builddir/"
@@ -1051,7 +1059,8 @@ build_package() {
         if tar --help 2>/dev/null | grep -q -- '--zstd'; then
             ( cd "$destdir" && tar --zstd -cf "$pkgfile_zst" . )
         else
-            # fallback manual
+            # fallback manual: exige 'zstd' instalado
+            require_cmd zstd 
             ( cd "$destdir" && tar -cf - . | zstd -19 -o "$pkgfile_zst" )
         fi
         if [[ ! -f "$pkgfile_zst" ]]; then
