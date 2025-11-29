@@ -1,0 +1,32 @@
+# Gzip-1.14 - LFS 6.11
+PKG_NAME="gzip"
+
+PKG_BUILD() {
+    set -e
+
+    : "${GZIP_VER:?GZIP_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "gzip-${GZIP_VER}.tar.xz" ]] || [[ -f "gzip-${GZIP_VER}.tar.gz" ]] || {
+        echo "ERRO: gzip-${GZIP_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "gzip-${GZIP_VER}.tar."*
+    cd "gzip-${GZIP_VER}"
+
+    ./configure --prefix=/usr --host="$LFS_TGT"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "gzip-${GZIP_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/gzip" ]]
+}
