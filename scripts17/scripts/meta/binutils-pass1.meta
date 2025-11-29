@@ -1,0 +1,35 @@
+# Binutils-2.45.1 - Pass 1 (LFS cross-toolchain)
+PKG_NAME="binutils-pass1"
+
+# Você pode usar BINUTILS_VER e LFS que vêm do mini-adm
+PKG_BUILD() {
+    set -e
+
+    cd "$LFS/sources"
+
+    tar -xf "binutils-${BINUTILS_VER}.tar."* 
+    cd "binutils-${BINUTILS_VER}"
+
+    mkdir -v build
+    cd build
+
+    ../configure --prefix="$LFS/tools" \
+                 --with-sysroot="$LFS" \
+                 --target="$LFS_TGT" \
+                 --disable-nls \
+                 --disable-werror
+
+    make
+    make install
+
+    cd "$LFS/sources"
+    rm -rf "binutils-${BINUTILS_VER}"
+}
+
+# Opcional: verificação mínima
+PKG_CHECK() {
+    # Verifica se o linker do cross-toolchain existe
+    if [[ -x "$LFS/tools/bin/${LFS_TGT}-ld" ]]; then
+        "$LFS/tools/bin/${LFS_TGT}-ld" --version >/dev/null 2>&1
+    fi
+}
