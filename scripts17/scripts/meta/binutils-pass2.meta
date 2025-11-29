@@ -1,4 +1,14 @@
 # Binutils-2.45.1 - Pass 2 (LFS 6.17)
+# -----------------------------------
+# Usa:
+#   - BINUTILS_VER
+#   - LFS
+#   - LFS_TGT
+#
+# Instala binutils temporário em $LFS/usr (ld, as, ar, nm, etc.)
+# e usa checagem genérica do mini-adm:
+#   PKG_MAIN_BINS, PKG_CHECK_BINS, PKG_CHECK_LIBS, PKG_CHECK_CMDS
+
 PKG_NAME="binutils-pass2"
 
 PKG_BUILD() {
@@ -10,41 +20,72 @@ PKG_BUILD() {
 
     cd "$LFS/sources"
 
+    # Tarball
     [[ -f "binutils-${BINUTILS_VER}.tar.xz" ]] || [[ -f "binutils-${BINUTILS_VER}.tar.gz" ]] || {
-        echo "ERRO: binutils-${BINUTILS_VER}.tar.[xz|gz] não encontrado." >&2
+        echo "ERRO: binutils-${BINUTILS_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
         exit 1
     }
 
     tar -xf "binutils-${BINUTILS_VER}.tar."*
     cd "binutils-${BINUTILS_VER}"
 
+    # Workaround do LFS (linha ~6031 do ltmain.sh)
+    sed '6031s/$add_dir//' -i ltmain.sh || sed '6009s/$add_dir//' -i ltmain.sh || true
+
     mkdir -v build
     cd build
 
-    # Configure Pass 2 (LFS 6.17.1)
-    ../configure               \
-        --prefix=/usr          \
+    ../configure                   \
+        --prefix=/usr              \
         --build="$(../config.guess)" \
-        --host="$LFS_TGT"      \
-        --disable-nls          \
-        --enable-shared        \
-        --enable-gprofng=no
+        --host="$LFS_TGT"          \
+        --disable-nls              \
+        --enable-shared            \
+        --enable-gprofng=no        \
+        --disable-werror           \
+        --enable-64-bit-bfd        \
+        --enable-new-dtags         \
+        --enable-default-hash-style=gnu
 
     make
-
     make DESTDIR="$LFS" install
 
-    # Remove libtool archive
-    rm -v "$LFS"/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.la
+    # Remover arquivos .a/.la que atrapalham cross
+    rm -v "$LFS"/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes,sframe}.{a,la} || true
 
     cd "$LFS/sources"
     rm -rf "binutils-${BINUTILS_VER}"
 }
 
-PKG_CHECK() {
-    # Checar se o ld do Pass2 está no lugar
-    if [[ -x "$LFS/usr/bin/ld" ]]; then
-        return 0
-    fi
-    return 1
-}
+#######################################################
+# Checagem genérica (run_generic_pkg_checks - mini-adm)
+# Paths relativos a $LFS
+#######################################################
+
+# Bins principais
+PKG_MAIN_BINS=(
+  "/usr/bin/ld"
+  "/usr/bin/as"
+)
+
+# Bins extras que queremos garantir
+PKG_CHECK_BINS=(
+  "/usr/bin/ar"
+  "/usr/bin/nm"
+  "/usr/bin/objdump"
+  "/usr/bin/objcopy"
+)
+
+# Bibliotecas principais de binutils
+PKG_CHECK_LIBS=(
+  "/usr/lib/libbfd.so"
+  "/usr/lib/libopcodes.so"
+)
+
+# Comandos de teste (no host, usando o tree do $LFS)
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/ld --version"
+  "$LFS/usr/bin/as --version"
+  "$LFS/usr/bin/ar --version"
+)
+# Sem PKG_CHECK personalizado: mini-adm usa só a genérica.
