@@ -1,0 +1,64 @@
+# Ncurses-6.5-20250809 - LFS r12.4-46 (8.31)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/ncurses.html
+
+PKG_NAME="ncurses"
+PKG_VERSION="6.5-20250809"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://invisible-mirror.net/archives/ncurses/current/ncurses-6.5-20250809.tgz"
+)
+
+# LFS r12.4-dev packages list
+# MD5: 679987405412f970561cc85e1e6428a2
+PKG_MD5S=(
+  "679987405412f970561cc85e1e6428a2"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("core" "libs")
+
+PKG_UPSTREAM_URL="https://www.gnu.org/software/ncurses/"
+PKG_UPSTREAM_REGEX='ncurses-([0-9.0-9-]+)\.tgz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr           \
+                --mandir=/usr/share/man \
+                --with-shared           \
+                --without-debug         \
+                --without-normal        \
+                --with-cxx-shared       \
+                --enable-pc-files       \
+                --with-pkg-config-libdir=/usr/lib/pkgconfig
+
+    make
+    # test suite só depois da instalação (como no LFS), então fica fora daqui
+}
+
+PKG_INSTALL() {
+    # Segue a lógica do LFS, mas instalada em DESTDIR em vez de /
+    local stagedir="$PWD/dest"
+
+    make DESTDIR="$stagedir" install
+
+    # força o uso de wide-char ABI no curses.h do stagedir
+    sed -e 's/^#if.*XOPEN.*$/#if 1/' \
+        -i "$stagedir/usr/include/curses.h"
+
+    # copia para DESTDIR com --remove-destination como no livro
+    mkdir -p "$DESTDIR"
+    cp --remove-destination -av "$stagedir"/* "$DESTDIR"/
+
+    # symlinks para compat (ajustados para DESTDIR)
+    for lib in ncurses form panel menu ; do
+        ln -sfv "lib${lib}w.so" "$DESTDIR/usr/lib/lib${lib}.so"
+        ln -sfv "${lib}w.pc"    "$DESTDIR/usr/lib/pkgconfig/${lib}.pc"
+    done
+
+    # libcurses.so -> libncursesw.so
+    ln -sfv libncursesw.so "$DESTDIR/usr/lib/libcurses.so"
+
+    # documentação opcional (como no LFS)
+    mkdir -p "$DESTDIR/usr/share/doc"
+    cp -v -R doc -T "$DESTDIR/usr/share/doc/ncurses-6.5-20250809"
+}
