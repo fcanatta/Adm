@@ -1,4 +1,7 @@
 # Make-4.4.1 - LFS 6.12
+# ---------------------
+# Variáveis: MAKE_VER, LFS, LFS_TGT
+
 PKG_NAME="make"
 
 PKG_BUILD() {
@@ -29,6 +32,14 @@ PKG_BUILD() {
     rm -rf "make-${MAKE_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/make" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/make"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/make --version"
+)
