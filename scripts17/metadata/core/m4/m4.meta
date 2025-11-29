@@ -1,0 +1,36 @@
+# M4-1.4.20 - LFS r12.4-46 (8.14)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/m4.html
+
+PKG_NAME="m4"
+PKG_VERSION="1.4.20"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/m4/m4-1.4.20.tar.xz"
+)
+
+# From LFS r12.4-dev packages list
+# MD5: 6eb2ebed5b24e74b6e890919331d2132
+PKG_MD5S=(
+  "6eb2ebed5b24e74b6e890919331d2132"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("devel" "tools")
+
+PKG_UPSTREAM_URL="https://www.gnu.org/software/m4/"
+PKG_UPSTREAM_REGEX='m4-([0-9.]+)\.tar\.xz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
