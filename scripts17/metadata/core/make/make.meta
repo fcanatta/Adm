@@ -1,0 +1,48 @@
+# Make-${PKG_VERSION} - LFS r12.4-46 (8.71)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/make.html
+
+PKG_NAME="make"
+PKG_VERSION="4.4.1"
+PKG_RELEASE=1
+
+# Fonte oficial GNU + mirror
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/make/make-${PKG_VERSION}.tar.gz"
+  "https://ftpmirror.gnu.org/gnu/make/make-${PKG_VERSION}.tar.gz"
+)
+
+# SHA256 do tarball .tar.gz
+# make-4.4.1.tar.gz → dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3
+PKG_SHA256S=(
+  "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
+)
+
+# Sem dependências explícitas aqui (tudo que LFS exige já está presente no capítulo)
+PKG_DEPENDS=()
+
+# Agrupa como ferramenta de desenvolvimento
+PKG_GROUPS=("core")
+
+# Dados para o sistema de update do adm
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/make/"
+PKG_UPSTREAM_REGEX='make-([0-9.]+)\.tar\.gz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr
+    make
+
+    # Testes conforme o livro LFS:
+    #   chown -R tester .
+    #   su tester -c "PATH=$PATH make check"
+    #
+    # Controlado por ADM_RUN_TESTS (1 = roda testes, 0 = pula)
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        chown -R tester .
+        su tester -c "PATH=$PATH make check"
+    fi
+}
+
+PKG_INSTALL() {
+    # Instalação com DESTDIR para o adm
+    make DESTDIR="$DESTDIR" install
+}
