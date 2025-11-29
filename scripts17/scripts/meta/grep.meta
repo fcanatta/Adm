@@ -1,0 +1,34 @@
+# Grep-3.12 - LFS 6.10
+PKG_NAME="grep"
+
+PKG_BUILD() {
+    set -e
+
+    : "${GREP_VER:?GREP_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "grep-${GREP_VER}.tar.xz" ]] || [[ -f "grep-${GREP_VER}.tar.gz" ]] || {
+        echo "ERRO: grep-${GREP_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "grep-${GREP_VER}.tar."*
+    cd "grep-${GREP_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(./build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "grep-${GREP_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/grep" ]]
+}
