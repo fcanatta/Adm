@@ -1,4 +1,10 @@
 # Ncurses-6.5-20250809 - LFS 6.3 (Cross Compiling Temporary Tools)
+# ---------------------------------------------------------------
+# Pré-requisitos:
+#   - TOOLCHAIN pass1 + m4
+# Variáveis:
+#   - NCURSES_VER, LFS, LFS_TGT
+
 PKG_NAME="ncurses"
 
 PKG_BUILD() {
@@ -18,7 +24,7 @@ PKG_BUILD() {
     tar -xf "ncurses-${NCURSES_VER}.tar."*
     cd "ncurses-${NCURSES_VER}"
 
-    # 1) Construir tic no host e instalar em $LFS/tools (6.3.1)
+    # 1) Construir tic pro host e instalar em $LFS/tools (como no LFS)
     mkdir -v build
     pushd build
       ../configure --prefix="$LFS/tools" AWK=gawk
@@ -27,28 +33,28 @@ PKG_BUILD() {
       install -v progs/tic "$LFS/tools/bin"
     popd
 
-    # 2) Configure para cross (6.3.1)
+    # 2) Configure cross
     ./configure --prefix=/usr                \
                 --host="$LFS_TGT"           \
                 --build="$(./config.guess)" \
-                --mandir=/usr/share/man      \
+                --mandir=/usr/share/man     \
                 --with-manpage-format=normal \
-                --with-shared                \
-                --without-normal             \
-                --with-cxx-shared            \
-                --without-debug              \
-                --without-ada                \
-                --disable-stripping          \
+                --with-shared               \
+                --without-normal            \
+                --with-cxx-shared           \
+                --without-debug             \
+                --without-ada               \
+                --disable-stripping         \
                 AWK=gawk
 
-    # 3) Build
     make
 
-    # 4) Instalar temporário (DESTDIR=$LFS) e ajustes (6.3.1)
     make DESTDIR="$LFS" install
 
+    # link libncurses.so -> libncursesw.so
     ln -svf libncursesw.so "$LFS/usr/lib/libncurses.so"
 
+    # habilitar XOPEN em curses.h
     sed -e 's/^#if.*XOPEN.*$/#if 1/' \
         -i "$LFS/usr/include/curses.h"
 
@@ -56,21 +62,31 @@ PKG_BUILD() {
     rm -rf "ncurses-${NCURSES_VER}"
 }
 
-PKG_CHECK() {
-    # Verifica se a lib wide e o link libncurses.so existem
-    local ok=0
+#######################################################
+# Checagem genérica (run_generic_pkg_checks - mini-adm)
+#######################################################
 
-    if [[ -f "$LFS/usr/lib/libncursesw.so" ]]; then
-        ok=$((ok+1))
-    else
-        echo "ncurses CHECK: não encontrei $LFS/usr/lib/libncursesw.so" >&2
-    fi
+# Binário principal de tipo: tic (compila terminfo)
+PKG_MAIN_BINS=(
+  "/usr/bin/tic"
+)
 
-    if [[ -L "$LFS/usr/lib/libncurses.so" ]]; then
-        ok=$((ok+1))
-    else
-        echo "ncurses CHECK: não encontrei symlink $LFS/usr/lib/libncurses.so" >&2
-    fi
+PKG_CHECK_BINS=(
+  "/usr/bin/tput"
+  "/usr/bin/clear"
+)
 
-    (( ok >= 2 ))
-}
+PKG_CHECK_LIBS=(
+  "/usr/lib/libncursesw.so"
+  "/usr/lib/libncurses.so"
+)
+
+PKG_CHECK_DIRS=(
+  "/usr/include"
+  "/usr/share/terminfo"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/tic -V"
+  "$LFS/usr/bin/tput cols >/dev/null"
+)
