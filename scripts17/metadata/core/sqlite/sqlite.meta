@@ -1,0 +1,79 @@
+# Sqlite-3510000 - LFS r12.4-46 (8.52)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/sqlite.html
+
+# Atenção: aqui usamos o "version code" 3510000 como o LFS,
+# e convertimos para 3.51.0 só na hora de instalar a documentação.
+
+PKG_NAME="sqlite"
+PKG_VERSION="3510000"   # corresponde a 3.51.0
+PKG_RELEASE=1
+
+# Fontes:
+# - sqlite-autoconf-${PKG_VERSION}.tar.gz vem do site oficial
+# - sqlite-doc-${PKG_VERSION}.tar.xz vem do servidor anduin da LFS
+PKG_SOURCE_URLS=(
+  "https://sqlite.org/2025/sqlite-autoconf-${PKG_VERSION}.tar.gz"
+  "https://anduin.linuxfromscratch.org/LFS/sqlite-doc-${PKG_VERSION}.tar.xz"
+)
+
+# LFS fornece MD5 para esses arquivos (r12.4-46 / r12.4-45 list de pacotes)
+PKG_MD5S=(
+  "cfcf0004cb6893d2555b33d89ff39cb6"  # sqlite-autoconf-${PKG_VERSION}.tar.gz
+  "383d8db5502bbc385c0415fe3f653cf4"  # sqlite-doc-${PKG_VERSION}.tar.xz
+)
+
+# Sem dependências adicionais explícitas no livro
+PKG_DEPENDS=()
+
+# Grupo lógico (ajuste conforme seu esquema: "libs", "devel", etc.)
+PKG_GROUPS=("core")
+
+# Dados para o sistema de update do adm:
+# Usa o codenum (3510000, 3510100, etc.) para facilitar o upgrade automático.
+PKG_UPSTREAM_URL="https://sqlite.org/download.html"
+PKG_UPSTREAM_REGEX='sqlite-autoconf-([0-9]{7})\.tar\.gz'
+
+# -------------------------------------------------------------------
+# Funções de build/install para o adm
+# -------------------------------------------------------------------
+
+PKG_BUILD() {
+    # Descompacta documentação (como no livro):
+    #   tar -xf ../sqlite-doc-3510000.tar.xz
+    # Aqui assumimos que o adm extraiu as duas fontes no mesmo dir
+    if [[ -f ../sqlite-doc-${PKG_VERSION}.tar.xz ]]; then
+        tar -xf ../sqlite-doc-${PKG_VERSION}.tar.xz
+    fi
+
+    ./configure --prefix=/usr     \
+                --disable-static  \
+                --enable-fts{4,5} \
+                CPPFLAGS="-D SQLITE_ENABLE_COLUMN_METADATA=1 \
+                          -D SQLITE_ENABLE_UNLOCK_NOTIFY=1   \
+                          -D SQLITE_ENABLE_DBSTAT_VTAB=1     \
+                          -D SQLITE_SECURE_DELETE=1"
+
+    # LFS: make LDFLAGS.rpath=""
+    make LDFLAGS.rpath=""
+
+    # Não existe suíte de testes para este pacote no LFS
+}
+
+PKG_INSTALL() {
+    # Instalação em DESTDIR (adm sempre trabalha com DESTDIR)
+    make DESTDIR="$DESTDIR" install
+
+    # Converter o "version code" 3510000 em versão humana 3.51.0
+    # Formato padrão do SQLite: XYYZZ00 -> X.YY.ZZ
+    local hv_major hv_minor hv_patch hv
+    hv_major="${PKG_VERSION:0:1}"
+    hv_minor="${PKG_VERSION:1:2}"
+    hv_patch=$((10#${PKG_VERSION:3:2}))   # remove zeros à esquerda
+    hv="${hv_major}.${hv_minor}.${hv_patch}"
+
+    # Doc dir como no livro: /usr/share/doc/sqlite-3.51.0
+    install -v -m755 -d "$DESTDIR/usr/share/doc/sqlite-${hv}"
+    if [[ -d sqlite-doc-${PKG_VERSION} ]]; then
+        cp -v -R sqlite-doc-${PKG_VERSION}/* "$DESTDIR/usr/share/doc/sqlite-${hv}"
+    fi
+}
