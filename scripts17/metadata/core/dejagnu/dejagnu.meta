@@ -1,0 +1,51 @@
+# DejaGNU-1.6.3 - LFS r12.4-dev (8.19)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/dejagnu.html
+
+PKG_NAME="dejagnu"
+PKG_VERSION="1.6.3"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/dejagnu/dejagnu-1.6.3.tar.gz"
+)
+
+# LFS r12.4-dev packages list
+# MD5: 68c5208c58236eba447d7d6d1326b821
+PKG_MD5S=(
+  "68c5208c58236eba447d7d6d1326b821"
+)
+
+# DejaGNU é escrito em expect/tcl -> depende de Expect (e logo de Tcl)
+PKG_DEPENDS=(
+  "expect"
+  "tcl"
+)
+
+PKG_GROUPS=("devel" "tests")
+
+PKG_UPSTREAM_URL="https://www.gnu.org/software/dejagnu/"
+PKG_UPSTREAM_REGEX='dejagnu-([0-9.]+)\.tar\.gz'
+
+PKG_BUILD() {
+    mkdir -v build
+    cd build
+
+    ../configure --prefix=/usr
+
+    # docs (como no LFS)
+    makeinfo --html --no-split -o doc/dejagnu.html ../doc/dejagnu.texi
+    makeinfo --plaintext       -o doc/dejagnu.txt  ../doc/dejagnu.texi
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    cd build
+
+    make DESTDIR="$DESTDIR" install
+
+    install -v -dm755  "$DESTDIR/usr/share/doc/dejagnu-1.6.3"
+    install -v -m644   doc/dejagnu.{html,txt} "$DESTDIR/usr/share/doc/dejagnu-1.6.3"
+}
