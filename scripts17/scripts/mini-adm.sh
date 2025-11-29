@@ -158,8 +158,11 @@ load_meta() {
 
   [[ -f "$meta_file" ]] || die "Metadata não encontrado: $meta_file"
 
-  # limpamos funções antigas pra evitar lixo de outros metas
-  unset PKG_NAME PKG_BUILD PKG_INSTALL PKG_CHECK || true
+  # limpamos funções e variáveis de checagem antigas pra evitar lixo de outros metas
+  unset PKG_NAME PKG_BUILD PKG_INSTALL PKG_CHECK \
+        PKG_MAIN_BIN PKG_MAIN_BINS \
+        PKG_CHECK_BINS PKG_CHECK_LIBS PKG_CHECK_DIRS PKG_CHECK_CMDS \
+        PKG_CHECK_CHROOT || true
 
   # shellcheck source=/dev/null
   source "$meta_file"
@@ -210,6 +213,144 @@ run_pkg() {
   echo "=== $(timestamp) : FIM OK $pkg ===" >>"$pkg_log"
 }
 
+# Checagem genérica baseada em variáveis do metadata:
+#   PKG_MAIN_BIN         - string, caminho relativo à raiz do LFS (ex: /usr/bin/gcc)
+#   PKG_MAIN_BINS        - array, vários binários principais
+#   PKG_CHECK_BINS       - array, executáveis adicionais
+#   PKG_CHECK_LIBS       - array, arquivos de biblioteca (ex: /usr/lib/libc.so.6)
+#   PKG_CHECK_DIRS       - array, diretórios que devem existir
+#   PKG_CHECK_CMDS       - array, comandos para rodar
+#   PKG_CHECK_CHROOT=1   - se definido e =1, PKG_CHECK_CMDS rodam em chroot $LFS
+#
+# Retornos:
+#   0 - tudo OK
+#   1 - algum check falhou
+#   2 - nenhum critério genérico definido
+run_generic_pkg_checks() {
+  local pkg="$1"
+  local total=0
+  local fail=0
+  local has_cfg=0
+
+  # Detecta se há algum critério configurado
+  if [[ -n "${PKG_MAIN_BIN:-}" ]]; then has_cfg=1; fi
+  if [[ "${PKG_MAIN_BINS+set}" == "set" ]];      then has_cfg=1; fi
+  if [[ "${PKG_CHECK_BINS+set}" == "set" ]];     then has_cfg=1; fi
+  if [[ "${PKG_CHECK_LIBS+set}" == "set" ]];     then has_cfg=1; fi
+  if [[ "${PKG_CHECK_DIRS+set}" == "set" ]];     then has_cfg=1; fi
+  if [[ "${PKG_CHECK_CMDS+set}" == "set" ]];     then has_cfg=1; fi
+
+  if (( has_cfg == 0 )); then
+    # Nenhuma checagem declarada nesse meta
+    return 2
+  fi
+
+  # Helper interno para checar um path sob $LFS
+  _check_path() {
+    local kind="$1"   # BIN | LIB | DIR
+    local path="$2"
+    local full="$LFS$path"
+
+    case "$kind" in
+      BIN)
+        if [[ -x "$full" ]]; then
+          log INFO "Check [$pkg] bin OK: $path"
+        else
+          log ERROR "Check [$pkg] bin FALHOU: $path (não executável em $full)"
+          fail=$((fail+1))
+        fi
+        ;;
+      LIB)
+        if [[ -f "$full" ]]; then
+          log INFO "Check [$pkg] lib OK: $path"
+        else
+          log ERROR "Check [$pkg] lib FALHOU: $path (não existe em $full)"
+          fail=$((fail+1))
+        fi
+        ;;
+      DIR)
+        if [[ -d "$full" ]]; then
+          log INFO "Check [$pkg] dir OK: $path"
+        else
+          log ERROR "Check [$pkg] dir FALHOU: $path (não existe em $full)"
+          fail=$((fail+1))
+        fi
+        ;;
+    esac
+    total=$((total+1))
+  }
+
+  # 1) PKG_MAIN_BIN (string única)
+  if [[ -n "${PKG_MAIN_BIN:-}" ]]; then
+    _check_path BIN "$PKG_MAIN_BIN"
+  fi
+
+  # 2) PKG_MAIN_BINS (array)
+  if [[ "${PKG_MAIN_BINS+set}" == "set" ]]; then
+    local b
+    for b in "${PKG_MAIN_BINS[@]}"; do
+      _check_path BIN "$b"
+    done
+  fi
+
+  # 3) PKG_CHECK_BINS
+  if [[ "${PKG_CHECK_BINS+set}" == "set" ]]; then
+    local b
+    for b in "${PKG_CHECK_BINS[@]}"; do
+      _check_path BIN "$b"
+    done
+  fi
+
+  # 4) PKG_CHECK_LIBS
+  if [[ "${PKG_CHECK_LIBS+set}" == "set" ]]; then
+    local f
+    for f in "${PKG_CHECK_LIBS[@]}"; do
+      _check_path LIB "$f"
+    done
+  fi
+
+  # 5) PKG_CHECK_DIRS
+  if [[ "${PKG_CHECK_DIRS+set}" == "set" ]]; then
+    local d
+    for d in "${PKG_CHECK_DIRS[@]}"; do
+      _check_path DIR "$d"
+    done
+  fi
+
+  # 6) PKG_CHECK_CMDS (com ou sem chroot)
+  if [[ "${PKG_CHECK_CMDS+set}" == "set" ]]; then
+    local cmd
+    for cmd in "${PKG_CHECK_CMDS[@]}"; do
+      total=$((total+1))
+      if [[ "${PKG_CHECK_CHROOT:-0}" -eq 1 ]]; then
+        log INFO "Check [$pkg] cmd (chroot) → $cmd"
+        if chroot "$LFS" /bin/sh -lc "$cmd" >/dev/null 2>&1; then
+          log INFO "Check [$pkg] cmd OK (chroot): $cmd"
+        else
+          log ERROR "Check [$pkg] cmd FALHOU (chroot): $cmd"
+          fail=$((fail+1))
+        fi
+      else
+        log INFO "Check [$pkg] cmd → $cmd"
+        if /bin/sh -lc "$cmd" >/dev/null 2>&1; then
+          log INFO "Check [$pkg] cmd OK: $cmd"
+        else
+          log ERROR "Check [$pkg] cmd FALHOU: $cmd"
+          fail=$((fail+1))
+        fi
+      fi
+    done
+  fi
+
+  # Resultado final
+  if (( fail > 0 )); then
+    return 1
+  fi
+
+  # Se chegou aqui, havia critérios e nenhum falhou
+  return 0
+}
+
 ########################################
 # 8. Verificação de integridade        #
 ########################################
@@ -219,30 +360,63 @@ verify_pkg() {
   export_version_vars
   load_meta "$pkg"
 
-  if ! declare -F PKG_CHECK >/dev/null 2>&1; then
-    log WARN "PKG_CHECK não definido para '$pkg'; verificação básica."
-    # Verificação mínima: se tiver PKG_MAIN_BIN definido no meta,
-    # checamos existência.
-    if [[ -n "${PKG_MAIN_BIN:-}" ]]; then
-      if [[ -x "$LFS/$PKG_MAIN_BIN" ]]; then
-        log INFO "Verificação simples OK para '$pkg' (binário $PKG_MAIN_BIN existe)."
-        return 0
-      else
-        log ERROR "Verificação simples FALHOU para '$pkg' (não achei $LFS/$PKG_MAIN_BIN)."
-        return 1
-      fi
+  local rc_generic=0
+
+  # 1) Se o meta tiver PKG_CHECK personalizado, usa primeiro
+  if declare -F PKG_CHECK >/dev/null 2>&1; then
+    log INFO "Rodando PKG_CHECK personalizado para '$pkg'..."
+    if ! PKG_CHECK; then
+      log ERROR "Integridade FALHOU para '$pkg' (PKG_CHECK personalizado)."
+      return 1
     fi
-    # Sem PKG_CHECK e sem PKG_MAIN_BIN -> nada a fazer
-    return 0
+    log INFO "PKG_CHECK personalizado OK para '$pkg'."
+
+    # Tenta checagem genérica adicional se houver critérios
+    if run_generic_pkg_checks "$pkg"; then
+      log INFO "Checagem genérica adicional (se definida) OK para '$pkg'."
+      return 0
+    else
+      rc_generic=$?
+      case "$rc_generic" in
+        1)
+          log ERROR "Checagem genérica adicional FALHOU para '$pkg'."
+          return 1
+          ;;
+        2)
+          # nenhum critério genérico definido; tudo bem
+          log INFO "Nenhuma checagem genérica extra definida para '$pkg'."
+          return 0
+          ;;
+        *)
+          log ERROR "Checagem genérica retornou código inesperado ($rc_generic) para '$pkg'."
+          return 1
+          ;;
+      esac
+    fi
   fi
 
-  log INFO "Rodando PKG_CHECK para '$pkg'..."
-  if PKG_CHECK; then
-    log INFO "Integridade OK para '$pkg'."
+  # 2) Sem PKG_CHECK personalizado: usar apenas checagem genérica
+  log WARN "PKG_CHECK não definido para '$pkg'; usando checagem genérica (se configurada)."
+
+  if run_generic_pkg_checks "$pkg"; then
+    log INFO "Checagem genérica OK para '$pkg'."
     return 0
   else
-    log ERROR "Integridade FALHOU para '$pkg'."
-    return 1
+    rc_generic=$?
+    case "$rc_generic" in
+      1)
+        log ERROR "Checagem genérica FALHOU para '$pkg'."
+        return 1
+        ;;
+      2)
+        log WARN "Nenhuma checagem genérica configurada para '$pkg'; considerando OK por enquanto."
+        return 0
+        ;;
+      *)
+        log ERROR "Checagem genérica retornou código inesperado ($rc_generic) para '$pkg'."
+        return 1
+        ;;
+    esac
   fi
 }
 
