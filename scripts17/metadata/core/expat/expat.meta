@@ -1,0 +1,40 @@
+# Expat-2.7.3 — LFS r12.4-46, Capítulo 8.41
+
+PKG_NAME="expat"
+PKG_VERSION="2.7.3"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="Expat is a stream-oriented C library for parsing XML."
+
+PKG_HOMEPAGE="https://libexpat.github.io/"
+PKG_SOURCE_URLS=(
+    "https://github.com/libexpat/libexpat/releases/download/R_2_7_3/expat-${PKG_VERSION}.tar.xz"
+)
+
+PKG_MD5S=(
+    "423975a2a775ff32f12c53635b463a91"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+PKG_UPSTREAM_URL="https://github.com/libexpat/libexpat/releases"
+PKG_UPSTREAM_REGEX='expat-([0-9.]+)\.tar\.xz'
+
+
+PKG_BUILD() {
+    ./configure --prefix=/usr \
+                --disable-static \
+                --docdir=/usr/share/doc/expat-${PKG_VERSION}
+
+    make
+    make check
+}
+
+PKG_INSTALL() {
+    make DESTDIR="${DESTDIR}" install
+
+    # docs opcionais (iguais ao livro, mas em DESTDIR)
+    install -v -m644 doc/*.{html,css} \
+        "${DESTDIR}/usr/share/doc/expat-${PKG_VERSION}"
+}
