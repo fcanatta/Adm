@@ -1,0 +1,40 @@
+# Attr-2.5.2 - LFS r12.4-46 (8.25)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/attr.html
+
+PKG_NAME="attr"
+PKG_VERSION="2.5.2"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://download.savannah.nongnu.org/releases/attr/attr-2.5.2.tar.gz"
+)
+
+# MD5 do LFS (Chapter 3 - All Packages)
+# attr-2.5.2.tar.gz -> 227043ec2f6ca03c0948df5517f9c927
+PKG_MD5S=(
+  "227043ec2f6ca03c0948df5517f9c927"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("core" "libs")
+
+PKG_UPSTREAM_URL="https://savannah.nongnu.org/projects/attr"
+PKG_UPSTREAM_REGEX='attr-([0-9.]+)\.tar\.(gz|xz)'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr     \
+                --disable-static  \
+                --sysconfdir=/etc \
+                --docdir=/usr/share/doc/attr-2.5.2
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        # precisa de FS com xattr (ext4, etc.)
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
