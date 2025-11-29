@@ -1,0 +1,19 @@
+#!/bin/bash
+# attr.post_install – hook executado após a instalação do Attr
+set -euo pipefail
+
+pkgname="${1:-attr}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# Attr instala libattr.so (e amigas), então é recomendado atualizar o cache de libs
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig para atualizar cache de bibliotecas..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não foi atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
