@@ -1,0 +1,20 @@
+#!/bin/bash
+# libxcrypt.post_install – hook executado após a instalação da Libxcrypt
+set -euo pipefail
+
+pkgname="${1:-libxcrypt}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# Libxcrypt fornece libcrypt.so.*, usada pelo sistema inteiro.
+# Atualizar o cache de bibliotecas é fundamental.
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig para atualizar cache de bibliotecas..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não foi atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
