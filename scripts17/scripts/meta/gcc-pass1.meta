@@ -1,31 +1,61 @@
-# GCC-15.2.0 - Pass 1 (cross-compiler) - LFS 5.3
+# GCC-15.2.0 - Pass 1 (cross-compiler) - LFS
+# -------------------------------------------
+# Usa:
+#   - GCC_VER    (definido no mini-adm)
+#   - LFS        (raiz do sistema em construção)
+#   - LFS_TGT    (triplet do target, ex: x86_64-lfs-linux-gnu)
+#
+# Instala o cross-compiler em:
+#   $LFS/tools/bin/${LFS_TGT}-gcc
+#
+# E usa o esquema de checagem genérica do mini-adm:
+#   PKG_MAIN_BINS, PKG_CHECK_LIBS, PKG_CHECK_CMDS
+
 PKG_NAME="gcc-pass1"
 
 PKG_BUILD() {
     set -e
 
-    # Versões auxiliares (iguais ao livro)
+    : "${GCC_VER:?GCC_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    # Tarball do GCC
+    [[ -f "gcc-${GCC_VER}.tar.xz" ]] || [[ -f "gcc-${GCC_VER}.tar.gz" ]] || {
+        echo "ERRO: gcc-${GCC_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    # Versões auxiliares (iguais às usadas no LFS)
     local MPFR_VER="4.2.2"
     local GMP_VER="6.3.0"
     local MPC_VER="1.3.1"
 
-    cd "$LFS/sources"
+    # Confere tarballs auxiliares
+    for dep in "mpfr-${MPFR_VER}" "gmp-${GMP_VER}" "mpc-${MPC_VER}"; do
+        [[ -f "${dep}.tar.xz" ]] || [[ -f "${dep}.tar.gz" ]] || {
+            echo "ERRO: ${dep}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+            exit 1
+        }
+    done
 
     # Extrair GCC
-    tar -xf "gcc-${GCC_VER}.tar."* 
+    tar -xf "gcc-${GCC_VER}.tar."*
     cd "gcc-${GCC_VER}"
 
-    # Desempacotar mpfr, gmp, mpc dentro do diretório do GCC, como no livro
-    tar -xf "../mpfr-${MPFR_VER}.tar."* 
+    # Integrar mpfr, gmp, mpc dentro da árvore do GCC
+    tar -xf "../mpfr-${MPFR_VER}.tar."*
     mv -v "mpfr-${MPFR_VER}" mpfr
 
-    tar -xf "../gmp-${GMP_VER}.tar."* 
+    tar -xf "../gmp-${GMP_VER}.tar."*
     mv -v "gmp-${GMP_VER}" gmp
 
-    tar -xf "../mpc-${MPC_VER}.tar."* 
+    tar -xf "../mpc-${MPC_VER}.tar."*
     mv -v "mpc-${MPC_VER}" mpc
 
-    # Ajuste lib64 -> lib em x86_64 (5.3)
+    # Ajuste lib64 -> lib para x86_64 (como no livro)
     case "$(uname -m)" in
         x86_64)
             sed -e '/m64=/s/lib64/lib/' \
@@ -33,11 +63,11 @@ PKG_BUILD() {
             ;;
     esac
 
-    # Diretório de build separado
+    # Diretório separado de build
     mkdir -v build
     cd build
 
-    # Configure (5.3.1)
+    # Configure Pass 1 (cross-compiler sem headers)
     ../configure                  \
         --target="$LFS_TGT"       \
         --prefix="$LFS/tools"     \
@@ -63,7 +93,7 @@ PKG_BUILD() {
     make
     make install
 
-    # Criar headers internos completos (limits.h) – comando do livro
+    # Gerar limits.h internal completo (como no livro)
     cd ..
     cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
         "$(dirname "$("$LFS_TGT-gcc" -print-libgcc-file-name)")"/include/limits.h
@@ -73,10 +103,37 @@ PKG_BUILD() {
     rm -rf "gcc-${GCC_VER}"
 }
 
-# Verificação simples: o cross gcc existe e roda --version
-PKG_CHECK() {
-    if "$LFS/tools/bin/${LFS_TGT}-gcc" --version >/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
-}
+#######################################################
+# Checagem genérica (usa run_generic_pkg_checks do
+# mini-adm: PKG_MAIN_BINS, PKG_CHECK_LIBS, PKG_CHECK_CMDS)
+#
+# Paths são relativos à raiz $LFS.
+#######################################################
+
+# Bins principais do cross-compiler
+PKG_MAIN_BINS=(
+  "/tools/bin/${LFS_TGT}-gcc"
+  "/tools/bin/${LFS_TGT}-cpp"
+)
+
+# Bins extras que queremos garantir
+PKG_CHECK_BINS=(
+  "/tools/bin/${LFS_TGT}-gcc-ar"
+  "/tools/bin/${LFS_TGT}-gcc-nm"
+  "/tools/bin/${LFS_TGT}-gcc-ranlib"
+)
+
+# Bibliotecas principais (dentro da árvore do GCC em $LFS/tools)
+PKG_CHECK_LIBS=(
+  "/tools/lib/gcc/${LFS_TGT}/${GCC_VER}/libgcc.a"
+)
+
+# Comandos de teste (no host, sem chroot)
+PKG_CHECK_CMDS=(
+  "$LFS/tools/bin/${LFS_TGT}-gcc --version"
+  "$LFS/tools/bin/${LFS_TGT}-cpp --version"
+  "$LFS/tools/bin/${LFS_TGT}-gcc -print-libgcc-file-name"
+)
+
+# Não definimos PKG_CHECK():
+# o mini-adm vai usar só a checagem genérica acima.
