@@ -1,0 +1,50 @@
+PKG_NAME="ninja"
+PKG_VERSION="1.13.1"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://github.com/ninja-build/ninja/archive/v${PKG_VERSION}/ninja-${PKG_VERSION}.tar.gz"
+)
+PKG_MD5S=(
+  "c35f8f55f4cf60f1a916068d8f45a0f8"
+)
+
+PKG_UPSTREAM_URL="https://ninja-build.org"
+PKG_GROUPS=("devel" "core")
+PKG_DEPENDS=("python" "glibc")
+
+PKG_BUILD() {
+    set -e
+    local srcdir="ninja-${PKG_VERSION}"
+    cd "$srcdir"
+
+    # Patch opcional do LFS multilib para respeitar NINJAJOBS
+    sed -i '/int Guess/a \
+      int   j = 0;\
+      char* jobs = getenv( "NINJAJOBS" );\
+      if ( jobs != NULL ) j = atoi( jobs );\
+      if ( j > 0 ) return j;\
+    ' src/ninja.cc
+
+    # Bootstrap (LFS 8.59.1)
+    python3 configure.py --bootstrap --verbose
+}
+
+PKG_INSTALL() {
+    set -e
+    local srcdir="ninja-${PKG_VERSION}"
+    cd "$srcdir"
+
+    DESTDIR="${DESTDIR:-/}"
+
+    # binário
+    install -vm755 ninja "${DESTDIR}/usr/bin/ninja"
+
+    # bash completion
+    install -vDm644 misc/bash-completion \
+        "${DESTDIR}/usr/share/bash-completion/completions/ninja"
+
+    # zsh completion
+    install -vDm644 misc/zsh-completion \
+        "${DESTDIR}/usr/share/zsh/site-functions/_ninja"
+}
