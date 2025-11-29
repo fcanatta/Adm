@@ -1,0 +1,56 @@
+# Bash-5.3 - LFS r12.4-46 (8.37)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/bash.html
+
+PKG_NAME="bash"
+PKG_VERSION="5.3"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"
+)
+
+# MD5 do LFS
+# bash-5.3.tar.gz -> 977c8c0c5ae6309191e7768e28ebc951
+PKG_MD5S=(
+  "977c8c0c5ae6309191e7768e28ebc951"
+)
+
+# Usa readline do sistema
+PKG_DEPENDS=(
+  "readline"
+)
+
+PKG_GROUPS=("core" "shell")
+
+PKG_UPSTREAM_URL="https://www.gnu.org/software/bash/"
+PKG_UPSTREAM_REGEX='bash-([0-9.]+)\.tar\.(gz|xz)'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr             \
+                --without-bash-malloc     \
+                --with-installed-readline \
+                --docdir=/usr/share/doc/bash-5.3
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        # Testes como no LFS: rodar como usuário tester via expect
+        chown -R tester .
+
+        LC_ALL=C.UTF-8 su -s /usr/bin/expect tester << "EOF"
+set timeout -1
+spawn make tests
+expect eof
+lassign [wait] _ _ _ value
+exit \$value
+EOF
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+
+    # Em ambiente chroot real do LFS faria:
+    #   exec /usr/bin/bash --login
+    # No adm você decide se quer fazer isso pós-instalação ou via hook.
+}
