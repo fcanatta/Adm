@@ -1,0 +1,62 @@
+# Zlib-1.3.1 — Linux From Scratch r12.4-46, Capítulo 8.6
+
+PKG_NAME="zlib"
+PKG_VERSION="1.3.1"
+PKG_RELEASE=1
+
+# Descrição textual tirada do LFS:
+# "The Zlib package contains compression and decompression routines used by some programs."
+PKG_DESCRIPTION="The Zlib package contains compression and decompression routines used by some programs."
+
+# Página oficial e fonte exatamente como no LFS
+PKG_HOMEPAGE="https://zlib.net/"
+PKG_SOURCE_URLS=(
+    "https://zlib.net/fossils/zlib-${PKG_VERSION}.tar.gz"
+)
+
+# MD5 retirado de 3.2 All Packages (LFS development, r12.4-46)
+PKG_MD5S=(
+    "9855b6d802d7fe5b7bd5b196a2271655"
+)
+
+# Dependências diretas não são listadas no capítulo do LFS para o Zlib,
+# então deixamos vazio (o toolchain já existe no ambiente LFS).
+PKG_DEPENDS=()
+
+# Grupos são apenas organizacionais para o adm; aqui deixo vazio
+# para não inventar categorias que não existem no livro.
+PKG_GROUPS=( "core" )
+
+# Opcional: ajuda para checar novas versões diretamente no site do zlib
+PKG_UPSTREAM_URL="https://zlib.net/fossils/"
+PKG_UPSTREAM_REGEX='zlib-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # Passo 1: configurar (LFS 8.6.1)
+    ./configure --prefix=/usr
+
+    # Passo 2: compilar
+    make
+
+    # Passo 3: testes (opcional mas recomendado pelo livro)
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # No adm, DESTDIR já vem setado pelo build_package() dentro do chroot.
+    # Adaptamos o "make install" do LFS para instalar em DESTDIR.
+    make DESTDIR="${DESTDIR}" install
+
+    # O LFS remove a biblioteca estática libz.a após a instalação:
+    #   rm -fv /usr/lib/libz.a
+    # Aqui fazemos o equivalente dentro do DESTDIR.
+    rm -fv "${DESTDIR}/usr/lib/libz.a"
+}
