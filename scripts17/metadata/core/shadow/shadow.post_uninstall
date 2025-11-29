@@ -1,0 +1,11 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-shadow}"
+phase="${2:-post_uninstall}"
+
+echo "[$pkg] [$phase] Shadow foi desinstalado."
+
+if compgen -G "/var/backups/adm-${pkg}-*/passwd" > /dev/null; then
+    echo "[$pkg] [$phase] Existem backups em /var/backups/adm-${pkg}-*/"
+    ls -1d /var/backups/adm-${pkg}-* 2>/dev/null || true
+fi
