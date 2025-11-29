@@ -1,0 +1,46 @@
+# Sed-4.9 - LFS r12.4-46 (8.32)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/sed.html
+
+PKG_NAME="sed"
+PKG_VERSION="4.9"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/sed/sed-4.9.tar.xz"
+)
+
+# LFS r12.4-dev packages list
+# MD5: 6aac9b2dbafcd5b7a67a8a9bcb8036c3
+PKG_MD5S=(
+  "6aac9b2dbafcd5b7a67a8a9bcb8036c3"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("core" "utils")
+
+PKG_UPSTREAM_URL="https://www.gnu.org/software/sed/"
+PKG_UPSTREAM_REGEX='sed-([0-9.]+)\.tar\.xz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr
+
+    make
+    make html
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        # segue o LFS: rodar testes como usuário tester
+        if id tester >/dev/null 2>&1; then
+            chown -R tester .
+            su tester -c "PATH=$PATH make check"
+        else
+            echo "[SED] Usuário 'tester' não existe, pulando make check"
+        fi
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+
+    install -d -m755           "$DESTDIR/usr/share/doc/sed-4.9"
+    install -m644 doc/sed.html "$DESTDIR/usr/share/doc/sed-4.9"
+}
