@@ -1,0 +1,34 @@
+# Patch-2.8 - LFS 6.13
+PKG_NAME="patch"
+
+PKG_BUILD() {
+    set -e
+
+    : "${PATCH_VER:?PATCH_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "patch-${PATCH_VER}.tar.xz" ]] || [[ -f "patch-${PATCH_VER}.tar.gz" ]] || {
+        echo "ERRO: patch-${PATCH_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "patch-${PATCH_VER}.tar."*
+    cd "patch-${PATCH_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "patch-${PATCH_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/patch" ]]
+}
