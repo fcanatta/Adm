@@ -1,0 +1,87 @@
+# Binutils-2.45.1 — Linux From Scratch r12.4-46, Capítulo 8.21
+
+PKG_NAME="binutils"
+PKG_VERSION="2.45.1"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Binutils package contains a linker, an assembler, and other tools for handling object files."
+
+PKG_HOMEPAGE="https://www.gnu.org/software/binutils/"
+
+# Fonte exatamente como em 3.2 All Packages (development)
+PKG_SOURCE_URLS=(
+    "https://sourceware.org/pub/binutils/releases/binutils-${PKG_VERSION}.tar.xz"
+)
+
+# MD5 exato da tabela 3.2 (Binutils 2.45.1)
+PKG_MD5S=(
+    "ff59f8dc1431edfa54a257851bea74e7"
+)
+
+# O livro usa --with-system-zlib, então depende da zlib instalada previamente em /usr
+PKG_DEPENDS=("zlib")
+
+PKG_GROUPS=( "core" )
+
+# Opcional: ajuda para futuros upgrades automáticos
+PKG_UPSTREAM_URL="https://sourceware.org/pub/binutils/releases/"
+PKG_UPSTREAM_REGEX='binutils-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # Recomenda-se build em diretório separado (LFS 8.21.1)
+    mkdir -v build
+    cd       build
+
+    # ../configure --prefix=/usr       \
+    #              --sysconfdir=/etc   \
+    #              --enable-ld=default \
+    #              --enable-plugins    \
+    #              --enable-shared     \
+    #              --disable-werror    \
+    #              --enable-64-bit-bfd \
+    #              --enable-new-dtags  \
+    #              --with-system-zlib  \
+    #              --enable-default-hash-style=gnu
+    ../configure --prefix=/usr       \
+                 --sysconfdir=/etc   \
+                 --enable-ld=default \
+                 --enable-plugins    \
+                 --enable-shared     \
+                 --disable-werror    \
+                 --enable-64-bit-bfd \
+                 --enable-new-dtags  \
+                 --with-system-zlib  \
+                 --enable-default-hash-style=gnu
+
+    # Compila (LFS: make tooldir=/usr)
+    make tooldir=/usr
+
+    # Testes (LFS: "não pule de jeito nenhum"): make -k check
+    make -k check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # O `adm` garante que estamos no diretório raiz do builddir (topo da árvore),
+    # então precisamos entrar de novo no subdiretório 'build' criado no PKG_BUILD.
+    cd build
+
+    # Instala como no livro, mas respeitando DESTDIR do adm:
+    #   make tooldir=/usr install
+    make tooldir=/usr DESTDIR="${DESTDIR}" install
+
+    # LFS manda remover bibliotecas estáticas inúteis e docs do gprofng:
+    #   rm -rfv /usr/lib/lib{bfd,ctf,ctf-nobfd,gprofng,opcodes,sframe}.a \
+    #           /usr/share/doc/gprofng/
+    #
+    # Adaptado para DESTDIR:
+    rm -rfv "${DESTDIR}/usr/lib/lib"{bfd,ctf,ctf-nobfd,gprofng,opcodes,sframe}.a \
+            "${DESTDIR}/usr/share/doc/gprofng/"
+}
