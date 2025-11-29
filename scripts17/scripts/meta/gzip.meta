@@ -1,4 +1,7 @@
 # Gzip-1.14 - LFS 6.11
+# --------------------
+# Variáveis: GZIP_VER, LFS, LFS_TGT
+
 PKG_NAME="gzip"
 
 PKG_BUILD() {
@@ -27,6 +30,19 @@ PKG_BUILD() {
     rm -rf "gzip-${GZIP_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/gzip" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/gzip"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/gunzip"
+  "/usr/bin/zcat"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/gzip --version"
+)
