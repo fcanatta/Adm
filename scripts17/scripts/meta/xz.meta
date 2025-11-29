@@ -1,0 +1,39 @@
+# Xz-5.8.1 - LFS 6.16
+PKG_NAME="xz"
+
+PKG_BUILD() {
+    set -e
+
+    : "${XZ_VER:?XZ_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "xz-${XZ_VER}.tar.xz" ]] || [[ -f "xz-${XZ_VER}.tar.gz" ]] || {
+        echo "ERRO: xz-${XZ_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "xz-${XZ_VER}.tar."*
+    cd "xz-${XZ_VER}"
+
+    ./configure --prefix=/usr                     \
+                --host="$LFS_TGT"                 \
+                --build="$(build-aux/config.guess)" \
+                --disable-static                  \
+                --docdir="/usr/share/doc/xz-${XZ_VER}"
+
+    make
+    make DESTDIR="$LFS" install
+
+    # remove .la perigoso pro cross
+    rm -v "$LFS/usr/lib/liblzma.la"
+
+    cd "$LFS/sources"
+    rm -rf "xz-${XZ_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/xz" ]]
+}
