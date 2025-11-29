@@ -1,0 +1,34 @@
+# Tar-1.35 - LFS 6.15
+PKG_NAME="tar"
+
+PKG_BUILD() {
+    set -e
+
+    : "${TAR_VER:?TAR_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "tar-${TAR_VER}.tar.xz" ]] || [[ -f "tar-${TAR_VER}.tar.gz" ]] || {
+        echo "ERRO: tar-${TAR_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "tar-${TAR_VER}.tar."*
+    cd "tar-${TAR_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "tar-${TAR_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/tar" ]]
+}
