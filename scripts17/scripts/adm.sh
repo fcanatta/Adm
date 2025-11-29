@@ -408,32 +408,39 @@ download_sources_parallel() {
     mkdir -p "$CACHE_DIR"
 
     local -a urls=("${PKG_SOURCE_URLS[@]}")
-    local idx urlspec sha256 md5 first_url base out
+    local -a sha256s=()
+    local -a md5s=()
+
+    if [[ ${#PKG_SHA256S[@]:-0} -gt 0 ]]; then
+        sha256s=("${PKG_SHA256S[@]}")
+    fi
+    if [[ ${#PKG_MD5S[@]:-0} -gt 0 ]]; then
+        md5s=("${PKG_MD5S[@]}")
+    fi
 
     local -a pids=()
+    local i=0
+    local urlspec
     local fail=0
 
-    for idx in "${!urls[@]}"; do
-        urlspec="${urls[$idx]}"
-
-        # Pode ser que arrays de hash estejam vazias; o bash retorna vazio nesses casos
-        sha256="${PKG_SHA256S[$idx]:-}"
-        md5="${PKG_MD5S[$idx]:-}"
-
-        # Usa a primeira URL (antes do '|') para nomear o arquivo no cache
-        first_url="${urlspec%%|*}"
+    for urlspec in "${urls[@]}"; do
+        # Usamos a PRIMEIRA URL (antes do '|') só para nomear o arquivo
+        local first_url="${urlspec%%|*}"
+        local base
         base="$(basename "${first_url%%\?*}")"
-        [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-${idx}.src"
+        [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-src-$i.tar"
 
-        out="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-${idx}-${base}"
+        local out="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-$i-$base"
+        local sha="${sha256s[$i]:-}"
+        local md="${md5s[$i]:-}"
 
         (
-            download_one_source "$pkg" "$idx" "$urlspec" "$out" "$sha256" "$md5"
+            download_one_source "$PKG_NAME" "$i" "$urlspec" "$out" "$sha" "$md"
         ) &
-
         pids+=("$!")
+        (( i++ ))
 
-        # Limita paralelismo
+        # limitar paralelismo só com os PIDs que a gente mesmo criou
         while ((${#pids[@]} >= PARALLEL_JOBS)); do
             if ! wait "${pids[0]}"; then
                 fail=1
@@ -442,7 +449,6 @@ download_sources_parallel() {
         done
     done
 
-    # Espera os demais
     local pid
     for pid in "${pids[@]}"; do
         if ! wait "$pid"; then
@@ -450,9 +456,7 @@ download_sources_parallel() {
         fi
     done
 
-    if (( fail != 0 )); then
-        die "[$PKG_NAME] Falha em algum download (um ou mais sources não foram baixados corretamente)."
-    fi
+    (( fail == 0 )) || die "[$PKG_NAME] Falha em algum download (um ou mais sources não foram baixados corretamente)."
 }
 
 # =========================
@@ -897,8 +901,6 @@ build_package() {
 
     # DESTDIR para instalação temporária (lado host)
     local destdir="$BUILD_ROOT/${PKG_NAME}-${PKG_VERSION}-destdir"
-    rm -rf "$destdir"
-    mkdir -p "$destdir"
 
     # Caminho equivalente visto de dentro do chroot (se houver)
     local destdir_chroot="$destdir"
@@ -908,15 +910,17 @@ build_package() {
     fi
 
     if (( stage < 4 )); then
+        rm -rf "$destdir"
+        mkdir -p "$destdir"
+
         log_info "[$pkg] Instalando em DESTDIR: $destdir"
         if declare -F PKG_INSTALL >/dev/null 2>&1; then
+            # Exporta variáveis PKG_* do metadata e executa a função de instalação
             run_in_chroot "$builddir" "$(metadata_export_snippet); PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR='$destdir_chroot'; $(declare -f PKG_INSTALL); PKG_INSTALL"
         else
             log_warn "[$pkg] PKG_INSTALL não definido, nenhum arquivo instalado em DESTDIR"
         fi
-        # (restante do bloco, empacotamento, permanece como está)
 
-        # Empacotar DESTDIR
         mkdir -p "$PKG_DIR"
         local pkgfile_zst="$PKG_DIR/${PKG_NAME}-${PKG_VERSION}-${PKG_RELEASE}.tar.zst"
         local pkgfile_xz="$PKG_DIR/${PKG_NAME}-${PKG_VERSION}-${PKG_RELEASE}.tar.xz"
@@ -1044,24 +1048,23 @@ uninstall_package() {
 
     log_info "[$pkg] Removendo arquivos instalados."
 
-    # Remove em ordem reversa para tentar apagar diretórios depois dos arquivos
     tac "$listfile" | while IFS= read -r f; do
         [[ -z "$f" ]] && continue
 
-        # Apenas caminhos absolutos são aceitos (segurança extra)
+        # Segurança extra: só aceita caminhos absolutos
         if [[ "$f" != /* ]]; then
             log_warn "[$pkg] Ignorando caminho não absoluto em files.list: $f"
             continue
         fi
 
-        # Nunca remova raiz por engano
+        # Nunca remova a raiz por engano
         if [[ "$f" == "/" ]]; then
-            log_warn "[$pkg] Ignorando entrada inválida '/' em files.list."
+            log_warn "[$pkg] Ignorando entrada '/' em files.list."
             continue
         fi
 
         if [[ -d "$f" && ! -L "$f" ]]; then
-            # tenta remover diretório se estiver vazio
+            # Diretório: tenta remover se estiver vazio
             if ! rmdir "$f" 2>/dev/null; then
                 log_debug "[$pkg] Diretório não removido (provavelmente não vazio): $f"
             fi
@@ -1074,7 +1077,6 @@ uninstall_package() {
         fi
     done
 
-    # Limpa banco de dados e estado
     rm -rf "$(db_pkg_dir "$pkg")"
     clear_pkg_stage "$pkg"
     rm -rf "$BUILD_ROOT/${pkg}-"* "$STATE_DIR/$pkg.builddir" 2>/dev/null || true
@@ -1084,20 +1086,18 @@ uninstall_package() {
 
 remove_orphans() {
     log_info "Localizando órfãos..."
-    local orf_list
-    orf_list="$(list_orphans || true)"
-
-    if [[ -z "$orf_list" ]]; then
+    local orf
+    orf=$(list_orphans || true)
+    if [[ -z "$orf" ]]; then
         log_info "Nenhum pacote órfão encontrado."
         return 0
     fi
 
-    log_info "Pacotes órfãos detectados:"
-    printf '  %s\n' $orf_list
+    log_info "Órfãos detectados: $orf"
 
     local failed=()
     local p
-    for p in $orf_list; do
+    for p in $orf; do
         log_info "Removendo órfão: $p"
         if ! uninstall_package "$p"; then
             log_error "[$p] Falha ao remover órfão."
@@ -1119,11 +1119,9 @@ remove_orphans() {
 
 verify_package_integrity() {
     local pkg="$1"
-
     if [[ -z "$pkg" ]]; then
         die "verify_package_integrity: pacote não informado."
     fi
-
     if ! is_installed "$pkg"; then
         die "[$pkg] Não está instalado."
     fi
@@ -1134,8 +1132,6 @@ verify_package_integrity() {
 
     log_info "[$pkg] Verificando integridade de arquivos..."
     local broken=0
-    local line
-
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
 
@@ -1143,7 +1139,7 @@ verify_package_integrity() {
         sum="${line%% *}"
         file="${line##*  }"
 
-        if [[ -z "$file" || -z "$sum" ]]; then
+        if [[ -z "$sum" || -z "$file" ]]; then
             log_warn "[$pkg] Linha inválida no manifesto: $line"
             broken=1
             continue
@@ -1172,7 +1168,7 @@ verify_package_integrity() {
 }
 
 verify_all() {
-    local pkgdir pkg
+    local pkg pkgdir
     local failed=()
 
     while IFS= read -r -d '' pkgdir; do
@@ -1184,7 +1180,7 @@ verify_all() {
         if ! verify_package_integrity "$pkg"; then
             failed+=("$pkg")
         fi
-    done < <(find "$DB_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
     if ((${#failed[@]} > 0)); then
         log_error "Pacotes com integridade comprometida: ${failed[*]}"
@@ -1205,17 +1201,15 @@ check_upstream_version() {
     if [[ -z "${PKG_UPSTREAM_URL:-}" || -z "${PKG_UPSTREAM_REGEX:-}" ]]; then
         die "[$pkg] PKG_UPSTREAM_URL/PKG_UPSTREAM_REGEX não definidos no metadata."
     fi
-
     require_cmd curl
 
     log_info "[$pkg] Consultando upstream: $PKG_UPSTREAM_URL"
-
     local html
     if ! html=$(curl -L --fail --connect-timeout 15 --max-time 60 -s "$PKG_UPSTREAM_URL"); then
         die "[$pkg] Falha ao baixar página de upstream."
     fi
 
-    # Extrair versões pelo regex; o regex deve ter um grupo de captura com a versão
+    # extrair versões pelo regex; o regex deve ter grupo de captura com a versão
     local versions
     versions=$(printf "%s" "$html" \
         | grep -Eo "$PKG_UPSTREAM_REGEX" \
@@ -1234,7 +1228,7 @@ check_upstream_version() {
 
     if [[ "$newest" == "$PKG_VERSION" ]]; then
         log_info "[$pkg] Já está na versão mais recente."
-        # não imprime nada para sinalizar "sem upgrade"
+        # não imprime nada → upgrade_package interpreta como "sem upgrade"
         return 0
     fi
 
@@ -1242,8 +1236,7 @@ check_upstream_version() {
     oldmeta="$(meta_path_for_pkg "$pkg")"
     local newmeta="${oldmeta%.meta}-${newest}.meta"
 
-    # copia o metadata antigo trocando apenas a versão
-    sed -E "s/^(PKG_VERSION=).*$/\\1\"$newest\"/" "$oldmeta" >"$newmeta"
+    sed -E "s/^(PKG_VERSION=).*$/\1\"$newest\"/" "$oldmeta" >"$newmeta"
 
     # zera hashes no metadata novo, para você preencher depois manualmente
     {
@@ -1255,7 +1248,7 @@ check_upstream_version() {
     } >>"$newmeta"
 
     log_info "[$pkg] Novo metadata criado: $newmeta"
-    printf "%s\n" "$newmeta"
+    echo "$newmeta"
 }
 
 upgrade_package() {
@@ -1266,8 +1259,7 @@ upgrade_package() {
     fi
 
     local newmeta
-    newmeta="$(check_upstream_version "$pkg")" || true
-
+    newmeta=$(check_upstream_version "$pkg")
     if [[ -z "$newmeta" ]]; then
         log_info "[$pkg] Nenhum upgrade necessário."
         return 0
@@ -1288,10 +1280,9 @@ upgrade_package() {
     original="$(meta_path_for_pkg "$pkg")"
     cp "$original" "$original.bak"
 
-    # troca o metadata em uso
     mv "$tmpmeta" "$original"
 
-    # recompila e reinstala
+    # construir e instalar nova versão, com rollback em caso de falha
     if ! build_package "$pkg"; then
         log_error "[$pkg] Falha durante build no upgrade; restaurando metadata original."
         mv "$original.bak" "$original"
@@ -1306,7 +1297,6 @@ upgrade_package() {
 
     rm -f "$original.bak"
 
-    # recarrega metadata para pegar versão final
     load_metadata "$pkg"
     log_info "[$pkg] Upgrade concluído para versão $PKG_VERSION"
 }
@@ -1329,7 +1319,6 @@ rebuild_one() {
     log_info "Rebuild do pacote: $pkg"
     clear_pkg_stage "$pkg"
     rm -rf "$BUILD_ROOT/${pkg}-"* "$STATE_DIR/$pkg.builddir" 2>/dev/null || true
-
     build_package "$pkg"
     install_package_root "$pkg"
 }
@@ -1340,7 +1329,7 @@ rebuild_all() {
 
     log_info "Calculando ordem de rebuild global com base nas dependências..."
 
-    local pkg pkgdir order p
+    local pkg pkgdir
 
     # Para cada pacote instalado (diretório com metadata.meta)
     while IFS= read -r -d '' pkgdir; do
@@ -1350,14 +1339,16 @@ rebuild_all() {
         fi
         pkg="$(basename "$pkgdir")"
 
-        order="$(resolve_deps_order "$pkg")"
+        local order
+        order=$(resolve_deps_order "$pkg")
+        local p
         for p in $order; do
             if [[ -d "$(db_pkg_dir "$p")" && -z "${seen[$p]:-}" ]]; then
                 ordered+=("$p")
                 seen["$p"]=1
             fi
         done
-    done < <(find "$DB_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
     if ((${#ordered[@]} == 0)); then
         log_info "Nenhum pacote instalado encontrado para rebuild."
@@ -1367,10 +1358,10 @@ rebuild_all() {
     log_info "Ordem final de rebuild: ${ordered[*]}"
 
     local failed=()
-    for pkg in "${ordered[@]}"; do
-        if ! rebuild_one "$pkg"; then
-            log_error "[$pkg] Falha no rebuild."
-            failed+=("$pkg")
+    local p
+    for p in "${ordered[@]}"; do
+        if ! rebuild_one "$p"; then
+            failed+=("$p")
         fi
     done
 
