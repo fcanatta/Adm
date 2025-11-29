@@ -1,0 +1,47 @@
+# GDBM-1.26 - LFS r12.4.46 (8.41)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/gdbm.html
+
+PKG_NAME="gdbm"
+PKG_VERSION="1.26"
+PKG_RELEASE=1
+
+# Fontes oficiais (capítulo 3 - All Packages)
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/gdbm/gdbm-${PKG_VERSION}.tar.gz"
+  "https://ftpmirror.gnu.org/gdbm/gdbm-${PKG_VERSION}.tar.gz"
+)
+
+# MD5 oficial: 26f8899ea9268afaa62ee33fee0d1920
+PKG_MD5S=(
+  "26f8899ea9268afaa62ee33fee0d1920"
+)
+
+# Sem dependências diretas além do que LFS já fornece
+PKG_DEPENDS=()
+
+# Grupo lógico (ajuste segundo seu layout)
+PKG_GROUPS=("core" "libs")
+
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/gdbm/"
+PKG_UPSTREAM_REGEX='gdbm-([0-9.]+)\.tar\.gz'
+
+# -------------------------------------------------------------
+# Compilação seguindo o LFS 12.4.46 (com DESTDIR para o ADM)
+# -------------------------------------------------------------
+PKG_BUILD() {
+    ./configure --prefix=/usr \
+                --disable-static \
+                --enable-libgdbm-compat
+
+    make
+
+    # Testes (não requer usuário tester)
+    # make check
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
