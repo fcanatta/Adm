@@ -42,6 +42,10 @@ PKG_BUILD() {
             ;;
     esac
 
+    # Substitua as regras de compilação dos cabeçalhos libgcc e libstdc++ para permitir a compilação dessas bibliotecas com suporte a threads POSIX:
+    sed '/thread_header =/s/@.*@/gthr-posix.h/' \
+    -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+
     # Criar diretório de build
     mkdir -v build
     cd build
