@@ -1,0 +1,92 @@
+# Bzip2-1.0.8 — Linux From Scratch r12.4-46, Capítulo 8.7
+
+PKG_NAME="bzip2"
+PKG_VERSION="1.0.8"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Bzip2 package contains programs for compressing and decompressing files."
+
+# Fonte e patch exatamente como no LFS (development)
+PKG_HOMEPAGE="https://sourceware.org/bzip2/"
+PKG_SOURCE_URLS=(
+    "https://www.sourceware.org/pub/bzip2/bzip2-${PKG_VERSION}.tar.gz"
+    # espelho opcional do LFS (útil se o mirror principal cair)
+    "https://anduin.linuxfromscratch.org/LFS/bzip2-${PKG_VERSION}.tar.gz"
+)
+
+# MD5 do tarball, conforme a tabela 3.2 All Packages (development)
+# Bzip2 (1.0.8) — MD5: 67e051268d0c475ea773822f7500d0e5
+PKG_MD5S=(
+    "67e051268d0c475ea773822f7500d0e5"
+)
+
+# Patch obrigatório de documentação, conforme 3.3 Needed Patches (development)
+# Bzip2 Documentation Patch — MD5: 6a5ac7e89b791aae556de0f745916f7f
+PKG_PATCH_URLS=(
+    "https://www.linuxfromscratch.org/patches/lfs/development/bzip2-1.0.8-install_docs-1.patch"
+)
+PKG_PATCH_MD5S=(
+    "6a5ac7e89b791aae556de0f745916f7f"
+)
+
+# Bzip2 não tem dependências extras explícitas no capítulo 8.7
+PKG_DEPENDS=()
+
+# Grupos são organizacionais do adm; deixe vazio ou use algo como "core" se quiser
+PKG_GROUPS=()
+
+# Opcional: configuração para checar versões upstream (útil pro 'upgrade_package')
+PKG_UPSTREAM_URL="https://sourceware.org/pub/bzip2/"
+PKG_UPSTREAM_REGEX='bzip2-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # Capítulo 8.7.1 — exatamente na ordem do livro:
+    # 1. Aplicar o patch de documentação
+    patch -Np1 -i ../bzip2-1.0.8-install_docs-1.patch
+
+    # 2. Garantir links simbólicos relativos
+    sed -i 's@\(ln -s -f \)$(PREFIX)/bin/@\1@' Makefile
+
+    # 3. Corrigir o prefixo do diretório de manpages
+    sed -i "s@(PREFIX)/man@(PREFIX)/share/man@g" Makefile
+
+    # 4. Preparar para compilar a lib compartilhada
+    make -f Makefile-libbz2_so
+
+    # 5. Limpar antes da build normal
+    make clean
+
+    # 6. Compilar o pacote (make padrão, como no livro)
+    make
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # No fluxo do adm, DESTDIR já vem definido (pelo build_package) apontando
+    # para o diretório de instalação temporário visto DE DENTRO do chroot.
+
+    # 1. Instalar os binários, manpages e docs no DESTDIR
+    make PREFIX=/usr DESTDIR="${DESTDIR}" install
+
+    # 2. Instalar a biblioteca compartilhada no lugar correto
+    #    (adaptado do livro, que faz cp diretamente em /usr/lib)
+    install -v -m755 libbz2.so.* "${DESTDIR}/usr/lib"
+    ln -svf "libbz2.so.1.0.8" "${DESTDIR}/usr/lib/libbz2.so"
+
+    # 3. Substituir o binário bzip2 pelo bzip2 compartilhado e garantir links
+    install -v -m755 bzip2-shared "${DESTDIR}/usr/bin/bzip2"
+
+    for i in "${DESTDIR}"/usr/bin/{bzcat,bunzip2}; do
+        ln -svf bzip2 "$i"
+    done
+
+    # 4. Remover a biblioteca estática inútil, como manda o livro
+    rm -fv "${DESTDIR}/usr/lib/libbz2.a"
+}
