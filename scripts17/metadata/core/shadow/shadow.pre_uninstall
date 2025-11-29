@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-shadow}"
+phase="${2:-pre_uninstall}"
+
+echo "[$pkg] [$phase] AVISO: tentativa de desinstalar o pacote de gerenciamento de contas (shadow)."
+
+# Se você REALMENTE quiser permitir, comente o exit 1:
+echo "[$pkg] [$phase] Desinstalação automática de 'shadow' está bloqueada por segurança."
+exit 1
