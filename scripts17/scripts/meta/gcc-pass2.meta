@@ -1,4 +1,14 @@
 # GCC-15.2.0 - Pass 2 (LFS 6.18)
+# -------------------------------
+# Usa:
+#   - GCC_VER
+#   - LFS
+#   - LFS_TGT
+#
+# Instala GCC (temporário) em $LFS/usr (gcc, cc, $LFS_TGT-gcc, etc.)
+# e usa checagem genérica do mini-adm:
+#   PKG_MAIN_BINS, PKG_CHECK_BINS, PKG_CHECK_LIBS, PKG_CHECK_CMDS
+
 PKG_NAME="gcc-pass2"
 
 PKG_BUILD() {
@@ -10,21 +20,29 @@ PKG_BUILD() {
 
     cd "$LFS/sources"
 
+    # Tarball principal
     [[ -f "gcc-${GCC_VER}.tar.xz" ]] || [[ -f "gcc-${GCC_VER}.tar.gz" ]] || {
-        echo "ERRO: gcc-${GCC_VER}.tar.[xz|gz] não encontrado." >&2
+        echo "ERRO: gcc-${GCC_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
         exit 1
     }
 
-    # Versões fixas do LFS
+    # Versões auxiliares (LFS)
     local MPFR_VER="4.2.2"
     local GMP_VER="6.3.0"
     local MPC_VER="1.3.1"
+
+    for dep in "mpfr-${MPFR_VER}" "gmp-${GMP_VER}" "mpc-${MPC_VER}"; do
+        [[ -f "${dep}.tar.xz" ]] || [[ -f "${dep}.tar.gz" ]] || {
+            echo "ERRO: ${dep}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+            exit 1
+        }
+    done
 
     # Extrair GCC
     tar -xf "gcc-${GCC_VER}.tar."*
     cd "gcc-${GCC_VER}"
 
-    # Unpack MPFR/GMP/MPC
+    # Integrar MPFR, GMP, MPC
     tar -xf "../mpfr-${MPFR_VER}.tar."*
     mv -v "mpfr-${MPFR_VER}" mpfr
 
@@ -34,59 +52,80 @@ PKG_BUILD() {
     tar -xf "../mpc-${MPC_VER}.tar."*
     mv -v "mpc-${MPC_VER}" mpc
 
-    # Ajuste lib64→lib apenas para x86_64 (LFS 6.18.1)
+    # Ajuste lib64->lib para x86_64
     case "$(uname -m)" in
-        x86_64)
-            sed -e '/m64=/s/lib64/lib/' \
-                -i.orig gcc/config/i386/t-linux64
-            ;;
+      x86_64)
+        sed -e '/m64=/s/lib64/lib/' \
+            -i.orig gcc/config/i386/t-linux64
+        ;;
     esac
 
-    # Substitua as regras de compilação dos cabeçalhos libgcc e libstdc++ para permitir a compilação dessas bibliotecas com suporte a threads POSIX:
+    # Habilitar POSIX threads em libgcc/libstdc++
     sed '/thread_header =/s/@.*@/gthr-posix.h/' \
-    -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
+        -i libgcc/Makefile.in libstdc++-v3/include/Makefile.in
 
-    # Criar diretório de build
     mkdir -v build
     cd build
 
-    # Configure Pass2 (LFS 6.18.1)
-    ../configure                           \
-        --prefix=/usr                      \
-        --build="$(../config.guess)"       \
-        --host="$LFS_TGT"                  \
-        --enable-default-pie               \
-        --enable-default-ssp               \
-        --enable-languages=c,c++           \
-        --disable-multilib                 \
-        --disable-bootstrap                \
-        --disable-libgomp                  \
-        --disable-libatomic                \
-        --disable-libquadmath              \
-        --disable-libsanitizer             \
-        --disable-libvtv                   \
-        --disable-nls
+    ../configure                   \
+        --build="$(../config.guess)" \
+        --host="$LFS_TGT"          \
+        --target="$LFS_TGT"        \
+        --prefix=/usr              \
+        --with-build-sysroot="$LFS" \
+        --enable-default-pie       \
+        --enable-default-ssp       \
+        --disable-nls              \
+        --disable-multilib         \
+        --disable-libatomic        \
+        --disable-libgomp          \
+        --disable-libquadmath      \
+        --disable-libsanitizer     \
+        --disable-libssp           \
+        --disable-libvtv           \
+        --enable-languages=c,c++   \
+        LDFLAGS_FOR_TARGET="-L$PWD/$LFS_TGT/libgcc"
 
     make
     make DESTDIR="$LFS" install
 
-    # Ajuste do linker specs para usar /usr/lib e /lib corretos
-    # (trecho baseado no livro, mas adaptado para garantir segurança)
-    "$LFS_TGT-gcc" -dumpspecs \
-        | sed -e "s@/tools@@g" \
-        > specs
-
-    install -v -m644 specs "$LFS/usr/lib/gcc/$LFS_TGT/$GCC_VER/specs"
-    rm -v specs
+    # Symlink cc -> gcc dentro do $LFS (como no livro)
+    ln -svf gcc "$LFS/usr/bin/cc"
 
     cd "$LFS/sources"
     rm -rf "gcc-${GCC_VER}"
 }
 
-PKG_CHECK() {
-    # Verificação básica Pass 2
-    if "$LFS_TGT-gcc" --version >/dev/null 2>&1; then
-        return 0
-    fi
-    return 1
-}
+#######################################################
+# Checagem genérica (run_generic_pkg_checks - mini-adm)
+# Paths relativos a $LFS
+#######################################################
+
+# Bins principais (target e genéricos)
+PKG_MAIN_BINS=(
+  "/usr/bin/${LFS_TGT}-gcc"
+  "/usr/bin/${LFS_TGT}-g++"
+  "/usr/bin/gcc"
+  "/usr/bin/cc"
+)
+
+# Bins extras uteis
+PKG_CHECK_BINS=(
+  "/usr/bin/${LFS_TGT}-cpp"
+)
+
+# Bibliotecas principais do GCC temporário
+PKG_CHECK_LIBS=(
+  "/usr/lib/gcc/${LFS_TGT}/${GCC_VER}/libgcc.a"
+  "/usr/lib/gcc/${LFS_TGT}/${GCC_VER}/libstdc++.a"
+)
+
+# Comandos de teste (host, usando o tree do $LFS)
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/${LFS_TGT}-gcc --version"
+  "$LFS/usr/bin/gcc --version"
+  "$LFS/usr/bin/cc --version"
+  "$LFS/usr/bin/${LFS_TGT}-gcc -print-libgcc-file-name"
+)
+
+# Sem PKG_CHECK personalizado: mini-adm usa só a genérica.
