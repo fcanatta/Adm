@@ -1,0 +1,51 @@
+# Xz-5.8.1 — Linux From Scratch r12.4-46, Capítulo 8.8
+
+PKG_NAME="xz"
+PKG_VERSION="5.8.1"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Xz package contains programs for compressing and decompressing files, supporting the lzma and xz formats."
+
+PKG_HOMEPAGE="https://tukaani.org/xz"
+PKG_SOURCE_URLS=(
+    "https://github.com//tukaani-project/xz/releases/download/v${PKG_VERSION}/xz-${PKG_VERSION}.tar.xz"
+)
+
+# Xz Utils (5.8.1) — MD5 de acordo com 3.2 All Packages (development)
+PKG_MD5S=(
+    "cf5e1feb023d22c6bdaa30e84ef3abe3"
+)
+
+# LFS não declara deps extras diretas aqui
+PKG_DEPENDS=()
+PKG_GROUPS=( "core" )
+
+# Opcional: para 'upgrade_package'
+PKG_UPSTREAM_URL="https://github.com/tukaani-project/xz/releases"
+PKG_UPSTREAM_REGEX='xz-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # LFS 8.8.1 — exatamente:
+    #   ./configure --prefix=/usr --disable-static --docdir=/usr/share/doc/xz-5.8.1
+    ./configure --prefix=/usr \
+                --disable-static \
+                --docdir=/usr/share/doc/xz-${PKG_VERSION}
+
+    make
+
+    # Testes: make check
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # Adaptando o "make install" do livro para DESTDIR do adm
+    make DESTDIR="${DESTDIR}" install
+}
