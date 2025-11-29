@@ -1,0 +1,40 @@
+# Packaging-25.0 — LFS 12.4, Capítulo 8.53
+
+PKG_NAME="packaging"
+PKG_VERSION="25.0"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="Python packaging utilities implementing PEP 440/425 versioning, specifiers, tags and requirements."
+
+PKG_HOMEPAGE="https://pypi.org/project/packaging/"
+PKG_SOURCE_URLS=(
+    "https://files.pythonhosted.org/packages/source/p/packaging/packaging-${PKG_VERSION}.tar.gz"
+)
+
+PKG_MD5S=(
+    "ab0ef21ddebe09d1803575120d3f99f8"
+)
+
+PKG_DEPENDS=("python")
+PKG_GROUPS=()
+
+PKG_UPSTREAM_URL="https://pypi.org/simple/packaging/"
+PKG_UPSTREAM_REGEX='packaging-([0-9.]+)\.tar\.gz'
+
+
+PKG_BUILD() {
+    # LFS: pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps $PWD
+    pip3 wheel -w dist --no-cache-dir --no-build-isolation --no-deps "$PWD"
+}
+
+PKG_INSTALL() {
+    # LFS: pip3 install --no-index --find-links dist packaging
+    # Adaptado para DESTDIR:
+    pip3 install \
+        --no-index \
+        --no-user \
+        --find-links dist \
+        --root "${DESTDIR}" \
+        --prefix /usr \
+        packaging
+}
