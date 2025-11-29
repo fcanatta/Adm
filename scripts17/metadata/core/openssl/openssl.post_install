@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-openssl}"
+phase="${2:-post_install}"
+
+echo "[$pkg] [$phase] Ajustando estrutura de /etc/ssl e executando rehash de certificados..."
+
+# Garante diretórios básicos
+mkdir -p /etc/ssl/certs
+mkdir -p /etc/ssl/private
+chmod 700 /etc/ssl/private || true
+
+# Se existir 'c_rehash', use-o. Senão, use 'openssl rehash' se disponível.
+if command -v c_rehash >/dev/null 2>&1; then
+    c_rehash /etc/ssl/certs || true
+elif openssl rehash /etc/ssl/certs >/dev/null 2>&1; then
+    openssl rehash /etc/ssl/certs || true
+else
+    echo "[$pkg] [$phase] Aviso: nem c_rehash nem 'openssl rehash' encontrados; rehash não executado."
+fi
+
+echo "[$pkg] [$phase] Configuração pós-instalação do OpenSSL concluída."
