@@ -190,6 +190,87 @@ load_metadata() {
 }
 
 # =========================
+# Hooks locais por pacote
+# =========================
+
+# Diretório onde ficam os hooks de um pacote (normalmente o mesmo da .meta)
+hook_dir_for_pkg() {
+    local pkg="$1"
+    local meta_path
+
+    meta_path="$(meta_path_for_pkg "$pkg" 2>/dev/null || true)"
+    if [[ -n "$meta_path" && -f "$meta_path" ]]; then
+        dirname "$meta_path"
+    else
+        # Fallback razoável se o metadata ainda não existir
+        echo "$META_DIR/$pkg"
+    fi
+}
+
+# Executa um hook de tipo (pre_install, post_install, pre_uninstall, post_uninstall)
+# dentro da pasta do programa, se existir e for executável.
+run_pkg_hook() {
+    local hook_type="$1"
+    local pkg="$2"
+    local hook_dir hook_file prog
+
+    hook_dir="$(hook_dir_for_pkg "$pkg")"
+    prog="${pkg##*/}"  # nome curto do programa, sem o grupo (core/shadow -> shadow)
+
+    hook_file="${hook_dir}/${prog}.${hook_type}"
+
+    if [[ -x "$hook_file" ]]; then
+        log_info "[$pkg] Executando hook ${hook_type}: $hook_file"
+        if ! /bin/bash "$hook_file" "$pkg" "$hook_type"; then
+            die "[$pkg] Hook ${hook_type} falhou: $hook_file"
+        fi
+    else
+        log_debug "[$pkg] Nenhum hook ${hook_type} encontrado em ${hook_dir}"
+    fi
+}
+
+# Gera uma estrutura padrão de hooks para um pacote
+generate_hooks_for_pkg() {
+    local pkg="$1"
+
+    if [[ -z "$pkg" ]]; then
+        die "generate_hooks_for_pkg: pacote não informado."
+    fi
+
+    # Garante que o metadata exista (para sabermos o diretório real)
+    ensure_metadata_exists "$pkg"
+    local meta_dir prog
+    meta_dir="$(dirname "$(meta_path_for_pkg "$pkg")")"
+    prog="${pkg##*/}"
+
+    mkdir -p "$meta_dir"
+
+    local t hook
+    for t in pre_install post_install pre_uninstall post_uninstall; do
+        hook="${meta_dir}/${prog}.${t}"
+        if [[ -e "$hook" ]]; then
+            log_warn "[$pkg] Hook já existe, não sobrescrevendo: $hook"
+            continue
+        fi
+
+        cat >"$hook" <<'EOF'
+#!/bin/bash
+# Hook gerado automaticamente pelo adm.sh
+# Argumentos: $1 = nome do pacote lógico, $2 = tipo de hook
+set -euo pipefail
+pkg="${1:-<desconhecido>}"
+phase="${2:-<fase>}"
+
+# TODO: personalize este hook.
+# Exemplo:
+# echo "[$pkg] Executando hook ${phase} em $(basename "$0")"
+EOF
+        chmod +x "$hook"
+        log_info "[$pkg] Hook criado: $hook"
+    done
+}
+
+# =========================
 # Estado de construção (retomada)
 # =========================
 
@@ -962,6 +1043,9 @@ install_package_root() {
     local destdir="$BUILD_ROOT/${PKG_NAME}-${PKG_VERSION}-destdir"
     [[ -d "$destdir" ]] || die "[$pkg] DESTDIR não encontrado para instalação: $destdir"
 
+    # Hook de pré-instalação (roda no sistema real, antes de copiar arquivos)
+    run_pkg_hook "pre_install" "$pkg"
+
     log_info "[$pkg] Instalando em / a partir de $destdir"
     # Cópia preservando atributos
     ( cd "$destdir" && cp -a . / )
@@ -969,15 +1053,11 @@ install_package_root() {
     register_install "$pkg" "$destdir"
 
     set_pkg_stage "$pkg" 5
+
+    # Hook de pós-instalação (após registrar o pacote)
+    run_pkg_hook "post_install" "$pkg"
+
     log_info "[$pkg] Instalação em / concluída."
-
-    # (Executa hook de pós instalação)
-    hook="$LFS_PKG_ROOT/hooks/post-install/${pkg}.post_install"
-
-        if [[ -x "$hook" ]]; then
-          log_info "[$pkg] Executando pós-instalação: $hook"
-            /bin/bash "$hook"
-        fi
 }
 
 build_and_install_with_deps() {
@@ -1063,6 +1143,9 @@ uninstall_package() {
         die "Não é seguro remover '$pkg' automaticamente."
     fi
 
+     # Hook de pré-desinstalação (antes de remover arquivos do sistema)
+    run_pkg_hook "pre_uninstall" "$pkg"
+
     local listfile
     listfile="$(db_files_list "$pkg")"
     [[ -f "$listfile" ]] || die "[$pkg] Lista de arquivos não encontrada: $listfile"
@@ -1101,6 +1184,9 @@ uninstall_package() {
     rm -rf "$(db_pkg_dir "$pkg")"
     clear_pkg_stage "$pkg"
     rm -rf "$BUILD_ROOT/${pkg}-"* "$STATE_DIR/$pkg.builddir" 2>/dev/null || true
+
+     # Hook de pós-desinstalação (após limpar DB e estado)
+    run_pkg_hook "post_uninstall" "$pkg"
 
     log_info "[$pkg] Desinstalação concluída."
 }
@@ -1426,6 +1512,7 @@ Comandos principais:
   rebuild-all         - Rebuild de todos os pacotes instalados
   list-installed      - Listar pacotes instalados
   info <pkg>          - Mostrar info básica do pacote
+  gen-hooks <pkg>     - Gerar estrutura padrão de hooks locais para o pacote
 EOF
 }
 
@@ -1576,6 +1663,11 @@ case "$cmd" in
         shift || true
         [[ $# -ge 1 ]] || { usage; exit 1; }
         info_pkg "$1"
+        ;;
+    gen-hooks)
+        shift || true
+        [[ $# -ge 1 ]] || { usage; exit 1; }
+        generate_hooks_for_pkg "$1"
         ;;
     ""|-h|--help|help)
         usage
