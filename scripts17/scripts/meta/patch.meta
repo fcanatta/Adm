@@ -1,4 +1,7 @@
 # Patch-2.8 - LFS 6.13
+# --------------------
+# Variáveis: PATCH_VER, LFS, LFS_TGT
+
 PKG_NAME="patch"
 
 PKG_BUILD() {
@@ -18,8 +21,8 @@ PKG_BUILD() {
     tar -xf "patch-${PATCH_VER}.tar."*
     cd "patch-${PATCH_VER}"
 
-    ./configure --prefix=/usr   \
-                --host="$LFS_TGT" \
+    ./configure --prefix=/usr                     \
+                --host="$LFS_TGT"                 \
                 --build="$(build-aux/config.guess)"
 
     make
@@ -29,6 +32,14 @@ PKG_BUILD() {
     rm -rf "patch-${PATCH_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/patch" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/patch"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/patch --version"
+)
