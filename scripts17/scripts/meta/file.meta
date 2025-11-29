@@ -1,0 +1,47 @@
+# File-5.46 - LFS 6.7
+PKG_NAME="file"
+
+PKG_BUILD() {
+    set -e
+
+    : "${FILE_VER:?FILE_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "file-${FILE_VER}.tar.xz" ]] || [[ -f "file-${FILE_VER}.tar.gz" ]] || {
+        echo "ERRO: file-${FILE_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "file-${FILE_VER}.tar."*
+    cd "file-${FILE_VER}"
+
+    # build auxiliar só para gerar o 'file' usado na assinatura
+    mkdir -v build
+    pushd build
+      ../configure --disable-bzlib      \
+                   --disable-libseccomp \
+                   --disable-xzlib      \
+                   --disable-zlib
+      make
+    popd
+
+    # configure principal (cross)
+    ./configure --prefix=/usr --host="$LFS_TGT" --build="$(./config.guess)"
+
+    # usa o file recém-compilado
+    make FILE_COMPILE="$(pwd)/build/src/file"
+    make DESTDIR="$LFS" install
+
+    # remove .la perigoso
+    rm -v "$LFS/usr/lib/libmagic.la"
+
+    cd "$LFS/sources"
+    rm -rf "file-${FILE_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/file" ]]
+}
