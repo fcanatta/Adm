@@ -1,0 +1,58 @@
+# Coreutils-9.9 - baseado em LFS 6.5 (Coreutils-9.7)
+PKG_NAME="coreutils"
+
+PKG_BUILD() {
+    set -e
+
+    : "${COREUTILS_VER:?COREUTILS_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "coreutils-${COREUTILS_VER}.tar.xz" ]] || [[ -f "coreutils-${COREUTILS_VER}.tar.gz" ]] || {
+        echo "ERRO: coreutils-${COREUTILS_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "coreutils-${COREUTILS_VER}.tar."*
+    cd "coreutils-${COREUTILS_VER}"
+
+    ./configure --prefix=/usr                     \
+                --host="$LFS_TGT"                 \
+                --build="$(build-aux/config.guess)" \
+                --enable-install-program=hostname \
+                --enable-no-install-program=kill,uptime
+
+    make
+    make DESTDIR="$LFS" install
+
+    # Ajustes de chroot para /usr/sbin + man8 (6.5.1)
+    mv -v "$LFS/usr/bin/chroot"              "$LFS/usr/sbin"
+    mkdir -pv "$LFS/usr/share/man/man8"
+    mv -v "$LFS/usr/share/man/man1/chroot.1" "$LFS/usr/share/man/man8/chroot.8"
+    sed -i 's/"1"/"8"/'                      "$LFS/usr/share/man/man8/chroot.8"
+
+    cd "$LFS/sources"
+    rm -rf "coreutils-${COREUTILS_VER}"
+}
+
+PKG_CHECK() {
+    local ok=0
+
+    # ls é um bom indicador
+    if [[ -x "$LFS/usr/bin/ls" ]]; then
+        ok=$((ok+1))
+    else
+        echo "coreutils CHECK: não encontrei $LFS/usr/bin/ls" >&2
+    fi
+
+    # chroot movido para /usr/sbin
+    if [[ -x "$LFS/usr/sbin/chroot" ]]; then
+        ok=$((ok+1))
+    else
+        echo "coreutils CHECK: não encontrei $LFS/usr/sbin/chroot" >&2
+    fi
+
+    (( ok >= 2 ))
+}
