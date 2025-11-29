@@ -1,15 +1,12 @@
 # Libstdc++ from GCC-15.2.0 - LFS 5.6
 # -----------------------------------
-# Libstdc++ faz parte do tarball do GCC.
-# Este meta segue o capítulo 5.6 do LFS 12.4:
-#   - re-extrai gcc-15.2.0
-#   - entra em libstdc++-v3
-#   - compila e instala só a libstdc++ no $LFS
-#
+# Usa o tarball do GCC para construir apenas a libstdc++ no $LFS.
 # Pré-requisitos:
-#   - gcc-pass1 e glibc já feitos
-#   - $LFS, $LFS_TGT e $GCC_VER definidos
-#   - tarball gcc-${GCC_VER}.tar.* em $LFS/sources
+#   - gcc-pass1, glibc
+#   - GCC_VER, LFS, LFS_TGT definidos
+# Tarball:
+#   $LFS/sources/gcc-${GCC_VER}.tar.xz
+
 
 PKG_NAME="libstdcpp"
 
@@ -22,7 +19,6 @@ PKG_BUILD() {
 
     cd "$LFS/sources"
 
-    # 1. Extrair GCC de novo (libstdc++ está dentro dele)
     [[ -f "gcc-${GCC_VER}.tar.xz" ]] || [[ -f "gcc-${GCC_VER}.tar.gz" ]] || {
         echo "ERRO: gcc-${GCC_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
         exit 1
@@ -31,11 +27,9 @@ PKG_BUILD() {
     tar -xf "gcc-${GCC_VER}.tar."*
     cd "gcc-${GCC_VER}"
 
-    # 2. Diretório de build dedicado para libstdc++ (5.6.1)
     mkdir -v build-libstdc++
     cd build-libstdc++
 
-    # 3. Configure libstdc++ (comando do livro 5.6.1)
     ../libstdc++-v3/configure      \
         --host="$LFS_TGT"          \
         --build="$(../config.guess)" \
@@ -45,33 +39,29 @@ PKG_BUILD() {
         --disable-libstdcxx-pch    \
         --with-gxx-include-dir="/tools/$LFS_TGT/include/c++/${GCC_VER}"
 
-    # 4. Compilar e instalar em $LFS (5.6.1)
     make
     make DESTDIR="$LFS" install
 
-    # 5. Limpeza da árvore do GCC
     cd "$LFS/sources"
     rm -rf "gcc-${GCC_VER}"
 }
 
-PKG_CHECK() {
-    # Verificação simples:
-    #  - se existe libstdc++ em $LFS/usr/lib
-    #  - e se o cross g++ ($LFS_TGT-g++) responde
+#######################################################
+# Checagem genérica
+#######################################################
 
-    local ok=0
+# Libstdc++ é biblioteca, então foco em libs
+PKG_CHECK_LIBS=(
+  "/usr/lib/libstdc++.so.6"
+  "/usr/lib/libstdc++.a"
+)
 
-    if ls "$LFS"/usr/lib/libstdc++.so* >/dev/null 2>&1; then
-        ok=$((ok+1))
-    else
-        echo "libstdcpp CHECK: não encontrei libstdc++ em $LFS/usr/lib" >&2
-    fi
+# Também checamos se o cross g++ existe (binário)
+PKG_CHECK_BINS=(
+  "/usr/bin/${LFS_TGT}-g++"
+)
 
-    if "$LFS_TGT-g++" --version >/dev/null 2>&1; then
-        ok=$((ok+1))
-    else
-        echo "libstdcpp CHECK: $LFS_TGT-g++ não respondeu" >&2
-    fi
-
-    (( ok >= 2 ))
-}
+# Comandos simples no host usando o tree do $LFS
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/${LFS_TGT}-g++ --version"
+)
