@@ -1,0 +1,111 @@
+# LLVM + Clang + Compiler-RT
+PKG_NAME="llvm"
+PKG_VERSION="21.1.2"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://github.com/llvm/llvm-project/releases/download/llvmorg-${PKG_VERSION}/llvm-${PKG_VERSION}.src.tar.xz"
+  "https://anduin.linuxfromscratch.org/BLFS/llvm/llvm-cmake-${PKG_VERSION}.src.tar.xz"
+  "https://anduin.linuxfromscratch.org/BLFS/llvm/llvm-third-party-${PKG_VERSION}.src.tar.xz"
+  "https://github.com/llvm/llvm-project/releases/download/llvmorg-${PKG_VERSION}/clang-${PKG_VERSION}.src.tar.xz"
+  "https://github.com/llvm/llvm-project/releases/download/llvmorg-${PKG_VERSION}/compiler-rt-${PKG_VERSION}.src.tar.xz"
+)
+
+PKG_MD5S=(
+  "14fce9a7dd1a38c53e97d91bc71494e8"  # llvm-${PKG_VERSION}.src.tar.xz
+  "7e72735a92f6435ef4a43e3392839fdf"  # llvm-cmake-${PKG_VERSION}.src.tar.xz
+  "a65ff4150baaa4741e06f45adfe906c2"  # llvm-third-party-${PKG_VERSION}.src.tar.xz
+  "6b6a97065f4f0b141dbb6d2389770c75"  # clang-${PKG_VERSION}.src.tar.xz
+  "2bb9d716132507dd6335a507d9f9f4e6"  # compiler-rt-${PKG_VERSION}.src.tar.xz
+)
+
+PKG_UPSTREAM_URL="https://llvm.org"
+PKG_GROUPS=("devel" "toolchain" "compiler")
+PKG_DEPENDS=("cmake" "ninja" "python" "zlib" "libffi" "binutils" "gcc" "glibc")
+
+PKG_BUILD() {
+    set -e
+
+    # Estamos no buildroot do adm. As fontes foram extraídas aqui:
+    #   llvm-${PKG_VERSION}.src
+    #   cmake-21.1.2.src / third-party-21.1.2.src / clang-21.1.2.src / compiler-rt-21.1.2.src (irmãos)
+    local srcdir="llvm-${PKG_VERSION}.src"
+    cd "$srcdir"
+
+    # Garante que cmake/third-party estejam DENTRO da árvore do llvm
+    if [[ -d "../cmake-${PKG_VERSION}.src" && ! -d "cmake-${PKG_VERSION}.src" ]]; then
+        mv "../cmake-${PKG_VERSION}.src" .
+    fi
+    if [[ -d "../third-party-${PKG_VERSION}.src" && ! -d "third-party-${PKG_VERSION}.src" ]]; then
+        mv "../third-party-${PKG_VERSION}.src" .
+    fi
+
+    # Ajusta caminhos esperados pelo build system (BLFS)
+    sed -i \
+        '/LLVM_COMMON_CMAKE_UTILS/s@../cmake@cmake-21.1.2.src@' CMakeLists.txt
+    sed -i \
+        '/LLVM_THIRD_PARTY_DIR/s@../third-party@third-party-21.1.2.src@' \
+        cmake-21.1.2.src/modules/HandleLLVMOptions.cmake
+
+    # Move clang e compiler-rt para os lugares esperados
+    if [[ -d "../clang-${PKG_VERSION}.src" && ! -d "tools/clang" ]]; then
+        mkdir -p tools
+        mv "../clang-${PKG_VERSION}.src" tools/clang
+    fi
+    if [[ -d "../compiler-rt-${PKG_VERSION}.src" && ! -d "projects/compiler-rt" ]]; then
+        mkdir -p projects
+        mv "../compiler-rt-${PKG_VERSION}.src" projects/compiler-rt
+    fi
+
+    # Corrige shebangs de python -> python3
+    if command -v python3 >/dev/null 2>&1; then
+        grep -rl '#!.*python' . | xargs sed -i '1s/python$/python3/'
+    fi
+
+    # Garante instalação do FileCheck (usado por outros pacotes)
+    sed -i 's/utility/tool/' utils/FileCheck/CMakeLists.txt
+
+    mkdir -v build
+    cd build
+
+    CC=gcc CXX=g++ \
+    cmake -D CMAKE_INSTALL_PREFIX=/usr           \
+          -D CMAKE_SKIP_INSTALL_RPATH=ON         \
+          -D LLVM_ENABLE_FFI=ON                  \
+          -D CMAKE_BUILD_TYPE=Release            \
+          -D LLVM_BUILD_LLVM_DYLIB=ON            \
+          -D LLVM_LINK_LLVM_DYLIB=ON            \
+          -D LLVM_ENABLE_RTTI=ON                 \
+          -D LLVM_TARGETS_TO_BUILD="host;AMDGPU" \
+          -D LLVM_BINUTILS_INCDIR=/usr/include   \
+          -D LLVM_INCLUDE_BENCHMARKS=OFF         \
+          -D CLANG_DEFAULT_PIE_ON_LINUX=ON       \
+          -D CLANG_CONFIG_FILE_SYSTEM_DIR=/etc/clang \
+          -W no-dev -G Ninja ..
+
+    ninja
+
+    # (Opcional) testes - muito pesados. Se quiser, descomente:
+    # if [[ -d ../projects/compiler-rt ]]; then
+    #   sed -e 's/config.has_no_default_config_flag/True/' \
+    #       -e 's/"-fuse-ld=gold"//'                       \
+    #       -i ../projects/compiler-rt/test/lit.common.cfg.py
+    #   sh -c 'ulimit -c 0 && ninja check-all'
+    # fi
+}
+
+PKG_INSTALL() {
+    set -e
+    local srcdir="llvm-${PKG_VERSION}.src/build"
+    cd "$srcdir"
+
+    # Instalação respeitando DESTDIR
+    DESTDIR="${DESTDIR:-/}" ninja install
+
+    # Configuração padrão do clang para SSP (igual BLFS)
+    local etc_clang="${DESTDIR}/etc/clang"
+    mkdir -pv "$etc_clang"
+    for i in clang clang++; do
+        echo -fstack-protector-strong > "${etc_clang}/${i}.cfg"
+    done
+}
