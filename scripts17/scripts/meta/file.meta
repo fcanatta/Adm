@@ -1,4 +1,7 @@
 # File-5.46 - LFS 6.7
+# -------------------
+# Variáveis: FILE_VER, LFS, LFS_TGT
+
 PKG_NAME="file"
 
 PKG_BUILD() {
@@ -18,7 +21,7 @@ PKG_BUILD() {
     tar -xf "file-${FILE_VER}.tar."*
     cd "file-${FILE_VER}"
 
-    # build auxiliar só para gerar o 'file' usado na assinatura
+    # build auxiliar só pra gerar o 'file' usado na build
     mkdir -v build
     pushd build
       ../configure --disable-bzlib      \
@@ -35,13 +38,25 @@ PKG_BUILD() {
     make FILE_COMPILE="$(pwd)/build/src/file"
     make DESTDIR="$LFS" install
 
-    # remove .la perigoso
-    rm -v "$LFS/usr/lib/libmagic.la"
+    # remove .la
+    rm -v "$LFS/usr/lib/libmagic.la" || true
 
     cd "$LFS/sources"
     rm -rf "file-${FILE_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/file" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/file"
+)
+
+PKG_CHECK_LIBS=(
+  "/usr/lib/libmagic.so"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/file --version"
+)
