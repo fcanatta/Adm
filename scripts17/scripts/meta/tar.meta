@@ -1,4 +1,7 @@
 # Tar-1.35 - LFS 6.15
+# -------------------
+# Variáveis: TAR_VER, LFS, LFS_TGT
+
 PKG_NAME="tar"
 
 PKG_BUILD() {
@@ -18,8 +21,8 @@ PKG_BUILD() {
     tar -xf "tar-${TAR_VER}.tar."*
     cd "tar-${TAR_VER}"
 
-    ./configure --prefix=/usr   \
-                --host="$LFS_TGT" \
+    ./configure --prefix=/usr                       \
+                --host="$LFS_TGT"                   \
                 --build="$(build-aux/config.guess)"
 
     make
@@ -29,6 +32,14 @@ PKG_BUILD() {
     rm -rf "tar-${TAR_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/tar" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/tar"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/tar --version"
+)
