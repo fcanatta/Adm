@@ -1,0 +1,49 @@
+# Gzip-1.14 — Linux From Scratch r12.4-46, Capítulo 8.67
+
+PKG_NAME="gzip"
+PKG_VERSION="1.14"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Gzip package contains programs for compressing and decompressing files."
+
+PKG_HOMEPAGE="https://www.gnu.org/software/gzip/"
+PKG_SOURCE_URLS=(
+    "https://ftp.gnu.org/gnu/gzip/gzip-${PKG_VERSION}.tar.xz"
+)
+
+# Gzip (1.14) — MD5 de acordo com 3.2 All Packages (development)
+PKG_MD5S=(
+    "4bf5a10f287501ee8e8ebe00ef62b2c2"
+)
+
+# Nenhuma dependência adicional listada no capítulo do LFS
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+# Opcional: para 'upgrade_package'
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/gzip/"
+PKG_UPSTREAM_REGEX='gzip-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # LFS 8.67.1 — exatamente:
+    #   ./configure --prefix=/usr
+    ./configure --prefix=/usr
+
+    make
+
+    # Testes: make check
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # Adaptando o "make install" do livro para DESTDIR
+    make DESTDIR="${DESTDIR}" install
+}
