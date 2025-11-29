@@ -1,0 +1,52 @@
+# Zstd-1.5.7 — Linux From Scratch r12.4-46, Capítulo 8.10
+
+PKG_NAME="zstd"
+PKG_VERSION="1.5.7"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="Zstandard is a fast real-time compression algorithm with high compression ratios."  # LFS 8.10
+
+PKG_HOMEPAGE="https://facebook.github.io/zstd/"
+PKG_SOURCE_URLS=(
+    "https://github.com/facebook/zstd/releases/download/v${PKG_VERSION}/zstd-${PKG_VERSION}.tar.gz"
+)
+
+# De 3.2 All Packages (Zstd (1.5.7))
+PKG_MD5S=(
+    "780fc1896922b1bc52a4e90980cdda48"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+PKG_UPSTREAM_URL="https://github.com/facebook/zstd/releases"
+PKG_UPSTREAM_REGEX='zstd-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # LFS 8.10.1 — compile:
+    #   make prefix=/usr
+    make prefix=/usr
+
+    # Testes:
+    #   make check   (LFS observa que algumas mensagens 'failed' são esperadas,
+    #   mas só 'FAIL' conta como erro de teste)
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # LFS: make prefix=/usr install
+    # Adaptado pro DESTDIR:
+    make prefix=/usr DESTDIR="${DESTDIR}" install
+
+    # LFS manda remover a lib estática:
+    #   rm -v /usr/lib/libzstd.a
+    rm -v "${DESTDIR}/usr/lib/libzstd.a"
+}
