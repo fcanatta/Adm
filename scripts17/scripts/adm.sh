@@ -970,6 +970,14 @@ install_package_root() {
 
     set_pkg_stage "$pkg" 5
     log_info "[$pkg] Instalação em / concluída."
+
+    # (Executa hook de pós instalação)
+    hook="$LFS_PKG_ROOT/hooks/post-install/${pkg}.post_install"
+
+        if [[ -x "$hook" ]]; then
+          log_info "[$pkg] Executando pós-instalação: $hook"
+            /bin/bash "$hook"
+        fi
 }
 
 build_and_install_with_deps() {
