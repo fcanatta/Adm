@@ -275,6 +275,7 @@ BUILD_ORDER=(
   binutils-pass2          # Binutils-2.45.1 - Pass 2
   gcc-pass2               # GCC-15.2.0     - Pass 2
   musl                    # Libc musl
+  toolchain-check         # Roda a checagem no final
 )
 
 ########################################
