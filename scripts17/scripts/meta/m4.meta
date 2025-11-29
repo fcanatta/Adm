@@ -1,0 +1,38 @@
+# M4-1.4.20 - LFS 6.2 (Cross Compiling Temporary Tools)
+PKG_NAME="m4"
+
+PKG_BUILD() {
+    set -e
+
+    : "${M4_VER:?M4_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "m4-${M4_VER}.tar.xz" ]] || [[ -f "m4-${M4_VER}.tar.gz" ]] || {
+        echo "ERRO: m4-${M4_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "m4-${M4_VER}.tar."*
+    cd "m4-${M4_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "m4-${M4_VER}"
+}
+
+PKG_CHECK() {
+    # Verifica se o m4 temporário está instalado em $LFS/usr/bin
+    if [[ -x "$LFS/usr/bin/m4" ]]; then
+        return 0
+    fi
+    return 1
+}
