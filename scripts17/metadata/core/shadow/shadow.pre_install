@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-shadow}"
+phase="${2:-pre_install}"
+
+echo "[$pkg] [$phase] Fazendo backup de /etc/passwd, /etc/group, /etc/shadow, /etc/gshadow..."
+
+ts="$(date +%Y%m%d-%H%M%S)"
+backup_dir="/var/backups/adm-${pkg}-${ts}"
+
+mkdir -p "$backup_dir"
+
+for f in /etc/passwd /etc/group /etc/shadow /etc/gshadow; do
+    if [[ -e "$f" ]]; then
+        cp -a "$f" "$backup_dir"/
+    fi
+done
+
+echo "[$pkg] [$phase] Backups salvos em: $backup_dir"
