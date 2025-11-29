@@ -300,23 +300,23 @@ clear_pkg_stage() {
 # =========================
 # Download com cache + checksum
 # =========================
-download_one_source() {
+ download_one_source() {
     local pkg="$1" idx="$2" urlspec="$3" out="$4" sha256_spec="$5" md5_spec="$6"
 
-    # urlspec pode ter múltiplos espelhos separados por '|'
+    # urlspec pode ter múltiplos espelhos separados por "|"
     local -a mirrors=()
     IFS='|' read -r -a mirrors <<<"$urlspec"
     if ((${#mirrors[@]} == 0)); then
         die "[$pkg] Nenhuma URL válida em PKG_SOURCE_URLS[$idx]"
     fi
 
-    # hashes esperados: aceitamos múltiplos separados por '|' ou espaço
+    # hashes esperados: aceitamos múltiplos separados por "|" ou espaço
     local -a sha256_list=() md5_list=()
     if [[ -n "$sha256_spec" ]]; then
-        IFS='| ' read -r -a sha256_list <<<"$sha256_spec"
+        IFS='| ' read -r - a sha256_list <<<"$sha256_spec"
     fi
     if [[ -n "$md5_spec" ]]; then
-        IFS='| ' read -r -a md5_list <<<"$md5_spec"
+        IFS='| ' read -r - a md5_list <<<"$md5_spec"
     fi
 
     local have_checksum=0
@@ -324,17 +324,14 @@ download_one_source() {
         have_checksum=1
     fi
 
-    local attempts_per_mirror=3
-
-    # ---------- Validação de checksums (AGORA CORRETA) ----------
-    _check_file_checksums() {
+    # Verifica checksums de um arquivo já baixado
+    _dl_check_file() {
         local file="$1"
         local failed=0
 
         if ((${#sha256_list[@]} > 0)); then
-            local expected_s got_s
+            local got_s expected_s match=0
             got_s=$(sha256sum "$file" | awk '{print $1}')
-            local match=0
             for expected_s in "${sha256_list[@]}"; do
                 [[ -z "$expected_s" ]] && continue
                 if [[ "$got_s" == "$expected_s" ]]; then
@@ -349,9 +346,8 @@ download_one_source() {
         fi
 
         if ((${#md5_list[@]} > 0)); then
-            local expected_m got_m
+            local got_m expected_m match=0
             got_m=$(md5sum "$file" | awk '{print $1}')
-            local match=0
             for expected_m in "${md5_list[@]}"; do
                 [[ -z "$expected_m" ]] && continue
                 if [[ "$got_m" == "$expected_m" ]]; then
@@ -365,7 +361,7 @@ download_one_source() {
             fi
         fi
 
-        return "$failed"   # 0 = OK, 1 = FALHOU
+        return "$failed"   # 0 = OK, 1 = falhou
     }
 
     mkdir -p "$(dirname "$out")"
@@ -373,7 +369,7 @@ download_one_source() {
     # Se já existe no cache, verifica checksum ANTES de qualquer coisa
     if [[ -f "$out" && $have_checksum -eq 1 ]]; then
         log_info "[$pkg] Source já no cache: $out, verificando checksums..."
-        if _check_file_checksums "$out"; then
+        if _dl_check_file "$out"; then
             log_info "[$pkg] Arquivo em cache válido, reaproveitando."
             return 0
         else
@@ -385,8 +381,8 @@ download_one_source() {
         return 0
     fi
 
-    # ---------- Download de uma única URL para tmpout ----------
-    _do_download_url() {
+    # Helper para download de uma única URL
+    _dl_fetch_url() {
         local url="$1" tmpout="$2"
 
         if [[ "$url" == git://* || "$url" == *.git || "$url" == git+* ]]; then
@@ -418,7 +414,7 @@ download_one_source() {
             # HTTP/HTTPS/FTP etc
             if command -v curl >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via curl: $url"
-                if curl -L --fail --connect-timeout 15 --max-time 0 -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
+                if curl -L --fail --connect-timeout 15 --max-time 0 -o "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
                     return 0
                 else
                     log_warn "[$pkg] Falha no download via curl: $url"
@@ -438,7 +434,7 @@ download_one_source() {
         fi
     }
 
-    # ---------- Tenta cada mirror com algumas tentativas ----------
+    local attempts_per_mirror=3
     local mirror
     for mirror in "${mirrors[@]}"; do
         [[ -z "$mirror" ]] && continue
@@ -451,115 +447,7 @@ download_one_source() {
             local tmpout="${out}.part"
             rm -f "$tmpout"
 
-            if _do_download_url "$mirror" "$tmpout"; then
-                # Se temos checksums, valida ANTES de mover
-                if (( have_checksum == 1 )); then
-                    if _check_file_checksums "$tmpout"; then
-                        mv -f "$tmpout" "$out"
-                        log_info "[$pkg] Download concluído e checksum OK: $out"
-                        return 0
-                    else
-                        log_warn "[$pkg] Checksum inválido para arquivo baixado de $mirror (tentativa $attempt)."
-                        rm -f "$tmpout"
-                        continue
-                    fi
-                else
-                    mv -f "$tmpout" "$out"
-                    log_info "[$pkg] Download concluído (sem checksum): $out"
-                    return 0
-                fi
-            else
-                log_warn "[$pkg] Falha na tentativa $attempt de $mirror"
-            fi
-        done
-    done
-
-    die "[$pkg] Falha ao baixar source (todas URLs/tentativas esgotadas) para índice $idx -> $out"
-}
-
-    mkdir -p "$(dirname "$out")"
-
-    # Se já existe no cache, verifica checksum ANTES de qualquer coisa
-    if [[ -f "$out" && $have_checksum -eq 1 ]]; then
-        log_info "[$pkg] Source já no cache: $out, verificando checksums..."
-        if _check_file_checksums "$out"; then
-            log_info "[$pkg] Arquivo em cache válido, reaproveitando."
-            return 0
-        else
-            log_warn "[$pkg] Arquivo em cache com checksum inválido, removendo: $out"
-            rm -f "$out"
-        fi
-    elif [[ -f "$out" && $have_checksum -eq 0 ]]; then
-        log_info "[$pkg] Source já no cache: $out (sem checksums definidos)."
-        return 0
-    fi
-
-    # Helper para download de uma única URL em tmpout
-    _do_download_url() {
-        local url="$1" tmpout="$2"
-
-        if [[ "$url" == git://* || "$url" == *.git || "$url" == git+* ]]; then
-            require_cmd git
-            local tmpdir
-            tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/adm-git-XXXXXX")"
-            log_info "[$pkg] Clonando repositório git: $url"
-            if git clone --depth=1 "${url#git+}" "$tmpdir" >>"$LOG_FILE" 2>&1; then
-                ( cd "$tmpdir" && tar -cf "$tmpout" . ) >>"$LOG_FILE" 2>&1
-                rm -rf "$tmpdir"
-                return 0
-            else
-                log_warn "[$pkg] Falha ao clonar git: $url"
-                rm -rf "$tmpdir"
-                return 1
-            fi
-
-        elif [[ "$url" == rsync://* ]]; then
-            require_cmd rsync
-            log_info "[$pkg] Baixando via rsync: $url"
-            if rsync -av "$url" "$tmpout" >>"$LOG_FILE" 2>&1; then
-                return 0
-            else
-                log_warn "[$pkg] Falha no rsync: $url"
-                return 1
-            fi
-
-        else
-            # HTTP/HTTPS/FTP etc
-            if command -v curl >/dev/null 2>&1; then
-                log_info "[$pkg] Baixando via curl: $url"
-                if curl -L --fail --connect-timeout 15 --max-time 0 -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
-                    return 0
-                else
-                    log_warn "[$pkg] Falha no download via curl: $url"
-                    return 1
-                fi
-            elif command -v wget >/dev/null 2>&1; then
-                log_info "[$pkg] Baixando via wget: $url"
-                if wget -O "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
-                    return 0
-                else
-                    log_warn "[$pkg] Falha no download via wget: $url"
-                    return 1
-                fi
-            else
-                die "[$pkg] Nem curl nem wget encontrados para download HTTP/FTP."
-            fi
-        fi
-    }
-
-    local mirror
-    for mirror in "${mirrors[@]}"; do
-        [[ -z "$mirror" ]] && continue
-        log_info "[$pkg] Usando mirror: $mirror -> $out"
-
-        local attempt
-        for (( attempt=1; attempt<=attempts_per_mirror; attempt++ )); do
-            log_info "[$pkg] Download tentativa $attempt/$attempts_per_mirror: $mirror"
-
-            local tmpout="${out}.part"
-            rm -f "$tmpout"
-
-            if ! _do_download_url "$mirror" "$tmpout"; then
+            if ! _dl_fetch_url "$mirror" "$tmpout"; then
                 log_warn "[$pkg] Falha ao baixar de $mirror (tentativa $attempt)"
                 continue
             fi
@@ -570,25 +458,27 @@ download_one_source() {
             fi
 
             if (( have_checksum == 1 )); then
-                if _check_file_checksums "$tmpout"; then
-                    mv "$tmpout" "$out"
-                    log_info "[$pkg] Download concluído e válido: $out"
+                if _dl_check_file "$tmpout"; then
+                    mv -f "$tmpout" "$out"
+                    log_info "[$pkg] Download concluído e checksum OK: $out"
                     return 0
                 else
+                    log_warn "[$pkg] Checksum inválido para arquivo baixado de $mirror (tentativa $attempt)"
                     rm -f "$tmpout"
                     continue
                 fi
             else
-                mv "$tmpout" "$out"
-                log_info "[$pkg] Download concluído (sem checksums definidos): $out"
+                mv -f "$tmpout" "$out"
+                log_info "[$pkg] Download concluído (sem checksum): $out"
                 return 0
             fi
         done
     done
 
     die "[$pkg] Falha ao baixar/verificar source $idx depois de tentar todos os mirrors."
-}        
-            
+}  
+
+ # Downloads em paralelo           
 download_sources_parallel() {
     local pkg="$1"
 
