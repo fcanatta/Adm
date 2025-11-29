@@ -1,4 +1,7 @@
 # Gawk-5.3.2 - LFS 6.9
+# --------------------
+# Variáveis: GAWK_VER, LFS, LFS_TGT
+
 PKG_NAME="gawk"
 
 PKG_BUILD() {
@@ -18,12 +21,12 @@ PKG_BUILD() {
     tar -xf "gawk-${GAWK_VER}.tar."*
     cd "gawk-${GAWK_VER}"
 
-    # não instalar extras
+    # não instalar extras (igual livro)
     sed -i 's/extras//' Makefile.in
 
     ./configure --prefix=/usr   \
                 --host="$LFS_TGT" \
-                --build="$(build-aux/config.guess)"
+                --build="$(./build-aux/config.guess)"
 
     make
     make DESTDIR="$LFS" install
@@ -32,6 +35,18 @@ PKG_BUILD() {
     rm -rf "gawk-${GAWK_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/gawk" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/gawk"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/awk"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/gawk --version"
+)
