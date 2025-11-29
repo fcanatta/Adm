@@ -871,22 +871,31 @@ resolve_deps_order() {
 # Reverse deps para uninstall / órfãos
 reverse_deps_of() {
     local target="$1"
-    local pkg pkgpath
+    local pkgdir rel pkg_name d
 
-    while IFS= read -r -d '' pkgpath; do
-        [[ -d "$pkgpath" ]] || continue
-        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+    # Procura todos os pacotes instalados (diretórios em $DB_DIR)
+    while IFS= read -r -d '' pkgdir; do
+        [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" ]]; then
             continue
         fi
-        pkg="$(basename "$pkgpath")"
-        # carrega metadata salvo na instalação
+
+        # Caminho relativo ao DB_DIR (pode ser core/shadow, etc.)
+        rel="${pkgdir#$DB_DIR/}"
+
+        # Carrega metadata salvo no DB
         unset PKG_NAME PKG_DEPENDS
         # shellcheck source=/dev/null
-        source "$pkgpath/metadata.meta"
-        local d
+        source "$pkgdir/metadata.meta"
+
+        # Nome lógico do pacote: PKG_NAME, se existir, senão rel
+        pkg_name="${PKG_NAME:-$rel}"
+
         for d in "${PKG_DEPENDS[@]:-}"; do
+            [[ -z "$d" ]] && continue
             if [[ "$d" == "$target" ]]; then
-                echo "$pkg"
+                echo "$pkg_name"
+                break
             fi
         done
     done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
@@ -894,45 +903,59 @@ reverse_deps_of() {
 
 # Detectar órfãos: pacotes que ninguém depende (e que não são base listados)
 list_orphans() {
-    local base_pkgs=() # você pode adicionar base aqui se quiser preservar
-    declare -A has_revdep
-    local pkg pkgpath
+    local -a base_pkgs=()  # coloque aqui pacotes "protegidos" se quiser depois
+    declare -A has_revdep=()
+    local pkgdir rel pkg_name d b
 
-    # Inicializa todos como sem reverse deps
-    while IFS= read -r -d '' pkgpath; do
-        [[ -d "$pkgpath" ]] || continue
-        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+    # 1ª passada: inicializa todos os pacotes instalados com "sem revdeps"
+    while IFS= read -r -d '' pkgdir; do
+        [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" ]]; then
             continue
         fi
-        pkg="$(basename "$pkgpath")"
-        has_revdep["$pkg"]=0
+
+        rel="${pkgdir#$DB_DIR/}"
+
+        unset PKG_NAME PKG_DEPENDS
+        # shellcheck source=/dev/null
+        source "$pkgdir/metadata.meta"
+
+        pkg_name="${PKG_NAME:-$rel}"
+        has_revdep["$pkg_name"]=0
     done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
-    # Marca quem possui reverse deps
-    while IFS= read -r -d '' pkgpath; do
-        [[ -d "$pkgpath" ]] || continue
-        if [[ ! -f "$pkgpath/metadata.meta" ]]; then
+    # 2ª passada: marca quem é dependência de alguém
+    while IFS= read -r -d '' pkgdir; do
+        [[ -d "$pkgdir" ]] || continue
+        if [[ ! -f "$pkgdir/metadata.meta" ]]; then
             continue
         fi
-        pkg="$(basename "$pkgpath")"
-        unset PKG_DEPENDS
+
+        unset PKG_NAME PKG_DEPENDS
         # shellcheck source=/dev/null
-        source "$pkgpath/metadata.meta"
-        local d
+        source "$pkgdir/metadata.meta"
+
         for d in "${PKG_DEPENDS[@]:-}"; do
+            [[ -z "$d" ]] && continue
             has_revdep["$d"]=1
         done
     done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 
+    # 3ª passada: imprime quem não tem revdeps e não está em base_pkgs
+    local pkg skip
     for pkg in "${!has_revdep[@]}"; do
-        local keep=0
-        local b
+        (( ${has_revdep[$pkg]} != 0 )) && continue
+
+        skip=0
         for b in "${base_pkgs[@]}"; do
-            [[ "$pkg" == "$b" ]] && keep=1 && break
+            if [[ "$pkg" == "$b" ]]; then
+                skip=1
+                break
+            fi
         done
-        if (( has_revdep["$pkg"] == 0 && keep == 0 )); then
-            echo "$pkg"
-        fi
+        (( skip )) && continue
+
+        echo "$pkg"
     done
 }
 
@@ -1514,30 +1537,41 @@ EOF
 }
 
 list_installed() {
-    local pkg
+    if [[ ! -d "$DB_DIR" ]]; then
+        log_info "Nenhum pacote instalado (DB_DIR não existe: $DB_DIR)."
+        return 0
+    fi
+
+    local pkgdir rel name ver relnum
+
     while IFS= read -r -d '' pkgdir; do
         [[ -d "$pkgdir" ]] || continue
         if [[ ! -f "$pkgdir/metadata.meta" && ! -f "$pkgdir/files.list" ]]; then
             continue
         fi
-        pkg="$(basename "$pkgdir")"
 
-        # Tentar ler metadata salvo no DB primeiro, sem abortar o script inteiro
-        unset PKG_NAME PKG_VERSION PKG_RELEASE PKG_DEPENDS
-        local meta_db
-        meta_db="$pkgdir/metadata.meta"
-        if [[ -f "$meta_db" ]]; then
+        # Caminho relativo ao DB_DIR (pode ser core/shadow, etc.)
+        rel="${pkgdir#$DB_DIR/}"
+
+        unset PKG_NAME PKG_VERSION PKG_RELEASE
+
+        if [[ -f "$pkgdir/metadata.meta" ]]; then
+            # Metadata salvo na instalação
             # shellcheck source=/dev/null
-            source "$meta_db"
-        elif [[ -f "$(meta_path_for_pkg "$pkg")" ]]; then
-            # shellcheck source=/dev/null
-            source "$(meta_path_for_pkg "$pkg")"
+            source "$pkgdir/metadata.meta"
         else
-            PKG_VERSION="?"
-            PKG_RELEASE="?"
+            # Fallback: tenta metadata atual
+            if ensure_metadata_exists "$rel" 2>/dev/null; then
+                # shellcheck source=/dev/null
+                source "$(meta_path_for_pkg "$rel")"
+            fi
         fi
 
-        printf "%-20s %s-%s\n" "$pkg" "${PKG_VERSION:-?}" "${PKG_RELEASE:-?}"
+        name="${PKG_NAME:-$rel}"
+        ver="${PKG_VERSION:-?}"
+        relnum="${PKG_RELEASE:-?}"
+
+        printf "%s %s-%s\n" "$name" "$ver" "$relnum"
     done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
 }
 
