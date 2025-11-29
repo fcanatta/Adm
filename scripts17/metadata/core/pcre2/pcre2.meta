@@ -1,0 +1,65 @@
+# Pcre2-10.47 - LFS r12.4-46 (8.13)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/pcre2.html
+
+PKG_NAME="pcre2"
+PKG_VERSION="10.47"
+PKG_RELEASE=1
+
+# Fonte conforme LFS (capítulo 3 - packages)
+# Home: https://github.com/PCRE2Project/pcre2/
+# Download: https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PKG_VERSION}/pcre2-${PKG_VERSION}.tar.bz2
+PKG_SOURCE_URLS=(
+  "https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PKG_VERSION}/pcre2-${PKG_VERSION}.tar.bz2"
+)
+
+# MD5 oficial do livro LFS
+# pcre2-10.47.tar.bz2 -> aded5840ab5a7d772dd4e16fc294b665
+PKG_MD5S=(
+  "aded5840ab5a7d772dd4e16fc294b665"
+)
+
+# Dependências “reais” usadas pelas opções de configure:
+#   --enable-pcre2grep-libz       -> zlib
+#   --enable-pcre2grep-libbz2     -> bzip2
+#   --enable-pcre2test-libreadline-> readline
+PKG_DEPENDS=(
+  "zlib"
+  "bzip2"
+  "readline"
+)
+
+# Grupo lógico (ajuste se você estiver usando outra convenção)
+PKG_GROUPS=("libs" "core")
+
+# Dados para o sistema de update do adm
+PKG_UPSTREAM_URL="https://github.com/PCRE2Project/pcre2/releases/"
+PKG_UPSTREAM_REGEX='pcre2-([0-9.]+)\.tar\.bz2'
+
+# -------------------------------------------------------------
+# Build / Install seguindo o LFS, adaptado para DESTDIR do adm
+# -------------------------------------------------------------
+PKG_BUILD() {
+    ./configure --prefix=/usr                       \
+                --docdir=/usr/share/doc/pcre2-10.47 \
+                --enable-unicode                    \
+                --enable-jit                        \
+                --enable-pcre2-16                   \
+                --enable-pcre2-32                   \
+                --enable-pcre2grep-libz             \
+                --enable-pcre2grep-libbz2           \
+                --enable-pcre2test-libreadline      \
+                --disable-static
+
+    make
+
+    # Testes conforme LFS: make check
+    # Controlado por ADM_RUN_TESTS (default 1 = roda testes)
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    # Instalação sob DESTDIR para o adm
+    make DESTDIR="$DESTDIR" install
+}
