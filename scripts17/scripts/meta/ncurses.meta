@@ -1,0 +1,76 @@
+# Ncurses-6.5-20250809 - LFS 6.3 (Cross Compiling Temporary Tools)
+PKG_NAME="ncurses"
+
+PKG_BUILD() {
+    set -e
+
+    : "${NCURSES_VER:?NCURSES_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "ncurses-${NCURSES_VER}.tar.xz" ]] || [[ -f "ncurses-${NCURSES_VER}.tar.gz" ]] || {
+        echo "ERRO: ncurses-${NCURSES_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "ncurses-${NCURSES_VER}.tar."*
+    cd "ncurses-${NCURSES_VER}"
+
+    # 1) Construir tic no host e instalar em $LFS/tools (6.3.1)
+    mkdir -v build
+    pushd build
+      ../configure --prefix="$LFS/tools" AWK=gawk
+      make -C include
+      make -C progs tic
+      install -v progs/tic "$LFS/tools/bin"
+    popd
+
+    # 2) Configure para cross (6.3.1)
+    ./configure --prefix=/usr                \
+                --host="$LFS_TGT"           \
+                --build="$(./config.guess)" \
+                --mandir=/usr/share/man      \
+                --with-manpage-format=normal \
+                --with-shared                \
+                --without-normal             \
+                --with-cxx-shared            \
+                --without-debug              \
+                --without-ada                \
+                --disable-stripping          \
+                AWK=gawk
+
+    # 3) Build
+    make
+
+    # 4) Instalar temporário (DESTDIR=$LFS) e ajustes (6.3.1)
+    make DESTDIR="$LFS" install
+
+    ln -svf libncursesw.so "$LFS/usr/lib/libncurses.so"
+
+    sed -e 's/^#if.*XOPEN.*$/#if 1/' \
+        -i "$LFS/usr/include/curses.h"
+
+    cd "$LFS/sources"
+    rm -rf "ncurses-${NCURSES_VER}"
+}
+
+PKG_CHECK() {
+    # Verifica se a lib wide e o link libncurses.so existem
+    local ok=0
+
+    if [[ -f "$LFS/usr/lib/libncursesw.so" ]]; then
+        ok=$((ok+1))
+    else
+        echo "ncurses CHECK: não encontrei $LFS/usr/lib/libncursesw.so" >&2
+    fi
+
+    if [[ -L "$LFS/usr/lib/libncurses.so" ]]; then
+        ok=$((ok+1))
+    else
+        echo "ncurses CHECK: não encontrei symlink $LFS/usr/lib/libncurses.so" >&2
+    fi
+
+    (( ok >= 2 ))
+}
