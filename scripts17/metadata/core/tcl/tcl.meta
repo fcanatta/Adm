@@ -1,0 +1,89 @@
+# Tcl-8.6.17 - LFS r12.4-46 (8.17)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/tcl.html
+
+PKG_NAME="tcl"
+PKG_VERSION="8.6.17"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://downloads.sourceforge.net/tcl/tcl8.6.17-src.tar.gz"
+  "https://downloads.sourceforge.net/tcl/tcl8.6.17-html.tar.gz"
+)
+
+# From LFS r12.4 packages list (systemd/dev)
+# Tcl:           MD5=1ec3444533f54d0f86cd120058e15e48
+# Tcl HTML docs: MD5=60c71044e723b0db5f21be82929f3534
+PKG_MD5S=(
+  "1ec3444533f54d0f86cd120058e15e48"
+  "60c71044e723b0db5f21be82929f3534"
+)
+
+# LFS assume zlib já instalado, mas não exige mais nada explícito
+PKG_DEPENDS=("zlib")
+PKG_GROUPS=("devel" "lang")
+
+PKG_UPSTREAM_URL="https://tcl.sourceforge.net/"
+PKG_UPSTREAM_REGEX='tcl([0-9.]+)-src\.tar\.gz'
+
+PKG_BUILD() {
+    # A árvore de fontes do Tcl tem subdir "unix"
+    SRCDIR=$(pwd)
+    cd unix
+
+    ./configure --prefix=/usr           \
+                --mandir=/usr/share/man \
+                --disable-rpath
+
+    make
+
+    # Ajustes de tclConfig.sh e dos configs dos módulos tdbc/itcl
+    sed -e "s|$SRCDIR/unix|/usr/lib|" \
+        -e "s|$SRCDIR|/usr/include|"  \
+        -i tclConfig.sh
+
+    sed -e "s|$SRCDIR/unix/pkgs/tdbc1.1.12|/usr/lib/tdbc1.1.12|" \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12/generic|/usr/include|"     \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12/library|/usr/lib/tcl8.6|"  \
+        -e "s|$SRCDIR/pkgs/tdbc1.1.12|/usr/include|"             \
+        -i pkgs/tdbc1.1.12/tdbcConfig.sh
+
+    sed -e "s|$SRCDIR/unix/pkgs/itcl4.3.4|/usr/lib/itcl4.3.4|" \
+        -e "s|$SRCDIR/pkgs/itcl4.3.4/generic|/usr/include|"    \
+        -e "s|$SRCDIR/pkgs/itcl4.3.4|/usr/include|"            \
+        -i pkgs/itcl4.3.4/itclConfig.sh
+
+    unset SRCDIR
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        LC_ALL=C.UTF-8 make test
+    fi
+}
+
+PKG_INSTALL() {
+    cd unix
+
+    # Instala binários e libs
+    make DESTDIR="$DESTDIR" install
+
+    # Ajusta permissões das libs no DESTDIR
+    chmod 644 "$DESTDIR/usr/lib/libtclstub8.6.a"
+    chmod -v u+w "$DESTDIR/usr/lib/libtcl8.6.so"
+
+    # Headers privados (para Expect)
+    make DESTDIR="$DESTDIR" install-private-headers
+
+    # Link tclsh -> tclsh8.6 dentro do DESTDIR
+    ln -sfv tclsh8.6 "$DESTDIR/usr/bin/tclsh"
+
+    # Renomeia manpage que conflita com Perl
+    if [[ -f "$DESTDIR/usr/share/man/man3/Thread.3" ]]; then
+        mv "$DESTDIR/usr/share/man/man3/Thread.3" \
+           "$DESTDIR/usr/share/man/man3/Tcl_Thread.3"
+    fi
+
+    # Documentação HTML opcional (espelha o LFS)
+    cd ..
+    tar -xf "$SRC_DIR/tcl8.6.17-html.tar.gz" --strip-components=1
+    install -d -m755 "$DESTDIR/usr/share/doc/tcl-8.6.17"
+    cp -v -r ./html/* "$DESTDIR/usr/share/doc/tcl-8.6.17"
+}
