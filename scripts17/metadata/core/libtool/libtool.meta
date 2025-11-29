@@ -1,0 +1,60 @@
+# Libtool-2.5.4 — Linux From Scratch r12.4-46, Capítulo 8.37
+
+PKG_NAME="libtool"
+PKG_VERSION="2.5.4"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Libtool package contains the GNU generic library support script."
+
+PKG_HOMEPAGE="https://www.gnu.org/software/libtool/"
+PKG_SOURCE_URLS=(
+    "https://ftp.gnu.org/gnu/libtool/libtool-${PKG_VERSION}.tar.xz"
+)
+
+# De 3.2 All Packages (Libtool 2.5.4)
+# MD5: 22e0a29df8af5fdde276ea3a7d351d30
+PKG_MD5S=(
+    "22e0a29df8af5fdde276ea3a7d351d30"
+)
+
+# O capítulo 8.37 não declara dependências adicionais diretas;
+# o ambiente LFS já tem o toolchain e demais libs necessários.
+PKG_DEPENDS=()
+PKG_GROUPS=("core")
+
+# Opcional: para futuros upgrades automáticos
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/libtool/"
+PKG_UPSTREAM_REGEX='libtool-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # 8.37.1. Installation of Libtool (LFS 12.4)
+    # Passo 1: configurar
+    ./configure --prefix=/usr
+
+    # Passo 2: compilar
+    make
+
+    # Passo 3: testar
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # No adm, DESTDIR já vem setado pelo build_package() (dentro ou fora do chroot).
+    # Adaptamos o "make install" do livro para instalar em DESTDIR.
+
+    # Passo 4: instalar
+    make DESTDIR="${DESTDIR}" install
+
+    # Passo 5 (LFS): remover a biblioteca estática usada só na suíte de testes:
+    #   rm -fv /usr/lib/libltdl.a
+    # Aqui fazemos o equivalente dentro do DESTDIR.
+    rm -fv "${DESTDIR}/usr/lib/libltdl.a"
+}
