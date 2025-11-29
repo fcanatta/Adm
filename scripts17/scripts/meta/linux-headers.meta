@@ -1,0 +1,37 @@
+# Linux-6.17.8 API Headers - LFS 5.4
+PKG_NAME="linux-headers"
+
+PKG_BUILD() {
+    set -e
+
+    cd "$LFS/sources"
+
+    # Extrair o kernel
+    tar -xf "linux-${LINUX_VER}.tar."*
+    cd "linux-${LINUX_VER}"
+
+    # Garantir ausência de lixo (5.4.1)
+    make mrproper
+
+    # Gerar os headers (5.4.1)
+    make headers
+
+    # Remover arquivos que não sejam .h
+    find usr/include -type f ! -name '*.h' -delete
+
+    # Copiar para $LFS/usr/include (criando $LFS/usr se não existir)
+    mkdir -pv "$LFS/usr"
+    cp -rv usr/include "$LFS/usr"
+
+    # Limpeza
+    cd "$LFS/sources"
+    rm -rf "linux-${LINUX_VER}"
+}
+
+PKG_CHECK() {
+    # Checa um header chave
+    if [[ -f "$LFS/usr/include/linux/version.h" ]]; then
+        return 0
+    fi
+    return 1
+}
