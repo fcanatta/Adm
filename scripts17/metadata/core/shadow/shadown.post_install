@@ -1,22 +1,35 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+pkg="${1:-shadow}"
+phase="${2:-post_install}"
 
-echo "[shadow] Configurando Shadow de acordo com o LFS..."
+echo "[$pkg] [$phase] Configurando Shadow (pwconv, grpconv, login.defs, useradd)..."
 
-# Cria os bancos de senha shadow/group caso não existam
+# Cria os bancos shadow se ainda não existirem
 pwconv
 grpconv
 
-# Cria o arquivo padrão para novos usuários (LFS: /etc/default/useradd)
+# Garante diretório de mail
+install -vdm755 /var/mail
+
+# Cria /etc/default/useradd se ainda não existir
 if [[ ! -f /etc/default/useradd ]]; then
     install -v -m644 /etc/login.defs /etc/default/useradd
 fi
 
-# Ajustes padrões do useradd (LFS)
-sed -i 's/MAIL_DIR=.*/MAIL_DIR=\/var\/mail/' /etc/default/useradd
-sed -i 's/ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs
+# Ajusta MAIL_DIR em /etc/default/useradd
+if grep -q '^MAIL_DIR=' /etc/default/useradd 2>/dev/null; then
+    sed -i 's|^MAIL_DIR=.*|MAIL_DIR=/var/mail|' /etc/default/useradd
+else
+    echo 'MAIL_DIR=/var/mail' >> /etc/default/useradd
+fi
 
-# Garantir que o diretório de mail existe
-install -vdm755 /var/mail
+# Garante ENCRYPT_METHOD YESCRYPT em /etc/login.defs
+if grep -q '^ENCRYPT_METHOD' /etc/login.defs 2>/dev/null; then
+    sed -i 's/^ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs
+else
+    echo 'ENCRYPT_METHOD YESCRYPT' >> /etc/login.defs
+fi
 
-echo "[shadow] A configuração inicial do Shadow está completa."
+echo "[$pkg] [$phase] Configuração inicial do Shadow concluída."
+echo ">>> Lembre de definir a senha do root manualmente: passwd root"
