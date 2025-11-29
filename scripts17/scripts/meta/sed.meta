@@ -1,4 +1,7 @@
 # Sed-4.9 - LFS 6.14
+# ------------------
+# Variáveis: SED_VER, LFS, LFS_TGT
+
 PKG_NAME="sed"
 
 PKG_BUILD() {
@@ -18,8 +21,8 @@ PKG_BUILD() {
     tar -xf "sed-${SED_VER}.tar."*
     cd "sed-${SED_VER}"
 
-    ./configure --prefix=/usr   \
-                --host="$LFS_TGT" \
+    ./configure --prefix=/usr                       \
+                --host="$LFS_TGT"                   \
                 --build="$(./build-aux/config.guess)"
 
     make
@@ -29,6 +32,14 @@ PKG_BUILD() {
     rm -rf "sed-${SED_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/sed" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/sed"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/sed --version"
+)
