@@ -1,0 +1,75 @@
+# Perl-5.42.0 - LFS r12.4-46 (8.44)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/perl.html
+
+PKG_NAME="perl"
+PKG_VERSION="5.42.0"
+PKG_RELEASE=1
+
+# Fonte oficial conforme capítulo 3 (All Packages)
+# perl-5.42.0.tar.xz, MD5 = 7a6950a9f12d01eb96a9d2ed2f4e0072
+PKG_SOURCE_URLS=(
+  "https://www.cpan.org/src/5.0/perl-${PKG_VERSION}.tar.xz"
+)
+
+PKG_MD5S=(
+  "7a6950a9f12d01eb96a9d2ed2f4e0072"
+)
+
+# Dependências "reais" que o LFS já tem antes de Perl:
+# - zlib / bzip2: usados pelos módulos Compress::Raw::{Zlib,BZip2}
+# - gdbm: Perl usa GDBM como backend DBM
+PKG_DEPENDS=(
+  "zlib"
+  "bzip2"
+  "gdbm"
+)
+
+# Agrupamento lógico (ajuste se você tiver outra convenção)
+PKG_GROUPS=("core" "lang")
+
+# Dados para o sistema de update automático do adm
+PKG_UPSTREAM_URL="https://www.cpan.org/src/5.0/"
+PKG_UPSTREAM_REGEX='perl-([0-9.]+)\.tar\.xz'
+
+# -------------------------------------------------------------
+# Build / Install seguindo o LFS, adaptado para DESTDIR do adm
+# -------------------------------------------------------------
+PKG_BUILD() {
+    # Faz Perl usar as bibliotecas do sistema (zlib/bzip2) em vez do código interno
+    export BUILD_ZLIB=False
+    export BUILD_BZIP2=0
+
+    # Configure igual ao livro (8.44.1)
+    sh Configure -des                                          \
+                 -D prefix=/usr                                \
+                 -D vendorprefix=/usr                          \
+                 -D privlib=/usr/lib/perl5/5.42/core_perl      \
+                 -D archlib=/usr/lib/perl5/5.42/core_perl      \
+                 -D sitelib=/usr/lib/perl5/5.42/site_perl      \
+                 -D sitearch=/usr/lib/perl5/5.42/site_perl     \
+                 -D vendorlib=/usr/lib/perl5/5.42/vendor_perl  \
+                 -D vendorarch=/usr/lib/perl5/5.42/vendor_perl \
+                 -D man1dir=/usr/share/man/man1                \
+                 -D man3dir=/usr/share/man/man3                \
+                 -D pager="/usr/bin/less -isR"                 \
+                 -D useshrplib                                 \
+                 -D usethreads
+
+    make
+
+    # Testes: TEST_JOBS=$(nproc) make test_harness
+    # Controlado por ADM_RUN_TESTS (1 = roda, 0 = pula)
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        local jobs
+        jobs="${ADM_TEST_JOBS:-$(nproc)}"
+        TEST_JOBS="$jobs" make test_harness
+    fi
+}
+
+PKG_INSTALL() {
+    # Instalação em DESTDIR para o adm
+    make DESTDIR="$DESTDIR" install
+
+    # Limpa variáveis de ambiente de build, como no livro
+    unset BUILD_ZLIB BUILD_BZIP2 || true
+}
