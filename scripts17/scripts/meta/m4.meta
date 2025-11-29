@@ -1,4 +1,8 @@
 # M4-1.4.20 - LFS 6.2 (Cross Compiling Temporary Tools)
+# -----------------------------------------------------
+# Temporário em $LFS/usr
+# Variáveis: M4_VER, LFS, LFS_TGT
+
 PKG_NAME="m4"
 
 PKG_BUILD() {
@@ -29,10 +33,14 @@ PKG_BUILD() {
     rm -rf "m4-${M4_VER}"
 }
 
-PKG_CHECK() {
-    # Verifica se o m4 temporário está instalado em $LFS/usr/bin
-    if [[ -x "$LFS/usr/bin/m4" ]]; then
-        return 0
-    fi
-    return 1
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/m4"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/m4 --version"
+)
