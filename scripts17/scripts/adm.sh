@@ -18,6 +18,7 @@ set -euo pipefail
 : "${LOG_DIR:=$LFS_PKG_ROOT/log}"                 # logs (host)
 : "${LOG_FILE:=$LOG_DIR/lfs-pkg.log}"             # log sem cores
 : "${PARALLEL_JOBS:=4}"                           # downloads paralelos
+: "${ADM_DEBUG:=0}"                               # 0 = sem debug, 1 = log_debug ativo
 
 # Garante toda a hierarquia necessária
 mkdir -p "$META_DIR" "$CACHE_DIR" "$BUILD_ROOT" "$PKG_DIR" "$DB_DIR" "$STATE_DIR" "$LOG_DIR" "$CHROOT_DIR"
@@ -58,6 +59,8 @@ log_error() {
 }
 
 log_debug() {
+    # Só loga debug se ADM_DEBUG=1
+    [[ "${ADM_DEBUG:-0}" -eq 1 ]] || return 0
     log_to_file DEBUG "$*"
     printf "%s[DEBUG]%s %s\n" "$C_DEBUG" "$C_RESET" "$*"
 }
@@ -107,7 +110,7 @@ require_cmd() {
 
 # Checamos alguns comandos base
 # (file e tac são usados mais à frente; unzip é usado se você tiver fontes .zip)
-require_cmd tar gzip xz zstd sha256sum md5sum sed awk sort grep file tac
+require_cmd tar gzip xz sha256sum md5sum sed awk sort grep file tac
 
 # =========================
 # Carregar metadata
