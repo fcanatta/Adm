@@ -1,0 +1,152 @@
+# Glibc-2.42 - LFS 5.5 (Cross Toolchain)
+# --------------------------------------
+# Este meta é para a instalação da Glibc na fase de cross-toolchain,
+# conforme o capítulo 5.5 do LFS 12.4. Ele:
+#   - instala a glibc em $LFS/usr
+#   - faz os sanity checks com $LFS_TGT-gcc
+#   - não roda test suite (isso fica pro capítulo 8).
+
+PKG_NAME="glibc"
+
+PKG_BUILD() {
+    set -e
+
+    : "${GLIBC_VER:?GLIBC_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    # Verificar se temos o tarball e o patch necessários
+    [[ -f "glibc-${GLIBC_VER}.tar.xz" ]] || [[ -f "glibc-${GLIBC_VER}.tar.gz" ]] || {
+        echo "ERRO: glibc-${GLIBC_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    [[ -f "glibc-${GLIBC_VER}-fhs-1.patch" ]] || [[ -f "glibc-2.42-fhs-1.patch" ]] || {
+        echo "ERRO: patch glibc-2.42-fhs-1.patch (ou glibc-${GLIBC_VER}-fhs-1.patch) não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    # Usar um nome de patch que exista
+    local glibc_patch
+    if [[ -f "glibc-${GLIBC_VER}-fhs-1.patch" ]]; then
+        glibc_patch="glibc-${GLIBC_VER}-fhs-1.patch"
+    else
+        glibc_patch="glibc-2.42-fhs-1.patch"
+    fi
+
+    # Extrair o pacote
+    tar -xf "glibc-${GLIBC_VER}.tar."*
+    cd "glibc-${GLIBC_VER}"
+
+    # 1. Symlinks LSB para o loader (5.5.1)
+    case "$(uname -m)" in
+        i?86)
+            ln -sfv ld-linux.so.2 "$LFS/lib/ld-lsb.so.3"
+            ;;
+        x86_64)
+            mkdir -pv "$LFS/lib64"
+            ln -sfv ../lib/ld-linux-x86-64.so.2 "$LFS/lib64"
+            ln -sfv ../lib/ld-linux-x86-64.so.2 "$LFS/lib64/ld-lsb-x86-64.so.3"
+            ;;
+    esac
+
+    # 2. Patch FHS (5.5.1)
+    patch -Np1 -i "../${glibc_patch}"
+
+    # 3. Diretório de build dedicado (5.5.1)
+    mkdir -v build
+    cd build
+
+    # 4. rootsbindir para ldconfig e sln em /usr/sbin (5.5.1)
+    echo "rootsbindir=/usr/sbin" > configparms
+
+    # 5. Configure (5.5.1)
+    ../configure                             \
+          --prefix=/usr                      \
+          --host="$LFS_TGT"                  \
+          --build="$(../scripts/config.guess)" \
+          --disable-nscd                     \
+          libc_cv_slibdir=/usr/lib           \
+          --enable-kernel=5.4
+
+    # 6. Compilar (5.5.1)
+    make
+
+    # 7. Instalar em $LFS usando DESTDIR (5.5.1)
+    make DESTDIR="$LFS" install
+
+    # 8. Corrigir hardcoded path do loader no ldd (5.5.1)
+    sed '/RTLDLIST=/s@/usr@@g' -i "$LFS/usr/bin/ldd"
+
+    # 9. Sanity checks do toolchain (5.5.1)
+    cd "$LFS/sources"
+    echo 'int main(){}' | "$LFS_TGT-gcc" -x c - -v -Wl,--verbose &> dummy.log
+
+    # 9.1. Checar o program interpreter
+    echo ">> Glibc sanity check: readelf -l a.out | grep ': /lib'"
+    readelf -l a.out | grep ': /lib'
+
+    # 9.2. Start files (crt*.o)
+    echo ">> Glibc sanity check: crt start files"
+    grep -E -o "$LFS/lib.*/S?crt[1in].*succeeded" dummy.log
+
+    # 9.3. Includes padrão
+    echo ">> Glibc sanity check: includes"
+    grep -B3 "^ $LFS/usr/include" dummy.log
+
+    # 9.4. Search dirs do linker
+    echo ">> Glibc sanity check: SEARCH_DIR"
+    grep 'SEARCH.*/usr/lib' dummy.log | sed 's|; |\n|g'
+
+    # 9.5. libc correta
+    echo ">> Glibc sanity check: libc.so.6"
+    grep "/lib.*/libc.so.6 " dummy.log
+
+    # 9.6. dynamic linker correto
+    echo ">> Glibc sanity check: dynamic linker"
+    grep found dummy.log
+
+    # Limpar arquivos de teste
+    rm -v a.out dummy.log
+
+    # Voltar e limpar os fontes (como o livro sugere)
+    cd "$LFS/sources"
+    rm -rf "glibc-${GLIBC_VER}"
+}
+
+PKG_CHECK() {
+    # Verificação simplificada:
+    #  - verifica se libc.so.6 existe em $LFS/usr/lib
+    #  - verifica se o loader está em $LFS/usr/lib/ld-linux-*.so.2
+    #  - verifica se ldd funciona (pelo menos --version)
+
+    : "${LFS:?LFS não definido}"
+
+    local ok=0
+
+    if ls "$LFS"/usr/lib/libc.so.6 >/dev/null 2>&1; then
+        ok=$((ok+1))
+    else
+        echo "glibc CHECK: não encontrei $LFS/usr/lib/libc.so.6" >&2
+    fi
+
+    if ls "$LFS"/usr/lib/ld-linux-*.so.2 >/dev/null 2>&1; then
+        ok=$((ok+1))
+    else
+        echo "glibc CHECK: não encontrei loader em $LFS/usr/lib/ld-linux-*.so.2" >&2
+    fi
+
+    if chroot "$LFS" /usr/bin/ldd --version >/dev/null 2>&1; then
+        ok=$((ok+1))
+    else
+        echo "glibc CHECK: ldd não conseguiu rodar dentro do chroot $LFS (talvez chroot ainda não esteja pronto)." >&2
+    fi
+
+    # Se pelo menos libc e loader estão presentes, consideramos OK.
+    if (( ok >= 2 )); then
+        return 0
+    fi
+    return 1
+}
