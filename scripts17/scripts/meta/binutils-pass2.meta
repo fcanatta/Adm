@@ -1,0 +1,50 @@
+# Binutils-2.45.1 - Pass 2 (LFS 6.17)
+PKG_NAME="binutils-pass2"
+
+PKG_BUILD() {
+    set -e
+
+    : "${BINUTILS_VER:?BINUTILS_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "binutils-${BINUTILS_VER}.tar.xz" ]] || [[ -f "binutils-${BINUTILS_VER}.tar.gz" ]] || {
+        echo "ERRO: binutils-${BINUTILS_VER}.tar.[xz|gz] não encontrado." >&2
+        exit 1
+    }
+
+    tar -xf "binutils-${BINUTILS_VER}.tar."*
+    cd "binutils-${BINUTILS_VER}"
+
+    mkdir -v build
+    cd build
+
+    # Configure Pass 2 (LFS 6.17.1)
+    ../configure               \
+        --prefix=/usr          \
+        --build="$(../config.guess)" \
+        --host="$LFS_TGT"      \
+        --disable-nls          \
+        --enable-shared        \
+        --enable-gprofng=no
+
+    make
+
+    make DESTDIR="$LFS" install
+
+    # Remove libtool archive
+    rm -v "$LFS"/usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.la
+
+    cd "$LFS/sources"
+    rm -rf "binutils-${BINUTILS_VER}"
+}
+
+PKG_CHECK() {
+    # Checar se o ld do Pass2 está no lugar
+    if [[ -x "$LFS/usr/bin/ld" ]]; then
+        return 0
+    fi
+    return 1
+}
