@@ -1,0 +1,35 @@
+# Findutils-4.10.0 - LFS 6.8
+PKG_NAME="findutils"
+
+PKG_BUILD() {
+    set -e
+
+    : "${FINDUTILS_VER:?FINDUTILS_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "findutils-${FINDUTILS_VER}.tar.xz" ]] || [[ -f "findutils-${FINDUTILS_VER}.tar.gz" ]] || {
+        echo "ERRO: findutils-${FINDUTILS_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "findutils-${FINDUTILS_VER}.tar."*
+    cd "findutils-${FINDUTILS_VER}"
+
+    ./configure --prefix=/usr                   \
+                --localstatedir=/var/lib/locate \
+                --host="$LFS_TGT"               \
+                --build="$(build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "findutils-${FINDUTILS_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/find" ]]
+}
