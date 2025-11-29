@@ -1,0 +1,43 @@
+# Flex-2.6.4 - LFS r12.4 (8.15)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/flex.html
+
+PKG_NAME="flex"
+PKG_VERSION="2.6.4"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://github.com/westes/flex/releases/download/v2.6.4/flex-2.6.4.tar.gz"
+)
+
+# From LFS r12.4-dev packages list
+# MD5: 2882e3179748cc9f9c23ec593d6adc8d
+PKG_MD5S=(
+  "2882e3179748cc9f9c23ec593d6adc8d"
+)
+
+# Flex usa m4 pra gerar código
+PKG_DEPENDS=("m4")
+PKG_GROUPS=("devel" "tools")
+
+PKG_UPSTREAM_URL="https://github.com/westes/flex"
+PKG_UPSTREAM_REGEX='flex-([0-9.]+)\.tar\.gz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr \
+                --docdir=/usr/share/doc/flex-2.6.4 \
+                --disable-static
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+
+    # Links de compatibilidade para programas que ainda chamam "lex"
+    ln -sv flex   "$DESTDIR/usr/bin/lex"
+    ln -sv flex.1 "$DESTDIR/usr/share/man/man1/lex.1"
+}
