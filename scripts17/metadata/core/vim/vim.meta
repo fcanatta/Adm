@@ -1,0 +1,84 @@
+PKG_NAME="vim"
+PKG_VERSION="9.1.1629"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://github.com/vim/vim/archive/v${PKG_VERSION}/vim-${PKG_VERSION}.tar.gz"
+)
+PKG_MD5S=(
+  "4f856c3233c1c4570bc17572e4f9e8e4"
+)
+
+PKG_UPSTREAM_URL="https://www.vim.org"
+PKG_GROUPS=("apps" "editor")
+PKG_DEPENDS=("ncurses" "glibc")
+
+PKG_BUILD() {
+    set -e
+    local srcdir="vim-${PKG_VERSION}"
+    cd "$srcdir"
+
+    # LFS 8.73 – muda localização do vimrc para /etc
+    echo '#define SYS_VIMRC_FILE "/etc/vimrc"' >> src/feature.h
+
+    ./configure --prefix=/usr
+
+    make
+
+    # (Opcional) testes - exigem usuário tester e LANG/TERM:
+    # chown -R tester .
+    # sed -i '/test_plugin_glvs/d' src/testdir/Make_all.mak
+    # su tester -c "TERM=xterm-256color LANG=en_US.UTF-8 make -j1 test" \
+    #    &> vim-test.log
+}
+
+PKG_INSTALL() {
+    set -e
+    local srcdir="vim-${PKG_VERSION}"
+    cd "$srcdir"
+
+    DESTDIR="${DESTDIR:-/}"
+
+    make install DESTDIR="$DESTDIR"
+
+    # vi -> vim, incluindo manpages (adaptado para DESTDIR)
+    ln -sv vim "${DESTDIR}/usr/bin/vi" || true
+
+    # Loop nas manpages existentes dentro do DESTDIR
+    local manroot="${DESTDIR}/usr/share/man"
+    if [[ -d "$manroot" ]]; then
+        local L
+        # usa glob com nullglob para não explodir se não existir
+        shopt -s nullglob
+        for L in "$manroot"/man1/vim.1 "$manroot"/*/man1/vim.1; do
+            local d
+            d=$(dirname "$L")
+            ln -sv vim.1 "${d}/vi.1" || true
+        done
+        shopt -u nullglob
+    fi
+
+    # Link da documentação para /usr/share/doc/vim-9.1.1629 (LFS)
+    mkdir -p "${DESTDIR}/usr/share/doc"
+    ln -snfv ../vim/vim91/doc "${DESTDIR}/usr/share/doc/vim-${PKG_VERSION}"
+
+    # Cria /etc/vimrc padrão (igual LFS 8.73.2) dentro do DESTDIR
+    install -vdm755 "${DESTDIR}/etc"
+    cat > "${DESTDIR}/etc/vimrc" << "EOF"
+" Begin /etc/vimrc
+
+" Ensure defaults are set before customizing settings, not after
+source $VIMRUNTIME/defaults.vim
+let skip_defaults_vim=1
+
+set nocompatible
+set backspace=2
+set mouse=
+syntax on
+if (&term == "xterm") || (&term == "putty")
+  set background=dark
+endif
+
+" End /etc/vimrc
+EOF
+}
