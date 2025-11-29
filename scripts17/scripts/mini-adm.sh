@@ -31,6 +31,31 @@
 set -euo pipefail
 
 ########################################
+# Detectar LFS e LFS_TGT automaticamente
+########################################
+
+# 1) Se LFS não estiver definido, tenta detectar automaticamente
+if [[ -z "${LFS:-}" ]]; then
+    # Caminho padrão usado pela maioria dos usuários LFS
+    if [[ -d /mnt/lfs ]]; then
+        export LFS="/mnt/lfs"
+    else
+        echo "ERRO: Variável LFS não definida e /mnt/lfs não existe."
+        echo "Defina manualmente: export LFS=/caminho"
+        exit 1
+    fi
+fi
+
+# 2) Se LFS_TGT não estiver definido, gera automaticamente:
+if [[ -z "${LFS_TGT:-}" ]]; then
+    export LFS_TGT="$(uname -m)-lfs-linux-gnu"
+fi
+
+echo "Usando:"
+echo "  LFS = $LFS"
+echo "  LFS_TGT = $LFS_TGT"
+
+########################################
 # 1. Versões (ajuste se o livro mudar) #
 ########################################
 
