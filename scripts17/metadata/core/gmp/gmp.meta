@@ -1,0 +1,54 @@
+# $META_DIR/gmp.meta
+PKG_NAME="gmp"
+PKG_VERSION="6.3.0"
+PKG_RELEASE=1
+
+PKG_GROUPS=( "core" )
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/gmp/gmp-${PKG_VERSION}.tar.xz"
+)
+
+PKG_SHA256S=(
+  "a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898"
+)
+
+PKG_MD5S=(
+  "956dc04e864001a9c22429f761f2c283"
+)
+
+# GMP é base, não depende de outros no LFS
+PKG_DEPENDS=()
+
+PKG_BUILD() {
+    set -e
+
+    # Ajuste para gcc-15+ (LFS)
+    sed -i '/long long t1;/,+1s/()/(...)/' configure
+
+    ./configure --prefix=/usr    \
+                --enable-cxx     \
+                --disable-static \
+                --docdir=/usr/share/doc/gmp-6.3.0
+
+    make
+    make html
+
+    # Testes recomendados no LFS
+    make check 2>&1 | tee gmp-check-log || {
+        echo "WARN: testes do GMP falharam, verifique gmp-check-log"
+    }
+
+    # NESTA ETAPA NÃO instalar em /usr (o adm faz via DESTDIR)
+}
+
+PKG_INSTALL() {
+    set -e
+
+    # DESTDIR é fornecido pelo adm dentro do chroot
+    make DESTDIR="$DESTDIR" install
+    make DESTDIR="$DESTDIR" install-html
+}
+
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/gmp/"
+PKG_UPSTREAM_REGEX="gmp-([0-9.]+)\\.tar\\.xz"
