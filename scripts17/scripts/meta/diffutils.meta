@@ -1,4 +1,7 @@
 # Diffutils-3.12 - LFS 6.6
+# ------------------------
+# Variáveis: DIFFUTILS_VER, LFS, LFS_TGT
+
 PKG_NAME="diffutils"
 
 PKG_BUILD() {
@@ -30,6 +33,18 @@ PKG_BUILD() {
     rm -rf "diffutils-${DIFFUTILS_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/diff" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/diff"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/cmp"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/diff --version"
+)
