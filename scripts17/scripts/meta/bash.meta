@@ -1,0 +1,52 @@
+# Bash-5.3 - LFS 6.4 (Cross Compiling Temporary Tools)
+PKG_NAME="bash"
+
+PKG_BUILD() {
+    set -e
+
+    : "${BASH_VER:?BASH_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "bash-${BASH_VER}.tar.xz" ]] || [[ -f "bash-${BASH_VER}.tar.gz" ]] || {
+        echo "ERRO: bash-${BASH_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "bash-${BASH_VER}.tar."*
+    cd "bash-${BASH_VER}"
+
+    ./configure --prefix=/usr                      \
+                --build="$(sh support/config.guess)" \
+                --host="$LFS_TGT"                  \
+                --without-bash-malloc
+
+    make
+    make DESTDIR="$LFS" install
+
+    # Link /bin/sh → bash (6.4.1)
+    ln -svf bash "$LFS/bin/sh"
+
+    cd "$LFS/sources"
+    rm -rf "bash-${BASH_VER}"
+}
+
+PKG_CHECK() {
+    local ok=0
+
+    if [[ -x "$LFS/bin/bash" ]]; then
+        ok=$((ok+1))
+    else
+        echo "bash CHECK: não encontrei $LFS/bin/bash" >&2
+    fi
+
+    if [[ -L "$LFS/bin/sh" ]]; then
+        ok=$((ok+1))
+    else
+        echo "bash CHECK: não encontrei link $LFS/bin/sh" >&2
+    fi
+
+    (( ok >= 2 ))
+}
