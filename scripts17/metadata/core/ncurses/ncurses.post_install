@@ -1,0 +1,20 @@
+#!/bin/bash
+# ncurses.post_install – hook executado após a instalação do Ncurses
+set -euo pipefail
+
+pkgname="${1:-ncurses}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# Ncurses instala várias libs compartilhadas (libncursesw.so, libpanelw.so, etc.),
+# então é importante atualizar o cache de bibliotecas.
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig para atualizar cache de bibliotecas..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não foi atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
