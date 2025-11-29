@@ -206,7 +206,9 @@ get_pkg_stage() {
 
 set_pkg_stage() {
     local pkg="$1" stage="$2"
-    echo "$stage" >"$STATE_DIR/$pkg.stage"
+    local f="$STATE_DIR/$pkg.stage"
+    mkdir -p "$(dirname "$f")"
+    echo "$stage" >"$f"
 }
 
 clear_pkg_stage() {
@@ -244,9 +246,10 @@ download_one_source() {
     local attempts_per_mirror=3
 
     # Função auxiliar para validar checksums de um arquivo
+    # Função auxiliar para validar checksums de um arquivo
     _check_file_checksums() {
         local file="$1"
-        local ok=1
+        local failed=0
 
         if ((${#sha256_list[@]} > 0)); then
             local expected_s
@@ -262,7 +265,7 @@ download_one_source() {
             done
             if (( match == 0 )); then
                 log_warn "[$pkg] sha256 não confere para $file (obtido=$got_s)"
-                ok=0
+                failed=1
             fi
         fi
 
@@ -280,11 +283,16 @@ download_one_source() {
             done
             if (( match == 0 )); then
                 log_warn "[$pkg] md5 não confere para $file (obtido=$got_m)"
-                ok=0
+                failed=1
             fi
         fi
 
-        return $ok
+        if (( failed == 0 )); then
+            log_debug "[$pkg] Checksums OK para $file"
+            return 0
+        else
+            return 1
+        fi
     }
 
     mkdir -p "$(dirname "$out")"
@@ -700,6 +708,9 @@ is_installed() {
 
 register_install() {
     local pkg="$1" destdir="$2"
+    if [[ -z "$destdir" || "$destdir" == "/" ]]; then
+        die "[$pkg] register_install chamado com DESTDIR inválido: '$destdir'"
+    fi
     mkdir -p "$(db_pkg_dir "$pkg")"
     local listfile
     listfile="$(db_files_list "$pkg")"
@@ -868,7 +879,9 @@ build_package() {
     local builddir
     if (( stage < 2 )); then
         builddir="$(extract_sources "$pkg")"
-        echo "$builddir" >"$STATE_DIR/$pkg.builddir"
+        local builddir_state="$STATE_DIR/$pkg.builddir"
+        mkdir -p "$(dirname "$builddir_state")"
+        echo "$builddir" >"$builddir_state"
         set_pkg_stage "$pkg" 2
     else
         log_info "[$pkg] Retomando: extração já feita (stage>=2)"
@@ -1134,6 +1147,13 @@ verify_package_integrity() {
     local broken=0
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
+
+          # Espera formato: 64 hex, dois espaços, caminho
+        if [[ ! "$line" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]]/ ]]; then
+            log_warn "[$pkg] Linha em formato inesperado no manifesto (ignorando): $line"
+            broken=1
+            continue
+        fi
 
         local sum file
         sum="${line%% *}"
