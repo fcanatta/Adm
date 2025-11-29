@@ -1,0 +1,85 @@
+# Shadow-4.18.0 — Linux From Scratch r12.4-46, Capítulo 8.29
+
+PKG_NAME="shadow"
+PKG_VERSION="4.18.0"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Shadow package contains programs for handling passwords in a secure way."
+
+PKG_HOMEPAGE="https://github.com/shadow-maint/shadow/"
+
+# Fonte e MD5 exatamente da seção 3.2 All Packages (development)
+PKG_SOURCE_URLS=(
+    "https://github.com/shadow-maint/shadow/releases/download/4.18.0/shadow-4.18.0.tar.xz"
+)
+
+PKG_MD5S=(
+    "30ef46f54363db1d624587be68794ef2"
+)
+
+# O LFS constrói Shadow logo após Libxcrypt-4.5.1 e usa --with-{b,yes}crypt,
+# então Shadow depende de libxcrypt para os hashes Bcrypt/Yescrypt. 1
+PKG_DEPENDS=("libxcrypt")
+
+PKG_GROUPS=()
+
+# Opcional: suporte a upgrade automático via 'upgrade_package' do adm
+PKG_UPSTREAM_URL="https://github.com/shadow-maint/shadow/releases"
+PKG_UPSTREAM_REGEX='shadow-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # 8.29.1. Installation of Shadow (LFS r12.4-46) 2
+
+    # 1) Não instalar o programa 'groups' (Coreutils já fornece um melhor)
+    #    e não instalar manpages duplicadas (já vieram do Man-pages-6.16):
+    sed -i 's/groups$(EXEEXT) //' src/Makefile.in
+    find man -name Makefile.in -exec sed -i 's/groups\.1 / /'   {} \;
+    find man -name Makefile.in -exec sed -i 's/getspnam\.3 / /' {} \;
+    find man -name Makefile.in -exec sed -i 's/passwd\.5 / /'   {} \;
+
+    # 2) Ajustar login.defs no *fonte*:
+    #    - usar YESCRYPT
+    #    - mudar /var/spool/mail -> /var/mail
+    #    - remover /bin e /sbin do PATH padrão
+    sed -e 's:#ENCRYPT_METHOD DES:ENCRYPT_METHOD YESCRYPT:' \
+        -e 's:/var/spool/mail:/var/mail:'                   \
+        -e '/PATH=/{s@/sbin:@@;s@/bin:@@}'                  \
+        -i etc/login.defs
+
+    # 3) Preparar para compilação:
+    #    o arquivo /usr/bin/passwd precisa existir (o caminho é hardcoded
+    #    em alguns programas); se não existir, o script de instalação criaria
+    #    em local errado. 3
+    touch /usr/bin/passwd
+
+    # 4) Configurar exatamente como no livro:
+    ./configure --sysconfdir=/etc   \
+                --disable-static    \
+                --with-{b,yes}crypt \
+                --without-libbsd    \
+                --with-group-name-max-length=32
+
+    # 5) Compilar
+    make
+
+    # Shadow não tem suíte de testes (LFS: "This package does not come with a test suite.")
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # LFS: 
+    #   make exec_prefix=/usr install
+    #   make -C man install-man 4
+    #
+    # Adaptado para usar DESTDIR do adm (raiz temporária do pacote):
+
+    make exec_prefix=/usr DESTDIR="${DESTDIR}" install
+    make -C man DESTDIR="${DESTDIR}" install-man
+}
