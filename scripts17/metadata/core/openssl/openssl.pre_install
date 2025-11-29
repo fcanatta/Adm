@@ -1,0 +1,16 @@
+#!/bin/bash
+set -euo pipefail
+pkg="${1:-openssl}"
+phase="${2:-pre_install}"
+
+echo "[$pkg] [$phase] Fazendo backup de /etc/ssl (se existir)..."
+
+if [[ -d /etc/ssl ]]; then
+    ts="$(date +%Y%m%d-%H%M%S)"
+    backup_dir="/var/backups/adm-${pkg}-${ts}"
+    mkdir -p "$backup_dir"
+    cp -a /etc/ssl "$backup_dir"/
+    echo "[$pkg] [$phase] Backup feito em: $backup_dir"
+else
+    echo "[$pkg] [$phase] /etc/ssl não existe ainda, nada a fazer."
+fi
