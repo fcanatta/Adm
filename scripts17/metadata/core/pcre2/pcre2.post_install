@@ -1,0 +1,19 @@
+#!/bin/bash
+# pcre2.post_install – hook executado após a instalação do pacote Pcre2
+set -euo pipefail
+
+pkgname="${1:-pcre2}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# Pcre2 instala libpcre2-*.so em /usr/lib, então é recomendado atualizar o cache de libs
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não foi atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
