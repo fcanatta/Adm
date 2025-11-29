@@ -1,0 +1,19 @@
+#!/bin/bash
+# perl.post_install – hook executado após a instalação do Perl
+set -euo pipefail
+
+pkgname="${1:-perl}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# O Perl instala libperl.so e outras libs, então é essencial atualizar o cache
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig para atualizar o cache de bibliotecas..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não pôde ser atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
