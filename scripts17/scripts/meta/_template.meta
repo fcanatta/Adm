@@ -1,0 +1,217 @@
+############################################################
+# Modelo de metadata para o mini-adm
+#
+# COMO USAR:
+#  1. Copie este arquivo para meta/<nome-pacote>.meta
+#  2. Ajuste PKG_NAME, variáveis de versão, nome do tarball, etc.
+#  3. Adapte o PKG_BUILD para o pacote real.
+#  4. Preencha PKG_MAIN_BINS / PKG_CHECK_* de acordo com o pacote.
+#
+# LEMBRETES:
+#  - Provavelmente você vai querer criar uma variável de versão
+#    no mini-adm.sh, por exemplo:
+#
+#      MEUPACOTE_VER="1.2.3"
+#
+#    e adicionar essa variável em export_version_vars():
+#
+#      export MEUPACOTE_VER
+#
+#  - O mini-adm já exporta LFS e LFS_TGT pra você.
+############################################################
+
+# Nome lógico do pacote dentro do mini-adm
+PKG_NAME="meupacote"
+
+############################################################
+# PKG_BUILD
+#
+# - Obrigatório em TODOS os metas.
+# - É chamado pelo mini-adm em:
+#     run_pkg -> PKG_BUILD
+# - Tudo aqui roda NO HOST, usando $LFS como raiz do sistema LFS.
+#
+# Boas práticas:
+#  - Usar set -e dentro da função (o script já usa -e, mas é ok reforçar).
+#  - Usar : "${VAR:?msg}" pra garantir que variáveis obrigatórias existam.
+#  - Trabalhar sempre dentro de $LFS/sources.
+#  - No final, limpar os fontes extraídos (rm -rf).
+############################################################
+
+PKG_BUILD() {
+    set -e
+
+    # Versão do pacote - defina essa variável no mini-adm.sh e exporte
+    : "${MEUPACOTE_VER:?MEUPACOTE_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    # Use LFS_TGT se for pacote cross/temporário
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    ########################################################
+    # 1. Garantir que o tarball existe
+    ########################################################
+    # Ajuste o nome do tarball conforme o pacote real
+    [[ -f "meupacote-${MEUPACOTE_VER}.tar.xz" ]] || [[ -f "meupacote-${MEUPACOTE_VER}.tar.gz" ]] || {
+        echo "ERRO: meupacote-${MEUPACOTE_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    ########################################################
+    # 2. Extrair o pacote
+    ########################################################
+    tar -xf "meupacote-${MEUPACOTE_VER}.tar."*
+    cd "meupacote-${MEUPACOTE_VER}"
+
+    ########################################################
+    # 3. (Opcional) Aplicar patches
+    ########################################################
+    # Exemplo:
+    # [[ -f "../meupacote-${MEUPACOTE_VER}-fix-bug.patch" ]] && \
+    #   patch -Np1 -i "../meupacote-${MEUPACOTE_VER}-fix-bug.patch"
+
+    ########################################################
+    # 4. Configurar o build
+    ########################################################
+
+    # EXEMPLO A) Pacote temporário cross (instala em /usr dentro do $LFS)
+    # ./configure --prefix=/usr                     \
+    #             --host="$LFS_TGT"                 \
+    #             --build="$(./config.guess)"
+
+    # EXEMPLO B) Pacote para o toolchain em /tools (cross inicial)
+    # ./configure --prefix="$LFS/tools"             \
+    #             --host="$LFS_TGT"                 \
+    #             --build="$(./config.guess)"
+
+    # EXEMPLO C) Pacote já dentro do chroot (instalação final em /usr)
+    # ./configure --prefix=/usr
+
+    # Coloque aqui o configure real do seu pacote:
+    ./configure --prefix=/usr --host="$LFS_TGT" --build="$(./config.guess)"
+
+    ########################################################
+    # 5. Compilar e instalar no DESTDIR="$LFS"
+    ########################################################
+    make
+    make DESTDIR="$LFS" install
+
+    ########################################################
+    # 6. Ajustes pós-instalação (opcionais)
+    ########################################################
+    # Exemplo: mover binários, criar symlinks, mexer em manpages, etc.
+    # mv -v "$LFS/usr/bin/meupacote" "$LFS/usr/sbin"
+    # ln -svf meupacote "$LFS/usr/bin/meualias"
+
+    ########################################################
+    # 7. Limpar fontes extraídos
+    ########################################################
+    cd "$LFS/sources"
+    rm -rf "meupacote-${MEUPACOTE_VER}"
+}
+
+############################################################
+# Seção de CHECAGEM GENÉRICA
+#
+# O mini-adm tem uma função run_generic_pkg_checks que usa:
+#
+#   PKG_MAIN_BIN    (string única)   [opcional]
+#   PKG_MAIN_BINS   (array)          [opcional]
+#   PKG_CHECK_BINS  (array)          [opcional]
+#   PKG_CHECK_LIBS  (array)          [opcional]
+#   PKG_CHECK_DIRS  (array)          [opcional]
+#   PKG_CHECK_CMDS  (array)          [opcional]
+#   PKG_CHECK_CHROOT=1               [opcional]
+#
+# - TODAS os paths aqui são relativos à RAIZ LFS.
+#   Ex: "/usr/bin/meupacote" significa "$LFS/usr/bin/meupacote" no host,
+#       e "/usr/bin/meupacote" dentro do chroot.
+#
+# - PKG_CHECK_CMDS:
+#   * se PKG_CHECK_CHROOT=1, os comandos são rodados em:
+#       chroot "$LFS" /bin/sh -lc "<comando>"
+#   * caso contrário, rodam no host:
+#       /bin/sh -lc "<comando>"
+#
+# - Você NÃO precisa definir PKG_CHECK() manualmente.
+#   O verify_pkg() do mini-adm:
+#     - se existir PKG_CHECK, roda ele + genérico
+#     - se não existir, usa só o genérico
+############################################################
+
+############################################################
+# Exemplo de preenchimento para um pacote típico
+# (ajuste para o seu caso real)
+############################################################
+
+# Binário(s) principal(is) do pacote (se tiver mais de um, use array)
+PKG_MAIN_BINS=(
+  "/usr/bin/meupacote"   # principal
+  # "/usr/bin/meucomando2"
+)
+
+# Outros binários importantes que você quer garantir
+PKG_CHECK_BINS=(
+  "/usr/bin/meu-helper"
+  # "/usr/sbin/meu-daemon"
+)
+
+# Bibliotecas importantes
+PKG_CHECK_LIBS=(
+  "/usr/lib/libmeupacote.so"
+  # "/usr/lib/libmeupacote.a"
+)
+
+# Diretórios importantes
+PKG_CHECK_DIRS=(
+  "/usr/share/meupacote"
+  # "/var/lib/meupacote"
+)
+
+# Se quiser rodar testes DENTRO do ambiente LFS (chroot), defina:
+#   PKG_CHECK_CHROOT=1
+#
+# Senão, deixe 0 ou nem defina (testes rodam no host usando $LFS/...)
+PKG_CHECK_CHROOT=0
+
+# Comandos de teste:
+# - Se PKG_CHECK_CHROOT=0:
+#     "$LFS/usr/bin/meupacote --version"
+#   será executado no host.
+#
+# - Se PKG_CHECK_CHROOT=1:
+#     "meupacote --version"
+#   será executado dentro do chroot:
+#     chroot "$LFS" /bin/sh -lc "meupacote --version"
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/meupacote --version"
+  # "meupacote --help"
+)
+
+############################################################
+# (Opcional) PKG_CHECK personalizado
+#
+# NORMALMENTE você NÃO precisa disto.
+# Só use se o pacote tiver testes muito específicos, tipo:
+#   - rodar uma suíte de tests
+#   - compilar dummy.c com esse pacote e analisar o binário
+#
+# Se você definir PKG_CHECK(), o mini-adm vai:
+#   1. Rodar PKG_CHECK()
+#   2. Depois rodar também run_generic_pkg_checks (se tiver PKG_* definidos)
+############################################################
+
+# PKG_CHECK() {
+#     set -e
+#
+#     : "${LFS:?LFS não definido}"
+#
+#     # Exemplo: teste customizado
+#     if ! chroot "$LFS" /bin/sh -lc "meupacote --version >/dev/null"; then
+#         echo "Teste customizado de meupacote falhou." >&2
+#         return 1
+#     fi
+#
+#     return 0
+# }
