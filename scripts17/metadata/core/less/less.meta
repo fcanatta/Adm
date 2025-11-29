@@ -1,0 +1,50 @@
+# Less-685 - LFS r12.4-46 (8.43)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/less.html
+
+PKG_NAME="less"
+PKG_VERSION="685"
+PKG_RELEASE=1
+
+# Fonte conforme a lista oficial de pacotes do LFS:
+#   Download: https://www.greenwoodsoftware.com/less/less-${PKG_VERSION}.tar.gz
+PKG_SOURCE_URLS=(
+  "https://www.greenwoodsoftware.com/less/less-${PKG_VERSION}.tar.gz"
+)
+
+# MD5 do tarball (do capítulo 3 - All Packages do LFS)
+# less-${PKG_VERSION}.tar.gz -> 08bd7e4cd067ec19b755726ca4544d65
+PKG_MD5S=(
+  "08bd7e4cd067ec19b755726ca4544d65"
+)
+
+# O livro não menciona dependências explícitas aqui; tudo que ele precisa
+# já foi construído antes no capítulo (ncurses, etc.). Então deixamos vazio.
+PKG_DEPENDS=()
+
+# Agrupamento lógico (ajuste se você usa outra convenção, ex: "utils")
+PKG_GROUPS=("core")
+
+# Dados para o sistema de update do adm (opcional, mas útil):
+PKG_UPSTREAM_URL="https://www.greenwoodsoftware.com/less/"
+PKG_UPSTREAM_REGEX='less-([0-9]+)\.tar\.gz'
+
+# -------------------------------------------------------------
+# Build / Install seguindo o LFS, adaptado para DESTDIR do adm
+# -------------------------------------------------------------
+PKG_BUILD() {
+    ./configure --prefix=/usr --sysconfdir=/etc
+
+    make
+
+    # Testes conforme o livro:
+    #   make check
+    # Controlado por ADM_RUN_TESTS (1 = roda, 0 = pula)
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    # Instalação com DESTDIR para o adm
+    make DESTDIR="$DESTDIR" install
+}
