@@ -55,6 +55,7 @@ PATCH_VER="2.8"
 SED_VER="4.9"
 TAR_VER="1.35"
 XZ_VER="5.8.1"
+MUSL_VER=1.2.5
 
 ########################################
 # 2. Configuração e diretórios básicos #
@@ -273,6 +274,7 @@ BUILD_ORDER=(
   xz                      # Xz-5.8.1
   binutils-pass2          # Binutils-2.45.1 - Pass 2
   gcc-pass2               # GCC-15.2.0     - Pass 2
+  musl                    # Libc musl
 )
 
 ########################################
