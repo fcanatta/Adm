@@ -1,4 +1,7 @@
 # Grep-3.12 - LFS 6.10
+# --------------------
+# Variáveis: GREP_VER, LFS, LFS_TGT
+
 PKG_NAME="grep"
 
 PKG_BUILD() {
@@ -29,6 +32,19 @@ PKG_BUILD() {
     rm -rf "grep-${GREP_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/grep" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/grep"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/egrep"
+  "/usr/bin/fgrep"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/grep --version"
+)
