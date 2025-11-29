@@ -116,6 +116,7 @@ require_cmd tar gzip xz zstd sha256sum md5sum sed awk sort grep file tac
 meta_path_for_pkg() {
     local pkg="$1"
     local path=""
+    local -a candidates=()
 
     # Caso 1: o nome do pacote já veio no formato "grupo/programa"
     if [[ "$pkg" == */* ]]; then
@@ -141,22 +142,26 @@ meta_path_for_pkg() {
     fi
 
     # Caso 2: nome simples ("programa")
-    # Primeiro tentamos o layout de subdiretório padrão: $META_DIR/core/programa/programa.meta, etc.
-    # Ou qualquer $META_DIR/*/programa/programa.meta
-    path=$(find "$META_DIR" -mindepth 2 -maxdepth 3 -type f -name "$pkg.meta" -print -quit 2>/dev/null || true)
-    if [[ -n "$path" ]]; then
-        echo "$path"
+    # Procurar metadata em subdiretórios ($META_DIR/grupo/programa/programa.meta)
+    mapfile -t candidates < <(find "$META_DIR" -mindepth 2 -maxdepth 3 -type f -name "$pkg.meta" 2>/dev/null || true)
+    if ((${#candidates[@]} == 1)); then
+        echo "${candidates[0]}"
         return
+    elif ((${#candidates[@]} > 1)); then
+        die "Metadata ambígua para '$pkg': ${candidates[*]} (use grupo/pacote, ex: core/$pkg)"
     fi
 
-    # Fallback: procurar em qualquer lugar (como antes)
-    path=$(find "$META_DIR" -type f -name "$pkg.meta" -print -quit 2>/dev/null || true)
-    if [[ -n "$path" ]]; then
-        echo "$path"
-    else
-        # Último fallback: raiz direta
-        echo "$META_DIR/$pkg.meta"
+    # Fallback: procurar em qualquer lugar (como antes), ainda checando ambiguidade
+    mapfile -t candidates < <(find "$META_DIR" -type f -name "$pkg.meta" 2>/dev/null || true)
+    if ((${#candidates[@]} == 1)); then
+        echo "${candidates[0]}"
+        return
+    elif ((${#candidates[@]} > 1)); then
+        die "Metadata ambígua para '$pkg': ${candidates[*]} (use grupo/pacote, ex: core/$pkg)"
     fi
+
+    # Último fallback: assume arquivo direto na raiz
+    echo "$META_DIR/$pkg.meta"
 }
 
 ensure_metadata_exists() {
@@ -801,7 +806,8 @@ register_install() {
     log_info "[$pkg] Registrando arquivos instalados a partir de $destdir"
     (
         cd "$destdir" || die "[$pkg] Falha ao entrar em DESTDIR: $destdir"
-        find . -type f -o -type l -o -type d | sed 's|^\./||' | while read -r path; do
+        # Usa find com -print0 para lidar corretamente com espaços, quebras de linha e caracteres especiais em nomes de arquivos
+        find . -mindepth 1 -printf '%P\0' | while IFS= read -r -d '' path; do
             echo "/$path" >>"$listfile"
             if [[ -f "$path" ]]; then
                 sha256sum "$path" | sed "s|  $path|  /$path|" >>"$manifest"
@@ -1310,7 +1316,10 @@ verify_all() {
         if [[ ! -f "$pkgdir/metadata.meta" && ! -f "$pkgdir/files.list" ]]; then
             continue
         fi
-        pkg="$(basename "$pkgdir")"
+        # Usa caminho relativo ao DB_DIR como nome lógico do pacote (suporta subdiretórios, ex: core/shadow)
+        local rel
+        rel="${pkgdir#$DB_DIR/}"
+        pkg="$rel"
         if ! verify_package_integrity "$pkg"; then
             failed+=("$pkg")
         fi
