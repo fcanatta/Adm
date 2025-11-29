@@ -1,0 +1,39 @@
+# Bc-7.0.3 - LFS 12.4 / r12.4-46 (8.14)
+# https://www.linuxfromscratch.org/lfs/view/12.4/chapter08/bc.html
+
+PKG_NAME="bc"
+PKG_VERSION="7.0.3"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://github.com/gavinhoward/bc/releases/download/7.0.3/bc-7.0.3.tar.xz"
+)
+
+# From LFS packages list
+# MD5: ad4db5a0eb4fdbb3f6813be4b6b3da74
+PKG_MD5S=(
+  "ad4db5a0eb4fdbb3f6813be4b6b3da74"
+)
+
+# Usa readline quando compilado com -r
+PKG_DEPENDS=("readline")
+PKG_GROUPS=("core" "utils")
+
+PKG_UPSTREAM_URL="https://github.com/gavinhoward/bc"
+PKG_UPSTREAM_REGEX='bc-([0-9.]+)\.tar\.xz'
+
+PKG_BUILD() {
+    CC='gcc -std=c99' ./configure \
+        --prefix=/usr \
+        -G -O3 -r
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make test
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
