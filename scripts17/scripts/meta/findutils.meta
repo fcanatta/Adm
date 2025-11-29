@@ -1,4 +1,7 @@
 # Findutils-4.10.0 - LFS 6.8
+# --------------------------
+# Variáveis: FINDUTILS_VER, LFS, LFS_TGT
+
 PKG_NAME="findutils"
 
 PKG_BUILD() {
@@ -30,6 +33,23 @@ PKG_BUILD() {
     rm -rf "findutils-${FINDUTILS_VER}"
 }
 
-PKG_CHECK() {
-    [[ -x "$LFS/usr/bin/find" ]]
-}
+#######################################################
+# Checagem genérica
+#######################################################
+
+PKG_MAIN_BINS=(
+  "/usr/bin/find"
+)
+
+PKG_CHECK_BINS=(
+  "/usr/bin/xargs"
+  "/usr/bin/locate"
+)
+
+PKG_CHECK_DIRS=(
+  "/var/lib/locate"
+)
+
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/find --version"
+)
