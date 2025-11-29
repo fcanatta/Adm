@@ -1,0 +1,35 @@
+# Psmisc-23.7 - LFS 12.4 / r12.4-46 (8.32)
+# https://www.linuxfromscratch.org/lfs/view/stable/chapter08/psmisc.html
+
+PKG_NAME="psmisc"
+PKG_VERSION="23.7"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://sourceforge.net/projects/psmisc/files/psmisc/psmisc-23.7.tar.xz"
+)
+
+# From LFS r12.4-dev packages list
+# MD5: 53eae841735189a896d614cba440eb10
+PKG_MD5S=(
+  "53eae841735189a896d614cba440eb10"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=("core" "utils")
+
+PKG_UPSTREAM_URL="https://gitlab.com/psmisc/psmisc"
+PKG_UPSTREAM_REGEX='psmisc-([0-9.]+)\.tar\.xz'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        make check
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
