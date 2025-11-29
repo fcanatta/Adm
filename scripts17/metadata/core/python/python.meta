@@ -1,0 +1,106 @@
+# Python-3.14.0 — Linux From Scratch r12.4-46, Capítulo 8.53
+
+PKG_NAME="python"
+PKG_VERSION="3.14.0"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The Python 3 package contains the Python development environment, useful for object-oriented programming, scripting, prototyping and full applications."
+
+PKG_HOMEPAGE="https://www.python.org/"
+PKG_SOURCE_URLS=(
+    "https://www.python.org/ftp/python/${PKG_VERSION}/Python-${PKG_VERSION}.tar.xz"
+)
+
+# MD5 do tarball principal, conforme BLFS (Python-3.14.0)
+# Download MD5 sum: 41389edaf9c643263cbed9b5ed307df8
+PKG_MD5S=(
+    "41389edaf9c643263cbed9b5ed307df8"
+)
+
+# O configure usa explicitamente --with-system-expat, então pelo livro
+# sabemos que Python depende do Expat já instalado.
+PKG_DEPENDS=("expat")
+
+PKG_GROUPS=()
+
+# Opcional: suporte a upgrade automático no adm
+PKG_UPSTREAM_URL="https://www.python.org/ftp/python/"
+PKG_UPSTREAM_REGEX='Python-([0-9.]+)\.tar\.xz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # 8.53.1. Installation of Python 3
+    # Prepare Python for compilation:
+    #   ./configure --prefix=/usr          \
+    #               --enable-shared        \
+    #               --with-system-expat    \
+    #               --enable-optimizations \
+    #               --without-static-libpython
+    ./configure --prefix=/usr          \
+                --enable-shared        \
+                --with-system-expat    \
+                --enable-optimizations \
+                --without-static-libpython
+
+    # Compile the package:
+    make
+
+    # Testes, com timeout de 120s por teste, exatamente como no livro:
+    #   make test TESTOPTS="--timeout 120"
+    make test TESTOPTS="--timeout 120"
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # No fluxo do adm, DESTDIR já vem setado pelo build_package().
+    # Instalamos como no LFS, mas respeitando DESTDIR.
+
+    # LFS: make install
+    make DESTDIR="${DESTDIR}" install
+
+    # Opcional (do livro): suprimir os avisos chatos do pip3 rodando como root.
+    # No LFS o comando é:
+    #
+    #   cat > /etc/pip.conf << EOF
+    #   [global]
+    #   root-user-action = ignore
+    #   disable-pip-version-check = true
+    #   EOF
+    #
+    # Aqui adaptamos para criar dentro do DESTDIR, mantendo fidelidade
+    # mas sem escrever direto no sistema host.
+    mkdir -p "${DESTDIR}/etc"
+    cat > "${DESTDIR}/etc/pip.conf" << 'EOF'
+[global]
+root-user-action = ignore
+disable-pip-version-check = true
+EOF
+
+    # --- Documentação em HTML (OPCIONAL) ---
+    # O LFS instala docs a partir de um tarball separado:
+    #   python-3.14.0-docs-html.tar.bz2
+    # com comandos:
+    #
+    #   install -v -dm755 /usr/share/doc/python-3.14.0/html
+    #   tar --strip-components=1  \
+    #       --no-same-owner       \
+    #       --no-same-permissions \
+    #       -C /usr/share/doc/python-3.14.0/html \
+    #       -xvf ../python-3.14.0-docs-html.tar.bz2
+    #
+    # Se você também baixar esse tarball para perto da árvore de build,
+    # pode descomentar/adaptar o bloco abaixo para o adm (DESTDIR):
+    #
+    #   install -v -dm755 "${DESTDIR}/usr/share/doc/python-3.14.0/html"
+    #   tar --strip-components=1  \
+    #       --no-same-owner       \
+    #       --no-same-permissions \
+    #       -C "${DESTDIR}/usr/share/doc/python-3.14.0/html" \
+    #       -xvf ../python-3.14.0-docs-html.tar.bz2
+}
