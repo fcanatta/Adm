@@ -1,0 +1,48 @@
+# $META_DIR/mpfr.meta
+PKG_NAME="mpfr"
+PKG_VERSION="4.2.2"
+PKG_RELEASE=1
+
+PKG_GROUPS=( "core" )
+
+PKG_SOURCE_URLS=(
+  "https://ftp.gnu.org/gnu/mpfr/mpfr-${PKG_VERSION}.tar.xz"
+)
+
+PKG_SHA256S=(
+  "b67ba0383ef7e8a8563734e2e889ef5ec3c3b898a01d00fa0a6869ad81c6ce01"
+)
+
+# MD5 da mesma tarball usada por distros/packagers
+PKG_MD5S=(
+  "7c32c39b8b6e3ae85f25156228156061"
+)
+
+PKG_DEPENDS=(
+  "gmp"
+)
+
+PKG_BUILD() {
+    set -e
+
+    ./configure --prefix=/usr        \
+                --disable-static     \
+                --enable-thread-safe \
+                --docdir=/usr/share/doc/mpfr-${PKG_VERSION}
+
+    make
+    make html
+
+    make check || {
+        echo "WARN: testes do MPFR falharam, verifique logs"
+    }
+}
+
+PKG_INSTALL() {
+    set -e
+    make DESTDIR="$DESTDIR" install
+    make DESTDIR="$DESTDIR" install-html
+}
+
+PKG_UPSTREAM_URL="https://ftp.gnu.org/gnu/mpfr/"
+PKG_UPSTREAM_REGEX="mpfr-([0-9.]+)\\.tar\\.xz"
