@@ -1,0 +1,43 @@
+# Acl-2.3.2 - LFS r12.4-46 (8.26)
+# https://www.linuxfromscratch.org/lfs/view/development/chapter08/acl.html
+
+PKG_NAME="acl"
+PKG_VERSION="2.3.2"
+PKG_RELEASE=1
+
+PKG_SOURCE_URLS=(
+  "https://download.savannah.nongnu.org/releases/acl/acl-2.3.2.tar.xz"
+)
+
+# MD5 do LFS
+# acl-2.3.2.tar.xz -> 590765dee95907dbc3c856f7255bd669
+PKG_MD5S=(
+  "590765dee95907dbc3c856f7255bd669"
+)
+
+# Usa libattr.so, então depende de attr
+PKG_DEPENDS=(
+  "attr"
+)
+
+PKG_GROUPS=("core" "libs")
+
+PKG_UPSTREAM_URL="https://savannah.nongnu.org/projects/acl"
+PKG_UPSTREAM_REGEX='acl-([0-9.]+)\.tar\.(gz|xz)'
+
+PKG_BUILD() {
+    ./configure --prefix=/usr    \
+                --disable-static \
+                --docdir=/usr/share/doc/acl-2.3.2
+
+    make
+
+    if [[ "${ADM_RUN_TESTS:-1}" -eq 1 ]]; then
+        # um teste (cp.test) é conhecido por falhar porque coreutils ainda não tem suporte a ACL
+        make check || true
+    fi
+}
+
+PKG_INSTALL() {
+    make DESTDIR="$DESTDIR" install
+}
