@@ -1,0 +1,46 @@
+# $META_DIR/isl.meta
+PKG_NAME="isl"
+PKG_VERSION="0.27"
+PKG_RELEASE=1
+
+PKG_GROUPS=( "core" )
+
+PKG_SOURCE_URLS=(
+  "https://libisl.sourceforge.io/isl-${PKG_VERSION}.tar.xz"
+)
+
+PKG_SHA256S=(
+  "6d8babb59e7b672e8cb7870e874f3f7b813b6e00e6af3f8b04f7579965643d5c"
+)
+
+PKG_MD5S=(
+  "11ee9d335b227ea2e8579c4ba6e56138"
+)
+
+PKG_DEPENDS=(
+  "gmp"
+)
+
+PKG_BUILD() {
+    set -e
+
+    ./configure --prefix=/usr    \
+                --disable-static
+
+    make
+
+    # ISL não tem suite de testes obrigatória tipo LFS, então deixo opcional:
+    if make check; then
+        echo "Testes do ISL passaram."
+    else
+        echo "WARN: testes do ISL falharam (se existirem), verifique logs"
+    fi
+}
+
+PKG_INSTALL() {
+    set -e
+    make DESTDIR="$DESTDIR" install
+}
+
+PKG_UPSTREAM_URL="https://libisl.sourceforge.io/"
+PKG_UPSTREAM_REGEX="isl-([0-9.]+)\\.tar\\.xz"
