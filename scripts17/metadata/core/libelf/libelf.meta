@@ -1,0 +1,76 @@
+# Libelf from Elfutils-0.194 — Linux From Scratch r12.4-46, Capítulo 8.50
+
+PKG_NAME="libelf"
+PKG_VERSION="0.194"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="Libelf is a library for handling ELF (Executable and Linkable Format) files."
+
+PKG_HOMEPAGE="https://sourceware.org/elfutils/"
+PKG_SOURCE_URLS=(
+    "https://sourceware.org/ftp/elfutils/${PKG_VERSION}/elfutils-${PKG_VERSION}.tar.bz2"
+)
+
+# MD5 de Elfutils (0.194) em 3.2 All Packages
+PKG_MD5S=(
+    "1137792ea10e9194637d7344439a5955"
+)
+
+# O capítulo 8.50 não declara deps extras além do toolchain já presente
+PKG_DEPENDS=()
+PKG_GROUPS=("core")
+
+# Opcional: para o 'upgrade_package' do adm
+PKG_UPSTREAM_URL="https://sourceware.org/ftp/elfutils/"
+PKG_UPSTREAM_REGEX='elfutils-([0-9.]+)\.tar\.bz2'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # 8.50.1. Installation of Libelf (LFS r12.4-46)
+    # Libelf é parte do tarball elfutils-0.194
+
+    # Configurar:
+    #   ./configure --prefix=/usr        \
+    #               --disable-debuginfod \
+    #               --enable-libdebuginfod=dummy
+    ./configure --prefix=/usr        \
+                --disable-debuginfod \
+                --enable-libdebuginfod=dummy
+
+    # Compilar somente Libelf:
+    #   make -C lib
+    #   make -C libelf
+    make -C lib
+    make -C libelf
+
+    # Testes:
+    #   make -k check
+    # O livro avisa que dois testes falham (dwarf_srclang_check e
+    # run-backtrace-native-core.sh), mas isso é esperado.
+    make -k check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # 8.50.1, adaptado para DESTDIR do adm
+    #
+    # LFS faz:
+    #   make -C libelf install
+    #   install -vm644 config/libelf.pc /usr/lib/pkgconfig
+    #   rm /usr/lib/libelf.a
+
+    # Instalar só Libelf dentro do DESTDIR:
+    make -C libelf DESTDIR="${DESTDIR}" install
+
+    # Instalar o arquivo pkg-config no caminho correto dentro do DESTDIR:
+    install -vm644 config/libelf.pc "${DESTDIR}/usr/lib/pkgconfig"
+
+    # Remover a biblioteca estática, como manda o livro:
+    rm -f "${DESTDIR}/usr/lib/libelf.a"
+}
