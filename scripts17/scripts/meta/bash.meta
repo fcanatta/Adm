@@ -1,4 +1,9 @@
 # Bash-5.3 - LFS 6.4 (Cross Compiling Temporary Tools)
+# ----------------------------------------------------
+# Instala o bash temporário em $LFS/usr e cria /bin/sh -> bash.
+# Variáveis:
+#   - BASH_VER, LFS, LFS_TGT
+
 PKG_NAME="bash"
 
 PKG_BUILD() {
@@ -26,27 +31,24 @@ PKG_BUILD() {
     make
     make DESTDIR="$LFS" install
 
-    # Link /bin/sh → bash (6.4.1)
-    ln -svf bash "$LFS/bin/sh"
+    # Link /bin/sh → bash (em $LFS)
+    ln -svf ../usr/bin/bash "$LFS/bin/sh"
 
     cd "$LFS/sources"
     rm -rf "bash-${BASH_VER}"
 }
 
-PKG_CHECK() {
-    local ok=0
+#######################################################
+# Checagem genérica
+#######################################################
 
-    if [[ -x "$LFS/bin/bash" ]]; then
-        ok=$((ok+1))
-    else
-        echo "bash CHECK: não encontrei $LFS/bin/bash" >&2
-    fi
+# Principais: bash e /bin/sh
+PKG_MAIN_BINS=(
+  "/usr/bin/bash"
+  "/bin/sh"
+)
 
-    if [[ -L "$LFS/bin/sh" ]]; then
-        ok=$((ok+1))
-    else
-        echo "bash CHECK: não encontrei link $LFS/bin/sh" >&2
-    fi
-
-    (( ok >= 2 ))
-}
+PKG_CHECK_CMDS=(
+  "$LFS/usr/bin/bash --version"
+  "$LFS/bin/sh --version"
+)
