@@ -1,0 +1,49 @@
+# File-5.46 — Linux From Scratch r12.4-46, Capítulo 8.11
+
+PKG_NAME="file"
+PKG_VERSION="5.46"
+PKG_RELEASE=1
+
+PKG_DESCRIPTION="The File package contains a utility to determine the type of a file."  # LFS 8.11
+
+PKG_HOMEPAGE="https://www.darwinsys.com/file/"
+PKG_SOURCE_URLS=(
+    "https://astron.com/pub/file/file-${PKG_VERSION}.tar.gz"
+)
+
+# De 3.2 All Packages (File (5.46))
+PKG_MD5S=(
+    "459da2d4b534801e2e2861611d823864"
+)
+
+PKG_DEPENDS=()
+PKG_GROUPS=()
+
+PKG_UPSTREAM_URL="https://astron.com/pub/file/"
+PKG_UPSTREAM_REGEX='file-([0-9.]+)\.tar\.gz'
+
+
+# ======================
+#  Função de build
+# ======================
+PKG_BUILD() {
+    # LFS 8.11.1:
+    #   ./configure --prefix=/usr
+    ./configure --prefix=/usr
+
+    #   make
+    make
+
+    #   make check
+    make check
+}
+
+
+# ======================
+#  Função de instalação
+# ======================
+PKG_INSTALL() {
+    # LFS: make install
+    # Aqui só adicionamos DESTDIR para o adm:
+    make DESTDIR="${DESTDIR}" install
+}
