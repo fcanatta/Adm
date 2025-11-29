@@ -1,0 +1,22 @@
+#!/bin/bash
+set -e
+
+echo "[shadow] Configurando Shadow de acordo com o LFS..."
+
+# Cria os bancos de senha shadow/group caso não existam
+pwconv
+grpconv
+
+# Cria o arquivo padrão para novos usuários (LFS: /etc/default/useradd)
+if [[ ! -f /etc/default/useradd ]]; then
+    install -v -m644 /etc/login.defs /etc/default/useradd
+fi
+
+# Ajustes padrões do useradd (LFS)
+sed -i 's/MAIL_DIR=.*/MAIL_DIR=\/var\/mail/' /etc/default/useradd
+sed -i 's/ENCRYPT_METHOD.*/ENCRYPT_METHOD YESCRYPT/' /etc/login.defs
+
+# Garantir que o diretório de mail existe
+install -vdm755 /var/mail
+
+echo "[shadow] A configuração inicial do Shadow está completa."
