@@ -1,0 +1,35 @@
+# Diffutils-3.12 - LFS 6.6
+PKG_NAME="diffutils"
+
+PKG_BUILD() {
+    set -e
+
+    : "${DIFFUTILS_VER:?DIFFUTILS_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "diffutils-${DIFFUTILS_VER}.tar.xz" ]] || [[ -f "diffutils-${DIFFUTILS_VER}.tar.gz" ]] || {
+        echo "ERRO: diffutils-${DIFFUTILS_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "diffutils-${DIFFUTILS_VER}.tar."*
+    cd "diffutils-${DIFFUTILS_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                gl_cv_func_strcasecmp_works=y \
+                --build="$(./build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "diffutils-${DIFFUTILS_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/diff" ]]
+}
