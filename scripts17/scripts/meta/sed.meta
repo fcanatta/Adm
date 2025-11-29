@@ -1,0 +1,34 @@
+# Sed-4.9 - LFS 6.14
+PKG_NAME="sed"
+
+PKG_BUILD() {
+    set -e
+
+    : "${SED_VER:?SED_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    [[ -f "sed-${SED_VER}.tar.xz" ]] || [[ -f "sed-${SED_VER}.tar.gz" ]] || {
+        echo "ERRO: sed-${SED_VER}.tar.[xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    tar -xf "sed-${SED_VER}.tar."*
+    cd "sed-${SED_VER}"
+
+    ./configure --prefix=/usr   \
+                --host="$LFS_TGT" \
+                --build="$(./build-aux/config.guess)"
+
+    make
+    make DESTDIR="$LFS" install
+
+    cd "$LFS/sources"
+    rm -rf "sed-${SED_VER}"
+}
+
+PKG_CHECK() {
+    [[ -x "$LFS/usr/bin/sed" ]]
+}
