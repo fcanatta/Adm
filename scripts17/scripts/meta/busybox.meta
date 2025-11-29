@@ -1,0 +1,81 @@
+# BusyBox - meta para mini-adm
+# -----------------------------
+# Instala o BusyBox dentro de $LFS, com todos os applets padrão.
+#
+# Pré-requisitos:
+#   - $LFS, $LFS_TGT e $BUSYBOX_VER definidos
+#   - tarball busybox-${BUSYBOX_VER}.tar.* em $LFS/sources
+#
+# Exemplo de definição no mini-adm.sh:
+#   BUSYBOX_VER="1.36.1"
+
+PKG_NAME="busybox"
+
+PKG_BUILD() {
+    set -e
+
+    : "${BUSYBOX_VER:?BUSYBOX_VER não definido}"
+    : "${LFS:?LFS não definido}"
+    : "${LFS_TGT:?LFS_TGT não definido}"
+
+    cd "$LFS/sources"
+
+    # Verifica tarball
+    [[ -f "busybox-${BUSYBOX_VER}.tar.bz2" ]] || \
+    [[ -f "busybox-${BUSYBOX_VER}.tar.xz"  ]] || \
+    [[ -f "busybox-${BUSYBOX_VER}.tar.gz"  ]] || {
+        echo "ERRO: busybox-${BUSYBOX_VER}.tar.[bz2|xz|gz] não encontrado em $LFS/sources" >&2
+        exit 1
+    }
+
+    # Extrai (independente da extensão)
+    tar -xf "busybox-${BUSYBOX_VER}.tar."*
+    cd "busybox-${BUSYBOX_VER}"
+
+    # Limpa qualquer build antigo
+    make distclean || true
+
+    # Configuração padrão (defconfig)
+    make defconfig
+
+    # Opcional: você pode ajustar a config aqui via sed, exemplo:
+    #   - habilitar suporte a long options
+    #   - usar /bin/sh como shell padrão
+    #
+    # Exemplo (descomente se quiser):
+    #
+    # sed -i 's/.*CONFIG_FEATURE_SH_STANDALONE.*/CONFIG_FEATURE_SH_STANDALONE=y/' .config
+    # sed -i 's/.*CONFIG_FEATURE_SH_NOFORK.*/CONFIG_FEATURE_SH_NOFORK=y/' .config
+    #
+    # Regera arquivos de configuração se mexer no .config
+    # make oldconfig
+
+    # Compilação cruzada para o target do LFS
+    # (assumindo que o cross toolchain já está pronto)
+    make CROSS_COMPILE="${LFS_TGT}-"
+
+    # Instalação no sysroot $LFS com todos os applets
+    # CONFIG_PREFIX define o "root" de instalação
+    make CROSS_COMPILE="${LFS_TGT}-" CONFIG_PREFIX="$LFS" install
+
+    # Depois do install, teremos:
+    #   $LFS/bin/busybox
+    #   $LFS/bin/ls, $LFS/bin/cat, etc. (symlinks)
+    #   $LFS/sbin/..., $LFS/usr/bin/..., $LFS/usr/sbin/...
+
+    # Limpa fontes
+    cd "$LFS/sources"
+    rm -rf "busybox-${BUSYBOX_VER}"
+}
+
+PKG_CHECK() {
+    # Verificação simples:
+    #  - busybox existe em $LFS/bin/busybox
+    #  - responde a "--help"
+    if [[ -x "$LFS/bin/busybox" ]]; then
+        if chroot "$LFS" /bin/busybox --help >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
+}
