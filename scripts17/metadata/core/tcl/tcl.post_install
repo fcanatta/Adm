@@ -1,0 +1,20 @@
+#!/bin/bash
+# tcl.post_install – hook executado após a instalação do Tcl
+set -euo pipefail
+
+pkgname="${1:-tcl}"
+hooktype="${2:-post_install}"
+
+echo "[HOOK] Executando ${pkgname}.${hooktype}"
+
+# Tcl instala libtcl8.6.so e outras libs compartilhadas,
+# então é recomendado atualizar o cache de bibliotecas.
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[HOOK] Rodando ldconfig para atualizar cache de bibliotecas..."
+    ldconfig
+    echo "[HOOK] ldconfig concluído."
+else
+    echo "[HOOK] ldconfig não encontrado; cache de bibliotecas não foi atualizado."
+fi
+
+echo "[HOOK] ${pkgname}.${hooktype} finalizado."
