@@ -1,0 +1,39 @@
+# toolchain-check - meta especial para checar o toolchain LFS
+#
+# Este "pacote" não constrói nada. Ele serve para integrar o script
+# lfs-check-toolchain ao fluxo do mini-adm.
+#
+# Pré-requisito:
+#   - script lfs-check-toolchain instalado e executável, ex.:
+#       /usr/local/bin/lfs-check-toolchain
+#
+# Uso:
+#   ./mini-adm.sh build toolchain-check
+#   ./mini-adm.sh verify-all    # PKG_CHECK também será chamado
+
+PKG_NAME="toolchain-check"
+
+# Não há build/instalação; é só uma checagem
+PKG_BUILD() {
+    :
+}
+
+PKG_CHECK() {
+    set -e
+
+    : "${LFS:?VARIÁVEL LFS não definida (export LFS=/mnt/lfs)}"
+
+    # Verifica se o script existe
+    if ! command -v lfs-check-toolchain >/dev/null 2>&1; then
+        echo "ERRO: lfs-check-toolchain não encontrado no PATH." >&2
+        echo "Instale em /usr/local/bin ou ajuste o PATH antes de rodar." >&2
+        return 1
+    fi
+
+    # Log dedicado dentro do próprio LFS
+    mkdir -pv "$LFS/logs"
+
+    # Modo auto escolhe host-cross ou final dependendo do ambiente
+    echo "[toolchain-check] Rodando lfs-check-toolchain auto --strict ..."
+    lfs-check-toolchain auto --strict --log "$LFS/logs/toolchain-check.log"
+}
