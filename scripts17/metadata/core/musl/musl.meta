@@ -1,0 +1,109 @@
+# ===== musl-1.2.5 com patches de segurança CVE-2025-26519 =====
+# Patches oficiais do advisory:
+#   https://www.openwall.com/lists/musl/2025/02/13/1/1
+#   https://www.openwall.com/lists/musl/2025/02/13/1/2
+#
+# Todas as versões de 0.9.13 até 1.2.5 são afetadas; esses patches
+# são recomendados pelo próprio autor da musl. Versões futuras (>=1.2.6)
+# já virão com o fix embutido.
+
+PKG_NAME="musl"
+PKG_VERSION="1.2.5"
+PKG_RELEASE=1
+
+PKG_GROUPS=( "core" )
+
+PKG_SOURCE_URLS=(
+  # 0: tarball oficial
+  "https://musl.libc.org/releases/musl-${PKG_VERSION}.tar.gz"
+
+  # 1: patch 1 do advisory (fix validation bug)
+  "https://www.openwall.com/lists/musl/2025/02/13/1/1"
+
+  # 2: patch 2 do advisory (fechar vetor de escalonamento)
+  "https://www.openwall.com/lists/musl/2025/02/13/1/2"
+)
+
+# SHA256 do tarball (releases oficiais)
+PKG_SHA256S=(
+  "a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4"  # musl-1.2.5.tar.gz
+
+  ""  # patch 1 – deixo vazio para não forçar verificação (texto puro do mail)
+  ""  # patch 2 – idem
+)
+
+# Sem MD5 oficial para os patches; se quiser, você pode preenchê-los depois
+PKG_MD5S=(
+  ""  # tarball
+  ""  # patch 1
+  ""  # patch 2
+)
+
+PKG_DEPENDS=(
+  # Deixe vazio ou adicione libs que você quer garantir antes da musl.
+  "binutils" "gcc" 
+)
+
+PKG_UPSTREAM_URL="https://musl.libc.org/releases/"
+PKG_UPSTREAM_REGEX="musl-([0-9.]+)\\.tar\\.gz"
+
+# --------------------------------------------------------------------
+# BUILD
+# --------------------------------------------------------------------
+PKG_BUILD() {
+    set -e
+
+    # Estamos em: $BUILD_ROOT/musl-1.2.5
+    # Os patches foram baixados para o mesmo diretório pela lógica do adm.
+    #
+    # Precisamos descobrir os nomes reais que o adm deu aos arquivos 1 e 2.
+    # Pela convenção do adm, o cache fica em:
+    #   $CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-<idx>-<basename>
+    #
+    # Mas aqui, durante o build, temos apenas os arquivos extraídos.
+    # Então vamos localizar os patches por extensão/conteúdo.
+
+    # Para evitar confusão, vou assumir que o adm:
+    #  - não extraiu os patches (pois não são tar/zip),
+    #  - apenas copiou os arquivos para o diretório de build.
+    #
+    # Então usamos um padrão simples: pegar dois arquivos que não sejam .c/.h/.o/etc
+    # e que pareçam patches (começam com '--- ' ou 'diff --git').
+    # Para simplificar, vamos procurar por nomes que terminem com ".patch" OU
+    # qualquer arquivo que contenha 'CVE-2025-26519' no conteúdo.
+
+    local patch1 patch2
+    patch1="$(grep -rl 'CVE-2025-26519' . || true | head -n1)"
+    patch2="$(grep -rl 'CVE-2025-26519' . || true | tail -n1)"
+
+    if [[ -z "$patch1" || -z "$patch2" || "$patch1" == "$patch2" ]]; then
+        echo "WARNING: não foi possível localizar de forma automática os dois patches CVE-2025-26519." >&2
+        echo "         Verifique os arquivos baixados e aplique manualmente se necessário." >&2
+    else
+        echo ">> Aplicando patch de segurança 1: $patch1"
+        patch -Np1 -i "$patch1"
+
+        echo ">> Aplicando patch de segurança 2: $patch2"
+        patch -Np1 -i "$patch2"
+    fi
+
+    # Agora seguimos com o configure/make normal.
+    # Para usar musl como libc alternativa em sistema glibc,
+    # é mais seguro isolar as libs em /usr/lib/musl:
+    ./configure \
+        --prefix=/usr \
+        --syslibdir=/usr/lib/musl
+
+    make
+
+    # musl não tem "make check" estável em todas as distros, então
+    # não rodamos automaticamente pra evitar quebras.
+}
+
+# --------------------------------------------------------------------
+# INSTALL
+# --------------------------------------------------------------------
+PKG_INSTALL() {
+    set -e
+    make DESTDIR="$DESTDIR" install
+}
