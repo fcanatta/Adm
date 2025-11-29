@@ -217,9 +217,8 @@ clear_pkg_stage() {
 # =========================
 # Download com cache + checksum
 # =========================
-
 download_one_source() {
-    local pkg="$1" idx="$2" urlspec="$3" out="$4" sha256="$5" md5="$6"
+    local pkg="$1" idx="$2" urlspec="$3" out="$4" sha256_spec="$5" md5_spec="$6"
 
     # urlspec pode ter múltiplos espelhos separados por '|'
     local -a mirrors=()
@@ -228,45 +227,94 @@ download_one_source() {
         die "[$pkg] Nenhuma URL válida em PKG_SOURCE_URLS[$idx]"
     fi
 
-    local attempts_per_mirror=3
+    # hashes esperados: aceitamos múltiplos separados por '|' ou espaço
+    local -a sha256_list=() md5_list=()
+    if [[ -n "$sha256_spec" ]]; then
+        IFS='| ' read -r -a sha256_list <<<"$sha256_spec"
+    fi
+    if [[ -n "$md5_spec" ]]; then
+        IFS='| ' read -r -a md5_list <<<"$md5_spec"
+    fi
+
     local have_checksum=0
-    [[ -n "$sha256" ]] && have_checksum=1
-    [[ -n "$md5" ]] && have_checksum=1
+    if ((${#sha256_list[@]} > 0 || ${#md5_list[@]} > 0)); then
+        have_checksum=1
+    fi
+
+    local attempts_per_mirror=3
+
+    # Função auxiliar para validar checksums de um arquivo
+    _check_file_checksums() {
+        local file="$1"
+        local ok=1
+
+        if ((${#sha256_list[@]} > 0)); then
+            local expected_s
+            local got_s
+            got_s=$(sha256sum "$file" | awk '{print $1}')
+            local match=0
+            for expected_s in "${sha256_list[@]}"; do
+                [[ -z "$expected_s" ]] && continue
+                if [[ "$got_s" == "$expected_s" ]]; then
+                    match=1
+                    break
+                fi
+            done
+            if (( match == 0 )); then
+                log_warn "[$pkg] sha256 não confere para $file (obtido=$got_s)"
+                ok=0
+            fi
+        fi
+
+        if ((${#md5_list[@]} > 0)); then
+            local expected_m
+            local got_m
+            got_m=$(md5sum "$file" | awk '{print $1}')
+            local match=0
+            for expected_m in "${md5_list[@]}"; do
+                [[ -z "$expected_m" ]] && continue
+                if [[ "$got_m" == "$expected_m" ]]; then
+                    match=1
+                    break
+                fi
+            done
+            if (( match == 0 )); then
+                log_warn "[$pkg] md5 não confere para $file (obtido=$got_m)"
+                ok=0
+            fi
+        fi
+
+        return $ok
+    }
+
+    mkdir -p "$(dirname "$out")"
 
     # Se já existe no cache, verifica checksum ANTES de qualquer coisa
     if [[ -f "$out" && $have_checksum -eq 1 ]]; then
-        local ok=1
-        if [[ -n "$sha256" ]]; then
-            if ! echo "$sha256  $out" | sha256sum -c - >/dev/null 2>&1; then
-                ok=0
-            fi
-        fi
-        if [[ -n "$md5" ]]; then
-            if ! echo "$md5  $out" | md5sum -c - >/dev/null 2>&1; then
-                ok=0
-            fi
-        fi
-        if (( ok == 1 )); then
-            log_info "[$pkg] Cache OK (checksums) para $out"
+        log_info "[$pkg] Source já no cache: $out, verificando checksums..."
+        if _check_file_checksums "$out"; then
+            log_info "[$pkg] Arquivo em cache válido, reaproveitando."
             return 0
         else
-            log_warn "[$pkg] Cache inválido para $out, removendo"
+            log_warn "[$pkg] Arquivo em cache com checksum inválido, removendo: $out"
             rm -f "$out"
         fi
+    elif [[ -f "$out" && $have_checksum -eq 0 ]]; then
+        log_info "[$pkg] Source já no cache: $out (sem checksums definidos)."
+        return 0
     fi
 
-    # Função interna para fazer download de UMA url
+    # Helper para download de uma única URL em tmpout
     _do_download_url() {
         local url="$1" tmpout="$2"
 
         if [[ "$url" == git://* || "$url" == *.git || "$url" == git+* ]]; then
             require_cmd git
-            local tmpdir="${tmpout}.gitclone"
-            rm -rf "$tmpdir"
-            mkdir -p "$tmpdir"
+            local tmpdir
+            tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/adm-git-XXXXXX")"
             log_info "[$pkg] Clonando repositório git: $url"
             if git clone --depth=1 "${url#git+}" "$tmpdir" >>"$LOG_FILE" 2>&1; then
-                tar -cf "$tmpout" -C "$tmpdir" . >>"$LOG_FILE" 2>&1
+                ( cd "$tmpdir" && tar -cf "$tmpout" . ) >>"$LOG_FILE" 2>&1
                 rm -rf "$tmpdir"
                 return 0
             else
@@ -289,34 +337,31 @@ download_one_source() {
             # HTTP/HTTPS/FTP etc
             if command -v curl >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via curl: $url"
-                # Barra de progresso na tela e saída também no LOG_FILE
-                if curl -L --fail --progress-bar -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
+                if curl -L --fail --connect-timeout 15 --max-time 0 -o "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
                     return 0
                 else
-                    log_warn "[$pkg] Falha no curl: $url"
+                    log_warn "[$pkg] Falha no download via curl: $url"
                     return 1
                 fi
             elif command -v wget >/dev/null 2>&1; then
                 log_info "[$pkg] Baixando via wget: $url"
-                # Barra de progresso na tela e saída também no LOG_FILE
-                if wget --progress=bar:force -O "$tmpout" "$url" 2>&1 | tee -a "$LOG_FILE"; then
+                if wget -O "$tmpout" "$url" >>"$LOG_FILE" 2>&1; then
                     return 0
                 else
-                    log_warn "[$pkg] Falha no wget: $url"
+                    log_warn "[$pkg] Falha no download via wget: $url"
                     return 1
                 fi
             else
-                die "Nem curl nem wget encontrados para download."
+                die "[$pkg] Nem curl nem wget encontrados para download HTTP/FTP."
             fi
         fi
     }
 
     local mirror
     for mirror in "${mirrors[@]}"; do
-        mirror="${mirror//[[:space:]]/}"  # tira espaços acidentais
         [[ -z "$mirror" ]] && continue
-
         log_info "[$pkg] Usando mirror: $mirror -> $out"
+
         local attempt
         for (( attempt=1; attempt<=attempts_per_mirror; attempt++ )); do
             log_info "[$pkg] Download tentativa $attempt/$attempts_per_mirror: $mirror"
@@ -324,102 +369,95 @@ download_one_source() {
             local tmpout="${out}.part"
             rm -f "$tmpout"
 
-            if !_do_download_url "$mirror" "$tmpout"; then
+            if ! _do_download_url "$mirror" "$tmpout"; then
                 log_warn "[$pkg] Falha ao baixar de $mirror (tentativa $attempt)"
                 continue
             fi
 
-            if [[ ! -f "$tmpout" ]]; then
+            if [[ ! -e "$tmpout" ]]; then
                 log_warn "[$pkg] Download não produziu arquivo: $tmpout"
                 continue
             fi
 
-            # Verificar checksums se fornecidos
-            local ok=1
-            if [[ -n "$sha256" ]]; then
-                if ! echo "$sha256  $tmpout" | sha256sum -c - >/dev/null 2>&1; then
-                    log_warn "[$pkg] sha256 inválido para arquivo baixado de $mirror"
-                    ok=0
+            if (( have_checksum == 1 )); then
+                if _check_file_checksums "$tmpout"; then
+                    mv "$tmpout" "$out"
+                    log_info "[$pkg] Download concluído e válido: $out"
+                    return 0
+                else
+                    rm -f "$tmpout"
+                    continue
                 fi
-            fi
-            if [[ -n "$md5" ]]; then
-                if ! echo "$md5  $tmpout" | md5sum -c - >/dev/null 2>&1; then
-                    log_warn "[$pkg] md5 inválido para arquivo baixado de $mirror"
-                    ok=0
-                fi
-            fi
-
-            if (( ok == 1 || have_checksum == 0 )); then
-                mv "$tmpout" "$out"
-                log_info "[$pkg] Download concluído e válido: $out"
-                return 0
             else
-                rm -f "$tmpout"
+                mv "$tmpout" "$out"
+                log_info "[$pkg] Download concluído (sem checksums definidos): $out"
+                return 0
             fi
         done
     done
 
     die "[$pkg] Falha ao baixar/verificar source $idx depois de tentar todos os mirrors."
-}
-
+}        
+            
 download_sources_parallel() {
     local pkg="$1"
+
     load_metadata "$pkg"
-    validate_source_arrays   # <<< usa a função nova
-
-    local urls=("${PKG_SOURCE_URLS[@]}")
-    local sha256s=()
-    local md5s=()
-
-    if [[ ${#PKG_SHA256S[@]:-0} -gt 0 ]]; then
-        sha256s=("${PKG_SHA256S[@]}")
-    fi
-    if [[ ${#PKG_MD5S[@]:-0} -gt 0 ]]; then
-        md5s=("${PKG_MD5S[@]}")
-    fi
+    validate_source_arrays
 
     mkdir -p "$CACHE_DIR"
 
-    local pids=()
-    local i=0
-    local urlspec
-    for urlspec in "${urls[@]}"; do
-        # Usamos a PRIMEIRA URL (antes do '|') só para nomear o arquivo
-        local first_url="${urlspec%%|*}"
-        local base
-        base="$(basename "${first_url%%\?*}")"
-        [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-src-$i.tar"
+    local -a urls=("${PKG_SOURCE_URLS[@]}")
+    local idx urlspec sha256 md5 first_url base out
 
-        local out="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-$i-$base"
-        local sha="${sha256s[$i]:-}"
-        local md="${md5s[$i]:-}"
+    local -a pids=()
+    local fail=0
+
+    for idx in "${!urls[@]}"; do
+        urlspec="${urls[$idx]}"
+
+        # Pode ser que arrays de hash estejam vazias; o bash retorna vazio nesses casos
+        sha256="${PKG_SHA256S[$idx]:-}"
+        md5="${PKG_MD5S[$idx]:-}"
+
+        # Usa a primeira URL (antes do '|') para nomear o arquivo no cache
+        first_url="${urlspec%%|*}"
+        base="$(basename "${first_url%%\?*}")"
+        [[ -n "$base" ]] || base="${PKG_NAME}-${PKG_VERSION}-${idx}.src"
+
+        out="$CACHE_DIR/${PKG_NAME}-${PKG_VERSION}-${idx}-${base}"
 
         (
-            download_one_source "$PKG_NAME" "$i" "$urlspec" "$out" "$sha" "$md"
+            download_one_source "$pkg" "$idx" "$urlspec" "$out" "$sha256" "$md5"
         ) &
-        pids+=($!)
-        (( i++ ))
 
-        # limitar paralelismo
-        while (( $(jobs -rp | wc -l) >= PARALLEL_JOBS )); do
-            sleep 0.2
+        pids+=("$!")
+
+        # Limita paralelismo
+        while ((${#pids[@]} >= PARALLEL_JOBS)); do
+            if ! wait "${pids[0]}"; then
+                fail=1
+            fi
+            pids=("${pids[@]:1}")
         done
     done
 
-    local fail=0
+    # Espera os demais
     local pid
     for pid in "${pids[@]}"; do
         if ! wait "$pid"; then
             fail=1
         fi
     done
-    (( fail == 0 )) || die "[$PKG_NAME] Falha em algum download (um ou mais sources não foram baixados corretamente)."
+
+    if (( fail != 0 )); then
+        die "[$PKG_NAME] Falha em algum download (um ou mais sources não foram baixados corretamente)."
+    fi
 }
 
 # =========================
 # Extração de fontes
 # =========================
-
 extract_sources() {
     local pkg="$1"
     load_metadata "$pkg"
@@ -857,16 +895,22 @@ build_package() {
         log_info "[$pkg] Retomando: build já concluída (stage>=3)"
     fi
 
-    # DESTDIR para instalação temporária
+    # DESTDIR para instalação temporária (lado host)
     local destdir="$BUILD_ROOT/${PKG_NAME}-${PKG_VERSION}-destdir"
     rm -rf "$destdir"
     mkdir -p "$destdir"
 
+    # Caminho equivalente visto de dentro do chroot (se houver)
+    local destdir_chroot="$destdir"
+    if [[ -n "$CHROOT_DIR" ]]; then
+        destdir_chroot="${destdir#"$CHROOT_DIR"}"
+        [[ -z "$destdir_chroot" ]] && destdir_chroot="/"
+    fi
+
     if (( stage < 4 )); then
         log_info "[$pkg] Instalando em DESTDIR: $destdir"
         if declare -F PKG_INSTALL >/dev/null 2>&1; then
-            # Exporta variáveis PKG_* do metadata e executa a função de instalação
-            run_in_chroot "$builddir" "$(metadata_export_snippet); PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR='$destdir'; $(declare -f PKG_INSTALL); PKG_INSTALL"
+            run_in_chroot "$builddir" "$(metadata_export_snippet); PKG_NAME='$PKG_NAME'; PKG_VERSION='$PKG_VERSION'; DESTDIR='$destdir_chroot'; $(declare -f PKG_INSTALL); PKG_INSTALL"
         else
             log_warn "[$pkg] PKG_INSTALL não definido, nenhum arquivo instalado em DESTDIR"
         fi
@@ -976,6 +1020,11 @@ install_group() {
 
 uninstall_package() {
     local pkg="$1"
+
+    if [[ -z "$pkg" ]]; then
+        die "uninstall_package: pacote não informado."
+    fi
+
     if ! is_installed "$pkg"; then
         log_warn "[$pkg] Não está instalado."
         return 0
@@ -994,35 +1043,74 @@ uninstall_package() {
     [[ -f "$listfile" ]] || die "[$pkg] Lista de arquivos não encontrada: $listfile"
 
     log_info "[$pkg] Removendo arquivos instalados."
-    tac "$listfile" | while read -r f; do
+
+    # Remove em ordem reversa para tentar apagar diretórios depois dos arquivos
+    tac "$listfile" | while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+
+        # Apenas caminhos absolutos são aceitos (segurança extra)
+        if [[ "$f" != /* ]]; then
+            log_warn "[$pkg] Ignorando caminho não absoluto em files.list: $f"
+            continue
+        fi
+
+        # Nunca remova raiz por engano
+        if [[ "$f" == "/" ]]; then
+            log_warn "[$pkg] Ignorando entrada inválida '/' em files.list."
+            continue
+        fi
+
         if [[ -d "$f" && ! -L "$f" ]]; then
-            # remove diretório se vazio
-            rmdir "$f" 2>/dev/null || true
+            # tenta remover diretório se estiver vazio
+            if ! rmdir "$f" 2>/dev/null; then
+                log_debug "[$pkg] Diretório não removido (provavelmente não vazio): $f"
+            fi
         else
-            rm -f "$f" 2>/dev/null || true
+            if [[ -e "$f" || -L "$f" ]]; then
+                if ! rm -f "$f" 2>/dev/null; then
+                    log_warn "[$pkg] Falha ao remover arquivo: $f"
+                fi
+            fi
         fi
     done
 
+    # Limpa banco de dados e estado
     rm -rf "$(db_pkg_dir "$pkg")"
     clear_pkg_stage "$pkg"
     rm -rf "$BUILD_ROOT/${pkg}-"* "$STATE_DIR/$pkg.builddir" 2>/dev/null || true
+
     log_info "[$pkg] Desinstalação concluída."
 }
 
 remove_orphans() {
     log_info "Localizando órfãos..."
-    local orf
-    orf=$(list_orphans || true)
-    if [[ -z "$orf" ]]; then
-        log_info "Nenhum órfão encontrado."
+    local orf_list
+    orf_list="$(list_orphans || true)"
+
+    if [[ -z "$orf_list" ]]; then
+        log_info "Nenhum pacote órfão encontrado."
         return 0
     fi
-    log_info "Órfãos detectados: $orf"
+
+    log_info "Pacotes órfãos detectados:"
+    printf '  %s\n' $orf_list
+
+    local failed=()
     local p
-    for p in $orf; do
+    for p in $orf_list; do
         log_info "Removendo órfão: $p"
-        uninstall_package "$p"
+        if ! uninstall_package "$p"; then
+            log_error "[$p] Falha ao remover órfão."
+            failed+=("$p")
+        fi
     done
+
+    if ((${#failed[@]} > 0)); then
+        log_error "Remoção de órfãos concluída com falhas nos pacotes: ${failed[*]}"
+        return 1
+    fi
+
+    log_info "Remoção de órfãos concluída com sucesso."
 }
 
 # =========================
@@ -1031,49 +1119,79 @@ remove_orphans() {
 
 verify_package_integrity() {
     local pkg="$1"
+
+    if [[ -z "$pkg" ]]; then
+        die "verify_package_integrity: pacote não informado."
+    fi
+
     if ! is_installed "$pkg"; then
         die "[$pkg] Não está instalado."
     fi
+
     local manifest
     manifest="$(db_manifest "$pkg")"
     [[ -f "$manifest" ]] || die "[$pkg] Manifesto de integridade não encontrado."
 
     log_info "[$pkg] Verificando integridade de arquivos..."
     local broken=0
-    while read -r line; do
+    local line
+
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+
         local sum file
         sum="${line%% *}"
         file="${line##*  }"
-        if [[ ! -f "$file" ]]; then
-            log_error "Arquivo ausente: $file"
+
+        if [[ -z "$file" || -z "$sum" ]]; then
+            log_warn "[$pkg] Linha inválida no manifesto: $line"
             broken=1
-        else
-            local current
-            current=$(sha256sum "$file" | awk '{print $1}')
-            if [[ "$current" != "$sum" ]]; then
-                log_error "Checksum incorreto: $file"
-                broken=1
-            fi
+            continue
+        fi
+
+        if [[ ! -f "$file" ]]; then
+            log_error "[$pkg] Arquivo ausente: $file"
+            broken=1
+            continue
+        fi
+
+        local current
+        current=$(sha256sum "$file" | awk '{print $1}')
+        if [[ "$current" != "$sum" ]]; then
+            log_error "[$pkg] Checksum incorreto: $file"
+            broken=1
         fi
     done <"$manifest"
 
     if (( broken == 0 )); then
         log_info "[$pkg] Integridade OK."
+        return 0
     else
         die "[$pkg] Integridade comprometida."
     fi
 }
 
 verify_all() {
-    local pkg pkgdir
+    local pkgdir pkg
+    local failed=()
+
     while IFS= read -r -d '' pkgdir; do
         [[ -d "$pkgdir" ]] || continue
         if [[ ! -f "$pkgdir/metadata.meta" && ! -f "$pkgdir/files.list" ]]; then
             continue
         fi
         pkg="$(basename "$pkgdir")"
-        verify_package_integrity "$pkg" || true
-    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
+        if ! verify_package_integrity "$pkg"; then
+            failed+=("$pkg")
+        fi
+    done < <(find "$DB_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
+
+    if ((${#failed[@]} > 0)); then
+        log_error "Pacotes com integridade comprometida: ${failed[*]}"
+        return 1
+    fi
+
+    log_info "Todos os pacotes instalados passaram na verificação de integridade."
 }
 
 # =========================
@@ -1087,38 +1205,45 @@ check_upstream_version() {
     if [[ -z "${PKG_UPSTREAM_URL:-}" || -z "${PKG_UPSTREAM_REGEX:-}" ]]; then
         die "[$pkg] PKG_UPSTREAM_URL/PKG_UPSTREAM_REGEX não definidos no metadata."
     fi
+
     require_cmd curl
 
     log_info "[$pkg] Consultando upstream: $PKG_UPSTREAM_URL"
-    local html
-    html=$(curl -L --fail -s "$PKG_UPSTREAM_URL")
 
-    # extrair versões pelo regex
+    local html
+    if ! html=$(curl -L --fail --connect-timeout 15 --max-time 60 -s "$PKG_UPSTREAM_URL"); then
+        die "[$pkg] Falha ao baixar página de upstream."
+    fi
+
+    # Extrair versões pelo regex; o regex deve ter um grupo de captura com a versão
     local versions
-    versions=$(printf "%s" "$html" | grep -Eo "$PKG_UPSTREAM_REGEX" | sed -E "s/$PKG_UPSTREAM_REGEX/\\1/g" | sort -Vu || true)
+    versions=$(printf "%s" "$html" \
+        | grep -Eo "$PKG_UPSTREAM_REGEX" \
+        | sed -E "s/$PKG_UPSTREAM_REGEX/\\1/g" \
+        | sort -Vu || true)
 
     if [[ -z "$versions" ]]; then
-        die "[$pkg] Não foi possível extrair versões do upstream."
+        die "[$pkg] Não foi possível extrair versões do upstream (verifique PKG_UPSTREAM_REGEX)."
     fi
 
     local newest
     newest=$(printf "%s\n" "$versions" | tail -n1)
 
-    log_info "[$pkg] Version local : $PKG_VERSION"
-    log_info "[$pkg] Version upstream: $newest"
+    log_info "[$pkg] Versão local   : $PKG_VERSION"
+    log_info "[$pkg] Versão upstream: $newest"
 
     if [[ "$newest" == "$PKG_VERSION" ]]; then
         log_info "[$pkg] Já está na versão mais recente."
-        return 1
+        # não imprime nada para sinalizar "sem upgrade"
+        return 0
     fi
 
-    # criar metadata novo ao lado do antigo
     local oldmeta
     oldmeta="$(meta_path_for_pkg "$pkg")"
     local newmeta="${oldmeta%.meta}-${newest}.meta"
 
     # copia o metadata antigo trocando apenas a versão
-    sed -E "s/^(PKG_VERSION=).*$/\1\"$newest\"/" "$oldmeta" >"$newmeta"
+    sed -E "s/^(PKG_VERSION=).*$/\\1\"$newest\"/" "$oldmeta" >"$newmeta"
 
     # zera hashes no metadata novo, para você preencher depois manualmente
     {
@@ -1130,16 +1255,26 @@ check_upstream_version() {
     } >>"$newmeta"
 
     log_info "[$pkg] Novo metadata criado: $newmeta"
-    echo "$newmeta"
+    printf "%s\n" "$newmeta"
 }
 
 upgrade_package() {
     local pkg="$1"
+
+    if [[ -z "$pkg" ]]; then
+        die "upgrade_package: pacote não informado."
+    fi
+
     local newmeta
-    newmeta=$(check_upstream_version "$pkg" || true)
+    newmeta="$(check_upstream_version "$pkg")" || true
+
     if [[ -z "$newmeta" ]]; then
         log_info "[$pkg] Nenhum upgrade necessário."
         return 0
+    fi
+
+    if [[ ! -f "$newmeta" ]]; then
+        die "[$pkg] Arquivo de novo metadata não encontrado: $newmeta"
     fi
 
     # Usar o novo metadata temporariamente, mas manter o nome do pacote
@@ -1151,14 +1286,29 @@ upgrade_package() {
     # backup do original
     local original
     original="$(meta_path_for_pkg "$pkg")"
-    mv "$original" "$original.bak"
+    cp "$original" "$original.bak"
+
+    # troca o metadata em uso
     mv "$tmpmeta" "$original"
 
-    # construir e instalar nova versão
-    build_package "$pkg"
-    install_package_root "$pkg"
+    # recompila e reinstala
+    if ! build_package "$pkg"; then
+        log_error "[$pkg] Falha durante build no upgrade; restaurando metadata original."
+        mv "$original.bak" "$original"
+        return 1
+    fi
 
-    log_info "[$pkg] Upgrade concluído para versão $(load_metadata "$pkg"; echo "$PKG_VERSION")"
+    if ! install_package_root "$pkg"; then
+        log_error "[$pkg] Falha durante instalação no upgrade; restaurando metadata original."
+        mv "$original.bak" "$original"
+        return 1
+    fi
+
+    rm -f "$original.bak"
+
+    # recarrega metadata para pegar versão final
+    load_metadata "$pkg"
+    log_info "[$pkg] Upgrade concluído para versão $PKG_VERSION"
 }
 
 # =========================
@@ -1167,9 +1317,19 @@ upgrade_package() {
 
 rebuild_one() {
     local pkg="$1"
+
+    if [[ -z "$pkg" ]]; then
+        die "rebuild_one: pacote não informado."
+    fi
+
+    if ! is_installed "$pkg"; then
+        die "[$pkg] Não está instalado; não há o que rebuildar."
+    fi
+
     log_info "Rebuild do pacote: $pkg"
     clear_pkg_stage "$pkg"
     rm -rf "$BUILD_ROOT/${pkg}-"* "$STATE_DIR/$pkg.builddir" 2>/dev/null || true
+
     build_package "$pkg"
     install_package_root "$pkg"
 }
@@ -1180,7 +1340,7 @@ rebuild_all() {
 
     log_info "Calculando ordem de rebuild global com base nas dependências..."
 
-    local pkg pkgdir
+    local pkg pkgdir order p
 
     # Para cada pacote instalado (diretório com metadata.meta)
     while IFS= read -r -d '' pkgdir; do
@@ -1190,21 +1350,36 @@ rebuild_all() {
         fi
         pkg="$(basename "$pkgdir")"
 
-        local order
-        order=$(resolve_deps_order "$pkg")
-        local p
+        order="$(resolve_deps_order "$pkg")"
         for p in $order; do
             if [[ -d "$(db_pkg_dir "$p")" && -z "${seen[$p]:-}" ]]; then
                 ordered+=("$p")
                 seen["$p"]=1
             fi
         done
-    done < <(find "$DB_DIR" -mindepth 1 -type d -print0 2>/dev/null)
+    done < <(find "$DB_DIR" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
-    local p
-    for p in "${ordered[@]}"; do
-        rebuild_one "$p"
+    if ((${#ordered[@]} == 0)); then
+        log_info "Nenhum pacote instalado encontrado para rebuild."
+        return 0
+    fi
+
+    log_info "Ordem final de rebuild: ${ordered[*]}"
+
+    local failed=()
+    for pkg in "${ordered[@]}"; do
+        if ! rebuild_one "$pkg"; then
+            log_error "[$pkg] Falha no rebuild."
+            failed+=("$pkg")
+        fi
     done
+
+    if ((${#failed[@]} > 0)); then
+        log_error "Rebuild concluído com falhas nos pacotes: ${failed[*]}"
+        return 1
+    fi
+
+    log_info "Rebuild de todos os pacotes concluído com sucesso."
 }
 
 # =========================
