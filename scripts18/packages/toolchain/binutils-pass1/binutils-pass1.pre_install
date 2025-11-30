@@ -1,7 +1,13 @@
-# $LFS/packages/toolchain/binutils-pass1/binutils-pass1.pre_install
 #!/usr/bin/env bash
 set -euo pipefail
-category="$1"
-name="$2"
-key="$3"
-echo ">> [HOOK] pre_install para $key ($category/$name)"
+
+echo "[binutils-pass1.pre_install] Preparando ambiente para Binutils Pass 1..."
+echo "[binutils-pass1.pre_install] LFS=${LFS:-?}"
+echo "[binutils-pass1.pre_install] TERM=${TERM:-?}"
+
+# Aqui você pode fazer validações extras, criar diretórios, etc.
+# Exemplo: garantir que /sources exista (mas normalmente já existe):
+if [[ ! -d "$LFS/sources" ]]; then
+    echo "[binutils-pass1.pre_install] ERRO: diretório \$LFS/sources não existe."
+    exit 1
+fi
