@@ -1,0 +1,4 @@
+# $LFS/packages/base/musl-pass2/musl-pass2.deps
+binutils-pass1
+gcc-pass1
+musl-pass1
