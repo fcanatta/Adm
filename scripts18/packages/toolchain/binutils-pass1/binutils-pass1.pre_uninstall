@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[binutils-pass1.pre_uninstall] Prestes a remover Binutils Pass 1."
+echo "[binutils-pass1.pre_uninstall] ATENÇÃO: isso pode quebrar a toolchain temporária."
