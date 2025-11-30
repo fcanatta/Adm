@@ -17,6 +17,14 @@
 #  - Chroot automático para pacotes "normais"
 #    (cross-toolchain em .../cross/... é construído fora do chroot)
 #
+#  - update:
+#      Usa helper opcional: $pkg_dir/$pkg.upstream
+#      (script que imprime a última versão disponível no upstream)
+#
+#  - install:
+#      Instala pacotes binários (.tar.zst/.tar.xz/.tar.gz/.tar)
+#      gerados por você, e registra manifest/meta.
+#
 #  Configuração:
 #    - Padrão: LFS=/mnt/lfs
 #    - Opcional: /etc/adm.conf pode redefinir LFS, diretórios, etc.
@@ -42,6 +50,7 @@ ADM_PKG_META_DIR=""
 ADM_MANIFEST_DIR=""
 ADM_STATE_DIR=""
 ADM_LOG_FILE=""
+ADM_BIN_PKG_DIR=""
 CHROOT_FOR_BUILDS=1
 
 ADM_DEP_STACK=""
@@ -79,6 +88,14 @@ Comandos principais:
   list-installed              Lista pacotes registrados como instalados
   uninstall <pkg>             Desinstala um pacote via manifest + hooks
 
+Pacotes binários:
+  install <arquivo|nome>      Instala pacote binário (.tar.zst/.tar.xz/.tar.gz/.tar)
+                              e registra no banco do ADM
+
+Atualizações:
+  update [pkg...]             Verifica upstream (via *.upstream) e gera relatório
+                              de pacotes com nova versão
+
 Chroot / LFS:
   mount                       Monta /dev,/proc,/sys,/run em \$LFS
   umount                      Desmonta /dev,/proc,/sys,/run de \$LFS
@@ -94,6 +111,10 @@ Observações:
   - Dependências ficam em:
       \$LFS/packages/<categoria>/<programa>/<programa>.deps
     (um pacote por linha, # para comentário)
+
+  - Para 'update', cada pacote pode ter um helper opcional:
+      \$LFS/packages/<categoria>/<programa>/<programa>.upstream
+    que deve imprimir a última versão disponível (ex: 5.2.32)
 EOF
 }
 
@@ -124,6 +145,9 @@ load_config() {
     ADM_STATE_DIR="$ADM_DB_DIR/state"
     ADM_LOG_FILE="$ADM_DB_DIR/adm.log"
 
+    # Diretório padrão onde ficam pacotes binários prontos
+    ADM_BIN_PKG_DIR="${ADM_BIN_PKG_DIR:-$LFS/binary-packages}"
+
     CHROOT_FOR_BUILDS="${CHROOT_FOR_BUILDS:-1}"
 
     # Exporta LFS e alguns caminhos chave para scripts de build
@@ -131,7 +155,7 @@ load_config() {
 }
 
 adm_ensure_db() {
-    mkdir -p "$ADM_PKG_META_DIR" "$ADM_MANIFEST_DIR" "$ADM_STATE_DIR" "$LFS_LOG_DIR"
+    mkdir -p "$ADM_PKG_META_DIR" "$ADM_MANIFEST_DIR" "$ADM_STATE_DIR" "$LFS_LOG_DIR" "$ADM_BIN_PKG_DIR"
 }
 
 #============================================================
@@ -215,7 +239,7 @@ chroot_exec_file() {
     if [[ "$rel" == "$abs" ]]; then
         die "Arquivo $abs não está dentro de LFS ($LFS)"
     fi
-    rel="${rel#/}"  # remove /
+    rel="${rel#/}"
     chroot "$LFS" /usr/bin/env -i \
         HOME=/root \
         TERM="${TERM:-xterm}" \
@@ -256,23 +280,6 @@ is_installed() {
     local manifest
     manifest="$(pkg_manifest_file "$pkg")"
     [[ -f "$manifest" ]]
-}
-
-write_meta() {
-    local pkg="$1"
-    local script="$2"
-    local deps="$3"
-
-    local meta
-    meta="$(pkg_meta_file "$pkg")"
-
-    cat >"$meta" <<EOF
-NAME="$pkg"
-SCRIPT="$script"
-BUILT_AT="$(date +'%F %T')"
-DEPS="$deps"
-STATUS="installed"
-EOF
 }
 
 #============================================================
@@ -363,6 +370,73 @@ read_deps() {
 is_cross_script() {
     local script="$1"
     [[ "$script" == *"/cross/"* ]]
+}
+
+#============================================================
+# META helpers (inclui VERSION) e leitura
+#============================================================
+
+write_meta() {
+    local pkg="$1"
+    local script="$2"
+    local deps="$3"
+
+    local meta pkg_dir version_file version
+    meta="$(pkg_meta_file "$pkg")"
+    pkg_dir="$(pkg_dir_from_script "$script")"
+    version_file="$pkg_dir/$pkg.version"
+    version=""
+
+    if [[ -f "$version_file" ]]; then
+        version="$(<"$version_file")"
+    fi
+
+    cat >"$meta" <<EOF
+NAME="$pkg"
+SCRIPT="$script"
+BUILT_AT="$(date +'%F %T')"
+DEPS="$deps"
+STATUS="installed"
+VERSION="$version"
+EOF
+}
+
+write_meta_binary() {
+    local pkg="$1"
+    local version="$2"
+    local tarball="$3"
+
+    local meta
+    meta="$(pkg_meta_file "$pkg")"
+
+    cat >"$meta" <<EOF
+NAME="$pkg"
+SCRIPT="binary:$tarball"
+BUILT_AT="$(date +'%F %T')"
+DEPS=""
+STATUS="installed"
+VERSION="$version"
+EOF
+}
+
+read_meta_field() {
+    local pkg="$1"
+    local key="$2"
+    local meta
+    meta="$(pkg_meta_file "$pkg")"
+    [[ -f "$meta" ]] || return 1
+
+    # shellcheck disable=SC1090
+    . "$meta"
+    # usa eval pra pegar o valor da variável de forma genérica
+    eval "printf '%s\n' \"\${$key:-}\""
+}
+
+get_installed_version() {
+    local pkg="$1"
+    local ver
+    ver="$(read_meta_field "$pkg" VERSION 2>/dev/null || true)"
+    echo "$ver"
 }
 
 #============================================================
@@ -542,17 +616,20 @@ uninstall_pkg() {
     adm_log "UNINSTALL START $pkg"
     echo ">> [UNINSTALL] Removendo pacote $pkg"
 
-    local script pkg_dir
-    script="$(find_build_script "$pkg")"
-    pkg_dir="$(pkg_dir_from_script "$script")"
+    local script pkg_dir pre_un post_un
+    script="$(read_meta_field "$pkg" SCRIPT 2>/dev/null || true)"
+    pkg_dir=""
 
-    local pre_un post_un
-    pre_un="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
-    post_un="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
-
-    # Hooks de uninstall sempre no "ambiente normal":
-    # - se quiser dentro de chroot, basta rodar ADM de dentro do LFS.
-    run_hook_host "$pre_un" "pre_uninstall" "$pkg"
+    # Se for pacote de fonte (script real existe), usamos hooks
+    if [[ -n "$script" && -f "$script" ]]; then
+        pkg_dir="$(pkg_dir_from_script "$script")"
+        pre_un="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
+        post_un="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
+        run_hook_host "$pre_un" "pre_uninstall" "$pkg"
+    else
+        pre_un=""
+        post_un=""
+    fi
 
     local path
     tac "$manifest" | while read -r path; do
@@ -576,7 +653,9 @@ uninstall_pkg() {
 
     rm -f "$manifest" "$meta"
 
-    run_hook_host "$post_un" "post_uninstall" "$pkg"
+    if [[ -n "${post_un:-}" ]]; then
+        run_hook_host "$post_un" "post_uninstall" "$pkg"
+    fi
 
     adm_log "UNINSTALL OK $pkg"
     echo ">> [UNINSTALL] Pacote $pkg removido."
@@ -584,6 +663,266 @@ uninstall_pkg() {
 
 cmd_uninstall() {
     uninstall_pkg "${1:-}"
+}
+
+#============================================================
+# INSTALL de pacotes binários (.tar.*)
+#============================================================
+
+extract_tarball_into_lfs() {
+    local tarball="$1"
+
+    if [[ ! -f "$tarball" ]]; then
+        die "Pacote binário não encontrado: $tarball"
+    fi
+
+    case "$tarball" in
+        *.tar.zst)
+            zstd -d -c "$tarball" | tar -xf - -C "$LFS"
+            ;;
+        *.tar.xz)
+            xz -d -c "$tarball" | tar -xf - -C "$LFS"
+            ;;
+        *.tar.gz|*.tgz)
+            gzip -d -c "$tarball" | tar -xf - -C "$LFS"
+            ;;
+        *.tar)
+            tar -xf "$tarball" -C "$LFS"
+            ;;
+        *)
+            die "Formato de pacote não suportado: $tarball (use .tar.zst/.tar.xz/.tar.gz/.tar)"
+            ;;
+    esac
+}
+
+parse_pkg_from_tarball() {
+    local tarball="$1"
+    local base pkg version arch name_ver
+
+    base="$(basename "$tarball")"
+    base="${base%%.tar.zst}"
+    base="${base%%.tar.xz}"
+    base="${base%%.tar.gz}"
+    base="${base%%.tgz}"
+    base="${base%%.tar}"
+
+    # Tentativa de formato: nome-versao-arquitetura
+    if [[ "$base" == *-* ]]; then
+        arch="${base##*-}"
+        name_ver="${base%-*}"
+    else
+        name_ver="$base"
+        arch=""
+    fi
+
+    if [[ "$name_ver" == *-* ]]; then
+        pkg="${name_ver%%-*}"
+        version="${name_ver#*-}"
+    else
+        pkg="$name_ver"
+        version=""
+    fi
+
+    printf '%s\n' "$pkg" "$version"
+}
+
+install_binary_pkg() {
+    local tarball="$1"
+
+    adm_ensure_db
+    require_root
+
+    local pkg version
+    read -r pkg version < <(parse_pkg_from_tarball "$tarball")
+
+    [[ -n "$pkg" ]] || die "Não foi possível determinar o nome do pacote a partir de: $tarball"
+
+    echo ">> [INSTALL] Instalando pacote binário $tarball"
+    echo ">> [INSTALL] Pacote: $pkg Versão: ${version:-desconhecida}"
+
+    adm_log "INSTALL START $pkg TARBALL=$tarball VERSION=$version"
+
+    mkdir -p "$ADM_STATE_DIR"
+    local pre_snap post_snap
+    pre_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.prebin.XXXXXX")"
+    post_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.postbin.XXXXXX")"
+
+    snapshot_fs "$pre_snap"
+
+    extract_tarball_into_lfs "$tarball"
+
+    snapshot_fs "$post_snap"
+
+    local manifest
+    manifest="$(pkg_manifest_file "$pkg")"
+    comm -13 "$pre_snap" "$post_snap" >"$manifest"
+
+    rm -f "$pre_snap" "$post_snap"
+
+    write_meta_binary "$pkg" "$version" "$tarball"
+
+    adm_log "INSTALL OK $pkg TARBALL=$tarball MANIFEST=$manifest"
+    echo ">> [INSTALL] Pacote $pkg instalado a partir de binário."
+}
+
+cmd_install() {
+    if [[ $# -lt 1 ]]; then
+        die "Uso: $CMD_NAME install <arquivo.tar.* | nome_pacote>"
+    fi
+
+    local arg="$1"
+    local tarball=""
+
+    if [[ -f "$arg" ]]; then
+        tarball="$arg"
+    else
+        # Busca em ADM_BIN_PKG_DIR um arquivo que comece com arg-
+        shopt -s nullglob
+        local candidates=("$ADM_BIN_PKG_DIR/$arg"-*.tar.*)
+        shopt -u nullglob
+        if [[ ${#candidates[@]} -eq 0 ]]; then
+            die "Nenhum pacote binário encontrado em $ADM_BIN_PKG_DIR para: $arg"
+        elif [[ ${#candidates[@]} -gt 1 ]]; then
+            echo "Múltiplos pacotes encontrados para '$arg' em $ADM_BIN_PKG_DIR:" >&2
+            printf '  - %s\n' "${candidates[@]}" >&2
+            die "Especifique o arquivo exato."
+        fi
+        tarball="${candidates[0]}"
+    fi
+
+    install_binary_pkg "$tarball"
+}
+
+#============================================================
+# UPDATE – checagem de versões novas no upstream
+#============================================================
+# Para cada pacote:
+#   - Versão atual vem de:
+#        meta: VERSION="..."
+#      (que por sua vez, vem de $pkg_dir/$pkg.version, se existir)
+#
+#   - Versão mais nova vem de:
+#        $pkg_dir/$pkg.upstream  (opcional, executável)
+#        -> deve imprimir a versão mais recente em uma linha
+#
+#   - Resultado é salvo em:
+#        $ADM_STATE_DIR/updates-YYYYmmdd-HHMMSS.txt
+#============================================================
+
+check_upstream_for_pkg() {
+    local pkg="$1"
+    local script pkg_dir upstream latest
+
+    script="$(find_build_script "$pkg")"
+    pkg_dir="$(pkg_dir_from_script "$script")"
+    upstream="$pkg_dir/$pkg.upstream"
+
+    if [[ ! -x "$upstream" ]]; then
+        # sem upstream-helper => não dá pra checar
+        return 2
+    fi
+
+    if ! latest="$("$upstream")"; then
+        return 1
+    fi
+
+    # pega só primeira palavra/linha
+    latest="${latest%%[[:space:]]*}"
+
+    [[ -n "$latest" ]] || return 1
+
+    printf '%s\n' "$latest"
+}
+
+version_is_newer() {
+    local current="$1"
+    local latest="$2"
+
+    if [[ -z "$current" || -z "$latest" ]]; then
+        return 1
+    fi
+
+    local top
+    top="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)"
+
+    [[ "$top" != "$current" ]]
+}
+
+cmd_update() {
+    adm_ensure_db
+
+    local pkgs=()
+
+    if [[ $# -gt 0 ]]; then
+        pkgs=("$@")
+    else
+        shopt -s nullglob
+        local meta
+        for meta in "$ADM_PKG_META_DIR"/*.meta; do
+            [[ -f "$meta" ]] || continue
+            pkgs+=("$(basename "${meta%.meta}")")
+        done
+        shopt -u nullglob
+    fi
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        echo ">> [UPDATE] Nenhum pacote registrado."
+        return 0
+    fi
+
+    mkdir -p "$ADM_STATE_DIR"
+    local ts report
+    ts="$(date +'%Y%m%d-%H%M%S')"
+    report="$ADM_STATE_DIR/updates-$ts.txt"
+
+    echo "# Relatório de atualizações - $ts" >"$report"
+    echo "# Formato: pacote versão_instalada -> versão_upstream" >>"$report"
+    echo >>"$report"
+
+    local pkg current latest rc any=0
+
+    for pkg in "${pkgs[@]}"; do
+        current="$(get_installed_version "$pkg" || true)"
+
+        if [[ -z "$current" ]]; then
+            echo ">> [UPDATE] $pkg: versão instalada desconhecida (VERSION vazio em meta)." >&2
+            echo "$pkg: INSTALADO (versão desconhecida; crie $pkg.version no script)" >>"$report"
+            continue
+        fi
+
+        if ! latest="$(check_upstream_for_pkg "$pkg")"; then
+            rc=$?
+            case "$rc" in
+                1)
+                    echo ">> [UPDATE] $pkg: erro ao consultar upstream (script .upstream falhou)." >&2
+                    echo "$pkg: ERRO ao consultar upstream" >>"$report"
+                    ;;
+                2)
+                    echo ">> [UPDATE] $pkg: nenhum helper upstream (.upstream) definido; ignorando." >&2
+                    echo "$pkg: sem helper upstream (.upstream ausente)" >>"$report"
+                    ;;
+                *)
+                    echo ">> [UPDATE] $pkg: erro desconhecido no helper upstream (rc=$rc)." >&2
+                    echo "$pkg: ERRO desconhecido no upstream (rc=$rc)" >>"$report"
+                    ;;
+            esac
+            continue
+        fi
+
+        if version_is_newer "$current" "$latest"; then
+            any=1
+            echo ">> [UPDATE] $pkg: nova versão encontrada: $current -> $latest"
+            echo "$pkg: $current -> $latest" >>"$report"
+        else
+            echo ">> [UPDATE] $pkg: já está na versão mais recente ($current)."
+        fi
+    done
+
+    echo
+    echo ">> [UPDATE] Relatório salvo em: $report"
+    if [[ "$any" -eq 0 ]]; then
+        echo ">> [UPDATE] Nenhum pacote com versão mais nova encontrada (entre os que têm helper upstream)."
+    fi
 }
 
 #============================================================
@@ -608,6 +947,7 @@ ADM DB................: $ADM_DB_DIR
 Meta de pacotes.......: $ADM_PKG_META_DIR
 Manifests.............: $ADM_MANIFEST_DIR
 Log geral.............: $ADM_LOG_FILE
+Pacotes binários......: $ADM_BIN_PKG_DIR
 CHROOT_FOR_BUILDS.....: $CHROOT_FOR_BUILDS
 
 EOF
@@ -616,12 +956,17 @@ EOF
 cmd_list_installed() {
     adm_ensure_db
     echo "=== Pacotes instalados (registrados) ==="
-    local meta pkg
+    local meta pkg ver
     shopt -s nullglob
     for meta in "$ADM_PKG_META_DIR"/*.meta; do
         [[ -f "$meta" ]] || continue
         pkg="$(basename "${meta%.meta}")"
-        printf '  - %s\n' "$pkg"
+        ver="$(read_meta_field "$pkg" VERSION 2>/dev/null || true)"
+        if [[ -n "$ver" ]]; then
+            printf '  - %-20s  (%s)\n' "$pkg" "$ver"
+        else
+            printf '  - %-20s  (versão desconhecida)\n' "$pkg"
+        fi
     done
     shopt -u nullglob
 }
@@ -652,6 +997,12 @@ main() {
             ;;
         uninstall)
             cmd_uninstall "$@"
+            ;;
+        install)
+            cmd_install "$@"
+            ;;
+        update)
+            cmd_update "$@"
             ;;
         mount)
             require_root
