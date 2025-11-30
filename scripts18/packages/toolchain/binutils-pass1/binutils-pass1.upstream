@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Helper de upstream para o ADM:
+#  - Imprime na saída padrão a ÚLTIMA versão estável
+#    do GNU Binutils (ex: 2.45.1).
+#
+# O ADM usa isso para:
+#   ./adm.sh update binutils-pass1
+#
+# Requer:
+#   - curl OU wget
+#   - grep, sed, sort
+
+URL="https://ftp.gnu.org/gnu/binutils/"
+
+fetch_page() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$URL"
+    else
+        echo "ERRO: nem curl nem wget encontrados para consultar upstream do binutils." >&2
+        exit 1
+    fi
+}
+
+page="$(fetch_page)"
+
+# Extrai nomes de tarball tipo:
+#   binutils-2.45.1.tar.xz
+#   binutils-2.43.tar.bz2
+#
+# Converte para apenas "2.45.1", "2.43", etc.
+latest="$(
+    printf '%s\n' "$page" \
+    | grep -o 'binutils-[0-9][0-9.]*\.tar\.[a-z0-9]*' \
+    | sed -e 's/^binutils-//' -e 's/\.tar\..*$//' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "$latest" ]]; then
+    echo "ERRO: não foi possível determinar a versão mais recente do binutils." >&2
+    exit 1
+fi
+
+echo "$latest"
