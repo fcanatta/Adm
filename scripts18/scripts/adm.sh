@@ -33,6 +33,7 @@ ADM_DB_DIR="${ADM_DB_DIR:-$LFS/var/adm}"
 ADM_INSTALLED_DIR="$ADM_DB_DIR/installed"
 ADM_LOG_DIR="$ADM_DB_DIR/logs"
 ADM_LAST_SUCCESS="$ADM_DB_DIR/last_success"
+ADM_DEP_STACK=()
 
 # Manifesto por pacote: $ADM_INSTALLED_DIR/<pkg>.manifest
 # Meta por pacote:      $ADM_INSTALLED_DIR/<pkg>.meta
@@ -70,7 +71,10 @@ adm_ensure_db() {
 adm_log() {
     local ts
     ts="$(date +'%F %T')"
-    echo "[$ts] $*" >> "$ADM_LOG_DIR/adm.log"
+
+    if ! echo "[$ts] $*" >> "$ADM_LOG_DIR/adm.log"; then
+        echo "AVISO: falha ao gravar log em $ADM_LOG_DIR/adm.log" >&2
+    fi
 }
 
 pkg_name_from_script() {
@@ -230,7 +234,7 @@ find_build_script() {
         die "script de build '${spec}' (nome base '${name}.sh') não encontrado em $LFS_BUILD_SCRIPTS_DIR"
     elif [[ "$count" -gt 1 ]]; then
         echo "Mais de um script encontrado para base '${name}.sh':" >&2
-        printf '  %s\n' $hits >&2
+        printf '%s\n' "$hits" | sed 's/^/  /' >&2
         die "seja mais específico no nome do script."
     fi
 
@@ -299,15 +303,25 @@ run_hook_in_chroot() {
 #--------------------------------------------------------
 
 resolve_deps_for_script() {
-    local script_path="$1"  # absoluto
-    local pkg_dir
-    pkg_dir="$(dirname "$script_path")"
-    local pkg
-    pkg="$(pkg_name_from_script "$script_path")"
+    local script_path="$1"  # caminho absoluto do script
+    local pkg_dir pkg deps_file
 
-    local deps_file="$pkg_dir/${pkg}.deps"
+    pkg_dir="$(dirname "$script_path")"
+    pkg="$(pkg_name_from_script "$script_path")"
+    deps_file="$pkg_dir/${pkg}.deps"
 
     [[ -f "$deps_file" ]] || return 0
+
+    # Proteção contra ciclos de dependência simples
+    local frame
+    for frame in "${ADM_DEP_STACK[@]}"; do
+        if [[ "$frame" == "$pkg" ]]; then
+            echo ">> [ADM] Pilha de dependências: ${ADM_DEP_STACK[*]} -> $pkg" >&2
+            die "detecção de ciclo de dependências envolvendo o pacote '$pkg'"
+        fi
+    done
+
+    ADM_DEP_STACK+=("$pkg")
 
     echo ">> [ADM] Resolvendo dependências para $pkg (arquivo: $(basename "$deps_file"))"
     adm_log "RESOLVE DEPS $pkg (file=$(basename "$deps_file"))"
@@ -321,9 +335,8 @@ resolve_deps_for_script() {
         [[ -z "$dep" ]] && continue
 
         # acha script da dependência
-        local dep_path
+        local dep_path dep_pkg
         dep_path="$(find_build_script "$dep")"
-        local dep_pkg
         dep_pkg="$(pkg_name_from_script "$dep_path")"
 
         if pkg_is_installed "$dep_pkg"; then
@@ -337,6 +350,9 @@ resolve_deps_for_script() {
 
         run_build_script "$dep"   # recursivo, usa o mesmo mecanismo
     done < "$deps_file"
+
+    # remove este pacote da pilha (pop)
+    unset 'ADM_DEP_STACK[${#ADM_DEP_STACK[@]}-1]'
 }
 
 #--------------------------------------------------------
@@ -661,6 +677,18 @@ uninstall_pkg() {
 
     [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg: $manifest"
     [[ -f "$meta_file" ]] || die "Meta não encontrada para $pkg: $meta_file"
+
+    # Verificar se há outros pacotes que dependem deste
+    local meta other other_deps
+    for meta in "$ADM_INSTALLED_DIR"/*.meta; do
+        [[ -f "$meta" ]] || continue
+        other="$(basename "${meta%.meta}")"
+        [[ "$other" == "$pkg" ]] && continue
+        other_deps="$(read_meta_field "$other" DEPS || true)"
+        if [[ -n "$other_deps" ]] && echo " $other_deps " | grep -q " $pkg "; then
+            die "Não é seguro desinstalar $pkg: o pacote '$other' depende dele."
+        fi
+    done
 
     # encontra script correspondente para poder rodar hooks
     local script_path
