@@ -2,286 +2,222 @@
 set -euo pipefail
 
 #============================================================
-#  GCC-15.2.0 - Pass 1 (Cross GCC para LFS)
-#  - Segue LFS r12.4-46 (Cap. 5.3)
-#  - Baixa GCC + GMP + MPFR + MPC
-#  - Confere MD5
-#  - Constrói cross GCC Pass 1
-#  - Instala em DESTDIR e copia pra $LFS/tools
-#  - Faz strip seguro dos binários do Pass 1
-#  - Empacota em tar.zst
+#  GCC-15.2.0 - Pass 1 (LFS r12.4-46)
+#  - Cross-GCC instalado em $LFS/tools
+#  - Download automático + verificação MD5 dos tarballs:
+#      gcc-15.2.0, mpfr-4.2.2, gmp-6.3.0, mpc-1.3.1
+#  - Segue exatamente as instruções do livro para Pass 1
+#  - Gera gcc-pass1.version (usado pelo ADM)
 #============================================================
 
-#------------------------------------------------------------
-# Ambiente e triplets
-#------------------------------------------------------------
-
+# Não deve rodar como root (toolchain de capítulo 5 é com usuário 'lfs')
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    echo "ERRO: não execute este script como root." >&2
+    echo "ERRO: NÃO execute este script como root. Use o usuário 'lfs'." >&2
     exit 1
 fi
 
-: "${LFS:?Variável LFS não definida (ex: /mnt/lfs)}"
+# Diretório do próprio script (para gravar gcc-pass1.version aqui)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
-# Triplets host/target (mesma ideia do livro LFS)
-LFS_HOST="$(uname -m)-pc-linux-gnu"
-LFS_TGT="${LFS_TGT:-$(uname -m)-lfs-linux-gnu}"
+# Se ADM não definiu LFS, usar padrão do livro
+: "${LFS:=/mnt/lfs}"
 
-export LFS
-export LFS_HOST
-export LFS_TGT
+# Diretório de sources (padrão LFS)
+SRC_DIR="${LFS_SOURCES_DIR:-$LFS/sources}"
 
-# PATH da toolchain temporária
-export PATH="$LFS/tools/bin:/usr/bin:/bin"
+# Target padrão do livro
+: "${LFS_TGT:=$(uname -m)-lfs-linux-gnu}"
 
-# Não deixar variáveis do host poluírem o cross
-unset CC CXX CPP LD AR AS NM STRIP RANLIB OBJDUMP OBJCOPY
+# Versões / nomes
+GCC_VER="15.2.0"
+GCC_FULL="gcc-${GCC_VER}"
+GCC_TARBALL="${GCC_FULL}.tar.xz"
+GCC_URL="https://ftp.gnu.org/gnu/gcc/${GCC_FULL}/${GCC_TARBALL}"
 
-#------------------------------------------------------------
-# Configuração de versões e caminhos
-#------------------------------------------------------------
+MPFR_VER="4.2.2"
+MPFR_FULL="mpfr-${MPFR_VER}"
+MPFR_TARBALL="${MPFR_FULL}.tar.xz"
+MPFR_URL="https://ftp.gnu.org/gnu/mpfr/${MPFR_TARBALL}"
 
-PKG_NAME="gcc-pass1"
+GMP_VER="6.3.0"
+GMP_FULL="gmp-${GMP_VER}"
+GMP_TARBALL="${GMP_FULL}.tar.xz"
+GMP_URL="https://ftp.gnu.org/gnu/gmp/${GMP_TARBALL}"
 
-GCC_VERSION="${GCC_VERSION:-15.2.0}"
-GMP_VERSION="${GMP_VERSION:-6.3.0}"
-MPFR_VERSION="${MPFR_VERSION:-4.2.2}"
-MPC_VERSION="${MPC_VERSION:-1.3.1}"
-GLIBC_VERSION="${GLIBC_VERSION:-2.42}"
+MPC_VER="1.3.1"
+MPC_FULL="mpc-${MPC_VER}"
+MPC_TARBALL="${MPC_FULL}.tar.gz"
+MPC_URL="https://ftp.gnu.org/gnu/mpc/${MPC_TARBALL}"
 
-# URLs (pode sobrescrever via ambiente se quiser apontar pra mirror)
-GCC_SRC_URL="${GCC_SRC_URL:-https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz}"
-GMP_SRC_URL="${GMP_SRC_URL:-https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz}"
-MPFR_SRC_URL="${MPFR_SRC_URL:-https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.xz}"
-MPC_SRC_URL="${MPC_SRC_URL:-https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz}"
+# MD5 oficiais / confiáveis
+GCC_MD5="b861b092bf1af683c46a8aa2e689a6fd"   # BLFS gcc-15.2.0.tar.xz 
+MPFR_MD5="7c32c39b8b6e3ae85f25156228156061" # mpfr-4.2.2.orig.tar.xz 
+GMP_MD5="956dc04e864001a9c22429f761f2c283"  # gmp-6.3.0.tar.xz 
+MPC_MD5="5c9bc658c9fd0f940e8e3e0f09530c62"  # mpc-1.3.1.tar.gz 
 
-# MD5 (ajuste se quiser usar outros mirrors/tarballs)
-GCC_MD5="${GCC_MD5:-b861b092bf1af683c46a8aa2e689a6fd}"
-GMP_MD5="${GMP_MD5:-956dc04e864001a9c22429f761f2c283}"
-MPFR_MD5="${MPFR_MD5:-7c32c39b8b6e3ae85f25156228156061}"
-MPC_MD5="${MPC_MD5:-5c9bc658c9fd0f940e8e3e0f09530c62}"
-
-SRC_DIR="${SRC_DIR:-$LFS/sources}"
-
-GCC_TARBALL="gcc-${GCC_VERSION}.tar.xz"
-GMP_TARBALL="gmp-${GMP_VERSION}.tar.xz"
-MPFR_TARBALL="mpfr-${MPFR_VERSION}.tar.xz"
-MPC_TARBALL="mpc-${MPC_VERSION}.tar.gz"
-
-GCC_DIR="gcc-${GCC_VERSION}"
-
-DESTDIR="${DESTDIR:-$LFS/pkg/${PKG_NAME}}"
-
-PKG_OUTPUT_DIR="${PKG_OUTPUT_DIR:-$LFS/packages}"
-PKG_ARCH="${PKG_ARCH:-$(uname -m)}"
-PKG_TARBALL="$PKG_OUTPUT_DIR/${PKG_NAME}-${GCC_VERSION}-${PKG_ARCH}.tar.zst"
-
-if command -v nproc >/dev/null 2>&1; then
-    JOBS="$(nproc)"
-else
-    JOBS=1
-fi
+echo "=== GCC $GCC_VER - Pass 1 ==="
+echo "LFS.........: $LFS"
+echo "LFS_TGT.....: $LFS_TGT"
+echo "SRC_DIR.....: $SRC_DIR"
+echo "GCC_TARBALL.: $GCC_TARBALL"
+echo
 
 #------------------------------------------------------------
-# Funções auxiliares
+# Verificações básicas de ferramentas
 #------------------------------------------------------------
+for tool in wget md5sum tar; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERRO: ferramenta obrigatória não encontrada no PATH: $tool" >&2
+        exit 1
+    fi
+done
 
-msg() {
-    # azul forte
-    echo -e "\033[1;34m[$(date +'%F %T')] $*\033[0m"
-}
-
-die() {
-    # vermelho forte
-    echo -e "\033[1;31mERRO: $*\033[0m" >&2
-    exit 1
-}
-
+#============================================================
+# Função genérica de download + conferência MD5
+#============================================================
 download_and_check() {
-    local tarball="$1" url="$2" md5="$3"
+    local url="$1"
+    local file="$2"
+    local md5_expected="$3"
 
-    mkdir -p "$SRC_DIR"
-    cd "$SRC_DIR"
-
-    if [[ -f "$tarball" ]]; then
-        msg "Tarball já existe: $tarball"
-    else
-        msg "Baixando $url ..."
-        if command -v wget >/dev/null 2>&1; then
-            wget -c "$url" -O "$tarball"
-        elif command -v curl >/dev/null 2>&1; then
-            curl -L "$url" -o "$tarball"
-        else
-            die "Nem wget nem curl encontrados para baixar $tarball."
-        fi
+    if [[ ! -f "$file" ]]; then
+        echo ">> Baixando $file ..."
+        wget -q --show-progress "$url" -O "$file"
     fi
 
-    if command -v md5sum >/dev/null 2>&1; then
-        msg "Verificando MD5 de $tarball ..."
-        echo "${md5}  ${tarball}" | md5sum -c - || die "MD5 inválido para $tarball"
-    else
-        msg "md5sum não encontrado; *não* foi possível verificar o MD5 de $tarball."
+    echo ">> Verificando MD5 de $file ..."
+    local md5_file
+    md5_file="$(md5sum "$file" | awk '{print $1}')"
+
+    if [[ "$md5_file" != "$md5_expected" ]]; then
+        echo "ERRO: MD5 inválido para $file!" >&2
+        echo "Esperado: $md5_expected" >&2
+        echo "Obtido..: $md5_file" >&2
+        echo "Apague o arquivo e rode o script novamente." >&2
+        exit 1
     fi
+    echo "MD5 OK para $file."
+    echo
 }
 
-prepare_destdirs() {
-    mkdir -p "$DESTDIR"
-    mkdir -p "$PKG_OUTPUT_DIR"
-    mkdir -p "$LFS/tools"
-}
+#============================================================
+# 1. Preparar diretório de sources
+#============================================================
+mkdir -pv "$SRC_DIR"
+cd "$SRC_DIR"
 
-#------------------------------------------------------------
-# Strip seguro para GCC Pass 1 (no DESTDIR)
-#------------------------------------------------------------
+#============================================================
+# 2. Download + MD5 de todos os tarballs necessários
+#============================================================
+download_and_check "$GCC_URL"  "$GCC_TARBALL"  "$GCC_MD5"
+download_and_check "$MPFR_URL" "$MPFR_TARBALL" "$MPFR_MD5"
+download_and_check "$GMP_URL"  "$GMP_TARBALL"  "$GMP_MD5"
+download_and_check "$MPC_URL"  "$MPC_TARBALL"  "$MPC_MD5"
 
-strip_gcc_pass1() {
-    msg "Executando strip seguro dos binários do GCC Pass 1 (DESTDIR=$DESTDIR)..."
+#============================================================
+# 3. Extrair GCC e entrar no diretório
+#============================================================
+rm -rf "$GCC_FULL"
+echo ">> Extraindo $GCC_TARBALL ..."
+tar -xf "$GCC_TARBALL"
 
-    local HOST_STRIP
-    if command -v strip >/dev/null 2>&1; then
-        HOST_STRIP="strip"
-    else
-        die "strip não encontrado no sistema host."
-    fi
+cd "$GCC_FULL"
 
-    # Diretórios dentro do DESTDIR a serem varridos
-    local STRIP_DIRS=(
-        "$DESTDIR/tools/bin"
-        "$DESTDIR/tools/libexec/gcc/$LFS_TGT"
-        "$DESTDIR/tools/lib/gcc/$LFS_TGT"
-    )
+#============================================================
+# 4. Extrair MPFR, GMP, MPC dentro do source do GCC (como no LFS)
+#============================================================
+echo ">> Integrando MPFR $MPFR_VER, GMP $GMP_VER, MPC $MPC_VER no source do GCC..."
 
-    local d
-    for d in "${STRIP_DIRS[@]}"; do
-        [[ -d "$d" ]] || continue
+tar -xf "../$MPFR_TARBALL"
+mv -v "$MPFR_FULL" mpfr
 
-        msg "Strip em: $d"
-        # Só arquivos ELF
-        while IFS= read -r f; do
-            if file "$f" | grep -q "ELF"; then
-                $HOST_STRIP --strip-unneeded "$f" || true
-            fi
-        done < <(find "$d" -type f -print)
-    done
+tar -xf "../$GMP_TARBALL"
+mv -v "$GMP_FULL" gmp
 
-    msg "Strip concluído (modo seguro para Pass 1)."
-}
+tar -xf "../$MPC_TARBALL"
+mv -v "$MPC_FULL" mpc
 
-#------------------------------------------------------------
-# Build
-#------------------------------------------------------------
-
-main() {
-    msg "==== GCC ${GCC_VERSION} - Pass 1 ===="
-    msg "LFS        = $LFS"
-    msg "HOST       = $LFS_HOST"
-    msg "TARGET     = $LFS_TGT"
-    msg "PATH       = $PATH"
-    msg "DESTDIR    = $DESTDIR"
-    msg "PKG_TAR    = $PKG_TARBALL"
-
-    # 1) Baixar & verificar GCC + libs
-    download_and_check "$GCC_TARBALL" "$GCC_SRC_URL" "$GCC_MD5"
-    download_and_check "$GMP_TARBALL"  "$GMP_SRC_URL"  "$GMP_MD5"
-    download_and_check "$MPFR_TARBALL" "$MPFR_SRC_URL" "$MPFR_MD5"
-    download_and_check "$MPC_TARBALL"  "$MPC_SRC_URL"  "$MPC_MD5"
-
-    prepare_destdirs
-
-    cd "$SRC_DIR"
-
-    # 2) Extrair gcc
-    msg "Removendo árvore anterior: $GCC_DIR"
-    rm -rf "$GCC_DIR"
-
-    msg "Extraindo $GCC_TARBALL ..."
-    tar -xf "$GCC_TARBALL"
-
-    cd "$GCC_DIR"
-
-    # 3) Incorporar MPFR, GMP, MPC na árvore do GCC
-    msg "Incorporando MPFR, GMP e MPC na árvore do GCC ..."
-    tar -xf "../$MPFR_TARBALL"
-    mv -v "mpfr-${MPFR_VERSION}" mpfr
-
-    tar -xf "../$GMP_TARBALL"
-    mv -v "gmp-${GMP_VERSION}" gmp
-
-    tar -xf "../$MPC_TARBALL"
-    mv -v "mpc-${MPC_VERSION}" mpc
-
-    # 4) Ajuste do t-linux64 em x86_64 (lib vs lib64)
-    case "$(uname -m)" in
-        x86_64)
-            msg "Ajustando t-linux64 para usar lib ao invés de lib64..."
-            sed -e '/m64=/s/lib64/lib/' -i gcc/config/i386/t-linux64
+#============================================================
+# 5. Ajuste t-linux64 para x86_64 (lib64 -> lib) – LFS 5.3
+#============================================================
+case "$(uname -m)" in
+    x86_64)
+        echo ">> Ajustando t-linux64 (lib64 -> lib) para x86_64..."
+        sed -e '/m64=/s/lib64/lib/' -i gcc/config/i386/t-linux64
         ;;
-    esac
+esac
 
-    # 5) Diretório de build separado
-    msg "Criando diretório de build ..."
-    mkdir -v build
-    cd build
+#============================================================
+# 6. Build em diretório separado (build/)
+#============================================================
+echo ">> Criando diretório build/ ..."
+mkdir -v build
+cd       build
 
-    # 6) Configure (LFS Pass 1)
-    msg "Configurando GCC para o target $LFS_TGT ..."
-    ../configure                          \
-        --target="$LFS_TGT"               \
-        --prefix=/tools                   \
-        --with-glibc-version="$GLIBC_VERSION" \
-        --with-sysroot="$LFS"             \
-        --with-newlib                     \
-        --without-headers                 \
-        --enable-default-pie              \
-        --enable-default-ssp              \
-        --disable-nls                     \
-        --disable-shared                  \
-        --disable-multilib                \
-        --disable-threads                 \
-        --disable-libatomic               \
-        --disable-libgomp                 \
-        --disable-libquadmath             \
-        --disable-libssp                  \
-        --disable-libvtv                  \
-        --disable-libstdcxx               \
-        --enable-languages=c,c++
+#============================================================
+# 7. Configure (exatamente como no livro LFS r12.4-46)
+#============================================================
+echo ">> Configurando GCC (Pass 1)..."
 
-    # 7) Compilar
-    msg "Compilando GCC (make -j$JOBS) ..."
-    make -j"$JOBS"
+../configure                  \
+    --target="$LFS_TGT"       \
+    --prefix="$LFS/tools"     \
+    --with-glibc-version=2.42 \
+    --with-sysroot="$LFS"     \
+    --with-newlib             \
+    --without-headers         \
+    --enable-default-pie      \
+    --enable-default-ssp      \
+    --disable-nls             \
+    --disable-shared          \
+    --disable-multilib        \
+    --disable-threads         \
+    --disable-libatomic       \
+    --disable-libgomp         \
+    --disable-libquadmath     \
+    --disable-libssp          \
+    --disable-libvtv          \
+    --disable-libstdcxx       \
+    --enable-languages=c,c++
 
-    # 8) Instalar em DESTDIR
-    msg "Instalando em DESTDIR=$DESTDIR ..."
-    rm -rf "$DESTDIR"
-    make DESTDIR="$DESTDIR" install
+#============================================================
+# 8. Compilar e instalar
+#============================================================
+echo ">> Compilando GCC (isso pode demorar)..."
+make -j"$(nproc)"
 
-    # 9) Strip seguro no DESTDIR
-    strip_gcc_pass1
+echo ">> Instalando em $LFS/tools..."
+make install
 
-    # 10) Copiar do DESTDIR para o $LFS/tools real
-    msg "Copiando de DESTDIR/tools para $LFS/tools ..."
-    cp -av "$DESTDIR/tools/." "$LFS/tools/"
+#============================================================
+# 9. Criar limits.h interno completo (como no livro)
+#============================================================
+echo ">> Gerando limits.h interno completo para o cross-GCC..."
 
-    # 11) Criar o limits.h interno completo (como no livro)
-    msg "Gerando limits.h interno para o cross GCC ..."
-    cd ..
-    cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
-        "$(dirname "$($LFS_TGT-gcc -print-libgcc-file-name)")/include/limits.h"
+cd ..
+# Garantir que o cross-compiler está no PATH
+PATH="$LFS/tools/bin:$PATH"
 
-    # 12) Empacotar o DESTDIR em tar.zst
-    msg "Empacotando DESTDIR em $PKG_TARBALL ..."
-    cd "$DESTDIR"
-    if ! command -v zstd >/dev/null 2>&1; then
-        die "zstd não encontrado; não é possível gerar tar.zst."
-    fi
-    tar -cf - . | zstd -z -q -o "$PKG_TARBALL"
+libgcc_file="$($LFS_TGT-gcc -print-libgcc-file-name)"
+libgcc_dir="$(dirname "$libgcc_file")"
 
-    # 13) Limpeza do source
-    cd "$SRC_DIR"
-    msg "Removendo diretório de build: $GCC_DIR"
-    rm -rf "$GCC_DIR"
+mkdir -p "$libgcc_dir/include"
 
-    msg "==== GCC ${GCC_VERSION} - Pass 1 concluído com sucesso ===="
-}
+cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
+    "$libgcc_dir/include/limits.h"
 
-main "$@"
+echo ">> limits.h criado em: $libgcc_dir/include/limits.h"
+
+#============================================================
+# 10. Limpeza do source (opcional mas padrão LFS)
+#============================================================
+cd "$SRC_DIR"
+rm -rf "$GCC_FULL"
+
+#============================================================
+# 11. Registrar versão para o ADM (gcc-pass1.version)
+#============================================================
+echo "$GCC_VER" > "$SCRIPT_DIR/gcc-pass1.version"
+
+echo "=== GCC $GCC_VER - Pass 1 concluído com sucesso ==="
+echo "Versão registrada em: $SCRIPT_DIR/gcc-pass1.version"
