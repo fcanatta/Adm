@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Helper de upstream para o ADM:
+#   - Imprime a ÚLTIMA versão estável do musl (ex: 1.2.5)
+#
+# Uso pelo ADM:
+#   ./adm.sh update musl-pass2
+#
+# Requer:
+#   - curl OU wget
+#   - grep, sed, sort
+
+URL="https://musl.libc.org/releases.html"
+
+fetch_page() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$URL"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -O - "$URL"
+    else
+        echo "ERRO: nem curl nem wget encontrados para consultar upstream do musl." >&2
+        exit 1
+    fi
+}
+
+page="$(fetch_page)"
+
+# A página de releases contém entradas tipo:
+#   musl-1.2.5.tar.gz (sig) - February 29, 2024
+# Extraímos "musl-<versao>.tar.gz" e pegamos só "<versao>".
+latest="$(
+    printf '%s\n' "$page" \
+    | grep -o 'musl-[0-9][0-9.]*\.tar\.gz' \
+    | sed -e 's/^musl-//' -e 's/\.tar\.gz$//' \
+    | sort -V \
+    | tail -n1
+)"
+
+if [[ -z "$latest" ]]; then
+    echo "ERRO: não foi possível determinar a versão mais recente do musl." >&2
+    exit 1
+fi
+
+echo "$latest"
