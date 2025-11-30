@@ -2,232 +2,140 @@
 set -euo pipefail
 
 #============================================================
-#  Binutils - Pass 1 (Cross Binutils para LFS)
-#  - Define ambiente cross-toolchain
-#  - Baixa e verifica MD5 do source
-#  - Constrói Binutils Pass 1
-#  - Instala em DESTDIR
-#  - Faz strip seguro nos binários do DESTDIR
-#  - Copia para $LFS/tools
-#  - Empacota em tar.zst
+#  Binutils-2.45.1 - Pass 1 (LFS r12.4-46)
+#  Agora com:
+#     - DOWNLOAD automático
+#     - Verificação MD5
+#     - STRIP automático após instalação
 #============================================================
 
-#------------------------------------------------------------
-# Ambiente e triplets
-#------------------------------------------------------------
-
+# Não deve rodar como root (etapa cross-toolchain)
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    echo "ERRO: não execute este script como root." >&2
+    echo "ERRO: NÃO execute este script como root. Use o usuário 'lfs'." >&2
     exit 1
 fi
 
-: "${LFS:?Variável LFS não definida (ex: /mnt/lfs)}"
+# Se ADM não forneceu LFS, usar padrão
+: "${LFS:=/mnt/lfs}"
 
-# Triplets host/target
-LFS_HOST="$(uname -m)-pc-linux-gnu"
+# Diretório padrão de sources
+SRC_DIR="${LFS_SOURCES_DIR:-$LFS/sources}"
+
+# Target padrão do livro
 LFS_TGT="${LFS_TGT:-$(uname -m)-lfs-linux-gnu}"
+# Host
+LFS_HOST="$(uname -m)-pc-linux-gnu"        
 
-export LFS
-export LFS_HOST
-export LFS_TGT
+PKG_NAME="binutils"
+PKG_VER="2.45.1"
+PKG_FULL="${PKG_NAME}-${PKG_VER}"
+TARBALL="${PKG_FULL}.tar.xz"
+URL="https://ftp.gnu.org/gnu/binutils/${TARBALL}"
 
-# PATH da toolchain temporária
-export PATH="$LFS/tools/bin:/usr/bin:/bin"
+# MD5 oficial do Binutils 2.45.1
+MD5_EXPECTED="c6fbafa502fa935eb94d8b9a5d7235a4"
 
-# Evitar poluição do host
-unset CC CXX CPP LD AR AS NM STRIP RANLIB OBJDUMP OBJCOPY
+echo "=== Binutils $PKG_VER - Pass 1 ==="
+echo "LFS.......: $LFS"
+echo "SRC_DIR...: $SRC_DIR"
+echo "TARBALL...: $TARBALL"
+echo "URL.......: $URL"
+echo "MD5.......: $MD5_EXPECTED"
+echo
 
-#------------------------------------------------------------
-# Configuração de versões e caminhos
-#------------------------------------------------------------
 
-PKG_NAME="binutils-pass1"
+#============================================================
+# 1. Preparar diretório de sources
+#============================================================
+mkdir -pv "$SRC_DIR"
+cd "$SRC_DIR"
 
-BINUTILS_VERSION="${BINUTILS_VERSION:-2.41}"
 
-SRC_URL="${SRC_URL:-https://sourceware.org/pub/binutils/releases/binutils-${BINUTILS_VERSION}.tar.xz}"
-
-# MD5 oficial do binutils-2.41 (LFS 12.x)
-SRC_MD5="${SRC_MD5:-256d7e0ad998e423030c84483a7c1e30}"
-
-SRC_DIR="${SRC_DIR:-$LFS/sources}"
-TARBALL="binutils-${BINUTILS_VERSION}.tar.xz"
-PKG_DIR="binutils-${BINUTILS_VERSION}"
-
-# DESTDIR para fake root do pacote
-DESTDIR="${DESTDIR:-$LFS/pkg/${PKG_NAME}}"
-
-# Diretório de saída do pacote
-PKG_OUTPUT_DIR="${PKG_OUTPUT_DIR:-$LFS/packages}"
-PKG_ARCH="${PKG_ARCH:-$(uname -m)}"
-PKG_TARBALL="$PKG_OUTPUT_DIR/${PKG_NAME}-${BINUTILS_VERSION}-${PKG_ARCH}.tar.zst"
-
-# Número de jobs
-if command -v nproc >/dev/null 2>&1; then
-    JOBS="$(nproc)"
-else
-    JOBS=1
+#============================================================
+# 2. DOWNLOAD automático (somente se não existir)
+#============================================================
+if [[ ! -f "$TARBALL" ]]; then
+    echo ">> Baixando $TARBALL ..."
+    wget -q --show-progress "$URL"
 fi
 
-#------------------------------------------------------------
-# Funções auxiliares
-#------------------------------------------------------------
 
-msg() {
-    echo -e "\033[1;34m[$(date +'%F %T')] $*\033[0m"
-}
+#============================================================
+# 3. Verificar MD5SUM
+#============================================================
+echo ">> Verificando integridade (md5sum)..."
+MD5_FILE="$(md5sum "$TARBALL" | awk '{print $1}')"
 
-die() {
-    echo -e "\033[1;31mERRO: $*\033[0m" >&2
+if [[ "$MD5_FILE" != "$MD5_EXPECTED" ]]; then
+    echo "ERRO: MD5 inválido!"
+    echo "Esperado: $MD5_EXPECTED"
+    echo "Obtido..: $MD5_FILE"
     exit 1
-}
+fi
+echo "MD5 OK!"
 
-download_source() {
-    mkdir -p "$SRC_DIR"
-    cd "$SRC_DIR"
 
-    if [[ -f "$TARBALL" ]]; then
-        msg "Tarball já existe: $SRC_DIR/$TARBALL"
-    else
-        msg "Baixando $SRC_URL ..."
-        if command -v wget >/dev/null 2>&1; then
-            wget -c "$SRC_URL" -O "$TARBALL"
-        elif command -v curl >/dev/null 2>&1; then
-            curl -L "$SRC_URL" -o "$TARBALL"
-        else
-            die "Nem wget nem curl encontrados para baixar o source."
-        fi
-    fi
-}
+#============================================================
+# 4. Extrair fonte e entrar no diretório
+#============================================================
+rm -rf "$PKG_FULL"
+echo ">> Extraindo $TARBALL ..."
+tar -xf "$TARBALL"
 
-check_md5() {
-    cd "$SRC_DIR"
-    if ! command -v md5sum >/dev/null 2>&1; then
-        msg "md5sum não encontrado; ignorando verificação de MD5."
-        return 0
-    fi
+cd "$PKG_FULL"
+mkdir -v build
+cd build
 
-    msg "Verificando MD5 de $TARBALL ..."
-    echo "${SRC_MD5}  ${TARBALL}" | md5sum -c - || die "MD5 incorreto para $TARBALL"
-    msg "MD5 OK."
-}
 
-prepare_destdirs() {
-    mkdir -p "$DESTDIR"
-    mkdir -p "$PKG_OUTPUT_DIR"
-    mkdir -p "$LFS/tools"
-}
+#============================================================
+# 5. Configurar (exatamente como no LFS)
+#============================================================
+echo ">> Configurando Binutils (Pass 1)..."
 
-#------------------------------------------------------------
-# Strip seguro para Binutils Pass 1 (no DESTDIR)
-#------------------------------------------------------------
+../configure --prefix="$LFS/tools" \
+             --with-sysroot="$LFS" \
+             --target="$LFS_TGT"   \
+             --disable-nls         \
+             --enable-gprofng=no   \
+             --disable-werror      \
+             --enable-new-dtags    \
+             --enable-default-hash-style=gnu
 
-strip_binutils_pass1() {
-    msg "Executando strip seguro dos binários do Binutils Pass 1 (DESTDIR=$DESTDIR)..."
 
-    local HOST_STRIP
-    if command -v strip >/dev/null 2>&1; then
-        HOST_STRIP="strip"
-    else
-        die "strip não encontrado no sistema host."
-    fi
+#============================================================
+# 6. Compilar e instalar
+#============================================================
+echo ">> Compilando..."
+make -j"$(nproc)"
 
-    # Diretórios dentro do DESTDIR a serem verificados
-    local STRIP_DIRS=(
-        "$DESTDIR/tools/bin"
-        "$DESTDIR/tools/$LFS_TGT/bin"
-        "$DESTDIR/tools/lib"
-        "$DESTDIR/tools/lib64"
-    )
+echo ">> Instalando em $LFS/tools..."
+make install
 
-    local d
-    for d in "${STRIP_DIRS[@]}"; do
-        [[ -d "$d" ]] || continue
 
-        msg "Strip em: $d"
-        # Só arquivos ELF
-        while IFS= read -r f; do
-            if file "$f" | grep -q "ELF"; then
-                $HOST_STRIP --strip-unneeded "$f" || true
-            fi
-        done < <(find "$d" -type f -print)
+#============================================================
+# 7. STRIP automático dentro de $LFS/tools
+#============================================================
+echo ">> STRIP nos binários do toolchain..."
+
+find "$LFS/tools" -type f -executable -print0 | \
+    while IFS= read -r -d '' f; do
+        case "$f" in
+            *.a|*.la)
+                # não stripar libs estáticas (não é útil)
+                ;;
+            *)
+                strip --strip-unneeded "$f" 2>/dev/null || true
+                ;;
+        esac
     done
 
-    msg "Strip concluído para Binutils Pass 1."
-}
+echo ">> STRIP concluído."
 
-#------------------------------------------------------------
-# Build / Install / Package
-#------------------------------------------------------------
 
-main() {
-    msg "==== Binutils ${BINUTILS_VERSION} - Pass 1 ===="
-    msg "LFS        = $LFS"
-    msg "HOST       = $LFS_HOST"
-    msg "TARGET     = $LFS_TGT"
-    msg "PATH       = $PATH"
-    msg "DESTDIR    = $DESTDIR"
-    msg "PKG_TAR    = $PKG_TARBALL"
+#============================================================
+# 8. Limpeza segundo o padrão LFS
+#============================================================
+cd "$SRC_DIR"
+rm -rf "$PKG_FULL"
 
-    download_source
-    check_md5
-    prepare_destdirs
-
-    cd "$SRC_DIR"
-
-    # Limpa build anterior
-    msg "Removendo diretório de build antigo (se existir): $PKG_DIR"
-    rm -rf "$PKG_DIR"
-
-    msg "Extraindo tarball: $TARBALL"
-    tar -xf "$TARBALL"
-
-    cd "$PKG_DIR"
-    msg "Criando diretório de build separado"
-    mkdir -v build
-    cd build
-
-    msg "Configurando Binutils (Pass 1) para TARGET $LFS_TGT ..."
-    ../configure \
-        --prefix=/tools \
-        --with-sysroot="$LFS" \
-        --target="$LFS_TGT"   \
-        --disable-nls         \
-        --enable-gprofng=no   \
-        --disable-werror
-
-    msg "Compilando Binutils (make -j$JOBS)..."
-    make -j"$JOBS"
-
-    msg "Instalando em DESTDIR: $DESTDIR ..."
-    rm -rf "$DESTDIR"
-    make DESTDIR="$DESTDIR" install
-
-    # Strip no DESTDIR
-    strip_binutils_pass1
-
-    # Copiar do DESTDIR para o $LFS/tools real
-    msg "Copiando de DESTDIR/tools para $LFS/tools ..."
-    if [[ -d "$DESTDIR/tools" ]]; then
-        cp -av "$DESTDIR/tools/." "$LFS/tools/"
-    else
-        die "DESTDIR/tools não encontrado após instalação."
-    fi
-
-    # Empacotar o DESTDIR em tar.zst
-    msg "Empacotando DESTDIR em $PKG_TARBALL ..."
-    cd "$DESTDIR"
-    if ! command -v zstd >/dev/null 2>&1; then
-        die "zstd não encontrado; não é possível gerar tar.zst."
-    fi
-    tar -cf - . | zstd -z -q -o "$PKG_TARBALL"
-
-    # Limpar árvore de source
-    cd "$SRC_DIR"
-    msg "Limpando diretório de build: removendo $PKG_DIR"
-    rm -rf "$PKG_DIR"
-
-    msg "==== Binutils ${BINUTILS_VERSION} - Pass 1 concluído com sucesso ===="
-}
-
-main "$@"
+echo "=== Binutils $PKG_VER - Pass 1 concluído com sucesso ===" 
