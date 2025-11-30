@@ -1,0 +1,7 @@
+# $LFS/packages/toolchain/binutils-pass1/binutils-pass1.pre_install
+#!/usr/bin/env bash
+set -euo pipefail
+category="$1"
+name="$2"
+key="$3"
+echo ">> [HOOK] pre_install para $key ($category/$name)"
