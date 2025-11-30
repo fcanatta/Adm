@@ -62,6 +62,11 @@ load_config() {
         # shellcheck source=/dev/null
         . "$LFS_CONFIG"
     fi
+
+    # Garante que LFS está definido (pode ser /mnt/lfs ou / para modo host)
+    if [[ -z "${LFS:-}" ]]; then
+        die "Variável LFS não definida (verifique $LFS_CONFIG ou o ambiente)."
+    fi
 }
 
 adm_ensure_db() {
@@ -198,9 +203,36 @@ adm_safe_strip_tree() {
         die "Diretório para safe-strip não existe: $root"
     fi
 
+    if [[ -z "${LFS:-}" ]]; then
+        die "[safe-strip] LFS não definido (verifique sua configuração)."
+    fi
+
+    # Só permitimos strip dentro da árvore do LFS
+    case "$root" in
+        "$LFS"|"$LFS"/*)
+            ;;
+        *)
+            die "[safe-strip] Diretório '$root' não está dentro de LFS='$LFS'. Ajuste LFS ou use o caminho correto."
+            ;;
+    esac
+
+    # Se LFS=/ (modo host), pedir confirmação explícita e recusar em ambiente não interativo
+    if [[ "$LFS" == "/" ]]; then
+        if [[ ! -t 0 ]]; then
+            die "[safe-strip] LFS=/ e stdin não-interativo; recusando strip automático do sistema real."
+        fi
+        echo "ATENÇÃO: você está executando safe-strip no sistema REAL ($root)."
+        echo "Isso pode quebrar binários importantes se usado de forma agressiva."
+        read -r -p "Continuar mesmo assim? [y/N] " ans
+        case "$ans" in
+            y|Y) ;;
+            *) echo ">> [safe-strip] Abortado pelo usuário."; return 1 ;;
+        esac
+    fi
+
     echo ">> [safe-strip] Iniciando strip seguro em: $root"
     local f
-    # find + while para não estourar xargs
+    # find + enquanto para não estourar xargs
     while IFS= read -r f; do
         adm_safe_strip_file "$f"
     done < <(find "$root" -type f -print)
@@ -248,6 +280,14 @@ find_build_script() {
 
 snapshot_fs() {
     local outfile="$1"
+
+    if [[ -z "${LFS:-}" ]]; then
+        die "LFS não definido (snapshot_fs)."
+    fi
+    if [[ ! -d "$LFS" ]]; then
+        die "Diretório base LFS não existe: $LFS"
+    fi
+
     # -xdev vale para toda a árvore sob $LFS
     # e o diretório de DB do ADM é podado corretamente
     find "$LFS" -xdev \( -path "$ADM_DB_DIR" -prune -o -print \) \
@@ -419,6 +459,13 @@ read_meta_field() {
 mount_virtual_fs() {    
     echo ">> Montando sistemas de arquivos virtuais em $LFS ..."
 
+    if [[ -z "${LFS:-}" ]]; then
+        die "LFS não definido (verifique sua configuração)."
+    fi
+
+    # Garante que os pontos de montagem existem
+    mkdir -p "$LFS/dev" "$LFS/dev/pts" "$LFS/proc" "$LFS/sys" "$LFS/run"
+
     if ! mountpoint -q "$LFS"; then
         echo "AVISO: $LFS não é um ponto de montagem (mountpoint)."
         echo "       Continuando assim mesmo; certifique-se de saber o que está fazendo."
@@ -538,15 +585,21 @@ create_build_user() {
 }
 
 status() {
+    local mode_desc="LFS em árvore separada"
+    if [[ "${LFS:-}" == "/" ]]; then
+        mode_desc="MODO HOST (instalando diretamente em /)"
+    fi
+
     cat <<EOF
 === ADM / LFS Status ===
-LFS base...............: $LFS
-Sources................: $LFS_SOURCES_DIR
-Tools..................: $LFS_TOOLS_DIR
-Logs...................: $LFS_LOG_DIR
-Build scripts..........: $LFS_BUILD_SCRIPTS_DIR
-ADM DB.................: $ADM_DB_DIR
-LFS_USER / LFS_GROUP...: $LFS_USER / $LFS_GROUP
+Modo..................: $mode_desc
+LFS base..............: $LFS
+Sources...............: $LFS_SOURCES_DIR
+Tools.................: $LFS_TOOLS_DIR
+Logs..................: $LFS_LOG_DIR
+Build scripts.........: $LFS_BUILD_SCRIPTS_DIR
+ADM DB................: $ADM_DB_DIR
+LFS_USER / LFS_GROUP..: $LFS_USER / $LFS_GROUP
 Chroot seguro (unshare): $( [[ "$CHROOT_SECURE" -eq 1 ]] && echo "ATIVADO" || echo "DESATIVADO" )
 
 Montagens:
@@ -716,7 +769,7 @@ build_status() {
     adm_ensure_db
     echo "=== ADM Build Status ==="
     local any=0
-    for meta in "$ADM_INSTALLED_DIR"/*.meta 2>/dev/null; do
+    for meta in "$ADM_INSTALLED_DIR"/*.meta; do
         [[ -f "$meta" ]] || continue
         any=1
         # shellcheck disable=SC1090
@@ -751,6 +804,10 @@ uninstall_pkg() {
     [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg: $manifest"
     [[ -f "$meta_file" ]] || die "Meta não encontrada para $pkg: $meta_file"
 
+    if ! command -v tac >/dev/null 2>&1; then
+        die "'tac' não encontrado no PATH (necessário para uninstall)."
+    fi
+
     # Verificar se há outros pacotes que dependem deste
     local meta other other_deps
     for meta in "$ADM_INSTALLED_DIR"/*.meta; do
@@ -765,7 +822,7 @@ uninstall_pkg() {
 
     # encontra script correspondente para poder rodar hooks
     local script_path
-    script_path="$(read_meta_field "$pkg" SCRIPT)"
+    script_path="$(read_meta_field "$pkg" SCRIPT || true)"
     if [[ -z "$script_path" || ! -f "$script_path" ]]; then
         # fallback: tenta achar pelo nome
         script_path="$(find_build_script "$pkg")"
@@ -785,6 +842,17 @@ uninstall_pkg() {
     # remove arquivos/diretórios listados (ordem reversa)
     tac "$manifest" | while read -r path; do
         [[ -z "$path" ]] && continue
+
+        # Segurança extra: só remove caminhos dentro de $LFS
+        case "$path" in
+            "$LFS"|"$LFS"/*)
+                ;;
+            *)
+                echo "  ! Caminho fora de LFS ignorado: $path" >&2
+                continue
+                ;;
+        esac
+
         if [[ -f "$path" || -L "$path" ]]; then
             rm -f "$path" || echo "  ! Falha ao remover arquivo $path"
         elif [[ -d "$path" ]]; then
@@ -809,7 +877,7 @@ uninstall_pkg() {
 find_orphans() {
     adm_ensure_db
     local pkgs
-    pkgs=$(for f in "$ADM_INSTALLED_DIR"/*.meta 2>/dev/null; do
+    pkgs=$(for f in "$ADM_INSTALLED_DIR"/*.meta; do
         [[ -f "$f" ]] || continue
         basename "${f%.meta}"
     done)
@@ -819,8 +887,9 @@ find_orphans() {
         needed=0
         for o in $pkgs; do
             [[ "$o" == "$p" ]] && continue
-            deps=$(read_meta_field "$o" DEPS)
-            if echo " $deps " | grep -q " $p "; then
+            # se meta estiver corrompido, não derruba o script
+            deps=$(read_meta_field "$o" DEPS || true)
+            if [[ -n "$deps" ]] && echo " $deps " | grep -q " $p "; then
                 needed=1
                 break
             fi
@@ -835,14 +904,21 @@ uninstall_orphans() {
     adm_ensure_db
     local orphans
     orphans="$(find_orphans)"
-
     if [[ -z "$orphans" ]]; then
-        echo ">> [ADM] Nenhum órfão encontrado."
+        echo ">> [ADM] Nenhum pacote órfão encontrado."
         return 0
     fi
 
-    echo ">> [ADM] Pacotes órfãos (ninguém depende deles):"
+    echo ">> [ADM] Pacotes órfãos (ninguém os cita em DEPS):"
+    echo "   ATENÇÃO: isso NÃO significa que não estejam em uso,"
+    echo "            apenas que nenhum outro pacote os declara como dependência."
     echo "$orphans" | sed 's/^/  - /'
+
+    # Em ambiente não interativo, não tentamos remover nada automaticamente
+    if [[ ! -t 0 ]]; then
+        echo ">> [ADM] stdin não é um terminal; não será feita remoção automática de órfãos."
+        return 0
+    fi
 
     read -r -p "Remover todos? [y/N] " ans
     case "$ans" in
@@ -919,9 +995,17 @@ main() {
     fi
 
     load_config
-    require_root
 
     local cmd="$1"; shift || true
+
+    # Alguns comandos são apenas de leitura e não precisam de root
+    case "$cmd" in
+        status|build-status|help|-h|--help)
+            ;;
+        *)
+            require_root
+            ;;
+    esac
 
     case "$cmd" in
         init)
