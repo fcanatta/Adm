@@ -248,9 +248,10 @@ find_build_script() {
 
 snapshot_fs() {
     local outfile="$1"
-    find "$LFS" -xdev \
-        -path "$ADM_DB_DIR" -prune -o \
-        -print | sort > "$outfile"
+    # -xdev vale para toda a árvore sob $LFS
+    # e o diretório de DB do ADM é podado corretamente
+    find "$LFS" -xdev \( -path "$ADM_DB_DIR" -prune -o -print \) \
+        | sort > "$outfile"
 }
 
 calc_manifest() {
@@ -381,12 +382,13 @@ register_success() {
         deps="${deps% }"
     fi
 
-    cat > "$meta_file" <<EOF
-NAME=$pkg
-SCRIPT=$script_path
-BUILT_AT=$(date +'%F %T')
-DEPS=$deps
-EOF
+    # Grava meta em formato seguro para 'source'
+    {
+        printf 'NAME=%q\n' "$pkg"
+        printf 'SCRIPT=%q\n' "$script_path"
+        printf 'BUILT_AT=%q\n' "$(date +'%F %T')"
+        printf 'DEPS=%q\n' "$deps"
+    } > "$meta_file"
 
     echo "$pkg" > "$ADM_LAST_SUCCESS"
     adm_log "BUILD OK   $pkg (script=$script_path)"
@@ -636,6 +638,77 @@ if [[ -x './${pkg}.post_install' ]]; then ./'${pkg}.post_install'; fi;"
 }
 
 #--------------------------------------------------------
+# build-order: constrói pacotes na ordem do arquivo BUILD_ORDER_FILE
+#   - cada linha do arquivo pode ser:
+#       categoria:programa      (ex: core:binutils-pass1)
+#       ou um spec direto       (ex: core/binutils-pass1/binutils-pass1.sh)
+#   - usa ADM_LAST_SUCCESS para retomar de onde parou
+#--------------------------------------------------------
+
+build_from_order() {
+    adm_ensure_db
+
+    if [[ ! -f "$BUILD_ORDER_FILE" ]]; then
+        die "Arquivo de ordem de build não encontrado: $BUILD_ORDER_FILE"
+    fi
+
+    local last=""
+    if [[ -f "$ADM_LAST_SUCCESS" ]]; then
+        read -r last < "$ADM_LAST_SUCCESS" || last=""
+    fi
+
+    local started=0
+    [[ -z "$last" ]] && started=1
+
+    echo ">> [ORDER] Usando arquivo: $BUILD_ORDER_FILE"
+    [[ -n "$last" ]] && echo ">> [ORDER] Último build com sucesso: $last"
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # remove comentários e espaços
+        line="${line%%#*}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" ]] && continue
+
+        local spec pkg_name
+
+        # formato categoria:programa  -> core:binutils-pass1
+        if [[ "$line" == *:* ]]; then
+            local cat prog
+            cat="${line%%:*}"
+            prog="${line#*:}"
+            spec="$cat/$prog/$prog.sh"
+            pkg_name="$prog"
+        else
+            # spec direto
+            spec="$line"
+            pkg_name="${spec##*/}"
+            pkg_name="${pkg_name%.sh}"
+        fi
+
+        # Se ainda não chegamos no último sucesso, continuar pulando
+        if [[ "$started" -eq 0 ]]; then
+            if [[ "$pkg_name" == "$last" ]]; then
+                echo ">> [ORDER] Já construído (último sucesso): $pkg_name – retomando a partir do próximo."
+                started=1
+            fi
+            continue
+        fi
+
+        echo ">> [ORDER] Construindo: $pkg_name (spec: $spec)"
+
+        # Chamamos um novo processo adm pra cada pacote,
+        # assim o 'exit' interno de run_build_script não mata o loop daqui.
+        if ! "$0" run-build "$spec"; then
+            echo ">> [ORDER] Build falhou para $pkg_name. Interrompendo sequência."
+            return 1
+        fi
+    done < "$BUILD_ORDER_FILE"
+
+    echo ">> [ORDER] Sequência de build-order concluída."
+}
+
+#--------------------------------------------------------
 # build-status: lista pacotes registrados
 #--------------------------------------------------------
 
@@ -813,6 +886,8 @@ Comandos de build:
                            binutils-pass1.sh
                            core/binutils-pass1
                            core/binutils-pass1/binutils-pass1.sh
+  build-order            Constrói pacotes na ordem de $BUILD_ORDER_FILE
+                         (retomando a partir do último sucesso)
   build-status           Lista pacotes já registrados
 
 Comandos de desinstalação:
@@ -881,6 +956,9 @@ main() {
             ;;
         run-build)
             run_build_script "$@"
+            ;;
+        build-order)    
+            build_from_order
             ;;
         build-status)
             build_status
