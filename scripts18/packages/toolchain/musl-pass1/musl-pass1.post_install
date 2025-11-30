@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#============================================================
+# Hook de pós-instalação para musl-pass1
+#
+# Objetivo:
+#   - Validar instalação básica da libc estática musl no sysroot:
+#       $ROOT/usr/include      (headers)
+#       $ROOT/lib/libc.a       (libc estática)
+#
+#   - ROOT:
+#       - Se LFS estiver definido, ROOT="$LFS"
+#       - Caso contrário, ROOT="/mnt/lfs" (padrão de LFS)
+#
+#   - Não mexe em ld-musl.so.1 nem arquivos .path.
+#     Isso é responsabilidade do musl-pass2 (build final).
+#============================================================
+
+ROOT="${LFS:-/mnt/lfs}"
+
+echo ">> [musl-pass1 post_install] ROOT = $ROOT"
+
+# 1. Verificar diretório de headers
+hdr_dir="$ROOT/usr/include"
+
+if [[ ! -d "$hdr_dir" ]]; then
+    echo "ERRO [musl-pass1 post_install]: diretório de headers não encontrado: $hdr_dir" >&2
+    exit 1
+fi
+
+# Verifica alguns headers críticos
+critical_headers=(
+    "stdio.h"
+    "stdlib.h"
+    "string.h"
+    "errno.h"
+)
+
+missing_hdr=0
+for h in "${critical_headers[@]}"; do
+    if [[ ! -f "$hdr_dir/$h" ]]; then
+        echo "ERRO [musl-pass1 post_install]: header obrigatório ausente: $hdr_dir/$h" >&2
+        missing_hdr=1
+    fi
+done
+
+if [[ "$missing_hdr" -ne 0 ]]; then
+    echo "ERRO [musl-pass1 post_install]: um ou mais headers obrigatórios do musl não foram instalados corretamente." >&2
+    exit 1
+fi
+
+echo ">> [musl-pass1 post_install] Headers básicos OK em $hdr_dir"
+
+# 2. Verificar libc estática
+libc_static="$ROOT/lib/libc.a"
+
+if [[ ! -f "$libc_static" ]]; then
+    echo "ERRO [musl-pass1 post_install]: libc estática não encontrada: $libc_static" >&2
+    exit 1
+fi
+
+# Tamanho > 0?
+if [[ ! -s "$libc_static" ]]; then
+    echo "ERRO [musl-pass1 post_install]: libc.a existe mas está vazia ou corrompida: $libc_static" >&2
+    exit 1
+fi
+
+echo ">> [musl-pass1 post_install] libc estática OK em $libc_static"
+
+# 3. Mensagem final
+echo ">> [musl-pass1 post_install] Validação básica da instalação do musl-pass1 concluída com sucesso."
