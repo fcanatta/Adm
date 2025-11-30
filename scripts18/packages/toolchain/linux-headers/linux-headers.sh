@@ -2,165 +2,146 @@
 set -euo pipefail
 
 #============================================================
-#  Linux-6.17.8 API Headers
-#  - Segue LFS 12.4 (seção 5.4) adaptado para DESTDIR
-#  - Baixa o kernel, verifica MD5
-#  - Gera os headers com make headers
-#  - Limpa arquivos não .h
-#  - Instala em DESTDIR/usr/include
-#  - Copia para $LFS/usr
-#  - Empacota em tar.zst
+#  Linux API Headers 6.17.8
+#
+#  - Baixa linux-6.17.8 do kernel.org
+#  - Verifica SHA256 oficial
+#  - Instala os headers em $LFS/usr/include
+#    (make mrproper; make headers; copia usr/include)
+#  - Gera linux-headers.version para o ADM
+#
+#  Uso:
+#    - Normalmente com usuário 'lfs' (não root), com $LFS/mnt/lfs
 #============================================================
 
-#------------------------------------------------------------
-# Ambiente e triplets (para manter padrão com os outros scripts)
-#------------------------------------------------------------
-
+# Não é recomendado rodar como root no estágio de LFS em /mnt/lfs
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    echo "ERRO: não execute este script como root." >&2
+    echo "ERRO: NÃO execute este script como root quando estiver construindo em /mnt/lfs." >&2
+    echo "      Use o usuário 'lfs' que é dono de \$LFS." >&2
     exit 1
 fi
 
-: "${LFS:?Variável LFS não definida (ex: /mnt/lfs)}"
+# Diretório do próprio script (pra gravar linux-headers.version)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
-LFS_HOST="$(uname -m)-pc-linux-gnu"
-LFS_TGT="${LFS_TGT:-$(uname -m)-lfs-linux-gnu}"
+# LFS padrão (se o ADM não tiver exportado)
+: "${LFS:=/mnt/lfs}"
 
-export LFS
-export LFS_HOST
-export LFS_TGT
+# Diretório dos sources
+SRC_DIR="${LFS_SOURCES_DIR:-$LFS/sources}"
 
-# PATH padrão dos scripts temporários
-export PATH="$LFS/tools/bin:/usr/bin:/bin"
+# Versão / tarball / URL
+KVER="6.17.8"
+PKG_FULL="linux-${KVER}"
+TARBALL="${PKG_FULL}.tar.xz"
+URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/${TARBALL}"
 
-#------------------------------------------------------------
-# Configuração de versões e caminhos
-#------------------------------------------------------------
+# SHA256 oficial do linux-6.17.8.tar.xz (sha256sums.asc do kernel.org) 
+SHA256_EXPECTED="2a6c40299ea9c49d03a4ecea23d128d6cabc1735e2dec4ae83401fda7241ab42"
 
-PKG_NAME="linux-headers"
-
-KERNEL_VERSION="${KERNEL_VERSION:-6.17.8}"
-
-# URL e MD5 conforme LFS (All Packages) para linux-6.17.8 2
-KERNEL_SRC_URL="${KERNEL_SRC_URL:-https://www.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz}"
-KERNEL_MD5="${KERNEL_MD5:-74c34fafb5914d05447863cdc304ab55}"
-
-SRC_DIR="${SRC_DIR:-$LFS/sources}"
-TARBALL="linux-${KERNEL_VERSION}.tar.xz"
-KERNEL_DIR="linux-${KERNEL_VERSION}"
-
-# DESTDIR para empacotar os headers
-DESTDIR="${DESTDIR:-$LFS/pkg/${PKG_NAME}}"
-
-PKG_OUTPUT_DIR="${PKG_OUTPUT_DIR:-$LFS/packages}"
-PKG_ARCH="${PKG_ARCH:-$(uname -m)}"
-PKG_TARBALL="$PKG_OUTPUT_DIR/${PKG_NAME}-${KERNEL_VERSION}-${PKG_ARCH}.tar.zst"
+echo "=== Linux API Headers $KVER ==="
+echo "LFS........: $LFS"
+echo "SRC_DIR....: $SRC_DIR"
+echo "TARBALL....: $TARBALL"
+echo "URL........: $URL"
+echo "SHA256.....: $SHA256_EXPECTED"
+echo
 
 #------------------------------------------------------------
-# Funções auxiliares
+# Verificações básicas de ferramentas
 #------------------------------------------------------------
+for tool in wget sha256sum tar make find; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERRO: ferramenta obrigatória não encontrada no PATH: $tool" >&2
+        exit 1
+    fi
+done
 
-msg() {
-    echo -e "\033[1;34m[$(date +'%F %T')] $*\033[0m"
-}
+#============================================================
+# Função: download + checagem SHA256
+#============================================================
+download_and_check_sha256() {
+    local url="$1"
+    local file="$2"
+    local sha_expected="$3"
 
-die() {
-    echo -e "\033[1;31mERRO: $*\033[0m" >&2
-    exit 1
-}
-
-download_and_check_kernel() {
-    mkdir -p "$SRC_DIR"
-    cd "$SRC_DIR"
-
-    if [[ -f "$TARBALL" ]]; then
-        msg "Tarball já existe: $SRC_DIR/$TARBALL"
-    else
-        msg "Baixando $KERNEL_SRC_URL ..."
-        if command -v wget >/dev/null 2>&1; then
-            wget -c "$KERNEL_SRC_URL" -O "$TARBALL"
-        elif command -v curl >/dev/null 2>&1; then
-            curl -L "$KERNEL_SRC_URL" -o "$TARBALL"
-        else
-            die "Nem wget nem curl encontrados para baixar o kernel."
-        fi
+    if [[ ! -f "$file" ]]; then
+        echo ">> Baixando $file ..."
+        wget -q --show-progress "$url" -O "$file"
     fi
 
-    if command -v md5sum >/dev/null 2>&1; then
-        msg "Verificando MD5 de $TARBALL ..."
-        echo "${KERNEL_MD5}  ${TARBALL}" | md5sum -c - || die "MD5 incorreto para $TARBALL"
-        msg "MD5 OK."
-    else
-        msg "md5sum não encontrado; **não** foi possível verificar o MD5."
+    echo ">> Verificando SHA256 de $file ..."
+    local sha_file
+    sha_file="$(sha256sum "$file" | awk '{print $1}')"
+
+    if [[ "$sha_file" != "$sha_expected" ]]; then
+        echo "ERRO: SHA256 inválido para $file!" >&2
+        echo "Esperado: $sha_expected" >&2
+        echo "Obtido..: $sha_file" >&2
+        echo "Apague o arquivo e rode o script novamente." >&2
+        exit 1
     fi
+
+    echo "SHA256 OK para $file."
+    echo
 }
 
-prepare_dirs() {
-    mkdir -p "$DESTDIR"
-    mkdir -p "$PKG_OUTPUT_DIR"
-    mkdir -p "$LFS/usr"
-}
+#============================================================
+# 1. Preparar diretório de sources
+#============================================================
+mkdir -pv "$SRC_DIR"
+cd "$SRC_DIR"
 
-#------------------------------------------------------------
-# Build / Install / Package
-#------------------------------------------------------------
+#============================================================
+# 2. Baixar + checar o tarball do kernel
+#============================================================
+download_and_check_sha256 "$URL" "$TARBALL" "$SHA256_EXPECTED"
 
-main() {
-    msg "==== Linux-${KERNEL_VERSION} API Headers ===="
-    msg "LFS        = $LFS"
-    msg "HOST       = $LFS_HOST"
-    msg "TARGET     = $LFS_TGT"
-    msg "PATH       = $PATH"
-    msg "DESTDIR    = $DESTDIR"
-    msg "PKG_TAR    = $PKG_TARBALL"
+#============================================================
+# 3. Extrair fonte
+#============================================================
+rm -rf "$PKG_FULL"
+echo ">> Extraindo $TARBALL ..."
+tar -xf "$TARBALL"
 
-    download_and_check_kernel
-    prepare_dirs
+cd "$PKG_FULL"
 
-    cd "$SRC_DIR"
+#============================================================
+# 4. Limpeza e geração dos headers (estilo LFS)
+#============================================================
 
-    msg "Removendo diretório de build antigo (se existir): $KERNEL_DIR"
-    rm -rf "$KERNEL_DIR"
+# Garante árvore "limpa"
+echo ">> Rodando make mrproper ..."
+make mrproper
 
-    msg "Extraindo tarball: $TARBALL"
-    tar -xf "$TARBALL"
+# Gera os headers exportados para user-space
+echo ">> Rodando make headers ..."
+make headers
 
-    cd "$KERNEL_DIR"
+# Remove tudo que não é .h dentro de usr/include
+echo ">> Limpando arquivos não-.h em usr/include ..."
+find usr/include -type f ! -name '*.h' -delete
 
-    # Passos exatamente como no LFS 12.4 (adaptando só o destino) 3
-    msg "Executando make mrproper (limpeza do source)..."
-    make mrproper
+#============================================================
+# 5. Instalar headers em $LFS/usr/include
+#============================================================
+echo ">> Instalando headers em $LFS/usr/include ..."
 
-    msg "Gerando headers com make headers ..."
-    make headers
+mkdir -pv "$LFS/usr"
+cp -rv usr/include "$LFS/usr"
 
-    msg "Removendo arquivos não .h de usr/include ..."
-    find usr/include -type f ! -name '*.h' -delete
+echo ">> Headers instalados em: $LFS/usr/include"
 
-    # Instalar em DESTDIR (em vez de copiar direto para $LFS/usr)
-    msg "Instalando headers em DESTDIR/usr/include ..."
-    rm -rf "$DESTDIR"
-    mkdir -p "$DESTDIR/usr"
-    cp -rv usr/include "$DESTDIR/usr"
+#============================================================
+# 6. Limpeza da árvore de fontes
+#============================================================
+cd "$SRC_DIR"
+rm -rf "$PKG_FULL"
 
-    # Copiar para o $LFS real (como o livro faz com $LFS/usr)
-    msg "Copiando headers para $LFS/usr ..."
-    cp -av "$DESTDIR/usr/." "$LFS/usr/"
+#============================================================
+# 7. Registrar versão para o ADM (linux-headers.version)
+#============================================================
+echo "$KVER" > "$SCRIPT_DIR/linux-headers.version"
 
-    # Empacotar o DESTDIR em tar.zst
-    msg "Empacotando DESTDIR em $PKG_TARBALL ..."
-    cd "$DESTDIR"
-    if ! command -v zstd >/dev/null 2>&1; then
-        die "zstd não encontrado; não é possível gerar tar.zst."
-    fi
-    tar -cf - . | zstd -z -q -o "$PKG_TARBALL"
-
-    # Limpeza do source
-    cd "$SRC_DIR"
-    msg "Removendo diretório de build: $KERNEL_DIR"
-    rm -rf "$KERNEL_DIR"
-
-    msg "==== Linux-${KERNEL_VERSION} API Headers concluído com sucesso ===="
-}
-
-main "$@"
+echo "=== Linux API Headers $KVER concluído com sucesso ==="
+echo "Versão registrada em: $SCRIPT_DIR/linux-headers.version"
