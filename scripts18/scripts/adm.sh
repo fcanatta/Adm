@@ -1,114 +1,142 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-#=============================================
-#  lfs-pkg  -  gerenciador simples de builds
-#=============================================
+#========================================================
+#  ADM Manager - Gerenciador simples para Linux From Scratch
+#  - Prepara estrutura do LFS
+#  - Monta / desmonta FS virtuais
+#  - Entra em chroot (opcionalmente com unshare)
+#  - Administra builds de scripts em $LFS/build-scripts
+#    * resolução de dependências
+#    * hooks pre/post install & uninstall
+#    * manifesto de arquivos instalados
+#    * uninstall por manifesto
+#    * uninstall de órfãos
+#    * registro em $LFS/var/adm
+#========================================================
 
+LFS_CONFIG="${LFS_CONFIG:-/etc/adm.conf}"
+
+# Valores padrão (podem ser sobrescritos pelo arquivo de config)
 LFS="${LFS:-/mnt/lfs}"
-LFS_PACKAGES_DIR="${LFS_PACKAGES_DIR:-$LFS/packages}"
-LFS_PKG_DB_DIR="${LFS_PKG_DB_DIR:-$LFS/var/pkgdb}"
-BUILD_ORDER_FILE="${BUILD_ORDER_FILE:-$LFS_PACKAGES_DIR/build-order.txt}"
+LFS_USER="${LFS_USER:-lfsbuild}"
+LFS_GROUP="${LFS_GROUP:-lfsbuild}"
+LFS_SOURCES_DIR="${LFS_SOURCES_DIR:-$LFS/sources}"
+LFS_TOOLS_DIR="${LFS_TOOLS_DIR:-$LFS/tools}"
+LFS_LOG_DIR="${LFS_LOG_DIR:-$LFS/logs}"
+LFS_BUILD_SCRIPTS_DIR="${LFS_BUILD_SCRIPTS_DIR:-$LFS/build-scripts}"
 
-# Cores para saída na tela
-COLOR_INFO="\033[1;34m"
-COLOR_WARN="\033[1;33m"
-COLOR_ERROR="\033[1;31m"
-COLOR_OK="\033[1;32m"
-COLOR_RESET="\033[0m"
+CHROOT_SECURE="${CHROOT_SECURE:-1}"  # 1 = tentar unshare, 0 = chroot simples
 
-# Cria diretórios básicos de banco de dados
-mkdir -p "$LFS_PKG_DB_DIR"/{installed,logs}
+# Registro / banco do ADM
+ADM_DB_DIR="${ADM_DB_DIR:-$LFS/var/adm}"
+ADM_INSTALLED_DIR="$ADM_DB_DIR/installed"
+ADM_LOG_DIR="$ADM_DB_DIR/logs"
+ADM_LAST_SUCCESS="$ADM_DB_DIR/last_success"
 
-#---------------------------------------------
-# Logging
-#---------------------------------------------
+# Manifesto por pacote: $ADM_INSTALLED_DIR/<pkg>.manifest
+# Meta por pacote:      $ADM_INSTALLED_DIR/<pkg>.meta
 
-log_info() {
-    echo -e "${COLOR_INFO}[INFO] $*${COLOR_RESET}"
-}
+# Arquivo opcional com ordem de build (para ferramentas externas, se quiser):
+# linhas no formato: categoria:programa (ex: core:binutils-pass1)
+BUILD_ORDER_FILE="${BUILD_ORDER_FILE:-$LFS/build-scripts/build-order.txt}"
 
-log_warn() {
-    echo -e "${COLOR_WARN}[WARN] $*${COLOR_RESET}"
-}
-
-log_error() {
-    echo -e "${COLOR_ERROR}[ERRO] $*${COLOR_RESET}" >&2
-}
-
-log_ok() {
-    echo -e "${COLOR_OK}[OK] $*${COLOR_RESET}"
-}
+#--------------------------------------------------------
+# Helpers genéricos
+#--------------------------------------------------------
 
 die() {
-    log_error "$*"
+    echo "Erro: $*" >&2
     exit 1
 }
 
-#---------------------------------------------
-# Helpers gerais
-#---------------------------------------------
-
-ensure_not_root() {
-    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-        die "não execute este comando como root (use o usuário de build)."
+require_root() {
+    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+        die "este script precisa ser executado como root."
     fi
 }
 
-ensure_dirs() {
-    mkdir -p "$LFS_PACKAGES_DIR" || true
-    mkdir -p "$LFS_PKG_DB_DIR/installed" "$LFS_PKG_DB_DIR/logs"
+load_config() {
+    if [[ -f "$LFS_CONFIG" ]]; then
+        # shellcheck source=/dev/null
+        . "$LFS_CONFIG"
+    fi
 }
 
-# key = categoria:pacote
-pkg_key() {
-    local category="$1" name="$2"
-    echo "${category}:${name}"
+adm_ensure_db() {
+    mkdir -p "$ADM_INSTALLED_DIR" "$ADM_LOG_DIR" "$LFS_LOG_DIR"
 }
 
-pkg_db_dir() {
-    local key="$1"
-    echo "$LFS_PKG_DB_DIR/installed/$key"
+adm_log() {
+    local ts
+    ts="$(date +'%F %T')"
+    echo "[$ts] $*" >> "$ADM_LOG_DIR/adm.log"
 }
 
-pkg_manifest() {
-    local key="$1"
-    echo "$(pkg_db_dir "$key")/manifest"
+pkg_name_from_script() {
+    # /foo/core/binutils-pass1/binutils-pass1.sh -> binutils-pass1
+    local script_path="$1"
+    local base="${script_path##*/}"
+    echo "${base%.sh}"
 }
 
-pkg_meta() {
-    local key="$1"
-    echo "$(pkg_db_dir "$key")/meta"
+pkg_meta_file() {
+    local pkg="$1"
+    echo "$ADM_INSTALLED_DIR/${pkg}.meta"
 }
 
-pkg_logfile() {
-    local key="$1" action="$2"
-    echo "$LFS_PKG_DB_DIR/logs/${key}.${action}.log"
+pkg_manifest_file() {
+    local pkg="$1"
+    echo "$ADM_INSTALLED_DIR/${pkg}.manifest"
 }
 
-pkg_script_path() {
-    local category="$1" name="$2"
-    echo "$LFS_PACKAGES_DIR/$category/$name/$name.sh"
+pkg_is_installed() {
+    local pkg="$1"
+    [[ -f "$(pkg_manifest_file "$pkg")" ]]
 }
 
-pkg_hooks_prefix() {
-    local category="$1" name="$2"
-    echo "$LFS_PACKAGES_DIR/$category/$name/$name"
+#--------------------------------------------------------
+# Localizar script de build em subpastas de $LFS/build-scripts
+#   - aceita:
+#       binutils-pass1
+#       binutils-pass1.sh
+#       core/binutils-pass1
+#       core/binutils-pass1/binutils-pass1.sh
+#   - sempre resolve pelo NOME DO ARQUIVO (basename sem .sh)
+#--------------------------------------------------------
+
+find_build_script() {
+    local spec="$1"
+    local name="${spec##*/}"   # pega o último componente
+    name="${name%.sh}"         # remove .sh se tiver
+
+    local hits
+    hits=$(find "$LFS_BUILD_SCRIPTS_DIR" -type f -name "${name}.sh" 2>/dev/null || true)
+
+    # conta quantas linhas não vazias
+    local count
+    count=$(printf '%s\n' "$hits" | sed '/^$/d' | wc -l)
+
+    if [[ "$count" -eq 0 ]]; then
+        die "script de build '${spec}' (nome base '${name}.sh') não encontrado em $LFS_BUILD_SCRIPTS_DIR"
+    elif [[ "$count" -gt 1 ]]; then
+        echo "Mais de um script encontrado para base '${name}.sh':" >&2
+        printf '  %s\n' $hits >&2
+        die "seja mais específico no nome do script."
+    fi
+
+    printf '%s\n' "$hits"
 }
 
-is_installed() {
-    local key="$1"
-    [[ -f "$(pkg_manifest "$key")" ]]
-}
-
-#---------------------------------------------
+#--------------------------------------------------------
 # Snapshot de FS para gerar manifesto
-#---------------------------------------------
+#   - lista tudo sob $LFS, menos o diretório de DB do ADM
+#--------------------------------------------------------
 
 snapshot_fs() {
     local outfile="$1"
     find "$LFS" -xdev \
-        -path "$LFS_PKG_DB_DIR" -prune -o \
+        -path "$ADM_DB_DIR" -prune -o \
         -print | sort > "$outfile"
 }
 
@@ -117,456 +145,615 @@ calc_manifest() {
     comm -13 "$before" "$after" > "$out"
 }
 
-#---------------------------------------------
-# Metadados do script de pacote
-#---------------------------------------------
+#--------------------------------------------------------
+# Hooks por programa:
+#   em $LFS/build-scripts/<categoria>/<prog>/<prog>.* :
+#     <prog>.pre_install
+#     <prog>.post_install
+#     <prog>.pre_uninstall
+#     <prog>.post_uninstall
+#--------------------------------------------------------
 
-load_pkg_metadata_from_script() {
-    local script="$1"
+run_hook_in_chroot() {
+    local rel_dir="$1"   # relativo a $LFS_BUILD_SCRIPTS_DIR
+    local pkg="$2"       # binutils-pass1
+    local hook="$3"      # pre_install, post_install, pre_uninstall, post_uninstall
 
-    PKG_NAME=""
-    PKG_VERSION=""
-    PKG_CATEGORY=""
-    PKG_DEPS=()
+    local rel_path_dir="$rel_dir"
+    [[ "$rel_path_dir" == "." ]] && rel_path_dir=""
 
-    # shellcheck source=/dev/null
-    . "$script"
+    local chroot_dir="/build-scripts"
+    [[ -n "$rel_path_dir" ]] && chroot_dir="$chroot_dir/$rel_path_dir"
 
-    [[ -n "${PKG_NAME:-}" ]] || die "PKG_NAME não definido em $script"
-    [[ -n "${PKG_CATEGORY:-}" ]] || die "PKG_CATEGORY não definido em $script"
+    local hook_file="${pkg}.${hook}"
+
+    # Monta comando para rodar no chroot
+    local cmd="cd '$chroot_dir'; if [[ -x './$hook_file' ]]; then ./'$hook_file'; fi"
+
+    chroot "$LFS" /usr/bin/env -i \
+        HOME=/root \
+        TERM="${TERM:-xterm}" \
+        PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        /bin/bash -lc "$cmd"
 }
 
-write_meta_file() {
-    local key="$1" name="$2" category="$3" version="$4" deps="$5"
+#--------------------------------------------------------
+# Ler dependências do programa:
+#   arquivo: <prog>.deps na MESMA PASTA DO SCRIPT
+#   - um item por linha
+#   - aceita:
+#       gcc-pass1
+#       gcc-pass1.sh
+#       core/gcc-pass1
+#       core/gcc-pass1/gcc-pass1.sh
+#   - cada dependência é resolvida via find_build_script e construída com run-build
+#--------------------------------------------------------
+
+resolve_deps_for_script() {
+    local script_path="$1"  # absoluto
+    local pkg_dir
+    pkg_dir="$(dirname "$script_path")"
+    local pkg
+    pkg="$(pkg_name_from_script "$script_path")"
+
+    local deps_file="$pkg_dir/${pkg}.deps"
+
+    [[ -f "$deps_file" ]] || return 0
+
+    echo ">> [ADM] Resolvendo dependências para $pkg (arquivo: $(basename "$deps_file"))"
+    adm_log "RESOLVE DEPS $pkg (file=$(basename "$deps_file"))"
+
+    local dep
+    while IFS= read -r dep || [[ -n "$dep" ]]; do
+        # limpa comentários e espaços
+        dep="${dep%%#*}"
+        dep="${dep#"${dep%%[![:space:]]*}"}"
+        dep="${dep%"${dep##*[![:space:]]}"}"
+        [[ -z "$dep" ]] && continue
+
+        # acha script da dependência
+        local dep_path
+        dep_path="$(find_build_script "$dep")"
+        local dep_pkg
+        dep_pkg="$(pkg_name_from_script "$dep_path")"
+
+        if pkg_is_installed "$dep_pkg"; then
+            echo ">> [ADM] Dependência '$dep_pkg' já instalada; pulando."
+            adm_log "SKIP DEP  $dep_pkg (já instalado; req por $pkg)"
+            continue
+        fi
+
+        echo ">> [ADM] Construindo dependência: $dep_pkg ($dep)"
+        adm_log "BUILD DEP $dep_pkg (req por $pkg)"
+
+        run_build_script "$dep"   # recursivo, usa o mesmo mecanismo
+    done < "$deps_file"
+}
+
+#--------------------------------------------------------
+# Registro de sucesso/fracasso
+#  - meta: NAME, SCRIPT, BUILT_AT, DEPS
+#  - manifest: lista de arquivos instalados
+#--------------------------------------------------------
+
+register_success() {
+    local script_path="$1"
+    local pkg
+    pkg="$(pkg_name_from_script "$script_path")"
     local meta_file
-    meta_file="$(pkg_meta "$key")"
-    mkdir -p "$(dirname "$meta_file")"
-    {
-        echo "NAME=$name"
-        echo "CATEGORY=$category"
-        echo "VERSION=$version"
-        echo "DEPS=$deps"
-        echo "INSTALL_TIME=$(date +'%F %T')"
-    } > "$meta_file"
+    meta_file="$(pkg_meta_file "$pkg")"
+
+    local pkg_dir
+    pkg_dir="$(dirname "$script_path")"
+    local deps_file="$pkg_dir/${pkg}.deps"
+    local deps=""
+    if [[ -f "$deps_file" ]]; then
+        deps="$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$deps_file" \
+               | sed '/^$/d' | while read -r d; do
+                     d="${d##*/}"; d="${d%.sh}"
+                     printf '%s ' "$d"
+                 done)"
+        deps="${deps% }"
+    fi
+
+    cat > "$meta_file" <<EOF
+NAME=$pkg
+SCRIPT=$script_path
+BUILT_AT=$(date +'%F %T')
+DEPS=$deps
+EOF
+
+    echo "$pkg" > "$ADM_LAST_SUCCESS"
+    adm_log "BUILD OK   $pkg (script=$script_path)"
+}
+
+register_failure() {
+    local script_path="$1"
+    local rc="$2"
+    local pkg
+    pkg="$(pkg_name_from_script "$script_path")"
+    adm_log "BUILD FAIL $pkg (script=$script_path, exit=$rc)"
 }
 
 read_meta_field() {
-    local key="$1" field="$2"
+    local pkg="$1" field="$2"
     local meta_file
-    meta_file="$(pkg_meta "$key")"
+    meta_file="$(pkg_meta_file "$pkg")"
     [[ -f "$meta_file" ]] || return 1
     # shellcheck disable=SC1090
     . "$meta_file"
     eval "echo \${$field:-}"
 }
 
-#---------------------------------------------
-# Localizar script pelo nome (para deps)
-#---------------------------------------------
+#--------------------------------------------------------
+# Montagem / desmontagem FS virtuais
+#--------------------------------------------------------
 
-find_script_by_name() {
-    local name="$1"
-    local hits
-    hits=$(find "$LFS_PACKAGES_DIR" -maxdepth 3 -type f -name "$name.sh")
-    local count
-    count=$(echo "$hits" | sed '/^$/d' | wc -l)
-    if [[ "$count" -eq 0 ]]; then
-        return 1
-    elif [[ "$count" -gt 1 ]]; then
-        echo "$hits"
-        return 2
+mount_virtual_fs() {
+    echo ">> Montando sistemas de arquivos virtuais em $LFS ..."
+
+    mountpoint -q "$LFS" || die "Diretório $LFS não está montado como sistema de arquivos raiz (mas isso é opcional)."
+
+    # /dev
+    if ! mountpoint -q "$LFS/dev"; then
+        mount --bind /dev "$LFS/dev"
+        echo "  - /dev montado."
+    fi
+
+    # /dev/pts
+    if ! mountpoint -q "$LFS/dev/pts"; then
+        mount -t devpts devpts "$LFS/dev/pts" -o gid=5,mode=620
+        echo "  - devpts em /dev/pts montado."
+    fi
+
+    # /proc
+    if ! mountpoint -q "$LFS/proc"; then
+        mount -t proc proc "$LFS/proc"
+        echo "  - /proc montado."
+    fi
+
+    # /sys
+    if ! mountpoint -q "$LFS/sys"; then
+        mount -t sysfs sysfs "$LFS/sys"
+        echo "  - /sys montado."
+    fi
+
+    # /run
+    if ! mountpoint -q "$LFS/run"; then
+        mount -t tmpfs tmpfs "$LFS/run"
+        echo "  - /run montado."
+    fi
+
+    echo ">> Sistemas de arquivos virtuais montados."
+}
+
+umount_virtual_fs() {
+    echo ">> Desmontando sistemas de arquivos virtuais de $LFS ..."
+
+    for mp in run sys proc dev/pts dev; do
+        if mountpoint -q "$LFS/$mp"; then
+            umount "$LFS/$mp"
+            echo "  - $LFS/$mp desmontado."
+        fi
+    done
+
+    echo ">> Desmontagem concluída."
+}
+
+enter_chroot_plain() {
+    echo ">> Entrando em chroot simples em $LFS ..."
+    exec chroot "$LFS" /usr/bin/env -i \
+        HOME=/root \
+        TERM="${TERM:-xterm}" \
+        PS1='(lfs-chroot) \u:\w\$ ' \
+        PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        /bin/bash --login
+}
+
+enter_chroot_secure() {
+    echo ">> Entrando em chroot (modo seguro) em $LFS ..."
+
+    if ! command -v unshare >/dev/null 2>&1; then
+        echo ">> 'unshare' não encontrado; caindo para chroot simples."
+        enter_chroot_plain
+        return
+    fi
+
+    exec unshare --mount --uts --ipc --pid --fork --mount-proc \
+         chroot "$LFS" /usr/bin/env -i \
+         HOME=/root \
+         TERM="${TERM:-xterm}" \
+         PS1='(lfs-secure) \u:\w\$ ' \
+         PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+         /bin/bash --login
+}
+
+#--------------------------------------------------------
+# Init / user / status
+#--------------------------------------------------------
+
+init_layout() {
+    echo ">> Criando estrutura básica em $LFS ..."
+    mkdir -pv "$LFS"
+    mkdir -pv "$LFS_SOURCES_DIR" "$LFS_TOOLS_DIR" "$LFS_LOG_DIR" "$LFS_BUILD_SCRIPTS_DIR"
+
+    chmod -v a+wt "$LFS_SOURCES_DIR" || true
+
+    mkdir -pv "$LFS"/{bin,boot,etc,home,lib,lib64,usr,var,proc,sys,dev,run,tmp}
+    chmod -v 1777 "$LFS/tmp"
+
+    echo ">> Estrutura básica criada."
+}
+
+create_build_user() {
+    echo ">> Criando usuário/grupo de build ($LFS_USER:$LFS_GROUP)..."
+
+    if ! getent group "$LFS_GROUP" >/dev/null 2>&1; then
+        groupadd "$LFS_GROUP"
+        echo "  - Grupo $LFS_GROUP criado."
     else
-        echo "$hits"
-        return 0
+        echo "  - Grupo $LFS_GROUP já existe."
     fi
+
+    if ! id "$LFS_USER" >/dev/null 2>&1; then
+        useradd -s /bin/bash -g "$LFS_GROUP" -m -k /dev/null "$LFS_USER"
+        echo "  - Usuário $LFS_USER criado."
+    else
+        echo "  - Usuário $LFS_USER já existe."
+    fi
+
+    chown -v "$LFS_USER:$LFS_GROUP" "$LFS_SOURCES_DIR" "$LFS_TOOLS_DIR" "$LFS_LOG_DIR" "$LFS_BUILD_SCRIPTS_DIR"
+
+    echo ">> Usuário/grupo de build configurados."
 }
 
-#---------------------------------------------
-# Hooks
-#---------------------------------------------
+status() {
+    cat <<EOF
+=== ADM / LFS Status ===
+LFS base...............: $LFS
+Sources................: $LFS_SOURCES_DIR
+Tools..................: $LFS_TOOLS_DIR
+Logs...................: $LFS_LOG_DIR
+Build scripts..........: $LFS_BUILD_SCRIPTS_DIR
+ADM DB.................: $ADM_DB_DIR
+LFS_USER / LFS_GROUP...: $LFS_USER / $LFS_GROUP
+Chroot seguro (unshare): $( [[ "$CHROOT_SECURE" -eq 1 ]] && echo "ATIVADO" || echo "DESATIVADO" )
 
-run_hook_if_exists() {
-    local hook="$1" key="$2" category="$3" name="$4"
-    if [[ -x "$hook" ]]; then
-        log_info "Rodando hook $hook para $key"
-        "$hook" "$category" "$name" "$key" || die "Hook $hook falhou para $key"
-    fi
+Montagens:
+$(mount | grep "on $LFS" || echo "  (sem montagens relacionadas a $LFS)")
+
+EOF
 }
 
-#---------------------------------------------
-# INSTALL (com deps, manifest, hooks, log)
-#---------------------------------------------
+#--------------------------------------------------------
+# run-build: build com deps, hooks e manifesto
+#   uso: adm run-build binutils-pass1
+#        adm run-build core/binutils-pass1/binutils-pass1.sh
+#--------------------------------------------------------
 
-install_pkg() {
-    ensure_not_root
-    ensure_dirs
+run_build_script() {
+    local spec="${1:-}"
+    [[ -z "$spec" ]] && die "Informe o identificador do script de build. Ex: run-build binutils-pass1"
 
-    local category="$1" name="$2"
-    local key
-    key=$(pkg_key "$category" "$name")
+    adm_ensure_db
 
-    if is_installed "$key"; then
-        log_warn "Pacote $key já instalado; pulando."
+    local script_path
+    script_path="$(find_build_script "$spec")"
+    local pkg
+    pkg="$(pkg_name_from_script "$script_path")"
+
+    if pkg_is_installed "$pkg"; then
+        echo ">> [ADM] Pacote $pkg já registrado como instalado; pulando."
+        adm_log "SKIP       $pkg (já instalado)"
         return 0
     fi
 
-    local script
-    script="$(pkg_script_path "$category" "$name")"
-    [[ -f "$script" ]] || die "Script de pacote não encontrado: $script"
+    echo ">> [ADM] Preparando build de $pkg (script: $script_path)"
+    adm_log "RUN-BUILD  $pkg (script=$script_path)"
 
-    load_pkg_metadata_from_script "$script"
+    # Resolver dependências recursivas
+    resolve_deps_for_script "$script_path"
 
-    if [[ "$PKG_NAME" != "$name" ]]; then
-        die "PKG_NAME=$PKG_NAME no script, mas nome esperado é $name"
-    fi
+    # Montar FS virtuais se necessário
+    mount_virtual_fs
 
-    # --- Checar se scripts de dependência existem
-    local dep
-    for dep in "${PKG_DEPS[@]:-}"; do
-        if [[ -z "$dep" ]]; then
-            continue
-        fi
-        if ! find_script_by_name "$dep" >/dev/null 2>&1; then
-            die "Dependência $dep do pacote $key não encontrada em $LFS_PACKAGES_DIR"
-        fi
-    done
+    # Caminho relativo do script a partir de $LFS_BUILD_SCRIPTS_DIR
+    local rel_path
+    rel_path="${script_path#$LFS_BUILD_SCRIPTS_DIR/}"
+    local rel_dir pkg_dir_name
+    rel_dir="$(dirname "$rel_path")"
+    pkg_dir_name="$rel_dir"   # usado para hooks/chroot
+    [[ "$pkg_dir_name" == "." ]] && pkg_dir_name=""
 
-    # --- Resolver e instalar dependências recursivamente
-    for dep in "${PKG_DEPS[@]:-}"; do
-        [[ -z "$dep" ]] && continue
-        local dep_script
-        dep_script=$(find_script_by_name "$dep" || true)
-        if [[ -z "$dep_script" ]]; then
-            die "Dependência $dep não encontrada para $key"
-        fi
-        local dep_cat dep_name
-        dep_cat=$(basename "$(dirname "$dep_script")")
-        dep_name=$(basename "$dep_script" .sh)
-        local dep_key
-        dep_key=$(pkg_key "$dep_cat" "$dep_name")
-        if ! is_installed "$dep_key"; then
-            log_info "Instalando dependência $dep_key requerida por $key"
-            install_pkg "$dep_cat" "$dep_name"
-        fi
-    done
-
-    # Hooks específicos do pacote
-    local hooks_prefix
-    hooks_prefix="$(pkg_hooks_prefix "$category" "$name")"
-    local pre_install_hook="${hooks_prefix}.pre_install"
-    local post_install_hook="${hooks_prefix}.post_install"
-
-    local log_file
-    log_file="$(pkg_logfile "$key" install)"
-
-    log_info "==> Instalando pacote $key (versão ${PKG_VERSION:-desconhecida})"
-    log_info "Log: $log_file"
-
-    mkdir -p "$(dirname "$log_file")"
-
-    run_hook_if_exists "$pre_install_hook" "$key" "$category" "$name"
-
-    # Snapshot antes da instalação
-    local before after manifest_file
+    # Snapshots antes/depois para manifesto
+    local before after
     before="$(mktemp)"
     after="$(mktemp)"
-    manifest_file="$(pkg_manifest "$key")"
-    mkdir -p "$(dirname "$manifest_file")"
-
     snapshot_fs "$before"
 
-    {
-        log_info "Executando função pkg_build do script $script ..."
-        # shellcheck source=/dev/null
-        . "$script"
-        if ! type pkg_build >/dev/null 2>&1; then
-            die "Função pkg_build não definida em $script"
-        fi
-        pkg_build
-        log_ok "Build de $key concluído."
-    } > >(tee -a "$log_file") 2>&1
+    # Comando a ser executado no chroot:
+    #  cd /build-scripts/<rel_dir>;
+    #  ./<pkg>.pre_install (se existir)
+    #  ./<pkg>.sh
+    #  ./<pkg>.post_install (se existir)
+    local chroot_dir="/build-scripts"
+    [[ -n "$pkg_dir_name" ]] && chroot_dir="$chroot_dir/$pkg_dir_name"
 
-    # Snapshot depois e geração do manifesto
-    snapshot_fs "$after"
-    calc_manifest "$before" "$after" "$manifest_file"
-    rm -f "$before" "$after"
+    local chroot_cmd="cd '$chroot_dir'; \
+if [[ -x './${pkg}.pre_install' ]]; then ./'${pkg}.pre_install'; fi; \
+./'${pkg}.sh'; \
+if [[ -x './${pkg}.post_install' ]]; then ./'${pkg}.post_install'; fi;"
 
-    write_meta_file "$key" "$name" "$category" "${PKG_VERSION:-}" "${PKG_DEPS[*]:-}"
+    if chroot "$LFS" /usr/bin/env -i \
+        HOME=/root \
+        TERM="${TERM:-xterm}" \
+        PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        /bin/bash -lc "$chroot_cmd"
+    then
+        # snapshot depois
+        snapshot_fs "$after"
+        local manifest
+        manifest="$(pkg_manifest_file "$pkg")"
+        mkdir -p "$ADM_INSTALLED_DIR"
+        calc_manifest "$before" "$after" "$manifest"
+        rm -f "$before" "$after"
 
-    # Registrar último pacote instalado com sucesso
-    echo "$(pkg_key "$category" "$name")" > "$LFS_PKG_DB_DIR/last_success"
-
-    run_hook_if_exists "$post_install_hook" "$key" "$category" "$name"
-
-    log_ok "Pacote $key instalado com sucesso."
+        register_success "$script_path"
+    else
+        local rc=$?
+        rm -f "$before" "$after"
+        register_failure "$script_path" "$rc"
+        exit "$rc"
+    fi
 }
 
-#---------------------------------------------
-# UNINSTALL (via manifesto) + hooks
-#---------------------------------------------
+#--------------------------------------------------------
+# build-status: lista pacotes registrados
+#--------------------------------------------------------
+
+build_status() {
+    adm_ensure_db
+    echo "=== ADM Build Status ==="
+    local any=0
+    for meta in "$ADM_INSTALLED_DIR"/*.meta 2>/dev/null; do
+        [[ -f "$meta" ]] || continue
+        any=1
+        # shellcheck disable=SC1090
+        . "$meta"
+        printf "  - %-20s (script=%s, data=%s, deps=%s)\n" \
+            "${NAME:-?}" "${SCRIPT:-?}" "${BUILT_AT:-?}" "${DEPS:-}"
+    done
+    if [[ "$any" -eq 0 ]]; then
+        echo "  (nenhum pacote registrado ainda)"
+    fi
+    if [[ -f "$ADM_LAST_SUCCESS" ]]; then
+        echo
+        echo "Último build com sucesso: $(cat "$ADM_LAST_SUCCESS")"
+    fi
+}
+
+#--------------------------------------------------------
+# uninstall: remove arquivos pelo manifesto + hooks
+#   uso: adm uninstall binutils-pass1
+#--------------------------------------------------------
 
 uninstall_pkg() {
-    ensure_not_root
-    ensure_dirs
+    local pkg="${1:-}"
+    [[ -z "$pkg" ]] && die "Uso: adm uninstall <pacote>"
 
-    local name="$1" category="${2:-}"
-    local key
+    adm_ensure_db
 
-    if [[ -n "$category" ]]; then
-        key=$(pkg_key "$category" "$name")
-        if ! is_installed "$key"; then
-            die "Pacote $key não está instalado."
-        fi
-    else
-        # Descobrir categoria pelo meta
-        local metas
-        metas=$(grep -Rl "^NAME=$name\$" "$LFS_PKG_DB_DIR/installed" 2>/dev/null || true)
-        local count
-        count=$(echo "$metas" | sed '/^$/d' | wc -l)
-        if [[ "$count" -eq 0 ]]; then
-            die "Pacote $name não encontrado na base de instalados."
-        elif [[ "$count" -gt 1 ]]; then
-            echo "Múltiplos pacotes com NAME=$name encontrados:"
-            echo "$metas"
-            die "Especifique também a categoria."
-        else
-            local meta_file
-            meta_file="$metas"
-            local base
-            base=$(basename "$(dirname "$meta_file")")
-            key="$base"
-        fi
+    local manifest meta_file
+    manifest="$(pkg_manifest_file "$pkg")"
+    meta_file="$(pkg_meta_file "$pkg")"
+
+    [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg: $manifest"
+    [[ -f "$meta_file" ]] || die "Meta não encontrada para $pkg: $meta_file"
+
+    # encontra script correspondente para poder rodar hooks
+    local script_path
+    script_path="$(read_meta_field "$pkg" SCRIPT)"
+    if [[ -z "$script_path" || ! -f "$script_path" ]]; then
+        # fallback: tenta achar pelo nome
+        script_path="$(find_build_script "$pkg")"
     fi
+    local rel_path rel_dir
+    rel_path="${script_path#$LFS_BUILD_SCRIPTS_DIR/}"
+    rel_dir="$(dirname "$rel_path")"
+    [[ "$rel_dir" == "." ]] && rel_dir=""
 
-    local manifest
-    manifest="$(pkg_manifest "$key")"
-    [[ -f "$manifest" ]] || die "Manifesto não encontrado para $key: $manifest"
+    echo ">> [ADM] Desinstalando pacote $pkg"
+    adm_log "UNINSTALL  $pkg"
 
-    local name_field category_field
-    name_field=$(read_meta_field "$key" NAME)
-    category_field=$(read_meta_field "$key" CATEGORY)
+    # pre_uninstall hook (chroot)
+    mount_virtual_fs
+    run_hook_in_chroot "$rel_dir" "$pkg" "pre_uninstall"
 
-    if [[ -z "$category" ]]; then
-        category="$category_field"
-    fi
-
-    local hooks_prefix
-    hooks_prefix="$(pkg_hooks_prefix "$category" "$name_field")"
-    local pre_uninstall_hook="${hooks_prefix}.pre_uninstall"
-    local post_uninstall_hook="${hooks_prefix}.post_uninstall"
-
-    local log_file
-    log_file="$(pkg_logfile "$key" uninstall)"
-    mkdir -p "$(dirname "$log_file")"
-
-    log_info "==> Desinstalando pacote $key"
-    log_info "Log: $log_file"
-
-    run_hook_if_exists "$pre_uninstall_hook" "$key" "$category" "$name_field"
-
-    {
-        # Remove arquivos/diretórios listados no manifesto (de trás pra frente)
-        tac "$manifest" | while read -r path; do
-            if [[ -f "$path" || -L "$path" ]]; then
-                rm -f "$path" && log_info "Removido arquivo $path"
-            elif [[ -d "$path" ]]; then
-                rmdir "$path" 2>/dev/null && log_info "Removido diretório vazio $path" || true
-            fi
-        done
-
-        rm -f "$manifest"
-        rm -f "$(pkg_meta "$key")"
-        rmdir "$(pkg_db_dir "$key")" 2>/dev/null || true
-
-        log_ok "Pacote $key desinstalado."
-    } > >(tee -a "$log_file") 2>&1
-
-    run_hook_if_exists "$post_uninstall_hook" "$key" "$category" "$name_field"
-}
-
-#---------------------------------------------
-# Listar pacotes instalados
-#---------------------------------------------
-
-list_installed() {
-    ensure_dirs
-    echo "Pacotes instalados em $LFS_PKG_DB_DIR/installed:"
-    find "$LFS_PKG_DB_DIR/installed" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort | while read -r key; do
-        local name category version
-        name=$(read_meta_field "$key" NAME)
-        category=$(read_meta_field "$key" CATEGORY)
-        version=$(read_meta_field "$key" VERSION)
-        printf '  - %s (cat=%s, ver=%s)\n' "$name" "$category" "$version"
+    # remove arquivos/diretórios listados (ordem reversa)
+    tac "$manifest" | while read -r path; do
+        [[ -z "$path" ]] && continue
+        if [[ -f "$path" || -L "$path" ]]; then
+            rm -f "$path" || echo "  ! Falha ao remover arquivo $path"
+        elif [[ -d "$path" ]]; then
+            rmdir "$path" 2>/dev/null || true
+        fi
     done
+
+    rm -f "$manifest" "$meta_file"
+
+    # post_uninstall hook (chroot)
+    run_hook_in_chroot "$rel_dir" "$pkg" "post_uninstall"
+
+    adm_log "UNINSTALL OK $pkg"
+    echo ">> [ADM] Pacote $pkg desinstalado."
 }
 
-#---------------------------------------------
-# Encontrar e remover órfãos
-#---------------------------------------------
+#--------------------------------------------------------
+# Encontrar & desinstalar órfãos
+#  - órfão = ninguém o cita em DEPS
+#--------------------------------------------------------
 
 find_orphans() {
-    ensure_dirs
-    local all_keys
-    all_keys=$(find "$LFS_PKG_DB_DIR/installed" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' || true)
-    local key
-    for key in $all_keys; do
-        local name
-        name=$(read_meta_field "$key" NAME)
-        local others deps
-        local needed=0
-        for others in $all_keys; do
-            [[ "$others" == "$key" ]] && continue
-            deps=$(read_meta_field "$others" DEPS)
-            if echo " $deps " | grep -q " $name "; then
+    adm_ensure_db
+    local pkgs
+    pkgs=$(for f in "$ADM_INSTALLED_DIR"/*.meta 2>/dev/null; do
+        [[ -f "$f" ]] || continue
+        basename "${f%.meta}"
+    done)
+
+    local p o deps needed
+    for p in $pkgs; do
+        needed=0
+        for o in $pkgs; do
+            [[ "$o" == "$p" ]] && continue
+            deps=$(read_meta_field "$o" DEPS)
+            if echo " $deps " | grep -q " $p "; then
                 needed=1
                 break
             fi
         done
         if [[ "$needed" -eq 0 ]]; then
-            echo "$key"
+            echo "$p"
         fi
     done
 }
 
 uninstall_orphans() {
+    adm_ensure_db
     local orphans
-    orphans=$(find_orphans)
+    orphans="$(find_orphans)"
+
     if [[ -z "$orphans" ]]; then
-        log_info "Nenhum órfão encontrado."
+        echo ">> [ADM] Nenhum órfão encontrado."
         return 0
     fi
 
-    log_warn "Os seguintes pacotes parecem órfãos (ninguém depende deles):"
+    echo ">> [ADM] Pacotes órfãos (ninguém depende deles):"
     echo "$orphans" | sed 's/^/  - /'
+
     read -r -p "Remover todos? [y/N] " ans
     case "$ans" in
         y|Y)
-            local key
-            for key in $orphans; do
-                local name category
-                name=$(read_meta_field "$key" NAME)
-                category=$(read_meta_field "$key" CATEGORY)
-                uninstall_pkg "$name" "$category"
+            local p
+            for p in $orphans; do
+                uninstall_pkg "$p"
             done
             ;;
         *)
-            log_info "Abortado pelo usuário."
+            echo ">> [ADM] Remoção de órfãos abortada."
             ;;
     esac
 }
 
-#---------------------------------------------
-# Retomar a partir do último sucesso
-# (usa build-order.txt: linha no formato categoria:pacote)
-#---------------------------------------------
-
-resume_from_last_success() {
-    ensure_dirs
-    if [[ ! -f "$LFS_PKG_DB_DIR/last_success" ]]; then
-        die "Arquivo last_success não encontrado; ainda não há builds bem-sucedidos registrados."
-    fi
-
-    [[ -f "$BUILD_ORDER_FILE" ]] || die "Arquivo de ordem de build não encontrado: $BUILD_ORDER_FILE"
-
-    local last key_list
-    last=$(cat "$LFS_PKG_DB_DIR/last_success")
-    key_list=$(grep -Ev '^\s*$|^\s*#' "$BUILD_ORDER_FILE" || true)
-
-    if ! echo "$key_list" | grep -qx "$last"; then
-        die "Pacote last_success ($last) não está no arquivo de ordem de build."
-    fi
-
-    local start_install=0
-    local line
-    while read -r line; do
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        if [[ "$start_install" -eq 0 ]]; then
-            if [[ "$line" == "$last" ]]; then
-                start_install=1
-                continue    # começa no próximo
-            else
-                continue
-            fi
-        fi
-        local category name
-        category="${line%%:*}"
-        name="${line##*:}"
-        install_pkg "$category" "$name"
-    done <<< "$key_list"
-}
-
-#---------------------------------------------
-# CLI
-#---------------------------------------------
+#--------------------------------------------------------
+# Uso
+#--------------------------------------------------------
 
 usage() {
     cat <<EOF
-Uso: $0 <comando> [args]
+Uso: $0 <comando> [opções]
 
-Comandos:
-  install <categoria> <pacote>   Instala um pacote (resolve dependências)
-  uninstall <pacote> [categoria] Desinstala um pacote via manifesto
-  uninstall-orphans              Remove pacotes órfãos (sem dependentes)
-  list                           Lista pacotes instalados
-  resume                         Retoma build a partir do último sucesso (usa build-order.txt)
-  help                           Mostra esta ajuda
+Comandos principais:
+  init                   Prepara estrutura básica do LFS (pastas, permissões)
+  create-user            Cria usuário/grupo para construção (LFS_USER/LFS_GROUP)
+  mount                  Monta sistemas de arquivos virtuais no LFS
+  umount                 Desmonta sistemas de arquivos virtuais do LFS
+  chroot                 Entra em chroot (seguro se possível)
+  chroot-plain           Entra em chroot simples (sem unshare, etc.)
+  status                 Mostra status básico do ambiente LFS
 
-Estrutura esperada de scripts:
-  \$LFS/packages/<categoria>/<pacote>/<pacote>.sh
+Comandos de build:
+  run-build <spec>       Executa script de build dentro do LFS com:
+                         - resolução de dependências (arquivo <prog>.deps)
+                         - hooks pre/post install
+                         - manifesto de arquivos instalados
+                         spec pode ser:
+                           binutils-pass1
+                           binutils-pass1.sh
+                           core/binutils-pass1
+                           core/binutils-pass1/binutils-pass1.sh
+  build-status           Lista pacotes já registrados
 
-Dentro de <pacote>.sh:
-  PKG_NAME=nome
-  PKG_VERSION=versão
-  PKG_CATEGORY=categoria
-  PKG_DEPS=(dep1 dep2 ...)
+Comandos de desinstalação:
+  uninstall <pacote>     Desinstala pacote usando manifesto
+                         (pacote = nome lógico, ex: binutils-pass1)
+  uninstall-orphans      Desinstala pacotes órfãos (ninguém depende deles)
 
-  pkg_build() {
-      # aqui compila e instala o pacote (configure/make/make install, etc.)
-  }
+Arquivo de configuração (opcional):
+  $LFS_CONFIG
 
-Hooks opcionais por pacote (executáveis, no mesmo diretório):
-  <pacote>.pre_install
-  <pacote>.post_install
-  <pacote>.pre_uninstall
-  <pacote>.post_uninstall
-
-Arquivo de ordem de build (opcional, para 'resume'):
-  $BUILD_ORDER_FILE
-  Formato por linha: categoria:pacote
+Estrutura de scripts:
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.sh
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.deps
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.pre_install
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.post_install
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.pre_uninstall
+  $LFS/build-scripts/<categoria>/<programa>/<programa>.post_uninstall
 EOF
 }
 
+#--------------------------------------------------------
+# Main
+#--------------------------------------------------------
+
 main() {
-    local cmd="${1:-}"
-    if [[ -z "$cmd" ]]; then
+    if [[ $# -lt 1 ]]; then
         usage
         exit 1
     fi
-    shift || true
+
+    load_config
+    require_root
+
+    local cmd="$1"; shift || true
 
     case "$cmd" in
-        install)
-            [[ $# -eq 2 ]] || die "Uso: $0 install <categoria> <pacote>"
-            install_pkg "$1" "$2"
+        init)
+            init_layout
+            ;;
+        create-user)
+            create_build_user
+            ;;
+        mount)
+            mount_virtual_fs
+            ;;
+        umount)
+            umount_virtual_fs
+            ;;
+        chroot)
+            mount_virtual_fs
+            if [[ "$CHROOT_SECURE" -eq 1 ]]; then
+                enter_chroot_secure
+            else
+                enter_chroot_plain
+            fi
+            ;;
+        chroot-plain)
+            mount_virtual_fs
+            enter_chroot_plain
+            ;;
+        status)
+            status
+            ;;
+        run-build)
+            run_build_script "$@"
+            ;;
+        build-status)
+            build_status
             ;;
         uninstall)
-            [[ $# -ge 1 ]] || die "Uso: $0 uninstall <pacote> [categoria]"
-            uninstall_pkg "$1" "${2:-}"
+            uninstall_pkg "${1:-}"
             ;;
         uninstall-orphans)
             uninstall_orphans
-            ;;
-        list)
-            list_installed
-            ;;
-        resume)
-            resume_from_last_success
             ;;
         help|-h|--help)
             usage
             ;;
         *)
-            die "Comando inválido: $cmd"
+            echo "Comando desconhecido: $cmd"
+            usage
+            exit 1
             ;;
     esac
 }
