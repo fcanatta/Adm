@@ -1,0 +1,9 @@
+# Cada linha é um “identificador” de script.
+# O adm aceita:
+#   - nome do pacote            (ex: gcc-pass1)
+#   - nome + .sh                (ex: gcc-pass1.sh)
+#   - caminho "categoria/nome"  (ex: core/gcc-pass1)
+#   - caminho completo relativo (ex: core/gcc-pass1/gcc-pass1.sh)
+
+core/linux-headers
+core/gcc-pass1
