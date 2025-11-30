@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[binutils-pass1.post_uninstall] Binutils Pass 1 removido."
+echo "[binutils-pass1.post_uninstall] Verifique se não há builds em andamento que dependam dele."
