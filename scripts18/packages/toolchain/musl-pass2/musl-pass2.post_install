@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#============================================================
+# Hook de pós-instalação para musl (Pass 2)
+#
+# Tarefas:
+#   - Encontrar ld-musl-*.so.1 em $ROOT/lib
+#   - Criar/ajustar symlink genérico:
+#       $ROOT/lib/ld-musl.so.1 -> ld-musl-<arch>.so.1
+#   - Criar (se não existir) $ROOT/etc/ld-musl-<arch>.path
+#       com /lib e /usr/lib
+#
+# ROOT:
+#   - Se LFS estiver definido, usa ROOT="$LFS"
+#   - Caso contrário, ROOT="/"
+#   Isso permite funcionar tanto em /mnt/lfs quanto no sistema final.
+#============================================================
+
+ROOT="${LFS:-/}"
+
+# 1. Encontrar o dynamic linker específico (ld-musl-<arch>.so.1)
+ld_path="$(find "$ROOT/lib" -maxdepth 1 -type f -name 'ld-musl-*.so.1' | sort | head -n1 || true)"
+
+if [[ -z "$ld_path" ]]; then
+    echo "AVISO [musl post_install]: nenhum ld-musl-*.so.1 encontrado em $ROOT/lib; nada a fazer."
+    exit 0
+fi
+
+ld_name="${ld_path##*/}"          # ex: ld-musl-x86_64.so.1
+arch_part="${ld_name#ld-musl-}"   # x86_64.so.1
+arch_part="${arch_part%.so.1}"    # x86_64
+
+echo ">> [musl post_install] Dynamic linker detectado: $ld_name (arch=$arch_part)"
+
+# 2. Garantir symlink genérico /lib/ld-musl.so.1
+generic="$ROOT/lib/ld-musl.so.1"
+
+if [[ -L "$generic" || -e "$generic" ]]; then
+    target="$(readlink "$generic" 2>/dev/null || true)"
+    if [[ "$target" != "$ld_name" ]]; then
+        ln -sf "$ld_name" "$generic"
+        echo ">> [musl post_install] Symlink atualizado: $generic -> $ld_name"
+    else
+        echo ">> [musl post_install] Symlink $generic já aponta para $ld_name"
+    fi
+else
+    ln -s "$ld_name" "$generic"
+    echo ">> [musl post_install] Symlink criado: $generic -> $ld_name"
+fi
+
+# 3. Criar arquivo de paths /etc/ld-musl-<arch>.path, se ainda não existir
+etc_dir="$ROOT/etc"
+path_file="$etc_dir/ld-musl-${arch_part}.path"
+
+mkdir -p "$etc_dir"
+
+if [[ ! -f "$path_file" ]]; then
+    {
+        echo "/lib"
+        echo "/usr/lib"
+    } > "$path_file"
+    echo ">> [musl post_install] Criado $path_file com paths padrão:"
+    echo "                       /lib"
+    echo "                       /usr/lib"
+else
+    echo ">> [musl post_install] $path_file já existe; não será modificado."
+fi
+
+echo ">> [musl post_install] Hook de pós-instalação do musl concluído."
