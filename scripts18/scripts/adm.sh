@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #============================================================
-#  ADM - Gerenciador de builds para LFS / sistema final
+#  ADM - Gerenciador de builds para LFS / Sistema final
 #
-#  - Usa scripts de construção em:
+#  - Scripts de construção em:
 #      $LFS/packages/<categoria>/<programa>/<programa>.sh
 #      $LFS/packages/<categoria>/<programa>/<programa>.deps
 #      $LFS/packages/<categoria>/<programa>/<programa>.pre_install
@@ -12,10 +12,15 @@
 #
 #  - Resolve dependências (.deps)
 #  - Gera meta + manifest em $LFS/var/adm
-#  - Uninstall por manifest + hooks
-#  - Retoma builds (pula pacotes já instalados)
-#  - chroot automático (monta /dev,/proc,/sys,/run, entra e sai)
-#  - Suporta cross-toolchain em $LFS/tools (scripts como binutils-pass1.sh)
+#  - Uninstall via manifest + hooks
+#  - Retomada: já instalado => pula
+#  - Chroot automático para pacotes "normais"
+#    (cross-toolchain em .../cross/... é construído fora do chroot)
+#
+#  Configuração:
+#    - Padrão: LFS=/mnt/lfs
+#    - Opcional: /etc/adm.conf pode redefinir LFS, diretórios, etc.
+#
 #============================================================
 
 set -euo pipefail
@@ -23,7 +28,10 @@ set -euo pipefail
 CMD_NAME="${0##*/}"
 LFS_CONFIG="${LFS_CONFIG:-/etc/adm.conf}"
 
-# Variáveis globais preenchidas após load_config
+# LFS padrão se nada for definido
+DEFAULT_LFS="${DEFAULT_LFS:-/mnt/lfs}"
+
+# Variáveis globais (preenchidas em load_config)
 LFS="${LFS:-}"
 LFS_SOURCES_DIR=""
 LFS_TOOLS_DIR=""
@@ -34,8 +42,8 @@ ADM_PKG_META_DIR=""
 ADM_MANIFEST_DIR=""
 ADM_STATE_DIR=""
 ADM_LOG_FILE=""
+CHROOT_FOR_BUILDS=1
 
-# Pilha de dependências para detectar ciclos
 ADM_DEP_STACK=""
 
 #============================================================
@@ -67,7 +75,7 @@ Uso: $CMD_NAME <comando> [args...]
 
 Comandos principais:
   status                      Mostra status e caminhos do LFS/ADM
-  run-build <pkg>...          Constrói um ou mais pacotes (com deps)
+  run-build <pkg>...          Constrói um ou mais pacotes (com dependências)
   list-installed              Lista pacotes registrados como instalados
   uninstall <pkg>             Desinstala um pacote via manifest + hooks
 
@@ -77,15 +85,15 @@ Chroot / LFS:
   chroot                      Monta, entra em chroot, desmonta ao sair
 
 Observações:
-  - O valor de LFS vem do ambiente ou de $LFS_CONFIG.
-    Exemplos:
-        export LFS=/mnt/lfs   # fase de construção
-        export LFS=/          # depois que o LFS vira sistema principal
+  - LFS padrão: $DEFAULT_LFS
+  - Você pode ajustar LFS e outros caminhos em: $LFS_CONFIG
 
   - Scripts de construção devem estar em:
       \$LFS/packages/<categoria>/<programa>/<programa>.sh
 
-  - Dependências: arquivo .deps no mesmo diretório, com 1 pacote por linha.
+  - Dependências ficam em:
+      \$LFS/packages/<categoria>/<programa>/<programa>.deps
+    (um pacote por linha, # para comentário)
 EOF
 }
 
@@ -99,10 +107,12 @@ load_config() {
         . "$LFS_CONFIG"
     fi
 
-    # LFS precisa estar definido no final
-    : "${LFS:?LFS não definido. Exporte LFS=/mnt/lfs ou LFS=/ e/ou ajuste $LFS_CONFIG}"
+    # Se ainda não há LFS definido, usa padrão
+    if [[ -z "${LFS:-}" ]]; then
+        LFS="$DEFAULT_LFS"
+    fi
 
-    # Diretórios derivados (com defaults sensatos)
+    # Diretórios derivados com defaults sensatos
     LFS_SOURCES_DIR="${LFS_SOURCES_DIR:-$LFS/sources}"
     LFS_TOOLS_DIR="${LFS_TOOLS_DIR:-$LFS/tools}"
     LFS_BUILD_SCRIPTS_DIR="${LFS_BUILD_SCRIPTS_DIR:-$LFS/packages}"
@@ -113,6 +123,11 @@ load_config() {
     ADM_MANIFEST_DIR="$ADM_DB_DIR/manifests"
     ADM_STATE_DIR="$ADM_DB_DIR/state"
     ADM_LOG_FILE="$ADM_DB_DIR/adm.log"
+
+    CHROOT_FOR_BUILDS="${CHROOT_FOR_BUILDS:-1}"
+
+    # Exporta LFS e alguns caminhos chave para scripts de build
+    export LFS LFS_SOURCES_DIR LFS_TOOLS_DIR
 }
 
 adm_ensure_db() {
@@ -126,37 +141,24 @@ adm_ensure_db() {
 mount_virtual_fs() {
     echo ">> Montando sistemas de arquivos virtuais em $LFS ..."
 
-    if [[ -z "${LFS:-}" ]]; then
-        die "LFS não definido (mount_virtual_fs)."
-    fi
-
     mkdir -p "$LFS/dev" "$LFS/dev/pts" "$LFS/proc" "$LFS/sys" "$LFS/run"
 
-    # /dev
     if ! mountpoint -q "$LFS/dev"; then
         mount --bind /dev "$LFS/dev"
         echo "  - /dev montado."
     fi
-
-    # /dev/pts
     if ! mountpoint -q "$LFS/dev/pts"; then
         mount -t devpts devpts "$LFS/dev/pts" -o gid=5,mode=620
         echo "  - /dev/pts montado."
     fi
-
-    # /proc
     if ! mountpoint -q "$LFS/proc"; then
         mount -t proc proc "$LFS/proc"
         echo "  - /proc montado."
     fi
-
-    # /sys
     if ! mountpoint -q "$LFS/sys"; then
         mount -t sysfs sysfs "$LFS/sys"
         echo "  - /sys montado."
     fi
-
-    # /run
     if ! mountpoint -q "$LFS/run"; then
         mount -t tmpfs tmpfs "$LFS/run"
         echo "  - /run montado."
@@ -168,7 +170,6 @@ mount_virtual_fs() {
 umount_virtual_fs() {
     echo ">> Desmontando sistemas de arquivos virtuais de $LFS ..."
     local mp
-
     for mp in "$LFS/run" "$LFS/proc" "$LFS/sys" "$LFS/dev/pts" "$LFS/dev"; do
         if mountpoint -q "$mp"; then
             if ! umount "$mp"; then
@@ -178,7 +179,6 @@ umount_virtual_fs() {
             fi
         fi
     done
-
     echo ">> Desmontagem concluída."
 }
 
@@ -192,6 +192,7 @@ enter_chroot_shell() {
         TERM="${TERM:-xterm}" \
         PS1="[LFS chroot] \\u:\\w\\$ " \
         PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        LFS="/" \
         /bin/bash --login
 }
 
@@ -207,6 +208,22 @@ cmd_chroot() {
     umount_virtual_fs
 }
 
+# Executa um arquivo que está em $LFS/algum/caminho dentro do chroot
+chroot_exec_file() {
+    local abs="$1"
+    local rel="${abs#$LFS}"
+    if [[ "$rel" == "$abs" ]]; then
+        die "Arquivo $abs não está dentro de LFS ($LFS)"
+    fi
+    rel="${rel#/}"  # remove /
+    chroot "$LFS" /usr/bin/env -i \
+        HOME=/root \
+        TERM="${TERM:-xterm}" \
+        PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        LFS="/" \
+        /bin/bash -lc "/$rel"
+}
+
 #============================================================
 # Snapshot / Manifest
 #============================================================
@@ -214,20 +231,13 @@ cmd_chroot() {
 snapshot_fs() {
     local outfile="$1"
 
-    if [[ -z "${LFS:-}" ]]; then
-        die "LFS não definido (snapshot_fs)."
-    fi
     if [[ ! -d "$LFS" ]]; then
         die "Diretório base LFS não existe: $LFS"
     fi
 
-    # Apenas arquivos e symlinks, dentro de LFS, ignorando:
-    #  - banco de dados do ADM
-    #  - diretório de scripts de build
-    #  - diretório de sources
     find "$LFS" -xdev \
         \( -path "$ADM_DB_DIR" -o -path "$LFS_BUILD_SCRIPTS_DIR" -o -path "$LFS_SOURCES_DIR" \) -prune -o \
-        \( -type f -o -type l \) -print \
+        \( -type f -o -type l -o -type d \) -print \
         | sort > "$outfile"
 }
 
@@ -300,7 +310,7 @@ hook_path() {
     echo "$pkg_dir/${pkg}.${hook_type}"
 }
 
-run_hook() {
+run_hook_host() {
     local hook="$1"
     local phase="$2"
     local pkg="$3"
@@ -312,24 +322,34 @@ run_hook() {
     fi
 }
 
+run_hook_chroot() {
+    local hook="$1"
+    local phase="$2"
+    local pkg="$3"
+
+    if [[ -x "$hook" ]]; then
+        echo ">> [$pkg] Executando hook (chroot) $phase: $(basename "$hook")"
+        adm_log "HOOK_CHROOT $phase $pkg $hook"
+        chroot_exec_file "$hook"
+    fi
+}
+
 read_deps() {
     local pkg="$1"
-    local script
+    local script dir deps_file
+
     script="$(find_build_script "$pkg")"
-    local dir
     dir="$(pkg_dir_from_script "$script")"
-    local deps_file="$dir/$pkg.deps"
+    deps_file="$dir/$pkg.deps"
 
     if [[ ! -f "$deps_file" ]]; then
         echo ""
         return 0
     fi
 
-    # Lê dependências, ignorando linhas em branco e comentários
     local deps=()
     local line
     while IFS= read -r line; do
-        # remove espaços nas pontas
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" ]] && continue
@@ -338,6 +358,11 @@ read_deps() {
     done <"$deps_file"
 
     printf '%s\n' "${deps[@]}"
+}
+
+is_cross_script() {
+    local script="$1"
+    [[ "$script" == *"/cross/"* ]]
 }
 
 #============================================================
@@ -356,12 +381,10 @@ run_single_build() {
     echo ">> [$pkg] Iniciando build"
     adm_log "BUILD START $pkg SCRIPT=$script"
 
-    # logs
     local ts logfile
     ts="$(date +'%Y%m%d-%H%M%S')"
     logfile="$LFS_LOG_DIR/${pkg}-$ts.log"
 
-    # snapshots
     mkdir -p "$ADM_STATE_DIR"
     local pre_snap post_snap
     pre_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.pre.XXXXXX")"
@@ -369,47 +392,78 @@ run_single_build() {
 
     snapshot_fs "$pre_snap"
 
-    # hooks de pre_install
     local pre_install_hook post_install_hook
     pre_install_hook="$(hook_path "$pkg_dir" "$pkg" "pre_install")"
     post_install_hook="$(hook_path "$pkg_dir" "$pkg" "post_install")"
 
-    # Executa tudo com stdout/stderr indo para tee
+    local use_chroot=0
+    if is_cross_script "$script"; then
+        use_chroot=0
+    else
+        if [[ "$LFS" != "/" && "$CHROOT_FOR_BUILDS" -eq 1 ]]; then
+            use_chroot=1
+        fi
+    fi
+
+    local rc=0
+    local mounted=0
+
     {
         echo "==== ADM build: $pkg ===="
-        echo "Data: $(date +'%F %T')"
-        echo "LFS : $LFS"
-        echo "Script: $script"
+        echo "Data........: $(date +'%F %T')"
+        echo "LFS.........: $LFS"
+        echo "Script......: $script"
+        echo "Chroot build: $use_chroot"
         echo
 
-        run_hook "$pre_install_hook" "pre_install" "$pkg"
+        if [[ "$use_chroot" -eq 1 ]]; then
+            echo ">> [$pkg] Build será executado em chroot."
+        else
+            echo ">> [$pkg] Build será executado no host (sem chroot)."
+        fi
 
-        echo ">> [$pkg] Executando script de build..."
-        adm_log "BUILD RUN $pkg"
-        "$script"
-
-        run_hook "$post_install_hook" "post_install" "$pkg"
+        if [[ "$use_chroot" -eq 1 ]]; then
+            mount_virtual_fs
+            mounted=1
+            run_hook_chroot "$pre_install_hook" "pre_install" "$pkg"
+            echo ">> [$pkg] Executando script de build em chroot..."
+            chroot_exec_file "$script"
+            run_hook_chroot "$post_install_hook" "post_install" "$pkg"
+        else
+            run_hook_host "$pre_install_hook" "pre_install" "$pkg"
+            echo ">> [$pkg] Executando script de build (host)..."
+            "$script"
+            run_hook_host "$post_install_hook" "post_install" "$pkg"
+        fi
 
         echo ">> [$pkg] Build concluído."
-    } 2>&1 | tee "$logfile"
+    } >"$logfile" 2>&1 || rc=$?
+
+    if [[ "$mounted" -eq 1 ]]; then
+        umount_virtual_fs || true
+    fi
+
+    if [[ "$rc" -ne 0 ]]; then
+        adm_log "BUILD FAIL $pkg RC=$rc LOG=$logfile"
+        echo ">> [$pkg] ERRO no build. Veja o log: $logfile" >&2
+        exit "$rc"
+    fi
 
     snapshot_fs "$post_snap"
 
-    # Calcula manifest (arquivos novos)
     local manifest
     manifest="$(pkg_manifest_file "$pkg")"
     comm -13 "$pre_snap" "$post_snap" >"$manifest"
 
-    # Remove snapshots temporários
     rm -f "$pre_snap" "$post_snap"
 
-    # Meta
     local deps
     deps="$(read_deps "$pkg" || true)"
     write_meta "$pkg" "$script" "$deps"
 
     adm_log "BUILD OK $pkg LOG=$logfile"
     echo ">> [$pkg] Registrado com sucesso. Manifest: $manifest"
+    echo ">> [$pkg] Log: $logfile"
 }
 
 #============================================================
@@ -419,14 +473,12 @@ run_single_build() {
 build_with_deps() {
     local pkg="$1"
 
-    # Se já instalado, não reconstrói (retomada automática)
     if is_installed "$pkg"; then
         echo ">> [$pkg] Já instalado, pulando."
         adm_log "SKIP INSTALLED $pkg"
         return 0
     fi
 
-    # Lê deps
     local deps dep
     deps=()
     while IFS= read -r dep; do
@@ -434,7 +486,6 @@ build_with_deps() {
         deps+=("$dep")
     done < <(read_deps "$pkg" || true)
 
-    # Controle de ciclo
     if [[ " $ADM_DEP_STACK " == *" $pkg "* ]]; then
         die "Detectado ciclo de dependências envolvendo '$pkg' (stack: $ADM_DEP_STACK)"
     fi
@@ -442,13 +493,11 @@ build_with_deps() {
     local old_stack="$ADM_DEP_STACK"
     ADM_DEP_STACK="$ADM_DEP_STACK $pkg"
 
-    # Constrói dependências primeiro
     for dep in "${deps[@]}"; do
         echo ">> [$pkg] Dependência: $dep"
         build_with_deps "$dep"
     done
 
-    # Constrói o pacote em si
     run_single_build "$pkg"
 
     ADM_DEP_STACK="$old_stack"
@@ -484,30 +533,31 @@ uninstall_pkg() {
     [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg: $manifest"
     [[ -f "$meta" ]] || die "Meta não encontrado para $pkg: $meta"
 
+    if ! command -v tac >/dev/null 2>&1; then
+        die "'tac' não encontrado no PATH (necessário para uninstall)."
+    fi
+
     require_root
 
     adm_log "UNINSTALL START $pkg"
     echo ">> [UNINSTALL] Removendo pacote $pkg"
 
-    # Localiza script e diretório para hooks
     local script pkg_dir
     script="$(find_build_script "$pkg")"
     pkg_dir="$(pkg_dir_from_script "$script")"
 
-    local pre_un_hook post_un_hook
-    pre_un_hook="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
-    post_un_hook="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
+    local pre_un post_un
+    pre_un="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
+    post_un="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
 
-    # Hook de pre_uninstall
-    run_hook "$pre_un_hook" "pre_uninstall" "$pkg"
+    # Hooks de uninstall sempre no "ambiente normal":
+    # - se quiser dentro de chroot, basta rodar ADM de dentro do LFS.
+    run_hook_host "$pre_un" "pre_uninstall" "$pkg"
 
-    # Remove arquivos listados no manifest
     local path
-    # Remove em ordem reversa, pra tentar remover arquivos antes dos dirs
     tac "$manifest" | while read -r path; do
         [[ -z "$path" ]] && continue
 
-        # Segurança: só remover dentro de LFS
         case "$path" in
             "$LFS"|"$LFS"/*)
                 ;;
@@ -526,8 +576,7 @@ uninstall_pkg() {
 
     rm -f "$manifest" "$meta"
 
-    # Hook de post_uninstall
-    run_hook "$post_un_hook" "post_uninstall" "$pkg"
+    run_hook_host "$post_un" "post_uninstall" "$pkg"
 
     adm_log "UNINSTALL OK $pkg"
     echo ">> [UNINSTALL] Pacote $pkg removido."
@@ -559,6 +608,7 @@ ADM DB................: $ADM_DB_DIR
 Meta de pacotes.......: $ADM_PKG_META_DIR
 Manifests.............: $ADM_MANIFEST_DIR
 Log geral.............: $ADM_LOG_FILE
+CHROOT_FOR_BUILDS.....: $CHROOT_FOR_BUILDS
 
 EOF
 }
@@ -595,7 +645,6 @@ main() {
             cmd_status
             ;;
         run-build)
-            # run-build pode ser executado como usuário normal (ex: lfs)
             cmd_run_build "$@"
             ;;
         list-installed)
