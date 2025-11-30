@@ -96,6 +96,115 @@ pkg_is_installed() {
 }
 
 #--------------------------------------------------------
+# Proteção anti-strip (Gl i bc & libs críticas)
+#--------------------------------------------------------
+
+# Verifica se um arquivo é ELF
+adm_is_elf() {
+    local f="$1"
+    [[ -f "$f" ]] || return 1
+    if command -v file >/dev/null 2>&1; then
+        file -L "$f" 2>/dev/null | grep -q "ELF"
+    else
+        # Sem 'file', jogamos seguro: não stripamos nada
+        return 1
+    fi
+}
+
+# Retorna 0 se o arquivo é Glibc / loader / crt* crítico
+adm_is_glibc_critical() {
+    local f="$1"
+    local b
+    b="$(basename "$f")"
+
+    case "$b" in
+        # dynamic loaders
+        ld-linux*.so.*|ld-lsb*.so.*)
+            return 0 ;;
+        # libc
+        libc-*.so|libc.so.*)
+            return 0 ;;
+        # pthread
+        libpthread-*.so|libpthread.so.*)
+            return 0 ;;
+        # math
+        libm-*.so|libm.so.*)
+            return 0 ;;
+        # time / realtime
+        librt-*.so|librt.so.*)
+            return 0 ;;
+        # dl
+        libdl-*.so|libdl.so.*)
+            return 0 ;;
+        # resolver / nsl (algumas distros usam)
+        libresolv-*.so|libresolv.so.*|libnsl-*.so|libnsl.so.*)
+            return 0 ;;
+        # startup objects da toolchain
+        crt1.o|crti.o|crtn.o)
+            return 0 ;;
+    esac
+
+    # Também protegemos qualquer coisa dentro de /lib ou /lib64 que se pareça loader
+    case "$f" in
+        */lib/ld-linux*.so.*|*/lib64/ld-linux*.so.*)
+            return 0 ;;
+    esac
+
+    return 1
+}
+
+# Strip seguro de um único arquivo
+adm_safe_strip_file() {
+    local f="$1"
+
+    # Se não é arquivo regular, ignora
+    [[ -f "$f" ]] || return 0
+
+    # Se não é ELF, ignora
+    if ! adm_is_elf "$f"; then
+        return 0
+    fi
+
+    # Se é Glibc ou arquivo crítico, não mexe
+    if adm_is_glibc_critical "$f"; then
+        echo ">> [safe-strip] SKIP (glibc/crítico): $f"
+        return 0
+    fi
+
+    if ! command -v strip >/dev/null 2>&1; then
+        die "'strip' não encontrado no PATH (safe-strip abortado)."
+    fi
+
+    # Strip conservador: remove só símbolos não usados
+    if strip --strip-unneeded "$f" 2>/dev/null; then
+        echo ">> [safe-strip] strip --strip-unneeded: $f"
+    else
+        echo ">> [safe-strip] AVISO: falha ao stripar $f (ignorando)." >&2
+        # não damos die aqui pra não matar todo o processo por 1 arquivo
+    fi
+}
+
+# Strip seguro recursivo em uma árvore
+adm_safe_strip_tree() {
+    local root="${1:-}"
+
+    [[ -z "$root" ]] && die "Uso: adm safe-strip <diretório>"
+
+    if [[ ! -d "$root" ]]; then
+        die "Diretório para safe-strip não existe: $root"
+    fi
+
+    echo ">> [safe-strip] Iniciando strip seguro em: $root"
+    local f
+    # find + while para não estourar xargs
+    while IFS= read -r f; do
+        adm_safe_strip_file "$f"
+    done < <(find "$root" -type f -print)
+
+    echo ">> [safe-strip] Strip seguro concluído em: $root"
+}
+
+#--------------------------------------------------------
 # Localizar script de build em subpastas de $LFS/build-scripts
 #   - aceita:
 #       binutils-pass1
@@ -289,11 +398,14 @@ read_meta_field() {
 # Montagem / desmontagem FS virtuais
 #--------------------------------------------------------
 
-mount_virtual_fs() {
+mount_virtual_fs() {    
     echo ">> Montando sistemas de arquivos virtuais em $LFS ..."
 
-    mountpoint -q "$LFS" || die "Diretório $LFS não está montado como sistema de arquivos raiz (mas isso é opcional)."
-
+    if ! mountpoint -q "$LFS"; then
+        echo "AVISO: $LFS não é um ponto de montagem (mountpoint)."
+        echo "       Continuando assim mesmo; certifique-se de saber o que está fazendo."
+    fi
+    
     # /dev
     if ! mountpoint -q "$LFS/dev"; then
         mount --bind /dev "$LFS/dev"
@@ -661,6 +773,7 @@ Comandos principais:
   chroot                 Entra em chroot (seguro se possível)
   chroot-plain           Entra em chroot simples (sem unshare, etc.)
   status                 Mostra status básico do ambiente LFS
+  safe-strip <dir>       Faz strip seguro em <dir>, pulando Glibc e arquivos críticos
 
 Comandos de build:
   run-build <spec>       Executa script de build dentro do LFS com:
@@ -734,6 +847,9 @@ main() {
             ;;
         status)
             status
+            ;;
+        safe-strip)
+            adm_safe_strip_tree "${1:-}"
             ;;
         run-build)
             run_build_script "$@"
