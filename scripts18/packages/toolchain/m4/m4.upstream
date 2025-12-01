@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Helper de upstream para M4
+# Saída: versão mais recente do M4 em formato X.Y.Z
+set -euo pipefail
+
+BASE_URL="https://ftp.gnu.org/gnu/m4/"
+
+fallback_version() {
+    # Versão atualmente em uso na tua árvore
+    echo "1.4.20"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Pega entradas do tipo m4-X.Y.Z.tar.xz ou .tar.gz, etc.
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'm4-[0-9]+\.[0-9]+\.[0-9]+\.tar\.(xz|gz|bz2)' \
+        | sed -E 's#m4-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.(xz|gz|bz2)#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
