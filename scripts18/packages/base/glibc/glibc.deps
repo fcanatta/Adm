@@ -1,0 +1,6 @@
+# Dependências para construir a Glibc final (glibc-2.42)
+# A ordem aqui é respeitada pelo adm (via build_with_deps).
+  
+binutils
+gcc
+linux-headers
