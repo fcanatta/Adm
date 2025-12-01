@@ -1,0 +1,36 @@
+#!/bin/bash
+# glibc.upstream
+# Verifica se há versão mais nova do Glibc no ftp.gnu.org
+
+set -euo pipefail
+
+PKG_NAME="glibc"
+CURRENT_VERSION="2.42"
+UPSTREAM_DIR="https://ftp.gnu.org/gnu/glibc/"
+
+# Requer: curl, grep, sed, sort (coreutils)
+
+html="$(curl -fsSL "$UPSTREAM_DIR")"
+
+# Pega todos os nomes glibc-X.Y[.Z].tar.xz da listagem
+latest_tar="$(
+    printf '%s\n' "$html" \
+    | grep -o 'glibc-[0-9][0-9.]*\.tar\.xz' \
+    | sed 's/.*href="//; s/".*//' \
+    | sort -uV \
+    | tail -n1
+)"
+
+if [[ -z "$latest_tar" ]]; then
+    echo "WARN: não consegui detectar a versão mais recente de ${PKG_NAME} em ${UPSTREAM_DIR}" >&2
+    exit 0
+fi
+
+latest_version="${latest_tar#glibc-}"
+latest_version="${latest_version%.tar.xz}"
+
+if [[ "$latest_version" != "$CURRENT_VERSION" ]]; then
+    # Formato amigável para o seu adm coletar:
+    #   nome_atual versao_atual -> versao_nova URL
+    echo "${PKG_NAME} ${CURRENT_VERSION} -> ${latest_version} ${UPSTREAM_DIR}${latest_tar}"
+fi
