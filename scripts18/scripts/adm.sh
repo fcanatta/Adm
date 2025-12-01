@@ -148,6 +148,9 @@ load_config() {
     # Diretório padrão onde ficam pacotes binários prontos
     ADM_BIN_PKG_DIR="${ADM_BIN_PKG_DIR:-$LFS/binary-packages}"
 
+    # Diretório de perfis (env) para controlar modo de build (glibc/musl, pass1/final, etc.)
+    ADM_PROFILE_DIR="${ADM_PROFILE_DIR:-$LFS/profiles}"
+
     CHROOT_FOR_BUILDS="${CHROOT_FOR_BUILDS:-1}"
 
     # Exporta LFS e alguns caminhos chave para scripts de build
@@ -628,6 +631,9 @@ cmd_run_build() {
     fi
 
     adm_ensure_db
+
+    # Carrega o perfil (se ADM_PROFILE estiver definido), antes de qualquer build
+    load_profile
 
     local pkg
     for pkg in "$@"; do
