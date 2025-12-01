@@ -570,6 +570,21 @@ run_single_build() {
     echo ">> [$pkg] Log de build: $logfile"
 }
 
+load_profile() {
+    if [[ -z "${ADM_PROFILE:-}" ]]; then
+        return 0
+    fi
+
+    local pf="${ADM_PROFILE_DIR}/${ADM_PROFILE}.env"
+    if [[ ! -f "$pf" ]]; then
+        die "Perfil ADM_PROFILE='${ADM_PROFILE}' não encontrado em ${ADM_PROFILE_DIR}"
+    fi
+
+    echo "==> [adm] Carregando perfil: ${ADM_PROFILE} (${pf})"
+    # shellcheck source=/dev/null
+    . "$pf"
+}
+
 #============================================================
 # Build com dependências e retomada
 #============================================================
