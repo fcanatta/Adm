@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Helper de upstream para glibc
+# Saída: versão estável mais recente da glibc em formato X.Y ou X.Y.Z
+#
+# Lê o índice de https://ftp.gnu.org/gnu/libc/ e pega o maior
+# glibc-*.tar.xz disponível, usando sort -V.
+#
+# Fallback: 2.42 (estável atual, lançada em 2025-07-28).
+
+set -euo pipefail
+
+BASE_URL="https://ftp.gnu.org/gnu/libc/"
+
+fallback_version() {
+    # Versão fallback atual (glibc estável conhecida)
+    echo "2.42"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura arquivos glibc-X.Y(.Z).tar.xz e extrai só o X.Y(.Z)
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'glibc-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.xz' \
+        | sed -E 's#glibc-([0-9]+\.[0-9]+(\.[0-9]+)?)\.tar\.xz#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
