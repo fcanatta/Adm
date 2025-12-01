@@ -291,21 +291,21 @@ is_installed() {
 
 find_build_script() {
     local pkg="$1"
-    local pattern="$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"/"$pkg".sh
+    local matches=()
 
     shopt -s nullglob
-    local matches=($pattern)
+    matches=( "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"/"$pkg".sh )
     shopt -u nullglob
 
-    if [[ ${#matches[@]} -eq 0 ]]; then
+    if (( ${#matches[@]} == 0 )); then
         die "Script de build não encontrado para pacote '$pkg' em $LFS_BUILD_SCRIPTS_DIR/*/$pkg/$pkg.sh"
-    elif [[ ${#matches[@]} -gt 1 ]]; then
+    elif (( ${#matches[@]} > 1 )); then
         echo "Foram encontrados múltiplos scripts para '$pkg':" >&2
         printf '  - %s\n' "${matches[@]}" >&2
         die "Ambiguidade: mais de um script de build para '$pkg'."
     fi
 
-    echo "${matches[0]}"
+    printf '%s\n' "${matches[0]}"
 }
 
 pkg_dir_from_script() {
