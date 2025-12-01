@@ -1,0 +1,4 @@
+# mpfr.deps
+# MPFR depende de GMP.
+
+gmp
