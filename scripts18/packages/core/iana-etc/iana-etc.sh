@@ -154,7 +154,6 @@ find_services_protocols_dir() {
 # -------------------------------------------------------------
 
 install_pkg() {
-    # SRC_ETC_DIR é relativo ao diretório .src
     cd "${LFS_SOURCES_DIR}/${PKG_NAME}-${PKG_VERSION}.src"
 
     if [[ -z "${SRC_ETC_DIR:-}" ]]; then
@@ -173,12 +172,9 @@ install_pkg() {
 
     log "Instalando /etc/services e /etc/protocols"
 
-    # Opcionalmente, poderia fazer backup aqui, mas para LFS puro
-    # os arquivos ainda não existem. Mantemos simples:
     install -Dm644 "${services_file}"  "/etc/services"
     install -Dm644 "${protocols_file}" "/etc/protocols"
 
-    # Se existir LICENSE no tarball, instala em /usr/share/licenses/iana-etc/LICENSE
     local license_path=""
     license_path="$(find . -maxdepth 4 -type f -name 'LICENSE' -print | head -n1 || true)"
     if [[ -n "${license_path}" ]]; then
@@ -189,12 +185,60 @@ install_pkg() {
     fi
 }
 
+package_iana_etc() {
+    # Empacota os arquivos instalados em /etc/services e /etc/protocols
+    # em um tar.zst em $ADM_BIN_PKG_DIR (ou $LFS/binary-packages por padrão).
+
+    # Garante caminho de saída para pacotes binários
+    local bin_dir destdir arch pkgfile
+    bin_dir="${ADM_BIN_PKG_DIR:-${LFS:-/mnt/lfs}/binary-packages}"
+    mkdir -p "${bin_dir}"
+
+    # Cria DESTDIR temporário
+    destdir="$(mktemp -d "${TMPDIR:-/tmp}/${PKG_NAME}-pkg.XXXXXX")"
+
+    # Copia os arquivos instalados para o DESTDIR
+    if [[ -f /etc/services ]]; then
+        install -Dm644 /etc/services  "${destdir}/etc/services"
+    else
+        log "Aviso: /etc/services não existe; nada para empacotar."
+    fi
+
+    if [[ -f /etc/protocols ]]; then
+        install -Dm644 /etc/protocols "${destdir}/etc/protocols"
+    else
+        log "Aviso: /etc/protocols não existe; nada para empacotar."
+    fi
+
+    # Se nenhum arquivo foi copiado, não gera pacote
+    if [[ ! -e "${destdir}/etc/services" && ! -e "${destdir}/etc/protocols" ]]; then
+        log "Nenhum arquivo encontrado para empacotar; DESTDIR vazio. Cancelando empacotamento."
+        rm -rf "${destdir}"
+        return 0
+    fi
+
+    arch="$(uname -m)"
+    pkgfile="${bin_dir}/${PKG_NAME}-${PKG_VERSION}-${arch}.tar.zst"
+
+    if command -v zstd >/dev/null 2>&1; then
+        log "Empacotando ${PKG_NAME}-${PKG_VERSION} em ${pkgfile} ..."
+        tar -C "${destdir}" -cf - . | zstd -T0 -19 -o "${pkgfile}.tmp"
+        mv -f "${pkgfile}.tmp" "${pkgfile}"
+        log "Pacote binário gerado: ${pkgfile}"
+    else
+        log "zstd não encontrado; pulando empacotamento em .tar.zst (apenas instalação no sistema)."
+    fi
+
+    rm -rf "${destdir}"
+}
+
 main() {
     select_profile
     fetch_tarball
     check_sha256
     prepare_source
     install_pkg
+    package_iana_etc
 
     log "Concluído ${PKG_NAME}-${PKG_VERSION} para perfil ${ADM_PROFILE:-<não-definido>}."
 }
