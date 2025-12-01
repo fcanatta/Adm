@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Helper de upstream para libstdc++
+# A versão do libstdc++ acompanha a versão do GCC.
+# Aqui buscamos a última versão do GCC em ftp.gnu.org e retornamos X.Y.Z.
+#
+# Exemplo: se o último diretório for gcc-15.2.0/, este script imprime:
+#   15.2.0
+#
+# Fallback: 15.2.0 (versão atual que você está usando).
+
+set -euo pipefail
+
+BASE_URL="https://ftp.gnu.org/gnu/gcc/"
+
+fallback_version() {
+    # Versão fallback atual do GCC/libstdc++
+    echo "15.2.0"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura diretórios gcc-X.Y.Z/
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'gcc-[0-9]+\.[0-9]+\.[0-9]+/' \
+        | sed 's#gcc-##; s#/##' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
