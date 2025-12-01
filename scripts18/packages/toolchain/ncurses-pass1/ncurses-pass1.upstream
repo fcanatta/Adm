@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Helper de upstream para Ncurses 6.5
+# Saída: versão mais recente em formato 6.5-YYYYMMDD
+set -euo pipefail
+
+BASE_URL="https://invisible-mirror.net/archives/ncurses/current/"
+
+fallback_version() {
+    # Versão atual do livro LFS que você está usando
+    echo "6.5-20250809"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura arquivos ncurses-6.5-YYYYMMDD.tgz
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'ncurses-6\.5-[0-9]{8}\.tgz' \
+        | sed -E 's#ncurses-(6\.5-[0-9]{8})\.tgz#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
