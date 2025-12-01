@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-PKG_NAME="glibc"
+PKG_NAME="glibc-pass1"
 CURRENT_VERSION="2.42"
 UPSTREAM_DIR="https://ftp.gnu.org/gnu/glibc/"
 
