@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Helper de upstream para man-pages
+# Saída: versão estável mais recente da série man-pages
+# Formato: X.Y ou X.Y.Z
+#
+# Lê:
+#   https://www.kernel.org/pub/linux/docs/man-pages/
+# e escolhe o maior man-pages-*.tar.xz com sort -V.
+#
+# Fallback: 6.16 (versão conhecida atual).
+
+set -euo pipefail
+
+BASE_URL="https://www.kernel.org/pub/linux/docs/man-pages/"
+
+fallback_version() {
+    echo "6.16"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura arquivos man-pages-X.Y(.Z).tar.xz e extrai só X.Y(.Z)
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'man-pages-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.xz' \
+        | sed -E 's#man-pages-([0-9]+\.[0-9]+(\.[0-9]+)?)\.tar\.xz#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
