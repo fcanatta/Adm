@@ -1,0 +1,5 @@
+# mpc.deps
+# MPC depende de GMP e MPFR.
+
+gmp
+mpfr
