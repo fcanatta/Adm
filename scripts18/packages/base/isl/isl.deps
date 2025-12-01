@@ -1,0 +1,4 @@
+# isl.deps
+# ISL depende de GMP.
+
+gmp
