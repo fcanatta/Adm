@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Hook pós-instalação da Glibc
+# Executado automaticamente pelo adm depois de glibc.sh
+# - No modo final (CHROOT_FOR_BUILDS=1), este hook roda DENTRO do chroot.
+
+set -euo pipefail
+
+echo "[glibc.post_install] Rodando pós-instalação da Glibc..."
+
+# Atualiza o cache de bibliotecas, se ldconfig existir.
+if command -v ldconfig >/dev/null 2>&1; then
+    echo "[glibc.post_install] Executando ldconfig..."
+    ldconfig
+else
+    echo "[glibc.post_install] ldconfig não encontrado; pulando."
+fi
+
+echo "[glibc.post_install] Finalizado."
