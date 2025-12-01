@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Helper de upstream para zlib
+#
+# Saída: última versão estável no formato X.Y ou X.Y.Z
+# Fonte: https://zlib.net/fossils/
+#
+# Exemplo: 1.3.1
+#
+# Fallback: 1.3.1
+
+set -euo pipefail
+
+BASE_URL="https://zlib.net/fossils/"
+
+fallback_version() {
+    echo "1.3.1"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura arquivos zlib-X.Y(.Z).tar.gz e extrai só X.Y(.Z)
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'zlib-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz' \
+        | sed -E 's#zlib-([0-9]+\.[0-9]+(\.[0-9]+)?)\.tar\.gz#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
