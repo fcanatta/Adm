@@ -127,6 +127,60 @@ install_pkg() {
     make prefix="${PREFIX}" install
 }
 
+package_man_pages() {
+    # Empacota apenas as man pages instaladas por este pacote,
+    # usando DESTDIR no próprio Makefile do man-pages.
+    #
+    # Resultado: $ADM_BIN_PKG_DIR/man-pages-<versão>-<arch>.tar.zst
+
+    local bin_dir destdir arch pkgfile srcdir
+
+    bin_dir="${ADM_BIN_PKG_DIR:-${LFS:-/mnt/lfs}/binary-packages}"
+    mkdir -p "${bin_dir}"
+
+    # Diretório de build do man-pages (já preparado em prepare_source)
+    srcdir="${LFS_SOURCES_DIR}/${PKG_NAME}-${PKG_VERSION}"
+
+    if [[ ! -d "${srcdir}" ]]; then
+        log "Diretório de fonte ${srcdir} não existe mais; não é possível empacotar."
+        return 0
+    fi
+
+    destdir="$(mktemp -d "${TMPDIR:-/tmp}/${PKG_NAME}-pkg.XXXXXX")"
+
+    log "Reinstalando ${PKG_NAME}-${PKG_VERSION} em DESTDIR para empacotamento..."
+    (
+        cd "${srcdir}"
+        # Reaplicamos o mesmo install, mas com DESTDIR para montar a árvore do pacote
+        if ! make prefix="${PREFIX}" DESTDIR="${destdir}" install; then
+            log "make DESTDIR=${destdir} install falhou; removendo DESTDIR e abortando empacotamento."
+            rm -rf "${destdir}"
+            return 0
+        fi
+    )
+
+    # Se não tiver nada em share/man, não empacota
+    if [[ ! -d "${destdir}${PREFIX}/share/man" ]]; then
+        log "Nenhum conteúdo em ${destdir}${PREFIX}/share/man; nada para empacotar."
+        rm -rf "${destdir}"
+        return 0
+    fi
+
+    arch="$(uname -m)"
+    pkgfile="${bin_dir}/${PKG_NAME}-${PKG_VERSION}-${arch}.tar.zst"
+
+    if command -v zstd >/dev/null 2>&1; then
+        log "Empacotando ${PKG_NAME}-${PKG_VERSION} em ${pkgfile} ..."
+        tar -C "${destdir}" -cf - . | zstd -T0 -19 -o "${pkgfile}.tmp"
+        mv -f "${pkgfile}.tmp" "${pkgfile}"
+        log "Pacote binário gerado: ${pkgfile}"
+    else
+        log "zstd não encontrado; pulando empacotamento em .tar.zst (apenas instalação no sistema)."
+    fi
+
+    rm -rf "${destdir}"
+}
+
 main() {
     select_profile
     fetch_tarball
@@ -134,6 +188,7 @@ main() {
     prepare_source
     build
     install_pkg
+    package_man_pages
 
     log "Concluído ${PKG_NAME}-${PKG_VERSION} para perfil ${ADM_PROFILE:-<não-definido>}."
 }
