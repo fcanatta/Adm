@@ -1,0 +1,8 @@
+# gcc.deps
+# Dependências para GCC final (glibc-final ou musl-final).
+
+binutils
+gmp
+mpfr
+mpc
+isl
