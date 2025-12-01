@@ -292,13 +292,38 @@ is_installed() {
 find_build_script() {
     local pkg="$1"
     local matches=()
+    local roots=()
+
+    # 1) Se ADM_LIBC estiver setado, prioriza a categoria libc-<flavor>
+    #    Ex.: ADM_LIBC=musl --> base/libc-musl/<pkg>/<pkg>.sh
+    if [[ -n "${ADM_LIBC:-}" ]]; then
+        roots+=( "$LFS_BUILD_SCRIPTS_DIR/libc-${ADM_LIBC}" )
+    fi
+
+    # 2) Raiz padrão (permite manter scripts antigos, ex.: $LFS/packages/base/...)
+    roots+=( "$LFS_BUILD_SCRIPTS_DIR" )
 
     shopt -s nullglob
-    matches=( "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"/"$pkg".sh )
+    for root in "${roots[@]}"; do
+        matches+=( "$root"/*/"$pkg"/"$pkg".sh )
+    done
     shopt -u nullglob
 
+    # Remove duplicados (se algum path apareceu duas vezes)
+    if (( ${#matches[@]} > 1 )); then
+        local uniq=() seen
+        declare -A seen=()
+        local m
+        for m in "${matches[@]}"; do
+            [[ -n "${seen[$m]:-}" ]] && continue
+            uniq+=( "$m" )
+            seen["$m"]=1
+        done
+        matches=("${uniq[@]}")
+    fi
+
     if (( ${#matches[@]} == 0 )); then
-        die "Script de build não encontrado para pacote '$pkg' em $LFS_BUILD_SCRIPTS_DIR/*/$pkg/$pkg.sh"
+        die "Script de build não encontrado para pacote '$pkg' (roots: ${roots[*]})"
     elif (( ${#matches[@]} > 1 )); then
         echo "Foram encontrados múltiplos scripts para '$pkg':" >&2
         printf '  - %s\n' "${matches[@]}" >&2
