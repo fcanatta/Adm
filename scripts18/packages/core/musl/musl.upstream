@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Helper de upstream para musl
+# Saída: versão estável mais recente do musl em formato X.Y.Z
+set -euo pipefail
+
+BASE_URL="https://musl.libc.org/releases.html"
+
+fallback_version() {
+    # Versão que você está usando hoje no adm
+    echo "1.2.5"
+    exit 0
+}
+
+fetch_index() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${BASE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "${BASE_URL}"
+    else
+        fallback_version
+    fi
+}
+
+main() {
+    local html version
+
+    html="$(fetch_index)"
+
+    # Procura nomes de tarball tipo musl-1.2.5.tar.gz na página de releases
+    version="$(
+        printf '%s\n' "$html" \
+        | grep -Eo 'musl-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+        | sed -E 's#musl-([0-9]+\.[0-9]+\.[0-9]+)\.tar\.gz#\1#' \
+        | sort -V \
+        | tail -n1
+    )"
+
+    if [[ -n "${version}" ]]; then
+        printf '%s\n' "${version}"
+    else
+        fallback_version
+    fi
+}
+
+main "$@"
