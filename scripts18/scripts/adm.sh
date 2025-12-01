@@ -260,7 +260,10 @@ snapshot_fs() {
     fi
 
     find "$LFS" -xdev \
-        \( -path "$ADM_DB_DIR" -o -path "$LFS_BUILD_SCRIPTS_DIR" -o -path "$LFS_SOURCES_DIR" \) -prune -o \
+        \( -path "$ADM_DB_DIR" \
+           -o -path "$LFS_BUILD_SCRIPTS_DIR" \
+           -o -path "$LFS_SOURCES_DIR" \
+           -o -path "$LFS_LOG_DIR" \) -prune -o \
         \( -type f -o -type l -o -type d \) -print \
         | sort > "$outfile"
 }
@@ -470,6 +473,7 @@ run_single_build() {
     pre_install_hook="$(hook_path "$pkg_dir" "$pkg" "pre_install")"
     post_install_hook="$(hook_path "$pkg_dir" "$pkg" "post_install")"
 
+    # Decide se vai usar chroot
     local use_chroot=0
     if is_cross_script "$script"; then
         use_chroot=0
@@ -479,28 +483,28 @@ run_single_build() {
         fi
     fi
 
+    # Se for usar chroot, exija root ANTES de tentar montar/chrootar
+    if [[ "$use_chroot" -eq 1 ]]; then
+        require_root
+    fi
+
     local rc=0
     local mounted=0
 
     {
-        echo "==== ADM build: $pkg ===="
-        echo "Data........: $(date +'%F %T')"
-        echo "LFS.........: $LFS"
-        echo "Script......: $script"
-        echo "Chroot build: $use_chroot"
-        echo
+        echo "==> Build do pacote: $pkg"
+        echo "    LFS=$LFS"
+        echo "    Script: $script"
+        echo "    Data: $(date)"
+        echo "    CHROOT_FOR_BUILDS=$CHROOT_FOR_BUILDS (use_chroot=$use_chroot)"
 
         if [[ "$use_chroot" -eq 1 ]]; then
-            echo ">> [$pkg] Build será executado em chroot."
-        else
-            echo ">> [$pkg] Build será executado no host (sem chroot)."
-        fi
-
-        if [[ "$use_chroot" -eq 1 ]]; then
+            echo ">> [$pkg] Build será feito em chroot."
             mount_virtual_fs
             mounted=1
+
             run_hook_chroot "$pre_install_hook" "pre_install" "$pkg"
-            echo ">> [$pkg] Executando script de build em chroot..."
+            echo ">> [$pkg] Executando script de build (chroot)..."
             chroot_exec_file "$script"
             run_hook_chroot "$post_install_hook" "post_install" "$pkg"
         else
@@ -533,11 +537,12 @@ run_single_build() {
 
     local deps
     deps="$(read_deps "$pkg" || true)"
+
     write_meta "$pkg" "$script" "$deps"
 
-    adm_log "BUILD OK $pkg LOG=$logfile"
-    echo ">> [$pkg] Registrado com sucesso. Manifest: $manifest"
-    echo ">> [$pkg] Log: $logfile"
+    adm_log "BUILD OK $pkg MANIFEST=$manifest LOG=$logfile"
+    echo ">> [$pkg] Build concluído com sucesso. Manifesto: $manifest"
+    echo ">> [$pkg] Log de build: $logfile"
 }
 
 #============================================================
@@ -811,22 +816,37 @@ cmd_install() {
 
 check_upstream_for_pkg() {
     local pkg="$1"
-    local script pkg_dir upstream latest
+    local pkg_dir upstream latest
+    local candidates=()
 
-    script="$(find_build_script "$pkg")"
-    pkg_dir="$(pkg_dir_from_script "$script")"
-    upstream="$pkg_dir/$pkg.upstream"
+    # Procurar diretórios de pacote que tenham um helper .upstream executável
+    shopt -s nullglob
+    for pkg_dir in "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"; do
+        if [[ -x "$pkg_dir/$pkg.upstream" ]]; then
+            candidates+=("$pkg_dir/$pkg.upstream")
+        fi
+    done
+    shopt -u nullglob
 
-    if [[ ! -x "$upstream" ]]; then
-        # sem upstream-helper => não dá pra checar
+    # Nenhum helper encontrado => "sem upstream", mas NÃO morre, só retorna 2
+    if [[ ${#candidates[@]} -eq 0 ]]; then
         return 2
     fi
 
+    # Se houver mais de um helper, consideramos ambíguo e também retornamos 2,
+    # para não derrubar o update inteiro.
+    if [[ ${#candidates[@]} -gt 1 ]]; then
+        return 2
+    fi
+
+    upstream="${candidates[0]}"
+
     if ! latest="$("$upstream")"; then
+        # helper existe mas falhou
         return 1
     fi
 
-    # pega só primeira palavra/linha
+    # Pega só a primeira palavra/linha
     latest="${latest%%[[:space:]]*}"
 
     [[ -n "$latest" ]] || return 1
