@@ -295,28 +295,37 @@ snapshot_fs() {
 #============================================================
 
 generate_manifest_from_snapshots() {
-    local pre_snapshot="$1"
-    local post_snapshot="$2"
+    local pre="$1"
+    local post="$2"
     local manifest="$3"
-
-    if [[ ! -f "$pre_snapshot" || ! -f "$post_snapshot" ]]; then
-        echo "generate_manifest_from_snapshots: snapshots inexistentes: $pre_snapshot / $post_snapshot" >&2
-        return 1
-    fi
-
-    local tmp_created
-    tmp_created="$(mktemp "${ADM_STATE_DIR:-/tmp}/created.XXXXXX")"
-
-    # Paths que existem só no snapshot final (novos)
-    LC_ALL=C comm -13 "$pre_snapshot" "$post_snapshot" > "$tmp_created"
 
     : > "$manifest"
 
-    local path type
-    while IFS= read -r path; do
+    local path rel type
+
+    # Queremos que o manifest salve caminhos RELATIVOS ao LFS,
+    # por exemplo: /usr/bin/ls em vez de /mnt/lfs/usr/bin/ls.
+    #
+    # O snapshot (pre/post) contém caminhos ABSOLUTOS com prefixo $LFS.
+    # Aqui nós stripamos esse prefixo e garantimos um "/" inicial.
+    comm -13 "$pre" "$post" | while IFS= read -r path; do
         [[ -z "$path" ]] && continue
 
-        # Determina tipo atual do caminho
+        rel="$path"
+
+        # Se o caminho começa com $LFS, stripamos esse prefixo
+        if [[ -n "${LFS:-}" && "$path" == "$LFS"* ]]; then
+            rel="${path#$LFS}"
+            [[ -z "$rel" ]] && rel="/"
+        fi
+
+        # Garante que começa com "/"
+        if [[ "$rel" != /* ]]; then
+            rel="/$rel"
+        fi
+
+        # Descobre o tipo usando o caminho real (com prefixo $LFS)
+        # porque é isso que existe no filesystem real
         if [[ -L "$path" ]]; then
             type="L"
         elif [[ -d "$path" ]]; then
@@ -324,14 +333,11 @@ generate_manifest_from_snapshots() {
         elif [[ -f "$path" ]]; then
             type="F"
         else
-            # Tipo desconhecido, ainda assim registra com '?'
             type="?"
         fi
 
-        printf '%s %s\n' "$type" "$path" >> "$manifest"
-    done < "$tmp_created"
-
-    rm -f "$tmp_created"
+        printf '%s %s\n' "$type" "$rel"
+    done >> "$manifest"
 }
 
 #============================================================
@@ -850,7 +856,9 @@ uninstall_pkg() {
         return 1
     fi
 
+    # -------------------------------
     # Dependências reversas
+    # -------------------------------
     local other_meta other_pkg deps
     local rev_deps=()
     for other_meta in "$ADM_PKG_META_DIR"/*.meta; do
@@ -875,7 +883,9 @@ uninstall_pkg() {
         return 1
     fi
 
-    # Hooks de uninstall no padrão <pkg>.pre_uninstall / <pkg>.post_uninstall
+    # -------------------------------
+    # Hooks de uninstall
+    # -------------------------------
     local script pkg_dir pre_uninstall_hook post_uninstall_hook
     script="$(read_meta_field "$pkg" "SCRIPT" 2>/dev/null || true)"
     if [[ -n "$script" && -f "$script" ]]; then
@@ -888,10 +898,16 @@ uninstall_pkg() {
 
     echo "Removendo arquivos do pacote '$pkg' de acordo com manifest: $manifest"
 
+    # -------------------------------
+    # Leitura do manifest (ordem reversa)
+    #   - entende formato novo: "T /caminho/relativo"
+    #   - e formato antigo: "/LFS/.../caminho/absoluto"
+    # -------------------------------
     while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
 
-        local type path
+        local type path full
+
         if [[ "$entry" == [FDL?]" "* ]]; then
             type="${entry%% *}"
             path="${entry#* }"
@@ -900,25 +916,54 @@ uninstall_pkg() {
             path="$entry"
         fi
 
+        # trim
         path="${path#"${path%%[![:space:]]*}"}"
         path="${path%"${path##*[![:space:]]}"}"
 
         [[ -z "$path" ]] && continue
 
-        if [[ "$path" != "$LFS" && "$path" != "$LFS"/* ]]; then
-            echo "Aviso: ignorando caminho fora de \$LFS no manifest: $path" >&2
+        # -------------------------------
+        # Reconstruir caminho completo:
+        #   1) Se path já começa com $LFS → formato antigo (absoluto) → usa direto
+        #   2) Se path começa com "/"    → formato novo (relativo)   → prefixa $LFS
+        #   3) Senão                     → relativo estranho         → também prefixa
+        # -------------------------------
+        if [[ -n "${LFS:-}" && "$path" == "$LFS"* ]]; then
+            full="$path"
+        else
+            if [[ "$path" == /* ]]; then
+                # "/usr/bin/ls" → "$LFS/usr/bin/ls" (ou "/usr/bin/ls" se LFS="/")
+                if [[ "${LFS:-/}" == "/" ]]; then
+                    full="$path"
+                else
+                    full="$LFS$path"
+                fi
+            else
+                # "usr/bin/ls" → "$LFS/usr/bin/ls"
+                if [[ "${LFS:-/}" == "/" ]]; then
+                    full="/$path"
+                else
+                    full="$LFS/$path"
+                fi
+            fi
+        fi
+
+        # Segurança: não permitir caminhos fora de $LFS nem com ".." bizarro
+        if [[ -n "${LFS:-}" && "$full" != "$LFS" && "$full" != "$LFS"/* && "$LFS" != "/" ]]; then
+            echo "Aviso: ignorando caminho fora de \$LFS no manifest: $full" >&2
             continue
         fi
 
-        if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
-            echo "Aviso: ignorando caminho suspeito com '..' no manifest: $path" >&2
+        if [[ "$full" == *"/../"* || "$full" == "../"* || "$full" == *"/.." ]]; then
+            echo "Aviso: ignorando caminho suspeito com '..' no manifest: $full" >&2
             continue
         fi
 
-        if [[ -f "$path" || -L "$path" ]]; then
-            rm -f -- "$path" || echo "Falha ao remover arquivo/link: $path" >&2
-        elif [[ -d "$path" ]]; then
-            rmdir -- "$path" 2>/dev/null || true
+        # Remoção em si
+        if [[ -f "$full" || -L "$full" ]]; then
+            rm -f -- "$full" || echo "Falha ao remover arquivo/link: $full" >&2
+        elif [[ -d "$full" ]]; then
+            rmdir -- "$full" 2>/dev/null || true
         else
             :
         fi
@@ -1378,7 +1423,7 @@ verify_pkg() {
     local errors=0 warnings=0
     local missing=0 out_of_lfs=0 suspicious=0 total=0
 
-    # META
+    # ---- META ----
     if [[ ! -f "$meta" ]]; then
         echo "  [ERRO] Arquivo meta não encontrado: $meta"
         ((errors++))
@@ -1414,12 +1459,12 @@ verify_pkg() {
         echo "  Meta: OK (com $warnings aviso(s))."
     fi
 
-    # MANIFEST
+    # ---- MANIFEST ----
     if [[ ! -f "$manifest" ]]; then
         echo "  [ERRO] Manifesto não encontrado: $manifest"
         ((errors++))
     else
-        local line path type
+        local line path type full
 
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
@@ -1438,28 +1483,44 @@ verify_pkg() {
             [[ -z "$path" ]] && continue
             ((total++))
 
-            case "$path" in
-                "$LFS"|"$LFS"/*)
-                    ;;
-                *)
-                    echo "  [AVISO] Caminho fora de \$LFS no manifest: $path"
-                    ((warnings++))
-                    ((out_of_lfs++))
-                    continue
-                    ;;
-            esac
+            # Reconstruir caminho completo (mesma lógica do uninstall)
+            if [[ -n "${LFS:-}" && "$path" == "$LFS"* ]]; then
+                full="$path"
+            else
+                if [[ "$path" == /* ]]; then
+                    if [[ "${LFS:-/}" == "/" ]]; then
+                        full="$path"
+                    else
+                        full="$LFS$path"
+                    fi
+                else
+                    if [[ "${LFS:-/}" == "/" ]]; then
+                        full="/$path"
+                    else
+                        full="$LFS/$path"
+                    fi
+                fi
+            fi
 
-            if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
-                echo "  [AVISO] Caminho suspeito (contém '..') no manifest: $path"
+            # Checa se está dentro de $LFS (quando $LFS != "/")
+            if [[ -n "${LFS:-}" && "$LFS" != "/" && "$full" != "$LFS" && "$full" != "$LFS"/* ]]; then
+                echo "  [AVISO] Caminho fora de \$LFS no manifest: $full"
+                ((warnings++))
+                ((out_of_lfs++))
+                continue
+            fi
+
+            if [[ "$full" == *"/../"* || "$full" == "../"* || "$full" == *"/.." ]]; then
+                echo "  [AVISO] Caminho suspeito (contém '..') no manifest: $full"
                 ((warnings++))
                 ((suspicious++))
                 continue
             fi
 
-            if [[ -e "$path" || -L "$path" ]]; then
+            if [[ -e "$full" || -L "$full" ]]; then
                 :
             else
-                echo "  [ERRO] Caminho do manifest não existe mais: $path"
+                echo "  [ERRO] Caminho do manifest não existe mais: $full"
                 ((errors++))
                 ((missing++))
             fi
