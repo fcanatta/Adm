@@ -453,14 +453,39 @@ EOF
 read_meta_field() {
     local pkg="$1"
     local key="$2"
-    local meta
+    local meta k v
+
     meta="$(pkg_meta_file "$pkg")"
     [[ -f "$meta" ]] || return 1
 
-    # shellcheck disable=SC1090
-    . "$meta"
-    # usa eval pra pegar o valor da variável de forma genérica
-    eval "printf '%s\n' \"\${$key:-}\""
+    # Parser simples de KEY="value", sem usar source nem eval.
+    # Assume o formato gerado por write_meta/write_meta_binary.
+    while IFS='=' read -r k v; do
+        # Ignora linhas vazias ou comentários
+        [[ -z "$k" || "$k" == \#* ]] && continue
+
+        # Remove espaços em volta da chave
+        # (ex.: '  NAME  ' -> 'NAME')
+        k="${k#"${k%%[![:space:]]*}"}"   # trim left
+        k="${k%"${k##*[![:space:]]}"}"   # trim right
+
+        [[ "$k" == "$key" ]] || continue
+
+        # Remove espaços iniciais do valor
+        v="${v#"${v%%[![:space:]]*}"}"
+
+        # Se o valor estiver entre aspas duplas, remove o par externo
+        if [[ "$v" == \"*\" ]]; then
+            v="${v#\"}"   # tira primeira aspas
+            v="${v%\"}"   # tira última aspas
+        fi
+
+        printf '%s\n' "$v"
+        return 0
+    done < "$meta"
+
+    # Se chegou aqui, não encontrou a chave
+    return 1
 }
 
 get_installed_version() {
@@ -757,19 +782,78 @@ parse_pkg_from_tarball() {
     base="${base%%.tgz}"
     base="${base%%.tar}"
 
-    # Tentativa de formato: nome-versao-arquitetura
-    if [[ "$base" == *-* ]]; then
-        arch="${base##*-}"
-        name_ver="${base%-*}"
-    else
+    # Tenta detectar arquitetura apenas se for um sufixo "conhecido"
+    arch=""
+    name_ver="$base"
+
+    local known_arches=(
+        x86_64 aarch64 arm64 i486 i586 i686
+        armv7 armv7l riscv64 ppc64le s390x
+    )
+
+    local a
+    for a in "${known_arches[@]}"; do
+        if [[ "$base" == *"-${a}" ]]; then
+            arch="$a"
+            name_ver="${base%-*}"
+            break
+        fi
+    done
+
+    # Se não detectar arch, name_ver continua igual a base
+    if [[ -z "$arch" ]]; then
         name_ver="$base"
-        arch=""
     fi
 
-    if [[ "$name_ver" == *-* ]]; then
-        pkg="${name_ver%%-*}"
-        version="${name_ver#*-}"
+    # Agora precisamos separar nome e versão dentro de name_ver.
+    # Estratégia:
+    #   - Split em partes por '-'
+    #   - A primeira parte que COMEÇA com dígito marca o início da versão
+    #   - Tudo que vem antes é o nome do pacote (podendo conter '-')
+    #   - Tudo que vem a partir dali é a versão (podendo conter '-')
+    pkg=""
+    version=""
+
+    # Se não há '-', não dá pra separar nome/versão com essa heurística
+    if [[ "$name_ver" != *"-"* ]]; then
+        pkg="$name_ver"
+        version=""
+        printf '%s\n' "$pkg" "$version"
+        return 0
+    fi
+
+    local IFS='-'
+    read -r -a parts <<< "$name_ver"
+    IFS=$' \t\n'
+
+    local i found_ver=0
+    for i in "${!parts[@]}"; do
+        if [[ "${parts[i]}" =~ ^[0-9] ]]; then
+            # Encontramos o início de algo que parece versão
+            found_ver=1
+            break
+        fi
+    done
+
+    if (( found_ver == 1 && i > 0 )); then
+        # Monta o nome do pacote com as partes antes da primeira parte "numérica"
+        local j
+        for (( j = 0; j < i; j++ )); do
+            if (( j == 0 )); then
+                pkg="${parts[j]}"
+            else
+                pkg+="-${parts[j]}"
+            fi
+        done
+
+        # Monta a versão com as partes a partir da primeira parte "numérica"
+        version="${parts[i]}"
+        for (( j = i + 1; j < ${#parts[@]}; j++ )); do
+            version+="-${parts[j]}"
+        done
     else
+        # Não encontramos um pedaço que pareça versão (começando com dígito),
+        # então consideramos que não há versão separada.
         pkg="$name_ver"
         version=""
     fi
