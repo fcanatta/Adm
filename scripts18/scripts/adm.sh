@@ -87,6 +87,7 @@ Comandos principais:
   run-build <pkg>...          Constrói um ou mais pacotes (com dependências)
   list-installed              Lista pacotes registrados como instalados
   uninstall <pkg>             Desinstala um pacote via manifest + hooks
+  verify [pkg...]             Verifica integridade de meta/manifest/arquivos
 
 Pacotes binários:
   install <arquivo|nome>      Instala pacote binário (.tar.zst/.tar.xz/.tar.gz/.tar)
@@ -1331,6 +1332,171 @@ cmd_list_installed() {
 }
 
 #============================================================
+# Verificação de integridade de um pacote
+#============================================================
+verify_pkg() {
+    local pkg="$1"
+
+    adm_ensure_db
+
+    local meta manifest
+    meta="$(pkg_meta_file "$pkg")"
+    manifest="$(pkg_manifest_file "$pkg")"
+
+    echo "=== Verificando pacote: $pkg ==="
+
+    local errors=0 warnings=0
+    local missing=0 out_of_lfs=0 suspicious=0 total=0
+
+    #------------------------------
+    # Verifica meta
+    #------------------------------
+    if [[ ! -f "$meta" ]]; then
+        echo "  [ERRO] Arquivo meta não encontrado: $meta"
+        ((errors++))
+    else
+        local name status script version
+        name="$(read_meta_field "$pkg" NAME 2>/dev/null || true)"
+        status="$(read_meta_field "$pkg" STATUS 2>/dev/null || true)"
+        script="$(read_meta_field "$pkg" SCRIPT 2>/dev/null || true)"
+        version="$(read_meta_field "$pkg" VERSION 2>/dev/null || true)"
+
+        if [[ -z "$name" ]]; then
+            echo "  [AVISO] Campo NAME vazio em meta."
+            ((warnings++))
+        elif [[ "$name" != "$pkg" ]]; then
+            echo "  [AVISO] NAME em meta ($name) difere do nome do pacote ($pkg)."
+            ((warnings++))
+        fi
+
+        if [[ -z "$status" ]]; then
+            echo "  [AVISO] Campo STATUS vazio em meta."
+            ((warnings++))
+        elif [[ "$status" != "installed" ]]; then
+            echo "  [AVISO] STATUS em meta é '$status' (esperado: 'installed')."
+            ((warnings++))
+        fi
+
+        if [[ -n "$script" && "$script" != binary:* && ! -f "$script" ]]; then
+            echo "  [AVISO] SCRIPT em meta aponta para arquivo inexistente: $script"
+            ((warnings++))
+        fi
+
+        echo "  Meta: OK (com $warnings aviso(s))."
+    fi
+
+    #------------------------------
+    # Verifica manifest
+    #------------------------------
+    if [[ ! -f "$manifest" ]]; then
+        echo "  [ERRO] Manifesto não encontrado: $manifest"
+        ((errors++))
+    else
+        local line path
+
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+
+            path="$line"
+            # tira espaços em volta
+            path="${path#"${path%%[![:space:]]*}"}"
+            path="${path%"${path##*[![:space:]]}"}"
+
+            [[ -z "$path" ]] && continue
+            ((total++))
+
+            # Caminho deve estar dentro de $LFS
+            case "$path" in
+                "$LFS"|"$LFS"/*)
+                    ;;
+                *)
+                    echo "  [AVISO] Caminho fora de \$LFS no manifest: $path"
+                    ((warnings++))
+                    ((out_of_lfs++))
+                    continue
+                    ;;
+            esac
+
+            # Não permite '..' nos segmentos: caminho suspeito
+            if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
+                echo "  [AVISO] Caminho suspeito (contém '..') no manifest: $path"
+                ((warnings++))
+                ((suspicious++))
+                continue
+            fi
+
+            if [[ -e "$path" || -L "$path" ]]; then
+                # Existe (arquivo, dir ou link): consideramos OK
+                :
+            else
+                echo "  [ERRO] Caminho do manifest não existe mais: $path"
+                ((errors++))
+                ((missing++))
+            fi
+        done < "$manifest"
+
+        echo "  Manifesto: $total entradas; ausentes=$missing; fora_LFS=$out_of_lfs; suspeitos=$suspicious"
+    fi
+
+    if (( errors == 0 && missing == 0 && out_of_lfs == 0 && suspicious == 0 )); then
+        echo "  => OK: nenhum problema encontrado."
+        echo
+        return 0
+    else
+        echo "  => PROBLEMAS detectados: erros=$errors, avisos=$warnings"
+        echo
+        return 1
+    fi
+}
+
+#============================================================
+# Comando: verify
+#============================================================
+cmd_verify() {
+    adm_ensure_db
+
+    local pkgs=()
+
+    if [[ $# -gt 0 ]]; then
+        pkgs=("$@")
+    else
+        shopt -s nullglob
+        local meta
+        for meta in "$ADM_PKG_META_DIR"/*.meta; do
+            [[ -f "$meta" ]] || continue
+            pkgs+=("$(basename "${meta%.meta}")")
+        done
+        shopt -u nullglob
+    fi
+
+    if (( ${#pkgs[@]} == 0 )); then
+        echo "Nenhum pacote instalado encontrado para verificar."
+        return 0
+    fi
+
+    local ok=0 bad=0 pkg
+
+    for pkg in "${pkgs[@]}"; do
+        if verify_pkg "$pkg"; then
+            ((ok++))
+        else
+            ((bad++))
+        fi
+    done
+
+    echo "=== Resumo da verificação ==="
+    echo "  Pacotes OK.............: $ok"
+    echo "  Pacotes com problemas..: $bad"
+
+    # Se ADM_VERIFY_STRICT=1 e houver problemas, retorna erro
+    if (( bad > 0 )) && [[ "${ADM_VERIFY_STRICT:-0}" -eq 1 ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+#============================================================
 # main
 #============================================================
 
@@ -1344,7 +1510,7 @@ main() {
 
     local cmd="$1"; shift || true
 
-    case "$cmd" in
+        case "$cmd" in
         status)
             cmd_status
             ;;
@@ -1356,6 +1522,9 @@ main() {
             ;;
         uninstall)
             cmd_uninstall "$@"
+            ;;
+        verify)
+            cmd_verify "$@"
             ;;
         install)
             cmd_install "$@"
