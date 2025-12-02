@@ -434,15 +434,38 @@ run_hook_chroot() {
 #============================================================
 chroot_exec_file() {
     local abs="$1"
-    local rel="${abs#$LFS}"
 
-    if [[ "$rel" == "$abs" ]]; then
-        die "Arquivo $abs não está dentro de LFS ($LFS)"
+    if [[ -z "${LFS:-}" ]]; then
+        echo "chroot_exec_file: LFS não está definido" >&2
+        return 1
     fi
 
-    rel="${rel#/}"
+    # Caminho deve ser absoluto
+    case "$abs" in
+        /*) ;;
+        *)
+            echo "chroot_exec_file: caminho deve ser absoluto: $abs" >&2
+            return 1
+            ;;
+    esac
 
-    # Ambiente mínimo e previsível
+    # Tem que estar dentro de $LFS
+    if [[ "$abs" != "$LFS" && "$abs" != "$LFS"/* ]]; then
+        echo "chroot_exec_file: caminho fora de \$LFS: $abs (LFS=$LFS)" >&2
+        return 1
+    fi
+
+    # Arquivo precisa existir
+    if [[ ! -f "$abs" ]]; then
+        echo "chroot_exec_file: arquivo não encontrado: $abs" >&2
+        return 1
+    fi
+
+    # Caminho relativo dentro do chroot
+    local rel="${abs#$LFS}"
+    rel="${rel#/}"   # remove a / inicial, se existir
+
+    # Ambiente mínimo e previsível dentro do chroot
     local env_args=(
         HOME=/root
         TERM="${TERM:-xterm}"
@@ -450,19 +473,52 @@ chroot_exec_file() {
         LFS="/"
     )
 
-    # Propaga variáveis de contexto de hook, se existirem
-    if [[ -n "${ADM_HOOK_PHASE:-}" ]]; then
-        env_args+=("ADM_HOOK_PHASE=$ADM_HOOK_PHASE")
-    fi
-    if [[ -n "${ADM_HOOK_PKG:-}" ]]; then
-        env_args+=("ADM_HOOK_PKG=$ADM_HOOK_PKG")
-    fi
-    if [[ -n "${ADM_HOOK_MODE:-}" ]]; then
-        env_args+=("ADM_HOOK_MODE=$ADM_HOOK_MODE")
+    # ==========
+    # Variáveis principais do adm.conf (se existirem)
+    # ==========
+
+    [[ -n "${LFS_SOURCES_DIR:-}"        ]] && env_args+=("LFS_SOURCES_DIR=$LFS_SOURCES_DIR")
+    [[ -n "${LFS_TOOLS_DIR:-}"          ]] && env_args+=("LFS_TOOLS_DIR=$LFS_TOOLS_DIR")
+    [[ -n "${LFS_BUILD_SCRIPTS_DIR:-}"  ]] && env_args+=("LFS_BUILD_SCRIPTS_DIR=$LFS_BUILD_SCRIPTS_DIR")
+    [[ -n "${LFS_LOG_DIR:-}"            ]] && env_args+=("LFS_LOG_DIR=$LFS_LOG_DIR")
+
+    [[ -n "${ADM_DB_DIR:-}"             ]] && env_args+=("ADM_DB_DIR=$ADM_DB_DIR")
+    [[ -n "${ADM_PKG_META_DIR:-}"       ]] && env_args+=("ADM_PKG_META_DIR=$ADM_PKG_META_DIR")
+    [[ -n "${ADM_MANIFEST_DIR:-}"       ]] && env_args+=("ADM_MANIFEST_DIR=$ADM_MANIFEST_DIR")
+    [[ -n "${ADM_STATE_DIR:-}"          ]] && env_args+=("ADM_STATE_DIR=$ADM_STATE_DIR")
+    [[ -n "${ADM_LOG_FILE:-}"           ]] && env_args+=("ADM_LOG_FILE=$ADM_LOG_FILE")
+
+    [[ -n "${ADM_BIN_PKG_DIR:-}"        ]] && env_args+=("ADM_BIN_PKG_DIR=$ADM_BIN_PKG_DIR")
+    [[ -n "${ADM_PROFILE_DIR:-}"        ]] && env_args+=("ADM_PROFILE_DIR=$ADM_PROFILE_DIR")
+
+    # Perfil / libc (também declarados no adm.conf / perfis .env)
+    [[ -n "${ADM_PROFILE:-}"            ]] && env_args+=("ADM_PROFILE=$ADM_PROFILE")
+    [[ -n "${ADM_LIBC:-}"               ]] && env_args+=("ADM_LIBC=$ADM_LIBC")
+
+    # ==========
+    # Contexto de hook (se você estiver usando hooks avançados)
+    # ==========
+
+    [[ -n "${ADM_HOOK_PHASE:-}"         ]] && env_args+=("ADM_HOOK_PHASE=$ADM_HOOK_PHASE")
+    [[ -n "${ADM_HOOK_PKG:-}"           ]] && env_args+=("ADM_HOOK_PKG=$ADM_HOOK_PKG")
+    [[ -n "${ADM_HOOK_MODE:-}"          ]] && env_args+=("ADM_HOOK_MODE=$ADM_HOOK_MODE")
+
+    # ==========
+    # Variáveis extras opcionais:
+    #   ADM_ENV_PASSTHROUGH="CC CFLAGS RUN_ZLIB_TESTS"
+    # ==========
+
+    if [[ -n "${ADM_ENV_PASSTHROUGH:-}" ]]; then
+        local name
+        for name in $ADM_ENV_PASSTHROUGH; do
+            if [[ -n "${!name+x}" ]]; then
+                env_args+=("$name=${!name}")
+            fi
+        done
     fi
 
-    chroot "$LFS" /usr/bin/env -i "${env_args[@]}" \
-        /bin/bash -lc "/$rel"
+    # Execução final no chroot com ambiente limpo (+ as variáveis que passamos explicitamente)
+    chroot "$LFS" /usr/bin/env -i "${env_args[@]}" /bin/bash -lc "/$rel"
 }
 
 read_deps() {
