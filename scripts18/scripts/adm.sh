@@ -72,6 +72,32 @@ adm_log() {
     fi
 }
 
+# ============================================================
+# Helpers de META / MANIFEST / estado de instalação
+# ============================================================
+
+pkg_meta_file() {
+    # Arquivo de metadados do pacote: $ADM_PKG_META_DIR/<pkg>.meta
+    printf '%s/%s.meta\n' "$ADM_PKG_META_DIR" "$1"
+}
+
+pkg_manifest_file() {
+    # Arquivo de manifest do pacote: $ADM_MANIFEST_DIR/<pkg>.manifest
+    printf '%s/%s.manifest\n' "$ADM_MANIFEST_DIR" "$1"
+}
+
+is_installed() {
+    # Considera um pacote instalado se existir meta com STATUS=installed
+    local pkg="$1"
+    local meta status
+
+    meta="$(pkg_meta_file "$pkg")"
+    [[ -f "$meta" ]] || return 1
+
+    status="$(read_meta_field "$pkg" "STATUS" 2>/dev/null || true)"
+    [[ "$status" == "installed" ]]
+}
+
 require_root() {
     if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
         die "este comando precisa ser executado como root"
@@ -438,7 +464,6 @@ chroot_exec_file() {
         return 1
     fi
 
-    # Caminho deve ser absoluto
     case "$abs" in
         /*) ;;
         *)
@@ -447,23 +472,19 @@ chroot_exec_file() {
             ;;
     esac
 
-    # Tem que estar dentro de $LFS
     if [[ "$abs" != "$LFS" && "$abs" != "$LFS"/* ]]; then
         echo "chroot_exec_file: caminho fora de \$LFS: $abs (LFS=$LFS)" >&2
         return 1
     fi
 
-    # Arquivo precisa existir
     if [[ ! -f "$abs" ]]; then
         echo "chroot_exec_file: arquivo não encontrado: $abs" >&2
         return 1
     fi
 
-    # Caminho relativo dentro do chroot
     local rel="${abs#$LFS}"
-    rel="${rel#/}"   # remove a / inicial, se existir
+    rel="${rel#/}"
 
-    # Ambiente mínimo e previsível dentro do chroot
     local env_args=(
         HOME=/root
         TERM="${TERM:-xterm}"
@@ -471,10 +492,7 @@ chroot_exec_file() {
         LFS="/"
     )
 
-    # ==========
-    # Variáveis principais do adm.conf (se existirem)
-    # ==========
-
+    # Variáveis principais do adm.conf
     [[ -n "${LFS_SOURCES_DIR:-}"        ]] && env_args+=("LFS_SOURCES_DIR=$LFS_SOURCES_DIR")
     [[ -n "${LFS_TOOLS_DIR:-}"          ]] && env_args+=("LFS_TOOLS_DIR=$LFS_TOOLS_DIR")
     [[ -n "${LFS_BUILD_SCRIPTS_DIR:-}"  ]] && env_args+=("LFS_BUILD_SCRIPTS_DIR=$LFS_BUILD_SCRIPTS_DIR")
@@ -489,22 +507,15 @@ chroot_exec_file() {
     [[ -n "${ADM_BIN_PKG_DIR:-}"        ]] && env_args+=("ADM_BIN_PKG_DIR=$ADM_BIN_PKG_DIR")
     [[ -n "${ADM_PROFILE_DIR:-}"        ]] && env_args+=("ADM_PROFILE_DIR=$ADM_PROFILE_DIR")
 
-    # Perfil / libc (do adm.conf / perfis .env)
     [[ -n "${ADM_PROFILE:-}"            ]] && env_args+=("ADM_PROFILE=$ADM_PROFILE")
     [[ -n "${ADM_LIBC:-}"               ]] && env_args+=("ADM_LIBC=$ADM_LIBC")
 
-    # ==========
-    # Contexto de hook (se estiver executando um hook)
-    # ==========
-
+    # Contexto de hook (se estiver rodando um hook)
     [[ -n "${ADM_HOOK_PHASE:-}"         ]] && env_args+=("ADM_HOOK_PHASE=$ADM_HOOK_PHASE")
     [[ -n "${ADM_HOOK_PKG:-}"           ]] && env_args+=("ADM_HOOK_PKG=$ADM_HOOK_PKG")
     [[ -n "${ADM_HOOK_MODE:-}"          ]] && env_args+=("ADM_HOOK_MODE=$ADM_HOOK_MODE")
 
-    # ==========
-    # Variáveis extras opcionais via ADM_ENV_PASSTHROUGH
-    #   Ex.: ADM_ENV_PASSTHROUGH="CC CFLAGS RUN_TESTS"
-    # ==========
+    # Variáveis extras via ADM_ENV_PASSTHROUGH="CC CFLAGS RUN_TESTS ..."
     if [[ -n "${ADM_ENV_PASSTHROUGH:-}" ]]; then
         local name
         for name in $ADM_ENV_PASSTHROUGH; do
@@ -514,7 +525,6 @@ chroot_exec_file() {
         done
     fi
 
-    # Execução final no chroot com ambiente limpo (+ as variáveis que passamos)
     chroot "$LFS" /usr/bin/env -i "${env_args[@]}" /bin/bash -lc "/$rel"
 }
 
@@ -655,12 +665,11 @@ run_single_build() {
     local pkg_dir
     pkg_dir="$(dirname "$script")"
 
-    mkdir -p "$LFS_LOG_DIR"
+    mkdir -p "$LFS_LOG_DIR" "$ADM_STATE_DIR"
     local ts
     ts="$(date +%Y%m%d-%H%M%S)"
     local logfile="$LFS_LOG_DIR/${pkg}-${ts}.log"
 
-    mkdir -p "$ADM_STATE_DIR"
     local pre_snap post_snap manifest
     pre_snap="$ADM_STATE_DIR/${pkg}.pre.$ts.snapshot"
     post_snap="$ADM_STATE_DIR/${pkg}.post.$ts.snapshot"
@@ -669,8 +678,6 @@ run_single_build() {
     local use_chroot=0
     local mounted=0
 
-    # Decide se usa chroot: scripts em /cross/ rodam fora,
-    # demais, se LFS != "/", rodam em chroot (se CHROOT_FOR_BUILDS=1).
     if is_cross_script "$script"; then
         use_chroot=0
     else
@@ -683,7 +690,6 @@ run_single_build() {
         require_root
     fi
 
-    # Snapshot antes do build
     snapshot_fs "$pre_snap"
 
     {
@@ -692,41 +698,30 @@ run_single_build() {
         echo "Diretório do pacote: $pkg_dir"
         echo "Início: $(date)"
 
-        local pre_install post_install
-        pre_install="$pkg_dir/pre_install"
-        post_install="$pkg_dir/post_install"
+        local pre_install_hook post_install_hook
+        pre_install_hook="$(hook_path "$pkg_dir" "$pkg" "pre_install")"
+        post_install_hook="$(hook_path "$pkg_dir" "$pkg" "post_install")"
 
         if (( use_chroot )); then
             echo "Executando build em chroot em $LFS"
             mount_virtual_fs
             mounted=1
 
-            if [[ -x "$pre_install" ]]; then
-                echo "Rodando hook pre_install em chroot"
-                chroot_exec_file "$pre_install"
-            fi
+            run_hook_chroot "$pre_install_hook" "pre_install" "$pkg"
 
             echo "Rodando script de build em chroot"
             chroot_exec_file "$script"
 
-            if [[ -x "$post_install" ]]; then
-                echo "Rodando hook post_install em chroot"
-                chroot_exec_file "$post_install"
-            fi
+            run_hook_chroot "$post_install_hook" "post_install" "$pkg"
         else
             echo "Executando build no host (sem chroot)"
-            if [[ -x "$pre_install" ]]; then
-                echo "Rodando hook pre_install no host"
-                "$pre_install"
-            fi
+
+            run_hook_host "$pre_install_hook" "pre_install" "$pkg"
 
             echo "Rodando script de build no host"
             "$script"
 
-            if [[ -x "$post_install" ]]; then
-                echo "Rodando hook post_install no host"
-                "$post_install"
-            fi
+            run_hook_host "$post_install_hook" "post_install" "$pkg"
         fi
 
         echo "Build finalizado: $(date)"
@@ -743,18 +738,12 @@ run_single_build() {
         umount_virtual_fs || true
     fi
 
-    # Snapshot depois do build
     snapshot_fs "$post_snap"
-
-    # Gera manifest com tipos (F/L/D)
     generate_manifest_from_snapshots "$pre_snap" "$post_snap" "$manifest"
-
     rm -f "$pre_snap" "$post_snap"
 
-    # Lê deps para gravar meta
     local deps
     deps="$(read_deps "$pkg" || true)"
-
     write_meta "$pkg" "$script" "$deps"
 
     echo "Pacote '$pkg' construído com sucesso. Log: $logfile"
@@ -835,6 +824,11 @@ cmd_run_build() {
 uninstall_pkg() {
     local pkg="$1"
 
+    if [[ -z "$pkg" ]]; then
+        echo "Uso: $CMD_NAME uninstall <pacote>" >&2
+        return 1
+    fi
+
     adm_ensure_db
     require_root
 
@@ -856,17 +850,17 @@ uninstall_pkg() {
         return 1
     fi
 
-    # Verifica dependências reversas (outros pacotes que dependem deste)
-    local other_meta other_pkg deps rev_deps=()
+    # Dependências reversas
+    local other_meta other_pkg deps
+    local rev_deps=()
     for other_meta in "$ADM_PKG_META_DIR"/*.meta; do
         [[ -f "$other_meta" ]] || continue
         other_pkg="$(basename "${other_meta%.meta}")"
         [[ "$other_pkg" == "$pkg" ]] && continue
 
-        deps="$(read_meta_field "$other_pkg" "DEPS" || true)"
-        # compara por palavra
+        deps="$(read_meta_field "$other_pkg" "DEPS" 2>/dev/null || true)"
         if [[ " $deps " == *" $pkg "* ]]; then
-            rev_deps+=("$other_pkg")
+            rev_deps+=( "$other_pkg" )
         fi
     done
 
@@ -877,31 +871,24 @@ uninstall_pkg() {
         for rp in "${rev_deps[@]}"; do
             echo "  - $rp" >&2
         done
-        echo "Se quiser realmente remover mesmo assim, defina ADM_ALLOW_BROKEN_DEPS=1 no ambiente." >&2
+        echo "Defina ADM_ALLOW_BROKEN_DEPS=1 se quiser remover mesmo assim (com deps quebradas)." >&2
         return 1
     fi
 
-    # Hooks de pre/post-uninstall
-    local script pkg_dir pre_uninstall post_uninstall
-    script="$(read_meta_field "$pkg" "SCRIPT" || true)"
-
+    # Hooks de uninstall no padrão <pkg>.pre_uninstall / <pkg>.post_uninstall
+    local script pkg_dir pre_uninstall_hook post_uninstall_hook
+    script="$(read_meta_field "$pkg" "SCRIPT" 2>/dev/null || true)"
     if [[ -n "$script" && -f "$script" ]]; then
         pkg_dir="$(dirname "$script")"
-        pre_uninstall="$pkg_dir/pre_uninstall"
-        post_uninstall="$pkg_dir/post_uninstall"
+        pre_uninstall_hook="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
+        post_uninstall_hook="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
 
-        if [[ -x "$pre_uninstall" ]]; then
-            echo "Rodando hook pre_uninstall para '$pkg'"
-            "$pre_uninstall"
-        fi
+        run_hook_host "$pre_uninstall_hook" "pre_uninstall" "$pkg"
     fi
 
     echo "Removendo arquivos do pacote '$pkg' de acordo com manifest: $manifest"
 
-    # Lê manifest de trás pra frente com tac:
-    # - Formato novo: "T /caminho"
-    # - Formato antigo: "/caminho"
-    tac "$manifest" | while IFS= read -r entry; do
+    while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
 
         local type path
@@ -913,49 +900,45 @@ uninstall_pkg() {
             path="$entry"
         fi
 
-        # Normaliza espaços
         path="${path#"${path%%[![:space:]]*}"}"
         path="${path%"${path##*[![:space:]]}"}"
 
         [[ -z "$path" ]] && continue
 
-        # Segurança: caminho tem que estar dentro de $LFS
         if [[ "$path" != "$LFS" && "$path" != "$LFS"/* ]]; then
             echo "Aviso: ignorando caminho fora de \$LFS no manifest: $path" >&2
             continue
         fi
 
-        # Segurança: não permitir '..' nos segmentos
         if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
             echo "Aviso: ignorando caminho suspeito com '..' no manifest: $path" >&2
             continue
         fi
 
-        # Remove conforme tipo
         if [[ -f "$path" || -L "$path" ]]; then
             rm -f -- "$path" || echo "Falha ao remover arquivo/link: $path" >&2
         elif [[ -d "$path" ]]; then
-            # Diretório: tenta remover, mas ignora erro se não vazio
             rmdir -- "$path" 2>/dev/null || true
         else
-            # Se já não existe, ignore
             :
         fi
-    done
+    done < <(tac "$manifest")
 
-    # Remove manifest e meta
     rm -f -- "$manifest" "$meta"
 
-    if [[ -n "$post_uninstall" && -x "$post_uninstall" ]]; then
-        echo "Rodando hook post_uninstall para '$pkg'"
-        "$post_uninstall"
+    if [[ -n "$post_uninstall_hook" ]]; then
+        run_hook_host "$post_uninstall_hook" "post_uninstall" "$pkg"
     fi
 
     echo "Pacote '$pkg' desinstalado."
 }
 
 cmd_uninstall() {
-    uninstall_pkg "${1:-}"
+    if [[ $# -ne 1 ]]; then
+        echo "Uso: $CMD_NAME uninstall <pacote>" >&2
+        return 1
+    fi
+    uninstall_pkg "$1"
 }
 
 #============================================================
@@ -1395,18 +1378,17 @@ verify_pkg() {
     local errors=0 warnings=0
     local missing=0 out_of_lfs=0 suspicious=0 total=0
 
-    #------------------------------
-    # Verifica meta
-    #------------------------------
+    # META
     if [[ ! -f "$meta" ]]; then
         echo "  [ERRO] Arquivo meta não encontrado: $meta"
         ((errors++))
     else
         local name status script version
-        name="$(read_meta_field "$pkg" NAME 2>/dev/null || true)"
-        status="$(read_meta_field "$pkg" STATUS 2>/dev/null || true)"
-        script="$(read_meta_field "$pkg" SCRIPT 2>/dev/null || true)"
-        version="$(read_meta_field "$pkg" VERSION 2>/dev/null || true)"
+
+        name="$(read_meta_field "$pkg" "NAME" 2>/dev/null || true)"
+        status="$(read_meta_field "$pkg" "STATUS" 2>/dev/null || true)"
+        script="$(read_meta_field "$pkg" "SCRIPT" 2>/dev/null || true)"
+        version="$(read_meta_field "$pkg" "VERSION" 2>/dev/null || true)"
 
         if [[ -z "$name" ]]; then
             echo "  [AVISO] Campo NAME vazio em meta."
@@ -1432,27 +1414,30 @@ verify_pkg() {
         echo "  Meta: OK (com $warnings aviso(s))."
     fi
 
-    #------------------------------
-    # Verifica manifest
-    #------------------------------
+    # MANIFEST
     if [[ ! -f "$manifest" ]]; then
         echo "  [ERRO] Manifesto não encontrado: $manifest"
         ((errors++))
     else
-        local line path
+        local line path type
 
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
 
-            path="$line"
-            # tira espaços em volta
+            if [[ "$line" == [FDL?]" "* ]]; then
+                type="${line%% *}"
+                path="${line#* }"
+            else
+                type=""
+                path="$line"
+            fi
+
             path="${path#"${path%%[![:space:]]*}"}"
             path="${path%"${path##*[![:space:]]}"}"
 
             [[ -z "$path" ]] && continue
             ((total++))
 
-            # Caminho deve estar dentro de $LFS
             case "$path" in
                 "$LFS"|"$LFS"/*)
                     ;;
@@ -1464,7 +1449,6 @@ verify_pkg() {
                     ;;
             esac
 
-            # Não permite '..' nos segmentos: caminho suspeito
             if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
                 echo "  [AVISO] Caminho suspeito (contém '..') no manifest: $path"
                 ((warnings++))
@@ -1473,7 +1457,6 @@ verify_pkg() {
             fi
 
             if [[ -e "$path" || -L "$path" ]]; then
-                # Existe (arquivo, dir ou link): consideramos OK
                 :
             else
                 echo "  [ERRO] Caminho do manifest não existe mais: $path"
