@@ -238,17 +238,63 @@ cmd_chroot() {
 # Executa um arquivo que está em $LFS/algum/caminho dentro do chroot
 chroot_exec_file() {
     local abs="$1"
-    local rel="${abs#$LFS}"
-    if [[ "$rel" == "$abs" ]]; then
-        die "Arquivo $abs não está dentro de LFS ($LFS)"
+    local rel
+    local env_args=()
+
+    if [[ -z "${LFS:-}" ]]; then
+        echo "chroot_exec_file: LFS não está definido" >&2
+        return 1
     fi
-    rel="${rel#/}"
-    chroot "$LFS" /usr/bin/env -i \
-        HOME=/root \
-        TERM="${TERM:-xterm}" \
-        PATH=/usr/bin:/usr/sbin:/bin:/sbin \
-        LFS="/" \
-        /bin/bash -lc "/$rel"
+
+    # Caminho deve ser absoluto
+    case "$abs" in
+        /*) ;;
+        *)
+            echo "chroot_exec_file: caminho deve ser absoluto: $abs" >&2
+            return 1
+            ;;
+    esac
+
+    # Tem que estar dentro de $LFS
+    if [[ "$abs" != "$LFS"/* ]]; then
+        echo "chroot_exec_file: caminho fora de \$LFS: $abs" >&2
+        return 1
+    fi
+
+    # Arquivo precisa existir
+    if [[ ! -f "$abs" ]]; then
+        echo "chroot_exec_file: arquivo não encontrado: $abs" >&2
+        return 1
+    fi
+
+    # Caminho relativo dentro do chroot
+    rel="${abs#$LFS}"
+    rel="${rel#/}"   # remove / inicial, se existir
+
+    # Ambiente mínimo e explícito
+    env_args+=(HOME=/root)
+    env_args+=(TERM="${TERM:-xterm}")
+    env_args+=(PATH=/usr/bin:/usr/sbin:/bin:/sbin)
+    env_args+=(LFS="/")
+
+    # Propaga variáveis importantes se existirem
+    [[ -n "${LFS_SOURCES_DIR:-}"       ]] && env_args+=("LFS_SOURCES_DIR=$LFS_SOURCES_DIR")
+    [[ -n "${LFS_TOOLS_DIR:-}"         ]] && env_args+=("LFS_TOOLS_DIR=$LFS_TOOLS_DIR")
+    [[ -n "${LFS_BUILD_SCRIPTS_DIR:-}" ]] && env_args+=("LFS_BUILD_SCRIPTS_DIR=$LFS_BUILD_SCRIPTS_DIR")
+    [[ -n "${ADM_DB_DIR:-}"            ]] && env_args+=("ADM_DB_DIR=$ADM_DB_DIR")
+
+    # Lista opcional de variáveis extras para passar (ex: ADM_ENV_PASSTHROUGH="CC CFLAGS")
+    if [[ -n "${ADM_ENV_PASSTHROUGH:-}" ]]; then
+        local name
+        for name in $ADM_ENV_PASSTHROUGH; do
+            if [[ -n "${!name+x}" ]]; then
+                env_args+=("$name=${!name}")
+            fi
+        done
+    fi
+
+    # Executa dentro do chroot com ambiente limpo
+    chroot "$LFS" /usr/bin/env -i "${env_args[@]}" /bin/bash -lc "/$rel"
 }
 
 #============================================================
@@ -258,34 +304,69 @@ chroot_exec_file() {
 snapshot_fs() {
     local outfile="$1"
 
-    if [[ ! -d "$LFS" ]]; then
-        die "Diretório base LFS não existe: $LFS"
+    if [[ -z "${LFS:-}" || ! -d "$LFS" ]]; then
+        echo "snapshot_fs: diretório LFS inválido: ${LFS:-<não definido>}" >&2
+        return 1
     fi
 
+    # Garante diretório do arquivo de saída
+    mkdir -p "$(dirname "$outfile")"
+
+    # find dentro de $LFS, sem atravessar para outros devices (-xdev),
+    # podando diretórios internos que não devem entrar no snapshot.
     find "$LFS" -xdev \
-        \( -path "$ADM_DB_DIR" \
-           -o -path "$LFS_BUILD_SCRIPTS_DIR" \
-           -o -path "$LFS_SOURCES_DIR" \
-           -o -path "$LFS_LOG_DIR" \) -prune -o \
+        \(  -path "$ADM_DB_DIR" \
+         -o -path "$LFS_BUILD_SCRIPTS_DIR" \
+         -o -path "$LFS_SOURCES_DIR" \
+         -o -path "$LFS_LOG_DIR" \
+         -o -path "${ADM_BIN_PKG_DIR:-$LFS/binary-packages}" \
+         -o -path "${ADM_PROFILE_DIR:-$LFS/profiles}" \) -prune -o \
         \( -type f -o -type l -o -type d \) -print \
-        | sort > "$outfile"
+        | LC_ALL=C sort > "$outfile"
 }
 
-pkg_manifest_file() {
-    local pkg="$1"
-    echo "$ADM_MANIFEST_DIR/$pkg.manifest"
-}
+#============================================================
+#  Manifest generate from snapshots
+#============================================================
 
-pkg_meta_file() {
-    local pkg="$1"
-    echo "$ADM_PKG_META_DIR/$pkg.meta"
-}
+generate_manifest_from_snapshots() {
+    local pre_snapshot="$1"
+    local post_snapshot="$2"
+    local manifest="$3"
 
-is_installed() {
-    local pkg="$1"
-    local manifest
-    manifest="$(pkg_manifest_file "$pkg")"
-    [[ -f "$manifest" ]]
+    if [[ ! -f "$pre_snapshot" || ! -f "$post_snapshot" ]]; then
+        echo "generate_manifest_from_snapshots: snapshots inexistentes: $pre_snapshot / $post_snapshot" >&2
+        return 1
+    fi
+
+    local tmp_created
+    tmp_created="$(mktemp "${ADM_STATE_DIR:-/tmp}/created.XXXXXX")"
+
+    # Paths que existem só no snapshot final (novos)
+    LC_ALL=C comm -13 "$pre_snapshot" "$post_snapshot" > "$tmp_created"
+
+    : > "$manifest"
+
+    local path type
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+
+        # Determina tipo atual do caminho
+        if [[ -L "$path" ]]; then
+            type="L"
+        elif [[ -d "$path" ]]; then
+            type="D"
+        elif [[ -f "$path" ]]; then
+            type="F"
+        else
+            # Tipo desconhecido, ainda assim registra com '?'
+            type="?"
+        fi
+
+        printf '%s %s\n' "$type" "$path" >> "$manifest"
+    done < "$tmp_created"
+
+    rm -f "$tmp_created"
 }
 
 #============================================================
@@ -504,98 +585,114 @@ run_single_build() {
 
     adm_ensure_db
 
-    local script pkg_dir
-    script="$(find_build_script "$pkg")"
-    pkg_dir="$(pkg_dir_from_script "$script")"
+    local script
+    script="$(find_build_script "$pkg")" || return 1
+    local pkg_dir
+    pkg_dir="$(dirname "$script")"
 
-    echo ">> [$pkg] Iniciando build"
-    adm_log "BUILD START $pkg SCRIPT=$script"
-
-    local ts logfile
-    ts="$(date +'%Y%m%d-%H%M%S')"
-    logfile="$LFS_LOG_DIR/${pkg}-$ts.log"
+    mkdir -p "$LFS_LOG_DIR"
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    local logfile="$LFS_LOG_DIR/${pkg}-${ts}.log"
 
     mkdir -p "$ADM_STATE_DIR"
-    local pre_snap post_snap
-    pre_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.pre.XXXXXX")"
-    post_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.post.XXXXXX")"
+    local pre_snap post_snap manifest
+    pre_snap="$ADM_STATE_DIR/${pkg}.pre.$ts.snapshot"
+    post_snap="$ADM_STATE_DIR/${pkg}.post.$ts.snapshot"
+    manifest="$(pkg_manifest_file "$pkg")"
 
-    snapshot_fs "$pre_snap"
-
-    local pre_install_hook post_install_hook
-    pre_install_hook="$(hook_path "$pkg_dir" "$pkg" "pre_install")"
-    post_install_hook="$(hook_path "$pkg_dir" "$pkg" "post_install")"
-
-    # Decide se vai usar chroot
     local use_chroot=0
+    local mounted=0
+
+    # Decide se usa chroot: scripts em /cross/ rodam fora,
+    # demais, se LFS != "/", rodam em chroot (se CHROOT_FOR_BUILDS=1).
     if is_cross_script "$script"; then
         use_chroot=0
     else
-        if [[ "$LFS" != "/" && "$CHROOT_FOR_BUILDS" -eq 1 ]]; then
+        if [[ "${CHROOT_FOR_BUILDS:-1}" -eq 1 && "${LFS:-/}" != "/" ]]; then
             use_chroot=1
         fi
     fi
 
-    # Se for usar chroot, exija root ANTES de tentar montar/chrootar
-    if [[ "$use_chroot" -eq 1 ]]; then
+    if (( use_chroot )); then
         require_root
     fi
 
-    local rc=0
-    local mounted=0
+    # Snapshot antes do build
+    snapshot_fs "$pre_snap"
 
     {
-        echo "==> Build do pacote: $pkg"
-        echo "    LFS=$LFS"
-        echo "    Script: $script"
-        echo "    Data: $(date)"
-        echo "    CHROOT_FOR_BUILDS=$CHROOT_FOR_BUILDS (use_chroot=$use_chroot)"
+        echo "=== Build do pacote: $pkg ==="
+        echo "Script de build: $script"
+        echo "Diretório do pacote: $pkg_dir"
+        echo "Início: $(date)"
 
-        if [[ "$use_chroot" -eq 1 ]]; then
-            echo ">> [$pkg] Build será feito em chroot."
+        local pre_install post_install
+        pre_install="$pkg_dir/pre_install"
+        post_install="$pkg_dir/post_install"
+
+        if (( use_chroot )); then
+            echo "Executando build em chroot em $LFS"
             mount_virtual_fs
             mounted=1
 
-            run_hook_chroot "$pre_install_hook" "pre_install" "$pkg"
-            echo ">> [$pkg] Executando script de build (chroot)..."
+            if [[ -x "$pre_install" ]]; then
+                echo "Rodando hook pre_install em chroot"
+                chroot_exec_file "$pre_install"
+            fi
+
+            echo "Rodando script de build em chroot"
             chroot_exec_file "$script"
-            run_hook_chroot "$post_install_hook" "post_install" "$pkg"
+
+            if [[ -x "$post_install" ]]; then
+                echo "Rodando hook post_install em chroot"
+                chroot_exec_file "$post_install"
+            fi
         else
-            run_hook_host "$pre_install_hook" "pre_install" "$pkg"
-            echo ">> [$pkg] Executando script de build (host)..."
+            echo "Executando build no host (sem chroot)"
+            if [[ -x "$pre_install" ]]; then
+                echo "Rodando hook pre_install no host"
+                "$pre_install"
+            fi
+
+            echo "Rodando script de build no host"
             "$script"
-            run_hook_host "$post_install_hook" "post_install" "$pkg"
+
+            if [[ -x "$post_install" ]]; then
+                echo "Rodando hook post_install no host"
+                "$post_install"
+            fi
         fi
 
-        echo ">> [$pkg] Build concluído."
-    } >"$logfile" 2>&1 || rc=$?
+        echo "Build finalizado: $(date)"
+    } >"$logfile" 2>&1 || {
+        local rc=$?
+        if (( mounted )); then
+            umount_virtual_fs || true
+        fi
+        echo "Erro ao construir pacote '$pkg'. Veja o log em: $logfile" >&2
+        return "$rc"
+    }
 
-    if [[ "$mounted" -eq 1 ]]; then
+    if (( mounted )); then
         umount_virtual_fs || true
     fi
 
-    if [[ "$rc" -ne 0 ]]; then
-        adm_log "BUILD FAIL $pkg RC=$rc LOG=$logfile"
-        echo ">> [$pkg] ERRO no build. Veja o log: $logfile" >&2
-        exit "$rc"
-    fi
-
+    # Snapshot depois do build
     snapshot_fs "$post_snap"
 
-    local manifest
-    manifest="$(pkg_manifest_file "$pkg")"
-    comm -13 "$pre_snap" "$post_snap" >"$manifest"
+    # Gera manifest com tipos (F/L/D)
+    generate_manifest_from_snapshots "$pre_snap" "$post_snap" "$manifest"
 
     rm -f "$pre_snap" "$post_snap"
 
+    # Lê deps para gravar meta
     local deps
     deps="$(read_deps "$pkg" || true)"
 
     write_meta "$pkg" "$script" "$deps"
 
-    adm_log "BUILD OK $pkg MANIFEST=$manifest LOG=$logfile"
-    echo ">> [$pkg] Build concluído com sucesso. Manifesto: $manifest"
-    echo ">> [$pkg] Log de build: $logfile"
+    echo "Pacote '$pkg' construído com sucesso. Log: $logfile"
 }
 
 load_profile() {
@@ -671,70 +768,125 @@ cmd_run_build() {
 #============================================================
 
 uninstall_pkg() {
-    local pkg="${1:-}"
-    [[ -z "$pkg" ]] && die "Uso: $CMD_NAME uninstall <pacote>"
+    local pkg="$1"
 
     adm_ensure_db
+    require_root
 
     local manifest meta
     manifest="$(pkg_manifest_file "$pkg")"
     meta="$(pkg_meta_file "$pkg")"
 
-    [[ -f "$manifest" ]] || die "Manifesto não encontrado para $pkg: $manifest"
-    [[ -f "$meta" ]] || die "Meta não encontrado para $pkg: $meta"
+    if [[ ! -f "$manifest" ]]; then
+        echo "uninstall_pkg: manifest não encontrado para pacote '$pkg': $manifest" >&2
+        return 1
+    fi
+    if [[ ! -f "$meta" ]]; then
+        echo "uninstall_pkg: meta não encontrado para pacote '$pkg': $meta" >&2
+        return 1
+    fi
 
     if ! command -v tac >/dev/null 2>&1; then
-        die "'tac' não encontrado no PATH (necessário para uninstall)."
+        echo "uninstall_pkg: 'tac' é necessário para desinstalar (não encontrado no PATH)" >&2
+        return 1
     fi
 
-    require_root
+    # Verifica dependências reversas (outros pacotes que dependem deste)
+    local other_meta other_pkg deps rev_deps=()
+    for other_meta in "$ADM_PKG_META_DIR"/*.meta; do
+        [[ -f "$other_meta" ]] || continue
+        other_pkg="$(basename "${other_meta%.meta}")"
+        [[ "$other_pkg" == "$pkg" ]] && continue
 
-    adm_log "UNINSTALL START $pkg"
-    echo ">> [UNINSTALL] Removendo pacote $pkg"
-
-    local script pkg_dir pre_un post_un
-    script="$(read_meta_field "$pkg" SCRIPT 2>/dev/null || true)"
-    pkg_dir=""
-
-    # Se for pacote de fonte (script real existe), usamos hooks
-    if [[ -n "$script" && -f "$script" ]]; then
-        pkg_dir="$(pkg_dir_from_script "$script")"
-        pre_un="$(hook_path "$pkg_dir" "$pkg" "pre_uninstall")"
-        post_un="$(hook_path "$pkg_dir" "$pkg" "post_uninstall")"
-        run_hook_host "$pre_un" "pre_uninstall" "$pkg"
-    else
-        pre_un=""
-        post_un=""
-    fi
-
-    local path
-    tac "$manifest" | while read -r path; do
-        [[ -z "$path" ]] && continue
-
-        case "$path" in
-            "$LFS"|"$LFS"/*)
-                ;;
-            *)
-                echo "  ! Caminho fora de LFS ignorado: $path" >&2
-                continue
-                ;;
-        esac
-
-        if [[ -f "$path" || -L "$path" ]]; then
-            rm -f "$path" || echo "  ! Falha ao remover arquivo $path" >&2
-        elif [[ -d "$path" ]]; then
-            rmdir "$path" 2>/dev/null || true
+        deps="$(read_meta_field "$other_pkg" "DEPS" || true)"
+        # compara por palavra
+        if [[ " $deps " == *" $pkg "* ]]; then
+            rev_deps+=("$other_pkg")
         fi
     done
 
-    rm -f "$manifest" "$meta"
-
-    if [[ -n "${post_un:-}" ]]; then
-        run_hook_host "$post_un" "post_uninstall" "$pkg"
+    if (( ${#rev_deps[@]} > 0 )) && [[ "${ADM_ALLOW_BROKEN_DEPS:-0}" != "1" ]]; then
+        echo "uninstall_pkg: não é seguro remover '$pkg'." >&2
+        echo "Os seguintes pacotes dependem dele:" >&2
+        local rp
+        for rp in "${rev_deps[@]}"; do
+            echo "  - $rp" >&2
+        done
+        echo "Se quiser realmente remover mesmo assim, defina ADM_ALLOW_BROKEN_DEPS=1 no ambiente." >&2
+        return 1
     fi
 
-    adm_log "UNINSTALL OK $pkg"
-    echo ">> [UNINSTALL] Pacote $pkg removido."
+    # Hooks de pre/post-uninstall
+    local script pkg_dir pre_uninstall post_uninstall
+    script="$(read_meta_field "$pkg" "SCRIPT" || true)"
+
+    if [[ -n "$script" && -f "$script" ]]; then
+        pkg_dir="$(dirname "$script")"
+        pre_uninstall="$pkg_dir/pre_uninstall"
+        post_uninstall="$pkg_dir/post_uninstall"
+
+        if [[ -x "$pre_uninstall" ]]; then
+            echo "Rodando hook pre_uninstall para '$pkg'"
+            "$pre_uninstall"
+        fi
+    fi
+
+    echo "Removendo arquivos do pacote '$pkg' de acordo com manifest: $manifest"
+
+    # Lê manifest de trás pra frente com tac:
+    # - Formato novo: "T /caminho"
+    # - Formato antigo: "/caminho"
+    tac "$manifest" | while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+
+        local type path
+        if [[ "$entry" == [FDL?]" "* ]]; then
+            type="${entry%% *}"
+            path="${entry#* }"
+        else
+            type=""
+            path="$entry"
+        fi
+
+        # Normaliza espaços
+        path="${path#"${path%%[![:space:]]*}"}"
+        path="${path%"${path##*[![:space:]]}"}"
+
+        [[ -z "$path" ]] && continue
+
+        # Segurança: caminho tem que estar dentro de $LFS
+        if [[ "$path" != "$LFS" && "$path" != "$LFS"/* ]]; then
+            echo "Aviso: ignorando caminho fora de \$LFS no manifest: $path" >&2
+            continue
+        fi
+
+        # Segurança: não permitir '..' nos segmentos
+        if [[ "$path" == *"/../"* || "$path" == "../"* || "$path" == *"/.." ]]; then
+            echo "Aviso: ignorando caminho suspeito com '..' no manifest: $path" >&2
+            continue
+        fi
+
+        # Remove conforme tipo
+        if [[ -f "$path" || -L "$path" ]]; then
+            rm -f -- "$path" || echo "Falha ao remover arquivo/link: $path" >&2
+        elif [[ -d "$path" ]]; then
+            # Diretório: tenta remover, mas ignora erro se não vazio
+            rmdir -- "$path" 2>/dev/null || true
+        else
+            # Se já não existe, ignore
+            :
+        fi
+    done
+
+    # Remove manifest e meta
+    rm -f -- "$manifest" "$meta"
+
+    if [[ -n "$post_uninstall" && -x "$post_uninstall" ]]; then
+        echo "Rodando hook post_uninstall para '$pkg'"
+        "$post_uninstall"
+    fi
+
+    echo "Pacote '$pkg' desinstalado."
 }
 
 cmd_uninstall() {
@@ -864,40 +1016,66 @@ parse_pkg_from_tarball() {
 install_binary_pkg() {
     local tarball="$1"
 
-    adm_ensure_db
     require_root
+    adm_ensure_db
+
+    if [[ ! -f "$tarball" ]]; then
+        echo "install_binary_pkg: arquivo não encontrado: $tarball" >&2
+        return 1
+    fi
 
     local pkg version
     read -r pkg version < <(parse_pkg_from_tarball "$tarball")
 
-    [[ -n "$pkg" ]] || die "Não foi possível determinar o nome do pacote a partir de: $tarball"
-
-    echo ">> [INSTALL] Instalando pacote binário $tarball"
-    echo ">> [INSTALL] Pacote: $pkg Versão: ${version:-desconhecida}"
-
-    adm_log "INSTALL START $pkg TARBALL=$tarball VERSION=$version"
+    if [[ -z "$pkg" ]]; then
+        echo "install_binary_pkg: não foi possível determinar nome do pacote a partir de $tarball" >&2
+        return 1
+    fi
 
     mkdir -p "$ADM_STATE_DIR"
-    local pre_snap post_snap
-    pre_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.prebin.XXXXXX")"
-    post_snap="$(mktemp "$ADM_STATE_DIR/${pkg}.postbin.XXXXXX")"
+
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+
+    local pre_snap post_snap manifest
+    pre_snap="$ADM_STATE_DIR/${pkg}.prebin.$ts.snapshot"
+    post_snap="$ADM_STATE_DIR/${pkg}.postbin.$ts.snapshot"
+    manifest="$(pkg_manifest_file "$pkg")"
 
     snapshot_fs "$pre_snap"
 
-    extract_tarball_into_lfs "$tarball"
+    echo "Instalando pacote binário '$pkg' a partir de: $tarball"
+
+    case "$tarball" in
+        *.tar.zst)
+            zstd -d < "$tarball" | tar -C "$LFS" -xvf -
+            ;;
+        *.tar.xz)
+            xz -d < "$tarball" | tar -C "$LFS" -xvf -
+            ;;
+        *.tar.gz|*.tgz)
+            gzip -d < "$tarball" | tar -C "$LFS" -xvf -
+            ;;
+        *.tar)
+            tar -C "$LFS" -xvf "$tarball"
+            ;;
+        *)
+            echo "install_binary_pkg: extensão de arquivo não suportada: $tarball" >&2
+            rm -f "$pre_snap"
+            return 1
+            ;;
+    esac
 
     snapshot_fs "$post_snap"
 
-    local manifest
-    manifest="$(pkg_manifest_file "$pkg")"
-    comm -13 "$pre_snap" "$post_snap" >"$manifest"
+    # Gera manifest com tipos (F/L/D)
+    generate_manifest_from_snapshots "$pre_snap" "$post_snap" "$manifest"
 
     rm -f "$pre_snap" "$post_snap"
 
     write_meta_binary "$pkg" "$version" "$tarball"
 
-    adm_log "INSTALL OK $pkg TARBALL=$tarball MANIFEST=$manifest"
-    echo ">> [INSTALL] Pacote $pkg instalado a partir de binário."
+    echo "Pacote binário '$pkg' instalado com sucesso."
 }
 
 cmd_install() {
@@ -946,133 +1124,153 @@ cmd_install() {
 
 check_upstream_for_pkg() {
     local pkg="$1"
-    local pkg_dir upstream latest
     local candidates=()
+    local dir helper
 
-    # Procurar diretórios de pacote que tenham um helper .upstream executável
-    shopt -s nullglob
-    for pkg_dir in "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"; do
-        if [[ -x "$pkg_dir/$pkg.upstream" ]]; then
-            candidates+=("$pkg_dir/$pkg.upstream")
+    # Procura helpers *.upstream em diretórios de pacote
+    for dir in "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"; do
+        [[ -d "$dir" ]] || continue
+        helper="$dir/$pkg.upstream"
+        if [[ -x "$helper" ]]; then
+            candidates+=("$helper")
         fi
     done
-    shopt -u nullglob
 
-    # Nenhum helper encontrado => "sem upstream", mas NÃO morre, só retorna 2
-    if [[ ${#candidates[@]} -eq 0 ]]; then
+    if (( ${#candidates[@]} == 0 )); then
+        # 2 = sem helper upstream
         return 2
     fi
 
-    # Se houver mais de um helper, consideramos ambíguo e também retornamos 2,
-    # para não derrubar o update inteiro.
-    if [[ ${#candidates[@]} -gt 1 ]]; then
+    if (( ${#candidates[@]} > 1 )); then
+        echo "Pacote '$pkg' possui múltiplos helpers upstream, ignorando:" >&2
+        local h
+        for h in "${candidates[@]}"; do
+            echo "  $h" >&2
+        done
+        # 2 = ambíguo / sem upstream utilizável
         return 2
     fi
 
-    upstream="${candidates[0]}"
+    helper="${candidates[0]}"
 
-    if ! latest="$("$upstream")"; then
-        # helper existe mas falhou
+    # Executa helper: deve imprimir "versão [info extra...]"
+    local out first rc
+    if ! out="$("$helper")"; then
+        # 1 = erro na execução do helper
+        echo "Erro ao executar helper upstream para '$pkg': $helper" >&2
         return 1
     fi
 
-    # Pega só a primeira palavra/linha
-    latest="${latest%%[[:space:]]*}"
+    # Pega primeira linha e primeiro campo
+    out="${out%%$'\n'*}"
+    # remove espaços à esquerda
+    out="${out#"${out%%[![:space:]]*}"}"
+    # remove espaços à direita
+    out="${out%"${out##*[![:space:]]}"}"
 
-    [[ -n "$latest" ]] || return 1
+    first="${out%%[[:space:]]*}"
 
-    printf '%s\n' "$latest"
+    if [[ -z "$first" ]]; then
+        echo "Helper upstream para '$pkg' não retornou versão válida." >&2
+        return 1
+    fi
+
+    printf '%s\n' "$first"
+    return 0
 }
 
 version_is_newer() {
     local current="$1"
     local latest="$2"
 
+    # Se qualquer um estiver vazio, não consideramos "mais novo"
     if [[ -z "$current" || -z "$latest" ]]; then
         return 1
     fi
 
     local top
-    top="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n1)"
+    top="$(printf '%s\n%s\n' "$current" "$latest" | LC_ALL=C sort -V | tail -n1)"
 
     [[ "$top" != "$current" ]]
 }
 
 cmd_update() {
     adm_ensure_db
+    mkdir -p "$ADM_STATE_DIR"
 
     local pkgs=()
-
-    if [[ $# -gt 0 ]]; then
+    if (( $# > 0 )); then
         pkgs=("$@")
     else
-        shopt -s nullglob
         local meta
         for meta in "$ADM_PKG_META_DIR"/*.meta; do
             [[ -f "$meta" ]] || continue
             pkgs+=("$(basename "${meta%.meta}")")
         done
-        shopt -u nullglob
     fi
 
-    if [[ ${#pkgs[@]} -eq 0 ]]; then
-        echo ">> [UPDATE] Nenhum pacote registrado."
+    if (( ${#pkgs[@]} == 0 )); then
+        echo "Nenhum pacote instalado encontrado para verificar atualizações."
         return 0
     fi
 
-    mkdir -p "$ADM_STATE_DIR"
-    local ts report
-    ts="$(date +'%Y%m%d-%H%M%S')"
-    report="$ADM_STATE_DIR/updates-$ts.txt"
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
+    local report="$ADM_STATE_DIR/updates-$ts.txt"
 
-    echo "# Relatório de atualizações - $ts" >"$report"
-    echo "# Formato: pacote versão_instalada -> versão_upstream" >>"$report"
-    echo >>"$report"
+    local pkg current latest
+    local n_updates=0 n_uptodate=0 n_unknown=0 n_nohelper=0
 
-    local pkg current latest rc any=0
+    {
+        echo "Relatório de atualizações - $ts"
+        echo "LFS: ${LFS:-/}"
+        echo
 
-    for pkg in "${pkgs[@]}"; do
-        current="$(get_installed_version "$pkg" || true)"
+        for pkg in "${pkgs[@]}"; do
+            current="$(get_installed_version "$pkg" || true)"
 
-        if [[ -z "$current" ]]; then
-            echo ">> [UPDATE] $pkg: versão instalada desconhecida (VERSION vazio em meta)." >&2
-            echo "$pkg: INSTALADO (versão desconhecida; crie $pkg.version no script)" >>"$report"
-            continue
-        fi
+            if [[ -z "$current" ]]; then
+                echo "$pkg: versão instalada desconhecida."
+                ((n_unknown++))
+            fi
 
-        if ! latest="$(check_upstream_for_pkg "$pkg")"; then
-            rc=$?
-            case "$rc" in
-                1)
-                    echo ">> [UPDATE] $pkg: erro ao consultar upstream (script .upstream falhou)." >&2
-                    echo "$pkg: ERRO ao consultar upstream" >>"$report"
-                    ;;
-                2)
-                    echo ">> [UPDATE] $pkg: nenhum helper upstream (.upstream) definido; ignorando." >&2
-                    echo "$pkg: sem helper upstream (.upstream ausente)" >>"$report"
-                    ;;
-                *)
-                    echo ">> [UPDATE] $pkg: erro desconhecido no helper upstream (rc=$rc)." >&2
-                    echo "$pkg: ERRO desconhecido no upstream (rc=$rc)" >>"$report"
-                    ;;
-            esac
-            continue
-        fi
+            if ! latest="$(check_upstream_for_pkg "$pkg")"; then
+                case $? in
+                    2)
+                        echo "$pkg: sem helper upstream disponível."
+                        ((n_nohelper++))
+                        ;;
+                    1|*)
+                        echo "$pkg: erro ao consultar upstream (veja logs)."
+                        ;;
+                esac
+                continue
+            fi
 
-        if version_is_newer "$current" "$latest"; then
-            any=1
-            echo ">> [UPDATE] $pkg: nova versão encontrada: $current -> $latest"
-            echo "$pkg: $current -> $latest" >>"$report"
-        else
-            echo ">> [UPDATE] $pkg: já está na versão mais recente ($current)."
-        fi
-    done
+            if [[ -z "$current" ]]; then
+                echo "$pkg: instalado (versão desconhecida) -> upstream: $latest"
+                ((n_updates++))
+                continue
+            fi
 
-    echo
-    echo ">> [UPDATE] Relatório salvo em: $report"
-    if [[ "$any" -eq 0 ]]; then
-        echo ">> [UPDATE] Nenhum pacote com versão mais nova encontrada (entre os que têm helper upstream)."
-    fi
+            if version_is_newer "$current" "$latest"; then
+                echo "$pkg: $current -> $latest (ATUALIZAÇÃO DISPONÍVEL)"
+                ((n_updates++))
+            else
+                echo "$pkg: $current (já está na versão mais recente: $latest)"
+                ((n_uptodate++))
+            fi
+        done
+
+        echo
+        echo "Resumo:"
+        echo "  Com atualização disponível: $n_updates"
+        echo "  Já atualizados:            $n_uptodate"
+        echo "  Versão desconhecida:       $n_unknown"
+        echo "  Sem helper upstream:       $n_nohelper"
+    } > "$report"
+
+    echo "Relatório de atualizações gerado em: $report"
 }
 
 #============================================================
