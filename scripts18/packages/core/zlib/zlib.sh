@@ -20,9 +20,10 @@ PKG_VERSION="1.3.1"
 PKG_TARBALL="${PKG_NAME}-${PKG_VERSION}.tar.gz"
 PKG_URL="https://zlib.net/${PKG_TARBALL}"
 
-# SHA256 oficial do zlib-1.3.1.tar.gz (zlib.net / Homebrew / Conan) 
+# SHA256 oficial do zlib-1.3.1.tar.gz
 PKG_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
 
+# Precisa vir do adm (chroot já exporta isso)
 : "${LFS_SOURCES_DIR:?LFS_SOURCES_DIR não definido}"
 
 log() {
@@ -48,13 +49,18 @@ select_profile() {
         glibc-final|musl-final)
             PREFIX="/usr"
             ;;
+        "")
+            # Sem perfil definido: ainda assim funciona para zlib, mas avisamos.
+            PREFIX="/usr"
+            log "ADM_PROFILE não definido; usando PREFIX=${PREFIX} (comportamento padrão)."
+            ;;
         *)
             error "ADM_PROFILE='${profile}' não suportado para ${PKG_NAME}.
 Use glibc-final ou musl-final dentro do chroot apropriado."
             ;;
     esac
 
-    log "Perfil selecionado: ${profile}"
+    log "Perfil selecionado: ${profile:-<padrão>}"
     log "  PREFIX = ${PREFIX}"
 }
 
@@ -85,6 +91,11 @@ fetch_tarball() {
 check_sha256() {
     cd "${LFS_SOURCES_DIR}"
 
+    if [[ -z "${PKG_SHA256}" ]]; then
+        log "PKG_SHA256 vazio; pulando verificação de SHA256 (por sua conta e risco)"
+        return
+    fi
+
     if ! command -v sha256sum >/dev/null 2>&1; then
         log "sha256sum não encontrado; pulando verificação de SHA256 (por sua conta e risco)"
         return
@@ -105,7 +116,7 @@ check_sha256() {
 }
 
 # -------------------------------------------------------------
-# Fonte / configure / build / testes / install
+# Preparar fonte e build
 # -------------------------------------------------------------
 
 prepare_source() {
@@ -117,16 +128,32 @@ prepare_source() {
 }
 
 configure_build() {
+    if [[ -z "${BUILD_DIR:-}" || ! -d "${BUILD_DIR:-}" ]]; then
+        error "BUILD_DIR não definido ou inexistente; rode prepare_source antes."
+    fi
+
+    cd "${BUILD_DIR}"
     log "Configurando ${PKG_NAME}-${PKG_VERSION}"
     ./configure --prefix="${PREFIX}"
 }
 
 build() {
+    if [[ -z "${BUILD_DIR:-}" || ! -d "${BUILD_DIR:-}" ]]; then
+        error "BUILD_DIR não definido ou inexistente; rode prepare_source antes."
+    fi
+
+    cd "${BUILD_DIR}"
     log "Compilando ${PKG_NAME}"
     make
 }
 
 run_tests() {
+    if [[ -z "${BUILD_DIR:-}" || ! -d "${BUILD_DIR:-}" ]]; then
+        error "BUILD_DIR não definido ou inexistente; rode prepare_source antes."
+    fi
+
+    cd "${BUILD_DIR}"
+
     # Testes opcionais, habilite com RUN_ZLIB_TESTS=1
     if [[ "${RUN_ZLIB_TESTS:-0}" = "1" ]]; then
         log "Executando testes de ${PKG_NAME} (make check)"
@@ -137,6 +164,12 @@ run_tests() {
 }
 
 install_pkg() {
+    if [[ -z "${BUILD_DIR:-}" || ! -d "${BUILD_DIR:-}" ]]; then
+        error "BUILD_DIR não definido ou inexistente; rode prepare_source antes."
+    fi
+
+    cd "${BUILD_DIR}"
+
     log "Instalando ${PKG_NAME} em ${PREFIX}"
 
     make install
@@ -174,7 +207,8 @@ package_zlib() {
         if ! make DESTDIR="${destdir}" install; then
             log "make DESTDIR=${destdir} install falhou; removendo DESTDIR e abortando empacotamento."
             rm -rf "${destdir}"
-            return 0
+            # sair apenas do subshell com sucesso; a lógica externa trata como "nada a empacotar"
+            exit 0
         fi
 
         # Remover lib estática também do pacote binário, para ficar
@@ -205,10 +239,6 @@ package_zlib() {
 
     rm -rf "${destdir}"
 }
-
-# -------------------------------------------------------------
-# main
-# -------------------------------------------------------------
 
 main() {
     select_profile
