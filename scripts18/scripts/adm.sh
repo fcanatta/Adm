@@ -365,16 +365,12 @@ hook_path() {
     local pkg_dir="$1"
     local pkg="$2"
     local hook_type="$3" # pre_install, post_install, pre_uninstall, post_uninstall
+    # padrão da doc:
+    #   $LFS/packages/<categoria>/<programa>/<programa>.pre_install
+    #   ...
     echo "$pkg_dir/${pkg}.${hook_type}"
 }
 
-# Executa hook no host (fora do chroot)
-# Comportamento:
-#   - Se o hook não existir ou não for executável, não faz nada.
-#   - Se o hook falhar:
-#       - Faz log e mostra aviso.
-#       - Se ADM_STRICT_HOOKS=1, PROPAGA o erro (faz o build/uninstall falhar).
-#       - Caso contrário, ignora o erro (retorna 0).
 run_hook_host() {
     local hook="$1"
     local phase="$2"
@@ -385,9 +381,11 @@ run_hook_host() {
         adm_log "HOOK $phase $pkg $hook"
 
         local rc=0
-        if ! ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="host" \
-             "$hook"; then
-            rc=$?
+        # contexto no ambiente do hook (host)
+        ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="host" \
+            "$hook" || rc=$?
+
+        if (( rc != 0 )); then
             echo "!! [$pkg] Hook $phase falhou (rc=$rc): $(basename "$hook")" >&2
             adm_log "HOOK_FAIL $phase $pkg $hook RC=$rc"
             if [[ "${ADM_STRICT_HOOKS:-0}" -eq 1 ]]; then
@@ -401,8 +399,6 @@ run_hook_host() {
     return 0
 }
 
-# Executa hook dentro do chroot
-# Mesma lógica de falha de run_hook_host, mas usando chroot_exec_file.
 run_hook_chroot() {
     local hook="$1"
     local phase="$2"
@@ -413,9 +409,11 @@ run_hook_chroot() {
         adm_log "HOOK_CHROOT $phase $pkg $hook"
 
         local rc=0
-        if ! ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="chroot" \
-             chroot_exec_file "$hook"; then
-            rc=$?
+        # contexto vai pro chroot via chroot_exec_file
+        ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="chroot" \
+            chroot_exec_file "$hook" || rc=$?
+
+        if (( rc != 0 )); then
             echo "!! [$pkg] Hook (chroot) $phase falhou (rc=$rc): $(basename "$hook")" >&2
             adm_log "HOOK_CHROOT_FAIL $phase $pkg $hook RC=$rc"
             if [[ "${ADM_STRICT_HOOKS:-0}" -eq 1 ]]; then
@@ -491,12 +489,12 @@ chroot_exec_file() {
     [[ -n "${ADM_BIN_PKG_DIR:-}"        ]] && env_args+=("ADM_BIN_PKG_DIR=$ADM_BIN_PKG_DIR")
     [[ -n "${ADM_PROFILE_DIR:-}"        ]] && env_args+=("ADM_PROFILE_DIR=$ADM_PROFILE_DIR")
 
-    # Perfil / libc (também declarados no adm.conf / perfis .env)
+    # Perfil / libc (do adm.conf / perfis .env)
     [[ -n "${ADM_PROFILE:-}"            ]] && env_args+=("ADM_PROFILE=$ADM_PROFILE")
     [[ -n "${ADM_LIBC:-}"               ]] && env_args+=("ADM_LIBC=$ADM_LIBC")
 
     # ==========
-    # Contexto de hook (se você estiver usando hooks avançados)
+    # Contexto de hook (se estiver executando um hook)
     # ==========
 
     [[ -n "${ADM_HOOK_PHASE:-}"         ]] && env_args+=("ADM_HOOK_PHASE=$ADM_HOOK_PHASE")
@@ -504,10 +502,9 @@ chroot_exec_file() {
     [[ -n "${ADM_HOOK_MODE:-}"          ]] && env_args+=("ADM_HOOK_MODE=$ADM_HOOK_MODE")
 
     # ==========
-    # Variáveis extras opcionais:
-    #   ADM_ENV_PASSTHROUGH="CC CFLAGS RUN_ZLIB_TESTS"
+    # Variáveis extras opcionais via ADM_ENV_PASSTHROUGH
+    #   Ex.: ADM_ENV_PASSTHROUGH="CC CFLAGS RUN_TESTS"
     # ==========
-
     if [[ -n "${ADM_ENV_PASSTHROUGH:-}" ]]; then
         local name
         for name in $ADM_ENV_PASSTHROUGH; do
@@ -517,7 +514,7 @@ chroot_exec_file() {
         done
     fi
 
-    # Execução final no chroot com ambiente limpo (+ as variáveis que passamos explicitamente)
+    # Execução final no chroot com ambiente limpo (+ as variáveis que passamos)
     chroot "$LFS" /usr/bin/env -i "${env_args[@]}" /bin/bash -lc "/$rel"
 }
 
@@ -1192,59 +1189,53 @@ cmd_install() {
 
 check_upstream_for_pkg() {
     local pkg="$1"
+    local pkg_dir upstream latest
     local candidates=()
-    local dir helper
+    local roots=()
 
-    # Procura helpers *.upstream em diretórios de pacote
-    for dir in "$LFS_BUILD_SCRIPTS_DIR"/*/"$pkg"; do
-        [[ -d "$dir" ]] || continue
-        helper="$dir/$pkg.upstream"
-        if [[ -x "$helper" ]]; then
-            candidates+=("$helper")
-        fi
-    done
-
-    if (( ${#candidates[@]} == 0 )); then
-        # 2 = sem helper upstream
-        return 2
+    # Mesma lógica do find_build_script: prioriza libc-<ADM_LIBC> se definido
+    if [[ -n "${ADM_LIBC:-}" ]]; then
+        roots+=( "$LFS_BUILD_SCRIPTS_DIR/libc-${ADM_LIBC}" )
     fi
+    roots+=( "$LFS_BUILD_SCRIPTS_DIR" )
 
-    if (( ${#candidates[@]} > 1 )); then
-        echo "Pacote '$pkg' possui múltiplos helpers upstream, ignorando:" >&2
-        local h
-        for h in "${candidates[@]}"; do
-            echo "  $h" >&2
+    shopt -s nullglob
+    local root dir
+    for root in "${roots[@]}"; do
+        for dir in "$root"/*/"$pkg"; do
+            if [[ -x "$dir/$pkg.upstream" ]]; then
+                candidates+=( "$dir/$pkg.upstream" )
+            fi
         done
-        # 2 = ambíguo / sem upstream utilizável
+    done
+    shopt -u nullglob
+
+    # Nenhum helper encontrado => "sem upstream", mas NÃO morre, só retorna 2
+    if (( ${#candidates[@]} == 0 )); then
         return 2
     fi
 
-    helper="${candidates[0]}"
+    # Se houver mais de um helper, consideramos ambíguo e também retornamos 2,
+    # para não derrubar o update inteiro.
+    if (( ${#candidates[@]} > 1 )); then
+        echo ">> [update] Múltiplos helpers upstream para $pkg:" >&2
+        printf '    - %s\n' "${candidates[@]}" >&2
+        return 2
+    fi
 
-    # Executa helper: deve imprimir "versão [info extra...]"
-    local out first rc
-    if ! out="$("$helper")"; then
-        # 1 = erro na execução do helper
-        echo "Erro ao executar helper upstream para '$pkg': $helper" >&2
+    upstream="${candidates[0]}"
+
+    if ! latest="$("$upstream")"; then
+        # helper existe mas falhou
         return 1
     fi
 
-    # Pega primeira linha e primeiro campo
-    out="${out%%$'\n'*}"
-    # remove espaços à esquerda
-    out="${out#"${out%%[![:space:]]*}"}"
-    # remove espaços à direita
-    out="${out%"${out##*[![:space:]]}"}"
+    # Pega só a primeira palavra/linha
+    latest="${latest%%[[:space:]]*}"
 
-    first="${out%%[[:space:]]*}"
+    [[ -n "$latest" ]] || return 1
 
-    if [[ -z "$first" ]]; then
-        echo "Helper upstream para '$pkg' não retornou versão válida." >&2
-        return 1
-    fi
-
-    printf '%s\n' "$first"
-    return 0
+    printf '%s\n' "$latest"
 }
 
 version_is_newer() {
