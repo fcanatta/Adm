@@ -235,68 +235,6 @@ cmd_chroot() {
     umount_virtual_fs
 }
 
-# Executa um arquivo que está em $LFS/algum/caminho dentro do chroot
-chroot_exec_file() {
-    local abs="$1"
-    local rel
-    local env_args=()
-
-    if [[ -z "${LFS:-}" ]]; then
-        echo "chroot_exec_file: LFS não está definido" >&2
-        return 1
-    fi
-
-    # Caminho deve ser absoluto
-    case "$abs" in
-        /*) ;;
-        *)
-            echo "chroot_exec_file: caminho deve ser absoluto: $abs" >&2
-            return 1
-            ;;
-    esac
-
-    # Tem que estar dentro de $LFS
-    if [[ "$abs" != "$LFS"/* ]]; then
-        echo "chroot_exec_file: caminho fora de \$LFS: $abs" >&2
-        return 1
-    fi
-
-    # Arquivo precisa existir
-    if [[ ! -f "$abs" ]]; then
-        echo "chroot_exec_file: arquivo não encontrado: $abs" >&2
-        return 1
-    fi
-
-    # Caminho relativo dentro do chroot
-    rel="${abs#$LFS}"
-    rel="${rel#/}"   # remove / inicial, se existir
-
-    # Ambiente mínimo e explícito
-    env_args+=(HOME=/root)
-    env_args+=(TERM="${TERM:-xterm}")
-    env_args+=(PATH=/usr/bin:/usr/sbin:/bin:/sbin)
-    env_args+=(LFS="/")
-
-    # Propaga variáveis importantes se existirem
-    [[ -n "${LFS_SOURCES_DIR:-}"       ]] && env_args+=("LFS_SOURCES_DIR=$LFS_SOURCES_DIR")
-    [[ -n "${LFS_TOOLS_DIR:-}"         ]] && env_args+=("LFS_TOOLS_DIR=$LFS_TOOLS_DIR")
-    [[ -n "${LFS_BUILD_SCRIPTS_DIR:-}" ]] && env_args+=("LFS_BUILD_SCRIPTS_DIR=$LFS_BUILD_SCRIPTS_DIR")
-    [[ -n "${ADM_DB_DIR:-}"            ]] && env_args+=("ADM_DB_DIR=$ADM_DB_DIR")
-
-    # Lista opcional de variáveis extras para passar (ex: ADM_ENV_PASSTHROUGH="CC CFLAGS")
-    if [[ -n "${ADM_ENV_PASSTHROUGH:-}" ]]; then
-        local name
-        for name in $ADM_ENV_PASSTHROUGH; do
-            if [[ -n "${!name+x}" ]]; then
-                env_args+=("$name=${!name}")
-            fi
-        done
-    fi
-
-    # Executa dentro do chroot com ambiente limpo
-    chroot "$LFS" /usr/bin/env -i "${env_args[@]}" /bin/bash -lc "/$rel"
-}
-
 #============================================================
 # Snapshot / Manifest
 #============================================================
@@ -429,6 +367,13 @@ hook_path() {
     echo "$pkg_dir/${pkg}.${hook_type}"
 }
 
+# Executa hook no host (fora do chroot)
+# Comportamento:
+#   - Se o hook não existir ou não for executável, não faz nada.
+#   - Se o hook falhar:
+#       - Faz log e mostra aviso.
+#       - Se ADM_STRICT_HOOKS=1, PROPAGA o erro (faz o build/uninstall falhar).
+#       - Caso contrário, ignora o erro (retorna 0).
 run_hook_host() {
     local hook="$1"
     local phase="$2"
@@ -437,10 +382,26 @@ run_hook_host() {
     if [[ -x "$hook" ]]; then
         echo ">> [$pkg] Executando hook $phase: $(basename "$hook")"
         adm_log "HOOK $phase $pkg $hook"
-        "$hook"
+
+        local rc=0
+        if ! ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="host" \
+             "$hook"; then
+            rc=$?
+            echo "!! [$pkg] Hook $phase falhou (rc=$rc): $(basename "$hook")" >&2
+            adm_log "HOOK_FAIL $phase $pkg $hook RC=$rc"
+            if [[ "${ADM_STRICT_HOOKS:-0}" -eq 1 ]]; then
+                return "$rc"
+            fi
+        else
+            adm_log "HOOK_OK $phase $pkg $hook"
+        fi
     fi
+
+    return 0
 }
 
+# Executa hook dentro do chroot
+# Mesma lógica de falha de run_hook_host, mas usando chroot_exec_file.
 run_hook_chroot() {
     local hook="$1"
     local phase="$2"
@@ -449,8 +410,58 @@ run_hook_chroot() {
     if [[ -x "$hook" ]]; then
         echo ">> [$pkg] Executando hook (chroot) $phase: $(basename "$hook")"
         adm_log "HOOK_CHROOT $phase $pkg $hook"
-        chroot_exec_file "$hook"
+
+        local rc=0
+        if ! ADM_HOOK_PHASE="$phase" ADM_HOOK_PKG="$pkg" ADM_HOOK_MODE="chroot" \
+             chroot_exec_file "$hook"; then
+            rc=$?
+            echo "!! [$pkg] Hook (chroot) $phase falhou (rc=$rc): $(basename "$hook")" >&2
+            adm_log "HOOK_CHROOT_FAIL $phase $pkg $hook RC=$rc"
+            if [[ "${ADM_STRICT_HOOKS:-0}" -eq 1 ]]; then
+                return "$rc"
+            fi
+        else
+            adm_log "HOOK_CHROOT_OK $phase $pkg $hook"
+        fi
     fi
+
+    return 0
+}
+
+#============================================================
+# Chroot helper (ajustado para passar variáveis dos hooks)
+#============================================================
+chroot_exec_file() {
+    local abs="$1"
+    local rel="${abs#$LFS}"
+
+    if [[ "$rel" == "$abs" ]]; then
+        die "Arquivo $abs não está dentro de LFS ($LFS)"
+    fi
+
+    rel="${rel#/}"
+
+    # Ambiente mínimo e previsível
+    local env_args=(
+        HOME=/root
+        TERM="${TERM:-xterm}"
+        PATH=/usr/bin:/usr/sbin:/bin:/sbin
+        LFS="/"
+    )
+
+    # Propaga variáveis de contexto de hook, se existirem
+    if [[ -n "${ADM_HOOK_PHASE:-}" ]]; then
+        env_args+=("ADM_HOOK_PHASE=$ADM_HOOK_PHASE")
+    fi
+    if [[ -n "${ADM_HOOK_PKG:-}" ]]; then
+        env_args+=("ADM_HOOK_PKG=$ADM_HOOK_PKG")
+    fi
+    if [[ -n "${ADM_HOOK_MODE:-}" ]]; then
+        env_args+=("ADM_HOOK_MODE=$ADM_HOOK_MODE")
+    fi
+
+    chroot "$LFS" /usr/bin/env -i "${env_args[@]}" \
+        /bin/bash -lc "/$rel"
 }
 
 read_deps() {
