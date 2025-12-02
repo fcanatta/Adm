@@ -74,19 +74,55 @@ pkg_build() {
 
   #------------------------------------
   # Ajustes específicos por PROFILE
+  #   Use EXTRA_CONFIG_FLAGS para passar
+  #   opções adicionais de ./configure
   #------------------------------------
   local EXTRA_CONFIG_FLAGS=""
   case "${PROFILE:-}" in
-    musl)
-      echo "==> [binutils] Ajustes para musl (exemplo: desativar nls se necessário)"
-      # Se quiser algo específico pra musl, coloque aqui:
-      # EXTRA_CONFIG_FLAGS+=" --disable-nls"
-      ;;
     glibc|"")
-      echo "==> [binutils] Usando configuração padrão para glibc"
+      echo "==> [binutils] Ajustes de configure para GLIBC"
+
+      # Ativa NLS (traduções) – requer gettext/libintl em tempo de build
+      EXTRA_CONFIG_FLAGS+=" --enable-nls"
+
+      # Usa zlib do sistema (recomendado em distros)
+      EXTRA_CONFIG_FLAGS+=" --with-system-zlib"
+
+      # Garante que ar/ranlib criem arquivos determinísticos por padrão
+      EXTRA_CONFIG_FLAGS+=" --enable-deterministic-archives"
+
+      # Se não quiser gprofng (profiling novo do binutils), descomente:
+      # EXTRA_CONFIG_FLAGS+=" --disable-gprofng"
+
+      # Se quiser o linker gold junto com ld.bfd, descomente:
+      # EXTRA_CONFIG_FLAGS+=" --enable-gold"
+
       ;;
+
+    musl)
+      echo "==> [binutils] Ajustes de configure para MUSL"
+
+      # Em musl é comum desabilitar NLS pra evitar dependências extras
+      EXTRA_CONFIG_FLAGS+=" --disable-nls"
+
+      # Ainda assim usa zlib do sistema, se você tiver zlib pra musl
+      EXTRA_CONFIG_FLAGS+=" --with-system-zlib"
+
+      # Deterministic archives também é útil aqui
+      EXTRA_CONFIG_FLAGS+=" --enable-deterministic-archives"
+
+      # gprofng costuma dar mais trabalho em ambientes não-glibc;
+      # upstream já desabilita para musl em vários casos.
+      EXTRA_CONFIG_FLAGS+=" --disable-gprofng"
+
+      # Se tiver qualquer problema de build com avisos tratados como erro,
+      # você pode forçar desativar werror (além do WERROR que você já controla):
+      # EXTRA_CONFIG_FLAGS+=" --disable-werror"
+
+      ;;
+
     *)
-      echo "==> [binutils] PROFILE desconhecido: ${PROFILE}, seguindo configuração padrão"
+      echo "==> [binutils] PROFILE desconhecido (${PROFILE}), sem flags extras específicas"
       ;;
   esac
 
