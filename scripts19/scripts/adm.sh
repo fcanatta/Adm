@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# adm.sh - simples gerenciador de builds e pacotes
-# Estrutura:
+# adm - gerenciador de builds e pacotes simples
+#
+# Layout esperado:
 #   /mnt/adm/
-#     adm.sh
+#     adm
 #     packages/<categoria>/<programa>/
-#       programa.sh            # script de build
-#       programa.deps          # dependências (uma por linha, formato categoria/programa)
-#       programa.pre_install   # hook opcional
-#       programa.post_install  # hook opcional
-#       programa.pre_uninstall # hook opcional
-#       programa.post_uninstall# hook opcional
+#       programa.sh
+#       programa.deps
+#       programa.pre_install
+#       programa.post_install
+#       programa.pre_uninstall
+#       programa.post_uninstall
 #     cache/src
 #     cache/packages
 #     logs
@@ -81,6 +82,7 @@ log_ok()    { _log OK    "$C_OK"   "$*"; }
 #--------------------------------------
 DEFAULT_LIBC="unknown"
 PROFILE="${PROFILE:-}"
+FORCE_REBUILD="${FORCE_REBUILD:-0}"
 
 detect_libc() {
   if getconf GNU_LIBC_VERSION &>/dev/null; then
@@ -124,13 +126,13 @@ set_profile() {
 }
 
 #--------------------------------------
-# Helpers para identificação de pacote
+# Identidade do pacote (globais)
 #--------------------------------------
 PKG_CAT=""
 PKG_NAME=""
-PKG_ID=""          # categoria/programa
-PKG_KEY=""         # categoria_programa (para arquivos em db)
-PKG_META_DIR=""    # /mnt/adm/packages/categoria/programa
+PKG_ID=""      # categoria/programa
+PKG_KEY=""     # categoria_programa
+PKG_META_DIR=""
 
 set_pkg_vars() {
   PKG_CAT="$1"
@@ -145,8 +147,44 @@ set_pkg_vars() {
   fi
 }
 
+# Resolve só pelo nome do programa (sem categoria):
+resolve_pkg_by_name() {
+  local name="$1"
+  local -a matches=()
+  local p
+
+  while IFS= read -r p; do
+    matches+=("$p")
+  done < <(find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type f -name "${name}.sh" 2>/dev/null || true)
+
+  local count="${#matches[@]}"
+  if (( count == 0 )); then
+    log_error "Pacote '${name}' não encontrado em $PKG_BASE"
+    exit 1
+  elif (( count > 1 )); then
+    log_error "Nome de pacote '${name}' é ambíguo. Encontrados:"
+    local m
+    for m in "${matches[@]}"; do
+      # .../packages/cat/name/name.sh
+      local cat
+      cat="$(basename "$(dirname "$m")")"
+      local prog
+      prog="$(basename "$m" .sh)"
+      printf "  %s/%s\n" "$cat" "$prog"
+    done
+    exit 1
+  fi
+
+  local full="${matches[0]}"
+  local cat
+  cat="$(basename "$(dirname "$full")")"
+  local prog
+  prog="$(basename "$full" .sh)"
+  set_pkg_vars "$cat" "$prog"
+}
+
 #--------------------------------------
-# Registro em banco simples
+# Registro de eventos
 #--------------------------------------
 register_event() {
   local action="$1" status="$2" version="$3"
@@ -157,7 +195,7 @@ register_event() {
 }
 
 #--------------------------------------
-# Carregar script de build do pacote
+# Script e variáveis do pacote
 #--------------------------------------
 PKG_VERSION=""
 SRC_URL=""
@@ -167,14 +205,14 @@ PKG_BUILD_FUNC="pkg_build"
 load_pkg_script() {
   local script="$PKG_META_DIR/${PKG_NAME}.sh"
   if [[ ! -f "$script" ]]; then
-    log_error "Script de build do pacote não encontrado: $script"
+    log_error "Script de build não encontrado: $script"
     exit 1
   fi
 
-  # Limpa variáveis globais relacionadas ao pacote
   PKG_VERSION=""
   SRC_URL=""
   SRC_MD5=""
+
   if declare -F "$PKG_BUILD_FUNC" &>/dev/null; then
     unset -f "$PKG_BUILD_FUNC"
   fi
@@ -192,8 +230,7 @@ load_pkg_script() {
 }
 
 #--------------------------------------
-# Dependências (arquivo .deps)
-# formato: categoria/programa (uma por linha, # = comentário)
+# Dependências
 #--------------------------------------
 declare -A BUILT_IN_SESSION
 declare -A INSTALLED_IN_SESSION
@@ -215,7 +252,7 @@ read_deps() {
 }
 
 #--------------------------------------
-# Download + cache de source + extração
+# Download + cache + extração
 #--------------------------------------
 prepare_source() {
   mkdir -p "$CACHE_SRC" "$BUILD_ROOT"
@@ -278,16 +315,24 @@ prepare_source() {
 }
 
 #--------------------------------------
-# Empacotar resultado do build
+# Empacotar resultado
 #--------------------------------------
+get_profile_tag() {
+  local p="${PROFILE:-$DEFAULT_LIBC}"
+  [[ -z "$p" ]] && p="unknownlibc"
+  echo "$p"
+}
+
+get_pkg_tarball_path() {
+  local profile_tag
+  profile_tag="$(get_profile_tag)"
+  echo "$CACHE_PKG/${PKG_CAT}-${PKG_NAME}-${PKG_VERSION}-${profile_tag}.tar.xz"
+}
+
 package_result() {
   mkdir -p "$CACHE_PKG"
-
-  local profile_tag="${PROFILE:-$DEFAULT_LIBC}"
-  [[ -z "$profile_tag" ]] && profile_tag="unknownlibc"
-
-  local out_name="${PKG_CAT}-${PKG_NAME}-${PKG_VERSION}-${profile_tag}.tar.xz"
-  local out_path="$CACHE_PKG/$out_name"
+  local out_path
+  out_path="$(get_pkg_tarball_path)"
 
   log_info "Gerando pacote: $out_path"
   (
@@ -298,7 +343,6 @@ package_result() {
     fi
   )
   log_ok "Pacote gerado: $out_path"
-
   echo "$out_path"
 }
 
@@ -307,7 +351,7 @@ package_result() {
 #--------------------------------------
 run_hook_if_exists() {
   local hook_path="$1"
-  local when="$2" # string para log: pre_install, post_install, etc.
+  local when="$2"
 
   if [[ -f "$hook_path" ]]; then
     log_info "Executando hook $when: $hook_path"
@@ -321,19 +365,18 @@ run_hook_if_exists() {
 }
 
 #--------------------------------------
-# Instalar pacote (tarball) no sistema
-# - resolve dependências
-# - executa hooks
-# - registra arquivos
+# Instalação
 #--------------------------------------
 is_pkg_installed() {
   [[ -f "$DB_PKG_META/${PKG_KEY}.meta" ]]
 }
 
-get_pkg_tarball_path() {
-  local profile_tag="${PROFILE:-$DEFAULT_LIBC}"
-  [[ -z "$profile_tag" ]] && profile_tag="unknownlibc"
-  echo "$CACHE_PKG/${PKG_CAT}-${PKG_NAME}-${PKG_VERSION}-${profile_tag}.tar.xz"
+installed_mark() {
+  if [[ -f "$DB_PKG_META/${PKG_KEY}.meta" ]]; then
+    echo "[ ✔️]"
+  else
+    echo "[   ]"
+  fi
 }
 
 install_pkg_files() {
@@ -346,18 +389,15 @@ install_pkg_files() {
 
   log_info "Instalando pacote no sistema a partir de: $tarball"
 
-  # Lista de arquivos instalados
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
   : > "$list_file"
 
-  # Primeiro, registra quais arquivos serão criados:
   tar tf "$tarball" | while IFS= read -r path; do
     path="$(echo "$path" | sed 's#^\.\/##')"
     [[ -z "$path" ]] && continue
     echo "/$path" >> "$list_file"
   done
 
-  # Agora extrai de fato:
   if ! tar -C / -xpf "$tarball"; then
     log_error "Falha ao extrair pacote em /"
     exit 1
@@ -375,78 +415,17 @@ write_pkg_meta() {
     echo "CATEGORY=$PKG_CAT"
     echo "ID=$PKG_ID"
     echo "VERSION=$PKG_VERSION"
-    echo "PROFILE=${PROFILE:-$DEFAULT_LIBC}"
+    echo "PROFILE=$(get_profile_tag)"
     echo "DEPS=$deps_str"
   } > "$meta_file"
 
   log_ok "Metadados gravados em $meta_file"
 }
 
-install_pkg_recursive() {
-  # Evitar loops
-  if [[ -n "${INSTALLED_IN_SESSION[$PKG_ID]:-}" ]]; then
-    log_info "Pacote $PKG_ID já tratado para instalação nesta sessão."
-    return 0
-  fi
-
-  # Resolve dependências primeiro
-  local deps=()
-  mapfile -t deps < <(read_deps || true)
-
-  for dep in "${deps[@]}"; do
-    local dep_cat="${dep%%/*}"
-    local dep_name="${dep##*/}"
-
-    log_info "Resolvendo dependência: $dep -> $dep_cat/$dep_name"
-    (
-      # escopo próprio
-      set_pkg_vars "$dep_cat" "$dep_name"
-      load_pkg_script
-      build_pkg_if_needed
-      install_pkg_recursive
-    )
-  done
-
-  # Volta ao pacote atual (escopo externo)
-  set_pkg_vars "$PKG_CAT" "$PKG_NAME"
-  load_pkg_script
-
-  if is_pkg_installed; then
-    log_info "Pacote $PKG_ID já instalado. Pulando instalação."
-    INSTALLED_IN_SESSION["$PKG_ID"]=1
-    return 0
-  fi
-
-  # Garante tarball
-  build_pkg_if_needed
-  local tarball
-  tarball="$(get_pkg_tarball_path)"
-
-  # Hooks de pre-install
-  run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.pre_install" "pre_install"
-
-  # Instala arquivos
-  install_pkg_files "$tarball"
-
-  # Hooks de post-install
-  run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_install" "post_install"
-
-  # grava metadados e registro
-  local deps_str="${deps[*]:-}"
-  write_pkg_meta "$deps_str"
-  register_event "install" "OK" "$PKG_VERSION"
-
-  INSTALLED_IN_SESSION["$PKG_ID"]=1
-  log_ok "Instalação de $PKG_ID concluída."
-}
-
 #--------------------------------------
 # Build
 #--------------------------------------
 build_pkg_only() {
-  local build_tag="build-${PKG_CAT}_${PKG_NAME}"
-  log_init "$build_tag"
-
   detect_libc
   set_profile "${PROFILE:-}"
 
@@ -472,10 +451,15 @@ build_pkg_if_needed() {
   detect_libc
   set_profile "${PROFILE:-}"
 
+  load_pkg_script
   local tarball
   tarball="$(get_pkg_tarball_path)"
 
-  if [[ -f "$tarball" ]]; then
+  if [[ "$FORCE_REBUILD" = "1" ]]; then
+    log_info "FORCE_REBUILD ativo; rebuildando $PKG_ID"
+    rm -f "$tarball"
+    build_pkg_only
+  elif [[ -f "$tarball" ]]; then
     log_info "Tarball já existe: $tarball (não rebuildando)"
   else
     build_pkg_only
@@ -483,19 +467,78 @@ build_pkg_if_needed() {
 }
 
 #--------------------------------------
-# Uninstall
-# - remove dependentes primeiro (reverse deps)
-# - executa hooks pre/post_uninstall
+# Instalação recursiva com deps
+#--------------------------------------
+install_pkg_recursive() {
+  if [[ -n "${INSTALLED_IN_SESSION[$PKG_ID]:-}" ]]; then
+    log_info "Pacote $PKG_ID já tratado para instalação nesta sessão."
+    return 0
+  fi
+
+  # Carrega script do pacote atual
+  load_pkg_script
+
+  # Dependências (categoria/programa)
+  local deps=()
+  mapfile -t deps < <(read_deps || true)
+
+  local dep
+  for dep in "${deps[@]}"; do
+    local dep_cat="${dep%%/*}"
+    local dep_name="${dep##*/}"
+
+    log_info "Resolvendo dependência: $dep"
+
+    # Salva estado atual
+    local saved_cat="$PKG_CAT" saved_name="$PKG_NAME" saved_id="$PKG_ID" saved_key="$PKG_KEY" saved_meta="$PKG_META_DIR"
+
+    set_pkg_vars "$dep_cat" "$dep_name"
+    install_pkg_recursive
+
+    # Restaura pacote atual
+    PKG_CAT="$saved_cat"; PKG_NAME="$saved_name"
+    PKG_ID="$saved_id"; PKG_KEY="$saved_key"; PKG_META_DIR="$saved_meta"
+  done
+
+  # Garante tarball (respeitando FORCE_REBUILD)
+  build_pkg_if_needed
+  local tarball
+  tarball="$(get_pkg_tarball_path)"
+
+  if is_pkg_installed && [[ "$FORCE_REBUILD" != "1" ]]; then
+    log_info "Pacote $PKG_ID já instalado (sem FORCE_REBUILD). Pulando instalação."
+    INSTALLED_IN_SESSION["$PKG_ID"]=1
+    return 0
+  fi
+
+  # Hooks e instalação
+  run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.pre_install" "pre_install"
+  install_pkg_files "$tarball"
+  run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_install" "post_install"
+
+  local deps_str="${deps[*]:-}"
+  write_pkg_meta "$deps_str"
+  register_event "install" "OK" "$PKG_VERSION"
+
+  INSTALLED_IN_SESSION["$PKG_ID"]=1
+  log_ok "Instalação de $PKG_ID concluída."
+}
+
+#--------------------------------------
+# Uninstall (com dependentes)
 #--------------------------------------
 find_reverse_deps() {
   local target_id="$PKG_ID"
   local f
+
   for f in "$DB_PKG_META"/*.meta; do
     [[ ! -f "$f" ]] && continue
+    # isolando variáveis
+    local NAME="" CATEGORY="" DEPS=""
     # shellcheck disable=SC1090
     source "$f"
-    local deps_str="${DEPS:-}"
-    for d in $deps_str; do
+    local d
+    for d in $DEPS; do
       if [[ "$d" == "$target_id" ]]; then
         echo "${CATEGORY}/${NAME}"
       fi
@@ -515,34 +558,37 @@ uninstall_pkg_recursive() {
     return 0
   fi
 
-  # Descobre dependentes e remove primeiro
   log_info "Verificando dependentes de $PKG_ID..."
-  local rev
+  local rev=()
   mapfile -t rev < <(find_reverse_deps || true)
 
+  local r
   for r in "${rev[@]}"; do
     local r_cat="${r%%/*}"
     local r_name="${r##*/}"
     log_info "Removendo dependente: $r"
-    (
-      set_pkg_vars "$r_cat" "$r_name"
-      uninstall_pkg_recursive
-    )
+
+    local saved_cat="$PKG_CAT" saved_name="$PKG_NAME" saved_id="$PKG_ID" saved_key="$PKG_KEY" saved_meta="$PKG_META_DIR"
+
+    set_pkg_vars "$r_cat" "$r_name"
+    uninstall_pkg_recursive
+
+    PKG_CAT="$saved_cat"; PKG_NAME="$saved_name"
+    PKG_ID="$saved_id"; PKG_KEY="$saved_key"; PKG_META_DIR="$saved_meta"
   done
 
-  # Recarrega meta do pacote alvo para obter versão
   local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
-  # shellcheck disable=SC1090
-  source "$meta_file"
+  if [[ ! -f "$meta_file" ]]; then
+    log_warn "Metadados ausentes para $PKG_ID, removendo somente lista de arquivos se existir."
+  else
+    # shellcheck disable=SC1090
+    source "$meta_file"
+  fi
 
-  # Hook pre_uninstall
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.pre_uninstall" "pre_uninstall"
 
-  # Remove arquivos listados
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
-  if [[ ! -f "$list_file" ]]; then
-    log_warn "Lista de arquivos não encontrada para $PKG_ID: $list_file"
-  else
+  if [[ -f "$list_file" ]]; then
     log_info "Removendo arquivos listados em $list_file"
     while IFS= read -r p || [[ -n "$p" ]]; do
       [[ -z "$p" ]] && continue
@@ -559,21 +605,21 @@ uninstall_pkg_recursive() {
       fi
     done < "$list_file"
     rm -f "$list_file"
+  else
+    log_warn "Lista de arquivos não encontrada para $PKG_ID."
   fi
 
-  # Hook post_uninstall
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_uninstall" "post_uninstall"
 
-  # Remove metadados
   rm -f "$meta_file"
-
   register_event "uninstall" "OK" "${VERSION:-unknown}"
+
   UNINSTALLED_IN_SESSION["$PKG_ID"]=1
   log_ok "Remoção de $PKG_ID concluída."
 }
 
 #--------------------------------------
-# Comandos de Git (update/sync)
+# Git sync
 #--------------------------------------
 git_sync() {
   local repo="${1:-$ADM_ROOT}"
@@ -593,18 +639,27 @@ git_sync() {
     fi
 
     if ! git push; then
-      log_warn "git push falhou (talvez sem remote configurado ou conflitos)."
+      log_warn "git push falhou (sem remote ou conflitos)."
     fi
   )
-  log_ok "Sync Git finalizado (verifique logs acima para detalhes)."
+  log_ok "Sync Git finalizado."
 }
 
 #--------------------------------------
-# Listagem / info
+# Listagem e info
 #--------------------------------------
 list_packages() {
   echo "Pacotes disponíveis em $PKG_BASE:"
-  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type d | sed "s#^$PKG_BASE/##" | sort
+  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type f -name '*.sh' \
+    | sed "s#^$PKG_BASE/##;s#\.sh\$##" \
+    | sed 's#/[^/]*$##' | sort -u \
+    | while read -r line; do
+        local cat prog
+        cat="${line%%/*}"
+        prog="${line##*/}"
+        set_pkg_vars "$cat" "$prog"
+        printf "%-20s (%s) %s\n" "$prog" "$cat" "$(installed_mark)"
+      done
 }
 
 show_registry() {
@@ -617,33 +672,142 @@ show_registry() {
 
 show_pkg_info() {
   local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
-  if [[ ! -f "$meta_file" ]]; then
-    echo "Pacote $PKG_ID não está instalado ou não possui metadados."
-    return 1
+  local installed_flag="[   ]"
+  if [[ -f "$meta_file" ]]; then
+    installed_flag="[ ✔️]"
   fi
-  cat "$meta_file"
+
+  echo "Programa: $PKG_NAME $installed_flag"
+  echo "Categoria: $PKG_CAT"
+  load_pkg_script
+  echo "Versão (script): $PKG_VERSION"
+  echo "Source URL: $SRC_URL"
+
+  local deps_script=()
+  mapfile -t deps_script < <(read_deps || true)
+  echo "Dependências (script): ${deps_script[*]:-(nenhuma)}"
+
+  if [[ -f "$meta_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$meta_file"
+    echo "----- Informações instaladas -----"
+    echo "ID: $ID"
+    echo "Versão instalada: $VERSION"
+    echo "Profile instalado: $PROFILE"
+    echo "Dependências registradas: ${DEPS:-}"
+  else
+    echo "Pacote ainda não instalado (sem metadados em $meta_file)."
+  fi
 }
 
+list_installed() {
+  if [[ ! -d "$DB_PKG_META" ]]; then
+    echo "Nenhum pacote instalado."
+    return 0
+  fi
+
+  local f
+  for f in "$DB_PKG_META"/*.meta; do
+    [[ ! -f "$f" ]] && continue
+    local NAME="" CATEGORY="" ID="" VERSION="" PROFILE="" DEPS=""
+    # shellcheck disable=SC1090
+    source "$f"
+    printf "Programa: %s [ ✔️]\n" "$NAME"
+    printf "  Categoria: %s\n" "$CATEGORY"
+    printf "  ID: %s\n" "$ID"
+    printf "  Versão: %s\n" "$VERSION"
+    printf "  Profile: %s\n" "$PROFILE"
+    printf "  Dependências: %s\n" "${DEPS:-}"
+    echo
+  done
+}
+
+search_packages() {
+  local pattern="$1"
+  echo "Busca por: $pattern"
+  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type d \
+    | while read -r d; do
+        local cat prog
+        cat="$(basename "$(dirname "$d")")"
+        prog="$(basename "$d")"
+        if [[ "$prog" == *"$pattern"* || "$cat" == *"$pattern"* ]]; then
+          set_pkg_vars "$cat" "$prog"
+          printf "%-20s (%s) %s\n" "$prog" "$cat" "$(installed_mark)"
+        fi
+      done
+}
+
+#--------------------------------------
+# Rebuild (programa ou sistema)
+#--------------------------------------
+rebuild_program() {
+  FORCE_REBUILD=1
+  detect_libc
+  set_profile "${PROFILE:-}"
+  install_pkg_recursive
+}
+
+rebuild_system() {
+  FORCE_REBUILD=1
+  detect_libc
+  set_profile "${PROFILE:-}"
+
+  if [[ ! -d "$DB_PKG_META" ]]; then
+    echo "Nenhum pacote instalado para rebuild."
+    return 0
+  fi
+
+  # Limpa cache de sessão
+  INSTALLED_IN_SESSION=()
+  BUILT_IN_SESSION=()
+
+  local f
+  for f in "$DB_PKG_META"/*.meta; do
+    [[ ! -f "$f" ]] && continue
+    local NAME="" CATEGORY=""
+    # shellcheck disable=SC1090
+    source "$f"
+    log_info "Rebuild de ${CATEGORY}/${NAME}"
+    set_pkg_vars "$CATEGORY" "$NAME"
+    install_pkg_recursive
+  done
+}
+
+#--------------------------------------
+# Usage
+#--------------------------------------
 usage() {
   cat <<EOF
 Uso: $0 <comando> [args]
 
 Comandos principais:
-  build <categoria> <programa> [profile]      Apenas compila e gera tarball em cache
-  install <categoria> <programa> [profile]    Resolve deps, build se precisar e instala com hooks
-  uninstall <categoria> <programa>            Remove pacotes dependentes e depois o alvo
+  build <programa>                 Compila e gera tarball em cache
+  install <programa> [profile]     Resolve deps, build se precisar e instala (com hooks)
+  uninstall <programa>             Remove dependentes e depois o programa
 
-Outros comandos:
-  list                                        Lista todos os pacotes disponíveis
-  info <categoria> <programa>                 Mostra metadados do pacote instalado
-  registry                                    Mostra histórico de build/install/uninstall
-  git-sync [caminho_repo]                     Executa git pull/push no repositório (default: $ADM_ROOT)
+Rebuild:
+  rebuild <programa>               Reconstrói (build + reinstall) o programa e deps
+  rebuild-system                   Reconstrói todo o sistema instalado com deps organizadas
+
+Consulta:
+  list                             Lista todos os programas disponíveis (com [ ✔️] se instalados)
+  search <padrão>                  Procura programa pelo nome/categoria, mostra [ ✔️] se instalado
+  info <programa>                  Mostra informações do programa + estado [ ✔️] se instalado
+  installed                        Lista todos os programas instalados com todas as informações
+  registry                         Mostra histórico de build/install/uninstall
+
+Git:
+  git-sync [caminho_repo]          Executa git pull/push no repositório (default: $ADM_ROOT)
 
 Exemplos:
-  $0 build dev binutils
-  $0 install dev binutils musl
-  $0 uninstall dev binutils
-  $0 git-sync /mnt/adm
+  $0 build binutils
+  $0 install binutils musl
+  $0 uninstall binutils
+  $0 rebuild binutils
+  $0 rebuild-system
+  $0 search bin
+  $0 info binutils
+  $0 installed
 EOF
 }
 
@@ -654,46 +818,67 @@ cmd="${1:-}"
 
 case "$cmd" in
   build)
-    [[ $# -lt 3 ]] && { usage; exit 1; }
-    cat="$2"; prog="$3"; prof="${4:-}"
-    set_pkg_vars "$cat" "$prog"
-    [[ -n "$prof" ]] && PROFILE="$prof"
-    log_init "build-${cat}_${prog}"
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    prog="$2"
+    log_init "build-${prog}"
+    resolve_pkg_by_name "$prog"
     build_pkg_only
     ;;
   install)
-    [[ $# -lt 3 ]] && { usage; exit 1; }
-    cat="$2"; prog="$3"; prof="${4:-}"
-    set_pkg_vars "$cat" "$prog"
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    prog="$2"; prof="${3:-}"
+    log_init "install-${prog}"
+    resolve_pkg_by_name "$prog"
     [[ -n "$prof" ]] && PROFILE="$prof"
-    log_init "install-${cat}_${prog}"
-    detect_libc
-    set_profile "$PROFILE"
+    INSTALLED_IN_SESSION=()
     install_pkg_recursive
     ;;
   uninstall)
-    [[ $# -lt 3 ]] && { usage; exit 1; }
-    cat="$2"; prog="$3"
-    set_pkg_vars "$cat" "$prog"
-    log_init "uninstall-${cat}_${prog}"
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    prog="$2"
+    log_init "uninstall-${prog}"
+    resolve_pkg_by_name "$prog"
+    UNINSTALLED_IN_SESSION=()
     detect_libc
     set_profile "${PROFILE:-}"
     uninstall_pkg_recursive
+    ;;
+  rebuild)
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    prog="$2"
+    log_init "rebuild-${prog}"
+    resolve_pkg_by_name "$prog"
+    INSTALLED_IN_SESSION=()
+    rebuild_program
+    ;;
+  rebuild-system)
+    log_init "rebuild-system"
+    rebuild_system
     ;;
   list)
     log_init "list"
     list_packages
     ;;
+  search)
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    pattern="$2"
+    log_init "search-${pattern}"
+    search_packages "$pattern"
+    ;;
+  info)
+    [[ $# -lt 2 ]] && { usage; exit 1; }
+    prog="$2"
+    log_init "info-${prog}"
+    resolve_pkg_by_name "$prog"
+    show_pkg_info
+    ;;
+  installed)
+    log_init "installed"
+    list_installed
+    ;;
   registry)
     log_init "registry"
     show_registry
-    ;;
-  info)
-    [[ $# -lt 3 ]] && { usage; exit 1; }
-    cat="$2"; prog="$3"
-    set_pkg_vars "$cat" "$prog"
-    log_init "info-${cat}_${prog}"
-    show_pkg_info
     ;;
   git-sync)
     log_init "git-sync"
