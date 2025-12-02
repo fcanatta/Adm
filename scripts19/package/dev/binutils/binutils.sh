@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
 # Script de construção do Binutils para o adm
+#
 # Caminho esperado:
 #   /mnt/adm/packages/dev/binutils/binutils.sh
 #
-# O adm fornece:
-#   - SRC_DIR  : diretório com o source extraído
-#   - DESTDIR  : raiz de instalação temporária (pkgroot)
-#   - PROFILE  : glibc / musl / outro (string)
-#   - NUMJOBS  : número de jobs para o make
+# O adm fornece as variáveis:
+#   SRC_DIR  : diretório com o source extraído do tarball
+#   DESTDIR  : raiz de instalação temporária (pkgroot)
+#   PROFILE  : glibc / musl / outro (string)
+#   NUMJOBS  : número de jobs para o make
 #
 # Este script deve definir:
-#   - PKG_VERSION
-#   - SRC_URL
-#   - (opcional) SRC_MD5
-#   - função pkg_build()
+#   PKG_VERSION
+#   SRC_URL
+#   (opcional) SRC_MD5
+#   função pkg_build()
 
-# Versão e source oficial
+#----------------------------------------
+# Versão e origem oficial
+#----------------------------------------
 PKG_VERSION="2.45.1"
 SRC_URL="https://ftp.gnu.org/gnu/binutils/binutils-${PKG_VERSION}.tar.xz"
-# Se quiser verificar integridade via MD5, defina aqui:
+# Se quiser verificar integridade via MD5, preencha:
 # SRC_MD5="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 pkg_build() {
+  # fail fast dentro do build
   set -euo pipefail
 
   echo "==> [binutils] Build iniciado"
@@ -34,7 +38,7 @@ pkg_build() {
   cd "$SRC_DIR"
 
   #------------------------------------
-  # Detecção básica de arquitetura
+  # Detecção de arquitetura e flags
   #------------------------------------
   local ARCH SLKCFLAGS LIBDIRSUFFIX WERROR
   ARCH="$(uname -m)"
@@ -44,7 +48,7 @@ pkg_build() {
       ARCH=i586
       SLKCFLAGS="-O2 -march=pentium4 -mtune=generic"
       LIBDIRSUFFIX=""
-      # werror = off em 32 bits para evitar build quebrar com warnings
+      # em 32 bits, evitar que warnings virem erro
       WERROR="--enable-werror=no"
       ;;
     x86_64)
@@ -59,7 +63,7 @@ pkg_build() {
       ;;
   esac
 
-  # TARGET (triplet de build)
+  # TARGET (triplet) – tenta usar o próprio GCC
   local TARGET
   if command -v gcc >/dev/null 2>&1; then
     TARGET="$(gcc -dumpmachine)"
@@ -74,8 +78,7 @@ pkg_build() {
 
   #------------------------------------
   # Ajustes específicos por PROFILE
-  #   Use EXTRA_CONFIG_FLAGS para passar
-  #   opções adicionais de ./configure
+  #   EXTRA_CONFIG_FLAGS vai pro ./configure
   #------------------------------------
   local EXTRA_CONFIG_FLAGS=""
   case "${PROFILE:-}" in
@@ -85,40 +88,36 @@ pkg_build() {
       # Ativa NLS (traduções) – requer gettext/libintl em tempo de build
       EXTRA_CONFIG_FLAGS+=" --enable-nls"
 
-      # Usa zlib do sistema (recomendado em distros)
+      # Usa zlib do sistema (recomendado)
       EXTRA_CONFIG_FLAGS+=" --with-system-zlib"
 
-      # Garante que ar/ranlib criem arquivos determinísticos por padrão
+      # Garante ar/ranlib determinísticos
       EXTRA_CONFIG_FLAGS+=" --enable-deterministic-archives"
 
-      # Se não quiser gprofng (profiling novo do binutils), descomente:
+      # Se tiver problema com gprofng ou não quiser:
       # EXTRA_CONFIG_FLAGS+=" --disable-gprofng"
 
-      # Se quiser o linker gold junto com ld.bfd, descomente:
+      # Se quiser o linker gold junto com ld.bfd:
       # EXTRA_CONFIG_FLAGS+=" --enable-gold"
-
       ;;
 
     musl)
       echo "==> [binutils] Ajustes de configure para MUSL"
 
-      # Em musl é comum desabilitar NLS pra evitar dependências extras
+      # Em musl é comum desabilitar NLS
       EXTRA_CONFIG_FLAGS+=" --disable-nls"
 
-      # Ainda assim usa zlib do sistema, se você tiver zlib pra musl
+      # Usa zlib do sistema (se você tiver zlib para musl)
       EXTRA_CONFIG_FLAGS+=" --with-system-zlib"
 
-      # Deterministic archives também é útil aqui
+      # Deterministic archives também aqui
       EXTRA_CONFIG_FLAGS+=" --enable-deterministic-archives"
 
-      # gprofng costuma dar mais trabalho em ambientes não-glibc;
-      # upstream já desabilita para musl em vários casos.
+      # gprofng costuma dar mais trabalho fora de glibc
       EXTRA_CONFIG_FLAGS+=" --disable-gprofng"
 
-      # Se tiver qualquer problema de build com avisos tratados como erro,
-      # você pode forçar desativar werror (além do WERROR que você já controla):
+      # Se rolar problema com werror extra:
       # EXTRA_CONFIG_FLAGS+=" --disable-werror"
-
       ;;
 
     *)
@@ -177,36 +176,44 @@ pkg_build() {
   # Pós-instalação em DESTDIR (limpezas)
   #------------------------------------
 
-  # 1) Remover libtool .la se você não quiser espalhar .la
+  # 1) Remover .la (se existir)
   if command -v find >/dev/null 2>&1; then
-    echo "==> [binutils] Removendo arquivos .la desnecessários"
-    find "$DESTDIR/usr/lib${LIBDIRSUFFIX}" -name '*.la' -type f -print0 2>/dev/null \
-      | xargs -0r rm -f
+    if [ -d "$DESTDIR/usr/lib${LIBDIRSUFFIX}" ]; then
+      echo "==> [binutils] Removendo arquivos .la desnecessários"
+      find "$DESTDIR/usr/lib${LIBDIRSUFFIX}" -name '*.la' -type f -print0 2>/dev/null \
+        | xargs -0r rm -f
+    fi
   fi
 
-  # 2) Strip de binários (sem falhar se strip não suportar algo)
-  if command -v strip >/dev/null 2>&1; then
-    echo "==> [binutils] strip de binários"
+  # 2) Strip de binários e libs (sem abortar se strip não suportar algo)
+  if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
+    echo "==> [binutils] strip de binários e bibliotecas"
+
     # ELF executáveis
     find "$DESTDIR" -type f -perm -0100 2>/dev/null \
-      -exec sh -c 'file -bi "$1" | grep -q "x-executable" && strip --strip-unneeded "$1" || true' _ {} \;
+      | while IFS= read -r f; do
+          if file -bi "$f" 2>/dev/null | grep -q "x-executable"; then
+            strip --strip-unneeded "$f" 2>/dev/null || true
+          fi
+        done
+
     # Bibliotecas compartilhadas
     find "$DESTDIR" -type f -name '*.so*' 2>/dev/null \
-      -exec sh -c 'file -bi "$1" | grep -q "x-sharedlib" && strip --strip-unneeded "$1" || true' _ {} \;
+      | while IFS= read -r f; do
+          if file -bi "$f" 2>/dev/null | grep -q "x-sharedlib"; then
+            strip --strip-unneeded "$f" 2>/dev/null || true
+          fi
+        done
   else
-    echo "==> [binutils] strip não encontrado; pulando etapa de strip"
+    echo "==> [binutils] strip ou file não encontrados; pulando etapa de strip"
   fi
 
   # 3) Compactar manpages
   if command -v gzip >/dev/null 2>&1; then
-    echo "==> [binutils] Compactando manpages"
     if [ -d "$DESTDIR/usr/man" ]; then
+      echo "==> [binutils] Compactando manpages"
       find "$DESTDIR/usr/man" -type f -name '*.[0-9]' -print0 2>/dev/null \
         | xargs -0r gzip -9
-    fi
-    if [ -d "$DESTDIR/usr/info" ]; then
-      # Muitos sistemas ainda usam info não comprimido; ajuste se quiser
-      :
     fi
   fi
 
