@@ -1,185 +1,135 @@
-#!/usr/bin/env bash
-# Script de construção do musl libc para o adm
-#
-# Caminho esperado:
-#   /mnt/adm/packages/libs/musl/musl.sh
-#
-# O adm fornece:
-#   SRC_DIR  : diretório com o source extraído do tarball
-#   DESTDIR  : raiz de instalação temporária (pkgroot)
-#   PROFILE  : glibc / musl / outro (string)
-#   NUMJOBS  : número de jobs para o make
-#
-# Este script deve definir:
-#   PKG_VERSION
-#   SRC_URL
-#   (opcional) SRC_MD5
-#   função pkg_build()
-#
-# IMPORTANTE:
-#   Este script constrói o musl como libc “de sistema” instalada em /usr.
-#   Em cenários reais de cross ou bootstrap você pode querer um layout
-#   mais complexo, mas aqui focamos no caso direto + aplicação dos
-#   patches de segurança de 2025-02-13 (iconv).
+# Script de build para musl-1.2.5 no admV2
+# - libc alternativa ao glibc
+# - instala como libc "nativa" do sistema alvo (prefix=/usr, syslibdir=/lib)
+# - aplica 2 patches de segurança em iconv (CVE-2025-26519, EUC-KR + UTF-8 path) 1
 
-#----------------------------------------
-# Versão e origem oficial
-#----------------------------------------
 PKG_VERSION="1.2.5"
-SRC_URL="https://musl.libc.org/releases/musl-${PKG_VERSION}.tar.gz"
-# Se quiser verificar integridade via MD5, defina:
-# SRC_MD5="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Tarball oficial do musl 1.2.5
+SRC_URL="https://musl.libc.org/releases/musl-${PKG_VERSION}.tar.gz"  # 2
+SRC_MD5=""
 
 pkg_build() {
-  set -euo pipefail
+    # Variáveis do admV2:
+    #  - SRC_DIR  : fonte do musl já extraído
+    #  - DESTDIR  : root fake onde 'make install' cai (adm empacota isso)
+    #  - NUMJOBS  : paralelismo (opcional)
+    cd "$SRC_DIR"
 
-  echo "==> [musl] Build iniciado"
-  echo "    Versão  : ${PKG_VERSION}"
-  echo "    SRC_DIR : ${SRC_DIR}"
-  echo "    DESTDIR : ${DESTDIR}"
-  echo "    PROFILE : ${PROFILE:-desconhecido}"
-  echo "    NUMJOBS : ${NUMJOBS:-1}"
+    # ===========================================================
+    # 1. Baixar e aplicar 2 patches de segurança (iconv / CVE-2025-26519)
+    #    Usamos os patches backportados pela Bootlin para musl-1.2.5: 3
+    #      - 0004-iconv-fix-erroneous-input-validation-in-EUC-KR-decod.patch
+    #      - 0005-iconv-harden-UTF-8-output-code-path-against-input-de.patch
+    # ===========================================================
 
-  cd "$SRC_DIR"
+    _fetch_patch() {
+        local url="$1"
+        local out="$2"
 
-  #------------------------------------
-  # Detecção de arquitetura e flags
-  #------------------------------------
-  local ARCH CFLAGS_MUSL
-  ARCH="$(uname -m)"
+        if [[ -f "../$out" ]]; then
+            return 0
+        fi
 
-  case "$ARCH" in
-    i?86)
-      ARCH=i386
-      CFLAGS_MUSL="-O2 -pipe"
-      ;;
-    x86_64)
-      CFLAGS_MUSL="-O2 -pipe -fPIC"
-      ;;
-    *)
-      # genérico
-      CFLAGS_MUSL="-O2 -pipe"
-      ;;
-  esac
+        echo ">> Baixando patch $out de $url"
+        if command -v curl >/dev/null 2>&1; then
+            curl -L -o "../$out" "$url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "../$out" "$url"
+        else
+            echo "ERRO: nem curl nem wget disponíveis para baixar $out"
+            exit 1
+        fi
+    }
 
-  echo "==> [musl] ARCH   : $ARCH"
-  echo "==> [musl] CFLAGS : $CFLAGS_MUSL"
+    local PATCH1="0004-iconv-fix-erroneous-input-validation-in-EUC-KR-decod.patch"
+    local PATCH2="0005-iconv-harden-UTF-8-output-code-path-against-input-de.patch"
 
-  #------------------------------------
-  # Ajustes por PROFILE (informativo)
-  #------------------------------------
-  case "${PROFILE:-}" in
-    musl)
-      echo "==> [musl] PROFILE = musl (construindo a própria libc musl)"
-      ;;
-    glibc|"")
-      echo "==> [musl] PROFILE parece ser glibc (ou vazio): construindo musl"
-      echo "            a partir de um sistema baseado em glibc (caso de bootstrap)."
-      ;;
-    *)
-      echo "==> [musl] PROFILE desconhecido (${PROFILE}), apenas informativo."
-      ;;
-  esac
+    local PATCH1_URL="https://toolchains.bootlin.com/downloads/releases/sources/musl-1.2.5/${PATCH1}"
+    local PATCH2_URL="https://toolchains.bootlin.com/downloads/releases/sources/musl-1.2.5/${PATCH2}"
 
-  #------------------------------------
-  # Aplicação dos patches de segurança do iconv
-  #
-  # Patches:
-  #   1) EUC-KR: corrige checagem de bounds no lead byte, evitando
-  #      load fora dos limites da tabela ksc. 2
-  #   2) UTF-8 output: garante que valores inválidos de wctomb_utf8
-  #      não causem overflow/underflow do ponteiro de saída. 3
-  #------------------------------------
-  local PATCH_BASE="https://www.openwall.com/lists/musl/2025/02/13/1"
+    _fetch_patch "$PATCH1_URL" "$PATCH1"
+    _fetch_patch "$PATCH2_URL" "$PATCH2"
 
-  echo "==> [musl] Aplicando patches de segurança do iconv (EUC-KR + UTF-8 hardening)"
+    echo ">> Aplicando patch de segurança: $PATCH1"
+    patch -Np1 -i "../$PATCH1"
 
-  apply_patch_stream() {
-    local url="$1"
-    echo "==> [musl] Baixando e aplicando patch: $url"
-    if command -v curl >/dev/null 2>&1; then
-      # -f: falha em HTTP >=400, -s: silencioso, -S: mostra erro, -L: segue redirect
-      if ! curl -fsSL "$url" | patch -p1; then
-        echo "ERRO: falha ao aplicar patch de $url"
-        exit 1
-      fi
-    elif command -v wget >/dev/null 2>&1; then
-      if ! wget -qO- "$url" | patch -p1; then
-        echo "ERRO: falha ao aplicar patch de $url"
-        exit 1
-      fi
+    echo ">> Aplicando patch de segurança: $PATCH2"
+    patch -Np1 -i "../$PATCH2"
+
+    # ===========================================================
+    # 2. Definir TARGET_TRIPLET, ADM_ROOTFS, CROSS_SYSROOT
+    # ===========================================================
+
+    : "${TARGET_TRIPLET:=}"
+
+    if [[ -z "$TARGET_TRIPLET" ]]; then
+        if [[ -n "${HOST:-}" ]]; then
+            TARGET_TRIPLET="$HOST"
+        else
+            TARGET_TRIPLET="$(./configure --help >/dev/null 2>&1; ./config.sub "$(uname -m)-linux" 2>/dev/null || echo unknown-linux-musl)"
+        fi
+    fi
+
+    echo ">> musl alvo: ${TARGET_TRIPLET}"
+
+    : "${ADM_ROOTFS:=/}"
+    case "$ADM_ROOTFS" in
+        /) ;;
+        */) ADM_ROOTFS="${ADM_ROOTFS%/}" ;;
+    esac
+
+    # Para o GCC/ toolchain, CROSS_SYSROOT é onde estão headers/libs do sistema alvo
+    : "${CROSS_SYSROOT:=${ADM_ROOTFS}}"
+
+    echo ">> ADM_ROOTFS    = ${ADM_ROOTFS}"
+    echo ">> CROSS_SYSROOT = ${CROSS_SYSROOT}"
+
+    # ===========================================================
+    # 3. Toolchain: usar ${TARGET_TRIPLET}-gcc se existir
+    # ===========================================================
+
+    : "${NUMJOBS:=1}"
+    : "${CFLAGS:=-O2 -pipe}"
+    : "${CXXFLAGS:=-O2 -pipe}"
+
+    if command -v "${TARGET_TRIPLET}-gcc" >/dev/null 2>&1; then
+        export CC="${TARGET_TRIPLET}-gcc"
     else
-      echo "ERRO: nem curl nem wget encontrados para baixar patches."
-      exit 1
+        # fallback (não é o ideal pra cross, mas deixa o script utilizável)
+        export CC="gcc"
     fi
-  }
 
-  # Patch 1: EUC-KR decoder fix
-  apply_patch_stream "${PATCH_BASE}/1"
+    # ===========================================================
+    # 4. Diretório de build e configure
+    #    Para sistema nativo musl:
+    #      - prefix=/usr        (binaries, headers)
+    #      - syslibdir=/lib     (linker dinâmico: /lib/ld-musl-*.so.1) 4
+    #      - --host=$TARGET_TRIPLET (cross)
+    # ===========================================================
 
-  # Patch 2: UTF-8 output hardening
-  apply_patch_stream "${PATCH_BASE}/2"
+    rm -rf build
+    mkdir -v build
+    cd       build
 
-  echo "==> [musl] Patches de segurança aplicados com sucesso."
+    echo ">> Rodando configure do musl..."
+    ../configure \
+        --prefix=/usr \
+        --host="${TARGET_TRIPLET}" \
+        --syslibdir=/lib
 
-  #------------------------------------
-  # Configure
-  #
-  #   - prefix=/usr: instalar em /usr (adm empacota via DESTDIR).
-  #   - CFLAGS: simples, sem otimizações agressivas demais.
-  #------------------------------------
-  ./configure \
-    --prefix=/usr \
-    CFLAGS="$CFLAGS_MUSL"
+    # ===========================================================
+    # 5. Compilar e instalar no DESTDIR (pacote admV2)
+    # ===========================================================
 
-  echo "==> [musl] configure concluído"
+    echo ">> Compilando musl-$(../config.mak 2>/dev/null | grep '^version ' || echo ${PKG_VERSION}) ..."
+    make -j"${NUMJOBS}"
 
-  #------------------------------------
-  # Compilação
-  #------------------------------------
-  make -j"${NUMJOBS:-1}"
-  echo "==> [musl] make concluído"
+    echo ">> Instalando musl em DESTDIR=${DESTDIR} ..."
+    make DESTDIR="$DESTDIR" install
 
-  #------------------------------------
-  # (Opcional) Testes
-  #
-  # O musl não tem um 'make check' trivial como outros projetos.
-  # Se você tiver um conjunto próprio de testes, encaixe aqui.
-  #------------------------------------
-  # make check || true
-
-  #------------------------------------
-  # Instalação em DESTDIR
-  #------------------------------------
-  make DESTDIR="$DESTDIR" install
-  echo "==> [musl] make install concluído em $DESTDIR"
-
-  #------------------------------------
-  # Pós-instalação em DESTDIR
-  #------------------------------------
-  # - garantir symlink do loader dinâmico em /lib/ld-musl-*.so.1
-
-  # 1) Descobrir o loader ld-musl-*.so.1 dentro do DESTDIR
-  local LOADER
-  LOADER="$(cd "$DESTDIR" && find . -maxdepth 4 -name 'ld-musl-*.so.1' -print | head -n1 | sed 's#^\./##' || true)"
-
-  if [ -n "$LOADER" ]; then
-    echo "==> [musl] Loader dinâmico encontrado em DESTDIR: /${LOADER}"
-  else
-    echo "==> [musl] AVISO: loader ld-musl-*.so.1 não encontrado em DESTDIR após install."
-  fi
-
-  # 2) Criar symlink padrão em /lib (dentro do DESTDIR)
-  if [ -n "$LOADER" ]; then
-    local LOADER_BASENAME
-    LOADER_BASENAME="$(basename "$LOADER")"
-
-    mkdir -p "$DESTDIR/lib"
-    if [ ! -e "$DESTDIR/lib/$LOADER_BASENAME" ]; then
-      echo "==> [musl] Criando symlink do loader em /lib/$LOADER_BASENAME"
-      ln -sf "../$LOADER" "$DESTDIR/lib/$LOADER_BASENAME"
-    fi
-  fi
-
-  echo "==> [musl] Build do musl-${PKG_VERSION} finalizado com sucesso."
+    # Depois que o admV2 instalar o pacote, os arquivos vão parar em:
+    #   ${ADM_ROOTFS}/usr/include/*
+    #   ${ADM_ROOTFS}/usr/lib/libc.so
+    #   ${ADM_ROOTFS}/lib/ld-musl-*.so.1
 }
