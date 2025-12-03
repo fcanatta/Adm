@@ -112,6 +112,15 @@ else
   run mkdir -pv "$LFS/dev/shm"
 fi
 
+echo "==> Montando /mnt/adm dentro do chroot (para os scripts do adm)"
+
+if [ -d /mnt/adm ]; then
+    mkdir -pv "$LFS/adm"
+    mount --bind /mnt/adm "$LFS/adm"
+else
+    echo "AVISO: /mnt/adm não existe no host. Crie /mnt/adm com seus scripts."
+fi
+
 # ---------- 4. Copiar /etc/resolv.conf ----------
 
 echo "==> Copiando /etc/resolv.conf para dentro do chroot"
