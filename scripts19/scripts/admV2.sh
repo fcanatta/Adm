@@ -554,15 +554,17 @@ install_pkg_files() {
 
   if is_dry_run; then
     log_info "[dry-run] Geraria lista de arquivos em $list_file a partir de $tarball"
-    log_info "[dry-run] Extrairia $tarball em /"
+    log_info "[dry-run] Extrairia $tarball em $ADM_ROOTFS (root de instalação)"
     return 0
   fi
 
   log_info "Registrando arquivos de $tarball em $list_file"
+  # Obs: a lista guarda caminhos lógicos (sempre começando em /),
+  # independentes do ADM_ROOTFS. Na hora de remover, prefixamos com ADM_ROOTFS.
   tar tf "$tarball" | sed 's|^|/|' > "$list_file"
 
-  log_info "Extraindo $tarball em /"
-  tar -C / -xpf "$tarball"
+  log_info "Extraindo $tarball em $ADM_ROOTFS"
+  tar -C "$ADM_ROOTFS" -xpf "$tarball"
 }
 
 write_pkg_meta() {
@@ -793,34 +795,37 @@ uninstall_pkg_recursive() {
 
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
   if [[ -f "$list_file" ]]; then
-    if is_dry_run; then
-      log_info "[dry-run] Removeria arquivos listados em $list_file"
-      while IFS= read -r p || [[ -n "$p" ]]; do
-        [[ -z "$p" ]] && continue
-        log_info "[dry-run]   $p"
-      done < "$list_file"
-    else
-      log_info "Removendo arquivos listados em $list_file"
-      while IFS= read -r p || [[ -n "$p" ]]; do
-        [[ -z "$p" ]] && continue
+  if is_dry_run; then
+    log_info "[dry-run] Removeria arquivos listados em $list_file (root: $ADM_ROOTFS)"
+    while IFS= read -r p || [[ -n "$p" ]]; do
+      [[ -z "$p" ]] && continue
+      local realpath="$ADM_ROOTFS$p"
+      log_info "[dry-run]   $realpath"
+    done < "$list_file"
+  else
+    log_info "Removendo arquivos listados em $list_file (root: $ADM_ROOTFS)"
+    while IFS= read -r p || [[ -n "$p" ]]; do
+      [[ -z "$p" ]] && continue
 
-        if [[ -d "$p" && ! -L "$p" ]]; then
-          if ! rmdir "$p" 2>/dev/null; then
-            log_info "Mantendo diretório (provavelmente não vazio): $p"
-          fi
-        else
-          if [[ -e "$p" || -L "$p" ]]; then
-            if ! rm -f "$p"; then
-              log_warn "Falha ao remover arquivo: $p"
-            fi
+      local realpath="$ADM_ROOTFS$p"
+
+      if [[ -d "$realpath" && ! -L "$realpath" ]]; then
+        if ! rmdir "$realpath" 2>/dev/null; then
+          log_info "Mantendo diretório (provavelmente não vazio): $realpath"
+        fi
+      else
+        if [[ -e "$realpath" || -L "$realpath" ]]; then
+          if ! rm -f "$realpath"; then
+            log_warn "Falha ao remover arquivo: $realpath"
           fi
         fi
-      done < "$list_file"
-      rm -f "$list_file"
-    fi
-  else
-    log_warn "Lista de arquivos não encontrada para $PKG_ID."
+      fi
+    done < "$list_file"
+    rm -f "$list_file"
   fi
+else
+  log_warn "Lista de arquivos não encontrada para $PKG_ID."
+fi
 
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_uninstall" "post_uninstall"
 
