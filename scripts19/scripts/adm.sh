@@ -77,6 +77,48 @@ log_warn()  { _log WARN  "$C_WARN" "$*"; }
 log_error() { _log ERROR "$C_ERR"  "$*"; }
 log_ok()    { _log OK    "$C_OK"   "$*"; }
 
+# --- [INÍCIO] Integração com módulo adm-fixperms --------------------
+
+adm_load_fixperms() {
+  # Carrega o módulo só uma vez
+  if [ -z "${ADM_FIXPERMS_LOADED:-}" ]; then
+    local mod="$ADM_ROOT/scripts/adm-fixperms.sh"
+    if [ -f "$mod" ]; then
+      # shellcheck source=/mnt/adm/scripts/adm-fixperms.sh
+      . "$mod"
+      ADM_FIXPERMS_LOADED=1
+    else
+      echo "adm: módulo de permissões não encontrado: $mod" >&2
+      ADM_FIXPERMS_LOADED=0
+    fi
+  fi
+}
+
+adm_fixperms_wrapper() {
+  local destdir="$1"
+
+  # Se ADM_DISABLE_FIXPERMS=1, nem tenta.
+  if [ "${ADM_DISABLE_FIXPERMS:-0}" = "1" ]; then
+    echo "adm: fixperms desativado (ADM_DISABLE_FIXPERMS=1)" >&2
+    return 0
+  fi
+
+  adm_load_fixperms
+  if [ "${ADM_FIXPERMS_LOADED:-0}" != "1" ]; then
+    echo "adm: módulo adm-fixperms não carregado; pulando normalização de permissões." >&2
+    return 0
+  fi
+
+  if [ -z "$destdir" ] || [ ! -d "$destdir" ]; then
+    echo "adm: DESTDIR inválido para fixperms: '$destdir'" >&2
+    return 1
+  fi
+
+  adm_fixperms "$destdir"
+}
+
+# --- [FIM] Integração com módulo adm-fixperms -----------------------
+
 #--------------------------------------
 # Libc / profile
 #--------------------------------------
