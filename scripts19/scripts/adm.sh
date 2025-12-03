@@ -24,6 +24,10 @@
 # ADM_FIXPERMS_VERBOSE=1 ./adm install categoria/pacote
 # Desativar temporariamente 
 # ADM_DISABLE_FIXPERMS=1 ./adm build categoria/pacote
+# Instalação simulada
+# ADM_DRYRUN=1 ./adm install cross/file-pass1
+# Uninstall simulada
+# ADM_DRYRUN=1 ./adm uninstall cross/file-pass1
 
 set -euo pipefail
 
@@ -131,6 +135,10 @@ adm_fixperms_wrapper() {
 }
 
 # --- [FIM] Integração com módulo adm-fixperms -----------------------
+
+is_dry_run() {
+  [[ "${ADM_DRYRUN:-0}" = "1" ]]
+}
 
 #--------------------------------------
 # Libc / profile
@@ -247,10 +255,15 @@ register_event() {
   local action="$1" status="$2" version="$3"
   local ts
   ts="$(date +'%Y-%m-%d %H:%M:%S')"
+
+  if is_dry_run; then
+    log_info "[dry-run] Registraria evento: ${ts}|${action}|${PKG_ID}|${version}|${PROFILE}|${status}"
+    return 0
+  fi
+
   mkdir -p "$(dirname "$DB_INSTALLED")"
   echo "${ts}|${action}|${PKG_ID}|${version}|${PROFILE}|${status}" >> "$DB_INSTALLED"
 }
-
 #--------------------------------------
 # Script e variáveis do pacote
 #--------------------------------------
@@ -347,7 +360,7 @@ prepare_source() {
 
   local build_dir="$BUILD_ROOT/${PKG_CAT}/${PKG_NAME}"
 
-  # --- Proteção extra contra rm -rf perigoso ---
+  # Proteção extra contra rm -rf perigoso
   if [[ -z "$build_dir" || -z "$BUILD_ROOT" ]]; then
     log_error "build_dir/BUILD_ROOT vazios; abortando por segurança."
     exit 1
@@ -360,7 +373,6 @@ prepare_source() {
       exit 1
       ;;
   esac
-  # ------------------------------------------------
 
   rm -rf -- "$build_dir"
   mkdir -p "$build_dir"
@@ -386,6 +398,7 @@ prepare_source() {
   log_info "SRC_DIR=$SRC_DIR"
   log_info "DESTDIR=$DESTDIR"
 }
+
 #--------------------------------------
 # Empacotar resultado
 #--------------------------------------
@@ -461,45 +474,45 @@ installed_mark() {
 
 install_pkg_files() {
   local tarball="$1"
-
-  if [[ ! -f "$tarball" ]]; then
-    log_error "Tarball não encontrado: $tarball"
-    exit 1
-  fi
-
-  log_info "Instalando pacote no sistema a partir de: $tarball"
-
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
-  : > "$list_file"
 
-  tar tf "$tarball" | while IFS= read -r path; do
-    path="$(echo "$path" | sed 's#^\.\/##')"
-    [[ -z "$path" ]] && continue
-    echo "/$path" >> "$list_file"
-  done
+  mkdir -p "$DB_PKG_FILES"
 
-  if ! tar -C / -xpf "$tarball"; then
-    log_error "Falha ao extrair pacote em /"
-    exit 1
+  if is_dry_run; then
+    log_info "[dry-run] Geraria lista de arquivos em $list_file a partir de $tarball"
+    log_info "[dry-run] Extrairia $tarball em /"
+    return 0
   fi
 
-  log_ok "Arquivos instalados; lista registrada em $list_file"
+  log_info "Registrando arquivos de $tarball em $list_file"
+  tar tf "$tarball" | sed 's|^|/|' > "$list_file"
+
+  log_info "Extraindo $tarball em /"
+  tar -C / -xpf "$tarball"
 }
 
 write_pkg_meta() {
   local deps_str="$1"
   local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
 
+  if is_dry_run; then
+    log_info "[dry-run] Não escreverei metadados em $meta_file"
+    log_info "[dry-run] Metadados seriam: NAME=$PKG_NAME, CATEGORY=$PKG_CAT, VERSION=$PKG_VERSION, PROFILE=${PROFILE:-unknown}, DEPS=($deps_str)"
+    return 0
+  fi
+
+  mkdir -p "$DB_PKG_META"
+
   {
-    echo "NAME=$PKG_NAME"
-    echo "CATEGORY=$PKG_CAT"
-    echo "ID=$PKG_ID"
-    echo "VERSION=$PKG_VERSION"
-    echo "PROFILE=$(get_profile_tag)"
-    echo "DEPS=$deps_str"
+    echo "NAME=\"$PKG_NAME\""
+    echo "CATEGORY=\"$PKG_CAT\""
+    echo "ID=\"$PKG_ID\""
+    echo "VERSION=\"$PKG_VERSION\""
+    echo "PROFILE=\"${PROFILE:-unknown}\""
+    echo "DEPS=($deps_str)"
   } > "$meta_file"
 
-  log_ok "Metadados gravados em $meta_file"
+  log_info "Metadados gravados em $meta_file"
 }
 
 #--------------------------------------
@@ -550,10 +563,19 @@ build_pkg_if_needed() {
 # Instalação recursiva com deps
 #--------------------------------------
 install_pkg_recursive() {
-  if [[ -n "${INSTALLED_IN_SESSION[$PKG_ID]:-}" ]]; then
+  # Estado desta sessão: "" (não visitado), "visiting" (em processamento), "done" (já finalizado)
+  local state="${INSTALLED_IN_SESSION[$PKG_ID]:-}"
+
+  if [[ "$state" == "visiting" ]]; then
+    log_error "Dependência cíclica detectada envolvendo $PKG_ID"
+    exit 1
+  elif [[ "$state" == "done" ]]; then
     log_info "Pacote $PKG_ID já tratado para instalação nesta sessão."
     return 0
   fi
+
+  # Marca como em processamento para detectar ciclos
+  INSTALLED_IN_SESSION["$PKG_ID"]="visiting"
 
   # Carrega script do pacote atual
   load_pkg_script
@@ -564,30 +586,36 @@ install_pkg_recursive() {
 
   local dep
   for dep in "${deps[@]}"; do
+    [[ -z "$dep" ]] && continue
+
     local dep_cat="${dep%%/*}"
     local dep_name="${dep##*/}"
 
-    log_info "Resolvendo dependência: $dep"
+    log_info "Resolvendo dependência $dep_cat/$dep_name para $PKG_ID..."
 
-    # Salva estado atual
+    # Salva contexto atual
     local saved_cat="$PKG_CAT" saved_name="$PKG_NAME" saved_id="$PKG_ID" saved_key="$PKG_KEY" saved_meta="$PKG_META_DIR"
 
     set_pkg_vars "$dep_cat" "$dep_name"
     install_pkg_recursive
 
-    # Restaura pacote atual
-    PKG_CAT="$saved_cat"; PKG_NAME="$saved_name"
-    PKG_ID="$saved_id"; PKG_KEY="$saved_key"; PKG_META_DIR="$saved_meta"
+    # Restaura contexto do pacote original
+    PKG_CAT="$saved_cat"
+    PKG_NAME="$saved_name"
+    PKG_ID="$saved_id"
+    PKG_KEY="$saved_key"
+    PKG_META_DIR="$saved_meta"
   done
 
-  # Garante tarball (respeitando FORCE_REBUILD)
+  # Garante que o pacote esteja construído
   build_pkg_if_needed
   local tarball
   tarball="$(get_pkg_tarball_path)"
 
-  if is_pkg_installed && [[ "$FORCE_REBUILD" != "1" ]]; then
-    log_info "Pacote $PKG_ID já instalado (sem FORCE_REBUILD). Pulando instalação."
-    INSTALLED_IN_SESSION["$PKG_ID"]=1
+  # Se já estiver instalado e não estamos forçando, não reinstala
+  if is_pkg_installed && [[ "${FORCE_REBUILD:-0}" != "1" ]]; then
+    log_info "Pacote $PKG_ID já instalado. Use FORCE_REBUILD=1 para forçar rebuild/reinstalação."
+    INSTALLED_IN_SESSION["$PKG_ID"]="done"
     return 0
   fi
 
@@ -600,7 +628,7 @@ install_pkg_recursive() {
   write_pkg_meta "$deps_str"
   register_event "install" "OK" "$PKG_VERSION"
 
-  INSTALLED_IN_SESSION["$PKG_ID"]=1
+  INSTALLED_IN_SESSION["$PKG_ID"]="done"
   log_ok "Instalação de $PKG_ID concluída."
 }
 
@@ -627,16 +655,25 @@ find_reverse_deps() {
 }
 
 uninstall_pkg_recursive() {
-  if [[ -n "${UNINSTALLED_IN_SESSION[$PKG_ID]:-}" ]]; then
+  # Estado desta sessão: "" (não visitado), "visiting" (em processamento), "done" (já finalizado)
+  local state="${UNINSTALLED_IN_SESSION[$PKG_ID]:-}"
+
+  if [[ "$state" == "visiting" ]]; then
+    log_error "Dependência reversa cíclica detectada envolvendo $PKG_ID"
+    exit 1
+  elif [[ "$state" == "done" ]]; then
     log_info "Pacote $PKG_ID já tratado para remoção nesta sessão."
     return 0
   fi
 
   if ! is_pkg_installed; then
     log_warn "Pacote $PKG_ID não está registrado como instalado. Nada a fazer."
-    UNINSTALLED_IN_SESSION["$PKG_ID"]=1
+    UNINSTALLED_IN_SESSION["$PKG_ID"]="done"
     return 0
   fi
+
+  # Marca como em processamento
+  UNINSTALLED_IN_SESSION["$PKG_ID"]="visiting"
 
   log_info "Verificando dependentes de $PKG_ID..."
   local rev=()
@@ -644,17 +681,25 @@ uninstall_pkg_recursive() {
 
   local r
   for r in "${rev[@]}"; do
+    [[ -z "$r" ]] && continue
+
     local r_cat="${r%%/*}"
     local r_name="${r##*/}"
+
     log_info "Removendo dependente: $r"
 
+    # Salva contexto
     local saved_cat="$PKG_CAT" saved_name="$PKG_NAME" saved_id="$PKG_ID" saved_key="$PKG_KEY" saved_meta="$PKG_META_DIR"
 
     set_pkg_vars "$r_cat" "$r_name"
     uninstall_pkg_recursive
 
-    PKG_CAT="$saved_cat"; PKG_NAME="$saved_name"
-    PKG_ID="$saved_id"; PKG_KEY="$saved_key"; PKG_META_DIR="$saved_meta"
+    # Restaura contexto
+    PKG_CAT="$saved_cat"
+    PKG_NAME="$saved_name"
+    PKG_ID="$saved_id"
+    PKG_KEY="$saved_key"
+    PKG_META_DIR="$saved_meta"
   done
 
   local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
@@ -668,10 +713,22 @@ uninstall_pkg_recursive() {
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.pre_uninstall" "pre_uninstall"
 
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
+  local dry=0
+  if is_dry_run; then
+    dry=1
+    log_info "[dry-run] Simulando remoção de arquivos de $PKG_ID"
+  fi
+
   if [[ -f "$list_file" ]]; then
-    log_info "Removendo arquivos listados em $list_file"
+    log_info "Processando lista de arquivos $list_file"
     while IFS= read -r p || [[ -n "$p" ]]; do
       [[ -z "$p" ]] && continue
+
+      if (( dry )); then
+        log_info "[dry-run] Removeria: $p"
+        continue
+      fi
+
       if [[ -d "$p" && ! -L "$p" ]]; then
         if ! rmdir "$p" 2>/dev/null; then
           log_info "Mantendo diretório (provavelmente não vazio): $p"
@@ -684,20 +741,29 @@ uninstall_pkg_recursive() {
         fi
       fi
     done < "$list_file"
-    rm -f "$list_file"
+
+    if (( dry )); then
+      log_info "[dry-run] Não removendo lista de arquivos $list_file"
+    else
+      rm -f "$list_file"
+    fi
   else
     log_warn "Lista de arquivos não encontrada para $PKG_ID."
   fi
 
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_uninstall" "post_uninstall"
 
-  rm -f "$meta_file"
+  if is_dry_run; then
+    log_info "[dry-run] Não removendo meta $meta_file"
+  else
+    rm -f "$meta_file"
+  fi
 
   # Usa VERSION do .meta se existir; senão cai para PKG_VERSION; se nada, "unknown"
   local event_version="${VERSION:-${PKG_VERSION:-unknown}}"
   register_event "uninstall" "OK" "$event_version"
 
-  UNINSTALLED_IN_SESSION["$PKG_ID"]=1
+  UNINSTALLED_IN_SESSION["$PKG_ID"]="done"
   log_ok "Remoção de $PKG_ID concluída."
 }
 
