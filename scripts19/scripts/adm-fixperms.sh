@@ -44,10 +44,10 @@ adm_fixperms() {
   ########################################
   # Excluímos alguns caminhos sensíveis.
   find "$root" -xdev -type d \
-    ! -path "$root/proc*" \
-    ! -path "$root/sys*" \
-    ! -path "$root/dev*" \
-    ! -path "$root/run*" \
+    ! -path "$root/proc" ! -path "$root/proc/*" \
+    ! -path "$root/sys"  ! -path "$root/sys/*"  \
+    ! -path "$root/dev"  ! -path "$root/dev/*"  \
+    ! -path "$root/run"  ! -path "$root/run/*"  \
     ! -path "$root/tmp" \
     ! -path "$root/tmp/*" \
     ! -path "$root/var/tmp" \
@@ -141,14 +141,12 @@ adm_fixperms() {
   ########################################
   # 7) Arquivos em /etc (config)
   ########################################
-  # Regra padrão: 644, exceto se já forem mais restritos.
+  # Regra padrão: 644 (u=rw,go=r), exceto shadow/gshadow (600).
   if [ -d "$root/etc" ]; then
     find "$root/etc" -xdev -type f ! -type l \
       ! -name 'shadow' ! -name 'gshadow' \
       -exec sh -c '
         f="$1"
-        # se já é 600/640/644 etc, respeitamos apenas se não estiver muito aberto
-        # Forçamos u=rw,go=r
         chmod u=rw,go=r "$f" 2>/dev/null || true
       ' _ {} \; 2>/dev/null || true
 
@@ -163,7 +161,7 @@ adm_fixperms() {
   ########################################
   # 8) Arquivos regulares não-executáveis genéricos -> 644
   ########################################
-  # (Isso é o “fallback”: o que não entrou nas regras acima
+  # (Fallback: o que não entrou nas regras acima
   #  e não tem bit de execução, forçamos 644.)
   find "$root" -xdev -type f ! -type l \
     ! -perm -111 \
