@@ -17,6 +17,13 @@
 #     db/installed
 #     db/pkgs/*.meta
 #     db/files/*.list
+#  Usando o fixperms
+# rebuild de um pacote qualquer
+# ADM_FIXPERMS_VERBOSE=1 ./adm build categoria/pacote
+# ou instalar (que internamente vai buildar se precisar)
+# ADM_FIXPERMS_VERBOSE=1 ./adm install categoria/pacote
+# Desativar temporariamente 
+# ADM_DISABLE_FIXPERMS=1 ./adm build categoria/pacote
 
 set -euo pipefail
 
@@ -81,16 +88,20 @@ log_ok()    { _log OK    "$C_OK"   "$*"; }
 
 adm_load_fixperms() {
   # Carrega o módulo só uma vez
-  if [ -z "${ADM_FIXPERMS_LOADED:-}" ]; then
-    local mod="$ADM_ROOT/scripts/adm-fixperms.sh"
-    if [ -f "$mod" ]; then
-      # shellcheck source=/mnt/adm/scripts/adm-fixperms.sh
-      . "$mod"
-      ADM_FIXPERMS_LOADED=1
-    else
-      echo "adm: módulo de permissões não encontrado: $mod" >&2
-      ADM_FIXPERMS_LOADED=0
-    fi
+  if [[ -n "${ADM_FIXPERMS_LOADED:-}" ]]; then
+    return 0
+  fi
+
+  local mod="${ADM_FIXPERMS_MODULE:-$ADM_ROOT/scripts/adm-fixperms.sh}"
+
+  if [[ -f "$mod" ]]; then
+    # shellcheck source=/mnt/adm/scripts/adm-fixperms.sh
+    . "$mod"
+    ADM_FIXPERMS_LOADED=1
+    log_info "Módulo adm-fixperms carregado: $mod"
+  else
+    ADM_FIXPERMS_LOADED=0
+    log_warn "Módulo de permissões não encontrado: $mod (defina ADM_DISABLE_FIXPERMS=1 se não quiser ver este aviso)"
   fi
 }
 
@@ -98,23 +109,25 @@ adm_fixperms_wrapper() {
   local destdir="$1"
 
   # Se ADM_DISABLE_FIXPERMS=1, nem tenta.
-  if [ "${ADM_DISABLE_FIXPERMS:-0}" = "1" ]; then
-    echo "adm: fixperms desativado (ADM_DISABLE_FIXPERMS=1)" >&2
+  if [[ "${ADM_DISABLE_FIXPERMS:-0}" = "1" ]]; then
+    log_info "fixperms desativado (ADM_DISABLE_FIXPERMS=1)"
     return 0
   fi
 
-  adm_load_fixperms
-  if [ "${ADM_FIXPERMS_LOADED:-0}" != "1" ]; then
-    echo "adm: módulo adm-fixperms não carregado; pulando normalização de permissões." >&2
-    return 0
-  fi
-
-  if [ -z "$destdir" ] || [ ! -d "$destdir" ]; then
-    echo "adm: DESTDIR inválido para fixperms: '$destdir'" >&2
+  if [[ -z "$destdir" || ! -d "$destdir" ]]; then
+    log_warn "DESTDIR inválido para fixperms: '$destdir'"
     return 1
   fi
 
-  adm_fixperms "$destdir"
+  adm_load_fixperms
+  if [[ "${ADM_FIXPERMS_LOADED:-0}" != "1" ]]; then
+    log_warn "Módulo adm-fixperms não carregado; pulando normalização de permissões."
+    return 0
+  fi
+
+  log_info "Normalizando permissões em DESTDIR com adm-fixperms..."
+  # Permite controlar verbosidade pelo ambiente
+  ADM_FIXPERMS_VERBOSE="${ADM_FIXPERMS_VERBOSE:-0}" adm_fixperms "$destdir"
 }
 
 # --- [FIM] Integração com módulo adm-fixperms -----------------------
@@ -392,6 +405,14 @@ package_result() {
   mkdir -p "$CACHE_PKG"
   local out_path
   out_path="$(get_pkg_tarball_path)"
+
+  # Normaliza permissões do DESTDIR antes de empacotar
+  if [[ -n "${DESTDIR:-}" && -d "$DESTDIR" ]]; then
+    adm_fixperms_wrapper "$DESTDIR" || \
+      log_warn "Falha ao normalizar permissões em $DESTDIR (continuando mesmo assim)"
+  else
+    log_warn "DESTDIR não definido ou inexistente ao gerar pacote; pulando fixperms."
+  fi
 
   log_info "Gerando pacote: $out_path"
   (
