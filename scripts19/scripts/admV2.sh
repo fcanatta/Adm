@@ -107,7 +107,7 @@ adm_load_fixperms() {
       log_info "Módulo adm-fixperms carregado: $mod"
     else
       ADM_FIXPERMS_LOADED=0
-      log_warn "Módulo $mod foi carregado mas a função adm_fixperms não foi encontrada."
+      log_warn "Módulo $mod foi carregado, mas a função adm_fixperms não foi encontrada."
     fi
   else
     ADM_FIXPERMS_LOADED=0
