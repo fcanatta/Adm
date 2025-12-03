@@ -1,0 +1,52 @@
+4. Como usar na prática agora
+
+Depois dessas mudanças, você já consegue testar assim:
+
+4.1. Criar um root “do sistema”
+
+sudo mkdir -p /opt/systems/glibc-root
+sudo mkdir -p /opt/systems/musl-root
+
+4.2. Construir e instalar, por exemplo, o patch-pass1 no root glibc
+
+Assumindo que o script patch-pass1.sh já está certo no admV2:
+
+# Build (gera tarball no cache, não mexe em root ainda)
+ADM_ROOTFS=/opt/systems/glibc-root PROFILE=glibc ./admV2.sh build patch-pass1
+
+# Install (extrai o pacote dentro do root escolhido)
+ADM_ROOTFS=/opt/systems/glibc-root PROFILE=glibc ./admV2.sh install patch-pass1
+
+Isso vai colocar:
+
+binário do patch em:
+/opt/systems/glibc-root/usr/bin/patch
+
+e registrar os arquivos em:
+/mnt/adm/db/files/<categoria>_patch-pass1.list
+
+e o meta em:
+/mnt/adm/db/pkgs/<categoria>_patch-pass1.meta.
+
+
+Para remover:
+
+ADM_ROOTFS=/opt/systems/glibc-root ./admV2.sh uninstall patch-pass1
+
+
+---
+
+5. Por que isso é o “passo prático” certo agora
+
+Com essas mudanças:
+
+O admV2 vira um gerenciador de pacotes multi-root,
+em vez de só escrever no /.
+
+Você pode ter:
+
+um root glibc,
+
+um root musl,
+
+e usar o MESMO admV2 pra administrar os dois, só mudando ADM_ROOTFS e PROFILE.
