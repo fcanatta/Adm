@@ -1,0 +1,4 @@
+# cat >/mnt/adm/packages/base/coreutils-pass1/coreutils-pass1.deps << 'EOF'
+# Coreutils-pass1 depende de:
+bash-pass1
+# EOF
