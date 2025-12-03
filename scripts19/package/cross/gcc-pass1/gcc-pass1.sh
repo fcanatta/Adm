@@ -1,231 +1,191 @@
-#!/usr/bin/env bash
-# Script de construção do GCC-15.2.0 - Pass 1 para o adm
-#
-# Caminho esperado:
-#   /mnt/adm/packages/cross/gcc-pass1/gcc-pass1.sh
-#
-# O adm fornece:
-#   SRC_DIR  : diretório com o source extraído do tarball (gcc-15.2.0)
-#   DESTDIR  : raiz de instalação temporária (pkgroot)
-#   PROFILE  : glibc / musl / outro (aqui é só log; Pass 1 é libc-agnóstico)
-#   NUMJOBS  : número de jobs para o make
-#
-# Este script deve definir:
-#   PKG_VERSION
-#   SRC_URL
-#   (opcional) SRC_MD5
-#   função pkg_build()
-#
-# OBS:
-#   - Este é o GCC PASS 1 (cross-GCC), no estilo LFS 12.4. 
-#   - Assume que LFS e LFS_TGT estão configurados:
-#       export LFS=/mnt/lfs
-#       export LFS_TGT=$(uname -m)-lfs-linux-gnu
-#   - PREFIX é /tools (como no LFS), mas com DESTDIR:
-#       arquivos vão para $DESTDIR/tools/...
-#       quando o adm instalar o pacote (untar em /), o resultado final será /tools/...
+# Script de build para GNU GCC 15.2.0 (Pass 1) no admV2
+# Cross-compiler inicial, inspirado no LFS 12.4, mas:
+#  - sem $LFS
+#  - sem /tools do livro
+#  - usando TARGET_TRIPLET, ADM_ROOTFS, CROSS_PREFIX, CROSS_SYSROOT
 
-#----------------------------------------
-# Versão e origem oficial
-#----------------------------------------
 PKG_VERSION="15.2.0"
+
+# Tarball oficial do GCC 15.2.0 (formato .tar.xz)
 SRC_URL="https://ftp.gnu.org/gnu/gcc/gcc-${PKG_VERSION}/gcc-${PKG_VERSION}.tar.xz"
-# Se quiser usar o mirror do LFS:
-# SRC_URL="https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/gcc-${PKG_VERSION}.tar.xz"
+SRC_MD5=""   # deixamos vazio: admV2 não faz checagem de md5
 
 pkg_build() {
-  set -euo pipefail
+    # Variáveis fornecidas pelo admV2:
+    #   SRC_DIR  -> diretório do source do GCC já extraído
+    #   DESTDIR  -> root fake usado para make install
+    #   NUMJOBS  -> número de jobs paralelos (já definido pelo adm ou pelo profile)
+    cd "$SRC_DIR"
 
-  echo "==> [gcc-pass1] Build iniciado"
-  echo "    Versão   : ${PKG_VERSION}"
-  echo "    SRC_DIR  : ${SRC_DIR}"
-  echo "    DESTDIR  : ${DESTDIR}"
-  echo "    PROFILE  : ${PROFILE:-desconhecido}"
-  echo "    NUMJOBS  : ${NUMJOBS:-1}"
+    # ======= Versões das libs internas usadas pelo GCC ========
 
-  #------------------------------------
-  # Verificar ambiente LFS / LFS_TGT
-  #------------------------------------
-  if [ -z "${LFS:-}" ]; then
-    echo "ERRO: variável de ambiente LFS não está definida."
-    echo "      Exemplo: export LFS=/mnt/lfs"
-    exit 1
-  fi
+    local MPFR_VER="4.2.2"
+    local GMP_VER="6.3.0"
+    local MPC_VER="1.3.1"
 
-  if [ -z "${LFS_TGT:-}" ]; then
-    echo "ERRO: variável de ambiente LFS_TGT não está definida."
-    echo "      Exemplo: export LFS_TGT=\$(uname -m)-lfs-linux-gnu"
-    exit 1
-  fi
+    local MPFR_TAR="mpfr-${MPFR_VER}.tar.xz"
+    local GMP_TAR="gmp-${GMP_VER}.tar.xz"
+    local MPC_TAR="mpc-${MPC_VER}.tar.gz"
 
-  echo "==> [gcc-pass1] LFS     = $LFS"
-  echo "==> [gcc-pass1] LFS_TGT = $LFS_TGT"
+    # Helper simples para baixar um tarball se não existir
+    _fetch_if_missing() {
+        local url="$1"
+        local out="$2"
 
-  cd "$SRC_DIR"
+        if [[ -f "../$out" ]]; then
+            return 0
+        fi
 
-  #------------------------------------
-  # Log do PROFILE (Pass 1 é agnóstico à libc)
-  #------------------------------------
-  case "${PROFILE:-}" in
-    glibc|"")
-      echo "==> [gcc-pass1] PROFILE = glibc (ou vazio) – Pass 1 não depende da libc"
-      ;;
-    musl)
-      echo "==> [gcc-pass1] PROFILE = musl – Pass 1 continua igual (cross-compiler sem libc)"
-      ;;
-    *)
-      echo "==> [gcc-pass1] PROFILE desconhecido (${PROFILE}), apenas log"
-      ;;
-  esac
+        echo ">> Baixando $out de $url"
+        if command -v curl >/dev/null 2>&1; then
+            curl -L -o "../$out" "$url"
+        elif command -v wget >/dev/null 2>&1; then
+            wget -O "../$out" "$url"
+        else
+            echo "ERRO: nem curl nem wget encontrados para baixar $out"
+            exit 1
+        fi
+    }
 
-  #------------------------------------
-  # Incluir MPFR, GMP, MPC dentro da árvore do GCC (estilo LFS) 
-  #
-  # O LFS faz (dentro do diretório do GCC):
-  #   tar -xf ../mpfr-4.2.2.tar.xz  && mv -v mpfr-4.2.2 mpfr
-  #   tar -xf ../gmp-6.3.0.tar.xz   && mv -v gmp-6.3.0  gmp
-  #   tar -xf ../mpc-1.3.1.tar.gz   && mv -v mpc-1.3.1  mpc
-  #
-  # Aqui tentamos o mesmo *se* os tarballs estiverem um nível acima.
-  # Se não tiverem, o GCC tenta usar as libs do sistema (gmp/mpfr/mpc)
-  # que você já pode ter empacotado via adm.
-  #------------------------------------
-  if [ -f "../mpfr-4.2.2.tar.xz" ]; then
-    echo "==> [gcc-pass1] Incorporando mpfr-4.2.2 ao source do GCC"
-    tar -xf ../mpfr-4.2.2.tar.xz
-    mv -v mpfr-4.2.2 mpfr
-  else
-    echo "==> [gcc-pass1] AVISO: ../mpfr-4.2.2.tar.xz não encontrado; usando mpfr do sistema (se disponível)."
-  fi
+    # Baixa mpfr/gmp/mpc se necessário (diretório pai de SRC_DIR é onde os tarballs ficam)
+    _fetch_if_missing "https://ftp.gnu.org/gnu/mpfr/${MPFR_TAR}" "$MPFR_TAR"
+    _fetch_if_missing "https://ftp.gnu.org/gnu/gmp/${GMP_TAR}"   "$GMP_TAR"
+    _fetch_if_missing "https://ftp.gnu.org/gnu/mpc/${MPC_TAR}"   "$MPC_TAR"
 
-  if [ -f "../gmp-6.3.0.tar.xz" ]; then
-    echo "==> [gcc-pass1] Incorporando gmp-6.3.0 ao source do GCC"
-    tar -xf ../gmp-6.3.0.tar.xz
-    mv -v gmp-6.3.0 gmp
-  else
-    echo "==> [gcc-pass1] AVISO: ../gmp-6.3.0.tar.xz não encontrado; usando gmp do sistema (se disponível)."
-  fi
+    # Só descompacta/renomeia se os diretórios ainda não existem
+    if [[ ! -d mpfr ]]; then
+        echo ">> Incorporando MPFR ${MPFR_VER} ao tree do GCC"
+        tar -xf "../${MPFR_TAR}"
+        mv -v "mpfr-${MPFR_VER}" mpfr
+    fi
 
-  if [ -f "../mpc-1.3.1.tar.gz" ]; then
-    echo "==> [gcc-pass1] Incorporando mpc-1.3.1 ao source do GCC"
-    tar -xf ../mpc-1.3.1.tar.gz
-    mv -v mpc-1.3.1 mpc
-  else
-    echo "==> [gcc-pass1] AVISO: ../mpc-1.3.1.tar.gz não encontrado; usando mpc do sistema (se disponível)."
-  fi
+    if [[ ! -d gmp ]]; then
+        echo ">> Incorporando GMP ${GMP_VER} ao tree do GCC"
+        tar -xf "../${GMP_TAR}"
+        mv -v "gmp-${GMP_VER}" gmp
+    fi
 
-  #------------------------------------
-  # Ajuste em t-linux64 para lib em vez de lib64 (x86_64) 
-  #------------------------------------
-  case "$(uname -m)" in
-    x86_64)
-      echo "==> [gcc-pass1] Ajustando gcc/config/i386/t-linux64 (lib64 -> lib)"
-      sed -e '/m64=/s/lib64/lib/' -i gcc/config/i386/t-linux64
-      ;;
-  esac
+    if [[ ! -d mpc ]]; then
+        echo ">> Incorporando MPC ${MPC_VER} ao tree do GCC"
+        tar -xf "../${MPC_TAR}"
+        mv -v "mpc-${MPC_VER}" mpc
+    fi
 
-  #------------------------------------
-  # Diretório de build dedicado
-  #------------------------------------
-  rm -rf build
-  mkdir -p build
-  cd build
+    # ======= Ajuste de lib64 -> lib em x86_64 ========
+    # Mesmo sed que o LFS usa (em 12.4) para GCC pass1 em x86_64.
+    case "$(uname -m)" in
+        x86_64)
+            sed -e '/m64=/s/lib64/lib/' \
+                -i gcc/config/i386/t-linux64
+        ;;
+    esac
 
-  #------------------------------------
-  # Configure (igual ao LFS, exceto prefix=/tools) 
-  #
-  # ../configure                  \
-  #     --target=$LFS_TGT         \
-  #     --prefix=$LFS/tools       \
-  #     --with-glibc-version=2.42 \
-  #     --with-sysroot=$LFS       \
-  #     --with-newlib             \
-  #     --without-headers         \
-  #     --enable-default-pie      \
-  #     --enable-default-ssp      \
-  #     --disable-nls             \
-  #     --disable-shared          \
-  #     --disable-multilib        \
-  #     --disable-threads         \
-  #     --disable-libatomic       \
-  #     --disable-libgomp         \
-  #     --disable-libquadmath     \
-  #     --disable-libssp          \
-  #     --disable-libvtv          \
-  #     --disable-libstdcxx       \
-  #     --enable-languages=c,c++
-  #
-  # Aqui usamos prefix=/tools para que, com DESTDIR, os arquivos vão
-  # pra $DESTDIR/tools. Depois, quando o adm instalar o pacote no /,
-  # o prefix final será /tools (igual ao plano do LFS para toolchain).
-  #------------------------------------
-  ../configure                  \
-    --target="$LFS_TGT"         \
-    --prefix=/tools             \
-    --with-glibc-version=2.42   \
-    --with-sysroot="$LFS"       \
-    --with-newlib               \
-    --without-headers           \
-    --enable-default-pie        \
-    --enable-default-ssp        \
-    --disable-nls               \
-    --disable-shared            \
-    --disable-multilib          \
-    --disable-threads           \
-    --disable-libatomic         \
-    --disable-libgomp           \
-    --disable-libquadmath       \
-    --disable-libssp            \
-    --disable-libvtv            \
-    --disable-libstdcxx         \
-    --enable-languages=c,c++
+    # ======= Alvo (TARGET_TRIPLET) e sysroot ========
 
-  echo "==> [gcc-pass1] configure concluído"
+    # TARGET_TRIPLET deve vir do profile (glibc/musl), mas garantimos um fallback.
+    : "${TARGET_TRIPLET:=}"
 
-  #------------------------------------
-  # Compilação
-  #------------------------------------
-  echo "==> [gcc-pass1] Compilando..."
-  make -j"${NUMJOBS:-1}"
-  echo "==> [gcc-pass1] make concluído"
+    if [[ -z "$TARGET_TRIPLET" ]]; then
+        if [[ -n "${HOST:-}" ]]; then
+            TARGET_TRIPLET="$HOST"
+        else
+            TARGET_TRIPLET="$(./config.guess 2>/dev/null || echo unknown-unknown-linux-gnu)"
+        fi
+    fi
 
-  #------------------------------------
-  # Instalação em DESTDIR
-  #------------------------------------
-  echo "==> [gcc-pass1] Instalando em DESTDIR=${DESTDIR}"
-  make DESTDIR="$DESTDIR" install
-  echo "==> [gcc-pass1] make install concluído em $DESTDIR"
+    echo ">> GCC Pass 1 alvo: $TARGET_TRIPLET"
 
-  #------------------------------------
-  # Criar header interno completo limits.h (estilo LFS) 
-  #
-  # No LFS, é:
-  #   cd ..
-  #   cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
-  #     `dirname $($LFS_TGT-gcc -print-libgcc-file-name)`/include/limits.h
-  #
-  # Aqui, para não depender de rodar o $LFS_TGT-gcc de dentro do DESTDIR,
-  # descobrimos a pasta via árvore de arquivos em $DESTDIR/tools/lib/gcc/$LFS_TGT.
-  #------------------------------------
-  cd "$SRC_DIR"
+    # Root do sistema que você está construindo (vem do profile / admV2)
+    : "${ADM_ROOTFS:=/}"
 
-  local GCC_TARGET_LIB_BASE GCC_TARGET_VER GCC_TARGET_INC_DIR
-  GCC_TARGET_LIB_BASE="$DESTDIR/tools/lib/gcc/$LFS_TGT"
+    # Sysroot alvo que o GCC vai usar para procurar includes/libs do sistema alvo
+    : "${CROSS_SYSROOT:=$ADM_ROOTFS}"
 
-  if [ -d "$GCC_TARGET_LIB_BASE" ]; then
-    # Deve haver um único subdiretório com a versão (ex.: 15.2.0)
-    GCC_TARGET_VER="$(cd "$GCC_TARGET_LIB_BASE" && echo *)"
-    GCC_TARGET_INC_DIR="$GCC_TARGET_LIB_BASE/$GCC_TARGET_VER/include"
+    # Prefixo dos binários de cross (PARECIDO com $LFS/tools do livro, mas aqui é genérico):
+    : "${CROSS_PREFIX:=/cross-tools}"
 
-    echo "==> [gcc-pass1] Criando limits.h em $GCC_TARGET_INC_DIR"
-    mkdir -p "$GCC_TARGET_INC_DIR"
+    echo ">> GCC Pass 1 prefix (no alvo): $CROSS_PREFIX"
+    echo ">> GCC Pass 1 sysroot alvo    : $CROSS_SYSROOT"
 
-    cat gcc/limitx.h gcc/glimits.h gcc/limity.h > \
-      "$GCC_TARGET_INC_DIR/limits.h"
-  else
-    echo "AVISO: diretório $GCC_TARGET_LIB_BASE não encontrado."
-    echo "       limits.h interno não foi gerado; verifique se make install funcionou."
-  fi
+    # ======= Flags de compilação / paralelismo ========
 
-  echo "==> [gcc-pass1] Build do GCC-${PKG_VERSION} - Pass 1 finalizado com sucesso."
+    : "${NUMJOBS:=1}"
+    : "${CFLAGS:=-O2 -pipe}"
+    : "${CXXFLAGS:=-O2 -pipe}"
+
+    # ======= Opção --with-glibc-version (só se estiver em perfil glibc) ========
+
+    local glibc_opt=()
+    # PROFILE normalmente vem dos profiles profile-glibc.sh / profile-musl.sh
+    case "${PROFILE:-glibc}" in
+        glibc)
+            # versão do glibc alvo; pode ajustar com GLIBC_TARGET_VERSION
+            local _glibc_ver="${GLIBC_TARGET_VERSION:-2.42}"
+            glibc_opt=( "--with-glibc-version=${_glibc_ver}" )
+        ;;
+        *)
+            # para musl ou outros alvos, não usamos --with-glibc-version
+        ;;
+    esac
+
+    # ======= Build em diretório separado ========
+
+    rm -rf build
+    mkdir -v build
+    cd       build
+
+    # Configure baseado no LFS 12.4 GCC Pass 1 (adaptado)
+    ../configure \
+        --target="${TARGET_TRIPLET}" \
+        --prefix="${CROSS_PREFIX}" \
+        --with-sysroot="${CROSS_SYSROOT}" \
+        "${glibc_opt[@]}" \
+        --with-newlib \
+        --without-headers \
+        --enable-default-pie \
+        --enable-default-ssp \
+        --disable-nls \
+        --disable-shared \
+        --disable-multilib \
+        --disable-threads \
+        --disable-libatomic \
+        --disable-libgomp \
+        --disable-libquadmath \
+        --disable-libssp \
+        --disable-libvtv \
+        --disable-libstdcxx \
+        --enable-languages=c,c++
+
+    # Compila o cross-compiler
+    make -j"${NUMJOBS}"
+
+    # Instala no DESTDIR preparado pelo admV2.
+    # No pacote final, isso vira:
+    #   ${ADM_ROOTFS}${CROSS_PREFIX}/bin/${TARGET_TRIPLET}-gcc
+    make DESTDIR="$DESTDIR" install
+
+    # ======= Gerar limits.h "completo" para o cross-compiler ========
+    # Igual ao que o LFS faz, mas respeitando DESTDIR e CROSS_PREFIX. 2
+
+    cd ..
+
+    local gcc_prog="${DESTDIR}${CROSS_PREFIX}/bin/${TARGET_TRIPLET}-gcc"
+    if [[ ! -x "$gcc_prog" ]]; then
+        echo "AVISO: não encontrei ${gcc_prog} para gerar limits.h; verifique a instalação do GCC pass1."
+        return 0
+    fi
+
+    local libgcc_file libgcc_dir
+    libgcc_file="$("$gcc_prog" -print-libgcc-file-name 2>/dev/null || true)"
+    if [[ -z "$libgcc_file" ]]; then
+        echo "AVISO: ${gcc_prog} -print-libgcc-file-name não retornou caminho; pulando geração de limits.h."
+        return 0
+    fi
+
+    libgcc_dir="$(dirname "$libgcc_file")"
+
+    echo ">> Gerando limits.h em ${libgcc_dir}/include/limits.h"
+
+    mkdir -p "${libgcc_dir}/include"
+    cat gcc/limitx.h gcc/glimits.h gcc/limity.h > "${libgcc_dir}/include/limits.h"
 }
