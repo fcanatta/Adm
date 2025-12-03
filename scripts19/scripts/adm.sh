@@ -146,8 +146,14 @@ is_dry_run() {
 DEFAULT_LIBC="unknown"
 PROFILE="${PROFILE:-}"
 FORCE_REBUILD="${FORCE_REBUILD:-0}"
+DEFAULT_LIBC_DETECTED=""
 
 detect_libc() {
+  # Detecta apenas uma vez por execução
+  if [[ -n "${DEFAULT_LIBC_DETECTED:-}" ]]; then
+    return 0
+  fi
+
   if getconf GNU_LIBC_VERSION &>/dev/null; then
     DEFAULT_LIBC="glibc"
   elif ldd --version 2>&1 | grep -qi musl; then
@@ -157,6 +163,9 @@ detect_libc() {
   else
     DEFAULT_LIBC="unknown"
   fi
+
+  DEFAULT_LIBC_DETECTED=1
+  log_info "Libc detectada: $DEFAULT_LIBC"
 }
 
 set_profile() {
@@ -165,6 +174,7 @@ set_profile() {
   if [[ -n "$requested" ]]; then
     PROFILE="$requested"
   elif [[ -z "${PROFILE:-}" ]]; then
+    detect_libc
     PROFILE="$DEFAULT_LIBC"
   fi
 
@@ -174,14 +184,15 @@ set_profile() {
       ;;
     musl)
       log_info "Usando profile de libc: musl"
-      if command -v musl-gcc &>/dev/null; then
-        export CC="${CC:-musl-gcc}"
-      else
-        log_warn "musl-gcc não encontrado; ajuste CC/CFLAGS manualmente se necessário."
+      # Só seta CC se não estiver definido
+      if [[ -z "${CC:-}" ]] && command -v musl-gcc &>/dev/null; then
+        export CC="musl-gcc"
+        log_info "Definindo CC=musl-gcc para profile musl"
       fi
       ;;
     *)
-      log_warn "Profile de libc desconhecido: '$PROFILE'. Sem ajustes especiais."
+      detect_libc
+      log_warn "Profile de libc desconhecido: '$PROFILE' (libc detectada: $DEFAULT_LIBC)"
       ;;
   esac
 
@@ -312,13 +323,44 @@ read_deps() {
 
   local deps=()
   while IFS= read -r line || [[ -n "$line" ]]; do
+    # Remove comentários
     line="${line%%#*}"
+    # Trim
     line="$(echo "$line" | xargs || true)"
     [[ -z "$line" ]] && continue
     deps+=("$line")
   done < "$deps_file"
 
   printf '%s\n' "${deps[@]:-}"
+}
+
+# Converte DEPS / DEPS_STR de um .meta em um array
+# Uso:
+#   local arr=()
+#   meta_deps_to_array arr
+#   for d in "${arr[@]}"; do ...; done
+meta_deps_to_array() {
+  local __name="$1"
+  local -n __out="$__name"
+
+  __out=()
+
+  # Caso novo/antigo: DEPS como array bash
+  if declare -p DEPS &>/dev/null 2>&1; then
+    if [[ "$(declare -p DEPS 2>/dev/null)" == "declare -a DEPS="* ]]; then
+      __out+=("${DEPS[@]}")
+    fi
+  fi
+
+  # DEPS_STR (formato string, espaço-separado)
+  if [[ ${#__out[@]} -eq 0 && -n "${DEPS_STR:-}" ]]; then
+    read -r -a __out <<< "$DEPS_STR"
+  fi
+
+  # Fallback: DEPS como string simples
+  if [[ ${#__out[@]} -eq 0 && -n "${DEPS:-}" ]]; then
+    read -r -a __out <<< "$DEPS"
+  fi
 }
 
 #--------------------------------------
@@ -495,12 +537,6 @@ write_pkg_meta() {
   local deps_str="$1"
   local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
 
-  if is_dry_run; then
-    log_info "[dry-run] Não escreverei metadados em $meta_file"
-    log_info "[dry-run] Metadados seriam: NAME=$PKG_NAME, CATEGORY=$PKG_CAT, VERSION=$PKG_VERSION, PROFILE=${PROFILE:-unknown}, DEPS=($deps_str)"
-    return 0
-  fi
-
   mkdir -p "$DB_PKG_META"
 
   {
@@ -509,7 +545,9 @@ write_pkg_meta() {
     echo "ID=\"$PKG_ID\""
     echo "VERSION=\"$PKG_VERSION\""
     echo "PROFILE=\"${PROFILE:-unknown}\""
-    echo "DEPS=($deps_str)"
+    # Compatibilidade: array + string
+    echo "DEPS_STR=\"$deps_str\""
+    echo "DEPS=( $deps_str )"
   } > "$meta_file"
 
   log_info "Metadados gravados em $meta_file"
@@ -563,7 +601,7 @@ build_pkg_if_needed() {
 # Instalação recursiva com deps
 #--------------------------------------
 install_pkg_recursive() {
-  # Estado desta sessão: "" (não visitado), "visiting" (em processamento), "done" (já finalizado)
+  # Estado: "" (não visitado), "visiting" (em processamento), "done" (finalizado)
   local state="${INSTALLED_IN_SESSION[$PKG_ID]:-}"
 
   if [[ "$state" == "visiting" ]]; then
@@ -574,13 +612,12 @@ install_pkg_recursive() {
     return 0
   fi
 
-  # Marca como em processamento para detectar ciclos
   INSTALLED_IN_SESSION["$PKG_ID"]="visiting"
 
   # Carrega script do pacote atual
   load_pkg_script
 
-  # Dependências (categoria/programa)
+  # Dependências declaradas no .deps (categoria/programa)
   local deps=()
   mapfile -t deps < <(read_deps || true)
 
@@ -593,13 +630,13 @@ install_pkg_recursive() {
 
     log_info "Resolvendo dependência $dep_cat/$dep_name para $PKG_ID..."
 
-    # Salva contexto atual
+    # Salva contexto do pacote atual
     local saved_cat="$PKG_CAT" saved_name="$PKG_NAME" saved_id="$PKG_ID" saved_key="$PKG_KEY" saved_meta="$PKG_META_DIR"
 
     set_pkg_vars "$dep_cat" "$dep_name"
     install_pkg_recursive
 
-    # Restaura contexto do pacote original
+    # Restaura contexto
     PKG_CAT="$saved_cat"
     PKG_NAME="$saved_name"
     PKG_ID="$saved_id"
@@ -636,26 +673,33 @@ install_pkg_recursive() {
 # Uninstall (com dependentes)
 #--------------------------------------
 find_reverse_deps() {
-  local target_id="$PKG_ID"
+  local target="$PKG_ID"
   local f
+
+  [[ ! -d "$DB_PKG_META" ]] && return 0
 
   for f in "$DB_PKG_META"/*.meta; do
     [[ ! -f "$f" ]] && continue
-    # isolando variáveis
-    local NAME="" CATEGORY="" DEPS=""
+
+    local NAME="" CATEGORY="" ID="" VERSION="" PROFILE="" DEPS=() DEPS_STR=""
     # shellcheck disable=SC1090
     source "$f"
+
+    local deps=()
+    meta_deps_to_array deps
+
     local d
-    for d in $DEPS; do
-      if [[ "$d" == "$target_id" ]]; then
-        echo "${CATEGORY}/${NAME}"
+    for d in "${deps[@]}"; do
+      if [[ "$d" == "$target" ]]; then
+        printf '%s/%s\n' "$CATEGORY" "$NAME"
+        break
       fi
     done
   done
 }
 
 uninstall_pkg_recursive() {
-  # Estado desta sessão: "" (não visitado), "visiting" (em processamento), "done" (já finalizado)
+  # Estado: "" (não visitado), "visiting" (em processamento), "done" (finalizado)
   local state="${UNINSTALLED_IN_SESSION[$PKG_ID]:-}"
 
   if [[ "$state" == "visiting" ]]; then
@@ -672,7 +716,6 @@ uninstall_pkg_recursive() {
     return 0
   fi
 
-  # Marca como em processamento
   UNINSTALLED_IN_SESSION["$PKG_ID"]="visiting"
 
   log_info "Verificando dependentes de $PKG_ID..."
@@ -713,21 +756,10 @@ uninstall_pkg_recursive() {
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.pre_uninstall" "pre_uninstall"
 
   local list_file="$DB_PKG_FILES/${PKG_KEY}.list"
-  local dry=0
-  if is_dry_run; then
-    dry=1
-    log_info "[dry-run] Simulando remoção de arquivos de $PKG_ID"
-  fi
-
   if [[ -f "$list_file" ]]; then
-    log_info "Processando lista de arquivos $list_file"
+    log_info "Removendo arquivos listados em $list_file"
     while IFS= read -r p || [[ -n "$p" ]]; do
       [[ -z "$p" ]] && continue
-
-      if (( dry )); then
-        log_info "[dry-run] Removeria: $p"
-        continue
-      fi
 
       if [[ -d "$p" && ! -L "$p" ]]; then
         if ! rmdir "$p" 2>/dev/null; then
@@ -741,25 +773,15 @@ uninstall_pkg_recursive() {
         fi
       fi
     done < "$list_file"
-
-    if (( dry )); then
-      log_info "[dry-run] Não removendo lista de arquivos $list_file"
-    else
-      rm -f "$list_file"
-    fi
+    rm -f "$list_file"
   else
     log_warn "Lista de arquivos não encontrada para $PKG_ID."
   fi
 
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_uninstall" "post_uninstall"
 
-  if is_dry_run; then
-    log_info "[dry-run] Não removendo meta $meta_file"
-  else
-    rm -f "$meta_file"
-  fi
+  rm -f "$meta_file"
 
-  # Usa VERSION do .meta se existir; senão cai para PKG_VERSION; se nada, "unknown"
   local event_version="${VERSION:-${PKG_VERSION:-unknown}}"
   register_event "uninstall" "OK" "$event_version"
 
@@ -820,53 +842,84 @@ show_registry() {
 }
 
 show_pkg_info() {
-  local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
-  local installed_flag="[   ]"
-  if [[ -f "$meta_file" ]]; then
-    installed_flag="[ ✔️]"
+  echo "Informações do pacote $PKG_ID"
+
+  # Info vinda do script de build
+  if load_pkg_script 2>/dev/null; then
+    echo "Script:"
+    printf "  Nome: %s\n" "$PKG_NAME"
+    printf "  Categoria: %s\n" "$PKG_CAT"
+    printf "  Versão declarada: %s\n" "$PKG_VERSION"
+    printf "  URL: %s\n" "$SRC_URL"
+
+    local deps_decl=()
+    mapfile -t deps_decl < <(read_deps || true)
+    if ((${#deps_decl[@]})); then
+      printf "  Dependências declaradas (.deps): %s\n" "${deps_decl[*]}"
+    else
+      printf "  Dependências declaradas (.deps): (nenhuma)\n"
+    fi
+  else
+    echo "Script de build não pôde ser carregado."
   fi
 
-  echo "Programa: $PKG_NAME $installed_flag"
-  echo "Categoria: $PKG_CAT"
-  load_pkg_script
-  echo "Versão (script): $PKG_VERSION"
-  echo "Source URL: $SRC_URL"
+  echo
 
-  local deps_script=()
-  mapfile -t deps_script < <(read_deps || true)
-  echo "Dependências (script): ${deps_script[*]:-(nenhuma)}"
+  # Info vinda do meta de instalação
+  local meta_file="$DB_PKG_META/${PKG_KEY}.meta"
+  if [[ ! -f "$meta_file" ]]; then
+    echo "Pacote ainda não instalado (meta não encontrado: $meta_file)"
+    return 0
+  fi
 
-  if [[ -f "$meta_file" ]]; then
-    # shellcheck disable=SC1090
-    source "$meta_file"
-    echo "----- Informações instaladas -----"
-    echo "ID: $ID"
-    echo "Versão instalada: $VERSION"
-    echo "Profile instalado: $PROFILE"
-    echo "Dependências registradas: ${DEPS:-}"
+  local NAME="" CATEGORY="" ID="" VERSION="" PROFILE="" DEPS=() DEPS_STR=""
+  # shellcheck disable=SC1090
+  source "$meta_file"
+
+  echo "Meta de instalação:"
+  printf "  Nome: %s\n" "$NAME"
+  printf "  Categoria: %s\n" "$CATEGORY"
+  printf "  ID: %s\n" "$ID"
+  printf "  Versão instalada: %s\n" "$VERSION"
+  printf "  Profile: %s\n" "$PROFILE"
+
+  local deps_meta=()
+  meta_deps_to_array deps_meta
+  if ((${#deps_meta[@]})); then
+    printf "  Dependências (meta): %s\n" "${deps_meta[*]}"
   else
-    echo "Pacote ainda não instalado (sem metadados em $meta_file)."
+    printf "  Dependências (meta): (nenhuma)\n"
   fi
 }
 
 list_installed() {
+  echo "Pacotes instalados:"
   if [[ ! -d "$DB_PKG_META" ]]; then
-    echo "Nenhum pacote instalado."
+    echo "  (nenhum pacote instalado)"
     return 0
   fi
 
   local f
   for f in "$DB_PKG_META"/*.meta; do
     [[ ! -f "$f" ]] && continue
-    local NAME="" CATEGORY="" ID="" VERSION="" PROFILE="" DEPS=""
+
+    local NAME="" CATEGORY="" ID="" VERSION="" PROFILE="" DEPS=() DEPS_STR=""
     # shellcheck disable=SC1090
     source "$f"
+
+    local deps_meta=()
+    meta_deps_to_array deps_meta
+
     printf "Programa: %s [ ✔️]\n" "$NAME"
     printf "  Categoria: %s\n" "$CATEGORY"
     printf "  ID: %s\n" "$ID"
     printf "  Versão: %s\n" "$VERSION"
     printf "  Profile: %s\n" "$PROFILE"
-    printf "  Dependências: %s\n" "${DEPS:-}"
+    if ((${#deps_meta[@]})); then
+      printf "  Dependências: %s\n" "${deps_meta[*]}"
+    else
+      printf "  Dependências: (nenhuma)\n"
+    fi
     echo
   done
 }
