@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Hook pós-instalação do musl para sanity-check
+# Caminho: /mnt/adm/packages/libs/musl/musl.post_install
+#
+# Rodado DEPOIS que o pacote musl já foi instalado no sistema
+# (tarball extraído em / pelo adm).
+
+set -euo pipefail
+
+echo "==> [musl.post_install] Sanity-check do musl libc"
+
+#---------------------------------------------
+# 1) Verificar loader ld-musl-*.so.1
+#---------------------------------------------
+LOADER="$(find /lib /usr/lib -maxdepth 3 -name 'ld-musl-*.so.1' 2>/dev/null | head -n1 || true)"
+
+if [ -z "$LOADER" ]; then
+  echo "ERRO: loader ld-musl-*.so.1 não encontrado em /lib ou /usr/lib."
+  echo "      Verifique se o pacote foi instalado corretamente."
+  exit 1
+fi
+
+echo "==> [musl.post_install] Loader encontrado: $LOADER"
+
+#---------------------------------------------
+# 2) Verificar libc.so (de musl) se existir
+#---------------------------------------------
+LIBC_SO="$(find /usr/lib /lib -maxdepth 3 -name 'libc.so' 2>/dev/null | head -n1 || true)"
+
+if [ -n "$LIBC_SO" ]; then
+  echo "==> [musl.post_install] libc.so encontrado em: $LIBC_SO"
+  if command -v strings >/dev/null 2>&1; then
+    if strings "$LIBC_SO" 2>/dev/null | grep -qi "musl"; then
+      echo "==> [musl.post_install] libc.so aparenta ser do musl (string 'musl' encontrada)."
+    else
+      echo "AVISO: libc.so não contém 'musl' nas strings;"
+      echo "       isso pode indicar conflito com outra libc."
+    fi
+  else
+    echo "==> [musl.post_install] 'strings' não encontrado; pulando verificação de conteúdo da libc."
+  fi
+else
+  echo "AVISO: libc.so não encontrado em /usr/lib ou /lib."
+fi
+
+#---------------------------------------------
+# 3) Teste opcional com musl-gcc (se existir)
+#---------------------------------------------
+if command -v musl-gcc >/dev/null 2>&1; then
+  echo "==> [musl.post_install] musl-gcc encontrado em: $(command -v musl-gcc)"
+  TMPDIR="$(mktemp -d /tmp/adm-musl-test.XXXXXX)"
+  cleanup() { rm -rf "$TMPDIR"; }
+  trap cleanup EXIT
+
+  cd "$TMPDIR"
+
+  cat > test.c << 'EOF'
+#include <stdio.h>
+int main(void) {
+    printf("hello from musl\n");
+    return 0;
+}
+EOF
+
+  echo "==> [musl.post_install] Compilando teste em C com musl-gcc (estático)..."
+  if ! musl-gcc -static test.c -o test_musl; then
+    echo "ERRO: falha ao compilar teste com musl-gcc."
+    exit 1
+  fi
+
+  echo "==> [musl.post_install] Executando teste com musl-gcc..."
+  out="$(./test_musl || true)"
+  echo "Saída do binário: '$out'"
+
+  if [ "$out" != "hello from musl" ]; then
+    echo "ERRO: saída inesperada do teste com musl-gcc."
+    exit 1
+  fi
+
+  echo "==> [musl.post_install] Teste com musl-gcc OK."
+else
+  echo "AVISO: musl-gcc não encontrado no PATH."
+  echo "       Sanity-check limitado a presença do loader e (opcionalmente) da libc.so."
+fi
+
+echo "==> [musl.post_install] Sanity-check do musl concluído com sucesso."
