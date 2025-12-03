@@ -1,0 +1,3 @@
+# Tem que exportar antes da construção.
+export LFS=/mnt/lfs
+export LFS_TGT=$(uname -m)-lfs-linux-gnu   # ou o triplet que você estiver usando
