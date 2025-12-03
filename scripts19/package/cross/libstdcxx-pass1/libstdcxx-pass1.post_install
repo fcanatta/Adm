@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação para libstdc++-15.2.0 Pass 1
+# Sanity checks:
+#   - headers C++ do cross em ${ADM_ROOTFS}${CROSS_PREFIX}/${TARGET_TRIPLET}/include/c++/15.2.0
+#   - libs em ${ADM_ROOTFS}/usr/lib/libstdc++.so*
+#   - ${TARGET_TRIPLET}-g++ compila um programa simples com <iostream>
+#   - (informativo) inspeção do binário com ${TARGET_TRIPLET}-readelf/objdump
+
+set -euo pipefail
+
+echo "==> [libstdc++-pass1 post_install] Iniciando sanity checks..."
+
+# --------------------------------------------------------------------
+# 1. Validar TARGET_TRIPLET, ADM_ROOTFS, CROSS_PREFIX
+# --------------------------------------------------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-glibc.sh' ou 'source profile-musl.sh') antes de usar o admV2."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+: "${CROSS_PREFIX:=/cross-tools}"
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+echo "    CROSS_PREFIX   = ${CROSS_PREFIX}"
+
+# --------------------------------------------------------------------
+# 2. Verificar caminhos esperados da libstdc++ (headers + libs)
+# --------------------------------------------------------------------
+
+# Onde os headers para o cross-compiler devem estar (com base no configure)
+PKG_VERSION="15.2.0"
+CXX_INC_DIR="${ROOTFS}${CROSS_PREFIX}/${TARGET}/include/c++/${PKG_VERSION}"
+
+# Onde as libs devem estar no sistema alvo
+LIB_DIR="${ROOTFS}/usr/lib"
+
+if [[ ! -d "$CXX_INC_DIR" ]]; then
+  echo "ERRO: diretório de headers C++ do cross-compiler não encontrado:"
+  echo "      ${CXX_INC_DIR}"
+  echo "      Verifique se o configure usou --with-gxx-include-dir=${CROSS_PREFIX}/${TARGET}/include/c++/${PKG_VERSION}"
+  exit 1
+fi
+
+echo "    OK: headers C++ encontrados em ${CXX_INC_DIR}"
+
+if ! ls "${LIB_DIR}"/libstdc++.so* >/dev/null 2>&1; then
+  echo "ERRO: não encontrei libstdc++.so* em ${LIB_DIR}"
+  echo "      Verifique se 'make install' da libstdc++ foi feito corretamente."
+  exit 1
+fi
+
+echo "    OK: libstdc++.so* presentes em ${LIB_DIR}"
+
+# --------------------------------------------------------------------
+# 3. Verificar disponibilidade de ${TARGET}-g++, -readelf e -objdump
+# --------------------------------------------------------------------
+
+GXX_BIN="${TARGET}-g++"
+READELF_BIN="${TARGET}-readelf"
+OBJDUMP_BIN="${TARGET}-objdump"
+
+if ! command -v "$GXX_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GXX_BIN}' no PATH."
+  echo "      Esse binário deve vir do gcc-15.2.0-pass1 para o alvo ${TARGET}."
+  exit 1
+fi
+
+echo "    Encontrado g++ alvo: $(command -v "$GXX_BIN")"
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Encontrado readelf alvo: $(command -v "$READELF_BIN")"
+else
+  echo "    AVISO: '${READELF_BIN}' não está no PATH; checks com readelf serão pulados."
+fi
+
+if command -v "$OBJDUMP_BIN" >/dev/null 2>&1; then
+  echo "    Encontrado objdump alvo: $(command -v "$OBJDUMP_BIN")"
+else
+  echo "    AVISO: '${OBJDUMP_BIN}' não está no PATH; checks com objdump serão pulados."
+fi
+
+# --------------------------------------------------------------------
+# 4. Compilar um programa C++ simples com <iostream>
+# --------------------------------------------------------------------
+
+tmp_build_dir="$(mktemp -d -t libstdcxx-pass1-dummy-XXXXXX)"
+cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.cpp" << 'EOF'
+#include <iostream>
+
+int main() {
+    std::cout << "libstdc++ sanity OK\n";
+    return 0;
+}
+EOF
+
+echo "    Compilando dummy.cpp com ${GXX_BIN}..."
+
+(
+  cd "$tmp_build_dir"
+  # Deixamos o g++ decidir se linka estaticamente/dinamicamente conforme configuração.
+  "$GXX_BIN" dummy.cpp -o dummy
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy" ]]; then
+  echo "ERRO: não foi possível gerar o binário 'dummy' com ${GXX_BIN}."
+  exit 1
+fi
+
+echo "    Binário C++ gerado com sucesso: ${tmp_build_dir}/dummy"
+
+# --------------------------------------------------------------------
+# 5. Informações adicionais com readelf/objdump (opcional)
+# --------------------------------------------------------------------
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando NEEDED libs de dummy com ${READELF_BIN} -d (informativo)..."
+  "$READELF_BIN" -d "${tmp_build_dir}/dummy" | grep -E 'NEEDED|SONAME' || true
+fi
+
+if command -v "$OBJDUMP_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando tipo do binário com ${OBJDUMP_BIN} -f (informativo)..."
+  "$OBJDUMP_BIN" -f "${tmp_build_dir}/dummy" || true
+fi
+
+echo "==> [libstdc++-pass1 post_install] Sanity checks concluídos com SUCESSO."
