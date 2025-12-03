@@ -8,3 +8,11 @@ export LFS_TGT=$(uname -m)-lfs-linux-musl   # ou o triplet que você estiver usa
 export PATH=$LFS/tools/bin:$PATH           # e/ou tools-musl, conforme sua organização
 
 adm install musl-pass1 musl
+
+# No host faça esses exports
+export LFS=/mnt/lfs
+export LFS_TGT=$(uname -m)-lfs-linux-gnu
+export PATH=$LFS/tools/bin:$PATH   # tic vai cair aí
+
+adm build ncurses-pass1
+adm install ncurses-pass1
