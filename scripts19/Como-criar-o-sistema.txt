@@ -1,0 +1,250 @@
+1. Ideia central: 3 camadas
+
+Pensa assim:
+
+1. Kernel + bootloader
+
+Não é responsabilidade direta do admV2 (ele pode só empacotar arquivos).
+
+
+
+2. Toolchain e libc (binutils, gcc, glibc/musl)
+
+Precisa de cuidado com --host, --build, prefixo, etc.
+
+
+
+3. Userland (coreutils, bash, sed, patch, etc.)
+
+Aqui o admV2 brilha: pkg_build + DESTDIR + pacotes.
+
+
+
+
+O LFS organiza tudo com $LFS.
+Você pode fazer a MESMA ideia, só que:
+
+O “root do sistema alvo” é um diretório fixo que você escolhe, tipo:
+
+/opt/systems/glibc-root
+
+/opt/systems/musl-root
+
+
+E você não precisa de variável $LFS. O nome $LFS no livro é só convenção.
+
+
+
+---
+
+2. Como usar o admV2 para construir um sistema do zero
+
+2.1. Escolha os “roots” do(s) sistema(s)
+
+Por exemplo:
+
+/opt/systems/glibc-root   -> futuro sistema com glibc
+/opt/systems/musl-root    -> futuro sistema com musl
+
+Você pode até ter um só (começa com glibc, depois faz outro com musl).
+
+2.2. Use chroot em vez de DESTDIR gigante
+
+O LFS usa:
+
+DESTDIR=$LFS make install
+
+O admV2 já faz internamente:
+
+DESTDIR="$algum_diretório_de_pkgroot" make install
+# depois empacota
+# depois, na instalação, extrai o tar em /
+
+A maneira mais limpa de reproduzir o efeito do LFS é:
+
+1. Do seu sistema host (sua distro atual), preparar o root do sistema:
+
+mkdir -p /opt/systems/glibc-root
+# montar /dev, /proc, /sys, etc. se for chroot sério
+
+
+2. Entrar em chroot quando estiver pronto:
+
+chroot /opt/systems/glibc-root /bin/bash
+
+
+3. Dentro do chroot, o admV2 passa a enxergar / como o root do sistema.
+
+Não precisa de $LFS.
+
+Não precisa inventar ADM_ROOTFS na mão (embora dê para fazer isso também).
+
+
+
+
+Fluxo:
+
+Do host: constrói toolchain mínima e joga no root escolhido.
+
+Depois chroot nesse root e passa a usar admV2 “como se fosse o sistema real”.
+
+
+
+---
+
+3. Suporte a glibc e musl com o admV2
+
+Você JÁ tem um gancho muito bom no admV2: a variável PROFILE:
+
+PROFILE=glibc
+
+PROFILE=musl
+
+
+No admV2 (com a detect_libc corrigida e set_profile):
+
+Para PROFILE=musl, ele pode fazer export CC=musl-gcc automaticamente.
+
+Para PROFILE=glibc, usa o compilador padrão (gcc normal).
+
+
+Estratégia simples:
+
+Sistema glibc:
+
+Cria root: /opt/systems/glibc-root
+
+Toolchain glibc (pode começar usando a própria glibc do host).
+
+Chroot em /opt/systems/glibc-root e usa PROFILE=glibc nos builds.
+
+
+Sistema musl:
+
+Cria root: /opt/systems/musl-root
+
+Instala um toolchain baseado em musl (por exemplo, usando musl-cross, ou compilando gcc+musl).
+
+Dentro desse ambiente, usa PROFILE=musl e deixa o admV2 configurar CC=musl-gcc.
+
+
+
+Nos scripts de pacote (*.sh):
+
+Você não precisa entupir de if glibc / if musl.
+
+Basta respeitar CC, CFLAGS, HOST, TARGET que vierem do ambiente.
+
+
+Exemplo de ./configure genérico:
+
+./configure \
+    --prefix=/usr \
+    ${HOST:+--host="$HOST"} \
+    ${TARGET:+--target="$TARGET"} \
+    --build="$(build-aux/config.guess)"
+
+E deixa o ambiente dizer se é glibc ou musl.
+
+
+---
+
+4. Como amarrar isso de forma “correta e funcional”
+
+Vou propor um modelo de convenção em cima do admV2:
+
+4.1. Convenções de ambiente
+
+PROFILE
+
+glibc ou musl.
+
+O admV2 já usa isso pra ajustar CC (no set_profile).
+
+
+TARGET_TRIPLET
+
+Ex.: x86_64-linux-gnu para glibc, x86_64-linux-musl para musl.
+
+
+HOST
+
+Por padrão HOST="$TARGET_TRIPLET" no ambiente onde você vai construir.
+
+
+
+Você pode fazer um “wrapper” para chamar o adm:
+
+# Para glibc:
+PROFILE=glibc HOST=x86_64-linux-gnu TARGET_TRIPLET=x86_64-linux-gnu ./admV2.sh install patch-pass1
+
+# Para musl:
+PROFILE=musl  HOST=x86_64-linux-musl TARGET_TRIPLET=x86_64-linux-musl ./admV2.sh install patch-pass1
+
+E os scripts de pacote fazem o configure assim:
+
+./configure \
+    --prefix=/usr \
+    ${HOST:+--host="$HOST"} \
+    --build="$(build-aux/config.guess)"
+
+> Repara: QUEM decide se é glibc ou musl é o toolchain (CC + target), não o pacote em si.
+Os scripts só obedecem ao ambiente.
+
+
+
+4.2. Onde construir o sistema (sem $LFS)
+
+Você escolhe nomes próprios, por exemplo:
+
+# glibc
+/opt/systems/glibc-root
+/opt/systems/glibc-root/var/adm     (opcional, se quiser um adm só lá dentro)
+
+/opt/systems/musl-root
+/opt/systems/musl-root/var/adm      (idem para musl)
+
+Fluxo bem direto:
+
+1. No host, prepara /opt/systems/glibc-root com um mínimo necessário (ou monta, ou usa initramfs, etc.).
+
+
+2. Quando tiver binutils+gcc+libc suficientes (pode ser construído na mão ou com o adm), chroot em /opt/systems/glibc-root.
+
+
+3. Dentro do chroot, roda o admV2.sh para instalar os pacotes normais (coreutils, sed, grep, patch, etc.).
+
+
+4. Repete o mesmo conceito para /opt/systems/musl-root com toolchain musl.
+
+---
+
+5. E o que o livro LFS não cobre (glibc + musl)?
+
+O livro oficial foca em um tipo de libc só (glibc).
+Você quer algo mais avançado:
+
+ter dois sistemas (um glibc, um musl), ou
+
+um só sistema com binários separados por libc (mais complexo).
+
+
+O caminho “saudável” é:
+
+Tratar glibc e musl como dois targets diferentes.
+
+Cada target tem:
+
+seu root (chroot),
+
+seu toolchain,
+
+seu conjunto de pacotes.
+
+
+
+O admV2 te ajuda porque:
+
+Você pode reutilizar os mesmos scripts de pacote,
+
+Só mudando PROFILE, HOST, CC, etc.
