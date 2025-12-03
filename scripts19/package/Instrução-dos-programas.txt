@@ -1,0 +1,48 @@
+Como isso se encaixa no que você já tem
+
+1. Perfil glibc/musl
+
+Com os profile-glibc.sh / profile-musl.sh que a gente montou, você já tem:
+
+ADM_ROOTFS definido (por exemplo /opt/systems/glibc-root ou /opt/systems/musl-root);
+
+TARGET_TRIPLET e HOST configurados;
+
+PROFILE ajustando CC para glibc ou musl.
+
+
+Então, por exemplo:
+
+source ./profile-glibc.sh
+ADM_ROOTFS=/opt/systems/glibc-root ./admV2.sh build binutils-2.45.1-pass1
+ADM_ROOTFS=/opt/systems/glibc-root ./admV2.sh install binutils-2.45.1-pass1
+
+Vai instalar binutils pass1 em:
+
+/opt/systems/glibc-root/cross-tools/bin/{as,ld,ld.bfd,...}
+/opt/systems/glibc-root/cross-tools/${TARGET_TRIPLET}/bin/...
+
+
+2. Sem $LFS, sem /tools “do livro”
+
+No lugar de $LFS/tools → usamos CROSS_PREFIX=/cross-tools (ou outro que você quiser).
+
+No lugar de $LFS → usamos CROSS_SYSROOT=$ADM_ROOTFS por padrão.
+
+
+Se quiser ajustar:
+
+CROSS_PREFIX=/opt/toolchains/binutils-pass1 \
+CROSS_SYSROOT=/opt/systems/glibc-root \
+./admV2.sh install binutils-2.45.1-pass1
+
+
+3. Suporte glibc / musl
+
+O script não fixa nada de libc.
+
+Quem escolhe se é glibc ou musl é o toolchain (via CC, TARGET_TRIPLET e PROFILE).
+
+O mesmo binutils-2.45.1-pass1.sh serve para os dois perfis.
+
+
