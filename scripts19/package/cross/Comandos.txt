@@ -1,3 +1,10 @@
 # Tem que exportar antes da construção.
 export LFS=/mnt/lfs
 export LFS_TGT=$(uname -m)-lfs-linux-gnu   # ou o triplet que você estiver usando
+
+# Musl
+export LFS=/mnt/lfs-musl
+export LFS_TGT=$(uname -m)-lfs-linux-musl   # ou o triplet que você estiver usando
+export PATH=$LFS/tools/bin:$PATH           # e/ou tools-musl, conforme sua organização
+
+adm install musl-pass1 musl
