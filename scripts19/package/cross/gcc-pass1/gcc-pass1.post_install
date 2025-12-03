@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação para GCC-15.2.0 Pass 1
+# Faz sanity checks básicos do cross-compiler:
+#   - ${TARGET_TRIPLET}-gcc está no PATH
+#   - GCC foi configurado com --with-sysroot correto
+#   - include search paths não usam /usr/include do host
+#   - consegue compilar um dummy.c em dummy.o
+#
+# Este hook é chamado automaticamente pelo admV2
+# após instalar o pacote gcc-15.2.0-pass1.
+
+set -euo pipefail
+
+echo "==> [gcc-pass1 post_install] Iniciando sanity checks do toolchain (GCC Pass 1)..."
+
+# --------------------------------------------------------------------
+# 1. Validar TARGET_TRIPLET, ADM_ROOTFS, CROSS_SYSROOT e CROSS_PREFIX
+# --------------------------------------------------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-glibc.sh' ou 'source profile-musl.sh') antes de usar o admV2."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+# CROSS_SYSROOT: onde o GCC deve enxergar o sistema alvo (headers/libs)
+: "${CROSS_SYSROOT:=$ROOTFS}"
+
+# CROSS_PREFIX: onde o gcc pass1 foi instalado (no sistema alvo)
+: "${CROSS_PREFIX:=/cross-tools}"
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+echo "    CROSS_SYSROOT  = ${CROSS_SYSROOT}"
+echo "    CROSS_PREFIX   = ${CROSS_PREFIX}"
+
+# --------------------------------------------------------------------
+# 2. Localizar ${TARGET}-gcc e ${TARGET}-objdump
+# --------------------------------------------------------------------
+
+GCC_BIN="${TARGET}-gcc"
+OBJDUMP_BIN="${TARGET}-objdump"  # opcional
+
+if ! command -v "$GCC_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GCC_BIN}' no PATH."
+  echo "      Verifique se binutils-pass1 e gcc-pass1 estão instalados e se o PATH foi ajustado pelo profile."
+  exit 1
+fi
+
+echo "    Encontrado GCC: $(command -v "$GCC_BIN")"
+
+if command -v "$OBJDUMP_BIN" >/dev/null 2>&1; then
+  echo "    Encontrado objdump alvo: $(command -v "$OBJDUMP_BIN")"
+else
+  echo "    AVISO: '${OBJDUMP_BIN}' não está no PATH; alguns checks serão pulados."
+fi
+
+# --------------------------------------------------------------------
+# 3. Verificar opções de configuração do GCC (Configured with: ...)
+# --------------------------------------------------------------------
+
+tmp_verbose="$(mktemp -t gcc-pass1-verbose-XXXXXX)"
+cleanup_verbose() {
+  rm -f -- "$tmp_verbose"
+}
+trap cleanup_verbose EXIT
+
+echo "    Capturando saída verbose de '${GCC_BIN} -v'..."
+# gcc -v escreve no stderr; redirecionamos tudo para o arquivo
+("$GCC_BIN" -v </dev/null) >"$tmp_verbose" 2>&1 || true
+
+if ! grep -q "Configured with:" "$tmp_verbose"; then
+  echo "AVISO: não encontrei linha 'Configured with:' na saída de ${GCC_BIN} -v."
+else
+  config_line="$(grep 'Configured with:' "$tmp_verbose" | head -n1)"
+  echo "    Linha de configuração:"
+  echo "      $config_line"
+
+  # sanity: deve ter --with-sysroot=CROSS_SYSROOT (ou equivalente)
+  if echo "$config_line" | grep -q -- "--with-sysroot=${CROSS_SYSROOT}"; then
+    echo "    OK: GCC foi configurado com --with-sysroot=${CROSS_SYSROOT}"
+  else
+    echo "AVISO: a linha de configuração não mostra '--with-sysroot=${CROSS_SYSROOT}'."
+    echo "       Isso pode indicar que o GCC pass1 não está usando o sysroot esperado."
+  fi
+fi
+
+# --------------------------------------------------------------------
+# 4. Checar diretórios de include usados pelo GCC (sem /usr/include do host)
+# --------------------------------------------------------------------
+
+tmp_inc_search="$(mktemp -t gcc-pass1-inc-XXXXXX)"
+cleanup_inc() {
+  rm -f -- "$tmp_inc_search"
+}
+trap cleanup_inc EXIT
+
+echo "    Coletando include search paths de '${GCC_BIN} -xc /dev/null -S -v'..."
+(
+  cd /
+  # A saída relevante (include dirs) sai no stderr; redirecionamos para arquivo
+  "$GCC_BIN" -xc /dev/null -S -v >/dev/null 2>"$tmp_inc_search" || true
+)
+
+echo "    Diretórios de include reportados:"
+awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc_search" \
+  | sed 's/^/      /'
+
+# Regra de sanity:
+#   - não deve aparecer um /usr/include "cru" do host;
+#   - se aparecer /usr/include, deve estar dentro do CROSS_SYSROOT.
+bad_host_inc=0
+while IFS= read -r line; do
+  # Normalizamos espaços
+  dir="$(echo "$line" | sed 's/^[[:space:]]*//')"
+  [[ -z "$dir" ]] && continue
+
+  case "$dir" in
+    /usr/include*)
+      if [[ "$dir" != "${CROSS_SYSROOT}"* ]]; then
+        echo "ERRO: Include dir suspeito (host) detectado: $dir"
+        echo "      Esperado: includes sob ${CROSS_SYSROOT}/usr/include, não o /usr/include do host."
+        bad_host_inc=1
+      fi
+      ;;
+  esac
+done < <(awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc_search")
+
+if [[ "$bad_host_inc" -ne 0 ]]; then
+  echo "ERRO: GCC pass1 ainda está enxergando /usr/include do host."
+  exit 1
+fi
+
+# --------------------------------------------------------------------
+# 5. Compilar dummy.c em dummy.o (sem link) para testar pipeline front-end+as
+# --------------------------------------------------------------------
+
+tmp_build_dir="$(mktemp -d -t gcc-pass1-dummy-XXXXXX)"
+cleanup_build() {
+  rm -rf -- "$tmp_build_dir"
+}
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.c" << 'EOF'
+int main(void) {
+    return 0;
+}
+EOF
+
+echo "    Compilando dummy.c -> dummy.o com ${GCC_BIN} (sem link)..."
+(
+  cd "$tmp_build_dir"
+  "$GCC_BIN" -c dummy.c -o dummy.o
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy.o" ]]; then
+  echo "ERRO: GCC pass1 não conseguiu gerar dummy.o."
+  exit 1
+fi
+
+echo "    dummy.o gerado com sucesso: ${tmp_build_dir}/dummy.o"
+
+# Se tivermos objdump do alvo, inspecionamos o tipo do arquivo
+if command -v "$OBJDUMP_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando dummy.o com ${OBJDUMP_BIN} -f (informativo)..."
+  "$OBJDUMP_BIN" -f "${tmp_build_dir}/dummy.o" || true
+fi
+
+echo "==> [gcc-pass1 post_install] Sanity checks concluídos com SUCESSO."
