@@ -1,0 +1,9 @@
+# Ambiente glibc
+source ./profile-glibc.sh
+
+# Root do sistema glibc
+ADM_ROOTFS=/opt/systems/glibc-root \
+  ./admV2.sh build   libstdc++-15.2.0-pass1
+
+ADM_ROOTFS=/opt/systems/glibc-root \
+  ./admV2.sh install libstdc++-15.2.0-pass1
