@@ -1,123 +1,85 @@
-#!/usr/bin/env bash
-# Script de construção do Binutils-2.45.1 - Pass 1 para o adm
-#
-# Caminho esperado:
-#   /mnt/adm/packages/cross/binutils-pass1/binutils-pass1.sh
-#
-# O adm fornece:
-#   SRC_DIR  : diretório com o source extraído do tarball
-#   DESTDIR  : raiz de instalação temporária (pkgroot)
-#   PROFILE  : glibc / musl / outro (não usado aqui)
-#   NUMJOBS  : número de jobs para o make
-#
-# Este script deve definir:
-#   PKG_VERSION
-#   SRC_URL
-#   (opcional) SRC_MD5
-#   função pkg_build()
-#
-# OBS:
-#   - Este é o Binutils PASS 1 (cross-binutils), no estilo LFS.
-#   - Ele assume que as variáveis de ambiente LFS e LFS_TGT estão
-#     corretamente configuradas, como no livro LFS:
-#       export LFS=/mnt/lfs
-#       export LFS_TGT=$(uname -m)-lfs-linux-gnu   (exemplo)
-#   - PREFIX é /tools (como no LFS); com DESTDIR o adm empacota
-#     arquivos em /tools/... dentro do tarball.
+# Script de build para GNU Binutils 2.45.1 (pass1) no admV2
+# Focado em uso como binutils "cross/toolchain" inicial.
 
-#----------------------------------------
-# Versão e origem oficial
-#----------------------------------------
 PKG_VERSION="2.45.1"
+
+# Fonte oficial do GNU (formato .tar.xz)
+# Veja lista em ftp.gnu.org/gnu/binutils/ 0
 SRC_URL="https://ftp.gnu.org/gnu/binutils/binutils-${PKG_VERSION}.tar.xz"
-# Opcional:
-# SRC_MD5="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Não uso MD5 aqui (o projeto publica SHA256/GPG); deixar vazio faz o admV2 pular a checagem de md5
+SRC_MD5=""
 
 pkg_build() {
-  set -euo pipefail
+    # Variáveis fornecidas pelo admV2:
+    #   SRC_DIR  -> diretório com o código-fonte já extraído
+    #   DESTDIR  -> raiz falsa onde será feito o "make install"
+    #   NUMJOBS  -> número de jobs paralelos (setado pelo admV2)
+    cd "$SRC_DIR"
 
-  echo "==> [binutils-pass1] Build iniciado"
-  echo "    Versão   : ${PKG_VERSION}"
-  echo "    SRC_DIR  : ${SRC_DIR}"
-  echo "    DESTDIR  : ${DESTDIR}"
-  echo "    PROFILE  : ${PROFILE:-desconhecido}"
-  echo "    NUMJOBS  : ${NUMJOBS:-1}"
+    # ======= Configuração de alvo e sysroot ========
 
-  #------------------------------------
-  # Checar ambiente LFS / LFS_TGT (como no livro LFS)
-  #------------------------------------
-  if [ -z "${LFS:-}" ]; then
-    echo "ERRO: variável de ambiente LFS não está definida."
-    echo "      Exemplo: export LFS=/mnt/lfs"
-    exit 1
-  fi
+    # TARGET_TRIPLET vem normalmente do profile-glibc.sh / profile-musl.sh
+    # (ex.: x86_64-pc-linux-gnu, x86_64-linux-musl, etc.)
+    : "${TARGET_TRIPLET:=}"
 
-  if [ -z "${LFS_TGT:-}" ]; then
-    echo "ERRO: variável de ambiente LFS_TGT não está definida."
-    echo "      Exemplo: export LFS_TGT=\$(uname -m)-lfs-linux-gnu"
-    exit 1
-  fi
+    # Se não tiver TARGET_TRIPLET definido, tenta cair para HOST
+    # e, em último caso, usa o triplet "detetado" pelo config.guess.
+    if [[ -z "$TARGET_TRIPLET" ]]; then
+        if [[ -n "${HOST:-}" ]]; then
+            TARGET_TRIPLET="$HOST"
+        else
+            TARGET_TRIPLET="$(./config.guess 2>/dev/null || echo unknown-unknown-linux-gnu)"
+        fi
+    fi
 
-  echo "==> [binutils-pass1] LFS     = $LFS"
-  echo "==> [binutils-pass1] LFS_TGT = $LFS_TGT"
+    echo ">> Binutils pass1 alvo: $TARGET_TRIPLET"
 
-  cd "$SRC_DIR"
+    # SYSROOT alvo para binutils:
+    # Por padrão usamos o ADM_ROOTFS (root do sistema que você está montando),
+    # mas pode ser sobrescrito com CROSS_SYSROOT se quiser algo diferente.
+    : "${ADM_ROOTFS:=/}"
+    : "${CROSS_SYSROOT:=$ADM_ROOTFS}"
 
-  #------------------------------------
-  # Diretório de build dedicado (recomendação do Binutils/LFS) 
-  #------------------------------------
-  rm -rf build
-  mkdir -p build
-  cd build
+    # Prefixo dos binutils "pass1" dentro do sistema alvo:
+    # NÃO usa /tools nem $LFS – em vez disso, um prefixo neutro /cross-tools.
+    # Você pode trocar isso via CROSS_PREFIX se quiser outro layout.
+    : "${CROSS_PREFIX:=/cross-tools}"
 
-  #------------------------------------
-  # Configure (igual ao LFS - Pass 1) 
-  #
-  # ../configure --prefix=$LFS/tools \
-  #              --with-sysroot=$LFS \
-  #              --target=$LFS_TGT   \
-  #              --disable-nls       \
-  #              --enable-gprofng=no \
-  #              --disable-werror    \
-  #              --enable-new-dtags  \
-  #              --enable-default-hash-style=gnu
-  #
-  # Adaptado para o adm:
-  #   - prefix=/tools (sem $LFS), para que no tarball os paths sejam /tools/...
-  #   - with-sysroot=$LFS, igual ao LFS (precisa do root real, não do DESTDIR)
-  #
-  # Quando o adm instalar o pacote (untar em /), o resultado final
-  # será /tools/bin, /tools/lib, etc., igual ao LFS.
-  #------------------------------------
-  ../configure \
-    --prefix=/tools \
-    --with-sysroot="$LFS" \
-    --target="$LFS_TGT" \
-    --disable-nls \
-    --enable-gprofng=no \
-    --disable-werror \
-    --enable-new-dtags \
-    --enable-default-hash-style=gnu
+    echo ">> Binutils pass1 prefix (no alvo): $CROSS_PREFIX"
+    echo ">> Binutils pass1 sysroot alvo    : $CROSS_SYSROOT"
 
-  echo "==> [binutils-pass1] configure concluído"
+    # ======= Flags e paralelismo ========
 
-  #------------------------------------
-  # Compilação
-  #------------------------------------
-  make -j"${NUMJOBS:-1}"
-  echo "==> [binutils-pass1] make concluído"
+    : "${NUMJOBS:=1}"
 
-  #------------------------------------
-  # Instalação em DESTDIR
-  #
-  # LFS manda: make install (direto em $LFS/tools).
-  # Aqui usamos DESTDIR para empacotar: os arquivos vão para
-  #   $DESTDIR/tools/...
-  # No momento da instalação, o adm vai extrair o pacote em /,
-  # resultando em /tools/... igual ao LFS.
-  #------------------------------------
-  make DESTDIR="$DESTDIR" install
-  echo "==> [binutils-pass1] make install concluído em $DESTDIR"
+    # Flags de compilação padrão, se não vierem de fora:
+    : "${CFLAGS:=-O2 -pipe}"
+    : "${CXXFLAGS:=-O2 -pipe}"
 
-  echo "==> [binutils-pass1] Build do Binutils-${PKG_VERSION} - Pass 1 finalizado com sucesso."
+    # ======= Build em diretório separado ========
+
+    mkdir -v build
+    cd       build
+
+    # Configuração inspirada no LFS Binutils Pass 1 (mas sem $LFS/$LFS_TGT)
+    ../configure \
+        --prefix="${CROSS_PREFIX}" \
+        --with-sysroot="${CROSS_SYSROOT}" \
+        --target="${TARGET_TRIPLET}" \
+        --disable-nls \
+        --enable-gprofng=no \
+        --disable-werror \
+        --enable-new-dtags \
+        --enable-default-hash-style=gnu
+
+    # Compila
+    make -j"${NUMJOBS}"
+
+    # Passo 1 normalmente não roda test-suite
+
+    # Instala dentro do DESTDIR que o admV2 preparou.
+    # O layout final (na hora da instalação do pacote) será:
+    #   ${ADM_ROOTFS}${CROSS_PREFIX}/bin/{as,ld,...}
+    make DESTDIR="$DESTDIR" install
 }
