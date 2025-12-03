@@ -195,9 +195,14 @@ resolve_pkg_by_name() {
   local -a matches=()
   local p
 
+  # Layout esperado:
+  #   packages/<categoria>/<programa>/<programa>.sh
+  # Ou seja, profundidade 3 a partir de $PKG_BASE
   while IFS= read -r p; do
     matches+=("$p")
-  done < <(find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type f -name "${name}.sh" 2>/dev/null || true)
+  done < <(
+    find "$PKG_BASE" -mindepth 3 -maxdepth 3 -type f -name "${name}.sh" 2>/dev/null || true
+  )
 
   local count="${#matches[@]}"
   if (( count == 0 )); then
@@ -205,12 +210,10 @@ resolve_pkg_by_name() {
     exit 1
   elif (( count > 1 )); then
     log_error "Nome de pacote '${name}' é ambíguo. Encontrados:"
-    local m
+    local m cat prog
     for m in "${matches[@]}"; do
       # .../packages/cat/name/name.sh
-      local cat
       cat="$(basename "$(dirname "$m")")"
-      local prog
       prog="$(basename "$m" .sh)"
       printf "  %s/%s\n" "$cat" "$prog"
     done
@@ -218,9 +221,8 @@ resolve_pkg_by_name() {
   fi
 
   local full="${matches[0]}"
-  local cat
+  local cat prog
   cat="$(basename "$(dirname "$full")")"
-  local prog
   prog="$(basename "$full" .sh)"
   set_pkg_vars "$cat" "$prog"
 }
@@ -331,7 +333,23 @@ prepare_source() {
   fi
 
   local build_dir="$BUILD_ROOT/${PKG_CAT}/${PKG_NAME}"
-  rm -rf "$build_dir"
+
+  # --- Proteção extra contra rm -rf perigoso ---
+  if [[ -z "$build_dir" || -z "$BUILD_ROOT" ]]; then
+    log_error "build_dir/BUILD_ROOT vazios; abortando por segurança."
+    exit 1
+  fi
+
+  case "$build_dir" in
+    "$BUILD_ROOT"/*) ;;
+    *)
+      log_error "build_dir '$build_dir' não está dentro de BUILD_ROOT '$BUILD_ROOT'; abortando rm -rf por segurança."
+      exit 1
+      ;;
+  esac
+  # ------------------------------------------------
+
+  rm -rf -- "$build_dir"
   mkdir -p "$build_dir"
 
   log_info "Extraindo source em $build_dir..."
@@ -355,7 +373,6 @@ prepare_source() {
   log_info "SRC_DIR=$SRC_DIR"
   log_info "DESTDIR=$DESTDIR"
 }
-
 #--------------------------------------
 # Empacotar resultado
 #--------------------------------------
@@ -654,7 +671,10 @@ uninstall_pkg_recursive() {
   run_hook_if_exists "$PKG_META_DIR/${PKG_NAME}.post_uninstall" "post_uninstall"
 
   rm -f "$meta_file"
-  register_event "uninstall" "OK" "${VERSION:-unknown}"
+
+  # Usa VERSION do .meta se existir; senão cai para PKG_VERSION; se nada, "unknown"
+  local event_version="${VERSION:-${PKG_VERSION:-unknown}}"
+  register_event "uninstall" "OK" "$event_version"
 
   UNINSTALLED_IN_SESSION["$PKG_ID"]=1
   log_ok "Remoção de $PKG_ID concluída."
@@ -692,13 +712,13 @@ git_sync() {
 #--------------------------------------
 list_packages() {
   echo "Pacotes disponíveis em $PKG_BASE:"
-  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type f -name '*.sh' \
-    | sed "s#^$PKG_BASE/##;s#\.sh\$##" \
-    | sed 's#/[^/]*$##' | sort -u \
-    | while read -r line; do
+  # Diretórios de pacote: packages/<categoria>/<programa>/
+  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type d 2>/dev/null \
+    | sort \
+    | while read -r d; do
         local cat prog
-        cat="${line%%/*}"
-        prog="${line##*/}"
+        cat="$(basename "$(dirname "$d")")"
+        prog="$(basename "$d")"
         set_pkg_vars "$cat" "$prog"
         printf "%-20s (%s) %s\n" "$prog" "$cat" "$(installed_mark)"
       done
@@ -767,7 +787,8 @@ list_installed() {
 search_packages() {
   local pattern="$1"
   echo "Busca por: $pattern"
-  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type d \
+  find "$PKG_BASE" -mindepth 2 -maxdepth 2 -type d 2>/dev/null \
+    | sort \
     | while read -r d; do
         local cat prog
         cat="$(basename "$(dirname "$d")")"
