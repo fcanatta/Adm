@@ -45,4 +45,17 @@ Quem escolhe se é glibc ou musl é o toolchain (via CC, TARGET_TRIPLET e PROFIL
 
 O mesmo binutils-2.45.1-pass1.sh serve para os dois perfis.
 
+# Construir gcc-pass1 
+# Para sistema glibc:
+source ./profile-glibc.sh
+ADM_ROOTFS=/opt/systems/glibc-root \
+  ./admV2.sh build   gcc-15.2.0-pass1
+ADM_ROOTFS=/opt/systems/glibc-root \
+  ./admV2.sh install gcc-15.2.0-pass1
 
+# Para sistema musl:
+source ./profile-musl.sh
+ADM_ROOTFS=/opt/systems/musl-root \
+  ./admV2.sh build   gcc-15.2.0-pass1
+ADM_ROOTFS=/opt/systems/musl-root \
+  ./admV2.sh install gcc-15.2.0-pass1
