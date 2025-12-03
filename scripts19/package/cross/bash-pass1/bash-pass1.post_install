@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Hook pós-instalação do Bash-5.3 Pass 1 para o adm
+#
+# Caminho esperado:
+#   /mnt/adm/packages/cross/bash-pass1/bash-pass1.post_install
+#
+# Rodado DEPOIS que o pacote bash-pass1 já foi instalado pelo adm:
+#   - /mnt/lfs/usr/bin/bash     (dentro do sysroot $LFS)
+#   - /mnt/lfs/bin/sh -> bash   (link simbólico)
+#
+# Objetivo:
+#   - Verificar se $LFS/usr/bin/bash existe e é executável
+#   - Verificar se $LFS/bin/sh é um symlink apontando para "bash"
+#   - (Opcional) Se possível, rodar "bash --version" dentro de um chroot $LFS
+
+set -euo pipefail
+
+echo "==> [bash-pass1.post_install] Sanity-check do Bash Pass 1"
+
+#-------------------------------------------------
+# 1) Verificar LFS
+#-------------------------------------------------
+if [ -z "${LFS:-}" ]; then
+  echo "ERRO: variável de ambiente LFS não está definida."
+  echo "      Exemplo: export LFS=/mnt/lfs"
+  exit 1
+fi
+
+echo "==> [bash-pass1.post_install] LFS = $LFS"
+
+#-------------------------------------------------
+# 2) Verificar $LFS/usr/bin/bash
+#-------------------------------------------------
+BASH_BIN="$LFS/usr/bin/bash"
+
+echo "==> [bash-pass1.post_install] Verificando $BASH_BIN"
+
+if [ ! -x "$BASH_BIN" ]; then
+  if [ -e "$BASH_BIN" ]; then
+    echo "ERRO: $BASH_BIN existe mas não é executável."
+  else
+    echo "ERRO: $BASH_BIN não existe."
+  fi
+  exit 1
+fi
+
+echo "==> [bash-pass1.post_install] OK: $BASH_BIN encontrado e executável."
+
+# Opcional: mostrar um pouco de info sobre o binário
+if command -v file >/dev/null 2>&1; then
+  echo "==> [bash-pass1.post_install] Tipo do binário (file):"
+  file "$BASH_BIN" || true
+fi
+
+#-------------------------------------------------
+# 3) Verificar /bin/sh dentro do sysroot ($LFS/bin/sh)
+#-------------------------------------------------
+SH_LINK="$LFS/bin/sh"
+
+echo "==> [bash-pass1.post_install] Verificando link $SH_LINK"
+
+if [ ! -e "$SH_LINK" ]; then
+  echo "ERRO: $SH_LINK não existe. O build do bash-pass1 deveria ter criado o link."
+  exit 1
+fi
+
+if [ ! -L "$SH_LINK" ]; then
+  echo "ERRO: $SH_LINK existe mas não é um symlink."
+  exit 1
+fi
+
+SH_TARGET="$(readlink "$SH_LINK")"
+echo "==> [bash-pass1.post_install] $SH_LINK -> $SH_TARGET"
+
+case "$SH_TARGET" in
+  bash|*/bash)
+    echo "==> [bash-pass1.post_install] OK: /bin/sh aponta para bash."
+    ;;
+  *)
+    echo "ERRO: /bin/sh aponta para '$SH_TARGET', não para 'bash'."
+    exit 1
+    ;;
+esac
+
+#-------------------------------------------------
+# 4) Sanity-check opcional: rodar bash --version dentro do chroot
+#
+# Só se:
+#   - comando 'chroot' existir
+#   - UID atual for 0 (root)
+#
+# Se não der, apenas avisamos; não é erro.
+#-------------------------------------------------
+if command -v chroot >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+  echo "==> [bash-pass1.post_install] Tentando rodar 'bash --version' dentro de chroot $LFS"
+
+  # Usamos env -i pra evitar poluir o ambiente do chroot
+  if chroot "$LFS" /usr/bin/bash --version >/dev/null 2>&1; then
+    echo "==> [bash-pass1.post_install] 'bash --version' no chroot executou com sucesso."
+  else
+    echo "AVISO: falha ao rodar 'bash --version' dentro de chroot $LFS."
+    echo "       Isso pode indicar problema com bibliotecas ou toolchain."
+    # Não damos exit 1 aqui pra não travar a instalação se você não quer usar chroot agora.
+  fi
+else
+  echo "AVISO: chroot não disponível ou usuário não é root; pulando teste 'bash --version' no chroot."
+fi
+
+echo
+echo "==> [bash-pass1.post_install] Sanity-check do bash-pass1 concluído com sucesso."
+echo "    Verifique manualmente, se quiser:"
+echo "      $LFS/usr/bin/bash --version  (via chroot)"
+echo "      ls -l $LFS/bin/sh"
