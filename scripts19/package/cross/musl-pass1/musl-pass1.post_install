@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Hook pós-instalação do musl-1.2.5 Pass 1 para o adm
+#
+# Caminho esperado:
+#   /mnt/adm/packages/cross/musl-pass1/musl-pass1.post_install
+#
+# Rodado DEPOIS que o pacote musl-pass1 já foi instalado pelo adm,
+# isto é, depois que os arquivos existem em $LFS/usr/... e $LFS/lib.
+#
+# Objetivo:
+#   - Verificar loader ld-musl-*.so.1 no sysroot $LFS
+#   - Verificar alguns headers básicos em $LFS/usr/include
+#   - (opcional) Se existir um cross-compiler $LFS_TGT-gcc,
+#                compilar um hello world para sanity-check.
+
+set -euo pipefail
+
+echo "==> [musl-pass1.post_install] Sanity-check do musl Pass 1"
+
+#-------------------------------------------------
+# 1) Verificar LFS
+#-------------------------------------------------
+if [ -z "${LFS:-}" ]; then
+  echo "ERRO: variável de ambiente LFS não está definida."
+  echo "      Exemplo: export LFS=/mnt/lfs-musl"
+  exit 1
+fi
+
+echo "==> [musl-pass1.post_install] LFS = $LFS"
+
+#-------------------------------------------------
+# 2) Verificar loader ld-musl-*.so.1 em $LFS
+#-------------------------------------------------
+echo "==> [musl-pass1.post_install] Procurando loader ld-musl-*.so.1 sob $LFS"
+
+LOADER="$(
+  find "$LFS/lib" "$LFS/usr/lib" -maxdepth 3 -name 'ld-musl-*.so.1' 2>/dev/null \
+    | head -n1 || true
+)"
+
+if [ -z "$LOADER" ]; then
+  echo "ERRO: loader ld-musl-*.so.1 não encontrado em $LFS/lib nem em $LFS/usr/lib."
+  echo "      Verifique se a instalação do musl-pass1 foi concluída corretamente."
+  exit 1
+fi
+
+echo "==> [musl-pass1.post_install] Loader encontrado: $LOADER"
+
+#-------------------------------------------------
+# 3) Verificar headers básicos em $LFS/usr/include
+#-------------------------------------------------
+INC_DIR="$LFS/usr/include"
+
+echo "==> [musl-pass1.post_install] Verificando headers em $INC_DIR"
+
+if [ ! -d "$INC_DIR" ]; then
+  echo "ERRO: diretório $INC_DIR não existe. Headers do musl não foram instalados."
+  exit 1
+fi
+
+MISSING_HEADERS=0
+for h in stdio.h stdlib.h errno.h unistd.h; do
+  if [ ! -f "$INC_DIR/$h" ]; then
+    echo "ERRO: header $INC_DIR/$h não encontrado."
+    MISSING_HEADERS=1
+  fi
+done
+
+if [ "$MISSING_HEADERS" -ne 0 ]; then
+  echo "ERRO: um ou mais headers básicos do musl estão faltando em $INC_DIR."
+  exit 1
+fi
+
+echo "==> [musl-pass1.post_install] Headers básicos encontrados com sucesso."
+
+#-------------------------------------------------
+# 4) Sanity-check opcional com cross-compiler $LFS_TGT-gcc
+#
+# Se NÃO houver $LFS_TGT ou o compilador, só avisamos e não falhamos.
+# Se HOUVER e a compilação do teste falhar, o hook falha.
+#-------------------------------------------------
+if [ -z "${LFS_TGT:-}" ]; then
+  echo "AVISO: LFS_TGT não está definido; pulando teste de compilação com cross-compiler."
+else
+  echo "==> [musl-pass1.post_install] LFS_TGT = $LFS_TGT"
+  CC_BIN=""
+
+  # tenta achar $LFS_TGT-gcc
+  if command -v "$LFS_TGT-gcc" >/dev/null 2>&1; then
+    CC_BIN="$(command -v "$LFS_TGT-gcc")"
+  elif [ -x "$LFS/tools/bin/$LFS_TGT-gcc" ]; then
+    CC_BIN="$LFS/tools/bin/$LFS_TGT-gcc"
+  elif [ -x "$LFS/tools-musl/bin/$LFS_TGT-gcc" ]; then
+    CC_BIN="$LFS/tools-musl/bin/$LFS_TGT-gcc"
+  fi
+
+  if [ -z "$CC_BIN" ]; then
+    echo "AVISO: não encontrei $LFS_TGT-gcc no PATH, nem em $LFS/tools/bin, nem em $LFS/tools-musl/bin."
+    echo "       Pulando teste de compilação com cross-compiler."
+  else
+    echo "==> [musl-pass1.post_install] Usando cross-compiler: $CC_BIN"
+
+    TESTDIR="$LFS/tmp/adm-musl-pass1-test"
+    rm -rf "$TESTDIR"
+    mkdir -p "$TESTDIR"
+    chmod 1777 "$TESTDIR" || true
+
+    DUMMY_C="$TESTDIR/dummy.c"
+    DUMMY_BIN="$TESTDIR/dummy"
+    DUMMY_LOG="$TESTDIR/dummy.log"
+
+    cat > "$DUMMY_C" << 'EOF'
+#include <stdio.h>
+int main(void) {
+    puts("hello from musl-pass1");
+    return 0;
+}
+EOF
+
+    echo "==> [musl-pass1.post_install] Compilando dummy.c com $LFS_TGT-gcc (log em dummy.log)"
+
+    # Tentamos compilar usando o sysroot $LFS, estático (para preferir libc do sysroot).
+    # Se falhar, consideramos erro, porque indica que o toolchain ainda não está coerente.
+    if ! "$CC_BIN" --sysroot="$LFS" -static "$DUMMY_C" -o "$DUMMY_BIN" >"$DUMMY_LOG" 2>&1; then
+      echo "ERRO: falha ao compilar dummy.c com $LFS_TGT-gcc apontando para sysroot $LFS."
+      echo "      Veja o log em: $DUMMY_LOG"
+      exit 1
+    fi
+
+    echo "==> [musl-pass1.post_install] Compilação OK. Binário: $DUMMY_BIN"
+    echo "==> [musl-pass1.post_install] Log de compilação: $DUMMY_LOG"
+
+    if command -v readelf >/dev/null 2>&1; then
+      echo "==> [musl-pass1.post_install] Inspecionando ELF com readelf -l (pode não ter interpreter se for estático):"
+      readelf -l "$DUMMY_BIN" 2>/dev/null || true
+    else
+      echo "AVISO: readelf não encontrado; pulando inspeção de ELF."
+    fi
+  fi
+fi
+
+echo
+echo "==> [musl-pass1.post_install] Sanity-check do musl-pass1 concluído com sucesso."
+echo "    Se quiser, examine o log de compilação (se gerado) em:"
+echo "      $LFS/tmp/adm-musl-pass1-test/dummy.log"
