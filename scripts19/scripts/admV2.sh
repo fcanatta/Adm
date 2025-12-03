@@ -89,9 +89,8 @@ log_error() { _log ERROR "$C_ERR"  "$*"; }
 log_ok()    { _log OK    "$C_OK"   "$*"; }
 
 # --- [INÍCIO] Integração com módulo adm-fixperms --------------------
-
 adm_load_fixperms() {
-  # Carrega o módulo só uma vez
+  # Carrega o módulo só uma vez por execução
   if [[ -n "${ADM_FIXPERMS_LOADED:-}" ]]; then
     return 0
   fi
@@ -101,8 +100,15 @@ adm_load_fixperms() {
   if [[ -f "$mod" ]]; then
     # shellcheck source=/mnt/adm/scripts/adm-fixperms.sh
     . "$mod"
-    ADM_FIXPERMS_LOADED=1
-    log_info "Módulo adm-fixperms carregado: $mod"
+
+    # Só marca como carregado se a função esperada existir
+    if declare -F adm_fixperms &>/dev/null; then
+      ADM_FIXPERMS_LOADED=1
+      log_info "Módulo adm-fixperms carregado: $mod"
+    else
+      ADM_FIXPERMS_LOADED=0
+      log_warn "Módulo $mod foi carregado mas a função adm_fixperms não foi encontrada."
+    fi
   else
     ADM_FIXPERMS_LOADED=0
     log_warn "Módulo de permissões não encontrado: $mod (defina ADM_DISABLE_FIXPERMS=1 se não quiser ver este aviso)"
@@ -118,9 +124,11 @@ adm_fixperms_wrapper() {
     return 0
   fi
 
+  # Validação básica de DESTDIR
   if [[ -z "$destdir" || ! -d "$destdir" ]]; then
     log_warn "DESTDIR inválido para fixperms: '$destdir'"
-    return 1
+    # Não derruba o build, apenas sinaliza problema
+    return 0
   fi
 
   adm_load_fixperms
@@ -130,11 +138,17 @@ adm_fixperms_wrapper() {
   fi
 
   log_info "Normalizando permissões em DESTDIR com adm-fixperms..."
-  # Permite controlar verbosidade pelo ambiente
-  ADM_FIXPERMS_VERBOSE="${ADM_FIXPERMS_VERBOSE:-0}" adm_fixperms "$destdir"
+
+  # Trata erro explicitamente para NÃO derrubar o build em caso de falha
+  if ! ADM_FIXPERMS_VERBOSE="${ADM_FIXPERMS_VERBOSE:-0}" adm_fixperms "$destdir"; then
+    log_warn "adm-fixperms falhou em '$destdir'; continuando mesmo assim."
+    return 0
+  fi
+
+  return 0
 }
 
-# --- [FIM] Integração com módulo adm-fixperms -----------------------
+# --- [FIM] Integração com módulo adm-fixperms --------------------
 
 is_dry_run() {
   [[ "${ADM_DRYRUN:-0}" = "1" ]]
