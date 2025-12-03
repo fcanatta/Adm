@@ -10,25 +10,86 @@
 #   PROFILE  : glibc / musl / outro (string)
 #   NUMJOBS  : número de jobs para o make
 #
-# Este script deve definir:
+# Este script define:
 #   PKG_VERSION
 #   SRC_URL
 #   (opcional) SRC_MD5
 #   função pkg_build()
 #
 # OBS:
-#   - Glibc 2.42 pede GCC >= 12.1 e Binutils >= 2.39 para compilar. 5
+#   - Glibc 2.42 pede GCC >= 12.1 e Binutils >= 2.39.
 #   - Pressupõe headers de kernel já instalados em /usr/include.
 
-#----------------------------------------
-# Versão e origem oficial
-#----------------------------------------
 PKG_VERSION="2.42"
 SRC_URL="https://ftp.osuosl.org/pub/lfs/lfs-packages/12.4/glibc-${PKG_VERSION}.tar.xz"
-# ou, se preferir, use o ftp.gnu.org:
+# Alternativa oficial:
 # SRC_URL="https://ftp.gnu.org/gnu/glibc/glibc-${PKG_VERSION}.tar.xz"
 # SRC_MD5 opcional:
 # SRC_MD5="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+#--------------------------------------------------------
+# Geração de locales (chamado depois do "make install")
+#--------------------------------------------------------
+generate_glibc_locales() {
+  # Usa localedef do sistema host
+  local localedef_bin="${LOCALEDEF:-localedef}"
+  local adm_root="${ADM_ROOT:-/mnt/adm}"
+  local locale_gen_file="${adm_root}/etc/locale.gen"
+
+  if ! command -v "$localedef_bin" >/dev/null 2>&1; then
+    echo "==> [glibc] AVISO: localedef não encontrado; pulando geração de locales."
+    return 0
+  fi
+
+  echo "==> [glibc] Gerando locales dentro do DESTDIR usando: $localedef_bin"
+
+  # Lê lista de locales de um arquivo estilo LFS:
+  #   <locale> <charmap>
+  # Ex:
+  #   en_US.UTF-8 UTF-8
+  #   pt_BR.UTF-8 UTF-8
+  local entries=()
+
+  if [[ -f "$locale_gen_file" ]]; then
+    echo "==> [glibc] Usando lista de locales de: $locale_gen_file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="$(echo "$line" | xargs || true)"
+      [[ -z "$line" ]] && continue
+      entries+=("$line")
+    done < "$locale_gen_file"
+  else
+    echo "==> [glibc] $locale_gen_file não encontrado; usando conjunto padrão mínimo."
+    entries+=("en_US.UTF-8 UTF-8")
+    entries+=("pt_BR.UTF-8 UTF-8")
+  fi
+
+  if ((${#entries[@]} == 0)); then
+    echo "==> [glibc] Nenhum locale definido; pulando geração."
+    return 0
+  fi
+
+  # Gera cada locale em DESTDIR
+  #   localedef --prefix="$DESTDIR" -i <input> -f <charmap> <locale>
+  #   onde <input> é o nome sem ".charset", ex: pt_BR para pt_BR.UTF-8
+  for entry in "${entries[@]}"; do
+    local locale_name charset in_name
+    locale_name="${entry%% *}"
+    charset="${entry##* }"
+    # parte antes do primeiro ponto: pt_BR.UTF-8 -> pt_BR
+    in_name="${locale_name%%.*}"
+
+    echo "   - Gerando locale: $locale_name (charmap: $charset, input: $in_name)"
+    if ! "$localedef_bin" --prefix="$DESTDIR" \
+           -i "$in_name" -f "$charset" "$locale_name" 2>/dev/null; then
+      echo "      AVISO: falha ao gerar locale $locale_name ($charset)."
+      echo "             Verifique se os arquivos de locale existem em /usr/share/i18n/locales."
+      # não dou exit 1 aqui pra não matar o build todo por um locale opcional
+    fi
+  done
+
+  echo "==> [glibc] Geração de locales concluída."
+}
 
 pkg_build() {
   set -euo pipefail
@@ -44,7 +105,6 @@ pkg_build() {
 
   #------------------------------------
   # Detecção de arquitetura e flags
-  # (glibc não precisa de nada muito maluco aqui)
   #------------------------------------
   local ARCH CFLAGS_GLIBC
   ARCH="$(uname -m)"
@@ -66,25 +126,22 @@ pkg_build() {
   echo "==> [glibc] CFLAGS : $CFLAGS_GLIBC"
 
   #------------------------------------
-  # PROFILE (apenas informativo aqui)
+  # PROFILE (informativo)
   #------------------------------------
   case "${PROFILE:-}" in
     glibc|"")
       echo "==> [glibc] PROFILE = glibc (esperado para esta libc)"
       ;;
     musl)
-      echo "==> [glibc] PROFILE = musl, mas estamos construindo glibc."
-      echo "                (provavelmente para um rootfs/chroot separado)."
+      echo "==> [glibc] PROFILE = musl, mas estamos construindo glibc (provável rootfs/chroot)."
       ;;
     *)
-      echo "==> [glibc] PROFILE desconhecido (${PROFILE}), só informativo."
+      echo "==> [glibc] PROFILE desconhecido (${PROFILE}), apenas informativo."
       ;;
   esac
 
   #------------------------------------
-  # Aplicar patches recomendados pelo LFS
-  #   - upstream_fixes-1: bugfixes da branch estável
-  #   - fhs-1: ajustar programas que usariam /var/db para caminhos FHS
+  # Patches recomendados LFS 12.4
   #------------------------------------
   local PATCH_BASE="https://www.linuxfromscratch.org/patches/lfs/development"
 
@@ -107,14 +164,14 @@ pkg_build() {
     fi
   }
 
-  # Patches do LFS 12.4 para glibc-2.42 6
+  # upstream_fixes + fhs (LFS 12.4)
   apply_patch_stream "${PATCH_BASE}/glibc-2.42-upstream_fixes-1.patch"
   apply_patch_stream "${PATCH_BASE}/glibc-2.42-fhs-1.patch"
 
   echo "==> [glibc] Patches upstream_fixes-1 e fhs-1 aplicados."
 
   #------------------------------------
-  # Fix no stdlib/abort.c (Valgrind / BLFS) – igual ao LFS
+  # Ajuste em stdlib/abort.c (Valgrind fix)
   #------------------------------------
   echo "==> [glibc] Aplicando ajuste em stdlib/abort.c (Valgrind fix)"
   sed -e '/unistd.h/i #include <string.h>' \
@@ -131,16 +188,14 @@ pkg_build() {
   mkdir -p build
   cd build
 
-  # Garante que ldconfig/sln vão para /usr/sbin dentro do DESTDIR 7
+  # Garantir ldconfig/sln em /usr/sbin (dentro do DESTDIR)
   echo "rootsbindir=/usr/sbin" > configparms
 
   #------------------------------------
-  # Configure – baseado no LFS 12.4 (cap. 8.5) 8
+  # Configure (baseado no LFS 12.4)
   #------------------------------------
   echo "==> [glibc] Rodando configure"
 
-  # Opcionalmente você pode ajustar enable-kernel conforme o mínimo
-  # que seu sistema precisa suportar (aqui usando 5.4 como no LFS).
   CFLAGS="$CFLAGS_GLIBC" \
   ../configure \
     --prefix=/usr                   \
@@ -160,11 +215,9 @@ pkg_build() {
   echo "==> [glibc] make concluído"
 
   #------------------------------------
-  # Testes (opcional – MUITO pesados)
-  #   Em LFS eles rodam 'make check' com várias variáveis de ambiente.
-  #   Aqui deixo comentado pra não doer na primeira rodada.
+  # Testes (opcionais – pesados)
   #------------------------------------
-  # echo "==> [glibc] Rodando test suite (make check)..."
+  # echo "==> [glibc] Testes (make check)..."
   # make check || true
 
   #------------------------------------
@@ -173,13 +226,11 @@ pkg_build() {
   echo "==> [glibc] Instalando em DESTDIR=${DESTDIR}"
   make DESTDIR="$DESTDIR" install
 
-  # OBS: Glibc normalmente instala:
-  #   - libc.so.* em /usr/lib (por causa do libc_cv_slibdir)
-  #   - loader ld-linux-*.so.* em /usr/lib ou /lib conforme config
-  #   - ldconfig, sln em /usr/sbin (por causa do configparms)
+  #------------------------------------
+  # Geração de locales dentro do DESTDIR
+  #------------------------------------
+  generate_glibc_locales
 
-  # Não fazemos strip em glibc aqui – deixar as libs intactas é mais
-  # seguro para debug e para evitar quebrar recursos mais avançados.
-
+  # Não faço strip agressivo em glibc (melhor para debug).
   echo "==> [glibc] Build do glibc-${PKG_VERSION} finalizado com sucesso."
 }
