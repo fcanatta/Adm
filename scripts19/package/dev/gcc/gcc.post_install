@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Hook pós-instalação do GCC para rodar testes rápidos e sanity-check
+# Caminho: /mnt/adm/packages/dev/gcc/gcc.post_install
+
+set -euo pipefail
+
+echo "==> [gcc.post_install] Sanity-check do GCC instalado"
+
+# 1) Verificar se gcc e g++ estão no PATH
+if ! command -v gcc >/dev/null 2>&1; then
+  echo "ERRO: gcc não encontrado no PATH após instalação."
+  exit 1
+fi
+
+if ! command -v g++ >/dev/null 2>&1; then
+  echo "ERRO: g++ não encontrado no PATH após instalação."
+  exit 1
+fi
+
+echo "gcc encontrado em:  $(command -v gcc)"
+echo "g++ encontrado em:  $(command -v g++)"
+
+echo "Versão do gcc:"
+gcc --version | head -n 1 || true
+
+# 2) Diretório temporário para testes
+TMPDIR="$(mktemp -d /tmp/adm-gcc-test.XXXXXX)"
+cleanup() {
+  rm -rf "$TMPDIR"
+}
+trap cleanup EXIT
+
+cd "$TMPDIR"
+
+# 3) Teste simples em C
+cat > test.c << 'EOF'
+#include <stdio.h>
+
+int main(void) {
+    printf("hello from gcc C\n");
+    return 0;
+}
+EOF
+
+echo "==> [gcc.post_install] Compilando teste em C..."
+gcc -Wall -Wextra test.c -o test_c
+
+echo "==> [gcc.post_install] Executando teste em C..."
+out_c="$(./test_c)"
+echo "Saída C: $out_c"
+if [ "$out_c" != "hello from gcc C" ]; then
+  echo "ERRO: saída inesperada do teste em C."
+  exit 1
+fi
+
+# 4) Teste simples em C++
+cat > test.cpp << 'EOF'
+#include <iostream>
+
+int main() {
+    std::cout << "hello from gcc C++" << std::endl;
+    return 0;
+}
+EOF
+
+echo "==> [gcc.post_install] Compilando teste em C++..."
+g++ -Wall -Wextra test.cpp -o test_cpp
+
+echo "==> [gcc.post_install] Executando teste em C++..."
+out_cpp="$(./test_cpp)"
+echo "Saída C++: $out_cpp"
+if [ "$out_cpp" != "hello from gcc C++" ]; then
+  echo "ERRO: saída inesperada do teste em C++."
+  exit 1
+fi
+
+echo "==> [gcc.post_install] Sanity-check do GCC OK."
