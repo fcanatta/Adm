@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# Cria e prepara um chroot LFS em /mnt/lfs (capítulo 7 completo o suficiente
-# pra continuar a construir os pacotes temporários).
+# Gerenciador completo do chroot LFS para uso com o adm
 #
-# Faz:
-#   - ajusta ownership ($LFS) para root:root (7.2 Changing Ownership)
-#   - monta /dev, /proc, /sys, /run, devpts, shm em $LFS (7.3 Kernfs)
-#   - copia /etc/resolv.conf para $LFS/etc/resolv.conf
-#   - copia o binário/script "adm" para dentro do chroot
-#   - entra no chroot automaticamente para:
-#       * criar diretórios (7.5 Creating Directories)
-#       * criar /etc/passwd, /etc/group, /etc/hosts, /etc/mtab, logs (7.6)
+# Funcionalidades:
+#   - setup   : prepara o chroot em $LFS (ownership, mounts, resolv.conf,
+#               /mnt/adm bind, criação de dirs e arquivos básicos)
+#   - enter   : garante setup, entra no chroot e, ao sair, faz cleanup
+#   - cleanup : desmonta com segurança tudo que foi montado em $LFS
+#   - status  : mostra estado atual dos mounts relacionados ao $LFS
 #
-# Depois disso você só precisa rodar:
-#   chroot "$LFS" /usr/bin/env -i HOME=/root TERM="$TERM" \
-#       PS1='(lfs chroot) \u:\w\$ ' PATH=/usr/bin:/usr/sbin:/bin:/sbin \
-#       /bin/bash --login
+# Padrão (sem argumentos): "enter".
+#
+# Variáveis:
+#   LFS      : raiz do sistema LFS (padrão /mnt/lfs)
+#   ADM_ROOT : onde estão os scripts do adm no host (padrão /mnt/adm)
+#   ADM_BIN  : caminho do binário do adm (por padrão autodetectado via PATH)
+#
+# Requisitos:
+#   - rodar como root
+#   - capítulos anteriores do LFS já feitos (toolchain em $LFS/tools, etc.)
 
 set -euo pipefail
 
-LFS_DEFAULT="/mnt/lfs"
-LFS="${LFS:-$LFS_DEFAULT}"
+LFS="${LFS:-/mnt/lfs}"
+ADM_ROOT="${ADM_ROOT:-/mnt/adm}"
+ADM_BIN="${ADM_BIN:-$(command -v adm 2>/dev/null || true)}"
 
 # ---------- helpers ----------
 
@@ -34,9 +38,9 @@ need_root() {
   fi
 }
 
-check_lfs() {
+check_lfs_dir() {
   if [ ! -d "$LFS" ]; then
-    die "Diretório LFS ($LFS) não existe. Ex.: crie /mnt/lfs e monte a partição lá."
+    die "Diretório LFS ($LFS) não existe. Crie e monte a partição do LFS em $LFS."
   fi
 }
 
@@ -45,136 +49,135 @@ run() {
   "$@"
 }
 
-# ---------- 1. checagens ----------
+is_mounted() {
+  mountpoint -q "$1"
+}
 
-need_root
-check_lfs
+# ---------- STATUS ----------
 
-echo "==> Usando LFS=$LFS"
+show_status() {
+  echo "==> Status de mounts relacionados a $LFS:"
+  grep " $LFS" /proc/mounts || echo "(nenhum mount relativo a $LFS encontrado)"
+}
 
-# ---------- 2. Changing Ownership (cap. 7.2) ----------
+# ---------- SETUP (host) ----------
 
-echo "==> Ajustando ownership para root:root em diretórios chave do LFS"
+setup_ownership() {
+  echo "==> Ajustando ownership de diretórios em $LFS para root:root (cap. 7.2)"
 
-for d in usr lib var etc bin sbin tools; do
-  if [ -e "$LFS/$d" ]; then
-    run chown -R root:root "$LFS/$d"
+  for d in usr lib var etc bin sbin tools; do
+    if [ -e "$LFS/$d" ]; then
+      run chown -R root:root "$LFS/$d"
+    fi
+  done
+  if [ -e "$LFS/lib64" ]; then
+    run chown -R root:root "$LFS/lib64"
   fi
-done
+}
 
-if [ -e "$LFS/lib64" ]; then
-  run chown -R root:root "$LFS/lib64"
-fi
+setup_kernfs() {
+  echo "==> Montando sistemas de arquivos kernel em $LFS (cap. 7.3)"
 
-# ---------- 3. Preparar virtual kernel filesystems (cap. 7.3) ----------
+  run mkdir -pv "$LFS"/{dev,proc,sys,run}
 
-echo "==> Criando diretórios para /dev, /proc, /sys, /run dentro do LFS"
+  # /dev
+  if ! is_mounted "$LFS/dev"; then
+    run mount -v --bind /dev "$LFS/dev"
+  else
+    echo "   $LFS/dev já montado (bind)."
+  fi
 
-run mkdir -pv "$LFS"/{dev,proc,sys,run}
+  # devpts
+  if ! is_mounted "$LFS/dev/pts"; then
+    run mkdir -pv "$LFS/dev/pts"
+    run mount -vt devpts devpts "$LFS/dev/pts" -o gid=5,mode=620
+  else
+    echo "   $LFS/dev/pts já montado."
+  fi
 
-# /dev bind mount
-if mountpoint -q "$LFS/dev"; then
-  echo "==> $LFS/dev já está montado, pulando bind /dev"
-else
-  run mount -v --bind /dev "$LFS/dev"
-fi
+  # proc
+  if ! is_mounted "$LFS/proc"; then
+    run mount -vt proc proc "$LFS/proc"
+  else
+    echo "   $LFS/proc já montado."
+  fi
 
-# devpts, proc, sysfs, tmpfs /run
-if mountpoint -q "$LFS/dev/pts"; then
-  echo "==> $LFS/dev/pts já está montado"
-else
-  run mkdir -pv "$LFS/dev/pts"
-  run mount -vt devpts devpts "$LFS/dev/pts" -o gid=5,mode=620
-fi
+  # sysfs
+  if ! is_mounted "$LFS/sys"; then
+    run mount -vt sysfs sysfs "$LFS/sys"
+  else
+    echo "   $LFS/sys já montado."
+  fi
 
-if mountpoint -q "$LFS/proc"; then
-  echo "==> $LFS/proc já está montado"
-else
-  run mount -vt proc proc "$LFS/proc"
-fi
+  # run (tmpfs)
+  if ! is_mounted "$LFS/run"; then
+    run mount -vt tmpfs tmpfs "$LFS/run"
+  else
+    echo "   $LFS/run já montado."
+  fi
 
-if mountpoint -q "$LFS/sys"; then
-  echo "==> $LFS/sys já está montado"
-else
-  run mount -vt sysfs sysfs "$LFS/sys"
-fi
+  # /dev/shm
+  if [ -h "$LFS/dev/shm" ]; then
+    run mkdir -pv "$LFS/$(readlink "$LFS/dev/shm")"
+  else
+    run mkdir -pv "$LFS/dev/shm"
+  fi
+}
 
-if mountpoint -q "$LFS/run"; then
-  echo "==> $LFS/run já está montado"
-else
-  run mount -vt tmpfs tmpfs "$LFS/run"
-fi
+setup_resolv() {
+  echo "==> Copiando /etc/resolv.conf para o chroot"
+  run mkdir -pv "$LFS/etc"
 
-# /dev/shm inside chroot
-if [ -h "$LFS/dev/shm" ]; then
-  run mkdir -pv "$LFS/$(readlink "$LFS/dev/shm")"
-else
-  run mkdir -pv "$LFS/dev/shm"
-fi
+  if [ -f /etc/resolv.conf ]; then
+    run cp -vL /etc/resolv.conf "$LFS/etc/resolv.conf"
+  else
+    echo "AVISO: /etc/resolv.conf não existe no host; DNS pode falhar dentro do chroot."
+  fi
+}
 
-echo "==> Montando /mnt/adm dentro do chroot (para os scripts do adm)"
+setup_adm_mount_and_bin() {
+  echo "==> Preparando adm dentro do chroot"
 
-if [ -d /mnt/adm ]; then
-    mkdir -pv "$LFS/adm"
-    mount --bind /mnt/adm "$LFS/adm"
-else
-    echo "AVISO: /mnt/adm não existe no host. Crie /mnt/adm com seus scripts."
-fi
+  # Bind-mount dos scripts do adm: /mnt/adm (host) -> $LFS/mnt/adm
+  if [ -d "$ADM_ROOT" ]; then
+    run mkdir -pv "$LFS/mnt"
+    run mkdir -pv "$LFS/mnt/adm"
+    if ! is_mounted "$LFS/mnt/adm"; then
+      run mount --bind "$ADM_ROOT" "$LFS/mnt/adm"
+    else
+      echo "   $LFS/mnt/adm já está montado (bind)."
+    fi
+  else
+    echo "AVISO: Diretório ADM_ROOT=$ADM_ROOT não existe; scripts de build não estarão no chroot."
+  fi
 
-# ---------- 4. Copiar /etc/resolv.conf ----------
+  # Copiar binário do adm
+  if [ -n "$ADM_BIN" ] && [ -x "$ADM_BIN" ]; then
+    run mkdir -pv "$LFS/usr/local/bin"
+    run cp -v "$ADM_BIN" "$LFS/usr/local/bin/adm"
+    run chmod 0755 "$LFS/usr/local/bin/adm"
+  else
+    echo "AVISO: Binário 'adm' não encontrado (ADM_BIN=$ADM_BIN); só scripts estarão disponíveis."
+  fi
+}
 
-echo "==> Copiando /etc/resolv.conf para dentro do chroot"
+bootstrap_in_chroot() {
+  echo "==> Entrando no chroot (script interno) para criar diretórios e arquivos básicos (cap. 7.5 e 7.6)"
 
-run mkdir -pv "$LFS/etc"
+  chroot "$LFS" /usr/bin/env -i \
+    HOME=/root \
+    PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+    /bin/bash -xe << 'EOF_CHROOT'
 
-if [ -f /etc/resolv.conf ]; then
-  # -L para seguir symlink (como no livro)
-  run cp -vL /etc/resolv.conf "$LFS/etc/resolv.conf"
-else
-  echo "AVISO: /etc/resolv.conf não existe no host – DNS pode não funcionar dentro do chroot."
-fi
-
-# ---------- 5. Copiar o adm para dentro do chroot ----------
-
-echo "==> Copiando adm para dentro do chroot (se encontrado no PATH)"
-
-ADM_BIN="${ADM_BIN:-$(command -v adm 2>/dev/null || true)}"
-
-if [ -n "$ADM_BIN" ] && [ -x "$ADM_BIN" ]; then
-  run mkdir -pv "$LFS/usr/local/bin"
-  run cp -v "$ADM_BIN" "$LFS/usr/local/bin/adm"
-  run chmod 0755 "$LFS/usr/local/bin/adm"
-else
-  echo "AVISO: comando 'adm' não encontrado no PATH; nada foi copiado."
-  echo "       Exporte ADM_BIN=/caminho/do/adm e rode o script novamente se quiser copiá-lo."
-fi
-
-# ---------- 6. Rodar parte do capítulo 7 *dentro* do chroot ----------
-
-echo "==> Entrando no chroot temporariamente para criar diretórios e arquivos essenciais"
-
-if ! command -v chroot >/dev/null 2>&1; then
-  die "Comando 'chroot' não encontrado no host."
-fi
-
-# Aqui usamos env -i para ambiente limpo, como no livro.
-chroot "$LFS" /usr/bin/env -i \
-  HOME=/root \
-  PATH=/usr/bin:/usr/sbin:/bin:/sbin \
-  /bin/bash -xe << 'EOF_CHROOT'
-
-# ---------- dentro do chroot a partir daqui ----------
+# ===== Dentro do chroot a partir daqui =====
 
 echo "=== [chroot] Criando diretórios do FHS (cap. 7.5) ==="
 
 mkdir -pv /{boot,home,mnt,opt,srv}
-
 mkdir -pv /etc/{opt,sysconfig}
 mkdir -pv /lib/firmware
 mkdir -pv /media/{floppy,cdrom}
-mkdir -pv /usr/{,local/}{include,src}
-mkdir -pv /usr/lib/locale
-mkdir -pv /usr/local/{bin,lib,sbin}
+mkdir -pv /usr/{,local/}{bin,lib,sbin,include,src}
 mkdir -pv /usr/{,local/}share/{color,dict,doc,info,locale,man}
 mkdir -pv /usr/{,local/}share/{misc,terminfo,zoneinfo}
 mkdir -pv /usr/{,local/}share/man/man{1..8}
@@ -187,18 +190,20 @@ ln -sfv /run/lock /var/lock
 install -dv -m 0750 /root
 install -dv -m 1777 /tmp /var/tmp
 
-echo "=== [chroot] Criando /etc/mtab (link para /proc/self/mounts) ==="
+echo "=== [chroot] /etc/mtab -> /proc/self/mounts ==="
 ln -svf /proc/self/mounts /etc/mtab
 
-echo "=== [chroot] Criando /etc/hosts básico ==="
+echo "=== [chroot] /etc/hosts ==="
+if [ ! -f /etc/hosts ]; then
 cat > /etc/hosts << "EOF_HOSTS"
 127.0.0.1  localhost lfs
 ::1        localhost
 EOF_HOSTS
+fi
 
-echo "=== [chroot] Criando /etc/passwd se ainda não existir ==="
+echo "=== [chroot] /etc/passwd ==="
 if [ ! -f /etc/passwd ]; then
-  cat > /etc/passwd << "EOF_PASSWD"
+cat > /etc/passwd << "EOF_PASSWD"
 root:x:0:0:root:/root:/bin/bash
 bin:x:1:1:bin:/dev/null:/usr/bin/false
 daemon:x:6:6:Daemon User:/dev/null:/usr/bin/false
@@ -206,13 +211,11 @@ messagebus:x:18:18:D-Bus Message Daemon User:/run/dbus:/usr/bin/false
 uuidd:x:80:80:UUID Generation Daemon User:/dev/null:/usr/bin/false
 nobody:x:65534:65534:Unprivileged User:/dev/null:/usr/bin/false
 EOF_PASSWD
-else
-  echo "    /etc/passwd já existe, não será sobrescrito."
 fi
 
-echo "=== [chroot] Criando /etc/group se ainda não existir ==="
+echo "=== [chroot] /etc/group ==="
 if [ ! -f /etc/group ]; then
-  cat > /etc/group << "EOF_GROUP"
+cat > /etc/group << "EOF_GROUP"
 root:x:0:
 bin:x:1:
 daemon:x:6:
@@ -240,39 +243,122 @@ users:x:100:
 nogroup:x:65534:
 utmp:x:22:
 EOF_GROUP
-else
-  echo "    /etc/group já existe, não será sobrescrito."
 fi
 
-echo "=== [chroot] Criando arquivos de log vazios (btmp, faillog, lastlog, wtmp) ==="
+echo "=== [chroot] Logs em /var/log ==="
 touch /var/log/{btmp,faillog,lastlog,wtmp}
 chgrp -v utmp /var/log/lastlog /var/log/wtmp || true
-chmod -v 664 /var/log/{lastlog,wtmp}
-chmod -v 600 /var/log/btmp
+chmod -v 664 /var/log/{lastlog,wtmp} || true
+chmod -v 600 /var/log/btmp || true
 chmod -v 600 /var/log/faillog || true
 
-echo "=== [chroot] Estado final dos logs ==="
+echo "=== [chroot] Conteúdo de /var/log ==="
 ls -l /var/log
 
-echo "=== [chroot] Setup básico do capítulo 7 concluído. ==="
+echo "=== [chroot] Bootstrap básico do capítulo 7 concluído. ==="
 EOF_CHROOT
+}
 
-echo "==> Chroot preparado com sucesso."
+do_setup() {
+  need_root
+  check_lfs_dir
+  setup_ownership
+  setup_kernfs
+  setup_resolv
+  setup_adm_mount_and_bin
+  bootstrap_in_chroot
+  echo "==> Setup do chroot LFS em $LFS concluído."
+}
 
-cat << EOF_DONE
+# ---------- CLEANUP (host) ----------
 
-========================================================
-Chroot LFS pronto para o capítulo 7 em: $LFS
+do_cleanup() {
+  need_root
+  check_lfs_dir
 
-Para entrar no chroot e continuar a construir os programas:
+  echo "==> Desmontando mounts do chroot em ordem segura"
 
-  export LFS="$LFS"
-  chroot "\$LFS" /usr/bin/env -i \\
-      HOME=/root TERM="\$TERM" \\
-      PS1='(lfs chroot) \\u:\\w\\$ ' \\
-      PATH=/usr/bin:/usr/sbin:/bin:/sbin \\
-      /bin/bash --login
+  # Ordem inversa da montagem:
+  # 1) bind /mnt/adm
+  if is_mounted "$LFS/mnt/adm"; then
+    run umount -v "$LFS/mnt/adm"
+  fi
 
-Dentro do chroot, o 'adm' estará em /usr/local/bin/adm (se foi encontrado).
-========================================================
-EOF_DONE
+  # 2) devpts
+  if is_mounted "$LFS/dev/pts"; then
+    run umount -v "$LFS/dev/pts"
+  fi
+
+  # 3) shm (se for mount separado; geralmente não é)
+  if is_mounted "$LFS/dev/shm"; then
+    run umount -v "$LFS/dev/shm"
+  fi
+
+  # 4) run, proc, sys, dev (nessa ordem)
+  if is_mounted "$LFS/run"; then
+    run umount -v "$LFS/run"
+  fi
+  if is_mounted "$LFS/proc"; then
+    run umount -v "$LFS/proc"
+  fi
+  if is_mounted "$LFS/sys"; then
+    run umount -v "$LFS/sys"
+  fi
+  if is_mounted "$LFS/dev"; then
+    run umount -v "$LFS/dev"
+  fi
+
+  echo "==> Cleanup concluído. Montagens atuais:"
+  show_status
+}
+
+# ---------- ENTER (host) ----------
+
+do_enter() {
+  need_root
+  check_lfs_dir
+
+  # Faz setup mínimo se ainda não estiver montado
+  if ! is_mounted "$LFS/dev" || ! is_mounted "$LFS/proc" || ! is_mounted "$LFS/sys"; then
+    echo "==> Ambiente de chroot ainda não montado; rodando setup primeiro."
+    do_setup
+  else
+    # Garante bind do adm e resolv.conf atualizados
+    setup_adm_mount_and_bin
+  fi
+
+  echo "==> Entrando no chroot. Ao sair do bash, farei cleanup automático."
+
+  chroot "$LFS" /usr/bin/env -i \
+    HOME=/root \
+    TERM="${TERM:-xterm}" \
+    PS1='(lfs chroot) \u:\w\$ ' \
+    PATH=/usr/bin:/usr/sbin:/bin:/sbin:/tools/bin \
+    /bin/bash --login
+
+  echo "==> Você saiu do chroot. Iniciando cleanup..."
+  do_cleanup
+}
+
+# ---------- MAIN ----------
+
+CMD="${1:-enter}"
+
+case "$CMD" in
+  setup)
+    do_setup
+    ;;
+  enter)
+    do_enter
+    ;;
+  cleanup)
+    do_cleanup
+    ;;
+  status)
+    show_status
+    ;;
+  *)
+    echo "Uso: $0 [setup|enter|cleanup|status]"
+    exit 1
+    ;;
+esac
