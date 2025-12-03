@@ -46,6 +46,18 @@ DB_DIR="$ADM_ROOT/db"
 DB_INSTALLED="$DB_DIR/installed"
 DB_PKG_META="$DB_DIR/pkgs"
 DB_PKG_FILES="$DB_DIR/files"
+# Root real onde os pacotes serão instalados.
+# Por padrão é "/", mas você pode apontar para outro lugar, por exemplo:
+#   ADM_ROOTFS=/opt/systems/glibc-root ./admV2.sh install patch-pass1
+ADM_ROOTFS="${ADM_ROOTFS:-/}"
+
+# Normaliza: remove barra final se não for o próprio "/"
+case "$ADM_ROOTFS" in
+  /) ;;  # root puro, ok
+  */) ADM_ROOTFS="${ADM_ROOTFS%/}" ;;
+esac
+
+log_info "Root de instalação (ADM_ROOTFS) = $ADM_ROOTFS"
 
 mkdir -p "$PKG_BASE" "$CACHE_SRC" "$CACHE_PKG" "$LOG_DIR" \
          "$BUILD_ROOT" "$DB_DIR" "$DB_PKG_META" "$DB_PKG_FILES"
