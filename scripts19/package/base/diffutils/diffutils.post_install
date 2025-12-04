@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# diffutils-3.12.post_install
+
+set -euo pipefail
+echo "==> [diffutils-3.12] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+DIFF_BIN="${ROOTFS}/usr/bin/diff"
+
+if [[ ! -x "$DIFF_BIN" ]]; then
+  echo "ERRO: $DIFF_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t diffutils-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+echo "a" > "${tmpdir}/f1"
+echo "b" > "${tmpdir}/f2"
+
+if "$DIFF_BIN" "${tmpdir}/f1" "${tmpdir}/f2" >/dev/null 2>&1; then
+  echo "ERRO: diff não acusou diferença entre arquivos diferentes."
+  exit 1
+fi
+
+echo "OK: diffutils-3.12 instalado e funcional."
