@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# patch-2.8.post_install
+
+set -euo pipefail
+echo "==> [patch-2.8] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+PATCH_BIN="${ROOTFS}/usr/bin/patch"
+
+if [[ ! -x "$PATCH_BIN" ]]; then
+  echo "ERRO: $PATCH_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t patch-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+cat > "${tmpdir}/a.txt" << 'EOF'
+linha1
+linha2
+EOF
+
+cat > "${tmpdir}/a.patch" << 'EOF'
+--- a.txt	2025-01-01
++++ a.txt	2025-01-01
+@@ -1,2 +1,2 @@
+-linha1
++L1
+ linha2
+EOF
+
+(
+  cd "$tmpdir"
+  "$PATCH_BIN" < a.patch >/dev/null
+)
+
+if ! grep -q '^L1$' "${tmpdir}/a.txt"; then
+  echo "ERRO: patch não aplicou modificação esperada em a.txt."
+  exit 1
+fi
+
+echo "OK: patch-2.8 instalado e funcional."
