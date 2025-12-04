@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# make-4.4.1.post_install
+#
+# Sanity-check para GNU Make 4.4.1 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/make existe e é executável
+#   - se 'make --version' funciona
+#   - se um Makefile simples é processado corretamente
+
+set -euo pipefail
+
+echo "==> [make-4.4.1 post_install] Iniciando sanity checks do make..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+MAKE_BIN="${ROOTFS}/usr/bin/make"
+
+# ---------------------------------------
+# 2. Verificar /usr/bin/make
+# ---------------------------------------
+
+if [[ ! -x "$MAKE_BIN" ]]; then
+  if [[ -e "$MAKE_BIN" ]]; then
+    echo "ERRO: ${MAKE_BIN} existe mas não é executável."
+  else
+    echo "ERRO: binário ${MAKE_BIN} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: binário encontrado e executável: ${MAKE_BIN}"
+
+# ---------------------------------------
+# 3. Testar 'make --version'
+# ---------------------------------------
+
+echo "    Testando '${MAKE_BIN} --version'..."
+if ! "$MAKE_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: '${MAKE_BIN} --version' falhou."
+  exit 1
+fi
+
+version_line="$("$MAKE_BIN" --version | head -n1 || true)"
+echo "    Versão reportada: ${version_line}"
+
+if ! echo "$version_line" | grep -q "4.4.1"; then
+  echo "    AVISO: a primeira linha de '--version' não contém '4.4.1'."
+  echo "           Verifique se este é o make que você esperava."
+fi
+
+# ---------------------------------------
+# 4. Teste funcional com Makefile simples
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t make-4.4.1-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+cat > "${tmpdir}/main.c" << 'EOF'
+#include <stdio.h>
+
+int main(void) {
+    puts("MAKE_SANITY_OK");
+    return 0;
+}
+EOF
+
+cat > "${tmpdir}/Makefile" << 'EOF'
+all: hello
+
+hello: main.c
+	$(CC) main.c -o hello
+EOF
+
+# Se tiver CC definido no ambiente, usamos ele; senão, assume 'cc'
+if [[ -z "${CC:-}" ]]; then
+  CC="cc"
+fi
+
+echo "    Usando CC=${CC} para o teste do Makefile."
+
+(
+  cd "$tmpdir"
+  CC="$CC" "$MAKE_BIN" all
+)
+
+if [[ ! -x "${tmpdir}/hello" ]]; then
+  echo "ERRO: o make não produziu o binário 'hello' a partir do Makefile."
+  exit 1
+fi
+
+output="$("${tmpdir}/hello" | tr -d '[:space:]' || true)"
+if [[ "$output" != "MAKE_SANITY_OK" ]]; then
+  echo "ERRO: o binário gerado não produziu a saída esperada."
+  echo "      Esperado: 'MAKE_SANITY_OK'"
+  echo "      Obtido:   '${output}'"
+  exit 1
+fi
+
+echo "    OK: make compilou e executou o projeto de teste com sucesso."
+
+echo "==> [make-4.4.1 post_install] Sanity checks concluídos com SUCESSO."
