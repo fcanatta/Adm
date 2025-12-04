@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# libtool-2.5.4.post_install
+#
+# Sanity-check para GNU Libtool 2.5.4 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/libtool existe e é executável
+#   - se ${ADM_ROOTFS}/usr/bin/libtoolize existe e é executável
+#   - se 'libtool --version' funciona
+#   - se libltdl foi instalada (libltdl.so* e ltdl.h)
+#   - se libtoolize consegue preparar um projeto simples (gera ltmain.sh)
+
+set -euo pipefail
+
+echo "==> [libtool-2.5.4 post_install] Iniciando sanity checks do libtool..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+LIBTOOL_BIN="${ROOTFS}/usr/bin/libtool"
+LIBTOOLIZE_BIN="${ROOTFS}/usr/bin/libtoolize"
+LIB_DIR="${ROOTFS}/usr/lib"
+INCLUDE_DIR="${ROOTFS}/usr/include"
+
+# ---------------------------------------
+# 2. Verificar binários principais
+# ---------------------------------------
+
+if [[ ! -x "$LIBTOOL_BIN" ]]; then
+  echo "ERRO: ${LIBTOOL_BIN} não existe ou não é executável."
+  exit 1
+fi
+echo "    OK: libtool encontrado: ${LIBTOOL_BIN}"
+
+if [[ ! -x "$LIBTOOLIZE_BIN" ]]; then
+  echo "ERRO: ${LIBTOOLIZE_BIN} não existe ou não é executável."
+  exit 1
+fi
+echo "    OK: libtoolize encontrado: ${LIBTOOLIZE_BIN}"
+
+# ---------------------------------------
+# 3. Testar 'libtool --version'
+# ---------------------------------------
+
+echo "    Testando '${LIBTOOL_BIN} --version'..."
+if ! "$LIBTOOL_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: 'libtool --version' falhou."
+  exit 1
+fi
+
+version_line="$("$LIBTOOL_BIN" --version | head -n1 || true)"
+echo "    Versão reportada: ${version_line}"
+
+if ! echo "$version_line" | grep -q "2.5.4"; then
+  echo "    AVISO: a primeira linha de '--version' não contém '2.5.4'."
+  echo "           Verifique se este é o libtool que você esperava."
+fi
+
+# ---------------------------------------
+# 4. Verificar libltdl (biblioteca e header)
+# ---------------------------------------
+
+missing_ltdl=0
+
+if [[ ! -d "$LIB_DIR" ]]; then
+  echo "ERRO: diretório ${LIB_DIR} não existe."
+  exit 1
+fi
+
+if ! ls "${LIB_DIR}"/libltdl.so* >/dev/null 2>&1; then
+  echo "ERRO: não encontrei libltdl.so* em ${LIB_DIR}."
+  missing_ltdl=1
+else
+  echo "    OK: libltdl.so* encontrado(s) em ${LIB_DIR}."
+fi
+
+if [[ ! -d "$INCLUDE_DIR" ]]; then
+  echo "ERRO: diretório ${INCLUDE_DIR} não existe."
+  exit 1
+fi
+
+if [[ ! -f "${INCLUDE_DIR}/ltdl.h" ]]; then
+  echo "ERRO: header ltdl.h não encontrado em ${INCLUDE_DIR}."
+  missing_ltdl=1
+else
+  echo "    OK: header ltdl.h encontrado em ${INCLUDE_DIR}."
+fi
+
+if [[ "$missing_ltdl" -ne 0 ]]; then
+  echo "ERRO: instalação de libltdl parece incompleta."
+  exit 1
+fi
+
+# ---------------------------------------
+# 5. Teste funcional: libtoolize em projeto simples
+# ---------------------------------------
+#
+# Requer:
+#   - autoconf
+#   - automake
+#   (já fazem parte da sua toolchain de build-tools)
+#
+# Aqui nós:
+#   - criamos configure.ac e Makefile.am com LT_INIT
+#   - rodamos libtoolize --copy --force
+#   - verificamos se ltmain.sh foi criado
+
+tmpdir="$(mktemp -d -t libtool-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+echo "    Criando projeto fictício para teste de libtoolize..."
+
+cat > "${tmpdir}/configure.ac" << 'EOF'
+AC_INIT([lt-test], [1.0], [test@example.com])
+AC_CONFIG_SRCDIR([main.c])
+AC_CONFIG_AUX_DIR([build-aux])
+AM_INIT_AUTOMAKE([foreign])
+LT_INIT
+AC_PROG_CC
+AC_CONFIG_FILES([Makefile])
+AC_OUTPUT
+EOF
+
+cat > "${tmpdir}/Makefile.am" << 'EOF'
+bin_PROGRAMS = hello
+hello_SOURCES = main.c
+EOF
+
+cat > "${tmpdir}/main.c" << 'EOF'
+#include <stdio.h>
+int main(void) { puts("LIBTOOL_SANITY_OK"); return 0; }
+EOF
+
+echo "    Rodando libtoolize --copy --force ..."
+(
+  cd "$tmpdir"
+  "$LIBTOOLIZE_BIN" --copy --force
+)
+
+# Procurar ltmain.sh no diretório do projeto
+ltmain_path="$(find "$tmpdir" -maxdepth 3 -type f -name 'ltmain.sh' 2>/dev/null | head -n1 || true)"
+
+if [[ -z "$ltmain_path" ]]; then
+  echo "ERRO: libtoolize não gerou ltmain.sh no projeto fictício."
+  exit 1
+fi
+
+echo "    OK: ltmain.sh gerado em: ${ltmain_path}"
+
+echo "==> [libtool-2.5.4 post_install] Sanity checks concluídos com SUCESSO."
