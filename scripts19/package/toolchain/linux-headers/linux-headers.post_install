@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# linux-headers.post_install
+# Sanity-check para Linux API headers (linux-headers)
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/include existe
+#   - se ${ADM_ROOTFS}/usr/include/linux existe
+#   - se alguns headers essenciais (version.h, limits.h, errno.h) existem
+
+set -euo pipefail
+
+echo "==> [linux-headers post_install] Iniciando sanity checks dos Linux API headers..."
+
+# --------------------------------
+# 1. Determinar ADM_ROOTFS
+# --------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+INC_ROOT="${ROOTFS}/usr/include"
+LINUX_INC_DIR="${INC_ROOT}/linux"
+
+# --------------------------------
+# 2. Verificações básicas
+# --------------------------------
+
+if [[ ! -d "$INC_ROOT" ]]; then
+  echo "ERRO: diretório ${INC_ROOT} não existe."
+  echo "      Isso indica que os Linux headers não foram instalados corretamente."
+  exit 1
+fi
+
+echo "    OK: diretório base de headers existe: ${INC_ROOT}"
+
+if [[ ! -d "$LINUX_INC_DIR" ]]; then
+  echo "ERRO: diretório ${LINUX_INC_DIR} não existe."
+  echo "      'make headers' do kernel deveria ter criado 'usr/include/linux'."
+  exit 1
+fi
+
+echo "    OK: diretório de headers 'linux' existe: ${LINUX_INC_DIR}"
+
+# --------------------------------
+# 3. Checar alguns headers essenciais
+# --------------------------------
+
+missing=0
+
+check_header() {
+  local rel="$1"
+  local f="${INC_ROOT}/${rel}"
+  if [[ ! -f "$f" ]]; then
+    echo "ERRO: header essencial não encontrado: ${f}"
+    missing=1
+  else
+    echo "    OK: header presente: ${f}"
+  fi
+}
+
+# Os nomes abaixo são estáveis na interface de headers do kernel
+check_header "linux/version.h"
+check_header "linux/limits.h"
+check_header "linux/errno.h"
+
+# Em alguns setups, asm é symlink pra asm-generic; só fazemos aviso suave
+if [[ -d "${INC_ROOT}/asm" || -L "${INC_ROOT}/asm" ]]; then
+  echo "    OK: diretório/symlink 'asm' encontrado em ${INC_ROOT}/asm"
+else
+  echo "AVISO: diretório/symlink 'asm' não encontrado em ${INC_ROOT}/asm"
+  echo "       Em algumas arquiteturas, pode ser normal (asm é fornecido por libc)."
+fi
+
+if [[ "$missing" -ne 0 ]]; then
+  echo "ERRO: Um ou mais headers essenciais dos Linux API headers estão faltando."
+  exit 1
+fi
+
+# --------------------------------
+# 4. Verificação superficial de conteúdo
+# --------------------------------
+
+echo "    Verificando se o diretório de headers não está vazio de forma suspeita..."
+header_count="$(find "$INC_ROOT" -type f -name '*.h' 2>/dev/null | wc -l || echo 0)"
+
+echo "    Quantidade de arquivos .h em ${INC_ROOT}: ${header_count}"
+
+if [[ "$header_count" -lt 100 ]]; then
+  echo "AVISO: menos de 100 headers encontrados em ${INC_ROOT}."
+  echo "       Pode estar tudo bem (sistema muito minimalista), mas é um pouco suspeito."
+fi
+
+echo "==> [linux-headers post_install] Sanity checks concluídos com SUCESSO."
