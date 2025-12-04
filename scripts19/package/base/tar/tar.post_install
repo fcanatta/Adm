@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# tar-1.35.post_install
+
+set -euo pipefail
+echo "==> [tar-1.35] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+TAR_BIN="${ROOTFS}/usr/bin/tar"
+
+if [[ ! -x "$TAR_BIN" ]]; then
+  echo "ERRO: $TAR_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t tar-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+echo "ok" > "${tmpdir}/file.txt"
+
+(
+  cd "$tmpdir"
+  "$TAR_BIN" -cf test.tar file.txt
+  rm file.txt
+  "$TAR_BIN" -xf test.tar
+)
+
+if [[ "$(cat "${tmpdir}/file.txt")" != "ok" ]]; then
+  echo "ERRO: tar falhou na sequência criar/extrair."
+  exit 1
+fi
+
+echo "OK: tar-1.35 instalado e funcional."
