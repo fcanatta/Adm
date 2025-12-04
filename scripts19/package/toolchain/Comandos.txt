@@ -1,0 +1,9 @@
+chmod +x /mnt/adm/packages/toolchain/binutils-bootstrap/binutils-bootstrap.sh
+chmod +x /mnt/adm/packages/toolchain/binutils-bootstrap/binutils-bootstrap.post_install
+
+# No host
+source ./profile-glibc.sh
+export ADM_ROOTFS=/opt/systems/glibc-root
+
+adm build   binutils-bootstrap
+adm install binutils-bootstrap
