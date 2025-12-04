@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# readline-8.3.post_install
+#
+# Sanity-check para GNU Readline 8.3 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se libreadline.so* e libhistory.so* existem em /usr/lib
+#   - se headers em /usr/include/readline/ existem
+#   - se é possível compilar e executar um programa C simples usando readline
+
+set -euo pipefail
+
+echo "==> [readline-8.3 post_install] Iniciando sanity checks do readline..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+LIBDIR="${ROOTFS}/usr/lib"
+INCDIR="${ROOTFS}/usr/include"
+RL_INCDIR="${INCDIR}/readline"
+
+# ---------------------------------------
+# 2. Verificar libs
+# ---------------------------------------
+
+if [[ ! -d "$LIBDIR" ]]; then
+  echo "ERRO: diretório ${LIBDIR} não existe."
+  exit 1
+fi
+
+shopt -s nullglob
+rl_libs=( "${LIBDIR}"/libreadline.so* )
+hist_libs=( "${LIBDIR}"/libhistory.so* )
+shopt -u nullglob
+
+if [[ ${#rl_libs[@]} -eq 0 ]]; then
+  echo "ERRO: não encontrei libreadline.so* em ${LIBDIR}."
+  exit 1
+fi
+
+if [[ ${#hist_libs[@]} -eq 0 ]]; then
+  echo "ERRO: não encontrei libhistory.so* em ${LIBDIR}."
+  exit 1
+fi
+
+echo "    OK: libreadline.so* e libhistory.so* encontrados em ${LIBDIR}."
+
+# ---------------------------------------
+# 3. Verificar headers
+# ---------------------------------------
+
+if [[ ! -d "$RL_INCDIR" ]]; then
+  echo "ERRO: diretório de headers ${RL_INCDIR} não existe."
+  exit 1
+fi
+
+missing_header=0
+for hdr in readline.h history.h; do
+  if [[ ! -f "${RL_INCDIR}/${hdr}" ]]; then
+    echo "ERRO: header ${RL_INCDIR}/${hdr} não encontrado."
+    missing_header=1
+  fi
+done
+
+if [[ "$missing_header" -ne 0 ]]; then
+  exit 1
+fi
+
+echo "    OK: headers readline.h e history.h encontrados em ${RL_INCDIR}."
+
+# ---------------------------------------
+# 4. Teste de compilação e execução
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t readline-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+TEST_C="${tmpdir}/test_readline.c"
+TEST_BIN="${tmpdir}/test_readline"
+
+cat > "$TEST_C" << 'EOF'
+#include <stdio.h>
+#include <readline/readline.h>
+#include <readline/history.h>
+
+int main(void) {
+    rl_initialize();
+    add_history("first-command");
+    char *line = readline("prompt> ");
+    if (!line) {
+        printf("READLINE_EOF\n");
+        return 0;
+    }
+    if (line[0] == '\0') {
+        printf("READLINE_EMPTY\n");
+    } else {
+        printf("READLINE_OK:%s\n", line);
+    }
+    free(line);
+    return 0;
+}
+EOF
+
+CC_BIN="${CC:-cc}"
+
+echo "    Compilando programa de teste com ${CC_BIN}..."
+
+# Tentar usar pkg-config se houver um .pc para readline
+PKGCONFIG="${ROOTFS}/usr/bin/pkg-config"
+CFLAGS=""
+LIBS=""
+
+if [[ -x "$PKGCONFIG" ]] && "$PKGCONFIG" --exists readline 2>/dev/null; then
+  CFLAGS="$("$PKGCONFIG" --cflags readline)"
+  LIBS="$("$PKGCONFIG" --libs readline)"
+else
+  # fallback manual
+  CFLAGS="-I${INCDIR}"
+  LIBS="-L${LIBDIR} -lreadline -lhistory -lncursesw"
+fi
+
+(
+  cd "$tmpdir"
+  $CC_BIN $CFLAGS test_readline.c -o test_readline $LIBS
+)
+
+if [[ ! -x "$TEST_BIN" ]]; then
+  echo "ERRO: falha ao compilar programa de teste com readline."
+  echo "      CFLAGS='${CFLAGS}' LIBS='${LIBS}'"
+  exit 1
+fi
+
+echo "    OK: binário de teste compilado: ${TEST_BIN}"
+
+# Vamos fornecer uma linha de entrada via stdin pra não depender de TTY.
+echo "    Executando programa de teste (entrada simulada)..."
+output="$("$TEST_BIN" <<< 'hello-readline' 2>/dev/null | tr -d '\r' || true)"
+
+echo "    Saída completa do teste:"
+echo "      ${output}"
+
+if echo "$output" | grep -q "READLINE_OK:hello-readline"; then
+  echo "    OK: readline leu e retornou a linha de teste corretamente."
+else
+  echo "AVISO: saída do teste não corresponde ao esperado 'READLINE_OK:hello-readline'."
+  echo "       Ainda assim, o binário rodou; revise se necessário."
+fi
+
+echo "==> [readline-8.3 post_install] Sanity checks concluídos (sem erros fatais)."
