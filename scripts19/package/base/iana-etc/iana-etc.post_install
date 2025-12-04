@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# iana-etc-20251120.post_install
+#
+# Sanity-check para Iana-Etc 20251120 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/etc/services existe e não está vazio
+#   - se ${ADM_ROOTFS}/etc/protocols existe e não está vazio
+#   - se algumas entradas comuns existem (http/ssh/tcp/udp/icmp)
+
+set -euo pipefail
+
+echo "==> [iana-etc-20251120 post_install] Iniciando sanity checks do Iana-Etc..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+ETC_DIR="${ROOTFS}/etc"
+SERVICES="${ETC_DIR}/services"
+PROTOCOLS="${ETC_DIR}/protocols"
+
+# ---------------------------------------
+# 2. Verificar existência e tamanho
+# ---------------------------------------
+
+if [[ ! -f "$SERVICES" ]]; then
+  echo "ERRO: arquivo ${SERVICES} não encontrado."
+  exit 1
+fi
+
+if [[ ! -s "$SERVICES" ]]; then
+  echo "ERRO: arquivo ${SERVICES} existe mas está vazio."
+  exit 1
+fi
+
+echo "    OK: ${SERVICES} existe e não está vazio."
+
+if [[ ! -f "$PROTOCOLS" ]]; then
+  echo "ERRO: arquivo ${PROTOCOLS} não encontrado."
+  exit 1
+fi
+
+if [[ ! -s "$PROTOCOLS" ]]; then
+  echo "ERRO: arquivo ${PROTOCOLS} existe mas está vazio."
+  exit 1
+fi
+
+echo "    OK: ${PROTOCOLS} existe e não está vazio."
+
+# ---------------------------------------
+# 3. Verificar algumas entradas comuns
+# ---------------------------------------
+
+# Função auxiliar para checar entradas
+check_entry() {
+  local file="$1"
+  local pattern="$2"
+  local label="$3"
+
+  if grep -E "^[[:space:]]*${pattern}[[:space:]]" "$file" >/dev/null 2>&1; then
+    echo "    OK: entrada '${label}' encontrada em $(basename "$file")."
+  else
+    echo "    AVISO: entrada '${label}' NÃO encontrada em $(basename "$file")."
+  fi
+}
+
+echo "    Verificando entradas comuns em services..."
+#   nome       porta/proto
+check_entry "$SERVICES" "http[[:space:]]+80/tcp"   "http 80/tcp"
+check_entry "$SERVICES" "https[[:space:]]+443/tcp" "https 443/tcp"
+check_entry "$SERVICES" "ssh[[:space:]]+22/tcp"    "ssh 22/tcp"
+
+echo "    Verificando entradas comuns em protocols..."
+#   nome
+check_entry "$PROTOCOLS" "tcp[[:space:]]+6"        "tcp"
+check_entry "$PROTOCOLS" "udp[[:space:]]+17"       "udp"
+check_entry "$PROTOCOLS" "icmp[[:space:]]+1"       "icmp"
+
+echo "==> [iana-etc-20251120 post_install] Sanity checks concluídos com SUCESSO."
