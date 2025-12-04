@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# xz-5.8.1.post_install
+
+set -euo pipefail
+echo "==> [xz-5.8.1] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+XZ_BIN="${ROOTFS}/usr/bin/xz"
+
+if [[ ! -x "$XZ_BIN" ]]; then
+  echo "ERRO: $XZ_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t xz-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+echo "ok" > "${tmpdir}/a"
+
+"$XZ_BIN" -z "${tmpdir}/a"
+"$XZ_BIN" -d "${tmpdir}/a.xz"
+
+if [[ "$(cat "${tmpdir}/a")" != "ok" ]]; then
+  echo "ERRO: xz falhou em compress/decompress."
+  exit 1
+fi
+
+echo "OK: xz-5.8.1 instalado e funcional."
