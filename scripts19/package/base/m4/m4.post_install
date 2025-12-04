@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# m4-1.4.19.post_install
+#
+# Sanity-check para GNU M4 1.4.19 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/m4 existe e é executável
+#   - se "m4 --version" funciona
+#   - se uma macro simples funciona (define(x, 1) x => 1)
+
+set -euo pipefail
+
+echo "==> [m4-1.4.19 post_install] Iniciando sanity checks do m4..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+M4_PATH="${ROOTFS}/usr/bin/m4"
+
+# ---------------------------------------
+# 2. Verificar binário
+# ---------------------------------------
+
+if [[ ! -x "$M4_PATH" ]]; then
+  if [[ -e "$M4_PATH" ]]; then
+    echo "ERRO: ${M4_PATH} existe mas não é executável."
+  else
+    echo "ERRO: binário ${M4_PATH} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: binário encontrado e executável: ${M4_PATH}"
+
+# ---------------------------------------
+# 3. Testar 'm4 --version'
+# ---------------------------------------
+
+echo "    Testando '${M4_PATH} --version'..."
+if ! "$M4_PATH" --version >/dev/null 2>&1; then
+  echo "ERRO: '${M4_PATH} --version' falhou."
+  exit 1
+fi
+
+version_line="$("$M4_PATH" --version | head -n1 || true)"
+echo "    Versão reportada: ${version_line}"
+
+# Apenas aviso, não erro, se não aparecer 1.4.19
+if ! echo "$version_line" | grep -q "1.4.19"; then
+  echo "    AVISO: versão do m4 não parece ser 1.4.19 (pelo menos na primeira linha)."
+fi
+
+# ---------------------------------------
+# 4. Teste funcional simples
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t m4-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+cat > "${tmpdir}/test.m4" << 'EOF'
+define(x, 1)
+x
+EOF
+
+echo "    Rodando teste de macro: define(x,1) x ..."
+
+output="$("$M4_PATH" "${tmpdir}/test.m4" | tr -d '[:space:]' || true)"
+
+if [[ "$output" != "1" ]]; then
+  echo "ERRO: teste de macro falhou."
+  echo "      Esperado: '1'"
+  echo "      Obtido:   '${output}'"
+  exit 1
+fi
+
+echo "    OK: m4 expandiu macro corretamente (resultado = 1)."
+
+echo "==> [m4-1.4.19 post_install] Sanity checks concluídos com SUCESSO."
