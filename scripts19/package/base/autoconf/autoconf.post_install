@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# autoconf-2.72.post_install
+#
+# Sanity-check para GNU Autoconf 2.72 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/autoconf existe e é executável
+#   - se ${ADM_ROOTFS}/usr/bin/autom4te existe e é executável
+#   - se 'autoconf --version' funciona
+#   - se consegue gerar um configure simples a partir de configure.ac
+
+set -euo pipefail
+
+echo "==> [autoconf-2.72 post_install] Iniciando sanity checks do autoconf..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+AUTOCONF_BIN="${ROOTFS}/usr/bin/autoconf"
+AUTOM4TE_BIN="${ROOTFS}/usr/bin/autom4te"
+
+# ---------------------------------------
+# 2. Verificar binários
+# ---------------------------------------
+
+if [[ ! -x "$AUTOCONF_BIN" ]]; then
+  echo "ERRO: ${AUTOCONF_BIN} não existe ou não é executável."
+  exit 1
+fi
+
+echo "    OK: autoconf encontrado: ${AUTOCONF_BIN}"
+
+if [[ ! -x "$AUTOM4TE_BIN" ]]; then
+  echo "ERRO: ${AUTOM4TE_BIN} não existe ou não é executável."
+  exit 1
+fi
+
+echo "    OK: autom4te encontrado: ${AUTOM4TE_BIN}"
+
+# ---------------------------------------
+# 3. Testar 'autoconf --version'
+# ---------------------------------------
+
+echo "    Testando '${AUTOCONF_BIN} --version'..."
+if ! "$AUTOCONF_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: 'autoconf --version' falhou."
+  exit 1
+fi
+
+version_line="$("$AUTOCONF_BIN" --version | head -n1 || true)"
+echo "    Versão reportada: ${version_line}"
+
+if ! echo "$version_line" | grep -q "2.72"; then
+  echo "    AVISO: a primeira linha de '--version' não contém '2.72'."
+  echo "           Verifique se este é o autoconf que você esperava."
+fi
+
+# ---------------------------------------
+# 4. Teste funcional: gerar configure a partir de configure.ac
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t autoconf-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+cat > "${tmpdir}/configure.ac" << 'EOF'
+AC_INIT([testpkg], [1.0], [test@example.com])
+AC_CONFIG_SRCDIR([main.c])
+AC_CONFIG_HEADERS([config.h])
+AC_PROG_CC
+AC_OUTPUT
+EOF
+
+cat > "${tmpdir}/main.c" << 'EOF'
+#include <stdio.h>
+int main(void) { puts("AUTOCONF_SANITY_OK"); return 0; }
+EOF
+
+echo "    Gerando 'configure' a partir de configure.ac..."
+
+(
+  cd "$tmpdir"
+  "$AUTOCONF_BIN"
+)
+
+if [[ ! -x "${tmpdir}/configure" ]]; then
+  echo "ERRO: autoconf não gerou um script 'configure' executável."
+  exit 1
+fi
+
+echo "    OK: script 'configure' gerado com sucesso."
+
+echo "==> [autoconf-2.72 post_install] Sanity checks concluídos com SUCESSO."
