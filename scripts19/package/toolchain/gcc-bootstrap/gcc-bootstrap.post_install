@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# gcc-bootstrap.post_install
+# Sanity-check para GCC bootstrap (Pass 1)
+#
+# Verifica:
+#   - ${TARGET_TRIPLET}-gcc disponível no PATH
+#   - gcc -v contém --with-sysroot=${CROSS_SYSROOT} (se configurado assim)
+#   - include search paths NÃO usam /usr/include do host
+#   - compila dummy.c -> dummy.o
+#   - gera limits.h no lugar certo dentro do ADM_ROOTFS
+
+set -euo pipefail
+
+echo "==> [gcc-bootstrap post_install] Iniciando sanity checks..."
+
+# -----------------------------
+# 1. Variáveis de ambiente
+# -----------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-glibc.sh' ou 'source profile-musl.sh')."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+: "${CROSS_SYSROOT:=${ROOTFS}}"
+: "${CROSS_PREFIX:=/cross-tools}"
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+echo "    CROSS_SYSROOT  = ${CROSS_SYSROOT}"
+echo "    CROSS_PREFIX   = ${CROSS_PREFIX}"
+
+GCC_BIN="${TARGET}-gcc"
+
+if ! command -v "$GCC_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GCC_BIN}' no PATH."
+  echo "      Certifique-se de que o perfil adiciona ${ROOTFS}${CROSS_PREFIX}/bin ao PATH."
+  exit 1
+fi
+
+echo "    Encontrado GCC bootstrap: $(command -v "$GCC_BIN")"
+
+# -----------------------------
+# 2. Checar configuração (--with-sysroot)
+# -----------------------------
+
+tmp_verbose="$(mktemp -t gcc-bootstrap-verbose-XXXXXX)"
+cleanup_verbose() { rm -f -- "$tmp_verbose"; }
+trap cleanup_verbose EXIT
+
+echo "    Capturando saída de '${GCC_BIN} -v'..."
+("$GCC_BIN" -v </dev/null) >"$tmp_verbose" 2>&1 || true
+
+if grep -q "Configured with:" "$tmp_verbose"; then
+  config_line="$(grep 'Configured with:' "$tmp_verbose" | head -n1)"
+  echo "    Linha de configuração:"
+  echo "      $config_line"
+
+  if echo "$config_line" | grep -q -- "--with-sysroot=${CROSS_SYSROOT}"; then
+    echo "    OK: GCC bootstrap configurado com --with-sysroot=${CROSS_SYSROOT}"
+  else
+    echo "    AVISO: linha de configuração não mostra '--with-sysroot=${CROSS_SYSROOT}'."
+    echo "           Verifique se isso é esperado na sua configuração."
+  fi
+else
+  echo "    AVISO: não encontrei 'Configured with:' na saída de ${GCC_BIN} -v."
+fi
+
+# -----------------------------
+# 3. Checar include search paths (sem /usr/include do host)
+# -----------------------------
+
+tmp_inc="$(mktemp -t gcc-bootstrap-inc-XXXXXX)"
+cleanup_inc() { rm -f -- "$tmp_inc"; }
+trap cleanup_inc EXIT
+
+echo "    Coletando include search paths de '${GCC_BIN} -xc /dev/null -S -v'..."
+(
+  cd /
+  "$GCC_BIN" -xc /dev/null -S -v >/dev/null 2>"$tmp_inc" || true
+)
+
+echo "    Diretórios de include reportados:"
+awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc" \
+  | sed 's/^/      /'
+
+bad_host_inc=0
+while IFS= read -r line; do
+  dir="$(echo "$line" | sed 's/^[[:space:]]*//')"
+  [[ -z "$dir" ]] && continue
+
+  case "$dir" in
+    /usr/include*|/include*)
+      # só é aceitável se estiver sob CROSS_SYSROOT
+      if [[ "$dir" != "${CROSS_SYSROOT}"* ]]; then
+        echo "ERRO: Include dir suspeito (host) detectado: $dir"
+        echo "      Esperado: includes sob ${CROSS_SYSROOT}/usr/include, não o /usr/include do host."
+        bad_host_inc=1
+      fi
+      ;;
+  esac
+done < <(awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc")
+
+if [[ "$bad_host_inc" -ne 0 ]]; then
+  echo "ERRO: GCC bootstrap ainda está enxergando includes do host."
+  exit 1
+fi
+
+# -----------------------------
+# 4. Compilar dummy.c -> dummy.o (sem link)
+# -----------------------------
+
+tmp_build_dir="$(mktemp -d -t gcc-bootstrap-dummy-XXXXXX)"
+cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.c" << 'EOF'
+int main(void) {
+    return 0;
+}
+EOF
+
+echo "    Compilando dummy.c -> dummy.o com ${GCC_BIN} (sem link)..."
+(
+  cd "$tmp_build_dir"
+  "$GCC_BIN" -c dummy.c -o dummy.o
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy.o" ]]; then
+  echo "ERRO: GCC bootstrap não conseguiu gerar dummy.o."
+  exit 1
+fi
+
+echo "    dummy.o gerado com sucesso: ${tmp_build_dir}/dummy.o"
+
+# -----------------------------
+# 5. Gerar limits.h dentro do sysroot
+# -----------------------------
+# Agora que o GCC está instalado em ${ROOTFS}${CROSS_PREFIX}, podemos
+# gerar o limits.h "completo" como o LFS faz, mas apontando para o
+# libgcc dentro do sysroot.
+
+echo "    Gerando limits.h para o GCC bootstrap..."
+
+# Descobre o caminho do libgcc dentro do sysroot
+libgcc_file="$("$GCC_BIN" -print-libgcc-file-name 2>/dev/null || true)"
+if [[ -z "$libgcc_file" ]]; then
+  echo "AVISO: ${GCC_BIN} -print-libgcc-file-name não retornou nada; pulando geração de limits.h."
+  echo "       Verifique manualmente se isso é esperado."
+else
+  libgcc_dir="$(dirname "$libgcc_file")"
+  echo "    libgcc encontrado em: ${libgcc_dir}"
+
+  mkdir -p "${libgcc_dir}/include"
+
+  # As headers limitx.h/glimits.h/limity.h vêm do source do GCC.
+  # Como esse hook roda depois da instalação, vamos tentar localizar
+  # o diretório do fonte (na instalação padrão do GCC, esses arquivos
+  # também são instalados em ${CROSS_PREFIX}/lib/gcc/<target>/<vers>/include-fixed,
+  # mas para simplificar, tentamos via libgcc_dir/gcc/).
+  #
+  # No cenário clássico de cross-LFS, esses arquivos já estão "next to"
+  # o libgcc; se não estiverem, você pode adaptar este trecho.
+
+  # Tenta achar os arquivos no sysroot (forma robusta):
+  limitx="$(find "${ROOTFS}" -path "*gcc/limitx.h" 2>/dev/null | head -n1 || true)"
+  glimits="$(find "${ROOTFS}" -path "*gcc/glimits.h" 2>/dev/null | head -n1 || true)"
+  limity="$(find "${ROOTFS}" -path "*gcc/limity.h" 2>/dev/null | head -n1 || true)"
+
+  if [[ -n "$limitx" && -n "$glimits" && -n "$limity" ]]; then
+    echo "    Encontrados limitx.h / glimits.h / limity.h;"
+    echo "    escrevendo ${libgcc_dir}/include/limits.h ..."
+    cat "$limitx" "$glimits" "$limity" > "${libgcc_dir}/include/limits.h"
+  else
+    echo "AVISO: Não consegui localizar limitx.h/glimits.h/limity.h para gerar limits.h."
+    echo "       Verifique se o pacote GCC installou esses headers no ROOTFS."
+  fi
+fi
+
+echo "==> [gcc-bootstrap post_install] Sanity checks concluídos com SUCESSO."
