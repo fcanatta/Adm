@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# coreutils-9.9.post_install
+#
+# Sanity-check para GNU Coreutils 9.9 no ADM_ROOTFS.
+#
+# Verifica:
+#   - binários essenciais existem e são executáveis
+#   - versões de ls, cp, mv, rm, cat, echo
+#   - testes funcionais reais de arquivos e diretórios
+#   - kill e uptime NÃO foram instalados (pois foram desabilitados)
+#   - opcionalmente checa /usr/bin/coreutils multicall binary
+
+set -euo pipefail
+
+echo "==> [coreutils-9.9 post_install] Iniciando sanity checks..."
+
+# --------------------------------------------------------
+# 1. Determinar ADM_ROOTFS
+# --------------------------------------------------------
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+   /) ;; 
+   */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+BIN_DIR="${ROOTFS}/usr/bin"
+SBIN_DIR="${ROOTFS}/usr/sbin"
+
+# --------------------------------------------------------
+# 2. Lista de binários essenciais que devem existir
+# --------------------------------------------------------
+ESSENTIALS=(
+  ls
+  cp
+  mv
+  rm
+  mkdir
+  rmdir
+  cat
+  touch
+  echo
+  pwd
+  date
+  uname
+  chmod
+  chown
+  du
+  df
+  head
+  tail
+  sort
+  cut
+  tr
+  wc
+)
+
+echo "    Verificando binários essenciais..."
+for bin in "${ESSENTIALS[@]}"; do
+    if [[ ! -x "${BIN_DIR}/${bin}" ]]; then
+        echo "ERRO: ${BIN_DIR}/${bin} não existe ou não é executável."
+        exit 1
+    fi
+done
+echo "    OK: Todos os binários essenciais existem."
+
+# --------------------------------------------------------
+# 3. Verificar kill e uptime (devem estar ausentes)
+# --------------------------------------------------------
+if [[ -e "${BIN_DIR}/kill" ]]; then
+    echo "ERRO: 'kill' foi instalado mas deveria ter sido desabilitado."
+    exit 1
+fi
+
+if [[ -e "${BIN_DIR}/uptime" ]]; then
+    echo "ERRO: 'uptime' foi instalado mas deveria ter sido desabilitado."
+    exit 1
+fi
+
+echo "    OK: kill e uptime NÃO foram instalados, conforme esperado."
+
+# --------------------------------------------------------
+# 4. Testar versões principais
+# --------------------------------------------------------
+TEST_BINS=(ls cp mv rm cat echo)
+
+for tb in "${TEST_BINS[@]}"; do
+    if ! "${BIN_DIR}/${tb}" --version >/dev/null 2>&1; then
+        echo "ERRO: ${tb} --version falhou."
+        exit 1
+    fi
+done
+
+echo "    OK: --version funciona para os principais utilitários."
+
+# --------------------------------------------------------
+# 5. Teste funcional simples
+# --------------------------------------------------------
+tmpdir="$(mktemp -d -t coreutils-sanity-XXXXXX)"
+trap "rm -rf -- '$tmpdir'" EXIT
+
+TESTFILE="${tmpdir}/file.txt"
+
+echo "    Executando testes funcionais dos utilitários..."
+
+# touch
+"${BIN_DIR}/touch" "$TESTFILE"
+[[ -f "$TESTFILE" ]] || { echo "ERRO: touch falhou."; exit 1; }
+
+# echo + redirect + cat
+echo "ABC" > "$TESTFILE"
+result="$("${BIN_DIR}/cat" "$TESTFILE" | tr -d '[:space:]')"
+[[ "$result" == "ABC" ]] || { echo "ERRO: cat/echo falharam."; exit 1; }
+
+# cp
+"${BIN_DIR}/cp" "$TESTFILE" "${tmpdir}/copy.txt"
+[[ -f "${tmpdir}/copy.txt" ]] || { echo "ERRO: cp falhou."; exit 1; }
+
+# mv
+"${BIN_DIR}/mv" "${tmpdir}/copy.txt" "${tmpdir}/moved.txt"
+[[ -f "${tmpdir}/moved.txt" ]] || { echo "ERRO: mv falhou."; exit 1; }
+
+# rm
+"${BIN_DIR}/rm" "${tmpdir}/moved.txt"
+[[ ! -e "${tmpdir}/moved.txt" ]] || { echo "ERRO: rm falhou."; exit 1; }
+
+# ls
+ls_output="$("${BIN_DIR}/ls" "$tmpdir")" || { echo "ERRO: ls falhou."; exit 1; }
+
+echo "    OK: testes funcionais básicos concluídos."
+
+# --------------------------------------------------------
+# 6. Verificar multicall binary (informativo)
+# --------------------------------------------------------
+if [[ -x "${BIN_DIR}/coreutils" ]]; then
+    echo "    OK: multicall binary /usr/bin/coreutils presente."
+else
+    echo "    AVISO: /usr/bin/coreutils não existe (não é erro)."
+    echo "           Algumas distros usam, outras não."
+fi
+
+echo "==> [coreutils-9.9 post_install] Sanity checks concluídos com SUCESSO."
