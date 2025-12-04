@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# musl-1.2.5.post_install
+#
+# Sanity-check para musl libc 1.2.5 no ADM_ROOTFS.
+#
+# Verifica:
+#   - headers em ${ADM_ROOTFS}/usr/include (stdio.h)
+#   - loader ld-musl-*.so.1 em ${ADM_ROOTFS}/lib
+#   - symlink libc.so em ${ADM_ROOTFS}/lib
+#   - ${TARGET_TRIPLET}-gcc compila um dummy.c e linka
+#   - ${TARGET_TRIPLET}-readelf (se existir) mostra program interpreter correto
+
+set -euo pipefail
+
+echo "==> [musl-1.2.5 post_install] Iniciando sanity checks da musl..."
+
+# ------------------------------------
+# 1. Variáveis básicas
+# ------------------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-musl.sh')."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+
+INC_DIR="${ROOTFS}/usr/include"
+LIB_DIR="${ROOTFS}/lib"
+
+# ------------------------------------
+# 2. Headers básicos
+# ------------------------------------
+
+if [[ ! -d "$INC_DIR" ]]; then
+  echo "ERRO: Diretório ${INC_DIR} não existe."
+  exit 1
+fi
+
+if [[ ! -f "${INC_DIR}/stdio.h" ]]; then
+  echo "ERRO: Header ${INC_DIR}/stdio.h não encontrado."
+  echo "      A instalação da musl parece incompleta."
+  exit 1
+fi
+
+echo "    OK: headers da musl em ${INC_DIR} (stdio.h presente)."
+
+# ------------------------------------
+# 3. Loader ld-musl-*.so.1 e libc.so
+# ------------------------------------
+
+if [[ ! -d "$LIB_DIR" ]]; then
+  echo "ERRO: Diretório ${LIB_DIR} não existe."
+  exit 1
+fi
+
+shopt -s nullglob
+ld_musl=( "${LIB_DIR}"/ld-musl-*.so.1 )
+shopt -u nullglob
+
+if [[ ${#ld_musl[@]} -eq 0 ]]; then
+  echo "ERRO: Não encontrei ld-musl-*.so.1 em ${LIB_DIR}."
+  echo "      A musl normalmente instala o loader lá (ex.: /lib/ld-musl-x86_64.so.1)."
+  exit 1
+fi
+
+echo "    OK: loader(es) da musl encontrados:"
+for f in "${ld_musl[@]}"; do
+  echo "      ${f}"
+done
+
+if [[ ! -L "${LIB_DIR}/libc.so" && ! -f "${LIB_DIR}/libc.so" ]]; then
+  echo "ERRO: Não encontrei libc.so em ${LIB_DIR}."
+  echo "      A musl normalmente instala libc.so como symlink para o loader."
+  exit 1
+fi
+
+echo "    OK: libc.so encontrado em ${LIB_DIR}/libc.so."
+
+# ------------------------------------
+# 4. ${TARGET}-gcc e ${TARGET}-readelf
+# ------------------------------------
+
+GCC_BIN="${TARGET}-gcc"
+READELF_BIN="${TARGET}-readelf"
+
+if ! command -v "$GCC_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GCC_BIN}' no PATH."
+  echo "      Esse binário deve vir do GCC configurado para musl."
+  exit 1
+fi
+
+echo "    Encontrado GCC alvo (musl): $(command -v "$GCC_BIN")"
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Encontrado readelf alvo: $(command -v "$READELF_BIN")"
+else
+  echo "    AVISO: '${READELF_BIN}' não está no PATH; inspeções com readelf serão puladas."
+fi
+
+# ------------------------------------
+# 5. Compilar e linkar dummy.c
+# ------------------------------------
+
+tmp_build_dir="$(mktemp -d -t musl-final-dummy-XXXXXX)"
+cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.c" << 'EOF'
+#include <stdio.h>
+
+int main(void) {
+    puts("musl final sanity OK");
+    return 0;
+}
+EOF
+
+echo "    Compilando e linkando dummy.c com ${GCC_BIN}..."
+(
+  cd "$tmp_build_dir"
+  "$GCC_BIN" dummy.c -o dummy
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy" ]]; then
+  echo "ERRO: falha ao gerar binário dummy com ${GCC_BIN}."
+  exit 1
+fi
+
+echo "    Binário dummy gerado: ${tmp_build_dir}/dummy"
+
+# ------------------------------------
+# 6. Inspeção com readelf (se disponível)
+# ------------------------------------
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando program interpreter de dummy (informativo)..."
+  interp_line="$("$READELF_BIN" -l "${tmp_build_dir}/dummy" | awk '/Requesting program interpreter/ {print $0}')"
+
+  if [[ -z "$interp_line" ]]; then
+    echo "ERRO: readelf não mostrou 'Requesting program interpreter' para dummy."
+    "$READELF_BIN" -l "${tmp_build_dir}/dummy" || true
+    exit 1
+  fi
+
+  echo "      ${interp_line}"
+  interp_path="$(echo "$interp_line" | sed -n 's/.*Requesting program interpreter: \[\(.*\)\].*/\1/p')"
+
+  if [[ -z "$interp_path" ]]; then
+    echo "ERRO: Não consegui extrair o caminho do program interpreter."
+    exit 1
+  fi
+
+  echo "    program interpreter detectado: ${interp_path}"
+
+  case "$interp_path" in
+    /lib/ld-musl-*.so.1)
+      echo "    OK: program interpreter é o loader da musl."
+      ;;
+    *)
+      echo "ERRO: program interpreter inesperado para musl:"
+      echo "      ${interp_path}"
+      echo "      Esperado algo como /lib/ld-musl-<arch>.so.1"
+      exit 1
+      ;;
+  esac
+
+  echo "    Dependências dinâmicas (informativo):"
+  "$READELF_BIN" -d "${tmp_build_dir}/dummy" | grep -E 'NEEDED|SONAME' || true
+fi
+
+echo "==> [musl-1.2.5 post_install] Sanity checks concluídos com SUCESSO."
