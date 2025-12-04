@@ -1,0 +1,18 @@
+# Já deve ter:
+#   m4-1.4.19
+#   perl (quando tiver script)
+#   make-4.4.1
+
+source ./profile-glibc.sh      # ou profile-musl.sh
+export ADM_ROOTFS=/opt/systems/glibc-root
+
+adm build   autoconf-2.72
+adm install autoconf-2.72
+
+adm build   automake-1.18.1
+adm install automake-1.18.1
+
+# Depois:
+#   libtool-2.4.7
+#   pkg-config-0.29.2
+#   cmake, etc.
