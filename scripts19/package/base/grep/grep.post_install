@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# grep-3.12.post_install
+
+set -euo pipefail
+echo "==> [grep-3.12] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+GREP_BIN="${ROOTFS}/usr/bin/grep"
+
+if [[ ! -x "$GREP_BIN" ]]; then
+  echo "ERRO: $GREP_BIN não encontrado."
+  exit 1
+fi
+
+out="$("$GREP_BIN" foo <<< $'foo\nbar' | tr -d '\n')"
+if [[ "$out" != "foo" ]]; then
+  echo "ERRO: grep não encontrou 'foo'. Saída: '$out'"
+  exit 1
+fi
+
+echo "OK: grep-3.12 instalado e funcional."
