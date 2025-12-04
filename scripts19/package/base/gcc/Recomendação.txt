@@ -1,0 +1,5 @@
+# Depois de instalar o gcc rodar o hook do libstdcxx 
+adm install gcc-15.2.0
+
+# opcional: rodar o hook de sanity da libstdc++
+TARGET_TRIPLET=... ADM_ROOTFS=... /mnt/adm/packages/toolchain/libstdc++-15.2.0/libstdc++-15.2.0.post_install
