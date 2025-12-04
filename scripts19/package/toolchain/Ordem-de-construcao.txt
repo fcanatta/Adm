@@ -1,0 +1,23 @@
+Ordem de build sugerida (com libstdc++ vindo do GCC)
+
+Ficaria algo assim:
+
+1. binutils-bootstrap
+
+
+2. gcc-bootstrap
+
+
+3. linux-headers
+
+
+4. glibc-2.42
+
+
+5. binutils-2.45.1 (final)
+
+
+6. gcc-15.2.0 (final, constrói gcc + g++ + libstdc++)
+
+
+7. (opcional) rodar o hook de sanity da libstdc++ separado, ou fundido no hook do gcc
