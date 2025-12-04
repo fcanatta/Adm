@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# libstdc++-15.2.0.post_install
+#
+# Sanity-check para libstdc++ final (GCC 15.2.0)
+#
+# Verifica:
+#   - headers em ${ADM_ROOTFS}/usr/include/c++/15.2.0
+#   - libs libstdc++.so* e libsupc++.so* em ${ADM_ROOTFS}/usr/lib
+#   - ${TARGET_TRIPLET}-g++ compila um dummy.cpp com <iostream>
+#   - (informativo) readelf em dummy, se ${TARGET_TRIPLET}-readelf existir
+
+set -euo pipefail
+
+echo "==> [libstdc++-15.2.0 post_install] Iniciando sanity checks..."
+
+# --------------------------------------------------------------------
+# 1. Variáveis de ambiente básicas
+# --------------------------------------------------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-glibc.sh' ou 'source profile-musl.sh')."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+
+CXX_INC_BASE="${ROOTFS}/usr/include/c++"
+CXX_INC_DIR="${CXX_INC_BASE}/15.2.0"
+LIB_DIR="${ROOTFS}/usr/lib"
+
+# --------------------------------------------------------------------
+# 2. Checar headers de C++
+# --------------------------------------------------------------------
+
+if [[ ! -d "$CXX_INC_BASE" ]]; then
+  echo "ERRO: diretório base ${CXX_INC_BASE} não existe."
+  echo "      A instalação da libstdc++ parece incompleta."
+  exit 1
+fi
+
+if [[ ! -d "$CXX_INC_DIR" ]]; then
+  echo "ERRO: diretório ${CXX_INC_DIR} não existe."
+  echo "      Verifique se o configure usou --with-gxx-include-dir=/usr/include/c++/15.2.0."
+  exit 1
+fi
+
+if [[ ! -f "${CXX_INC_DIR}/iostream" ]]; then
+  echo "ERRO: header ${CXX_INC_DIR}/iostream não encontrado."
+  echo "      Algo está errado com a instalação dos headers da libstdc++."
+  exit 1
+fi
+
+echo "    OK: headers C++ encontrados em ${CXX_INC_DIR} (iostream presente)."
+
+# --------------------------------------------------------------------
+# 3. Checar bibliotecas em /usr/lib
+# --------------------------------------------------------------------
+
+if [[ ! -d "$LIB_DIR" ]]; then
+  echo "ERRO: diretório ${LIB_DIR} não existe."
+  exit 1
+fi
+
+missing_libs=0
+
+check_lib() {
+  local pattern="$1"
+  if ! ls "${LIB_DIR}"/${pattern} >/dev/null 2>&1; then
+    echo "ERRO: não encontrei ${LIB_DIR}/${pattern}"
+    missing_libs=1
+  else
+    echo "    OK: encontrado(s) ${LIB_DIR}/${pattern}"
+  fi
+}
+
+check_lib "libstdc++.so*"
+check_lib "libsupc++.so*"
+
+if [[ "$missing_libs" -ne 0 ]]; then
+  echo "ERRO: Uma ou mais bibliotecas essenciais da libstdc++ estão faltando."
+  exit 1
+fi
+
+# --------------------------------------------------------------------
+# 4. Localizar ${TARGET}-g++ e ${TARGET}-readelf
+# --------------------------------------------------------------------
+
+GXX_BIN="${TARGET}-g++"
+READELF_BIN="${TARGET}-readelf"
+
+if ! command -v "$GXX_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GXX_BIN}' no PATH."
+  echo "      Esse binário deve vir do GCC para o alvo ${TARGET}."
+  exit 1
+fi
+
+echo "    Encontrado g++ alvo: $(command -v "$GXX_BIN")"
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Encontrado readelf alvo: $(command -v "$READELF_BIN")"
+else
+  echo "    AVISO: '${READELF_BIN}' não está no PATH; checks com readelf serão pulados."
+fi
+
+# --------------------------------------------------------------------
+# 5. Compilar um programa C++ simples com <iostream>
+# --------------------------------------------------------------------
+
+tmp_build_dir="$(mktemp -d -t libstdcxx-final-dummy-XXXXXX)"
+cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.cpp" << 'EOF'
+#include <iostream>
+
+int main() {
+    std::cout << "libstdc++ final sanity OK\n";
+    return 0;
+}
+EOF
+
+echo "    Compilando dummy.cpp com ${GXX_BIN}..."
+
+(
+  cd "$tmp_build_dir"
+  "$GXX_BIN" dummy.cpp -o dummy
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy" ]]; then
+  echo "ERRO: não foi possível gerar o binário 'dummy' com ${GXX_BIN}."
+  exit 1
+fi
+
+echo "    Binário C++ gerado com sucesso: ${tmp_build_dir}/dummy"
+
+# --------------------------------------------------------------------
+# 6. Inspeção opcional com readelf
+# --------------------------------------------------------------------
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando NEEDED libs de dummy com ${READELF_BIN} -d (informativo)..."
+  "$READELF_BIN" -d "${tmp_build_dir}/dummy" | grep -E 'NEEDED|SONAME' || true
+
+  echo "    Inspecionando program interpreter (informativo)..."
+  "$READELF_BIN" -l "${tmp_build_dir}/dummy" | awk '/Requesting program interpreter/ {print "      " $0}'
+fi
+
+echo "==> [libstdc++-15.2.0 post_install] Sanity checks concluídos com SUCESSO."
