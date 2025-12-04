@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# bzip2-1.0.8.post_install
+
+set -euo pipefail
+echo "==> [bzip2-1.0.8] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+BZIP2_BIN="${ROOTFS}/usr/bin/bzip2"
+BUNZIP2_BIN="${ROOTFS}/usr/bin/bunzip2"
+
+if [[ ! -x "$BZIP2_BIN" ]]; then
+  echo "ERRO: $BZIP2_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t bzip2-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+echo "ok" > "${tmpdir}/a"
+
+"$BZIP2_BIN" "${tmpdir}/a"
+
+if [[ -x "$BUNZIP2_BIN" ]]; then
+  "$BUNZIP2_BIN" "${tmpdir}/a.bz2"
+else
+  "$BZIP2_BIN" -d "${tmpdir}/a.bz2"
+fi
+
+if [[ "$(cat "${tmpdir}/a")" != "ok" ]]; then
+  echo "ERRO: bzip2 falhou em compress/decompress."
+  exit 1
+fi
+
+echo "OK: bzip2-1.0.8 instalado e funcional."
