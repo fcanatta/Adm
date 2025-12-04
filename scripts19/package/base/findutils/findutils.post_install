@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# findutils-4.10.0.post_install
+
+set -euo pipefail
+echo "==> [findutils-4.10.0] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+FIND_BIN="${ROOTFS}/usr/bin/find"
+XARGS_BIN="${ROOTFS}/usr/bin/xargs"
+
+[[ -x "$FIND_BIN"  ]] || { echo "ERRO: $FIND_BIN não encontrado.";  exit 1; }
+[[ -x "$XARGS_BIN" ]] || { echo "ERRO: $XARGS_BIN não encontrado."; exit 1; }
+
+tmpdir="$(mktemp -d -t findutils-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+touch "${tmpdir}/a" "${tmpdir}/b"
+
+count="$("$FIND_BIN" "$tmpdir" -maxdepth 1 -type f | wc -l)"
+if (( count < 2 )); then
+  echo "ERRO: find não listou corretamente os arquivos (count=$count)."
+  exit 1
+fi
+
+echo "OK: findutils-4.10.0 instalado e funcional."
