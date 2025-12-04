@@ -241,14 +241,41 @@ resolve_build_deps() {
     local libc="$1" cat="$2" pkg="$3"
     local depfile
     depfile="$(pkg_dir "$cat" "$pkg")/${pkg}.deps"
+
+    local current="${cat}/${pkg}"
+    local stack="${ADM_DEP_STACK:-}"
+
+    # Adiciona o pacote atual à pilha, se ainda não estiver
+    case " $stack " in
+        *" $current "*) ;;
+        *)
+            stack="${stack:+$stack }$current"
+            ADM_DEP_STACK="$stack"
+            export ADM_DEP_STACK
+            ;;
+    esac
+
     local dep
     while read -r dep; do
         [ -n "$dep" ] || continue
-        local dcat="${dep%/*}"
-        local dpkg="${dep#*/}"
-        log_info "(build) Dependência: $dep"
-        "$0" build "${dcat}/${dpkg}" "$libc"
-        "$0" install "${dcat}/${dpkg}" "$libc"
+
+        # Normaliza nome da dependência (aceita "cat/pkg" ou só "pkg")
+        local resolved dcat dpkg dep_id
+        resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
+        IFS='|' read -r dcat dpkg _ <<< "$resolved"
+        dep_id="${dcat}/${dpkg}"
+
+        log_info "(build) Dependência: ${dep} -> ${dep_id}"
+
+        # Proteção contra ciclos: se dep já estiver na pilha, aborta
+        if [[ " $stack " == *" $dep_id "* ]]; then
+            die "Dependência cíclica detectada na fase de build: ${stack} -> ${dep_id}"
+        fi
+
+        # Usa o fluxo normal do adm: build + install
+        # (o empacotamento é feito no script de build e o registro em cmd_install)
+        cmd_build "${dep_id}" "$libc"
+        cmd_install "${dep_id}" "$libc"
     done < <(read_deps_file "$depfile")
 }
 
@@ -256,13 +283,40 @@ resolve_install_deps() {
     local libc="$1" cat="$2" pkg="$3"
     local depfile
     depfile="$(pkg_dir "$cat" "$pkg")/${pkg}.deps"
+
+    local current="${cat}/${pkg}"
+    local stack="${ADM_DEP_STACK:-}"
+
+    # Adiciona o pacote atual à pilha, se ainda não estiver
+    case " $stack " in
+        *" $current "*) ;;
+        *)
+            stack="${stack:+$stack }$current"
+            ADM_DEP_STACK="$stack"
+            export ADM_DEP_STACK
+            ;;
+    esac
+
     local dep
     while read -r dep; do
         [ -n "$dep" ] || continue
-        local dcat="${dep%/*}"
-        local dpkg="${dep#*/}"
-        log_info "(install) Dependência: $dep"
-        "$0" install "${dcat}/${dpkg}" "$libc"
+
+        # Normaliza nome da dependência (aceita "cat/pkg" ou só "pkg")
+        local resolved dcat dpkg dep_id
+        resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
+        IFS='|' read -r dcat dpkg _ <<< "$resolved"
+        dep_id="${dcat}/${dpkg}"
+
+        log_info "(install) Dependência: ${dep} -> ${dep_id}"
+
+        # Proteção contra ciclos também na fase de instalação
+        if [[ " $stack " == *" $dep_id "* ]]; then
+            die "Dependência cíclica detectada na fase de install: ${stack} -> ${dep_id}"
+        fi
+
+        # Apenas instala a dependência; se não houver buildinfo,
+        # o próprio cmd_install chama cmd_build antes de instalar.
+        cmd_install "${dep_id}" "$libc"
     done < <(read_deps_file "$depfile")
 }
 
