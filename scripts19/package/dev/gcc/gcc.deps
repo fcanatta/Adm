@@ -1,5 +1,0 @@
-# Uma dependência por linha, formato categoria/programa
-libs/gmp
-libs/mpfr
-libs/mpc
-libs/isl
