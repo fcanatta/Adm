@@ -111,28 +111,46 @@ check_requirements() {
 }
 
 ensure_repo() {
-    if [ ! -d "$ADM_REPO_DIR/.git" ]; then
-        log_info "Clonando repositório em $ADM_REPO_DIR..."
-        mkdir -p "$(dirname "$ADM_REPO_DIR")"
-        git clone "$ADM_REPO_URL" "$ADM_REPO_DIR" || die "Falha ao clonar repositório."
+    if [ -d "$ADM_REPO_DIR/.git" ]; then
+        # Já é um repositório git, nada a fazer
+        return 0
     fi
+
+    # Se o diretório existe mas não é git, evita sobrescrever coisas silenciosamente
+    if [ -d "$ADM_REPO_DIR" ] && [ "$(ls -A "$ADM_REPO_DIR" 2>/dev/null | wc -l)" -ne 0 ]; then
+        log_error "ADM_REPO_DIR existe mas não é um repositório git: $ADM_REPO_DIR"
+        log_error "Por segurança, não vou clonar por cima de um diretório não vazio."
+        log_error "Ajuste ADM_REPO_DIR ou inicialize o repositório git manualmente."
+        die "Repositório ADM inválido em $ADM_REPO_DIR"
+    fi
+
+    log_info "Clonando repositório em $ADM_REPO_DIR..."
+    mkdir -p "$(dirname "$ADM_REPO_DIR")"
+    git clone "$ADM_REPO_URL" "$ADM_REPO_DIR" || die "Falha ao clonar repositório."
 }
 
 detect_libc() {
     local arg_libc="${1:-}"
+    local libc=""
+
     if [ -n "$arg_libc" ]; then
-        echo "$arg_libc"
-        return 0
-    fi
-    if [ -n "${ADM_LIBC:-}" ]; then
-        echo "$ADM_LIBC"
-        return 0
-    fi
-    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
-        echo "musl"
+        libc="$arg_libc"
+    elif [ -n "${ADM_LIBC:-}" ]; then
+        libc="$ADM_LIBC"
+    elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        libc="musl"
     else
-        echo "glibc"
+        libc="glibc"
     fi
+
+    case "$libc" in
+        glibc|musl)
+            echo "$libc"
+            ;;
+        *)
+            die "libc inválida ou desconhecida: '$libc' (esperado: glibc ou musl)"
+            ;;
+    esac
 }
 
 rootfs_for_libc() {
@@ -167,8 +185,10 @@ load_profile() {
     local libc="$1"
     local profile="${PROFILES_DIR}/${libc}.profile"
     if [ -f "$profile" ]; then
-        # shellcheck disable=SC1090
-        . "$profile"
+        # Carrega com proteção: se der erro de sintaxe, não mata o adm todo
+        if ! . "$profile"; then
+            log_error "Falha ao carregar profile $profile (erro de shell). Continuando sem profile."
+        fi
     else
         log_warn "Profile $profile não encontrado. Continuando sem profile específico."
     fi
@@ -195,8 +215,11 @@ find_reverse_deps() {
     for meta in "$DB_DIR"/*.meta; do
         [ -e "$meta" ] || continue
         unset PKG_ID PKG_DEPS PKG_LIBC
-        # shellcheck disable=SC1090
-        . "$meta"
+        # Carrega o meta com proteção contra sintaxe inválida
+        if ! . "$meta"; then
+            log_warn "Falha ao ler meta $meta (arquivo inválido?), ignorando para reverse deps."
+            continue
+        fi
         [ "${PKG_LIBC:-}" = "$libc" ] || continue
         for d in ${PKG_DEPS:-}; do
             if [ "$d" = "$target" ]; then
@@ -229,12 +252,21 @@ run_hook() {
 
     log_info "Executando hook ${phase}: ${hook}"
 
+    # Executa hook com ambiente definido e reporta erros claramente
+    set +e
     ROOTFS="$rootfs" \
     ADM_CATEGORY="$cat" \
     ADM_PKG_NAME="$pkg" \
     ADM_LIBC="$libc" \
     ADM_PKG_VERSION="$version" \
     sh "$hook"
+    local status=$?
+    set -e
+
+    if [ $status -ne 0 ]; then
+        log_error "Hook ${phase} ($hook) falhou com status $status"
+        exit $status
+    fi
 }
 
 resolve_build_deps() {
@@ -245,7 +277,7 @@ resolve_build_deps() {
     local current="${cat}/${pkg}"
     local stack="${ADM_DEP_STACK:-}"
 
-    # Adiciona o pacote atual à pilha, se ainda não estiver
+    # Adiciona o pacote atual à pilha de dependências, se ainda não estiver
     case " $stack " in
         *" $current "*) ;;
         *)
@@ -267,13 +299,12 @@ resolve_build_deps() {
 
         log_info "(build) Dependência: ${dep} -> ${dep_id}"
 
-        # Proteção contra ciclos: se dep já estiver na pilha, aborta
+        # Proteção contra ciclos
         if [[ " $stack " == *" $dep_id "* ]]; then
             die "Dependência cíclica detectada na fase de build: ${stack} -> ${dep_id}"
         fi
 
-        # Usa o fluxo normal do adm: build + install
-        # (o empacotamento é feito no script de build e o registro em cmd_install)
+        # Usa o fluxo normal do adm (já passou por check_requirements)
         cmd_build "${dep_id}" "$libc"
         cmd_install "${dep_id}" "$libc"
     done < <(read_deps_file "$depfile")
@@ -287,7 +318,7 @@ resolve_install_deps() {
     local current="${cat}/${pkg}"
     local stack="${ADM_DEP_STACK:-}"
 
-    # Adiciona o pacote atual à pilha, se ainda não estiver
+    # Adiciona o pacote atual à pilha de dependências, se ainda não estiver
     case " $stack " in
         *" $current "*) ;;
         *)
@@ -309,19 +340,17 @@ resolve_install_deps() {
 
         log_info "(install) Dependência: ${dep} -> ${dep_id}"
 
-        # Proteção contra ciclos também na fase de instalação
+        # Proteção contra ciclos também na fase de install
         if [[ " $stack " == *" $dep_id "* ]]; then
             die "Dependência cíclica detectada na fase de install: ${stack} -> ${dep_id}"
         fi
 
-        # Apenas instala a dependência; se não houver buildinfo,
-        # o próprio cmd_install chama cmd_build antes de instalar.
+        # Apenas instala; se faltar buildinfo, cmd_install chamará cmd_build internamente
         cmd_install "${dep_id}" "$libc"
     done < <(read_deps_file "$depfile")
 }
 
 ### RESOLUÇÃO DE PACOTE (NOME -> CATEGORIA/PROGRAMA) ###########################
-
 # Retorna EXACTAMENTE uma linha: "categoria|programa|diretorio"
 resolve_pkg_single() {
     local name="$1"
