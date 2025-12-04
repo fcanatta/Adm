@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# man-pages-6.16.post_install
+#
+# Sanity-check para man-pages 6.16 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se /usr/share/man/man[1,2,3,5,7,8] existem no rootfs
+#   - se alguns arquivos clássicos existem e não estão vazios
+
+set -euo pipefail
+
+echo "==> [man-pages-6.16 post_install] Iniciando sanity checks das man-pages..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+MAN_BASE="${ROOTFS}/usr/share/man"
+
+# ---------------------------------------
+# 2. Verificar diretório base de manpages
+# ---------------------------------------
+
+if [[ ! -d "$MAN_BASE" ]]; then
+  echo "ERRO: diretório ${MAN_BASE} não existe."
+  echo "      As man-pages não parecem ter sido instaladas corretamente."
+  exit 1
+fi
+
+echo "    OK: diretório base encontrado: ${MAN_BASE}"
+
+# ---------------------------------------
+# 3. Verificar seções principais
+# ---------------------------------------
+
+SECTIONS=(man1 man2 man3 man5 man7 man8)
+
+for sec in "${SECTIONS[@]}"; do
+  if [[ ! -d "${MAN_BASE}/${sec}" ]]; then
+    echo "AVISO: seção ${sec} não existe em ${MAN_BASE}/${sec}."
+  else
+    echo "    OK: seção ${sec} encontrada."
+  fi
+done
+
+# ---------------------------------------
+# 4. Verificar alguns arquivos clássicos
+# ---------------------------------------
+#
+# Estes nomes/arquivos podem variar um pouco entre versões,
+# então tratamos como "AVISO" se não existir, e "ERRO" só
+# se nenhum dos arquivos do conjunto existir.
+
+declare -A TEST_FILES
+TEST_FILES[man1:intro]="${MAN_BASE}/man1/intro.1"
+TEST_FILES[man2:open]="${MAN_BASE}/man2/open.2"
+TEST_FILES[man3:printf]="${MAN_BASE}/man3/printf.3"
+TEST_FILES[man5:passwd]="${MAN_BASE}/man5/passwd.5"
+TEST_FILES[man7:standards]="${MAN_BASE}/man7/standards.7"
+TEST_FILES[man8:hostname]="${MAN_BASE}/man8/hostname.8"
+
+missing_all=1
+
+echo "    Verificando alguns arquivos comuns de manpages..."
+
+for key in "${!TEST_FILES[@]}"; do
+  file="${TEST_FILES[$key]}"
+  label="${key%%:*} (${key#*:})"  # ex: man1 (intro)
+
+  if [[ -f "$file" ]]; then
+    if [[ -s "$file" ]]; then
+      echo "    OK: ${label} -> $(basename "$file") existe e não está vazio."
+      missing_all=0
+    else
+      echo "AVISO: ${label} -> $(basename "$file") existe mas está vazio."
+    fi
+  else
+    echo "AVISO: ${label} -> $(basename "$file") não encontrado em $(dirname "$file")."
+  fi
+done
+
+if [[ "$missing_all" -ne 0 ]]; then
+  echo "ERRO: nenhum dos arquivos de teste de manpages foi encontrado com conteúdo."
+  echo "      Verifique se a instalação de man-pages-6.16 foi feita no DESTDIR correto."
+  exit 1
+fi
+
+echo "==> [man-pages-6.16 post_install] Sanity checks concluídos com SUCESSO."
