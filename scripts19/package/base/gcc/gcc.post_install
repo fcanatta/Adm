@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # gcc-15.2.0.post_install
 #
-# Sanity-check para GCC final (15.2.0) no ADM_ROOTFS.
+# Sanity-check UNIFICADO para GCC final (15.2.0) + libstdc++ final
+# no ADM_ROOTFS.
 #
 # Verifica:
-#   - ${TARGET_TRIPLET}-gcc existe e tem versão 15.2.0
-#   - caminhos de include não usam /usr/include do host (fora do sysroot)
-#   - compila dummy.c (C) e dummy.cpp (C++) com sucesso
-#   - verifica o program interpreter de dummy (informativo)
+#   - ${TARGET_TRIPLET}-gcc e ${TARGET_TRIPLET}-g++ existem
+#   - versão reportada do gcc contém "15.2.0"
+#   - include search paths não usam /usr/include do host (fora do sysroot)
+#   - headers de C++ existem em /usr/include/c++/15.2.0 (iostream)
+#   - libs libstdc++.so* e libsupc++.so* existem em /usr/lib
+#   - compila dummy.c (C) e dummy.cpp (C++)
+#   - se ${TARGET}-readelf existir, mostra NEEDED + program interpreter
 
 set -euo pipefail
 
-echo "==> [gcc-15.2.0 post_install] Iniciando sanity checks do GCC final..."
+echo "==> [gcc-15.2.0 post_install] Iniciando sanity checks do GCC final + libstdc++..."
 
 # ---------------------------------------------------------
 # 1. Variáveis de ambiente
@@ -50,7 +54,7 @@ echo "    Encontrado GCC final: $(command -v "$GCC_BIN")"
 
 if ! command -v "$GXX_BIN" >/dev/null 2>&1; then
   echo "ERRO: Não encontrei '${GXX_BIN}' no PATH."
-  echo "      A instalação do C++ front-end parece incompleta."
+  echo "      A instalação do front-end C++ parece incompleta."
   exit 1
 fi
 
@@ -69,7 +73,59 @@ if ! echo "$ver_line" | grep -q "15.2.0"; then
 fi
 
 # ---------------------------------------------------------
-# 3. Checar include search paths (sem host fora do sysroot)
+# 3. Sanity de libstdc++: headers e libs
+# ---------------------------------------------------------
+
+CXX_INC_BASE="${ROOTFS}/usr/include/c++"
+CXX_INC_DIR="${CXX_INC_BASE}/15.2.0"
+LIB_DIR="${ROOTFS}/usr/lib"
+
+if [[ ! -d "$CXX_INC_BASE" ]]; then
+  echo "ERRO: diretório base ${CXX_INC_BASE} não existe (headers C++)."
+  exit 1
+fi
+
+if [[ ! -d "$CXX_INC_DIR" ]]; then
+  echo "ERRO: diretório ${CXX_INC_DIR} não existe."
+  echo "      Verifique se o GCC instalou os headers da libstdc++ no local padrão."
+  exit 1
+fi
+
+if [[ ! -f "${CXX_INC_DIR}/iostream" ]]; then
+  echo "ERRO: header ${CXX_INC_DIR}/iostream não encontrado."
+  echo "      Algo está errado com a instalação dos headers da libstdc++."
+  exit 1
+fi
+
+echo "    OK: headers C++ encontrados em ${CXX_INC_DIR} (iostream presente)."
+
+if [[ ! -d "$LIB_DIR" ]]; then
+  echo "ERRO: diretório ${LIB_DIR} não existe."
+  exit 1
+fi
+
+missing_libs=0
+
+check_lib() {
+  local pattern="$1"
+  if ! ls "${LIB_DIR}"/${pattern} >/dev/null 2>&1; then
+    echo "ERRO: não encontrei ${LIB_DIR}/${pattern}"
+    missing_libs=1
+  else
+    echo "    OK: encontrado(s) ${LIB_DIR}/${pattern}"
+  fi
+}
+
+check_lib "libstdc++.so*"
+check_lib "libsupc++.so*"
+
+if [[ "$missing_libs" -ne 0 ]]; then
+  echo "ERRO: Uma ou mais bibliotecas essenciais da libstdc++ estão faltando."
+  exit 1
+fi
+
+# ---------------------------------------------------------
+# 4. Checar include search paths (sem host fora do sysroot)
 # ---------------------------------------------------------
 
 tmp_inc="$(mktemp -t gcc-final-inc-XXXXXX)"
@@ -113,12 +169,13 @@ if [[ "$bad_host_inc" -ne 0 ]]; then
 fi
 
 # ---------------------------------------------------------
-# 4. Compilar dummy.c (C) e dummy.cpp (C++)
+# 5. Compilar dummy.c (C) e dummy.cpp (C++)
 # ---------------------------------------------------------
 
 tmp_build_dir="$(mktemp -d -t gcc-final-dummy-XXXXXX)"
 cleanup_build() { rm -rf -- "$tmp_build_dir"; }
-trap cleanup_build EXIT
+# sobrescreve o trap anterior, garantindo limpeza de ambos:
+trap 'cleanup_inc; cleanup_build' EXIT
 
 cat > "${tmp_build_dir}/dummy.c" << 'EOF'
 #include <stdio.h>
@@ -165,7 +222,7 @@ fi
 echo "    Binário C++ gerado: ${tmp_build_dir}/dummy-cpp"
 
 # ---------------------------------------------------------
-# 5. Inspeção opcional com readelf
+# 6. Inspeção opcional com readelf
 # ---------------------------------------------------------
 
 if command -v "$READELF_BIN" >/dev/null 2>&1; then
@@ -180,4 +237,4 @@ else
   echo "    AVISO: '${READELF_BIN}' não está no PATH; pulando inspeções com readelf."
 fi
 
-echo "==> [gcc-15.2.0 post_install] Sanity checks concluídos com SUCESSO."
+echo "==> [gcc-15.2.0 post_install] Sanity checks (GCC + libstdc++) concluídos com SUCESSO."
