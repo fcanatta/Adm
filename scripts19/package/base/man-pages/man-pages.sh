@@ -1,110 +1,74 @@
 #!/usr/bin/env bash
-# Script de construção do Linux man-pages para o adm
+# man-pages-6.16.sh
 #
-# Caminho esperado:
-#   /mnt/adm/packages/base/man-pages/man-pages.sh
+# Pacote: man-pages 6.16
 #
-# O adm fornece:
-#   SRC_DIR  : diretório com o source extraído do tarball
-#   DESTDIR  : raiz de instalação temporária (pkgroot)
-#   PROFILE  : glibc / musl / outro (string)  -> aqui é só informativo
-#   NUMJOBS  : número de jobs para o make     -> quase não usamos aqui
+# Objetivo:
+#   - Instalar as páginas de manual base em /usr/share/man dentro do ADM_ROOTFS,
+#     via DESTDIR, usando o sistema de build do adm.
 #
-# Este script deve definir:
-#   PKG_VERSION
-#   SRC_URL
-#   (opcional) SRC_MD5
-#   função pkg_build()
+# Integração com adm:
+#   - Usa:
+#       SRC_DIR  -> diretório com o código-fonte extraído (man-pages-6.16)
+#       DESTDIR  -> raiz fake onde os arquivos serão colocados
+#       NUMJOBS  -> ignorado (não compila nada)
+#
+# Notas:
+#   - O pacote man-pages provê apenas páginas em inglês (man1, man2, man3, ...).
+#   - Não há ./configure nem make; é basicamente uma cópia de arquivos.
 
-#----------------------------------------
-# Versão e origem oficial
-#----------------------------------------
 PKG_VERSION="6.16"
-# Tarball oficial no kernel.org:
-# https://www.kernel.org/pub/linux/docs/man-pages/
+
 SRC_URL="https://www.kernel.org/pub/linux/docs/man-pages/man-pages-${PKG_VERSION}.tar.xz"
-# Se quiser validar integridade, pegue o checksum oficial e set:
-# SRC_MD5="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+SRC_MD5=""
 
 pkg_build() {
-  set -euo pipefail
+    # Variáveis fornecidas pelo adm:
+    #   SRC_DIR, DESTDIR
+    cd "$SRC_DIR"
 
-  echo "==> [man-pages] Build iniciado"
-  echo "    Versão  : ${PKG_VERSION}"
-  echo "    SRC_DIR : ${SRC_DIR}"
-  echo "    DESTDIR : ${DESTDIR}"
-  echo "    PROFILE : ${PROFILE:-desconhecido}"
-  echo "    NUMJOBS : ${NUMJOBS:-1}"
+    : "${ADM_ROOTFS:=/}"
+    case "$ADM_ROOTFS" in
+      /) ;;
+      */) ADM_ROOTFS="${ADM_ROOTFS%/}" ;;
+    esac
 
-  cd "$SRC_DIR"
+    echo ">> man-pages-${PKG_VERSION}"
+    echo ">> ADM_ROOTFS = ${ADM_ROOTFS}"
+    echo ">> DESTDIR    = ${DESTDIR}"
 
-  #------------------------------------
-  # Info de arquitetura (só pra log)
-  #------------------------------------
-  local ARCH
-  ARCH="$(uname -m)"
-  echo "==> [man-pages] ARCH: ${ARCH}"
+    # Diretório base onde as manpages serão instaladas (no DESTDIR)
+    MAN_BASE="${DESTDIR}/usr/share/man"
 
-  case "${PROFILE:-}" in
-    glibc|"")
-      echo "==> [man-pages] PROFILE = glibc (ou vazio) – páginas valem pra qualquer libc, mas foco glibc."
-      ;;
-    musl)
-      echo "==> [man-pages] PROFILE = musl – páginas também são úteis em ambiente musl."
-      ;;
-    *)
-      echo "==> [man-pages] PROFILE desconhecido (${PROFILE}), somente informativo."
-      ;;
-  esac
+    # Criar diretório base
+    mkdir -pv "${MAN_BASE}"
 
-  #------------------------------------
-  # Passo LFS: remover man3/crypt*
-  #   Libxcrypt fornece páginas melhores; então evitamos conflito.
-  #   (Se no teu sistema não tiver libxcrypt, ainda assim é aceitável.)
-  #------------------------------------
-  if ls man3/crypt* >/dev/null 2>&1; then
-    echo "==> [man-pages] Removendo man3/crypt* (conflito com libxcrypt)"
-    rm -v man3/crypt* || true
-  fi
+    # O tarball de man-pages já vem com a estrutura tipo:
+    #   man1/, man2/, man3/, man4/, man5/, man7/, man8/
+    # Vamos copiar tudo isso para /usr/share/man dentro do DESTDIR.
 
-  #------------------------------------
-  # Instalação
-  #
-  # LFS faz:
-  #   make -R GIT=false prefix=/usr install
-  #
-  # Aqui adicionamos DESTDIR para instalar dentro do pkgroot
-  # do adm (sem sujar o sistema host).
-  #
-  #  -R        : desabilita variáveis builtin do make (o build system
-  #              do man-pages não se dá bem com elas).
-  #  GIT=false : evita spam de "git: command not found".
-  #------------------------------------
-  echo "==> [man-pages] Executando make install (com DESTDIR)"
-  make -R GIT=false \
-    prefix=/usr \
-    DESTDIR="$DESTDIR" \
-    install
+    echo ">> Instalando páginas de manual em ${MAN_BASE} ..."
 
-  echo "==> [man-pages] Instalação concluída em $DESTDIR"
+    # Copiar diretórios de seções se existirem
+    for sec in man1 man2 man3 man4 man5 man7 man8; do
+        if [[ -d "$sec" ]]; then
+            mkdir -pv "${MAN_BASE}/${sec}"
+            # -m 644: arquivos de texto
+            install -vm 644 "${sec}"/* "${MAN_BASE}/${sec}/" || true
+        fi
+    done
 
-  #------------------------------------
-  # Pós-instalação (opcional)
-  #
-  # Normalmente não é necessário strip/compress aqui, porque:
-  #   - man costuma lidar bem com páginas não comprimidas;
-  #   - se quiser compressão, você pode ter um passo global de gzip
-  #     de manpages no teu sistema.
-  #
-  # Se quiser comprimir todas as manpages já no pacote, descomenta:
-  #------------------------------------
-  # if command -v gzip >/dev/null 2>&1; then
-  #   if [ -d "$DESTDIR/usr/share/man" ]; then
-  #     echo "==> [man-pages] Compactando manpages em usr/share/man"
-  #     find "$DESTDIR/usr/share/man" -type f -name '*.[0-9]' -print0 2>/dev/null \
-  #       | xargs -0r gzip -9
-  #   fi
-  # fi
+    # Algumas versões também possuem man0p, man3p, etc. Podemos copiar tudo
+    # o que se parece com "man*".
+    #
+    # Se quiser ser mais agressivo e garantir tudo, descomente abaixo:
+    #
+    # for d in man*; do
+    #     if [[ -d "$d" ]]; then
+    #         mkdir -pv "${MAN_BASE}/${d}"
+    #         install -vm 644 "${d}"/* "${MAN_BASE}/${d}/" || true
+    #     fi
+    # done
 
-  echo "==> [man-pages] Build do man-pages-${PKG_VERSION} finalizado com sucesso."
+    echo ">> man-pages-${PKG_VERSION} instaladas em ${MAN_BASE}."
 }
