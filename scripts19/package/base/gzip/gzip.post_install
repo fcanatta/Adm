@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# gzip-1.14.post_install
+
+set -euo pipefail
+echo "==> [gzip-1.14] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+GZIP_BIN="${ROOTFS}/usr/bin/gzip"
+GUNZIP_BIN="${ROOTFS}/usr/bin/gunzip"
+
+if [[ ! -x "$GZIP_BIN" ]]; then
+  echo "ERRO: $GZIP_BIN não encontrado."
+  exit 1
+fi
+
+tmpdir="$(mktemp -d -t gzip-test-XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+echo "ok" > "${tmpdir}/a"
+
+"$GZIP_BIN" "${tmpdir}/a"
+
+if [[ -x "$GUNZIP_BIN" ]]; then
+  "$GUNZIP_BIN" "${tmpdir}/a.gz"
+else
+  "$GZIP_BIN" -d "${tmpdir}/a.gz"
+fi
+
+if [[ "$(cat "${tmpdir}/a")" != "ok" ]]; then
+  echo "ERRO: gzip falhou em compress/decompress."
+  exit 1
+fi
+
+echo "OK: gzip-1.14 instalado e funcional."
