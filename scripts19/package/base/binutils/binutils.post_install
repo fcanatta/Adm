@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# binutils-2.45.1.post_install
+#
+# Sanity-check para binutils "final" no ADM_ROOTFS.
+#
+# Verifica:
+#   - ferramentas principais em ${ADM_ROOTFS}/usr/bin (as, ld, nm, objdump, readelf, strings, strip)
+#   - se ${TARGET_TRIPLET}-ld (se existir) não está pegando libs do host
+#     (SEARCH_DIR só dentro do ADM_ROOTFS)
+#   - compila um dummy.c com ${TARGET_TRIPLET}-gcc (se disponível) e
+#     inspeciona o binário com ${TARGET_TRIPLET}-readelf (informativo).
+
+set -euo pipefail
+
+echo "==> [binutils-2.45.1 post_install] Iniciando sanity checks..."
+
+# -----------------------------------
+# 1. Variáveis básicas
+# -----------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+TARGET="${TARGET_TRIPLET:-}"
+
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+echo "    TARGET_TRIPLET = ${TARGET:-<não definido>}"
+
+BINDIR="${ROOTFS}/usr/bin"
+LIBDIR="${ROOTFS}/usr/lib"
+
+if [[ ! -d "$BINDIR" ]]; then
+  echo "ERRO: diretório ${BINDIR} não existe."
+  exit 1
+fi
+
+# -----------------------------------
+# 2. Verificar ferramentas principais
+# -----------------------------------
+
+missing=0
+
+check_bin() {
+  local bin="$1"
+  local path="${BINDIR}/${bin}"
+  if [[ ! -x "$path" ]]; then
+    echo "ERRO: binário essencial não encontrado ou não executável: ${path}"
+    missing=1
+  else
+    echo "    OK: ${path}"
+  fi
+}
+
+check_bin "as"
+check_bin "ld"
+check_bin "nm"
+check_bin "objdump"
+check_bin "readelf"
+check_bin "strings"
+check_bin "strip"
+
+if [[ "$missing" -ne 0 ]]; then
+  echo "ERRO: Uma ou mais ferramentas essenciais do binutils final estão faltando."
+  exit 1
+fi
+
+# -----------------------------------
+# 3. Se tivermos TARGET_TRIPLET, checar ${TARGET}-ld --verbose
+# -----------------------------------
+
+if [[ -n "$TARGET" ]]; then
+  LD_TARGET_BIN="${TARGET}-ld"
+
+  if command -v "$LD_TARGET_BIN" >/dev/null 2>&1; then
+    echo "    Encontrado ${LD_TARGET_BIN}: $(command -v "$LD_TARGET_BIN")"
+
+    tmp_ld="$(mktemp -t binutils-final-ld-XXXXXX)"
+    cleanup_tmp_ld() { rm -f -- "$tmp_ld"; }
+    trap cleanup_tmp_ld EXIT
+
+    echo "    Capturando '${LD_TARGET_BIN} --verbose'..."
+    "$LD_TARGET_BIN" --verbose >"$tmp_ld" 2>&1 || true
+
+    echo "    SEARCH_DIR presentes em ${LD_TARGET_BIN} --verbose:"
+    awk '/SEARCH_DIR\(\"/ {print "      " $0}' "$tmp_ld"
+
+    bad_dir=0
+
+    while IFS= read -r line; do
+      dir="$(echo "$line" | sed -n 's/.*SEARCH_DIR(\"=\(.*\)\"\).*/\1/p')"
+      [[ -z "$dir" ]] && continue
+
+      case "$dir" in
+        /usr/*|/lib/*|/lib64/*)
+          # Aceitamos diretórios dentro do ADM_ROOTFS
+          if [[ "$ROOTFS" != "/" ]]; then
+            # Se temos um rootfs não-raiz, prefixo permitido é ${ROOTFS}
+            if [[ "$dir" != "${ROOTFS}"* ]]; then
+              echo "ERRO: SEARCH_DIR suspeito para ${LD_TARGET_BIN}: $dir"
+              echo "      Parece apontar para libs do host fora do ADM_ROOTFS=${ROOTFS}."
+              bad_dir=1
+            fi
+          fi
+          ;;
+      esac
+    done < <(awk '/SEARCH_DIR\(\"/ {print $0}' "$tmp_ld")
+
+    if [[ "$bad_dir" -ne 0 ]]; then
+      echo "ERRO: ${LD_TARGET_BIN} ainda está configurado para buscar libs fora do ADM_ROOTFS."
+      exit 1
+    fi
+  else
+    echo "    AVISO: '${LD_TARGET_BIN}' não está no PATH; pulando checks específicos de alvo."
+  fi
+else
+  echo "    AVISO: TARGET_TRIPLET não definido; pulando checks específicos de alvo."
+fi
+
+# -----------------------------------
+# 4. Teste opcional com dummy.c, se tivermos TARGET-gcc e TARGET-readelf
+# -----------------------------------
+
+if [[ -n "$TARGET" ]]; then
+  GCC_BIN="${TARGET}-gcc"
+  READELF_BIN="${TARGET}-readelf"
+
+  if command -v "$GCC_BIN" >/dev/null 2>&1; then
+    echo "    Encontrado GCC alvo: $(command -v "$GCC_BIN")"
+
+    tmp_build_dir="$(mktemp -d -t binutils-final-dummy-XXXXXX)"
+    cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+    trap cleanup_build EXIT
+
+    cat > "${tmp_build_dir}/dummy.c" << 'EOF'
+int main(void) {
+    return 0;
+}
+EOF
+
+    echo "    Compilando dummy.c com ${GCC_BIN}..."
+    (
+      cd "$tmp_build_dir"
+      "$GCC_BIN" dummy.c -o dummy
+    )
+
+    if [[ ! -f "${tmp_build_dir}/dummy" ]]; then
+      echo "ERRO: falha ao gerar binário dummy com ${GCC_BIN}."
+      exit 1
+    fi
+
+    echo "    Binário dummy gerado: ${tmp_build_dir}/dummy"
+
+    if command -v "$READELF_BIN" >/dev/null 2>&1; then
+      echo "    Inspecionando dummy com ${READELF_BIN} -d (informativo):"
+      "$READELF_BIN" -d "${tmp_build_dir}/dummy" | grep -E 'NEEDED|SONAME' || true
+
+      echo "    Inspecionando program interpreter (informativo):"
+      "$READELF_BIN" -l "${tmp_build_dir}/dummy" | awk '/Requesting program interpreter/ {print "      " $0}'
+    else
+      echo "    AVISO: '${READELF_BIN}' não está no PATH; pulando inspeção com readelf."
+    fi
+  else
+    echo "    AVISO: '${GCC_BIN}' não está no PATH; pulando teste com dummy.c."
+  fi
+fi
+
+echo "==> [binutils-2.45.1 post_install] Sanity checks concluídos com SUCESSO."
