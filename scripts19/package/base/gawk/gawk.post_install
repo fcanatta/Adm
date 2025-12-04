@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# gawk-5.3.2.post_install
+
+set -euo pipefail
+echo "==> [gawk-5.3.2] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+GAWK_BIN="${ROOTFS}/usr/bin/gawk"
+AWK_BIN="${ROOTFS}/usr/bin/awk"
+
+if [[ ! -x "$GAWK_BIN" ]]; then
+  echo "ERRO: $GAWK_BIN não encontrado."
+  exit 1
+fi
+
+if [[ ! -x "$AWK_BIN" ]]; then
+  echo "AVISO: /usr/bin/awk não existe (symlink para gawk é recomendado)."
+fi
+
+out="$("$GAWK_BIN" 'BEGIN{print 2+3}' | tr -d '\n')"
+if [[ "$out" != "5" ]]; then
+  echo "ERRO: gawk não calculou 2+3 corretamente. Saída: '$out'"
+  exit 1
+fi
+
+echo "OK: gawk-5.3.2 instalado e funcional."
