@@ -1,0 +1,141 @@
+===============================
+ ORDEM COMPLETA DE CONSTRUÇÃO
+ Sistema Linux via ADM
+===============================
+
+===============================
+ FASE 0 – PREPARAÇÃO DO AMBIENTE
+===============================
+01. Criar e carregar profiles:
+      - profile-glibc.sh
+      - profile-musl.sh
+02. Definir ADM_ROOTFS (ex: /opt/systems/glibc-root)
+03. Criar diretórios essenciais no rootfs:
+      bin, sbin, usr/bin, usr/sbin, lib, lib64,
+      etc, dev, proc, sys, run, var, tmp
+04. Executar adm-fixperms.sh
+
+===============================
+ FASE 1 – BOOTSTRAP TOOLCHAIN
+===============================
+05. Binutils-bootstrap
+06. GCC-bootstrap (sem libstdc++)
+07. Linux-headers
+08. Glibc-bootstrap ou Musl-bootstrap
+09. Libstdc++ (do GCC) – bootstrap
+
+CHECKPOINT: Toolchain mínima funcionando dentro de ADM_ROOTFS.
+
+===============================
+ FASE 2 – TOOLCHAIN FINAL
+===============================
+10. Binutils-final
+11. GCC-final (com libstdc++ final)
+
+CHECKPOINT: Sistema está self-hosting.
+
+===============================
+ FASE 3 – BASE DO SISTEMA (PRÉ-CHROOT)
+===============================
+12. M4
+13. Bash
+14. Coreutils
+15. Iana-etc
+16. Make
+17. Automake
+18. Perl
+19. Libtool
+20. Man-pages
+21. Python
+22. Pkgconf
+23. Ncurses
+24. Readline
+
+CHECKPOINT: Ambiente apto a entrar em chroot.
+
+===============================
+ FASE 4 – ENTRAR EM CHROOT
+===============================
+25. Montar sistemas virtuais:
+      mount --bind /dev      $ADM_ROOTFS/dev
+      mount --bind /dev/pts  $ADM_ROOTFS/dev/pts
+      mount --bind /proc     $ADM_ROOTFS/proc
+      mount --bind /sys      $ADM_ROOTFS/sys
+      mount --bind /run      $ADM_ROOTFS/run
+
+26. Entrar em chroot:
+      chroot $ADM_ROOTFS /usr/bin/env -i \
+        HOME=/root TERM=$TERM PATH=/usr/bin:/usr/sbin:/bin:/sbin \
+        /bin/bash --login
+
+===============================
+ FASE 5 – BASE ESSENCIAL NO CHROOT
+===============================
+27. Sed
+28. Grep
+29. Gawk
+30. Findutils
+31. Tar
+32. Xz
+33. Bzip2
+34. Gzip
+35. Diffutils
+36. File
+37. Patch
+
+===============================
+ FASE 6 – USERLAND PRINCIPAL
+===============================
+38. Shadow
+39. Util-linux
+40. Procps-ng
+41. Kbd
+42. E2fsprogs
+43. Psmisc
+44. Grep-final (se necessário)
+45. IPRoute2
+46. Linux-PAM
+47. OpenSSL ou LibreSSL
+48. Zlib
+49. Zstd
+
+===============================
+ FASE 7 – SISTEMA DE INIT
+===============================
+50. Escolher um:
+      - systemd
+      - sysvinit + eudev
+
+===============================
+ FASE 8 – REDE
+===============================
+51. dhcpcd ou dhclient
+52. resolvconf
+53. ethtool
+54. iputils
+
+===============================
+ FASE 9 – FERRAMENTAS COMPLEMENTARES
+===============================
+55. Less
+56. Vim ou Nano
+57. Bc
+58. Unzip / Zip
+59. Curl
+60. Wget
+61. Man-db
+62. Git
+
+===============================
+ FASE 10 – KERNEL E BOOTLOADER
+===============================
+63. Linux Kernel
+64. Grub ou Syslinux
+65. Criar fstab
+66. Configurar hostname, hosts, rede
+67. Criar usuários
+
+===============================
+ FASE FINAL – BOOT
+===============================
+68. Rebootar no novo sistema Linux.
