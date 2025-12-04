@@ -1,0 +1,117 @@
+#!/usr/bin/env sh
+# Sanity-check para GCC-15.2.0 - Pass 1
+# Executado automaticamente pelo adm após a instalação.
+
+set -euf
+
+# Cores simples
+if [ -t 1 ]; then
+    GREEN="$(printf '\033[32m')"
+    RED="$(printf '\033[31m')"
+    YELLOW="$(printf '\033[33m')"
+    RESET="$(printf '\033[0m')"
+else
+    GREEN=""; RED=""; YELLOW=""; RESET=""
+fi
+
+log()  { printf "%s\n" "$*"; }
+ok()   { printf "%s[OK]%s %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%s[WARN]%s %s\n" "$YELLOW" "$RESET" "$*"; }
+err()  { printf "%s[ERRO]%s %s\n" "$RED" "$RESET" "$*" >&2; }
+
+# Variáveis fornecidas pelo adm:
+#   ROOTFS
+#   ADM_CATEGORY
+#   ADM_PKG_NAME
+#   ADM_LIBC
+#   ADM_PKG_VERSION
+
+[ -n "${ROOTFS:-}" ] || { err "ROOTFS não definido no hook"; exit 1; }
+
+TOOLS_DIR="${ROOTFS}/tools"
+BIN_DIR="${TOOLS_DIR}/bin"
+
+# Triplet alvo padrão (se não vier de fora)
+: "${LFS_TGT:="$(uname -m)-lfs-linux-gnu"}"
+
+GCC_BIN="${BIN_DIR}/${LFS_TGT}-gcc"
+
+log "== Sanity-check do pacote ${ADM_CATEGORY}/${ADM_PKG_NAME} (${ADM_PKG_VERSION}, libc=${ADM_LIBC}) =="
+
+# 1) Checar diretórios esperados
+if [ ! -d "$TOOLS_DIR" ]; then
+    err "Diretório esperado ${TOOLS_DIR} não existe. Instalação incorreta."
+    exit 1
+fi
+
+if [ ! -d "$BIN_DIR" ]; then
+    err "Diretório esperado ${BIN_DIR} não existe. GCC não foi instalado em /tools/bin."
+    exit 1
+fi
+
+ok "Diretórios /tools e /tools/bin encontrados no ROOTFS"
+
+# 2) Checar binário ${LFS_TGT}-gcc
+if [ ! -x "$GCC_BIN" ]; then
+    err "Binário essencial NÃO encontrado ou não executável: ${GCC_BIN}"
+    exit 1
+fi
+ok "Encontrado: ${GCC_BIN}"
+
+# 3) Checar se responde --version
+if "$GCC_BIN" --version >/dev/null 2>&1; then
+    ver="$("$GCC_BIN" --version | head -n1 || true)"
+    ok "${LFS_TGT}-gcc responde: ${ver}"
+else
+    err "Falha ao executar ${GCC_BIN} --version"
+    exit 1
+fi
+
+# 4) Compilar um dummy.c em modo somente compilação (-c) e checar ELF
+WORKDIR="$(mktemp -d "/tmp/gcc-pass1-sanity.XXXXXX")"
+cleanup() {
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT INT TERM
+
+cd "$WORKDIR"
+
+cat > dummy.c << 'EOF'
+int main(void) { return 0; }
+EOF
+
+ok "Compilando dummy.c com ${LFS_TGT}-gcc (somente objeto, sem linkar)..."
+if ! "$GCC_BIN" -c dummy.c -o dummy.o >/dev/null 2>&1; then
+    err "Falha ao compilar dummy.c com ${GCC_BIN} (modo -c)."
+    exit 1
+fi
+
+if [ ! -f dummy.o ]; then
+    err "dummy.o não foi gerado, algo está errado com o GCC pass1."
+    exit 1
+fi
+
+if command -v file >/dev/null 2>&1; then
+    desc="$(file dummy.o 2>/dev/null || true)"
+    echo "  file dummy.o => ${desc}"
+    echo "$desc" | grep -qi 'ELF' || {
+        err "dummy.o não parece ser um objeto ELF. Verifique a toolchain."
+        exit 1
+    }
+    ok "dummy.o é um objeto ELF válido."
+else
+    warn "'file' não está disponível; não foi possível confirmar que dummy.o é ELF."
+fi
+
+# 5) Aviso sobre PATH
+case ":$PATH:" in
+    *":${BIN_DIR}:"*)
+        ok "/tools/bin está no PATH atual."
+        ;;
+    *)
+        warn "/tools/bin NÃO está no PATH atual. Em ambiente LFS, use: export PATH=/tools/bin:\$PATH"
+        ;;
+esac
+
+ok "Sanity-check do GCC-15.2.0 - Pass 1 concluído com sucesso."
+exit 0
