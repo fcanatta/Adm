@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# automake-1.18.1.post_install
+#
+# Sanity-check para GNU Automake 1.18.1 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/automake existe e é executável
+#   - se ${ADM_ROOTFS}/usr/bin/aclocal existe e é executável
+#   - se 'automake --version' e 'aclocal --version' funcionam
+#   - se um projeto simples pode ser processado (aclocal + automake)
+
+set -euo pipefail
+
+echo "==> [automake-1.18.1 post_install] Iniciando sanity checks do automake..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+
+case "$ROOTFS" in
+  /) ;; 
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+AUTOMAKE_BIN="${ROOTFS}/usr/bin/automake"
+ACLOCAL_BIN="${ROOTFS}/usr/bin/aclocal"
+
+# ---------------------------------------
+# 2. Verificar binários principais
+# ---------------------------------------
+
+if [[ ! -x "$AUTOMAKE_BIN" ]]; then
+  echo "ERRO: ${AUTOMAKE_BIN} não existe ou não é executável."
+  exit 1
+fi
+
+echo "    OK: automake encontrado: ${AUTOMAKE_BIN}"
+
+if [[ ! -x "$ACLOCAL_BIN" ]]; then
+  echo "ERRO: ${ACLOCAL_BIN} não existe ou não é executável."
+  exit 1
+fi
+
+echo "    OK: aclocal encontrado: ${ACLOCAL_BIN}"
+
+# ---------------------------------------
+# 3. Testar --version
+# ---------------------------------------
+
+echo "    Testando '${AUTOMAKE_BIN} --version'..."
+if ! "$AUTOMAKE_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: automake --version falhou."
+  exit 1
+fi
+
+version_line_a="$("$AUTOMAKE_BIN" --version | head -n1 || true)"
+echo "    Versão automake: ${version_line_a}"
+
+echo "    Testando '${ACLOCAL_BIN} --version'..."
+if ! "$ACLOCAL_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: aclocal --version falhou."
+  exit 1
+fi
+
+version_line_b="$("$ACLOCAL_BIN" --version | head -n1 || true)"
+echo "    Versão aclocal: ${version_line_b}"
+
+# ---------------------------------------
+# 4. Teste funcional: automake + aclocal
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t automake-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+echo "    Criando projeto fictício para teste..."
+
+cat > "${tmpdir}/configure.ac" << 'EOF'
+AC_INIT([testpkg], [1.0], [test@example.com])
+AM_INIT_AUTOMAKE([foreign])
+AC_PROG_CC
+AC_CONFIG_FILES([Makefile])
+AC_OUTPUT
+EOF
+
+cat > "${tmpdir}/Makefile.am" << 'EOF'
+bin_PROGRAMS = hello
+hello_SOURCES = hello.c
+EOF
+
+cat > "${tmpdir}/hello.c" << 'EOF'
+#include <stdio.h>
+int main(void) { puts("AUTOMAKE_SANITY_OK"); return 0; }
+EOF
+
+echo "    Rodando aclocal..."
+(
+  cd "$tmpdir"
+  "$ACLOCAL_BIN"
+)
+
+echo "    Rodando automake --add-missing..."
+(
+  cd "$tmpdir"
+  "$AUTOMAKE_BIN" --add-missing
+)
+
+if [[ ! -f "${tmpdir}/Makefile.in" ]]; then
+  echo "ERRO: automake não gerou Makefile.in."
+  exit 1
+fi
+
+echo "    OK: Makefile.in gerado com sucesso."
+
+echo "==> [automake-1.18.1 post_install] Sanity checks concluídos com SUCESSO."
