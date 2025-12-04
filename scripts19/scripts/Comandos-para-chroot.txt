@@ -1,0 +1,4 @@
+export ADM_ROOTFS=/opt/systems/glibc-root   # ou /opt/systems/musl-root
+export ADM_ROOT=/mnt/adm                    # onde está seu repo/scripts
+sudo ./adm-chroot.sh setup
+sudo ./adm-chroot.sh enter
