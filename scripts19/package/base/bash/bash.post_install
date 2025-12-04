@@ -5,9 +5,11 @@
 #
 # Verifica:
 #   - se ${ADM_ROOTFS}/usr/bin/bash existe e é executável
+#   - se /bin/bash existe (informativo)
 #   - se 'bash --version' funciona
-#   - se executa um script simples com sucesso
-#   - (informativo) se /bin/bash existe (muitos scripts esperam isso)
+#   - se, HAVENDO libreadline.so em ${ADM_ROOTFS}/usr/lib e havendo 'ldd',
+#     o bash está linkado contra libreadline
+#   - se um script simples roda corretamente
 
 set -euo pipefail
 
@@ -27,6 +29,7 @@ echo "    ADM_ROOTFS = ${ROOTFS}"
 
 BASH_USR_BIN="${ROOTFS}/usr/bin/bash"
 BASH_BIN="${ROOTFS}/bin/bash"
+LIBDIR="${ROOTFS}/usr/lib"
 
 # ---------------------------------------
 # 2. Verificar /usr/bin/bash
@@ -75,7 +78,57 @@ if ! echo "$version_line" | grep -q "5.3"; then
 fi
 
 # ---------------------------------------
-# 5. Executar um script simples com bash
+# 5. Verificar linkagem com libreadline (se existir)
+# ---------------------------------------
+
+READLINE_PRESENT=0
+
+if [[ -d "$LIBDIR" ]]; then
+  shopt -s nullglob
+  rl_libs=( "${LIBDIR}"/libreadline.so* )
+  shopt -u nullglob
+
+  if [[ ${#rl_libs[@]} -gt 0 ]]; then
+    READLINE_PRESENT=1
+    echo "    Detected libreadline em ${LIBDIR}:"
+    for f in "${rl_libs[@]}"; do
+      echo "      ${f}"
+    done
+  fi
+fi
+
+if [[ "$READLINE_PRESENT" -eq 1 ]]; then
+  if command -v ldd >/dev/null 2>&1; then
+    echo "    Verificando com 'ldd' se o bash está linkado contra libreadline..."
+
+    ldd_out="$(ldd "$BASH_USR_BIN" 2>/dev/null || true)"
+
+    if echo "$lddd_out" >/dev/null 2>&1; then :; fi  # noop pra evitar shellcheck chato
+
+    if ! echo "$ldd_out" | grep -q "libreadline"; then
+      echo "ERRO: libreadline.so existe em ${LIBDIR}, mas 'ldd' no bash"
+      echo "      não mostra dependência de libreadline."
+      echo "      Isso indica que o bash NÃO está usando a readline externa"
+      echo "      (ou algo deu errado no link)."
+      echo
+      echo "Saída de ldd:"
+      echo "$ldd_out"
+      exit 1
+    fi
+
+    echo "    OK: 'ldd' mostra libreadline linkada ao bash."
+  else
+    echo "    AVISO: 'ldd' não encontrado no PATH do host."
+    echo "           Não foi possível verificar linkagem com libreadline."
+  fi
+else
+  echo "    AVISO: libreadline.so* não encontrada em ${LIBDIR}."
+  echo "           Se você esperava que o bash usasse readline externa,"
+  echo "           verifique se o pacote readline foi instalado neste root."
+fi
+
+# ---------------------------------------
+# 6. Executar um script simples com bash
 # ---------------------------------------
 
 tmpdir="$(mktemp -d -t bash-5.3-sanity-XXXXXX)"
