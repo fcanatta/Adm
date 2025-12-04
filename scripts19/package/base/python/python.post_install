@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# python-3.14.0.post_install
+#
+# Sanity-check para Python 3.14.0 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/python3.14 existe e é executável
+#   - se ${ADM_ROOTFS}/usr/bin/python3 existe (symlink ou bin)
+#   - se 'python3.14 --version' funciona
+#   - se o diretório /usr/lib/python3.14 existe
+#   - se um script simples em Python roda corretamente
+#   - se o módulo ensurepip está disponível
+
+set -euo pipefail
+
+echo "==> [python-3.14.0 post_install] Iniciando sanity checks do Python 3.14..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+PY_BIN_DIR="${ROOTFS}/usr/bin"
+PY_LIB_DIR="${ROOTFS}/usr/lib"
+
+PYTHON314_BIN="${PY_BIN_DIR}/python3.14"
+PYTHON3_BIN="${PY_BIN_DIR}/python3"
+
+# ---------------------------------------
+# 2. Verificar /usr/bin/python3.14
+# ---------------------------------------
+
+if [[ ! -x "$PYTHON314_BIN" ]]; then
+  if [[ -e "$PYTHON314_BIN" ]]; then
+    echo "ERRO: ${PYTHON314_BIN} existe mas não é executável."
+  else
+    echo "ERRO: binário ${PYTHON314_BIN} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: python3.14 encontrado: ${PYTHON314_BIN}"
+
+# ---------------------------------------
+# 3. Verificar /usr/bin/python3 (informativo)
+# ---------------------------------------
+
+if [[ -x "$PYTHON3_BIN" ]]; then
+  echo "    OK: python3 encontrado: ${PYTHON3_BIN}"
+else
+  echo "    AVISO: /usr/bin/python3 não existe."
+  echo "           Recomenda-se ter um symlink python3 -> python3.14."
+fi
+
+# ---------------------------------------
+# 4. Testar 'python3.14 --version'
+# ---------------------------------------
+
+echo "    Testando '${PYTHON314_BIN} --version'..."
+if ! "$PYTHON314_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: 'python3.14 --version' falhou."
+  exit 1
+fi
+
+version_line="$("$PYTHON314_BIN" --version 2>/dev/null || true)"
+echo "    Versão reportada: ${version_line}"
+
+if ! echo "$version_line" | grep -q "3.14"; then
+  echo "    AVISO: '--version' não contém '3.14'."
+  echo "           Verifique se este é o Python que você esperava."
+fi
+
+# ---------------------------------------
+# 5. Verificar /usr/lib/python3.14
+# ---------------------------------------
+
+PYTHON314_LIBDIR="${PY_LIB_DIR}/python3.14"
+
+if [[ ! -d "$PYTHON314_LIBDIR" ]]; then
+  echo "ERRO: diretório ${PYTHON314_LIBDIR} não existe."
+  echo "      A biblioteca padrão do Python parece não estar instalada."
+  exit 1
+fi
+
+echo "    OK: diretório da stdlib encontrado: ${PYTHON314_LIBDIR}"
+
+# ---------------------------------------
+# 6. Teste funcional com script simples
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t python-3.14-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+TEST_SCRIPT="${tmpdir}/test.py"
+
+cat > "$TEST_SCRIPT" << 'EOF'
+import sys
+
+if sys.version_info.major == 3 and sys.version_info.minor == 14:
+    print("PYTHON_SANITY_OK")
+else:
+    print("PYTHON_VERSION_UNEXPECTED:", sys.version)
+EOF
+
+echo "    Executando script de teste com python3.14 ..."
+output="$("$PYTHON314_BIN" "$TEST_SCRIPT" 2>/dev/null | tr -d '[:space:]' || true)"
+
+if [[ "$output" != "PYTHON_SANITY_OK" ]]; then
+  echo "ERRO: script de teste não retornou saída esperada."
+  echo "      Esperado: 'PYTHON_SANITY_OK'"
+  echo "      Obtido:   '${output}'"
+  exit 1
+fi
+
+echo "    OK: Python 3.14 executou script de teste corretamente."
+
+# ---------------------------------------
+# 7. Verificar ensurepip (pip embutido)
+# ---------------------------------------
+#
+# Não vamos chamar ensurepip de novo com --upgrade, só verificar que
+# o módulo existe e pode ser importado.
+
+echo "    Verificando disponibilidade do módulo ensurepip..."
+
+ENSUREPIP_TEST="${tmpdir}/ensurepip_test.py"
+
+cat > "$ENSUREPIP_TEST" << 'EOF'
+try:
+    import ensurepip
+    print("ENSUREPIP_OK")
+except Exception as e:
+    print("ENSUREPIP_FAIL", repr(e))
+EOF
+
+ens_output="$("$PYTHON314_BIN" "$ENSUREPIP_TEST" 2>/dev/null | tr -d '[:space:]' || true)"
+
+if [[ "$ens_output" != "ENSUREPIP_OK" ]]; then
+  echo "AVISO: módulo ensurepip não parece disponível ou falhou ao importar."
+  echo "       Saída: ${ens_output}"
+else
+  echo "    OK: módulo ensurepip disponível."
+fi
+
+echo "==> [python-3.14.0 post_install] Sanity checks concluídos com SUCESSO."
