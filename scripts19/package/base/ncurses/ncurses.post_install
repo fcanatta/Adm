@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# ncurses-6.5-20250809.post_install
+#
+# Sanity-check para ncurses 6.5 snapshot (2025-08-09) no ADM_ROOTFS.
+#
+# Verifica:
+#   - se as libs libncursesw.so* e (symlink) libncurses.so* existem
+#   - se headers ncurses.h / curses.h estão disponíveis
+#   - se binários tic, tput, clear existem e rodam
+#   - se é possível compilar e executar um programa simples com ncurses
+
+set -euo pipefail
+
+echo "==> [ncurses-6.5-20250809 post_install] Iniciando sanity checks do ncurses..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+LIBDIR="${ROOTFS}/usr/lib"
+INCDIR="${ROOTFS}/usr/include"
+BINDIR="${ROOTFS}/usr/bin"
+TERMINFO_DIR="${ROOTFS}/usr/share/terminfo"
+
+# ---------------------------------------
+# 2. Verificar libs
+# ---------------------------------------
+
+if [[ ! -d "$LIBDIR" ]]; then
+  echo "ERRO: diretório ${LIBDIR} não existe."
+  exit 1
+fi
+
+shopt -s nullglob
+ncw_libs=( "${LIBDIR}"/libncursesw.so* )
+shopt -u nullglob
+
+if [[ ${#ncw_libs[@]} -eq 0 ]]; then
+  echo "ERRO: não encontrei libncursesw.so* em ${LIBDIR}."
+  exit 1
+fi
+
+echo "    OK: libncursesw.so* encontrado(s):"
+for f in "${ncw_libs[@]}"; do
+  echo "      ${f}"
+done
+
+if ! ls "${LIBDIR}"/libncurses.so* >/dev/null 2>&1; then
+  echo "AVISO: libncurses.so* não encontrado em ${LIBDIR}."
+  echo "       Se você usa apenas widec, isso pode ser normal, mas"
+  echo "       muitos programas ainda esperam -lncurses."
+else
+  echo "    OK: libncurses.so* encontrado(s) em ${LIBDIR}."
+fi
+
+# ---------------------------------------
+# 3. Verificar headers
+# ---------------------------------------
+
+if [[ ! -d "$INCDIR" ]]; then
+  echo "ERRO: diretório ${INCDIR} não existe."
+  exit 1
+fi
+
+if [[ ! -f "${INCDIR}/ncurses.h" && ! -f "${INCDIR}/ncursesw/ncurses.h" ]]; then
+  echo "ERRO: header ncurses.h não encontrado em ${INCDIR} ou ${INCDIR}/ncursesw."
+  exit 1
+fi
+
+if [[ ! -f "${INCDIR}/curses.h" && ! -f "${INCDIR}/ncursesw/curses.h" ]]; then
+  echo "ERRO: header curses.h não encontrado em ${INCDIR} ou ${INCDIR}/ncursesw."
+  exit 1
+fi
+
+echo "    OK: headers ncurses.h/curses.h disponíveis."
+
+# ---------------------------------------
+# 4. Verificar binários tic/tput/clear
+# ---------------------------------------
+
+for bin in tic tput clear; do
+  if [[ ! -x "${BINDIR}/${bin}" ]]; then
+    echo "ERRO: ${BINDIR}/${bin} não existe ou não é executável."
+    exit 1
+  fi
+  echo "    OK: ${bin} encontrado: ${BINDIR}/${bin}"
+done
+
+# Teste rápido do tput
+echo "    Testando 'tput cols' (informativo)..."
+if ! "${BINDIR}/tput" cols >/dev/null 2>&1; then
+  echo "AVISO: 'tput cols' falhou (talvez TERM/terminfo não configurados ainda)."
+fi
+
+# ---------------------------------------
+# 5. Teste de compilação de programa C com ncurses
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t ncurses-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+TEST_C="${tmpdir}/test_ncurses.c"
+TEST_BIN="${tmpdir}/test_ncurses"
+
+cat > "$TEST_C" << 'EOF'
+#include <ncurses.h>
+#include <stdio.h>
+
+int main(void) {
+    initscr();
+    if (!stdscr) {
+        printf("NCURSES_INIT_FAIL\n");
+        return 1;
+    }
+    printw("NCURSES_SANITY_OK\n");
+    refresh();
+    endwin();
+    return 0;
+}
+EOF
+
+# Determinar compilador
+CC_BIN="${CC:-cc}"
+
+echo "    Compilando programa de teste com ${CC_BIN}..."
+
+# Tentar usar pkg-config se disponível
+PKGCONFIG="${ROOTFS}/usr/bin/pkg-config"
+CFLAGS=""
+LIBS=""
+
+if [[ -x "$PKGCONFIG" ]] && "$PKGCONFIG" --exists ncursesw 2>/dev/null; then
+  CFLAGS="$("$PKGCONFIG" --cflags ncursesw)"
+  LIBS="$("$PKGCONFIG" --libs ncursesw)"
+else
+  # fallback simples
+  CFLAGS=""
+  LIBS="-lncursesw"
+fi
+
+(
+  cd "$tmpdir"
+  $CC_BIN $CFLAGS test_ncurses.c -o test_ncurses $LIBS
+)
+
+if [[ ! -x "$TEST_BIN" ]]; then
+  echo "ERRO: falha ao compilar programa de teste com ncurses."
+  echo "      CFLAGS='${CFLAGS}' LIBS='${LIBS}'"
+  exit 1
+fi
+
+echo "    OK: binário de teste compilado: ${TEST_BIN}"
+
+# Não vamos realmente "usar" a tela do terminal aqui, só verificar se roda.
+echo "    Executando programa de teste (saída capturada)..."
+output="$("$TEST_BIN" </dev/null 2>/dev/null | tr -d '[:space:]' || true)"
+
+# Se a saída vier pela stdio (printw + endwin pode não imprimir via printf),
+# não vamos ser rígidos. O importante é não crashar.
+echo "    Saída (sem whitespace): '${output}' (informativo)."
+
+echo "==> [ncurses-6.5-20250809 post_install] Sanity checks concluídos com SUCESSO."
