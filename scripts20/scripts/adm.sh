@@ -393,8 +393,8 @@ cmd_install() {
     local pre_hook="${pdir}/${pkg}.pre_install"
     local post_hook="${pdir}/${pkg}.post_install"
 
-    run_hook "pre_install" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
-    run_hook "post_install" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
+    # Hook de pré-instalação antes de tocar no filesystem
+    run_hook "pre_install" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
 
     log_info "Instalando ${PKG_TARBALL} em ${rootfs}"
     local filelist
@@ -420,7 +420,8 @@ cmd_install() {
         echo "\""
     } > "$meta"
 
-    run_hook_dir "post_install" "$post_dir" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
+    # Hook de pós-instalação depois de arquivos e metadados prontos
+    run_hook "post_install" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
 
     log_success "Instalado ${cat}/${pkg} (${PKG_VERSION:-?}, ${libc})"
 }
@@ -459,16 +460,16 @@ cmd_uninstall() {
     local pre_hook="${pdir}/${pkg}.pre_uninstall"
     local post_hook="${pdir}/${pkg}.post_uninstall"
 
+    # Hook de pré-desinstalação antes de modificar o filesystem
     run_hook "pre_uninstall" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
-    run_hook "post_uninstall" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
-    
+
     log_info "Removendo arquivos de ${target} (${libc})"
     while read -r path; do
         [ -n "$path" ] || continue
         rm -f "${rootfs}/${path}" || log_warn "Falha ao remover ${rootfs}/${path}"
     done < "$filesdb"
 
-    # tentar limpar diretórios vazios (best effort)
+    # Tentar limpar diretórios vazios (best effort)
     sort -r "$filesdb" | while read -r path; do
         local dir
         dir="$(dirname "$path")"
@@ -476,9 +477,11 @@ cmd_uninstall() {
         rmdir --ignore-fail-on-non-empty "${rootfs}/${dir}" 2>/dev/null || true
     done
 
-    run_hook_dir "post_uninstall" "$post_dir" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
-
+    # Remover metadados após remoção de arquivos
     rm -f "$meta" "$filesdb"
+
+    # Hook de pós-desinstalação depois da remoção
+    run_hook "post_uninstall" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
 
     log_success "Removido ${target} (${libc})"
 }
