@@ -1,0 +1,106 @@
+#!/usr/bin/env sh
+# Sanity-check para Binutils-2.45.1 - Pass 1
+# Executado pelo adm depois da instalação:
+#  ROOTFS, ADM_CATEGORY, ADM_PKG_NAME, ADM_LIBC, ADM_PKG_VERSION
+
+set -euf
+
+# Cores simples (se TTY)
+if [ -t 1 ]; then
+    GREEN="$(printf '\033[32m')"
+    RED="$(printf '\033[31m')"
+    YELLOW="$(printf '\033[33m')"
+    RESET="$(printf '\033[0m')"
+else
+    GREEN=""; RED=""; YELLOW=""; RESET=""
+fi
+
+log()  { printf '%s\n' "$*"; }
+ok()   { printf '%s[OK]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*"; }
+err()  { printf '%s[ERRO]%s %s\n' "$RED" "$RESET" "$*" >&2; }
+
+[ -n "${ROOTFS:-}" ] || { err "ROOTFS não definido no hook (bug no adm?)"; exit 1; }
+
+TOOLS_DIR="${ROOTFS}/tools"
+BIN_DIR="${TOOLS_DIR}/bin"
+
+# Triplet alvo (LFS_TGT). Se não vier de fora, usamos padrão.
+: "${LFS_TGT:="$(uname -m)-lfs-linux-gnu"}"
+
+LD_BIN="${BIN_DIR}/${LFS_TGT}-ld"
+AR_BIN="${BIN_DIR}/${LFS_TGT}-ar"
+AS_BIN="${BIN_DIR}/${LFS_TGT}-as"
+
+log "== Sanity-check de ${ADM_CATEGORY:-?}/${ADM_PKG_NAME:-?} (${ADM_PKG_VERSION:-?}, libc=${ADM_LIBC:-?}) =="
+
+# 1) Checar diretórios básicos
+if [ ! -d "$TOOLS_DIR" ]; then
+    err "Diretório ${TOOLS_DIR} não existe. Binutils não foi instalado em ROOTFS correto."
+    exit 1
+fi
+
+if [ ! -d "$BIN_DIR" ]; then
+    err "Diretório ${BIN_DIR} não existe. Algo errado com a instalação em /tools/bin."
+    exit 1
+fi
+ok "Diretórios base em ROOTFS encontrados: ${TOOLS_DIR} e ${BIN_DIR}"
+
+# 2) Checar arquivos principais
+missing=0
+
+for f in "$LD_BIN" "$AR_BIN" "$AS_BIN"; do
+    if [ ! -x "$f" ]; then
+        err "Binário esperado não encontrado ou não executável: $f"
+        missing=1
+    else
+        ok "Encontrado: $f"
+    fi
+done
+
+if [ "$missing" -ne 0 ]; then
+    err "Um ou mais binários principais do Binutils Pass 1 estão faltando."
+    exit 1
+fi
+
+# 3) Checar se são ELF executáveis
+if command -v file >/dev/null 2>&1; then
+    for f in "$LD_BIN" "$AR_BIN" "$AS_BIN"; do
+        desc="$(file "$f" 2>/dev/null || true)"
+        echo "  file $f -> $desc"
+        echo "$desc" | grep -qi 'ELF' || {
+            err "Arquivo $f não parece ELF. Verifique toolchain/compilação."
+            exit 1
+        }
+    done
+    ok "Todos os binários principais são ELF, como esperado."
+else
+    warn "'file' não encontrado; pulando checagem de tipo ELF."
+fi
+
+# 4) Rodar ${LFS_TGT}-ld --version para garantir que funciona
+if "$LD_BIN" --version >/dev/null 2>&1; then
+    ver="$("$LD_BIN" --version | head -n1 || true)"
+    ok "${LFS_TGT}-ld responde: ${ver}"
+else
+    err "Falha ao executar ${LD_BIN} --version. Binutils pode estar quebrado ou em diretório errado."
+    exit 1
+fi
+
+# 5) Opcional: mostrar onde está o ld que será usado se /tools estiver no PATH
+case ":$PATH:" in
+    *":${BIN_DIR}:"*)
+        maybe_ld="$(command -v "${LFS_TGT}-ld" 2>/dev/null || true)"
+        if [ -n "$maybe_ld" ]; then
+            ok "No PATH atual, ${LFS_TGT}-ld resolve para: ${maybe_ld}"
+        else
+            warn "${LFS_TGT}-ld não está no PATH, mas foi instalado corretamente em ${LD_BIN}."
+        fi
+        ;;
+    *)
+        warn "${BIN_DIR} não está no PATH atual. Em ambiente LFS, você provavelmente quer 'export PATH=/tools/bin:\$PATH'."
+        ;;
+esac
+
+ok "Sanity-check do Binutils-2.45.1 - Pass 1 concluído com sucesso."
+exit 0
