@@ -1,117 +1,71 @@
 #!/usr/bin/env bash
-# Script de construção do Iana-Etc para o adm
+# iana-etc-20251120.sh
 #
-# Caminho esperado:
-#   /mnt/adm/packages/base/iana-etc/iana-etc.sh
+# Pacote: Iana-Etc 20251120
 #
-# O adm fornece:
-#   SRC_DIR  : diretório com o source extraído do tarball
-#   DESTDIR  : raiz de instalação temporária (pkgroot)
-#   PROFILE  : glibc / musl / outro (string) -> aqui é só informativo
-#   NUMJOBS  : número de jobs para o make   -> não usamos aqui
+# Objetivo:
+#   - Instalar os arquivos 'services' e 'protocols' em /etc
+#     dentro do ADM_ROOTFS, via DESTDIR.
 #
-# Este script deve definir:
-#   PKG_VERSION
-#   SRC_URL
-#   função pkg_build()
+# Integração com adm:
+#   - Usa:
+#       SRC_DIR  -> diretório com o código-fonte extraído (iana-etc-20251120)
+#       DESTDIR  -> raiz fake usada para "make install"
+#       NUMJOBS  -> ignorado (não há build)
+#   - Não compila nada, apenas copia arquivos.
 #
-# Fonte usada: projeto Mic92/iana-etc, release 20251120. 
-#   - Gera arquivos /etc/protocols e /etc/services a partir dos dados da IANA.
-#   - README do projeto: "python3 update.py out" gera esses arquivos. 
+# Observação:
+#   - Se você já tiver /etc/services ou /etc/protocols, este script
+#     sobrescreve os arquivos no DESTDIR. Se quiser preservar, você
+#     pode adaptar para criar .bak ao invés de sobrescrever.
 
-#----------------------------------------
-# Versão e origem
-#----------------------------------------
 PKG_VERSION="20251120"
 
-# Tarball de release do GitHub (auto-gerado a partir da tag):
-# O arquivo terá nome iana-etc-${PKG_VERSION}.tar.gz com diretório raiz iana-etc-${PKG_VERSION}
-SRC_URL="https://github.com/Mic92/iana-etc/archive/refs/tags/${PKG_VERSION}.tar.gz"
+# URL segue o padrão da IANA (ajuste se preferir outro mirror)
+SRC_URL="https://www.iana.org/assignments/iana-etc/iana-etc-${PKG_VERSION}.tar.gz"
+SRC_MD5=""
 
 pkg_build() {
-  set -euo pipefail
+    # Variáveis fornecidas pelo adm:
+    #   SRC_DIR, DESTDIR
+    cd "$SRC_DIR"
 
-  echo "==> [iana-etc] Build iniciado"
-  echo "    Versão  : ${PKG_VERSION}"
-  echo "    SRC_DIR : ${SRC_DIR}"
-  echo "    DESTDIR : ${DESTDIR}"
-  echo "    PROFILE : ${PROFILE:-desconhecido}"
+    : "${ADM_ROOTFS:=/}"
+    case "$ADM_ROOTFS" in
+      /) ;;
+      */) ADM_ROOTFS="${ADM_ROOTFS%/}" ;;
+    esac
 
-  cd "$SRC_DIR"
+    echo ">> Iana-Etc versão ${PKG_VERSION}"
+    echo ">> ADM_ROOTFS = ${ADM_ROOTFS}"
+    echo ">> DESTDIR    = ${DESTDIR}"
 
-  #------------------------------------
-  # PROFILE é só informativo
-  #------------------------------------
-  case "${PROFILE:-}" in
-    glibc|"")
-      echo "==> [iana-etc] PROFILE = glibc (ou vazio) – dados servem pra qualquer libc."
-      ;;
-    musl)
-      echo "==> [iana-etc] PROFILE = musl – dados de rede idem."
-      ;;
-    *)
-      echo "==> [iana-etc] PROFILE desconhecido (${PROFILE}), apenas log."
-      ;;
-  esac
-
-  #------------------------------------
-  # Instalação: queremos apenas /etc/protocols e /etc/services
-  #
-  # Cenário 1 (ideal/compatível com tarball estilo LFS):
-  #   - Já existem arquivos 'services' e 'protocols' no topo do source:
-  #     cp services protocols /etc
-  #
-  # Cenário 2 (tarball puro do GitHub):
-  #   - Só tem scripts; usamos 'python3 update.py out' como no README
-  #     e copiamos out/services e out/protocols.
-  #------------------------------------
-
-  mkdir -p "$DESTDIR/etc"
-
-  if [ -f "services" ] && [ -f "protocols" ]; then
-    # Estilo LFS antigo: iana-etc-*.tar.* com arquivos prontos
-    echo "==> [iana-etc] Encontrados arquivos 'services' e 'protocols' no source."
-    echo "==> [iana-etc] Copiando para $DESTDIR/etc"
-    install -m 0644 services   "$DESTDIR/etc/services"
-    install -m 0644 protocols  "$DESTDIR/etc/protocols"
-  else
-    echo "==> [iana-etc] Arquivos 'services' e 'protocols' não encontrados no topo do source."
-    echo "==> [iana-etc] Tentando gerar usando update.py (formato Mic92/iana-etc)."
-
-    if [ ! -f "update.py" ]; then
-      echo "ERRO: update.py não encontrado no source e não há 'services'/'protocols' prontos."
-      echo "      Verifique se o tarball corresponde ao projeto Mic92/iana-etc ou a um tarball LFS."
-      exit 1
+    # Conferir se os arquivos necessários existem no tarball
+    if [[ ! -f services ]]; then
+        echo "ERRO: arquivo 'services' não encontrado em ${SRC_DIR}."
+        exit 1
     fi
 
-    # Verifica python3
-    local PYTHON_BIN="${PYTHON3:-python3}"
-    if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-      echo "ERRO: python3 não encontrado no PATH (nem PYTHON3=custom)."
-      echo "      É necessário para rodar update.py e gerar services/protocols."
-      exit 1
+    if [[ ! -f protocols ]]; then
+        echo "ERRO: arquivo 'protocols' não encontrado em ${SRC_DIR}."
+        exit 1
     fi
 
-    echo "==> [iana-etc] Usando $PYTHON_BIN para rodar update.py"
-    local OUTDIR
-    OUTDIR="$(pwd)/out"
+    # Criar diretório /etc dentro do DESTDIR
+    ETC_DIR="${DESTDIR}/etc"
+    mkdir -pv "${ETC_DIR}"
 
-    rm -rf "$OUTDIR"
-    mkdir -p "$OUTDIR"
+    # Opcional: se quiser preservar versões anteriores no DESTDIR, descomente:
+    # for f in services protocols; do
+    #     if [[ -f "${ETC_DIR}/${f}" ]]; then
+    #         mv -v "${ETC_DIR}/${f}" "${ETC_DIR}/${f}.bak-$(date +%s)"
+    #     fi
+    # done
 
-    # Conforme README do projeto: "python3 update.py out" 
-    "$PYTHON_BIN" update.py "$OUTDIR"
+    # Copiar arquivos para /etc no DESTDIR
+    echo ">> Instalando 'services' e 'protocols' em ${ETC_DIR} ..."
+    install -vm 644 services   "${ETC_DIR}/services"
+    install -vm 644 protocols "${ETC_DIR}/protocols"
 
-    if [ ! -f "$OUTDIR/services" ] || [ ! -f "$OUTDIR/protocols" ]; then
-      echo "ERRO: update.py foi executado, mas $OUTDIR/services ou $OUTDIR/protocols não existem."
-      exit 1
-    fi
-
-    echo "==> [iana-etc] Copiando services e protocols gerados para $DESTDIR/etc"
-    install -m 0644 "$OUTDIR/services"   "$DESTDIR/etc/services"
-    install -m 0644 "$OUTDIR/protocols"  "$DESTDIR/etc/protocols"
-  fi
-
-  echo "==> [iana-etc] Instalação concluída em $DESTDIR/etc"
-  echo "==> [iana-etc] Build do Iana-Etc-${PKG_VERSION} finalizado com sucesso."
+    echo ">> Iana-Etc ${PKG_VERSION} instalado em DESTDIR=${DESTDIR}/etc."
 }
