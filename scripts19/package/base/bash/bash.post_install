@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# bash-5.3.post_install
+#
+# Sanity-check para GNU Bash 5.3 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/bash existe e é executável
+#   - se 'bash --version' funciona
+#   - se executa um script simples com sucesso
+#   - (informativo) se /bin/bash existe (muitos scripts esperam isso)
+
+set -euo pipefail
+
+echo "==> [bash-5.3 post_install] Iniciando sanity checks do bash..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+BASH_USR_BIN="${ROOTFS}/usr/bin/bash"
+BASH_BIN="${ROOTFS}/bin/bash"
+
+# ---------------------------------------
+# 2. Verificar /usr/bin/bash
+# ---------------------------------------
+
+if [[ ! -x "$BASH_USR_BIN" ]]; then
+  if [[ -e "$BASH_USR_BIN" ]]; then
+    echo "ERRO: ${BASH_USR_BIN} existe mas não é executável."
+  else
+    echo "ERRO: binário ${BASH_USR_BIN} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: binário encontrado e executável: ${BASH_USR_BIN}"
+
+# ---------------------------------------
+# 3. /bin/bash (informativo)
+# ---------------------------------------
+
+if [[ -x "$BASH_BIN" ]]; then
+  echo "    OK: /bin/bash existe: ${BASH_BIN}"
+else
+  echo "    AVISO: /bin/bash não existe em ${BASH_BIN}."
+  echo "           Muitos scripts assumem /bin/bash."
+  echo "           Você pode criar o symlink depois, por exemplo:"
+  echo "             ln -s ../usr/bin/bash ${ROOTFS}/bin/bash"
+fi
+
+# ---------------------------------------
+# 4. Testar 'bash --version'
+# ---------------------------------------
+
+echo "    Testando '${BASH_USR_BIN} --version'..."
+if ! "$BASH_USR_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: '${BASH_USR_BIN} --version' falhou."
+  exit 1
+fi
+
+version_line="$("$BASH_USR_BIN" --version | head -n1 || true)"
+echo "    Versão reportada: ${version_line}"
+
+if ! echo "$version_line" | grep -q "5.3"; then
+  echo "    AVISO: a primeira linha de '--version' não contém '5.3'."
+  echo "           Verifique se este é o bash que você esperava."
+fi
+
+# ---------------------------------------
+# 5. Executar um script simples com bash
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t bash-5.3-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+cat > "${tmpdir}/test.sh" << 'EOF'
+#!/usr/bin/env bash
+echo "BASH_SANITY_OK"
+exit 0
+EOF
+
+chmod +x "${tmpdir}/test.sh"
+
+echo "    Executando script de teste com ${BASH_USR_BIN} ..."
+output="$("$BASH_USR_BIN" "${tmpdir}/test.sh" | tr -d '[:space:]' || true)"
+
+if [[ "$output" != "BASH_SANITY_OK" ]]; then
+  echo "ERRO: script de teste não retornou saída esperada."
+  echo "      Esperado: 'BASH_SANITY_OK'"
+  echo "      Obtido:   '${output}'"
+  exit 1
+fi
+
+echo "    OK: bash executou script de teste corretamente."
+
+echo "==> [bash-5.3 post_install] Sanity checks concluídos com SUCESSO."
