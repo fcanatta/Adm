@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# file-5.46.post_install
+
+set -euo pipefail
+echo "==> [file-5.46] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+FILE_BIN="${ROOTFS}/usr/bin/file"
+
+if [[ ! -x "$FILE_BIN" ]]; then
+  echo "ERRO: $FILE_BIN não encontrado."
+  exit 1
+fi
+
+out="$("$FILE_BIN" /bin/sh 2>/dev/null || true)"
+
+if [[ -z "$out" ]]; then
+  echo "ERRO: comando 'file /bin/sh' não retornou nada."
+  exit 1
+fi
+
+echo "OK: file-5.46 instalado e funcional."
