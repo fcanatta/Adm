@@ -660,20 +660,28 @@ cmd_uninstall() {
 }
 
 cmd_list() {
-    printf "%-4s %-30s %-10s %-6s %-10s\n" "OK" "PACOTE" "VERSÃO" "LIBC" "CATEG."
-    printf "%-4s %-30s %-10s %-6s %-10s\n" "----" "------" "-------" "----" "------"
+    printf "%-5s %-30s %-15s %-10s %-20s\n" "OK" "PACOTE" "VERSÃO" "LIBC" "CATEG."
+    printf "%-5s %-30s %-15s %-10s %-20s\n" "-----" "------------------------------" "---------------" "----------" "--------------------"
+
     local meta
     for meta in "$DB_DIR"/*.meta; do
         [ -e "$meta" ] || continue
+
         unset PKG_ID PKG_NAME PKG_CATEGORY PKG_VERSION PKG_LIBC
-        # shellcheck disable=SC1090
-        . "$meta"
-        printf "%-4s %-30s %-10s %-6s %-10s\n" \
-            "[✔]" \
-            "${PKG_ID:-?}" \
-            "${PKG_VERSION:-?}" \
-            "${PKG_LIBC:-?}" \
-            "${PKG_CATEGORY:-?}"
+
+        # Carrega .meta com proteção: se falhar, avisa e pula
+        if ! . "$meta"; then
+            log_warn "Falha ao carregar meta $meta (arquivo inválido?), ignorando na listagem."
+            continue
+        fi
+
+        local id="${PKG_ID:-unknown}"
+        local name="${PKG_NAME:-unknown}"
+        local cat="${PKG_CATEGORY:-unknown}"
+        local ver="${PKG_VERSION:-unknown}"
+        local libc="${PKG_LIBC:-unknown}"
+
+        printf "%-5s %-30s %-15s %-10s %-20s\n" "[✔]" "$id" "$ver" "$libc" "$cat"
     done
 }
 
@@ -706,34 +714,42 @@ cmd_search() {
 
 cmd_info() {
     local name="$1"
-    ensure_repo
-    [ -d "$PKG_BASE_DIR" ] || die "Diretório de pacotes não encontrado: $PKG_BASE_DIR"
 
-    # Pode ser categoria/programa ou apenas programa
+    ensure_repo
+
+    if [ ! -d "$PKG_BASE_DIR" ]; then
+        die "Diretório de pacotes não encontrado: $PKG_BASE_DIR"
+    fi
+
     local matches=()
 
     if [[ "$name" == */* ]]; then
         local cat="${name%/*}"
         local pkg="${name##*/}"
         local dir="${PKG_BASE_DIR}/${cat}/${pkg}"
-        [ -d "$dir" ] || die "Pacote '$name' não encontrado."
+        if [ ! -d "$dir" ]; then
+            die "Pacote '${name}' não encontrado."
+        fi
         matches+=("${cat}|${pkg}|${dir}")
     else
+        local dir cat pkg
         while IFS= read -r -d '' dir; do
-            local pkg cat
             pkg="$(basename "$dir")"
             cat="$(basename "$(dirname "$dir")")"
-            [ "$pkg" = "$name" ] || continue
-            matches+=("${cat}|${pkg}|${dir}")
+            if [ "$pkg" = "$name" ]; then
+                matches+=("${cat}|${pkg}|${dir}")
+            fi
         done < <(find "$PKG_BASE_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
     fi
 
-    local count="${#matches[@]}"
-    [ "$count" -gt 0 ] || die "Pacote '$name' não encontrado."
+    if [ "${#matches[@]}" -eq 0 ]; then
+        die "Pacote '${name}' não encontrado."
+    fi
 
-    local m
-    for m in "${matches[@]}"; do
-        IFS='|' read -r cat pkg dir <<< "$m"
+    local entry cat pkg dir
+    for entry in "${matches[@]}"; do
+        IFS='|' read -r cat pkg dir <<< "$entry"
+
         local installed mark
         if pkg_is_installed_any_libc "$cat" "$pkg"; then
             installed="sim"
@@ -743,29 +759,34 @@ cmd_info() {
             mark="[    ]"
         fi
 
-        printf "%s %s%s/%s%s\n" "$mark" "$BOLD" "$cat" "$pkg" "$RESET"
-        printf "  Diretório:   %s\n" "$dir"
+        printf "%s%s/%s%s\n" "$mark " "$cat" "$pkg" "$RESET"
+        printf "  Diretório: %s\n" "$dir"
 
-        # Mostrar infos por libc
-        local meta
         local any_meta=0
+        local meta
         for meta in "${DB_DIR}/${cat}__${pkg}__"*.meta; do
             [ -f "$meta" ] || continue
             any_meta=1
+
             unset PKG_LIBC PKG_VERSION PKG_TARBALL
-            # shellcheck disable=SC1090
-            . "$meta"
-            printf "  - libc:      %s\n" "${PKG_LIBC:-?}"
-            printf "    versão:    %s\n" "${PKG_VERSION:-?}"
-            printf "    tarball:   %s\n" "${PKG_TARBALL:-?}"
+
+            # Carrega .meta com proteção
+            if ! . "$meta"; then
+                log_warn "Falha ao carregar meta $meta (arquivo inválido?), ignorando nesta saída."
+                continue
+            fi
+
+            printf "  - libc:      %s\n" "${PKG_LIBC:-unknown}"
+            printf "    versão:    %s\n" "${PKG_VERSION:-unknown}"
+            printf "    tarball:   %s\n" "${PKG_TARBALL:-unknown}"
         done
 
         if [ "$any_meta" -eq 0 ]; then
             printf "  Instaldo?:   %s\n" "$installed"
         fi
 
-        printf "  Script:      %s\n" "${dir}/${pkg}.sh"
-        printf "\n"
+        printf "  Script:     %s/%s.sh\n" "$dir" "$pkg"
+        echo
     done
 }
 
