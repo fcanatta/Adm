@@ -99,14 +99,22 @@ EOF
 check_requirements() {
     local reqs=(git find tar md5sum)
     local missing=0
+
     for bin in "${reqs[@]}"; do
         if ! command -v "$bin" >/dev/null 2>&1; then
             log_error "Dependência obrigatória não encontrada: $bin"
             missing=1
         fi
     done
+
+    # Pelo menos um compressor para empacotar (zstd ou xz)
+    if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
+        log_error "Nem zstd nem xz encontrados. Pelo menos um compressor é necessário para empacotar os builds."
+        missing=1
+    fi
+
     if [ "$missing" -ne 0 ]; then
-        die "Instale as dependências acima e tente novamente."
+        die "Instale as dependências obrigatórias e tente novamente."
     fi
 }
 
