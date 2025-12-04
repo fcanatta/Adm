@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# gcc-15.2.0.post_install
+#
+# Sanity-check para GCC final (15.2.0) no ADM_ROOTFS.
+#
+# Verifica:
+#   - ${TARGET_TRIPLET}-gcc existe e tem versão 15.2.0
+#   - caminhos de include não usam /usr/include do host (fora do sysroot)
+#   - compila dummy.c (C) e dummy.cpp (C++) com sucesso
+#   - verifica o program interpreter de dummy (informativo)
+
+set -euo pipefail
+
+echo "==> [gcc-15.2.0 post_install] Iniciando sanity checks do GCC final..."
+
+# ---------------------------------------------------------
+# 1. Variáveis de ambiente
+# ---------------------------------------------------------
+
+TARGET="${TARGET_TRIPLET:-}"
+if [[ -z "$TARGET" ]]; then
+  echo "ERRO: TARGET_TRIPLET não está definido."
+  echo "      Carregue o profile (ex.: 'source profile-glibc.sh' ou 'source profile-musl.sh')."
+  exit 1
+fi
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+: "${CROSS_SYSROOT:=${ROOTFS}}"
+
+echo "    TARGET_TRIPLET = ${TARGET}"
+echo "    ADM_ROOTFS     = ${ROOTFS}"
+echo "    CROSS_SYSROOT  = ${CROSS_SYSROOT}"
+
+GCC_BIN="${TARGET}-gcc"
+GXX_BIN="${TARGET}-g++"
+READELF_BIN="${TARGET}-readelf"
+
+if ! command -v "$GCC_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GCC_BIN}' no PATH."
+  echo "      Verifique se o PATH inclui ${ROOTFS}/usr/bin ou equivalente."
+  exit 1
+fi
+
+echo "    Encontrado GCC final: $(command -v "$GCC_BIN")"
+
+if ! command -v "$GXX_BIN" >/dev/null 2>&1; then
+  echo "ERRO: Não encontrei '${GXX_BIN}' no PATH."
+  echo "      A instalação do C++ front-end parece incompleta."
+  exit 1
+fi
+
+echo "    Encontrado G++ final: $(command -v "$GXX_BIN")"
+
+# ---------------------------------------------------------
+# 2. Verificar versão do GCC (deve ser 15.2.0)
+# ---------------------------------------------------------
+
+ver_line="$("$GCC_BIN" --version | head -n1 || true)"
+echo "    Versão reportada: ${ver_line}"
+
+if ! echo "$ver_line" | grep -q "15.2.0"; then
+  echo "AVISO: '${GCC_BIN} --version' não mostra '15.2.0'."
+  echo "       Verifique se este é realmente o GCC que você acabou de instalar."
+fi
+
+# ---------------------------------------------------------
+# 3. Checar include search paths (sem host fora do sysroot)
+# ---------------------------------------------------------
+
+tmp_inc="$(mktemp -t gcc-final-inc-XXXXXX)"
+cleanup_inc() { rm -f -- "$tmp_inc"; }
+trap cleanup_inc EXIT
+
+echo "    Coletando include search paths com '${GCC_BIN} -xc /dev/null -S -v'..."
+(
+  cd /
+  "$GCC_BIN" -xc /dev/null -S -v >/dev/null 2>"$tmp_inc" || true
+)
+
+echo "    Diretórios de include reportados:"
+awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc" \
+  | sed 's/^/      /'
+
+bad_host_inc=0
+while IFS= read -r line; do
+  dir="$(echo "$line" | sed 's/^[[:space:]]*//')"
+  [[ -z "$dir" ]] && continue
+
+  # Se CROSS_SYSROOT for "/", aceitamos /usr/include diretamente.
+  if [[ "$CROSS_SYSROOT" = "/" ]]; then
+    continue
+  fi
+
+  case "$dir" in
+    /usr/include*|/include*)
+      if [[ "$dir" != "${CROSS_SYSROOT}"* ]]; then
+        echo "ERRO: Include dir suspeito (host) detectado: $dir"
+        echo "      Esperado: includes sob ${CROSS_SYSROOT}/usr/include."
+        bad_host_inc=1
+      fi
+      ;;
+  esac
+done < <(awk '/#include <\.\.\.> search starts here:/{flag=1;next}/End of search list./{flag=0}flag' "$tmp_inc")
+
+if [[ "$bad_host_inc" -ne 0 ]]; then
+  echo "ERRO: GCC final ainda está enxergando includes do host."
+  exit 1
+fi
+
+# ---------------------------------------------------------
+# 4. Compilar dummy.c (C) e dummy.cpp (C++)
+# ---------------------------------------------------------
+
+tmp_build_dir="$(mktemp -d -t gcc-final-dummy-XXXXXX)"
+cleanup_build() { rm -rf -- "$tmp_build_dir"; }
+trap cleanup_build EXIT
+
+cat > "${tmp_build_dir}/dummy.c" << 'EOF'
+#include <stdio.h>
+
+int main(void) {
+    puts("gcc final C sanity OK");
+    return 0;
+}
+EOF
+
+cat > "${tmp_build_dir}/dummy.cpp" << 'EOF'
+#include <iostream>
+
+int main() {
+    std::cout << "gcc final C++ sanity OK\n";
+    return 0;
+}
+EOF
+
+echo "    Compilando dummy.c com ${GCC_BIN}..."
+(
+  cd "$tmp_build_dir"
+  "$GCC_BIN" dummy.c -o dummy-c
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy-c" ]]; then
+  echo "ERRO: falha ao gerar dummy-c com ${GCC_BIN}."
+  exit 1
+fi
+
+echo "    Binário C gerado: ${tmp_build_dir}/dummy-c"
+
+echo "    Compilando dummy.cpp com ${GXX_BIN}..."
+(
+  cd "$tmp_build_dir"
+  "$GXX_BIN" dummy.cpp -o dummy-cpp
+)
+
+if [[ ! -f "${tmp_build_dir}/dummy-cpp" ]]; then
+  echo "ERRO: falha ao gerar dummy-cpp com ${GXX_BIN}."
+  exit 1
+fi
+
+echo "    Binário C++ gerado: ${tmp_build_dir}/dummy-cpp"
+
+# ---------------------------------------------------------
+# 5. Inspeção opcional com readelf
+# ---------------------------------------------------------
+
+if command -v "$READELF_BIN" >/dev/null 2>&1; then
+  echo "    Inspecionando dummy-c com ${READELF_BIN} (informativo):"
+  "$READELF_BIN" -d "${tmp_build_dir}/dummy-c" | grep -E 'NEEDED|SONAME' || true
+  "$READELF_BIN" -l "${tmp_build_dir}/dummy-c" | awk '/Requesting program interpreter/ {print "      " $0}'
+
+  echo "    Inspecionando dummy-cpp com ${READELF_BIN} (informativo):"
+  "$READELF_BIN" -d "${tmp_build_dir}/dummy-cpp" | grep -E 'NEEDED|SONAME' || true
+  "$READELF_BIN" -l "${tmp_build_dir}/dummy-cpp" | awk '/Requesting program interpreter/ {print "      " $0}'
+else
+  echo "    AVISO: '${READELF_BIN}' não está no PATH; pulando inspeções com readelf."
+fi
+
+echo "==> [gcc-15.2.0 post_install] Sanity checks concluídos com SUCESSO."
