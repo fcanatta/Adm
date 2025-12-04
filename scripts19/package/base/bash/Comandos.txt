@@ -1,0 +1,5 @@
+source ./profile-glibc.sh   # ou profile-musl.sh
+export ADM_ROOTFS=/opt/systems/glibc-root
+
+adm build   bash-5.3
+adm install bash-5.3
