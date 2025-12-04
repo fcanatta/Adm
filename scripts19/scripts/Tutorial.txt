@@ -1,0 +1,47 @@
+Quando esse chroot vira “o ponto certo” pra usar o adm
+O fluxo recomendado com esse adm-chroot.sh é:
+
+1. Fora do chroot (no host), com ADM_ROOTFS apontando pro root alvo:
+# Exemplo glibc
+source ./profile-glibc.sh
+export ADM_ROOTFS=/opt/systems/glibc-root
+
+adm build   binutils-2.45.1-pass1
+adm install binutils-2.45.1-pass1
+
+adm build   gcc-15.2.0-pass1
+adm install gcc-15.2.0-pass1
+
+adm build   linux-6.17.9-api-headers
+adm install linux-6.17.9-api-headers
+
+adm build   glibc-2.42-pass1
+adm install glibc-2.42-pass1
+
+adm build   libstdc++-15.2.0-pass1
+adm install libstdc++-15.2.0-pass1
+
+# E pelo menos: bash, coreutils, sed, grep, etc. já instalados no root
+
+2. Quando esse root já tiver o mínimo, aí sim:
+
+export ADM_ROOTFS=/opt/systems/glibc-root
+export ADM_ROOT=/mnt/adm
+sudo ./adm-chroot.sh enter
+
+A partir daqui, você está dentro do sistema que está construindo, com:
+
+/usr/local/bin/adm funcionando,
+
+/mnt/adm com todos os scripts de pacote,
+
+/dev, /proc, /sys, /run montados,
+
+rede funcional (DNS, etc.).
+
+E então pode seguir instalando novos pacotes “de dentro”:
+
+adm install util-linux
+adm install procps-ng
+adm install vim
+# etc.
