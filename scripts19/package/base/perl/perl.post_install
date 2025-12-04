@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# perl-5.42.0.post_install
+#
+# Sanity-check para Perl 5.42.0 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/perl existe e é executável
+#   - se 'perl -v' funciona
+#   - se Config_heavy.pl existe (módulo de configuração do perl)
+#   - se um script simples em perl roda corretamente
+
+set -euo pipefail
+
+echo "==> [perl-5.42.0 post_install] Iniciando sanity checks do perl..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+PERL_BIN="${ROOTFS}/usr/bin/perl"
+
+# ---------------------------------------
+# 2. Verificar /usr/bin/perl
+# ---------------------------------------
+
+if [[ ! -x "$PERL_BIN" ]]; then
+  if [[ -e "$PERL_BIN" ]]; then
+    echo "ERRO: ${PERL_BIN} existe mas não é executável."
+  else
+    echo "ERRO: binário ${PERL_BIN} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: perl encontrado: ${PERL_BIN}"
+
+# ---------------------------------------
+# 3. Testar 'perl -v'
+# ---------------------------------------
+
+echo "    Testando '${PERL_BIN} -v'..."
+if ! "$PERL_BIN" -v >/dev/null 2>&1; then
+  echo "ERRO: 'perl -v' falhou."
+  exit 1
+fi
+
+version_line="$("$PERL_BIN" -v 2>/dev/null | head -n2 | tail -n1 || true)"
+echo "    Versão reportada (linha relevante): ${version_line}"
+
+# ---------------------------------------
+# 4. Verificar Config_heavy.pl
+# ---------------------------------------
+#
+# Config_heavy.pl fica em uma árvore como:
+#   /usr/lib/perl5/5.xx.x/x86_64-linux-thread-multi/Config_heavy.pl
+#   ou similar. Não vamos adivinhar o caminho exato; vamos procurar.
+
+echo "    Procurando Config_heavy.pl em ${ROOTFS}/usr/lib/perl5..."
+
+CONFIG_HEAVY_PATH="$(find "${ROOTFS}/usr/lib" -maxdepth 6 -type f -name 'Config_heavy.pl' 2>/dev/null | head -n1 || true)"
+
+if [[ -z "$CONFIG_HEAVY_PATH" ]]; then
+  echo "ERRO: Config_heavy.pl não encontrado sob ${ROOTFS}/usr/lib."
+  echo "      A instalação do perl pode estar incompleta."
+  exit 1
+fi
+
+echo "    OK: Config_heavy.pl encontrado em: ${CONFIG_HEAVY_PATH}"
+
+# ---------------------------------------
+# 5. Teste funcional com script simples
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t perl-5.42.0-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+TEST_SCRIPT="${tmpdir}/test.pl"
+
+cat > "$TEST_SCRIPT" << 'EOF'
+#!/usr/bin/env perl
+use strict;
+use warnings;
+print "PERL_SANITY_OK\n";
+EOF
+
+chmod +x "$TEST_SCRIPT"
+
+echo "    Executando script de teste com ${PERL_BIN} ..."
+output="$("$PERL_BIN" "$TEST_SCRIPT" 2>/dev/null | tr -d '[:space:]' || true)"
+
+if [[ "$output" != "PERL_SANITY_OK" ]]; then
+  echo "ERRO: script de teste não retornou saída esperada."
+  echo "      Esperado: 'PERL_SANITY_OK'"
+  echo "      Obtido:   '${output}'"
+  exit 1
+fi
+
+echo "    OK: perl executou script de teste corretamente."
+
+echo "==> [perl-5.42.0 post_install] Sanity checks concluídos com SUCESSO."
