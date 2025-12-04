@@ -368,6 +368,65 @@ resolve_pkg_single() {
     echo "${matches[0]}"
 }
 
+adm_finalize_build() {
+    # $1 = libc
+    # $2 = categoria
+    # $3 = pacote
+    local libc="$1" cat="$2" pkg="$3"
+
+    local buildinfo
+    buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
+
+    # Diretório de build / DESTDIR padrão
+    local build_root="${ADM_BUILD_ROOT:-/tmp/adm-build-${cat}-${pkg}-${libc}}"
+    local destdir="${ADM_DESTDIR:-${build_root}/destdir}"
+
+    [ -d "$destdir" ] || die "DESTDIR de build não encontrado para ${cat}/${pkg} (${libc}): $destdir"
+
+    log_info "Finalizando build de ${cat}/${pkg} (${libc}) a partir de ${destdir}"
+
+    # Strip de binários ELF dentro do DESTDIR
+    if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
+        log_info "Aplicando strip em binários ELF dentro de ${destdir}"
+        find "$destdir" -type f -perm -u+x -print0 | while IFS= read -r -d '' f; do
+            if file "$f" 2>/dev/null | grep -qi 'ELF'; then
+                strip --strip-unneeded "$f" 2>/dev/null || true
+            fi
+        done
+    else
+        log_warn "strip ou file não encontrados, pulando otimização de strip."
+    fi
+
+    mkdir -p "$CACHE_PKG"
+
+    # Escolher compressor: preferir zstd, senão xz
+    local tarball
+    if command -v zstd >/dev/null 2>&1; then
+        tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.zst"
+        log_info "Empacotando DESTDIR em ${tarball} (zstd -19 --long=31)..."
+        tar -C "$destdir" -I "zstd -19 --long=31" -cf "$tarball" .
+    else
+        tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.xz"
+        log_warn "zstd não encontrado, usando xz para ${tarball}"
+        tar -C "$destdir" -Jcf "$tarball" .
+    fi
+
+    # Versão: primeiro tenta ADM_PKG_VERSION, depois PKG_VERSION, senão "unknown"
+    local version="${ADM_PKG_VERSION:-${PKG_VERSION:-unknown}}"
+
+    log_info "Gravando buildinfo em ${buildinfo}"
+    cat > "$buildinfo" <<EOF
+PKG_ID="${cat}/${pkg}"
+PKG_NAME="${pkg}"
+PKG_CATEGORY="${cat}"
+PKG_VERSION="${version}"
+PKG_LIBC="${libc}"
+PKG_TARBALL="${tarball}"
+EOF
+
+    log_success "Empacotamento e registro de build concluídos para ${cat}/${pkg} (${libc})"
+}
+
 ### COMANDOS ###################################################################
 
 cmd_update_repo() {
@@ -396,20 +455,43 @@ cmd_build() {
     log_info "Build de ${cat}/${pkg} para libc=${libc}"
     load_profile "$libc"
 
+    # Resolver dependências de build (usa cmd_build/cmd_install recursivamente)
     resolve_build_deps "$libc" "$cat" "$pkg"
 
+    # Diretório de build/DESTDIR padrão para este pacote/libc
+    local build_root="/tmp/adm-build-${cat}-${pkg}-${libc}"
+    local destdir="${build_root}/destdir"
+
+    # Limpa build antigo e prepara diretórios
+    rm -rf "$build_root"
+    mkdir -p "$build_root" "$destdir" "$CACHE_SRC" "$CACHE_PKG"
+
+    # Exporta variáveis padrão para o script de build
     export ADM_CATEGORY="$cat"
     export ADM_PKG_NAME="$pkg"
     export ADM_LIBC="$libc"
     export ADM_ROOTFS="$rootfs"
     export ADM_CACHE_SRC="$CACHE_SRC"
     export ADM_CACHE_PKG="$CACHE_PKG"
+
+    # Caminho onde o adm vai gravar o buildinfo (via adm_finalize_build)
     export ADM_BUILDINFO
     ADM_BUILDINFO="$(buildinfo_path "$cat" "$pkg" "$libc")"
 
-    mkdir -p "$CACHE_SRC" "$CACHE_PKG"
+    # Comunicar ao script de build onde ele deve instalar (DESTDIR)
+    export ADM_BUILD_ROOT="$build_root"
+    export ADM_DESTDIR="$destdir"
 
+    # O script de build deve:
+    #   - usar ADM_CACHE_SRC para cache de fontes
+    #   - compilar
+    #   - instalar em \$ADM_DESTDIR (usando DESTDIR ou diretamente)
+    #   - opcionalmente definir ADM_PKG_VERSION
     bash "$build_script" build "$libc"
+
+    # Empacotamento e buildinfo agora são responsabilidade do adm.sh
+    adm_finalize_build "$libc" "$cat" "$pkg"
+
     log_success "Build concluído para ${cat}/${pkg} (${libc})"
 }
 
