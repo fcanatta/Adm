@@ -1,0 +1,14 @@
+# Como entra no seu fluxo com o adm (perfil musl)
+Exemplo de uso (fora ou dentro do chroot, tanto faz, desde que o TARGET-gcc já seja musl-cross ou musl-nativo):
+
+source ./profile-musl.sh
+export ADM_ROOTFS=/opt/systems/musl-root
+
+# Já deve ter:
+#   binutils-bootstrap
+#   gcc-bootstrap (musl)
+#   linux-headers
+#   (opcionalmente outros pacotes mínimos)
+
+adm build   musl-1.2.5
+adm install musl-1.2.5
