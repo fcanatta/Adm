@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# sed-4.9.post_install
+
+set -euo pipefail
+echo "==> [sed-4.9] sanity check"
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in /) ;; */) ROOTFS="${ROOTFS%/}" ;; esac
+
+SED_BIN="${ROOTFS}/usr/bin/sed"
+
+if [[ ! -x "$SED_BIN" ]]; then
+  echo "ERRO: $SED_BIN não encontrado ou não executável."
+  exit 1
+fi
+
+out="$("$SED_BIN" 's/foo/bar/' <<< 'foo' | tr -d '\n')"
+if [[ "$out" != "bar" ]]; then
+  echo "ERRO: sed não transformou 'foo' em 'bar'. Saída: '$out'"
+  exit 1
+fi
+
+echo "OK: sed-4.9 instalado e funcional."
