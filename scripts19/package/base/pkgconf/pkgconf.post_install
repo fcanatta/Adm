@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# pkgconf-2.5.1.post_install
+#
+# Sanity-check para pkgconf 2.5.1 no ADM_ROOTFS.
+#
+# Verifica:
+#   - se ${ADM_ROOTFS}/usr/bin/pkgconf existe e é executável
+#   - se ${ADM_ROOTFS}/usr/bin/pkg-config existe (binário ou symlink)
+#   - se 'pkgconf --version' funciona
+#   - se 'pkg-config' consegue ler um .pc de teste e produzir cflags/libs
+
+set -euo pipefail
+
+echo "==> [pkgconf-2.5.1 post_install] Iniciando sanity checks do pkgconf..."
+
+# ---------------------------------------
+# 1. Determinar ADM_ROOTFS
+# ---------------------------------------
+
+ROOTFS="${ADM_ROOTFS:-/}"
+case "$ROOTFS" in
+  /) ;;
+  */) ROOTFS="${ROOTFS%/}" ;;
+esac
+
+echo "    ADM_ROOTFS = ${ROOTFS}"
+
+BIN_DIR="${ROOTFS}/usr/bin"
+PKGCONF_BIN="${BIN_DIR}/pkgconf"
+PKGCONFIG_BIN="${BIN_DIR}/pkg-config"
+
+# ---------------------------------------
+# 2. Verificar /usr/bin/pkgconf
+# ---------------------------------------
+
+if [[ ! -x "$PKGCONF_BIN" ]]; then
+  if [[ -e "$PKGCONF_BIN" ]]; then
+    echo "ERRO: ${PKGCONF_BIN} existe mas não é executável."
+  else
+    echo "ERRO: binário ${PKGCONF_BIN} não encontrado."
+  fi
+  exit 1
+fi
+
+echo "    OK: pkgconf encontrado: ${PKGCONF_BIN}"
+
+# ---------------------------------------
+# 3. Verificar /usr/bin/pkg-config
+# ---------------------------------------
+
+if [[ -x "$PKGCONFIG_BIN" ]]; then
+  echo "    OK: pkg-config encontrado: ${PKGCONFIG_BIN}"
+else
+  echo "    AVISO: /usr/bin/pkg-config não existe ou não é executável."
+  echo "           Normalmente espera-se um symlink pkg-config -> pkgconf."
+fi
+
+# ---------------------------------------
+# 4. Testar 'pkgconf --version'
+# ---------------------------------------
+
+echo "    Testando '${PKGCONF_BIN} --version'..."
+if ! "$PKGCONF_BIN" --version >/dev/null 2>&1; then
+  echo "ERRO: 'pkgconf --version' falhou."
+  exit 1
+fi
+
+version_line="$("$PKGCONF_BIN" --version 2>/dev/null || true)"
+echo "    Versão reportada: ${version_line}"
+
+# ---------------------------------------
+# 5. Teste funcional: .pc de teste
+# ---------------------------------------
+
+tmpdir="$(mktemp -d -t pkgconf-sanity-XXXXXX)"
+cleanup() { rm -rf -- "$tmpdir"; }
+trap cleanup EXIT
+
+PC_DIR="${tmpdir}/pkgconfig"
+mkdir -pv "${PC_DIR}"
+
+cat > "${PC_DIR}/testlib.pc" << 'EOF'
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: testlib
+Description: Test library for pkgconf sanity
+Version: 1.0
+Cflags: -I${includedir}/testlib
+Libs: -L${libdir} -ltestlib
+EOF
+
+# Vamos apontar PKG_CONFIG_PATH para o diretório de teste
+export PKG_CONFIG_PATH="${PC_DIR}"
+
+echo "    Rodando 'pkgconf --cflags --libs testlib'..."
+cflags_libs="$("$PKGCONF_BIN" --cflags --libs testlib 2>/dev/null || true)"
+
+if [[ -z "$cflags_libs" ]]; then
+  echo "ERRO: pkgconf não retornou nada para testlib.pc."
+  exit 1
+fi
+
+echo "    Saída de cflags/libs: ${cflags_libs}"
+
+case "$cflags_libs" in
+  *"-I/usr/include/testlib"*"-L/usr/lib"*"-ltestlib"*)
+    echo "    OK: pkgconf interpretou testlib.pc corretamente."
+    ;;
+  *)
+    echo "AVISO: saída de pkgconf para testlib.pc não bate com o esperado."
+    echo "       Ainda assim, pkgconf parece funcional; revise se necessário."
+    ;;
+esac
+
+# Se pkg-config existir, testar também
+if [[ -x "$PKGCONFIG_BIN" ]]; then
+  echo "    Testando 'pkg-config --cflags --libs testlib'..."
+  pc_cflags_libs="$("$PKGCONFIG_BIN" --cflags --libs testlib 2>/dev/null || true)"
+  if [[ -z "$pc_cflags_libs" ]]; then
+    echo "AVISO: pkg-config não retornou nada para testlib.pc."
+  else
+    echo "    Saída de pkg-config: ${pc_cflags_libs}"
+  fi
+fi
+
+echo "==> [pkgconf-2.5.1 post_install] Sanity checks concluídos com SUCESSO."
