@@ -206,20 +206,35 @@ find_reverse_deps() {
     done
 }
 
-run_hook_dir() {
-    local phase="$1" dir="$2" rootfs="$3" cat="$4" pkg="$5" libc="$6" version="$7"
-    [ -d "$dir" ] || return 0
-    log_info "Executando hooks de ${phase} em $dir"
-    local script
-    for script in "$dir"/*; do
-        [ -x "$script" ] || continue
-        ROOTFS="$rootfs" \
-        ADM_CATEGORY="$cat" \
-        ADM_PKG_NAME="$pkg" \
-        ADM_LIBC="$libc" \
-        ADM_PKG_VERSION="$version" \
-        sh "$script"
-    done
+run_hook() {
+    # $1 = phase (pre_install / post_install / pre_uninstall / post_uninstall)
+    # $2 = caminho do hook (arquivo único)
+    # $3 = rootfs
+    # $4 = cat
+    # $5 = pkg
+    # $6 = libc
+    # $7 = version
+    local phase="$1" hook="$2" rootfs="$3" cat="$4" pkg="$5" libc="$6" version="$7"
+
+    # Se não existir, não faz nada (hook opcional)
+    if [ -z "$hook" ] || [ ! -e "$hook" ]; then
+        return 0
+    fi
+
+    # Se existir mas não for executável, avisa e não roda
+    if [ ! -x "$hook" ]; then
+        log_warn "Hook ${phase} encontrado mas não executável: $hook (ignorando)"
+        return 0
+    fi
+
+    log_info "Executando hook ${phase}: ${hook}"
+
+    ROOTFS="$rootfs" \
+    ADM_CATEGORY="$cat" \
+    ADM_PKG_NAME="$pkg" \
+    ADM_LIBC="$libc" \
+    ADM_PKG_VERSION="$version" \
+    sh "$hook"
 }
 
 resolve_build_deps() {
@@ -375,10 +390,11 @@ cmd_install() {
 
     resolve_install_deps "$libc" "$cat" "$pkg"
 
-    local pre_dir="${pdir}/${pkg}.pre_install"
-    local post_dir="${pdir}/${pkg}.post_install"
+    local pre_hook="${pdir}/${pkg}.pre_install"
+    local post_hook="${pdir}/${pkg}.post_install"
 
-    run_hook_dir "pre_install" "$pre_dir" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
+    run_hook "pre_install" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
+    run_hook "post_install" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "$PKG_VERSION"
 
     log_info "Instalando ${PKG_TARBALL} em ${rootfs}"
     local filelist
@@ -440,11 +456,12 @@ cmd_uninstall() {
         die "Remoção abortada para evitar quebrar dependências."
     fi
 
-    local pre_dir="${pdir}/${pkg}.pre_uninstall"
-    local post_dir="${pdir}/${pkg}.post_uninstall"
+    local pre_hook="${pdir}/${pkg}.pre_uninstall"
+    local post_hook="${pdir}/${pkg}.post_uninstall"
 
-    run_hook_dir "pre_uninstall" "$pre_dir" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
-
+    run_hook "pre_uninstall" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+    run_hook "post_uninstall" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+    
     log_info "Removendo arquivos de ${target} (${libc})"
     while read -r path; do
         [ -n "$path" ] || continue
