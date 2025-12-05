@@ -1,0 +1,5 @@
+adm build toolchain/binutils-pass1 glibc
+adm install toolchain/binutils-pass1 glibc
+
+adm build toolchain/gcc-pass1 musl
+adm install toolchain/gcc-pass1 musl
