@@ -184,6 +184,7 @@ env_fingerprint() {
     data+="ADM_PROFILE=$ADM_PROFILE\n"
     data+="ADM_ROOTFS=$ADM_ROOTFS\n"
     data+="ADM_PERF_LEVEL=${ADM_PERF_LEVEL:-}\n"
+    data+="ADM_JOBS=${ADM_JOBS:-}\n"
     data+="CHOST=${CHOST:-}\n"
     data+="CC=${CC:-}\n"
     data+="CXX=${CXX:-}\n"
@@ -268,13 +269,46 @@ check_checksum() {
 download_one_source() {
     local url="$1"
     local checksum="$2"
-    local ctype="$3" # md5 ou sha256
+    local ctype="$3" # md5 ou sha256 (para arquivos); ignorado para git
     local pkgcache_dir="$ADM_SOURCES_DIR/$PKG_CATEGORY/$PKG_NAME"
 
     mkdir -p "$pkgcache_dir"
 
     local base
     base=$(basename "$url")
+
+    local stype
+    stype=$(detect_source_type "$url")
+
+    # --- Caso especial: fonte git (diretório, não arquivo) ---
+    if [[ "$stype" == "git" ]]; then
+        local gitdir="$pkgcache_dir/git-$(basename "$base" .git)"
+
+        if [[ -d "$gitdir/.git" ]]; then
+            log_info "Atualizando repositório git em cache: $gitdir"
+            (cd "$gitdir" && git fetch --all --prune) || \
+                die "Falha ao atualizar repositório git: $url"
+        else
+            log_info "Clonando repositório git: $url"
+            git clone "$url" "$gitdir" || die "Falha ao clonar: $url"
+        fi
+
+        # Se um "checksum" foi fornecido (commit/tag/branch) e não é SKIP,
+        # tenta assegurar que estamos exatamente nessa revisão.
+        if [[ -n "$checksum" && "$checksum" != "SKIP" ]]; then
+            (
+                cd "$gitdir"
+                if ! git checkout "$checksum"; then
+                    die "Falha ao dar checkout na revisão $checksum do repositório $url"
+                fi
+            )
+        fi
+
+        echo "$gitdir"
+        return 0
+    fi
+
+    # --- Demais tipos: arquivo em cache + checksum ---
     local dest="$pkgcache_dir/$base"
 
     if [[ -f "$dest" ]]; then
@@ -288,24 +322,9 @@ download_one_source() {
         fi
     fi
 
-    local stype
-    stype=$(detect_source_type "$url")
-
     log_info "Baixando source ($stype): $url"
 
     case "$stype" in
-        git)
-            # Clona em diretório separado, não em arquivo
-            local gitdir="$pkgcache_dir/git-$(basename "$base" .git)"
-            if [[ -d "$gitdir/.git" ]]; then
-                (cd "$gitdir" && git fetch --all --prune && git pull --rebase) || \
-                    die "Falha ao atualizar repositório git: $url"
-            else
-                git clone "$url" "$gitdir" || die "Falha ao clonar: $url"
-            fi
-            echo "$gitdir"
-            return 0
-            ;;
         rsync)
             rsync -av "$url" "$dest" || die "Falha rsync: $url"
             ;;
@@ -319,9 +338,14 @@ download_one_source() {
         file)
             cp -a "$url" "$dest" || die "Falha ao copiar: $url"
             ;;
+        *)
+            die "Tipo de source desconhecido: $stype"
+            ;;
     esac
 
-    check_checksum "$dest" "$checksum" "$ctype" || die "Checksum inválido após download: $dest"
+    check_checksum "$dest" "$checksum" "$ctype" || \
+        die "Checksum inválido após download: $dest"
+
     echo "$dest"
 }
 
@@ -452,11 +476,13 @@ prepare_sources() {
         extract_one "$src" "$ADM_PKG_SRCWORK"
     done
 
-    # Se a extração criou apenas um subdiretório, entra nele
-    local first_dir
-    first_dir=$(find "$ADM_PKG_SRCWORK" -mindepth 1 -maxdepth 1 -type d | head -n1 || true)
-    if [[ -n "$first_dir" ]]; then
-        ADM_PKG_SRCDIR="$first_dir"
+    # Se a extração criou apenas um subdiretório, entra nele;
+    # se tiver mais de um, usa o diretório raiz de work.
+    local -a dirs=()
+    mapfile -t dirs < <(find "$ADM_PKG_SRCWORK" -mindepth 1 -maxdepth 1 -type d)
+
+    if ((${#dirs[@]} == 1)); then
+        ADM_PKG_SRCDIR="${dirs[0]}"
     else
         ADM_PKG_SRCDIR="$ADM_PKG_SRCWORK"
     fi
