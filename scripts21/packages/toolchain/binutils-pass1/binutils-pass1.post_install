@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Hook: binutils-pass1.post_install
+# Sanity-check básico do Binutils cross (Pass 1)
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido no hook (esperado: ADM_ROOTFS)}"
+: "${LFS_TGT:?LFS_TGT não definido. Configure o perfil cross do ADM.}"
+
+LOG_PREFIX="[binutils-pass1 sanity-check]"
+
+echo "${LOG_PREFIX} ROOTFS=${ROOTFS}"
+echo "${LOG_PREFIX} LFS_TGT=${LFS_TGT}"
+
+CROSS_LD="${ROOTFS}/tools/bin/${LFS_TGT}-ld"
+
+if [[ ! -x "$CROSS_LD" ]]; then
+    echo "${LOG_PREFIX} ERRO: ${CROSS_LD} não encontrado ou não é executável." >&2
+    echo "${LOG_PREFIX} Verifique se a instalação do Binutils Pass 1 foi bem-sucedida." >&2
+    exit 1
+fi
+
+echo "${LOG_PREFIX} OK: Encontrado linker cross: ${CROSS_LD}"
+echo "${LOG_PREFIX} Versão do linker:"
+"$CROSS_LD" --version | head -n 3 || {
+    echo "${LOG_PREFIX} AVISO: não foi possível obter versão do linker." >&2
+}
+
+echo
+echo "${LOG_PREFIX} Checando diretórios de busca do linker (SEARCH_DIR)..."
+# Isso deve listar caminhos sob /tools/... se --with-sysroot=$ROOTFS estiver correto.
+if "$CROSS_LD" --verbose 2>/dev/null | grep -E 'SEARCH_DIR\("=/tools' | sed 's/;/;\n/g'; then
+    echo
+    echo "${LOG_PREFIX} OK: Encontrados SEARCH_DIR apontando para /tools/*"
+else
+    echo
+    echo "${LOG_PREFIX} AVISO: não foram encontrados SEARCH_DIR com \"/tools\"."
+    echo "${LOG_PREFIX} Isso pode indicar problema com --with-sysroot=${ROOTFS}."
+    echo "${LOG_PREFIX} Revise a configuração do Binutils Pass 1 se algo parecer errado."
+fi
+
+echo
+echo "${LOG_PREFIX} Sanity-check do Binutils Pass 1 finalizado."
