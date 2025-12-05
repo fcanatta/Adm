@@ -33,6 +33,18 @@
 
 set -euo pipefail
 
+# Definir quais libcs esse pacote suporta:
+#   - para gcc final: glibc, musl, uclibc-ng
+#   - para glibc: apenas glibc
+#   - para musl: apenas musl
+REQUIRED_LIBCS="glibc musl uclibc-ng"
+
+# Carregar validador de profile
+source /usr/src/adm/lib/adm_profile_validate.sh
+
+# Validar profile atual
+adm_profile_validate
+
 M4_VERSION="1.4.20"
 M4_NAME="m4-${M4_VERSION}"
 
