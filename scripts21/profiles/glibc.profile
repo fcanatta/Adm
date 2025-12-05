@@ -69,3 +69,9 @@ export CONFIG_SITE="${CONFIG_SITE:-$ROOTFS/usr/share/config.site}"
 
 # Make padrão
 export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
+
+# No fim do glibc.profile ou musl.profile:
+if [[ "${ADM_PERF_LEVEL:-}" == "high" ]]; then
+    # sobrescreve flags com perfil agressivo
+    . /opt/adm/profiles/highperf.profile
+fi
