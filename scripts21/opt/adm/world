@@ -1,0 +1,13 @@
+base/binutils
+base/bash
+base/gcc
+base/m4
+base/make
+base/musl
+base/zlib
+base/openssl
+base/coreutils
+base/vim
+base/glibc
+apps/nano
+apps/neofetch
