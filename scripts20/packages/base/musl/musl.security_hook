@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Hook unificado de SANITY + SEGURANÇA para musl
+#
+# Usado por:
+#   musl.pre_install  -> MUSL_HOOK_PHASE=pre
+#   musl.post_install -> MUSL_HOOK_PHASE=post
+#
+# Chamado pelo adm com:
+#   ROOTFS           - rootfs alvo (ex: /opt/systems/musl-rootfs)
+#   ADM_CATEGORY     - categoria (ex: "libc")
+#   ADM_PKG_NAME     - nome do pacote (ex: "musl")
+#   ADM_LIBC         - libc alvo (esperado: "musl")
+#   ADM_PKG_VERSION  - versão do musl (ex: "1.2.5")
+#
+# Variáveis de controle:
+#   MUSL_HOOK_PHASE        - "pre" ou "post"
+#
+# Controle de severidade (usa o que estiver definido, nessa ordem):
+#   MUSL_HOOK_STRICT       - global (0/1, default 1)
+#   MUSL_SANITY_STRICT     - legado (0/1)
+#   MUSL_SEC_STRICT        - legado (0/1)
+#
+# Segurança extra:
+#   MUSL_SEC_ALLOW_GLIBC   - se "1", não falha ao achar libs típicas de glibc (só avisa)
+#   MUSL_SEC_ALLOW_SETUID  - se "1", não falha com binários setuid root (só avisa)
+#   MUSL_SEC_MAX_WW_DIRS   - máximo de diretórios world-writable sem sticky tolerados (default 0)
+#
+# Sanity extra (apenas em post_install):
+#   MUSL_SANITY_CHROOT     - se "1", tenta executar loader musl via chroot (--help)
+#
+# Outros:
+#   ADM_MUSL_SYSLIBDIR     - syslibdir usado na instalação (default: /lib)
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_pkg_tag() {
+    printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[musl-hook:%s] %s\n' "$(_pkg_tag)" "$*"; }
+warn() { printf '[musl-hook:%s][WARN] %s\n' "$(_pkg_tag)" "$*" >&2; }
+fail() { printf '[musl-hook:%s][ERRO] %s\n' "$(_pkg_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+is_int() { printf '%s\n' "${1:-}" | grep -qE '^-?[0-9]+$'; }
+
+###############################################################################
+# CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook do musl.}"
+: "${MUSL_HOOK_PHASE:?MUSL_HOOK_PHASE não definido (esperado 'pre' ou 'post').}"
+
+if [ ! -d "$ROOTFS" ]; then
+    fail "ROOTFS não é diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+    fail "ROOTFS é '/', isso não deveria acontecer no fluxo do adm (risco de mexer no host)."
+fi
+
+if [ "${ADM_LIBC:-musl}" != "musl" ]; then
+    fail "Hook do musl chamado com ADM_LIBC='${ADM_LIBC:-}', esperado 'musl'."
+fi
+
+MUSL_VER="${ADM_PKG_VERSION:-desconhecida}"
+PHASE="$MUSL_HOOK_PHASE"
+
+# STRICT: prioridade MUSL_HOOK_STRICT > MUSL_SANITY_STRICT > MUSL_SEC_STRICT > default 1
+if [ -n "${MUSL_HOOK_STRICT:-}" ]; then
+    STRICT="$MUSL_HOOK_STRICT"
+elif [ -n "${MUSL_SANITY_STRICT:-}" ]; then
+    STRICT="$MUSL_SANITY_STRICT"
+elif [ -n "${MUSL_SEC_STRICT:-}" ]; then
+    STRICT="$MUSL_SEC_STRICT"
+else
+    STRICT="1"
+fi
+
+ALLOW_GLIBC="${MUSL_SEC_ALLOW_GLIBC:-0}"
+ALLOW_SETUID="${MUSL_SEC_ALLOW_SETUID:-0}"
+MAX_WW_DIRS="${MUSL_SEC_MAX_WW_DIRS:-0}"
+CHROOT_TEST="${MUSL_SANITY_CHROOT:-0}"
+SYSLIBDIR="${ADM_MUSL_SYSLIBDIR:-/lib}"
+
+if ! is_int "$MAX_WW_DIRS"; then
+    warn "MUSL_SEC_MAX_WW_DIRS ('${MAX_WW_DIRS}') não é inteiro; usando 0."
+    MAX_WW_DIRS=0
+fi
+
+ROOTFS_LIB="${ROOTFS%/}${SYSLIBDIR%/}"
+ROOTFS_USR_LIB="${ROOTFS%/}/usr/lib"
+ROOTFS_USR_LIB64="${ROOTFS%/}/usr/lib64"
+INC_BASE="${ROOTFS%/}/usr/include"
+
+log "Hook unificado do musl (fase=${PHASE}, versão=${MUSL_VER})"
+log "  ROOTFS          = ${ROOTFS}"
+log "  STRICT          = ${STRICT}"
+log "  SYSLIBDIR       = ${SYSLIBDIR}"
+log "  ALLOW_GLIBC     = ${ALLOW_GLIBC}"
+log "  ALLOW_SETUID    = ${ALLOW_SETUID}"
+log "  MAX_WW_DIRS     = ${MAX_WW_DIRS}"
+log "  CHROOT_TEST     = ${CHROOT_TEST}"
+
+###############################################################################
+# 1) FUNÇÕES DE SEGURANÇA (ambiente) – usadas em PRE e POST
+###############################################################################
+
+# 1.a – restos de glibc dentro de um rootfs musl
+check_glibc_leftovers() {
+    local GLIBC_SUSPECT_LIBS=(
+        "libc.so.6"
+        "libm.so.6"
+        "libpthread.so.0"
+        "libdl.so.2"
+        "librt.so.1"
+        "libnsl.so.1"
+        "libresolv.so.2"
+        "libnss_files.so.2"
+        "libnss_dns.so.2"
+        "ld-linux.so.2"
+        "ld-linux-x86-64.so.2"
+        "ld-linux-aarch64.so.1"
+    )
+
+    local suspect=()
+
+    scan_glibc_path() {
+        local base="$1"
+        [ -d "$base" ] || return 0
+        local name p
+        for name in "${GLIBC_SUSPECT_LIBS[@]}"; do
+            p="${base}/${name}"
+            if [ -e "$p" ]; then
+                suspect+=("$p")
+            fi
+        done
+    }
+
+    scan_glibc_path "$ROOTFS_LIB"
+    scan_glibc_path "$ROOTFS_USR_LIB"
+    scan_glibc_path "$ROOTFS_USR_LIB64"
+
+    if [ "${#suspect[@]}" -gt 0 ]; then
+        warn "Foram encontradas bibliotecas/loader típicos de glibc dentro de um rootfs musl:"
+        local p
+        for p in "${suspect[@]}"; do
+            warn "  - $p"
+        done
+
+        if [ "$ALLOW_GLIBC" != "1" ]; then
+            local msg="Bibliotecas glibc no rootfs musl podem causar conflitos graves."
+            if [ "$STRICT" = "1" ]; then
+                fail "$msg"
+            else
+                warn "$msg (STRICT=0, seguir com cautela)."
+            fi
+        else
+            log "MUSL_SEC_ALLOW_GLIBC=1, apenas avisando sobre libs glibc presentes."
+        fi
+    else
+        log "Nenhuma biblioteca típica de glibc encontrada em ${ROOTFS_LIB}, ${ROOTFS_USR_LIB}, ${ROOTFS_USR_LIB64}."
+    fi
+}
+
+# 1.b – diretórios world-writable sem sticky
+check_world_writable_dirs() {
+    local WW_SCAN_DIRS=(
+        "/"
+        "/tmp"
+        "/var/tmp"
+        "/home"
+        "/usr"
+        "/var"
+    )
+
+    local world_writable_count=0
+
+    log "Procurando diretórios world-writable sem sticky em paths comuns..."
+
+    local rel base
+    for rel in "${WW_SCAN_DIRS[@]}"; do
+        base="${ROOTFS%/}${rel}"
+        [ -d "$base" ] || continue
+
+        # -perm -0002 = world-writable; ! -perm -1000 = sem sticky bit
+        while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            world_writable_count=$((world_writable_count + 1))
+            warn "Diretório world-writable sem sticky: $d"
+        done < <(find "$base" -xdev -type d -perm -0002 ! -perm -1000 2>/dev/null || true)
+    done
+
+    if [ "$world_writable_count" -gt 0 ]; then
+        local msg="${world_writable_count} diretório(s) world-writable sem sticky foram encontrados."
+        if [ "$world_writable_count" -gt "$MAX_WW_DIRS" ]; then
+            if [ "$STRICT" = "1" ]; then
+                fail "$msg (acima do limite MUSL_SEC_MAX_WW_DIRS=${MAX_WW_DIRS})."
+            else
+                warn "$msg (STRICT=0, limite configurado=${MAX_WW_DIRS})."
+            fi
+        else
+            warn "$msg (dentro do limite MUSL_SEC_MAX_WW_DIRS=${MAX_WW_DIRS})."
+        fi
+    else
+        log "Nenhum diretório world-writable sem sticky encontrado nos paths escaneados."
+    fi
+}
+
+# 1.c – binários setuid root
+check_setuid_binaries() {
+    local SCAN_DIRS=(
+        "/bin"
+        "/sbin"
+        "/usr/bin"
+        "/usr/sbin"
+    )
+
+    local setuid_count=0
+    local setuid_list=()
+
+    log "Procurando binários setuid root em /bin, /sbin, /usr/bin, /usr/sbin..."
+
+    local rel base
+    for rel in "${SCAN_DIRS[@]}"; do
+        base="${ROOTFS%/}${rel}"
+        [ -d "$base" ] || continue
+
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            setuid_count=$((setuid_count + 1))
+            setuid_list+=("$f")
+        done < <(find "$base" -xdev -type f -perm -4000 2>/dev/null || true)
+    done
+
+    if [ "$setuid_count" -gt 0 ]; then
+        warn "Foram encontrados ${setuid_count} binário(s) setuid root:"
+        local f
+        for f in "${setuid_list[@]}"; do
+            warn "  - $f"
+        done
+
+        if [ "$ALLOW_SETUID" != "1" ]; then
+            local msg="Binários setuid root podem representar risco de segurança."
+            if [ "$STRICT" = "1" ]; then
+                fail "$msg"
+            else
+                warn "$msg (STRICT=0, ALLOW_SETUID=0, apenas avisando)."
+            fi
+        else
+            log "MUSL_SEC_ALLOW_SETUID=1, apenas avisando sobre binários setuid root."
+        fi
+    else
+        log "Nenhum binário setuid root encontrado nos paths padrão."
+    fi
+}
+
+###############################################################################
+# 2) FUNÇÕES DE SANITY ESPECÍFICAS DO MUSL – usadas só em POST
+###############################################################################
+
+FOUND_LOADER=""
+
+detect_musl_loader() {
+    local ARCH
+    ARCH="$(uname -m || echo unknown)"
+
+    local loader_candidates=()
+
+    case "$ARCH" in
+        x86_64)
+            loader_candidates=("ld-musl-x86_64.so.1")
+            ;;
+        i?86)
+            loader_candidates=("ld-musl-i386.so.1" "ld-musl-x86.so.1")
+            ;;
+        aarch64)
+            loader_candidates=("ld-musl-aarch64.so.1")
+            ;;
+        armv7l|armv6l|armhf|arm*)
+            loader_candidates=("ld-musl-armhf.so.1" "ld-musl-arm.so.1")
+            ;;
+        *)
+            warn "Arquitetura desconhecida para autodetectar loader musl: '${ARCH}'. Tentando alguns nomes comuns."
+            loader_candidates=(
+                "ld-musl-x86_64.so.1"
+                "ld-musl-i386.so.1"
+                "ld-musl-aarch64.so.1"
+                "ld-musl-armhf.so.1"
+            )
+            ;;
+    esac
+
+    local name cand
+    for name in "${loader_candidates[@]}"; do
+        cand="${ROOTFS%/}${SYSLIBDIR%/}/${name}"
+        if [ -x "$cand" ]; then
+            FOUND_LOADER="$cand"
+            break
+        fi
+    done
+
+    if [ -n "$FOUND_LOADER" ]; then
+        log "Loader dinâmico musl encontrado: ${FOUND_LOADER}"
+    else
+        local msg="Nenhum loader dinâmico musl encontrado em ${ROOTFS%/}${SYSLIBDIR%/}/{${loader_candidates[*]}}."
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    fi
+}
+
+check_musl_libc_so() {
+    local LIBC_SO="${ROOTFS%/}${SYSLIBDIR%/}/libc.so"
+
+    if [ -e "$LIBC_SO" ]; then
+        log "libc.so do musl encontrada em ${LIBC_SO}"
+    else
+        local msg="libc.so não encontrada em ${LIBC_SO}"
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    fi
+}
+
+check_musl_headers() {
+    local headers_ok=1
+
+    if [ ! -d "$INC_BASE" ]; then
+        warn "Diretório de headers não encontrado: ${INC_BASE}"
+        headers_ok=0
+    else
+        local REQUIRED_HEADERS=(
+            "stdio.h"
+            "stdlib.h"
+            "string.h"
+            "unistd.h"
+            "errno.h"
+            "features.h"
+        )
+
+        local h
+        for h in "${REQUIRED_HEADERS[@]}"; do
+            if [ ! -f "${INC_BASE}/${h}" ]; then
+                warn "Header básico ausente: ${INC_BASE}/${h}"
+                headers_ok=0
+            else
+                log "Header encontrado: ${INC_BASE}/${h}"
+            fi
+        done
+
+        local FEATURES="${INC_BASE}/features.h"
+        if [ -f "$FEATURES" ]; then
+            if grep -qi 'musl' "$FEATURES" 2>/dev/null; then
+                log "features.h parece ser do musl (contém 'musl')."
+            else
+                warn "features.h não parece mencionar 'musl'; verifique se não há headers misturados de outra libc."
+            fi
+        fi
+    fi
+
+    if [ "$headers_ok" -eq 0 ]; then
+        local msg="Nem todos os headers básicos foram encontrados em ${INC_BASE}."
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    fi
+}
+
+check_loader_elf() {
+    if [ -z "$FOUND_LOADER" ]; then
+        return 0
+    fi
+
+    if has_cmd file; then
+        local desc
+        desc="$(file -b "$FOUND_LOADER" 2>/dev/null || true)"
+        if echo "$desc" | grep -qi 'elf' && echo "$desc" | grep -qi 'shared object'; then
+            log "OK (ELF SO): $FOUND_LOADER -> $desc"
+        else
+            local msg="Loader musl com tipo inesperado: $FOUND_LOADER -> $desc"
+            if [ "$STRICT" = "1" ]; then
+                fail "$msg"
+            else
+                warn "$msg"
+            fi
+        fi
+    else
+        warn "Comando 'file' não encontrado; não foi possível validar tipo ELF do loader."
+    fi
+}
+
+chroot_test_loader() {
+    if [ "$CHROOT_TEST" != "1" ]; then
+        return 0
+    fi
+
+    if ! has_cmd chroot; then
+        warn "CHROOT_TEST=1, mas comando 'chroot' não está disponível no host."
+        return 0
+    fi
+
+    if [ -z "$FOUND_LOADER" ]; then
+        warn "CHROOT_TEST=1, mas nenhum loader musl foi detectado."
+        return 0
+    fi
+
+    local loader_in_chroot="${FOUND_LOADER#${ROOTFS%/}}"
+
+    log "Rodando teste simples dentro do ROOTFS: '${loader_in_chroot} --help'"
+
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/usr/bin:/bin:/sbin:/usr/sbin:${SYSLIBDIR}" "$loader_in_chroot" --help >/dev/null 2>&1; then
+        local msg="Falha ao executar '${loader_in_chroot} --help' dentro do ROOTFS."
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    else
+        log "Execução de '${loader_in_chroot} --help' dentro do ROOTFS parece OK."
+    fi
+}
+
+###############################################################################
+# EXECUÇÃO POR FASE
+###############################################################################
+
+case "$PHASE" in
+    pre)
+        log "Fase PRE-INSTALL: checando segurança do ambiente antes de instalar o musl..."
+        check_glibc_leftovers
+        check_world_writable_dirs
+        check_setuid_binaries
+        ;;
+
+    post)
+        log "Fase POST-INSTALL: rodando segurança + sanity do musl instalado..."
+        # Reaproveita checks de ambiente (agora com o pacote já presente)
+        check_glibc_leftovers
+        check_world_writable_dirs
+        check_setuid_binaries
+
+        # Sanity específico do musl
+        detect_musl_loader
+        check_musl_libc_so
+        check_musl_headers
+        check_loader_elf
+        chroot_test_loader
+        ;;
+
+    *)
+        fail "MUSL_HOOK_PHASE inválido: '${PHASE}' (esperado 'pre' ou 'post')."
+        ;;
+esac
+
+log "Hook do musl (fase=${PHASE}) concluído com sucesso."
+exit 0
