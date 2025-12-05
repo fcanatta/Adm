@@ -1,0 +1,121 @@
+# config.musl.site
+# Arquivo de "respostas" padrão para scripts autoconf (./configure)
+# voltado para sistemas baseados em musl libc.
+#
+# Ele tenta:
+#   - Evitar detecções erradas em cima de suposições específicas de glibc;
+#   - Acelerar um pouco ./configure (alguns testes caros já vêm respondidos);
+#   - Fornecer respostas coerentes com o comportamento da musl.
+#
+# ATENÇÃO:
+#   - Não invente respostas aqui. Se tiver dúvida, prefira comentar a linha;
+#   - Alguns pacotes “problemáticos” podem precisar de overrides próprios
+#     (config.cache local ou patches).
+
+echo "[config.musl.site] Usando config.site específico para musl: $0" >&2
+
+############################
+# Detecção básica de arch  #
+############################
+
+case "$(uname -m)" in
+    x86_64)
+        ac_cv_c_bigendian=${ac_cv_c_bigendian=no}
+        ;;
+    aarch64|arm64)
+        ac_cv_c_bigendian=${ac_cv_c_bigendian=no}
+        ;;
+    *)
+        # Não forçamos nada em arquiteturas exóticas
+        : ${ac_cv_c_bigendian=no}
+        ;;
+esac
+
+########################################
+# Funções POSIX que a musl implementa  #
+########################################
+
+# Funções reentrantes de passwd/grupo (musl segue POSIX)
+: ${ac_cv_func_posix_getpwuid_r=yes}
+: ${ac_cv_func_posix_getgrgid_r=yes}
+
+# strerror_r na musl é a variante POSIX (retorna int, NÃO char*)
+# Isso evita que configure conclua erroneamente que ela retorna char*.
+: ${ac_cv_func_strerror_r_char_p=no}
+
+# getpgrp() estilo POSIX sem argumentos
+: ${ac_cv_func_getpgrp_void=yes}
+
+# setvbuf(3) com argumentos padrão "normais"
+: ${ac_cv_func_setvbuf_reversed=no}
+
+########################################
+# Recursos de memória/processo comuns  #
+########################################
+
+# mmap com MAP_FIXED e mapeamentos reaproveitados é suportado
+: ${ac_cv_func_mmap_fixed_mapped=yes}
+
+# vfork geralmente é igual a fork na musl, mas a maioria dos pacotes
+# tratam isso adequadamente. Melhor não mentir:
+#: ${ac_cv_func_vfork_works=yes}
+
+########################################
+# Threads / pthread (cuidado aqui)     #
+########################################
+
+# A musl tem pthread bem completo. Em geral, deixar o configure testar
+# sozinho é o melhor. Mas, para alguns pacotes teimosos, você pode querer
+# “forçar” algo assim (DESCOMENTE SOMENTE SE SOUBER O QUE ESTÁ FAZENDO):
+#
+# : ${ac_cv_header_pthread_h=yes}
+# : ${ac_cv_lib_pthread_pthread_create=yes}
+# : ${ac_cv_search_pthread_create='-pthread'}
+#
+# OBS: muita gente “resolve” pondo 'none required', mas isso pode quebrar
+# builds que realmente precisam de -pthread/-lpthread no link.
+
+########################################
+# Headers variados                     #
+########################################
+
+# Alguns pacotes assumem headers raros de glibc. A musl geralmente não
+# fornece os headers exoticos de debug / internals.
+#
+# Em caso de pacote chato, você pode habilitar aqui:
+#
+# : ${ac_cv_header_execinfo_h=no}
+# : ${ac_cv_header_mntent_h=yes}   # se sua toolchain musl fornecer
+# : ${ac_cv_header_sys_auxv_h=no}  # musl em geral não expõe isso
+#
+# Deixe comentado até encontrar um pacote que precise.
+
+########################################
+# Macros para reduzir perguntas bobas  #
+########################################
+
+# Essas variáveis são “respostas padrão” que evitam alguns testes chatos.
+# Só mantenha as que você tem certeza. É melhor configurar por pacote
+# do que quebrar globalmente.
+
+# malloc(0) e realloc(0) retornam ponteiros não nulos na musl
+: ${ac_cv_func_malloc_0_nonnull=yes}
+: ${ac_cv_func_realloc_0_nonnull=yes}
+
+# Testes de suporte a sigaction, sigprocmask, etc – musl é 100% POSIX aqui
+: ${ac_cv_func_sigaction=yes}
+: ${ac_cv_func_sigprocmask=yes}
+
+########################################
+# Área reservada para ajustes seus     #
+########################################
+
+# Se um pacote específico insistir em detectar glibc e falhar na musl,
+# você pode criar um bloco condicional baseado em $PACKAGE_NAME
+# (alguns configure exportam essa variável):
+#
+# case "$PACKAGE_NAME" in
+#     samba*)
+#         : ${ac_cv_header_rpc_rpc_h=no}
+#         ;;
+# esac
