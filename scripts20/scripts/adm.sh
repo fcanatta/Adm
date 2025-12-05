@@ -69,6 +69,14 @@ die() {
     exit 1
 }
 
+# Escapa um valor para ser seguro em arquivos .meta/.buildinfo (código shell)
+sh_quote() {
+  # Usa printf %q (bash) para gerar uma representação segura
+  local q
+  printf -v q '%q' "$1"
+  printf '%s' "$q"
+}
+
 ### UTILITÁRIOS ###############################################################
 
 usage() {
@@ -97,25 +105,24 @@ EOF
 }
 
 check_requirements() {
-    local reqs=(git find tar md5sum)
-    local missing=0
+  local missing=()
 
-    for bin in "${reqs[@]}"; do
-        if ! command -v "$bin" >/dev/null 2>&1; then
-            log_error "Dependência obrigatória não encontrada: $bin"
-            missing=1
-        fi
-    done
-
-    # Pelo menos um compressor para empacotar (zstd ou xz)
-    if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
-        log_error "Nem zstd nem xz encontrados. Pelo menos um compressor é necessário para empacotar os builds."
-        missing=1
+  # Ferramentas realmente essenciais para o fluxo principal
+  for cmd in git find tar; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing+=("$cmd")
     fi
+  done
 
-    if [ "$missing" -ne 0 ]; then
-        die "Instale as dependências obrigatórias e tente novamente."
-    fi
+  # Compressor: precisa de pelo menos um
+  if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
+    missing+=("zstd/xz")
+  fi
+
+  if ((${#missing[@]} > 0)); then
+    log_error "Dependências externas ausentes: ${missing[*]}"
+    die "Instale os comandos acima e tente novamente."
+  fi
 }
 
 ensure_repo() {
@@ -278,84 +285,92 @@ run_hook() {
 }
 
 resolve_build_deps() {
-    local libc="$1" cat="$2" pkg="$3"
-    local depfile
-    depfile="$(pkg_dir "$cat" "$pkg")/${pkg}.deps"
+  local libc="$1" cat="$2" pkg="$3"
+  local depfile dep current resolved dcat dpkg _ dep_id
 
-    local current="${cat}/${pkg}"
-    local stack="${ADM_DEP_STACK:-}"
+  depfile="$(pkg_dir "$cat" "$pkg")/pkg.deps"
+  current="${cat}/${pkg}"
 
-    # Adiciona o pacote atual à pilha de dependências, se ainda não estiver
-    case " $stack " in
-        *" $current "*) ;;
-        *)
-            stack="${stack:+$stack }$current"
-            ADM_DEP_STACK="$stack"
-            export ADM_DEP_STACK
-            ;;
-    esac
+  # Atualiza "pilha" de dependências para detecção de ciclos
+  if [[ " ${ADM_DEP_STACK:-} " != *" ${current} "* ]]; then
+    ADM_DEP_STACK="${ADM_DEP_STACK:+$ADM_DEP_STACK }${current}"
+    export ADM_DEP_STACK
+  fi
 
-    local dep
-    while read -r dep; do
-        [ -n "$dep" ] || continue
+  # Lê arquivo de dependências (se existir)
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
 
-        # Normaliza nome da dependência (aceita "cat/pkg" ou só "pkg")
-        local resolved dcat dpkg dep_id
-        resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
-        IFS='|' read -r dcat dpkg _ <<< "$resolved"
-        dep_id="${dcat}/${dpkg}"
+    resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
+    dcat="${resolved%%|*}"
+    _="${resolved#*|}"; dpkg="${_%|*}"
+    dep_id="${dcat}/${dpkg}"
 
-        log_info "(build) Dependência: ${dep} -> ${dep_id}"
+    log_info "(build) Dependência: '$dep' -> '${dep_id}'"
 
-        # Proteção contra ciclos
-        if [[ " $stack " == *" $dep_id "* ]]; then
-            die "Dependência cíclica detectada na fase de build: ${stack} -> ${dep_id}"
-        fi
+    # Verifica ciclo de dependência
+    if [[ " ${ADM_DEP_STACK:-} " == *" ${dep_id} "* ]]; then
+      die "Dependência cíclica detectada: ${dep_id} (stack: ${ADM_DEP_STACK})"
+    fi
 
-        # Usa o fluxo normal do adm (já passou por check_requirements)
-        cmd_build "${dep_id}" "$libc"
-        cmd_install "${dep_id}" "$libc"
-    done < <(read_deps_file "$depfile")
+    # Evita processar o mesmo pacote várias vezes na mesma resolução
+    if [[ " ${ADM_DEP_SEEN_BUILD:-} " == *" ${dep_id} "* ]]; then
+      log_info "(build) Dependência '${dep_id}' já processada nesta resolução, pulando."
+      continue
+    fi
+    ADM_DEP_SEEN_BUILD="${ADM_DEP_SEEN_BUILD:+$ADM_DEP_SEEN_BUILD }${dep_id}"
+    export ADM_DEP_SEEN_BUILD
+
+    # Faz build da dependência (que também será instalada depois em cmd_install)
+    cmd_build "${dep_id}" "$libc"
+    cmd_install "${dep_id}" "$libc"
+  done < <(read_deps_file "$depfile")
 }
 
 resolve_install_deps() {
-    local libc="$1" cat="$2" pkg="$3"
-    local depfile
-    depfile="$(pkg_dir "$cat" "$pkg")/${pkg}.deps"
+  local libc="$1" cat="$2" pkg="$3"
+  local depfile dep current resolved dcat dpkg _ dep_id meta filesdb
 
-    local current="${cat}/${pkg}"
-    local stack="${ADM_DEP_STACK:-}"
+  depfile="$(pkg_dir "$cat" "$pkg")/pkg.deps"
+  current="${cat}/${pkg}"
 
-    # Adiciona o pacote atual à pilha de dependências, se ainda não estiver
-    case " $stack " in
-        *" $current "*) ;;
-        *)
-            stack="${stack:+$stack }$current"
-            ADM_DEP_STACK="$stack"
-            export ADM_DEP_STACK
-            ;;
-    esac
+  if [[ " ${ADM_DEP_STACK:-} " != *" ${current} "* ]]; then
+    ADM_DEP_STACK="${ADM_DEP_STACK:+$ADM_DEP_STACK }${current}"
+    export ADM_DEP_STACK
+  fi
 
-    local dep
-    while read -r dep; do
-        [ -n "$dep" ] || continue
+  while IFS= read -r dep; do
+    [[ -z "$dep" ]] && continue
 
-        # Normaliza nome da dependência (aceita "cat/pkg" ou só "pkg")
-        local resolved dcat dpkg dep_id
-        resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
-        IFS='|' read -r dcat dpkg _ <<< "$resolved"
-        dep_id="${dcat}/${dpkg}"
+    resolved="$(resolve_pkg_single "$dep")" || die "Dependência '$dep' não encontrada para ${current}"
+    dcat="${resolved%%|*}"
+    _="${resolved#*|}"; dpkg="${_%|*}"
+    dep_id="${dcat}/${dpkg}"
 
-        log_info "(install) Dependência: ${dep} -> ${dep_id}"
+    log_info "(install) Dependência: '$dep' -> '${dep_id}'"
 
-        # Proteção contra ciclos também na fase de install
-        if [[ " $stack " == *" $dep_id "* ]]; then
-            die "Dependência cíclica detectada na fase de install: ${stack} -> ${dep_id}"
-        fi
+    if [[ " ${ADM_DEP_STACK:-} " == *" ${dep_id} "* ]]; then
+      die "Dependência cíclica detectada na instalação: ${dep_id} (stack: ${ADM_DEP_STACK})"
+    fi
 
-        # Apenas instala; se faltar buildinfo, cmd_install chamará cmd_build internamente
-        cmd_install "${dep_id}" "$libc"
-    done < <(read_deps_file "$depfile")
+    # Evita processamento repetido da mesma dependência
+    if [[ " ${ADM_DEP_SEEN_INSTALL:-} " == *" ${dep_id} "* ]]; then
+      log_info "(install) Dependência '${dep_id}' já processada nesta resolução, pulando."
+      continue
+    fi
+    ADM_DEP_SEEN_INSTALL="${ADM_DEP_SEEN_INSTALL:+$ADM_DEP_SEEN_INSTALL }${dep_id}"
+    export ADM_DEP_SEEN_INSTALL
+
+    # Se já está instalada para essa libc, não precisa chamar cmd_install
+    meta="$(meta_path "$dcat" "$dpkg" "$libc")"
+    filesdb="$(files_path "$dcat" "$dpkg" "$libc")"
+    if [[ -f "$meta" && -f "$filesdb" ]]; then
+      log_info "(install) Dependência '${dep_id}' já instalada para libc '$libc', pulando."
+      continue
+    fi
+
+    cmd_install "${dep_id}" "$libc"
+  done < <(read_deps_file "$depfile")
 }
 
 ### RESOLUÇÃO DE PACOTE (NOME -> CATEGORIA/PROGRAMA) ###########################
@@ -406,62 +421,55 @@ resolve_pkg_single() {
 }
 
 adm_finalize_build() {
-    # $1 = libc
-    # $2 = categoria
-    # $3 = pacote
-    local libc="$1" cat="$2" pkg="$3"
+  local libc="$1" cat="$2" pkg="$3"
+  local buildinfo build_root destdir tarball version
 
-    local buildinfo
-    buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  build_root="${ADM_BUILD_ROOT:-/tmp/adm-build-${cat}-${pkg}-${libc}}"
+  destdir="${ADM_DESTDIR:-${build_root}/destdir}"
 
-    # Diretório de build / DESTDIR padrão
-    local build_root="${ADM_BUILD_ROOT:-/tmp/adm-build-${cat}-${pkg}-${libc}}"
-    local destdir="${ADM_DESTDIR:-${build_root}/destdir}"
+  if [[ ! -d "$destdir" ]]; then
+    die "DESTDIR '$destdir' não existe. Certifique-se de que o script de build instalou arquivos em ADM_DESTDIR."
+  fi
 
-    [ -d "$destdir" ] || die "DESTDIR de build não encontrado para ${cat}/${pkg} (${libc}): $destdir"
+  log_info "Finalizando build de ${cat}/${pkg} para ${libc} em '${destdir}'"
 
-    log_info "Finalizando build de ${cat}/${pkg} (${libc}) a partir de ${destdir}"
+  # Strip em binários ELF, se possível
+  if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
+    log_info "Aplicando strip em binários ELF..."
+    while IFS= read -r f; do
+      if file "$f" 2>/dev/null | grep -qi 'elf'; then
+        strip --strip-unneeded "$f" || log_warn "Falha no strip de '$f' (ignorando)."
+      fi
+    done < <(find "$destdir" -type f -perm -u+x 2>/dev/null || true)
+  else
+    log_warn "Comandos 'strip' ou 'file' não encontrados. Pulando strip de binários."
+  fi
 
-    # Strip de binários ELF dentro do DESTDIR
-    if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
-        log_info "Aplicando strip em binários ELF dentro de ${destdir}"
-        find "$destdir" -type f -perm -u+x -print0 | while IFS= read -r -d '' f; do
-            if file "$f" 2>/dev/null | grep -qi 'ELF'; then
-                strip --strip-unneeded "$f" 2>/dev/null || true
-            fi
-        done
-    else
-        log_warn "strip ou file não encontrados, pulando otimização de strip."
-    fi
+  mkdir -p "$CACHE_PKG"
 
-    mkdir -p "$CACHE_PKG"
+  if command -v zstd >/dev/null 2>&1; then
+    tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.zst"
+    tar -C "$destdir" -I "zstd -19 --long=31" -cf "$tarball" . || die "Falha ao criar tarball com zstd."
+  else
+    tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.xz"
+    log_warn "zstd não encontrado, usando xz para o tarball."
+    tar -C "$destdir" -Jcf "$tarball" . || die "Falha ao criar tarball com xz."
+  fi
 
-    # Escolher compressor: preferir zstd, senão xz
-    local tarball
-    if command -v zstd >/dev/null 2>&1; then
-        tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.zst"
-        log_info "Empacotando DESTDIR em ${tarball} (zstd -19 --long=31)..."
-        tar -C "$destdir" -I "zstd -19 --long=31" -cf "$tarball" .
-    else
-        tarball="${CACHE_PKG}/${cat}__${pkg}__${libc}.tar.xz"
-        log_warn "zstd não encontrado, usando xz para ${tarball}"
-        tar -C "$destdir" -Jcf "$tarball" .
-    fi
+  version="${ADM_PKG_VERSION:-${PKG_VERSION:-unknown}}"
 
-    # Versão: primeiro tenta ADM_PKG_VERSION, depois PKG_VERSION, senão "unknown"
-    local version="${ADM_PKG_VERSION:-${PKG_VERSION:-unknown}}"
+  {
+    printf 'PKG_ID=%s\n'       "$(sh_quote "${cat}/${pkg}")"
+    printf 'PKG_NAME=%s\n'     "$(sh_quote "${pkg}")"
+    printf 'PKG_CATEGORY=%s\n' "$(sh_quote "${cat}")"
+    printf 'PKG_VERSION=%s\n'  "$(sh_quote "${version}")"
+    printf 'PKG_LIBC=%s\n'     "$(sh_quote "${libc}")"
+    printf 'PKG_TARBALL=%s\n'  "$(sh_quote "${tarball}")"
+  } > "$buildinfo"
 
-    log_info "Gravando buildinfo em ${buildinfo}"
-    cat > "$buildinfo" <<EOF
-PKG_ID="${cat}/${pkg}"
-PKG_NAME="${pkg}"
-PKG_CATEGORY="${cat}"
-PKG_VERSION="${version}"
-PKG_LIBC="${libc}"
-PKG_TARBALL="${tarball}"
-EOF
-
-    log_success "Empacotamento e registro de build concluídos para ${cat}/${pkg} (${libc})"
+  log_success "Pacote empacotado em: ${tarball}"
+  log_info "Buildinfo registrado em: ${buildinfo}"
 }
 
 ### COMANDOS ###################################################################
@@ -474,189 +482,221 @@ cmd_update_repo() {
 }
 
 cmd_build() {
-    local name="$1"
-    local libc
-    libc="$(detect_libc "${2:-}")"
-    local rootfs
-    rootfs="$(rootfs_for_libc "$libc")"
+  local name="$1"
+  local libc
+  libc="$(detect_libc "${2:-}")"
 
-    ensure_repo
+  local rootfs
+  rootfs="$(rootfs_for_libc "$libc")"
 
-    local resolved cat pkg pdir
-    resolved="$(resolve_pkg_single "$name")"
-    IFS='|' read -r cat pkg pdir <<< "$resolved"
+  ensure_repo
 
-    local build_script="${pdir}/${pkg}.sh"
-    [ -x "$build_script" ] || die "Script de build não encontrado ou não executável: $build_script"
+  local resolved cat pkg pdir build_script
+  resolved="$(resolve_pkg_single "$name")"
+  cat="${resolved%%|*}"
+  resolved="${resolved#*|}"; pkg="${resolved%%|*}"
+  pdir="${resolved##*|}"
 
-    log_info "Build de ${cat}/${pkg} para libc=${libc}"
-    load_profile "$libc"
+  build_script="${pdir}/${pkg}.sh"
+  if [[ ! -x "$build_script" ]]; then
+    die "Script de build não encontrado ou não executável: ${build_script}"
+  fi
 
-    # Resolver dependências de build (usa cmd_build/cmd_install recursivamente)
-    resolve_build_deps "$libc" "$cat" "$pkg"
+  log_info "Iniciando build de ${cat}/${pkg} para libc '${libc}'"
 
-    # Diretório de build/DESTDIR padrão para este pacote/libc
-    local build_root="/tmp/adm-build-${cat}-${pkg}-${libc}"
-    local destdir="${build_root}/destdir"
+  load_profile "$libc"
+  resolve_build_deps "$libc" "$cat" "$pkg"
 
-    # Limpa build antigo e prepara diretórios
-    rm -rf "$build_root"
-    mkdir -p "$build_root" "$destdir" "$CACHE_SRC" "$CACHE_PKG"
+  # build_root único por processo, para evitar conflitos em builds paralelos
+  local build_root="/tmp/adm-build-${cat}-${pkg}-${libc}.$$"
+  local destdir="${build_root}/destdir"
 
-    # Exporta variáveis padrão para o script de build
-    export ADM_CATEGORY="$cat"
-    export ADM_PKG_NAME="$pkg"
-    export ADM_LIBC="$libc"
-    export ADM_ROOTFS="$rootfs"
-    export ADM_CACHE_SRC="$CACHE_SRC"
-    export ADM_CACHE_PKG="$CACHE_PKG"
+  rm -rf "$build_root"
+  mkdir -p "$build_root" "$destdir" "$CACHE_SRC" "$CACHE_PKG"
 
-    # Caminho onde o adm vai gravar o buildinfo (via adm_finalize_build)
-    export ADM_BUILDINFO
-    ADM_BUILDINFO="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  export ADM_CATEGORY="$cat"
+  export ADM_PKG_NAME="$pkg"
+  export ADM_LIBC="$libc"
+  export ADM_ROOTFS="$rootfs"
+  export ADM_CACHE_SRC="$CACHE_SRC"
+  export ADM_CACHE_PKG="$CACHE_PKG"
+  export ADM_BUILDINFO
+  ADM_BUILDINFO="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  export ADM_BUILD_ROOT="$build_root"
+  export ADM_DESTDIR="$destdir"
 
-    # Comunicar ao script de build onde ele deve instalar (DESTDIR)
-    export ADM_BUILD_ROOT="$build_root"
-    export ADM_DESTDIR="$destdir"
+  bash "$build_script" build "$libc"
 
-    # O script de build deve:
-    #   - usar ADM_CACHE_SRC para cache de fontes
-    #   - compilar
-    #   - instalar em \$ADM_DESTDIR (usando DESTDIR ou diretamente)
-    #   - opcionalmente definir ADM_PKG_VERSION
-    bash "$build_script" build "$libc"
+  adm_finalize_build "$libc" "$cat" "$pkg"
 
-    # Empacotamento e buildinfo agora são responsabilidade do adm.sh
-    adm_finalize_build "$libc" "$cat" "$pkg"
-
-    log_success "Build concluído para ${cat}/${pkg} (${libc})"
+  log_success "Build concluído de ${cat}/${pkg} para '${libc}'"
 }
 
 cmd_install() {
-    local name="$1"
-    local libc
-    libc="$(detect_libc "${2:-}")"
-    local rootfs
-    rootfs="$(rootfs_for_libc "$libc")"
+  local name="$1"
+  local libc
+  libc="$(detect_libc "${2:-}")"
 
-    ensure_repo
+  local rootfs
+  rootfs="$(rootfs_for_libc "$libc")"
 
-    mkdir -p "$rootfs"
+  ensure_repo
+  mkdir -p "$rootfs"
 
-    local resolved cat pkg pdir
-    resolved="$(resolve_pkg_single "$name")"
-    IFS='|' read -r cat pkg pdir <<< "$resolved"
+  local resolved cat pkg pdir
+  resolved="$(resolve_pkg_single "$name")"
+  cat="${resolved%%|*}"
+  resolved="${resolved#*|}"; pkg="${resolved%%|*}"
+  pdir="${resolved##*|}"
 
-    local buildinfo
-    buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  local meta filesdb buildinfo
+  meta="$(meta_path "$cat" "$pkg" "$libc")"
+  filesdb="$(files_path "$cat" "$pkg" "$libc")"
+  buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
 
-    if [ ! -f "$buildinfo" ]; then
-        log_warn "Nenhum buildinfo encontrado para ${cat}/${pkg} (${libc}). Chamando build..."
-        cmd_build "${cat}/${pkg}" "$libc"
-    fi
+  # Se já está instalado para esta libc, não faz nada
+  if [[ -f "$meta" && -f "$filesdb" ]]; then
+    log_info "Pacote ${cat}/${pkg} já está instalado para libc '${libc}'. Nenhuma ação necessária."
+    return 0
+  fi
 
-    # shellcheck disable=SC1090
-    . "$buildinfo"
+  # Se não há buildinfo ainda, faz build primeiro
+  if [[ ! -f "$buildinfo" ]]; then
+    log_warn "Buildinfo não encontrado para ${cat}/${pkg} (${libc}). Rodando build..."
+    cmd_build "${cat}/${pkg}" "$libc"
+  fi
 
-    [ -n "${PKG_TARBALL:-}" ] || die "PKG_TARBALL não definido em $buildinfo"
-    [ -f "$PKG_TARBALL" ] || die "Tarball não encontrado: $PKG_TARBALL"
+  # Carrega buildinfo
+  # shellcheck disable=SC1090
+  . "$buildinfo"
 
-    resolve_install_deps "$libc" "$cat" "$pkg"
+  if [[ -z "${PKG_TARBALL:-}" ]]; then
+    die "PKG_TARBALL não definido em buildinfo: ${buildinfo}"
+  fi
+  if [[ ! -f "$PKG_TARBALL" ]]; then
+    die "Tarball de pacote não encontrado: ${PKG_TARBALL}"
+  fi
 
-    local pre_hook="${pdir}/${pkg}.pre_install"
-    local post_hook="${pdir}/${pkg}.post_install"
+  resolve_install_deps "$libc" "$cat" "$pkg"
 
-    # Hook de pré-instalação antes de tocar no filesystem
-    run_hook "pre_install" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+  local pre_hook="${pdir}/${pkg}.pre_install"
+  local post_hook="${pdir}/${pkg}.post_install"
 
-    log_info "Instalando ${PKG_TARBALL} em ${rootfs}"
-    local filelist
-    filelist="$(mktemp)"
-    tar -tf "$PKG_TARBALL" > "$filelist"
-    tar -C "$rootfs" -xf "$PKG_TARBALL"
+  run_hook "pre_install" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
 
-    local meta filesdb
-    meta="$(meta_path "$cat" "$pkg" "$libc")"
-    filesdb="$(files_path "$cat" "$pkg" "$libc")"
+  log_info "Instalando tarball '${PKG_TARBALL}' em '${rootfs}'"
 
-    mv "$filelist" "$filesdb"
+  local filelist
+  filelist="$(mktemp)"
+  tar -tf "$PKG_TARBALL" > "$filelist"
 
-    {
-        echo "PKG_ID=\"${cat}/${pkg}\""
-        echo "PKG_NAME=\"$pkg\""
-        echo "PKG_CATEGORY=\"$cat\""
-        echo "PKG_VERSION=\"${PKG_VERSION:-unknown}\""
-        echo "PKG_LIBC=\"$libc\""
-        echo "PKG_TARBALL=\"$PKG_TARBALL\""
-        echo -n "PKG_DEPS=\""
-        read_deps_file "${pdir}/${pkg}.deps" | tr '\n' ' '
-        echo "\""
-    } > "$meta"
+  tar -C "$rootfs" -xf "$PKG_TARBALL"
 
-    # Hook de pós-instalação depois de arquivos e metadados prontos
-    run_hook "post_install" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+  mv "$filelist" "$filesdb"
 
-    log_success "Instalado ${cat}/${pkg} (${PKG_VERSION:-?}, ${libc})"
+  {
+    printf 'PKG_ID=%s\n'       "$(sh_quote "${cat}/${pkg}")"
+    printf 'PKG_NAME=%s\n'     "$(sh_quote "${pkg}")"
+    printf 'PKG_CATEGORY=%s\n' "$(sh_quote "${cat}")"
+    printf 'PKG_VERSION=%s\n'  "$(sh_quote "${PKG_VERSION:-unknown}")"
+    printf 'PKG_LIBC=%s\n'     "$(sh_quote "${libc}")"
+    printf 'PKG_TARBALL=%s\n'  "$(sh_quote "${PKG_TARBALL}")"
+
+    # Dependências deste pacote (não recursivas)
+    local deps_line
+    deps_line="$(read_deps_file "${pdir}/${pkg}.deps" | tr '\n' ' ' || true)"
+    printf 'PKG_DEPS=%s\n' "$(sh_quote "${deps_line}")"
+  } > "$meta"
+
+  run_hook "post_install" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+
+  log_success "Instalação concluída de ${cat}/${pkg} para '${libc}'"
 }
 
 cmd_uninstall() {
-    local name="$1"
-    local libc
-    libc="$(detect_libc "${2:-}")"
-    local rootfs
-    rootfs="$(rootfs_for_libc "$libc")"
+  local name="$1"
+  local libc
+  libc="$(detect_libc "${2:-}")"
 
-    local resolved cat pkg pdir
-    resolved="$(resolve_pkg_single "$name")"
-    IFS='|' read -r cat pkg pdir <<< "$resolved"
+  local rootfs
+  rootfs="$(rootfs_for_libc "$libc")"
 
-    local meta filesdb
-    meta="$(meta_path "$cat" "$pkg" "$libc")"
-    filesdb="$(files_path "$cat" "$pkg" "$libc")"
+  local resolved cat pkg pdir
+  resolved="$(resolve_pkg_single "$name")"
+  cat="${resolved%%|*}"
+  resolved="${resolved#*|}"; pkg="${resolved%%|*}"
+  pdir="${resolved##*|}"
 
-    [ -f "$meta" ] || die "Pacote ${cat}/${pkg} (${libc}) não parece estar instalado (meta ausente)."
-    [ -f "$filesdb" ] || die "Banco de arquivos ${filesdb} ausente, não posso desinstalar com segurança."
+  local meta filesdb
+  meta="$(meta_path "$cat" "$pkg" "$libc")"
+  filesdb="$(files_path "$cat" "$pkg" "$libc")"
 
-    # shellcheck disable=SC1090
-    . "$meta"
+  if [[ ! -f "$meta" || ! -f "$filesdb" ]]; then
+    die "Pacote ${cat}/${pkg} (${libc}) não parece estar instalado (faltam arquivos em ${DB_DIR})."
+  fi
 
-    local target="${cat}/${pkg}"
-    local rdeps
-    rdeps="$(find_reverse_deps "$target" "$libc" || true)"
+  # Carrega metadata de forma segura
+  if ! . "$meta"; then
+    log_error "Arquivo de metadata inválido ou corrompido: ${meta}"
+    die "Não foi possível carregar metadata para ${cat}/${pkg} (${libc})."
+  fi
 
-    if [ -n "$rdeps" ]; then
-        log_error "Não é seguro remover ${target} (${libc}). Pacotes dependentes:"
-        echo "$rdeps" >&2
-        die "Remoção abortada para evitar quebrar dependências."
-    fi
+  local target="${cat}/${pkg}"
+  local rdeps
+  rdeps="$(find_reverse_deps "$target" "$libc" || true)"
 
-    local pre_hook="${pdir}/${pkg}.pre_uninstall"
-    local post_hook="${pdir}/${pkg}.post_uninstall"
+  if [[ -n "$rdeps" ]]; then
+    log_error "Não é possível remover ${target} (${libc}). Outros pacotes dependem dele:"
+    printf '%s\n' "$rdeps"
+    die "Remoção abortada devido a dependências reversas."
+  fi
 
-    # Hook de pré-desinstalação antes de modificar o filesystem
-    run_hook "pre_uninstall" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+  local pre_hook="${pdir}/${pkg}.pre_uninstall"
+  local post_hook="${pdir}/${pkg}.post_uninstall"
 
-    log_info "Removendo arquivos de ${target} (${libc})"
-    while read -r path; do
-        [ -n "$path" ] || continue
-        rm -f "${rootfs}/${path}" || log_warn "Falha ao remover ${rootfs}/${path}"
-    done < "$filesdb"
+  run_hook "pre_uninstall" "$pre_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
 
-    # Tentar limpar diretórios vazios (best effort)
-    sort -r "$filesdb" | while read -r path; do
-        local dir
-        dir="$(dirname "$path")"
-        [ -n "$dir" ] || continue
-        rmdir --ignore-fail-on-non-empty "${rootfs}/${dir}" 2>/dev/null || true
-    done
+  log_info "Removendo arquivos de ${target} (${libc})"
 
-    # Remover metadados após remoção de arquivos
-    rm -f "$meta" "$filesdb"
+  # Remove arquivos listados, com verificação básica de segurança de caminho
+  while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
 
-    # Hook de pós-desinstalação depois da remoção
-    run_hook "post_uninstall" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+    case "$path" in
+      /*)
+        log_warn "Caminho absoluto inválido em '${filesdb}': '${path}'. Ignorando."
+        continue
+        ;;
+      *'..'*)
+        log_warn "Caminho inseguro (contém '..') em '${filesdb}': '${path}'. Ignorando."
+        continue
+        ;;
+    esac
 
-    log_success "Removido ${target} (${libc})"
+    rm -f "${rootfs}/${path}" || log_warn "Falha ao remover arquivo '${rootfs}/${path}'"
+  done < "$filesdb"
+
+  # Tenta remover diretórios vazios (em ordem reversa)
+  sort -r "$filesdb" 2>/dev/null | while IFS= read -r path; do
+    [[ -z "$path" ]] && continue
+
+    case "$path" in
+      /*|*'..'*)
+        # já avisamos acima quando necessário
+        continue
+        ;;
+    esac
+
+    local dir
+    dir="$(dirname "$path")"
+    rmdir --ignore-fail-on-non-empty "${rootfs}/${dir}" 2>/dev/null || true
+  done
+
+  rm -f "$meta" "$filesdb"
+
+  run_hook "post_uninstall" "$post_hook" "$rootfs" "$cat" "$pkg" "$libc" "${PKG_VERSION:-unknown}"
+
+  log_success "Remoção concluída de ${target} (${libc})"
 }
 
 cmd_list() {
