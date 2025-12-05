@@ -1,0 +1,14 @@
+# Modo super rígido (já é o padrão, mas explícito):
+MUSL_HOOK_STRICT=1 adm install libc/musl musl
+
+# Permitir libs glibc leftover (só warnings):
+MUSL_SEC_ALLOW_GLIBC=1 adm install libc/musl musl
+
+# Permitir setuid root:
+MUSL_SEC_ALLOW_SETUID=1 adm install libc/musl musl
+
+# Tolerar até 3 diretórios world-writable sem sticky:
+MUSL_SEC_MAX_WW_DIRS=3 adm install libc/musl musl
+
+# E em pós-instalação, testar loader via chroot:
+MUSL_SANITY_CHROOT=1 adm install libc/musl musl
