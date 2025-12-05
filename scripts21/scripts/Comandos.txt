@@ -1,0 +1,30 @@
+Como usar na prática
+
+Rolling release “normal” (inteligente com hash)
+
+# glibc, flags normais
+ADM_PROFILE=glibc adm.sh world-upgrade
+
+# musl
+ADM_PROFILE=musl adm.sh world-upgrade
+
+# glibc + high-performance
+ADM_PROFILE=glibc ADM_PERF_LEVEL=high adm.sh world-upgrade
+
+O sistema vai decidir sozinho o que precisa rebuildar com base em:
+versão do pacote
+hash do ambiente (perfil, CFLAGS, etc.)
+versões das dependências
+---
+
+Rebuild total com paralelismo pesado
+
+# 4 builds em paralelo, glibc
+ADM_PROFILE=glibc ADM_JOBS=4 adm.sh world-rebuild-all
+
+# 8 builds em paralelo, musl + high-perf
+ADM_PROFILE=musl ADM_PERF_LEVEL=high ADM_JOBS=8 adm.sh world-rebuild-all
+
+Etapa 1: compila tudo em paralelo (usa todos os perfis/flags atuais)
+
+Etapa 2: instala tudo em sequência, atualizando hashes de ambiente
