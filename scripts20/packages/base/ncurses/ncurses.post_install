@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação para Ncurses
+#
+# Chamado pelo adm via run_hook("post_install", ...):
+#   ROOTFS           - rootfs onde o ncurses foi instalado
+#   ADM_CATEGORY     - categoria do pacote (ex: "core")
+#   ADM_PKG_NAME     - nome do pacote (ex: "ncurses")
+#   ADM_LIBC         - libc alvo
+#   ADM_PKG_VERSION  - versão do ncurses (ex: "6.5-20250809")
+#
+# Variáveis opcionais:
+#   NCURSES_SANITY_STRICT        - se "1", falhas viram erro fatal (default: 1)
+#   NCURSES_SANITY_CHROOT_TEST   - se "1", testa tput via chroot
+#   ADM_NCURSES_LIBDIR           - libdir usado na instalação (default: /usr/lib)
+#   ADM_NCURSES_TERMINFO_DIR     - terminfo dir (default: /usr/share/terminfo)
+#
+# Objetivo:
+#   - Confirmar que binários básicos de ncurses estão presentes
+#   - Confirmar que bibliotecas compartilhadas existem
+#   - Confirmar que terminfo foi instalado
+#   - Validar ELF de libs/binários (se 'file' disponível)
+#   - Opcionalmente testar 'tput cols' dentro do ROOTFS
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_tag() {
+  printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[ncurses-sanity:%s] %s\n' "$(_tag)" "$*"; }
+warn() { printf '[ncurses-sanity:%s][WARN] %s\n' "$(_tag)" "$*" >&2; }
+fail() { printf '[ncurses-sanity:%s][ERRO] %s\n' "$(_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook ncurses.post_install.}"
+
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer no fluxo do adm (risco no sistema host)."
+fi
+
+NCURSES_VER="${ADM_PKG_VERSION:-desconhecida}"
+STRICT="${NCURSES_SANITY_STRICT:-1}"
+CHROOT_TEST="${NCURSES_SANITY_CHROOT_TEST:-0}"
+
+LIBDIR="${ADM_NCURSES_LIBDIR:-/usr/lib}"
+TERMINFO_DIR_REL="${ADM_NCURSES_TERMINFO_DIR:-/usr/share/terminfo}"
+
+LIBDIR_ABS="${ROOTFS%/}${LIBDIR%/}"
+LIBDIR_ABS64="${ROOTFS%/}/usr/lib64"
+TERMINFO_DIR="${ROOTFS%/}${TERMINFO_DIR_REL%/}"
+
+log "Sanity-check do Ncurses (versão reportada: ${NCURSES_VER})"
+log "  ROOTFS        = ${ROOTFS}"
+log "  STRICT        = ${STRICT}"
+log "  LIBDIR        = ${LIBDIR} (abs=${LIBDIR_ABS})"
+log "  TERMINFO_DIR  = ${TERMINFO_DIR_REL} (abs=${TERMINFO_DIR})"
+log "  CHROOT_TEST   = ${CHROOT_TEST}"
+
+###############################################################################
+# BINÁRIOS BÁSICOS
+###############################################################################
+
+ESSENTIAL_BINS=(
+  tput
+  clear
+  tic
+  infocmp
+)
+
+missing_bins=0
+checked_bins=()
+
+check_bin() {
+  local name="$1"
+  local rel="/usr/bin/${name}"
+  local abs="${ROOTFS%/}${rel}"
+  if [ -x "$abs" ]; then
+    log "Binário encontrado: ${abs}"
+    checked_bins+=("$abs")
+  else
+    warn "Binário NÃO encontrado ou não executável: ${abs}"
+    missing_bins=$((missing_bins + 1))
+  fi
+}
+
+for b in "${ESSENTIAL_BINS[@]}"; do
+  check_bin "$b"
+done
+
+if [ "$missing_bins" -gt 0 ]; then
+  local msg="${missing_bins} binário(s) essencial(is) de ncurses ausente(s) ou não executável(is)."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# BIBLIOTECAS PRINCIPAIS
+###############################################################################
+
+lib_paths=()
+
+search_lib_pattern() {
+  local base="$1"
+  local pattern="$2"
+  [ -d "$base" ] || return 0
+
+  local p
+  for p in "${base}/${pattern}"; do
+    [ -e "$p" ] || continue
+    lib_paths+=("$p")
+  done
+}
+
+# libs wide e compat
+search_lib_pattern "$LIBDIR_ABS"   "libncursesw.so*"
+search_lib_pattern "$LIBDIR_ABS"   "libncurses.so*"
+search_lib_pattern "$LIBDIR_ABS"   "libtinfow.so*"
+search_lib_pattern "$LIBDIR_ABS"   "libtinfo.so*"
+search_lib_pattern "$LIBDIR_ABS64" "libncursesw.so*"
+search_lib_pattern "$LIBDIR_ABS64" "libncurses.so*"
+search_lib_pattern "$LIBDIR_ABS64" "libtinfow.so*"
+search_lib_pattern "$LIBDIR_ABS64" "libtinfo.so*"
+
+if [ "${#lib_paths[@]}" -eq 0 ]; then
+  local msg="Nenhuma biblioteca compartilhada de ncurses encontrada em ${LIBDIR_ABS} ou ${LIBDIR_ABS64}."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+else
+  log "Bibliotecas ncurses detectadas:"
+  local p
+  for p in "${lib_paths[@]}"; do
+    log "  - ${p}"
+  done
+fi
+
+###############################################################################
+# TERMINFO
+###############################################################################
+
+terminfo_ok=1
+
+if [ ! -d "$TERMINFO_DIR" ]; then
+  warn "Diretório de terminfo não encontrado: ${TERMINFO_DIR}"
+  terminfo_ok=0
+else
+  log "Diretório de terminfo encontrado: ${TERMINFO_DIR}"
+
+  # Checar se existe ao menos uma entry xterm ou linux
+  local found_entry=0
+
+  if [ -f "${TERMINFO_DIR}/x/xterm" ] || [ -f "${TERMINFO_DIR}/78/xterm" ] || \
+     [ -f "${TERMINFO_DIR}/l/linux" ] || [ -f "${TERMINFO_DIR}/6c/linux" ]; then
+    found_entry=1
+  else
+    # fallback: qualquer arquivo em terminfo
+    if find "$TERMINFO_DIR" -type f 2>/dev/null | head -n1 | read -r _; then
+      found_entry=1
+    fi
+  fi
+
+  if [ "$found_entry" -eq 1 ]; then
+    log "Pelo menos uma entry de terminfo foi encontrada (ex: xterm/linux)."
+  else
+    warn "Nenhuma entry de terminfo típica (xterm/linux) encontrada em ${TERMINFO_DIR}."
+    terminfo_ok=0
+  fi
+fi
+
+if [ "$terminfo_ok" -eq 0 ]; then
+  local msg="Terminfo parece incompleto ou ausente em ${TERMINFO_DIR}."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# Validar tipo ELF de libs e binários (se 'file' existir)
+###############################################################################
+
+if has_cmd file; then
+  # libs
+  for p in "${lib_paths[@]}"; do
+    local desc
+    desc="$(file -b "$p" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf' && echo "$desc" | grep -qi 'shared object'; then
+      log "OK (ELF SO): $p -> $desc"
+    else
+      local msg="Biblioteca ncurses com tipo inesperado: $p -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+
+  # binários
+  for p in "${checked_bins[@]}"; do
+    local desc
+    desc="$(file -b "$p" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf'; then
+      log "OK (ELF bin): $p -> $desc"
+    else
+      local msg="Binário ncurses com tipo inesperado: $p -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+else
+  warn "Comando 'file' não encontrado; não foi possível validar tipo ELF de libs/binários."
+fi
+
+###############################################################################
+# TESTE OPCIONAL VIA CHROOT: tput cols
+###############################################################################
+
+if [ "$CHROOT_TEST" = "1" ] && has_cmd chroot; then
+  # tput dentro do chroot
+  local tput_path=""
+  if [ -x "${ROOTFS%/}/usr/bin/tput" ]; then
+    tput_path="/usr/bin/tput"
+  fi
+
+  if [ -z "$tput_path" ]; then
+    warn "NCURSES_SANITY_CHROOT_TEST=1, mas /usr/bin/tput não foi encontrado no ROOTFS."
+  else
+    log "Rodando teste simples dentro do ROOTFS: 'TERM=xterm ${tput_path} cols'"
+    if ! chroot "$ROOTFS" /usr/bin/env TERM=xterm PATH="/usr/bin:/bin:/sbin:/usr/sbin" "$tput_path" cols >/dev/null 2>&1; then
+      local msg="Falha ao executar 'tput cols' dentro do ROOTFS."
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    else
+      log "Execução de 'tput cols' dentro do ROOTFS parece OK."
+    fi
+  fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check do Ncurses concluído com sucesso."
+exit 0
