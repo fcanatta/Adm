@@ -1,0 +1,8 @@
+# Modo estrito, sem tolerância para arquivos faltando:
+ADM_SANITY_STRICT=1 ADM_SANITY_MAX_MISSING=0 adm install core/bash
+
+# Permitir até 3 arquivos faltando (por exemplo, arquivos gerados em runtime):
+ADM_SANITY_MAX_MISSING=3 adm install core/meu-pacote
+
+# Testar dependências de ELF com ldd dentro do chroot:
+ADM_SANITY_USE_LDD=1 adm install core/minha-biblioteca
