@@ -14,13 +14,14 @@
 # Dentro do chroot (inner mode), o script:
 #   - lê /etc/adm/bootstrap.queue ou a lista passada
 #   - lê estado em /var/lib/adm/bootstrap-state
-#   - retoma a partir do último índice concluído com sucesso
-#   - mostra tudo colorido e com logs individuais em /var/log/adm
+#   - retoma do último pacote concluído com sucesso
+#   - para cada pacote: adm build <pacote> && adm install <pacote>
+#   - registra logs em /var/log/adm/bootstrap-<idx>-<nome>.log
 
 set -euo pipefail
 
 ###############################################################################
-# CORES COMPARTILHADAS
+# CORES E LOG
 ###############################################################################
 
 if [ -t 1 ]; then
@@ -36,20 +37,22 @@ else
     RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; RESET=""
 fi
 
+# Log no host
 log_host()  { printf "%s\n" "$*"; }
-info_host() { printf "%s[INFO]%s %s\n" "$BLUE" "$RESET" "$*"; }
-ok_host()   { printf "%s[OK]%s %s\n"   "$GREEN" "$RESET" "$*"; }
+info_host() { printf "%s[INFO]%s %s\n" "$BLUE"   "$RESET" "$*"; }
+ok_host()   { printf "%s[OK]%s %s\n"   "$GREEN"  "$RESET" "$*"; }
 warn_host() { printf "%s[WARN]%s %s\n" "$YELLOW" "$RESET" "$*"; }
-err_host()  { printf "%s[ERRO]%s %s\n" "$RED" "$RESET" "$*" >&2; }
+err_host()  { printf "%s[ERRO]%s %s\n" "$RED"    "$RESET" "$*" >&2; }
 
+# Log dentro do chroot
 log_inner()  { printf "%s\n" "$*"; }
-info_inner() { printf "%s[INFO]%s %s\n" "$BLUE" "$RESET" "$*"; }
-ok_inner()   { printf "%s[✔]%s %s\n"   "$GREEN" "$RESET" "$*"; }
+info_inner() { printf "%s[INFO]%s %s\n" "$BLUE"   "$RESET" "$*"; }
+ok_inner()   { printf "%s[✔]%s %s\n"   "$GREEN"  "$RESET" "$*"; }
 warn_inner() { printf "%s[WARN]%s %s\n" "$YELLOW" "$RESET" "$*"; }
-err_inner()  { printf "%s[ERRO]%s %s\n" "$RED" "$RESET" "$*" >&2; }
+err_inner()  { printf "%s[ERRO]%s %s\n" "$RED"    "$RESET" "$*" >&2; }
 
 ###############################################################################
-# MODO HOST (fora do chroot)
+# CONSTANTES HOST
 ###############################################################################
 
 ROOTFS_GLIBC_DEFAULT="/opt/systems/glibc-rootfs"
@@ -65,6 +68,26 @@ ADM_PACKAGES_CHROOT="/usr/src/adm/packages"
 
 BOOTSTRAP_QUEUE_FILE="/etc/adm/bootstrap.queue"
 
+###############################################################################
+# HELPERS HOST
+###############################################################################
+
+host_check_requirements() {
+    local missing=()
+
+    for cmd in chroot mount cp mkdir id; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if ((${#missing[@]} > 0)); then
+        err_host "Comandos necessários ausentes no host: ${missing[*]}"
+        err_host "Instale-os antes de executar o adm-bootstrap."
+        exit 1
+    fi
+}
+
 detect_rootfs_host() {
     local arg="${1:-}"
 
@@ -72,9 +95,10 @@ detect_rootfs_host() {
         case "$arg" in
             glibc) echo "$ROOTFS_GLIBC_DEFAULT"; return 0 ;;
             musl)  echo "$ROOTFS_MUSL_DEFAULT";  return 0 ;;
-            /*)    echo "$arg";                 return 0 ;;
+            /*)    echo "$arg";                  return 0 ;;
             *)
                 err_host "Argumento de rootfs inválido: $arg"
+                err_host "Use 'glibc', 'musl' ou um caminho absoluto para o rootfs."
                 exit 1
                 ;;
         esac
@@ -138,10 +162,10 @@ umount_safe_host() {
     local dst="$1"
 
     if mountpoint -q "$dst" 2>/dev/null; then
-        umount "$dst" || {
+        if ! umount "$dst"; then
             warn_host "Falha ao desmontar $dst, tentando umount -l..."
             umount -l "$dst" || warn_host "Não foi possível desmontar $dst (verifique manualmente)."
-        }
+        fi
         ok_host "Desmontado: $dst"
     fi
 }
@@ -153,17 +177,23 @@ cleanup_mounts_host() {
     done
 }
 
+###############################################################################
+# HOST MAIN
+###############################################################################
+
 host_main() {
-    [ "$(id -u)" -eq 0 ] || {
+    host_check_requirements
+
+    if [ "$(id -u)" -ne 0 ]; then
         err_host "Este script precisa ser executado como root."
         exit 1
-    }
+    fi
 
     local rootfs_arg=""
     local pkgs=()
 
     # Se o primeiro argumento for glibc/musl ou caminho absoluto, é o rootfs
-    if [ $# -gt 0 ]; then
+    if [ "$#" -gt 0 ]; then
         case "$1" in
             glibc|musl|/*)
                 rootfs_arg="$1"
@@ -172,7 +202,7 @@ host_main() {
         esac
     fi
 
-    while [ $# -gt 0 ]; do
+    while [ "$#" -gt 0 ]; do
         pkgs+=("$1")
         shift
     done
@@ -182,72 +212,71 @@ host_main() {
     ROOTFS="${ROOTFS%/}"
 
     if [ ! -d "$ROOTFS" ]; then
-        err_host "ROOTFS não encontrado: $ROOTFS"
+        err_host "Rootfs não existe: $ROOTFS"
+        exit 1
+    fi
+
+    if [ "$ROOTFS" = "/" ]; then
+        err_host "Por segurança, não é permitido usar '/' como rootfs de chroot."
         exit 1
     fi
 
     local chroot_libc
     chroot_libc="$(detect_chroot_libc "$ROOTFS")"
 
-    info_host "Usando ROOTFS: $ROOTFS"
-    [ -n "$chroot_libc" ] && info_host "Libc detectada para o chroot: $chroot_libc" || warn_host "Não foi possível deduzir libc (ADM_LIBC ficará vazio)."
+    info_host "Usando rootfs: $ROOTFS"
+    if [ -n "$chroot_libc" ]; then
+        info_host "Libc detectada no chroot: $chroot_libc"
+    else
+        warn_host "Não foi possível detectar automaticamente a libc do chroot."
+    fi
 
     trap cleanup_mounts_host EXIT INT TERM
 
     # Diretórios básicos dentro do rootfs
-    local basic_dirs=(
-        "$ROOTFS/dev"
-        "$ROOTFS/proc"
-        "$ROOTFS/sys"
-        "$ROOTFS/run"
-        "$ROOTFS/tmp"
-        "$ROOTFS/etc"
-        "$ROOTFS/usr/bin"
-        "$ROOTFS/var/log/adm"
-        "$ROOTFS/var/lib/adm"
-        "$ROOTFS/var/cache/adm/sources"
-        "$ROOTFS/var/cache/adm/packages"
+    mkdir -p \
+        "$ROOTFS/dev" \
+        "$ROOTFS/proc" \
+        "$ROOTFS/sys"  \
+        "$ROOTFS/run"  \
+        "$ROOTFS/tmp"  \
+        "$ROOTFS/etc"  \
+        "$ROOTFS/usr/bin" \
+        "$ROOTFS/var/log/adm" \
+        "$ROOTFS/var/lib/adm" \
+        "$ROOTFS/var/cache/adm/sources" \
+        "$ROOTFS/var/cache/adm/packages" \
         "$ROOTFS/root"
-    )
 
-    for d in "${basic_dirs[@]}"; do
-        mkdir -p "$d"
-    done
-
-    # resolv.conf para DNS dentro do chroot
+    # Copiar resolv.conf para que DNS funcione dentro do chroot
     if [ -f /etc/resolv.conf ]; then
-        cp -L /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
-        ok_host "Copiado /etc/resolv.conf -> $ROOTFS/etc/resolv.conf"
-    else
-        warn_host "/etc/resolv.conf não encontrado no host; DNS pode não funcionar no chroot."
+        cp -f /etc/resolv.conf "$ROOTFS/etc/resolv.conf"
     fi
 
-    # adm binário
+    # Copiar /usr/bin/adm se existir
     if [ -x "$ADM_BIN_HOST" ]; then
         cp -f "$ADM_BIN_HOST" "$ROOTFS$ADM_BIN_CHROOT"
         chmod +x "$ROOTFS$ADM_BIN_CHROOT"
-        ok_host "Copiado adm: $ADM_BIN_HOST -> $ROOTFS$ADM_BIN_CHROOT"
+        ok_host "Copiado adm para dentro do chroot: $ROOTFS$ADM_BIN_CHROOT"
     else
-        warn_host "adm não encontrado em $ADM_BIN_HOST; 'adm' não estará disponível no chroot."
+        warn_host "adm não encontrado em $ADM_BIN_HOST; assumindo que será acessível de outra forma no chroot."
     fi
 
-    # /etc/adm com profiles e configs
+    # Copiar /etc/adm se existir
     if [ -d "$ADM_ETC_HOST" ]; then
         mkdir -p "$ROOTFS$ADM_ETC_CHROOT"
         cp -a "$ADM_ETC_HOST/." "$ROOTFS$ADM_ETC_CHROOT/"
-        ok_host "Copiado /etc/adm -> $ROOTFS$ADM_ETC_CHROOT"
-    else
-        warn_host "/etc/adm não encontrado no host; profiles do adm podem não estar disponíveis no chroot."
+        ok_host "Copiado /etc/adm para dentro do chroot."
     fi
 
-    # Bind /usr/src/adm/packages
+    # Bind mount de /usr/src/adm/packages (se existir) para o chroot
     if [ -d "$ADM_PACKAGES_HOST" ]; then
         mount_if_needed_host "$ADM_PACKAGES_HOST" "$ROOTFS$ADM_PACKAGES_CHROOT"
     else
-        warn_host "Diretório de pacotes não encontrado no host: $ADM_PACKAGES_HOST"
+        warn_host "Diretório de pacotes não encontrado em $ADM_PACKAGES_HOST; adm build pode falhar se depender disso."
     fi
 
-    # Montagens básicas
+    # Montagens básicas (proc, sys, dev, run)
     mount_if_needed_host proc          "$ROOTFS/proc" "proc"
     mount_if_needed_host sysfs         "$ROOTFS/sys"  "sysfs"
     mount_if_needed_host /dev          "$ROOTFS/dev"
@@ -264,7 +293,8 @@ host_main() {
         chroot_shell="/bin/bash"
     fi
     if [ ! -x "$ROOTFS$chroot_shell" ]; then
-        err_host "Nenhum shell encontrado em $ROOTFS/tools/bin/bash ou $ROOTFS/bin/bash"
+        err_host "Nenhum shell encontrado em $ROOTFS/tools/bin/bash ou $ROOTFS/bin/bash."
+        err_host "Instale um bash dentro do chroot antes de rodar o bootstrap."
         exit 1
     fi
 
@@ -289,13 +319,19 @@ host_main() {
         ADM_BOOTSTRAP_LIBC="$chroot_libc" \
         ADM_BOOTSTRAP_STATE_FILE="/var/lib/adm/bootstrap-state" \
         ADM_BOOTSTRAP_QUEUE_FILE="$BOOTSTRAP_QUEUE_FILE" \
-        /bin/bash "$inner_script" "${pkgs[@]}"
+        "$chroot_shell" "$inner_script" "${pkgs[@]}"
 
-    ok_host "Fila de bootstrap encerrada. Saindo do chroot."
+    local status=$?
+    if [ "$status" -ne 0 ]; then
+        err_host "Chroot retornou com erro (status=$status). Verifique os logs em $ROOTFS/var/log/adm."
+        exit "$status"
+    fi
+
+    ok_host "Bootstrap concluído com sucesso."
 }
 
 ###############################################################################
-# MODO INNER (dentro do chroot)
+# INNER MODE (dentro do chroot)
 ###############################################################################
 
 inner_load_queue() {
@@ -305,24 +341,28 @@ inner_load_queue() {
         return 0
     fi
 
-    # Senão, ler do arquivo de fila
     local qfile="${ADM_BOOTSTRAP_QUEUE_FILE:-/etc/adm/bootstrap.queue}"
     if [ ! -f "$qfile" ]; then
-        err_inner "Nenhuma fila de pacotes passada e arquivo $qfile não existe."
+        err_inner "Arquivo de fila não encontrado: $qfile"
         exit 1
     fi
 
     QUEUE=()
-    while IFS= read -r line; do
+    while IFS='' read -r line || [ -n "$line" ]; do
+        # Remove comentários
         line="${line%%#*}"
+        # Remove \r (CRLF) se existir
+        line="${line%$'\r'}"
+        # Trim espaços em volta
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
+
         [ -z "$line" ] && continue
         QUEUE+=("$line")
     done < "$qfile"
 
     if [ "${#QUEUE[@]}" -eq 0 ]; then
-        err_inner "Fila $qfile está vazia."
+        err_inner "Fila está vazia em $qfile."
         exit 1
     fi
 }
@@ -331,26 +371,44 @@ inner_read_state() {
     STATE_FILE="${ADM_BOOTSTRAP_STATE_FILE:-/var/lib/adm/bootstrap-state}"
     LAST_OK_INDEX="-1"
     LAST_OK_PKG=""
+
     if [ -f "$STATE_FILE" ]; then
         # shellcheck disable=SC1090
-        . "$STATE_FILE" || true
+        if ! . "$STATE_FILE"; then
+            warn_inner "Falha ao ler arquivo de estado $STATE_FILE; começando do início."
+            LAST_OK_INDEX="-1"
+            LAST_OK_PKG=""
+        fi
+    fi
+
+    # Sanitizar LAST_OK_INDEX: precisa ser inteiro >= -1
+    if printf '%s\n' "${LAST_OK_INDEX}" | grep -qE '^-?[0-9]+$'; then
+        :
+    else
+        warn_inner "Valor inválido em LAST_OK_INDEX ('$LAST_OK_INDEX'), redefinindo para -1."
+        LAST_OK_INDEX="-1"
     fi
 }
 
 inner_write_state() {
     local idx="$1" pkg="$2"
+
     mkdir -p "$(dirname "$STATE_FILE")"
     {
-        echo "LAST_OK_INDEX=\"$idx\""
-        echo "LAST_OK_PKG=\"$pkg\""
-        echo "LAST_OK_TIME=\"$(date +'%Y-%m-%d %H:%M:%S')\""
+        printf 'LAST_OK_INDEX="%s"\n' "$idx"
+        printf 'LAST_OK_PKG="%s"\n' "$pkg"
+        printf 'LAST_OK_TIME="%s"\n' "$(date +'%Y-%m-%d %H:%M:%S')"
     } > "$STATE_FILE"
 }
 
 inner_show_header() {
     local total="$1"
     info_inner "${BOLD}===== ADM BOOTSTRAP (total de pacotes: $total) =====${RESET}"
-    [ -n "${ADM_BOOTSTRAP_LIBC:-}" ] && info_inner "Libc: ${ADM_BOOTSTRAP_LIBC}" || info_inner "Libc: (não definida)"
+    if [ -n "${ADM_BOOTSTRAP_LIBC:-}" ]; then
+        info_inner "Libc: ${ADM_BOOTSTRAP_LIBC}"
+    else
+        info_inner "Libc: (não definida)"
+    fi
     info_inner "State file: ${STATE_FILE}"
     info_inner ""
 }
@@ -365,25 +423,28 @@ inner_show_pkg_info() {
     fi
 
     local dep_str="(sem deps)"
-    if [ -n "$cat" ]; then
+    if [ -n "$cat" ] && [ -d "/usr/src/adm/packages/${cat}/${name}" ]; then
         local depfile="/usr/src/adm/packages/${cat}/${name}/${name}.deps"
         if [ -f "$depfile" ]; then
-            dep_str="$(grep -Ev '^\s*($|#)' "$depfile" || true)"
+            dep_str="$(grep -Ev '^\s*($|#)' "$depfile" 2>/dev/null || true)"
             [ -z "$dep_str" ] && dep_str="(sem deps)"
         fi
     fi
 
     local ver_str="(?)"
-    # Se já tiver meta (instalado), tentar pegar versão
-    local meta_glob="/var/lib/adm/db/${cat}__${name}__"*.meta
-    for meta in $meta_glob; do
-        [ -f "$meta" ] || continue
-        unset PKG_VERSION
-        # shellcheck disable=SC1090
-        . "$meta"
-        ver_str="${PKG_VERSION:-$ver_str}"
-        break
-    done
+    if [ -n "$cat" ]; then
+        local meta_glob="/var/lib/adm/db/${cat}__${name}__"*.meta
+        local meta
+        for meta in $meta_glob; do
+            [ -f "$meta" ] || continue
+            unset PKG_VERSION
+            # shellcheck disable=SC1090
+            if . "$meta"; then
+                ver_str="${PKG_VERSION:-$ver_str}"
+            fi
+            break
+        done
+    fi
 
     printf "%s[%d/%d]%s %s%s%s (versão: %s)\n" \
         "$CYAN" "$((idx+1))" "$total" "$RESET" "$BOLD" "$pkg" "$RESET" "$ver_str"
@@ -396,6 +457,9 @@ inner_main() {
         err_inner "'adm' não encontrado dentro do chroot. Verifique se foi copiado para /usr/bin/adm."
         exit 1
     fi
+
+    # Garante diretório de logs dentro do chroot
+    mkdir -p /var/log/adm
 
     inner_load_queue "$@"
     inner_read_state
@@ -413,7 +477,7 @@ inner_main() {
         pkg="${QUEUE[$i]}"
 
         # Se já foi concluído antes, mostrar como OK e pular
-        if [ "$LAST_OK_INDEX" != "" ] && [ "$i" -le "${LAST_OK_INDEX:- -1}" ]; then
+        if [ -n "${LAST_OK_INDEX:-}" ] && [ "$LAST_OK_INDEX" -ge 0 ] && [ "$i" -le "$LAST_OK_INDEX" ]; then
             printf "%s< ✔️ >%s %s (já concluído, pulando)\n" "$GREEN" "$RESET" "$pkg"
             continue
         fi
@@ -429,19 +493,18 @@ inner_main() {
         local log_name="${name//\//_}"
         local log_file="/var/log/adm/bootstrap-${i}-${log_name}.log"
 
-        printf "  Log: %s%s%s\n" "$MAGENTA" "$log_file" "$RESET"
-        printf "  Etapas: %sbuild%s -> %sinstall%s\n" "$BLUE" "$RESET" "$BLUE" "$RESET"
+        printf "  Log: %s%s%s\n" "$CYAN" "$log_file" "$RESET"
+        printf "  Etapas: adm build %s && adm install %s\n" "$pkg" "$pkg"
 
-        # Executar build + install
         {
-            echo "===== $(date +'%Y-%m-%d %H:%M:%S') - Iniciando ${pkg} ====="
-            echo "Etapa: adm build ${pkg}"
+            echo "===== $(date +'%Y-%m-%d %H:%M:%S') - Iniciando $pkg ====="
+            echo "Etapa: adm build $pkg"
             adm build "$pkg"
-            echo "Etapa: adm install ${pkg}"
+            echo "Etapa: adm install $pkg"
             adm install "$pkg"
-            echo "===== $(date +'%Y-%m-%d %H:%M:%S') - SUCESSO ${pkg} ====="
+            echo "===== $(date +'%Y-%m-%d %H:%M:%S') - SUCESSO $pkg ====="
         } >> "$log_file" 2>&1 || {
-            err_inner "Falha na construção/instalação de ${pkg}. Veja o log: $log_file"
+            err_inner "Falha na construção/instalação do pacote '$pkg'. Veja o log em: $log_file"
             printf "%s< ✖ >%s %s\n" "$RED" "$RESET" "$pkg"
             exit 1
         }
