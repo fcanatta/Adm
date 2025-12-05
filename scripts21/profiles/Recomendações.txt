@@ -1,0 +1,7 @@
+Aí você controla com:
+
+export ADM_PROFILE=musl
+export ADM_PERF_LEVEL=high
+/opt/adm/adm.sh install core/hello
+
+Se quiser voltar pro “seguro”, é só não exportar ADM_PERF_LEVEL (ou setar low / normal).
