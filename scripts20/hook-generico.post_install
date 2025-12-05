@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# Hook genérico de sanity-check pós-instalação para o Adm
+#
+# Chamado pelo adm via run_hook():
+#   ROOTFS           - rootfs onde o pacote foi instalado (ex: /opt/systems/glibc-rootfs)
+#   ADM_CATEGORY     - categoria do pacote (ex: "core")
+#   ADM_PKG_NAME     - nome do pacote (ex: "bash")
+#   ADM_LIBC         - libc alvo ("glibc" ou "musl")
+#   ADM_PKG_VERSION  - versão do pacote (string qualquer, ex: "5.2.1")
+#
+# Convenções de banco de dados (compatível com adm.sh):
+#   DB_DIR (opcional)      - diretório do DB de pacotes no host
+#                            default: /var/lib/adm/db
+#   .files do pacote:
+#     ${DB_DIR}/${ADM_CATEGORY}__${ADM_PKG_NAME}__${ADM_LIBC}.files
+#
+# Variáveis de ajuste (opcionais):
+#   ADM_SANITY_DB_DIR        - override de DB_DIR
+#   ADM_SANITY_STRICT        - se "1", qualquer problema vira erro fatal
+#                              se "0" (ou unset), alguns problemas viram apenas WARN
+#   ADM_SANITY_MAX_MISSING   - número máximo de arquivos ausentes tolerados (default: 0)
+#   ADM_SANITY_USE_LDD       - se "1", tenta rodar ldd via chroot para ELF (mais pesado)
+#
+# Uso: coloque este arquivo como <nome-do-pacote>.post_install no diretório do pacote
+# e torne-o executável (chmod +x). O adm chamará automaticamente após install.
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_pkg_tag() {
+  printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log() {
+  printf '[sanity:%s] %s\n' "$(_pkg_tag)" "$*"
+}
+
+warn() {
+  printf '[sanity:%s][WARN] %s\n' "$(_pkg_tag)" "$*" >&2
+}
+
+fail() {
+  printf '[sanity:%s][ERRO] %s\n' "$(_pkg_tag)" "$*" >&2
+  exit 1
+}
+
+is_int() {
+  printf '%s\n' "${1:-}" | grep -qE '^-?[0-9]+$'
+}
+
+# Retorna 0 se comando existe, 1 se não
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+###############################################################################
+# CONFIG / CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook de sanity-check.}"
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer no fluxo do adm."
+fi
+
+DB_DIR="${ADM_SANITY_DB_DIR:-${DB_DIR:-/var/lib/adm/db}}"
+
+PKG_CAT="${ADM_CATEGORY:-}"
+PKG_NAME="${ADM_PKG_NAME:-}"
+PKG_LIBC="${ADM_LIBC:-unknown}"
+PKG_VER="${ADM_PKG_VERSION:-unknown}"
+
+if [ -z "$PKG_CAT" ] || [ -z "$PKG_NAME" ]; then
+  warn "ADM_CATEGORY ou ADM_PKG_NAME não definidos; sanity-check ficará parcial."
+fi
+
+FILES_DB="${DB_DIR}/${PKG_CAT}__${PKG_NAME}__${PKG_LIBC}.files"
+
+STRICT="${ADM_SANITY_STRICT:-0}"
+MAX_MISSING="${ADM_SANITY_MAX_MISSING:-0}"
+USE_LDD="${ADM_SANITY_USE_LDD:-0}"
+
+if ! is_int "$MAX_MISSING"; then
+  warn "ADM_SANITY_MAX_MISSING ('${MAX_MISSING}') não é inteiro; usando 0."
+  MAX_MISSING=0
+fi
+
+log "Iniciando sanity-check genérico."
+log "  rootfs   : $ROOTFS"
+log "  pacote   : ${PKG_CAT}/${PKG_NAME}"
+log "  libc     : ${PKG_LIBC}"
+log "  versão   : ${PKG_VER}"
+log "  db_dir   : ${DB_DIR}"
+log "  files_db : ${FILES_DB}"
+log "  strict   : ${STRICT}"
+log "  max_missing: ${MAX_MISSING}"
+log "  use_ldd  : ${USE_LDD}"
+
+###############################################################################
+# LEITURA DA LISTA DE ARQUIVOS (.files)
+###############################################################################
+
+if [ ! -f "$FILES_DB" ]; then
+  msg="Arquivo .files do pacote não encontrado: $FILES_DB"
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg (não será possível validar todos os arquivos do pacote)."
+    # Ainda podemos fazer alguns checks básicos de estrutura.
+  fi
+fi
+
+# Vamos carregar lista de arquivos se o .files existir
+FILES=()
+if [ -f "$FILES_DB" ]; then
+  while IFS= read -r path || [ -n "$path" ]; do
+    [ -z "$path" ] && continue
+    # Ignora qualquer linha esquisita (por segurança)
+    case "$path" in
+      /*)
+        warn "Caminho absoluto encontrado em .files (ignorado): $path"
+        continue
+        ;;
+      *'..'*)
+        warn "Caminho inseguro (.. ) em .files (ignorado): $path"
+        continue
+        ;;
+    esac
+    FILES+=("$path")
+  done < "$FILES_DB"
+fi
+
+###############################################################################
+# CHECK 1: EXISTÊNCIA DE ARQUIVOS
+###############################################################################
+
+missing_count=0
+total_files="${#FILES[@]}"
+
+if [ "$total_files" -gt 0 ]; then
+  log "Verificando existência de ${total_files} arquivos listados em .files..."
+
+  for rel in "${FILES[@]}"; do
+    abs="${ROOTFS%/}/${rel}"
+    if [ ! -e "$abs" ]; then
+      warn "Arquivo ausente no ROOTFS: $abs"
+      missing_count=$((missing_count + 1))
+    fi
+  done
+
+  if [ "$missing_count" -gt 0 ]; then
+    if [ "$missing_count" -gt "$MAX_MISSING" ]; then
+      fail "Foram encontrados ${missing_count} arquivos ausentes (limite permitido: ${MAX_MISSING})."
+    else
+      warn "Foram encontrados ${missing_count} arquivos ausentes, mas dentro do limite permitido (${MAX_MISSING})."
+    fi
+  else
+    log "Todos os arquivos listados em .files existem no ROOTFS."
+  fi
+else
+  warn "Nenhum arquivo carregado de .files; não há verificação de existência baseada no DB."
+fi
+
+###############################################################################
+# CHECK 2: SYMLINKS APONTANDO PARA ALGO VÁLIDO
+###############################################################################
+
+broken_symlinks=0
+symlink_count=0
+
+if [ "$total_files" -gt 0 ]; then
+  for rel in "${FILES[@]}"; do
+    abs="${ROOTFS%/}/${rel}"
+    [ -L "$abs" ] || continue
+
+    symlink_count=$((symlink_count + 1))
+
+    # Alvo do symlink
+    target="$(readlink "$abs" || true)"
+    if [ -z "$target" ]; then
+      warn "Symlink vazio (sem alvo): $abs"
+      broken_symlinks=$((broken_symlinks + 1))
+      continue
+    fi
+
+    # Resolver alvo
+    if [[ "$target" = /* ]]; then
+      target_abs="${ROOTFS%/}${target}"
+    else
+      # Alvo relativo ao diretório do link
+      target_abs="$(cd "$(dirname "$abs")" && realpath -m "$target")"
+    fi
+
+    if [ ! -e "$target_abs" ]; then
+      warn "Symlink quebrado: $abs -> $target (alvo inexistente em $target_abs)"
+      broken_symlinks=$((broken_symlinks + 1))
+    fi
+  done
+fi
+
+if [ "$symlink_count" -gt 0 ]; then
+  log "Verificados ${symlink_count} symlinks do pacote."
+  if [ "$broken_symlinks" -gt 0 ]; then
+    if [ "$STRICT" = "1" ]; then
+      fail "Foram encontrados ${broken_symlinks} symlinks quebrados."
+    else
+      warn "Foram encontrados ${broken_symlinks} symlinks quebrados."
+    fi
+  fi
+fi
+
+###############################################################################
+# CHECK 3: BINÁRIOS ELF E SCRIPTS COM SHEBANG
+###############################################################################
+
+if ! has_cmd file; then
+  warn "Comando 'file' não encontrado; detecção de ELF e scripts ficará limitada."
+fi
+
+shebang_missing_interp=0
+elf_checked=0
+
+for rel in "${FILES[@]}"; do
+  abs="${ROOTFS%/}/${rel}"
+
+  # Só arquivos regulares executáveis
+  if [ ! -f "$abs" ] || [ ! -x "$abs" ]; then
+    continue
+  fi
+
+  # 3.1 – Tentar usar "file" se disponível
+  if has_cmd file; then
+    desc="$(file -b "$abs" 2>/dev/null || true)"
+    # ELF?
+    if echo "$desc" | grep -qi 'elf'; then
+      elf_checked=$((elf_checked + 1))
+      # Poderíamos fazer checks adicionais aqui; por enquanto só acusamos o número.
+      continue
+    fi
+  fi
+
+  # 3.2 – Detectar shebang em scripts (começam com #!)
+  if head -c 2 "$abs" 2>/dev/null | grep -q '^#!'; then
+    # Pegar primeira linha
+    first_line="$(head -n 1 "$abs" || true)"
+    # Remover "#!" e espaços
+    interp="${first_line#\#!}"
+    interp="${interp#"${interp%%[![:space:]]*}"}"
+    # Se tiver args (ex: "/usr/bin/env python"), pega só o primeiro token
+    interp_path="${interp%%[[:space:]]*}"
+
+    if [ -z "$interp_path" ]; then
+      warn "Script com shebang inválido (sem interpretador): $abs"
+      shebang_missing_interp=$((shebang_missing_interp + 1))
+      continue
+    fi
+
+    # Se for caminho absoluto, verificar dentro do ROOTFS
+    if [[ "$interp_path" = /* ]]; then
+      interp_abs="${ROOTFS%/}${interp_path}"
+      if [ ! -x "$interp_abs" ]; then
+        warn "Interpretador de shebang não encontrado ou não executável em $interp_abs (arquivo: $abs)"
+        shebang_missing_interp=$((shebang_missing_interp + 1))
+      fi
+    else
+      # Caso tipo "/usr/bin/env python": não marcamos como erro fatal,
+      # apenas informamos (depende de PATH no chroot).
+      log "Script usa interpretador não-absoluto no shebang: '$interp_path' em $abs (verificar PATH no chroot)."
+    fi
+  fi
+done
+
+if [ "$elf_checked" -gt 0 ]; then
+  log "Verificados ${elf_checked} binários ELF do pacote."
+fi
+
+if [ "$shebang_missing_interp" -gt 0 ]; then
+  if [ "$STRICT" = "1" ]; then
+    fail "Foram encontrados ${shebang_missing_interp} scripts com shebang apontando para interpretador ausente."
+  else
+    warn "Foram encontrados ${shebang_missing_interp} scripts com shebang apontando para interpretador ausente."
+  fi
+fi
+
+###############################################################################
+# CHECK 4 (opcional): ldd dentro do chroot para ELF
+###############################################################################
+
+if [ "$USE_LDD" = "1" ] && has_cmd chroot && has_cmd file; then
+  log "USE_LDD=1: tentando validar dependências de ELF via chroot + ldd."
+  for rel in "${FILES[@]}"; do
+    abs="${ROOTFS%/}/${rel}"
+    [ -f "$abs" ] || continue
+    [ -x "$abs" ] || continue
+
+    desc="$(file -b "$abs" 2>/dev/null || true)"
+    echo "$desc" | grep -qi 'elf' || continue
+
+    # Caminho dentro do chroot
+    elf_chroot="/${rel#./}"
+
+    # Rodar ldd dentro do rootfs; se falhar completamente, avisar.
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/bin:/usr/bin:/sbin:/usr/sbin" ldd "$elf_chroot" >/dev/null 2>&1; then
+      warn "ldd falhou ou não está disponível para ELF $elf_chroot dentro do chroot (ROOTFS=$ROOTFS)."
+    fi
+  done
+fi
+
+###############################################################################
+# CHECK 5: PERMISSÕES ESTRANHAS (rudimentar)
+###############################################################################
+
+world_writable=0
+
+for rel in "${FILES[@]}"; do
+  abs="${ROOTFS%/}/${rel}"
+  [ -e "$abs" ] || continue
+
+  # Só checar diretórios comuns em /usr, /bin, /sbin para world-writable sem sticky
+  case "$rel" in
+    usr/*|bin/*|sbin/*|lib/*|lib64/*)
+      if [ -d "$abs" ]; then
+        mode="$(stat -c '%a' "$abs" 2>/dev/null || echo "")"
+        # modo octal, queremos detectar 0xx7, x7x, xx7 etc., mas sem o sticky (1xxx)
+        if [ -n "$mode" ] && [ $((8#"$mode" & 0007)) -eq 7 ]; then
+          # World-writable; poderia checar sticky bit (1xxx) se quiser
+          world_writable=$((world_writable + 1))
+          warn "Diretório world-writable suspeito: $abs (modo=$mode)"
+        fi
+      fi
+      ;;
+  esac
+done
+
+if [ "$world_writable" -gt 0 ]; then
+  if [ "$STRICT" = "1" ]; then
+    fail "Foram encontrados ${world_writable} diretórios world-writable suspeitos."
+  else
+    warn "Foram encontrados ${world_writable} diretórios world-writable suspeitos."
+  fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check genérico concluído com sucesso."
+exit 0
