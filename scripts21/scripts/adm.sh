@@ -798,6 +798,114 @@ cmd_sync_repo() {
     log_ok "Repositório de scripts sincronizado"
 }
 
+############################################################
+# WORLD: Rolling Release Manager
+############################################################
+
+ADM_WORLD_FILE="$ADM_ROOT/world"
+
+world_ensure_file() {
+    [[ -f "$ADM_WORLD_FILE" ]] || : > "$ADM_WORLD_FILE"
+}
+
+cmd_world_list() {
+    world_ensure_file
+    log_info "Pacotes no WORLD:"
+    nl -ba "$ADM_WORLD_FILE"
+}
+
+cmd_world_add() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && die "Uso: adm.sh world-add categoria/pacote"
+
+    world_ensure_file
+
+    if grep -qx "$pkg" "$ADM_WORLD_FILE"; then
+        log_warn "$pkg já está no world"
+        return 0
+    fi
+
+    echo "$pkg" >> "$ADM_WORLD_FILE"
+    log_ok "Adicionado ao world: $pkg"
+}
+
+cmd_world_remove() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && die "Uso: adm.sh world-remove categoria/pacote"
+
+    world_ensure_file
+
+    grep -vx "$pkg" "$ADM_WORLD_FILE" > "$ADM_WORLD_FILE.tmp"
+    mv "$ADM_WORLD_FILE.tmp" "$ADM_WORLD_FILE"
+
+    log_ok "Removido do world: $pkg"
+}
+
+############################################################
+# WORLD-UPGRADE: Rolling Release
+############################################################
+
+cmd_world_upgrade() {
+    world_ensure_file
+
+    log_info "=== Rolling Release: WORLD UPGRADE ==="
+    log_info "Perfil ativo: $ADM_PROFILE"
+    log_info "RootFS: $ADM_ROOTFS"
+    log_info "-------------------------------------"
+
+    # 1. Sincroniza repo
+    cmd_sync_repo
+
+    # Registrar lista de pacotes do mundo
+    mapfile -t WORLD_PKGS < "$ADM_WORLD_FILE"
+
+    local updated_any=0
+
+    for pkg in "${WORLD_PKGS[@]}"; do
+        log_info "Verificando pacote $pkg..."
+
+        load_pkg_script "$pkg"
+
+        local installed_version="none"
+        if pkg_installed_mark; then
+            installed_version=$(cat "$ADM_PKG_DB_DIR/version")
+        fi
+
+        if [[ "$installed_version" != "$PKG_VERSION" ]]; then
+            log_warn "→ Atualizando: $pkg ($installed_version → $PKG_VERSION)"
+            install_with_deps "$pkg"
+            updated_any=1
+            continue
+        fi
+
+        # Verificar se alguma dependência foi atualizada depois
+        resolve_deps_for_pkg "$pkg"
+
+        local dep
+        for dep in "${ADM_RESOLVED_DEPS[@]}"; do
+            [[ "$dep" == "$pkg" ]] && continue
+            load_pkg_script "$dep"
+
+            local dep_ver dep_inst
+            dep_ver="$PKG_VERSION"
+            dep_inst=$(cat "$ADM_DB_DIR/$dep/version" 2>/dev/null || echo "none")
+
+            if [[ "$dep_inst" != "$dep_ver" ]]; then
+                log_warn "→ Recompilando $pkg pois dependência mudou: $dep"
+                install_with_deps "$pkg"
+                updated_any=1
+                break
+            fi
+        done
+    done
+
+    if ((updated_any == 0)); then
+        log_ok "Sistema já está totalmente atualizado! 🎉"
+    else
+        log_ok "WORLD UPGRADE concluído!"
+    fi
+}
+
 #########################
 # Ajuda / CLI           #
 #########################
@@ -877,6 +985,18 @@ main() {
         uninstall)
             [[ $# -gt 0 ]] || die "Uso: adm.sh uninstall categoria/programa"
             do_pkg_uninstall "$1"
+            ;;
+        world-list)
+            cmd_world_list
+            ;;
+        world-add)
+            cmd_world_add "$@"
+            ;;
+        world-remove)
+            cmd_world_remove "$@"
+            ;;
+        world-upgrade)
+            cmd_world_upgrade
             ;;
         rebuild-last)
             cmd_rebuild_last
