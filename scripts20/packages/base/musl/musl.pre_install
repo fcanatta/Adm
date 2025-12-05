@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Wrapper de pré-instalação para o hook unificado do musl
+set -euo pipefail
+
+# Descobre o diretório deste script (pacote musl)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+export MUSL_HOOK_PHASE="pre"
+
+exec "${SCRIPT_DIR}/musl.security_hook"
