@@ -7,7 +7,7 @@ set -euo pipefail
 
 ADM_REPO_URL="${ADM_REPO_URL:-https://github.com/fcanatta/Adm.git}"
 ADM_REPO_DIR="${ADM_REPO_DIR:-/usr/src/adm}"
-PKG_BASE_DIR="${ADM_REPO_DIR}/packages"
+PKG_BASE_DIR="${PKG_BASE_DIR:-${ADM_REPO_DIR}/packages}"
 
 CACHE_SRC="${CACHE_SRC:-/var/cache/adm/sources}"
 CACHE_PKG="${CACHE_PKG:-/var/cache/adm/packages}"
@@ -16,21 +16,21 @@ DB_DIR="${DB_DIR:-/var/lib/adm/db}"
 PROFILES_DIR="${PROFILES_DIR:-/etc/adm/profiles}"
 
 LOG_DIR="${LOG_DIR:-/var/log/adm}"
-LOG_FILE="${LOG_DIR}/adm.log"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/adm.log}"
 
 mkdir -p "$CACHE_SRC" "$CACHE_PKG" "$DB_DIR" "$LOG_DIR"
 
-### CORES E LOG ###############################################################
+### CORES / LOG ###############################################################
 
 if [ -t 1 ]; then
-    RED=$'\033[31m'
-    GREEN=$'\033[32m'
-    YELLOW=$'\033[33m'
-    BLUE=$'\033[34m'
-    MAGENTA=$'\033[35m'
-    CYAN=$'\033[36m'
-    BOLD=$'\033[1m'
-    RESET=$'\033[0m'
+    RED=$(printf '\033[31m')
+    GREEN=$(printf '\033[32m')
+    YELLOW=$(printf '\033[33m')
+    BLUE=$(printf '\033[34m')
+    MAGENTA=$(printf '\033[35m')
+    CYAN=$(printf '\033[36m')
+    BOLD=$(printf '\033[1m')
+    RESET=$(printf '\033[0m')
 else
     RED=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""; CYAN=""; BOLD=""; RESET=""
 fi
@@ -41,80 +41,86 @@ timestamp() {
 
 log_append_file() {
     local level="$1"; shift
-    printf "[%s] %s: %s\n" "$(timestamp)" "$level" "$*" >> "$LOG_FILE"
+    {
+        printf '[%s] %s: %s\n' "$(timestamp)" "$level" "$*"
+    } >> "$LOG_FILE"
 }
 
 log_info() {
     log_append_file "INFO" "$@"
-    printf "%s[INFO]%s %s\n" "$BLUE" "$RESET" "$*"
+    printf '%s[INFO]%s %s\n' "$BLUE" "$RESET" "$*" >&1
 }
 
 log_warn() {
     log_append_file "WARN" "$@"
-    printf "%s[WARN]%s %s\n" "$YELLOW" "$RESET" "$*" >&2
+    printf '%s[WARN]%s %s\n' "$YELLOW" "$RESET" "$*" >&2
 }
 
 log_error() {
     log_append_file "ERROR" "$@"
-    printf "%s[ERRO]%s %s\n" "$RED" "$RESET" "$*" >&2
+    printf '%s[ERRO]%s %s\n' "$RED" "$RESET" "$*" >&2
 }
 
 log_success() {
     log_append_file "OK" "$@"
-    printf "%s[ OK ]%s %s\n" "$GREEN" "$RESET" "$*"
+    printf '%s[ OK ]%s %s\n' "$GREEN" "$RESET" "$*" >&1
 }
 
 die() {
-    log_error "$*"
+    log_error "$@"
     exit 1
 }
 
-# Escapa um valor para ser seguro em arquivos .meta/.buildinfo (código shell)
+# Escapa um valor para ser seguro em arquivos .meta/.buildinfo (shell)
 sh_quote() {
-  # Usa printf %q (bash) para gerar uma representação segura
-  local q
-  printf -v q '%q' "$1"
-  printf '%s' "$q"
+    local q
+    printf -v q '%q' "$1"
+    printf '%s' "$q"
 }
 
-### UTILITÁRIOS ###############################################################
+### USO / AJUDA ###############################################################
 
 usage() {
     cat <<EOF
-${BOLD}Uso:${RESET} adm <comando> [args]
+${BOLD}adm - mini gerenciador de pacotes / build system${RESET}
 
-Comandos principais:
-  ${BOLD}build${RESET}    <programa|categoria/programa>   - compila e gera tar.zst (glibc/musl detectado)
-  ${BOLD}install${RESET}  <programa|categoria/programa>   - instala no rootfs correspondente
-  ${BOLD}uninstall${RESET} <programa|categoria/programa>  - remove com checagem de dependências reversas
-  ${BOLD}search${RESET}   <padrão>                       - procura pacotes, mostra [ ✔️ ] se instalado
-  ${BOLD}info${RESET}     <programa|categoria/programa>  - mostra informações do pacote + [ ✔️ ] se instalado
-  ${BOLD}list${RESET}                                    - lista pacotes instalados
-  ${BOLD}update-repo${RESET}                             - sincroniza /usr/src/adm com o git
+Uso:
+  adm build <pacote> [libc]       - compila um pacote
+  adm install <pacote> [libc]     - instala um pacote (compila se preciso)
+  adm uninstall <pacote> [libc]   - remove um pacote
+  adm search <padrão>             - busca pacotes
+  adm info <pacote>               - mostra infos de um pacote
+  adm list                        - lista pacotes instalados
+  adm update-repo                 - atualiza o repositório de pacotes
+  adm help                        - mostra esta ajuda
 
 Variáveis úteis:
-  ADM_LIBC=glibc|musl     (força libc em vez de autodetectar)
+  ADM_LIBC      - força uso de 'glibc' ou 'musl' (override do auto-detect)
 
-Diretórios:
-  Repo de pacotes: ${PKG_BASE_DIR}
-  Cache sources:   ${CACHE_SRC}
-  Cache pkgs:      ${CACHE_PKG}
-  Banco de dados:  ${DB_DIR}
-  Logs:            ${LOG_FILE}
+Caminhos:
+  Repo:       $ADM_REPO_DIR
+  Pacotes:    $PKG_BASE_DIR
+  Cache src:  $CACHE_SRC
+  Cache pkg:  $CACHE_PKG
+  DB:         $DB_DIR
+  Perfis:     $PROFILES_DIR
+  Log:        $LOG_FILE
 EOF
 }
+
+### REQUISITOS / REPO ##########################################################
 
 check_requirements() {
   local missing=()
 
-  # Ferramentas realmente essenciais para o fluxo principal
+  # Ferramentas realmente essenciais
   for cmd in git find tar; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
   done
 
-  # Compressor: precisa de pelo menos um
+  # Pelo menos um compressor
   if ! command -v zstd >/dev/null 2>&1 && ! command -v xz >/dev/null 2>&1; then
     missing+=("zstd/xz")
   fi
@@ -135,21 +141,24 @@ ensure_repo() {
     if [ -d "$ADM_REPO_DIR" ] && [ "$(ls -A "$ADM_REPO_DIR" 2>/dev/null | wc -l)" -ne 0 ]; then
         log_error "ADM_REPO_DIR existe mas não é um repositório git: $ADM_REPO_DIR"
         log_error "Por segurança, não vou clonar por cima de um diretório não vazio."
-        log_error "Ajuste ADM_REPO_DIR ou inicialize o repositório git manualmente."
-        die "Repositório ADM inválido em $ADM_REPO_DIR"
+        log_error "Ajuste ADM_REPO_DIR ou limpe o diretório manualmente."
+        die "Repositório ADM inválido, abortando."
     fi
 
-    log_info "Clonando repositório em $ADM_REPO_DIR..."
+    log_info "Clonando repositório ADM em $ADM_REPO_DIR..."
     mkdir -p "$(dirname "$ADM_REPO_DIR")"
-    git clone "$ADM_REPO_URL" "$ADM_REPO_DIR" || die "Falha ao clonar repositório."
+    if ! git clone "$ADM_REPO_URL" "$ADM_REPO_DIR"; then
+        die "Falha ao clonar repositório ADM de $ADM_REPO_URL"
+    fi
 }
 
-detect_libc() {
-    local arg_libc="${1:-}"
-    local libc=""
+### DETECÇÃO DE LIBC / ROOTFS ##################################################
 
-    if [ -n "$arg_libc" ]; then
-        libc="$arg_libc"
+detect_libc() {
+    local libc="${1:-}"
+
+    if [ -n "${libc}" ]; then
+        :
     elif [ -n "${ADM_LIBC:-}" ]; then
         libc="$ADM_LIBC"
     elif command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
@@ -160,40 +169,43 @@ detect_libc() {
 
     case "$libc" in
         glibc|musl)
-            echo "$libc"
+            printf '%s\n' "$libc"
             ;;
         *)
-            die "libc inválida ou desconhecida: '$libc' (esperado: glibc ou musl)"
+            die "libc inválida: $libc (use glibc ou musl)"
             ;;
     esac
 }
 
 rootfs_for_libc() {
-    case "$1" in
-        glibc) echo "/opt/systems/glibc-rootfs" ;;
-        musl)  echo "/opt/systems/musl-rootfs" ;;
-        *) die "libc desconhecida: $1" ;;
+    local libc="$1"
+    case "$libc" in
+        glibc) printf '%s\n' "/opt/systems/glibc-rootfs" ;;
+        musl)  printf '%s\n' "/opt/systems/musl-rootfs" ;;
+        *)     die "libc desconhecida: $libc" ;;
     esac
 }
 
+### HELPERS DE CAMINHO / PERFIL ###############################################
+
 pkg_dir() {
     local cat="$1" pkg="$2"
-    echo "${PKG_BASE_DIR}/${cat}/${pkg}"
+    printf '%s\n' "${PKG_BASE_DIR}/${cat}/${pkg}"
 }
 
 meta_path() {
     local cat="$1" pkg="$2" libc="$3"
-    echo "${DB_DIR}/${cat}__${pkg}__${libc}.meta"
+    printf '%s\n' "${DB_DIR}/${cat}__${pkg}__${libc}.meta"
 }
 
 files_path() {
     local cat="$1" pkg="$2" libc="$3"
-    echo "${DB_DIR}/${cat}__${pkg}__${libc}.files"
+    printf '%s\n' "${DB_DIR}/${cat}__${pkg}__${libc}.files"
 }
 
 buildinfo_path() {
     local cat="$1" pkg="$2" libc="$3"
-    echo "${CACHE_PKG}/${cat}__${pkg}__${libc}.buildinfo"
+    printf '%s\n' "${CACHE_PKG}/${cat}__${pkg}__${libc}.buildinfo"
 }
 
 load_profile() {
@@ -211,63 +223,62 @@ load_profile() {
 
 read_deps_file() {
     local depfile="$1"
-    [ -f "$depfile" ] || return 0
-    grep -Ev '^\s*($|#)' "$depfile" || true
+    if [ ! -f "$depfile" ]; then
+        return 0
+    fi
+    grep -Ev '^\s*($|#)' "$depfile" 2>/dev/null || true
 }
 
 pkg_is_installed_any_libc() {
     local cat="$1" pkg="$2"
     local meta
     for meta in "${DB_DIR}/${cat}__${pkg}__"*.meta; do
-        [ -f "$meta" ] && return 0
+        if [ -f "$meta" ]; then
+            return 0
+        fi
     done
     return 1
 }
 
+### DEPENDÊNCIAS REVERSAS / HOOKS #############################################
+
 find_reverse_deps() {
     local target="$1" libc="$2"
-    local meta
+    local meta d
+
     for meta in "$DB_DIR"/*.meta; do
-        [ -e "$meta" ] || continue
+        [ -f "$meta" ] || continue
+
         unset PKG_ID PKG_DEPS PKG_LIBC
-        # Carrega o meta com proteção contra sintaxe inválida
+        # shellcheck disable=SC1090
         if ! . "$meta"; then
             log_warn "Falha ao ler meta $meta (arquivo inválido?), ignorando para reverse deps."
             continue
         fi
+
         [ "${PKG_LIBC:-}" = "$libc" ] || continue
+
         for d in ${PKG_DEPS:-}; do
             if [ "$d" = "$target" ]; then
-                echo "${PKG_ID:-unknown}"
+                printf '%s\n' "${PKG_ID:-unknown}"
             fi
         done
     done
 }
 
 run_hook() {
-    # $1 = phase (pre_install / post_install / pre_uninstall / post_uninstall)
-    # $2 = caminho do hook (arquivo único)
-    # $3 = rootfs
-    # $4 = cat
-    # $5 = pkg
-    # $6 = libc
-    # $7 = version
     local phase="$1" hook="$2" rootfs="$3" cat="$4" pkg="$5" libc="$6" version="$7"
 
-    # Se não existir, não faz nada (hook opcional)
-    if [ -z "$hook" ] || [ ! -e "$hook" ]; then
-        return 0
-    fi
+    [ -n "$hook" ] || return 0
+    [ -e "$hook" ] || return 0
 
-    # Se existir mas não for executável, avisa e não roda
     if [ ! -x "$hook" ]; then
-        log_warn "Hook ${phase} encontrado mas não executável: $hook (ignorando)"
+        log_warn "Hook $hook existe mas não é executável. Ignorando."
         return 0
     fi
 
-    log_info "Executando hook ${phase}: ${hook}"
+    log_info "Executando hook '${phase}' de ${cat}/${pkg}: $hook"
 
-    # Executa hook com ambiente definido e reporta erros claramente
     set +e
     ROOTFS="$rootfs" \
     ADM_CATEGORY="$cat" \
@@ -278,11 +289,13 @@ run_hook() {
     local status=$?
     set -e
 
-    if [ $status -ne 0 ]; then
-        log_error "Hook ${phase} ($hook) falhou com status $status"
-        exit $status
+    if [ "$status" -ne 0 ]; then
+        log_error "Hook ${hook} (fase ${phase}) retornou status ${status}."
+        exit "$status"
     fi
 }
+
+### RESOLUÇÃO DE DEPENDÊNCIAS #################################################
 
 resolve_build_deps() {
   local libc="$1" cat="$2" pkg="$3"
@@ -291,13 +304,12 @@ resolve_build_deps() {
   depfile="$(pkg_dir "$cat" "$pkg")/pkg.deps"
   current="${cat}/${pkg}"
 
-  # Atualiza "pilha" de dependências para detecção de ciclos
+  # Pilha para detectar ciclos
   if [[ " ${ADM_DEP_STACK:-} " != *" ${current} "* ]]; then
     ADM_DEP_STACK="${ADM_DEP_STACK:+$ADM_DEP_STACK }${current}"
     export ADM_DEP_STACK
   fi
 
-  # Lê arquivo de dependências (se existir)
   while IFS= read -r dep; do
     [[ -z "$dep" ]] && continue
 
@@ -308,12 +320,10 @@ resolve_build_deps() {
 
     log_info "(build) Dependência: '$dep' -> '${dep_id}'"
 
-    # Verifica ciclo de dependência
     if [[ " ${ADM_DEP_STACK:-} " == *" ${dep_id} "* ]]; then
       die "Dependência cíclica detectada: ${dep_id} (stack: ${ADM_DEP_STACK})"
     fi
 
-    # Evita processar o mesmo pacote várias vezes na mesma resolução
     if [[ " ${ADM_DEP_SEEN_BUILD:-} " == *" ${dep_id} "* ]]; then
       log_info "(build) Dependência '${dep_id}' já processada nesta resolução, pulando."
       continue
@@ -321,7 +331,6 @@ resolve_build_deps() {
     ADM_DEP_SEEN_BUILD="${ADM_DEP_SEEN_BUILD:+$ADM_DEP_SEEN_BUILD }${dep_id}"
     export ADM_DEP_SEEN_BUILD
 
-    # Faz build da dependência (que também será instalada depois em cmd_install)
     cmd_build "${dep_id}" "$libc"
     cmd_install "${dep_id}" "$libc"
   done < <(read_deps_file "$depfile")
@@ -353,7 +362,6 @@ resolve_install_deps() {
       die "Dependência cíclica detectada na instalação: ${dep_id} (stack: ${ADM_DEP_STACK})"
     fi
 
-    # Evita processamento repetido da mesma dependência
     if [[ " ${ADM_DEP_SEEN_INSTALL:-} " == *" ${dep_id} "* ]]; then
       log_info "(install) Dependência '${dep_id}' já processada nesta resolução, pulando."
       continue
@@ -361,7 +369,6 @@ resolve_install_deps() {
     ADM_DEP_SEEN_INSTALL="${ADM_DEP_SEEN_INSTALL:+$ADM_DEP_SEEN_INSTALL }${dep_id}"
     export ADM_DEP_SEEN_INSTALL
 
-    # Se já está instalada para essa libc, não precisa chamar cmd_install
     meta="$(meta_path "$dcat" "$dpkg" "$libc")"
     filesdb="$(files_path "$dcat" "$dpkg" "$libc")"
     if [[ -f "$meta" && -f "$filesdb" ]]; then
@@ -373,32 +380,28 @@ resolve_install_deps() {
   done < <(read_deps_file "$depfile")
 }
 
-### RESOLUÇÃO DE PACOTE (NOME -> CATEGORIA/PROGRAMA) ###########################
-# Retorna EXACTAMENTE uma linha: "categoria|programa|diretorio"
 resolve_pkg_single() {
     local name="$1"
+    local matches=()
+    local cat pkg dir
 
-    [ -d "$PKG_BASE_DIR" ] || die "Diretório de pacotes não encontrado: $PKG_BASE_DIR"
+    [ -d "$PKG_BASE_DIR" ] || die "Diretório base de pacotes não existe: $PKG_BASE_DIR"
 
-    # Se vier como categoria/programa
     if [[ "$name" == */* ]]; then
-        local cat="${name%/*}"
-        local pkg="${name##*/}"
-        local dir="${PKG_BASE_DIR}/${cat}/${pkg}"
-        [ -d "$dir" ] || die "Pacote '$name' não encontrado em $PKG_BASE_DIR"
-        echo "${cat}|${pkg}|${dir}"
+        cat="${name%/*}"
+        pkg="${name##*/}"
+        dir="${PKG_BASE_DIR}/${cat}/${pkg}"
+        if [ ! -d "$dir" ]; then
+            die "Pacote '${name}' não encontrado em ${PKG_BASE_DIR}"
+        fi
+        printf '%s|%s|%s\n' "$cat" "$pkg" "$dir"
         return 0
     fi
 
-    # Caso contrário, procurar por nome em todas categorias
-    local matches=()
     while IFS= read -r -d '' dir; do
-        local pkg
         pkg="$(basename "$dir")"
-        local cat
         cat="$(basename "$(dirname "$dir")")"
-        [ "$pkg" = "$name" ] || continue
-        if [ -x "${dir}/${pkg}.sh" ]; then
+        if [ "$pkg" = "$name" ] && [ -x "${dir}/${pkg}.sh" ]; then
             matches+=("${cat}|${pkg}|${dir}")
         fi
     done < <(find "$PKG_BASE_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
@@ -406,19 +409,23 @@ resolve_pkg_single() {
     local count="${#matches[@]}"
 
     if [ "$count" -eq 0 ]; then
-        die "Pacote '$name' não encontrado em $PKG_BASE_DIR"
+        die "Pacote '${name}' não encontrado em ${PKG_BASE_DIR}"
     elif [ "$count" -gt 1 ]; then
-        log_error "Mais de um pacote com nome '$name' encontrado:"
+        log_error "Pacote '${name}' é ambíguo. Foram encontrados:"
         local m
         for m in "${matches[@]}"; do
-            IFS='|' read -r cat pkg dir <<< "$m"
-            printf "  - %s/%s (%s)\n" "$cat" "$pkg" "$dir" >&2
+            cat="${m%%|*}"
+            pkg="${m#*|}"; pkg="${pkg%%|*}"
+            dir="${m##*|}"
+            log_error "  - ${cat}/${pkg} (${dir})"
         done
-        die "Use 'categoria/nome' para desambiguar (ex: utils/${name})."
+        die "Use 'categoria/nome' para desambiguar o pacote."
     fi
 
-    echo "${matches[0]}"
+    printf '%s\n' "${matches[0]}"
 }
+
+### FINALIZAÇÃO DE BUILD #######################################################
 
 adm_finalize_build() {
   local libc="$1" cat="$2" pkg="$3"
@@ -434,7 +441,6 @@ adm_finalize_build() {
 
   log_info "Finalizando build de ${cat}/${pkg} para ${libc} em '${destdir}'"
 
-  # Strip em binários ELF, se possível
   if command -v strip >/dev/null 2>&1 && command -v file >/dev/null 2>&1; then
     log_info "Aplicando strip em binários ELF..."
     while IFS= read -r f; do
@@ -472,13 +478,18 @@ adm_finalize_build() {
   log_info "Buildinfo registrado em: ${buildinfo}"
 }
 
-### COMANDOS ###################################################################
+### COMANDOS DE ALTO NÍVEL #####################################################
 
 cmd_update_repo() {
     ensure_repo
-    log_info "Atualizando repositório em $ADM_REPO_DIR..."
-    (cd "$ADM_REPO_DIR" && git pull --ff-only) || die "Falha ao atualizar repositório."
-    log_success "Repositório atualizado."
+    log_info "Atualizando repositório ADM em $ADM_REPO_DIR..."
+    (
+        cd "$ADM_REPO_DIR"
+        if ! git pull --ff-only; then
+            die "Falha ao atualizar repositório ADM."
+        fi
+    )
+    log_success "Repositório ADM atualizado."
 }
 
 cmd_build() {
@@ -507,7 +518,6 @@ cmd_build() {
   load_profile "$libc"
   resolve_build_deps "$libc" "$cat" "$pkg"
 
-  # build_root único por processo, para evitar conflitos em builds paralelos
   local build_root="/tmp/adm-build-${cat}-${pkg}-${libc}.$$"
   local destdir="${build_root}/destdir"
 
@@ -520,8 +530,8 @@ cmd_build() {
   export ADM_ROOTFS="$rootfs"
   export ADM_CACHE_SRC="$CACHE_SRC"
   export ADM_CACHE_PKG="$CACHE_PKG"
-  export ADM_BUILDINFO
   ADM_BUILDINFO="$(buildinfo_path "$cat" "$pkg" "$libc")"
+  export ADM_BUILDINFO
   export ADM_BUILD_ROOT="$build_root"
   export ADM_DESTDIR="$destdir"
 
@@ -554,19 +564,16 @@ cmd_install() {
   filesdb="$(files_path "$cat" "$pkg" "$libc")"
   buildinfo="$(buildinfo_path "$cat" "$pkg" "$libc")"
 
-  # Se já está instalado para esta libc, não faz nada
   if [[ -f "$meta" && -f "$filesdb" ]]; then
     log_info "Pacote ${cat}/${pkg} já está instalado para libc '${libc}'. Nenhuma ação necessária."
     return 0
   fi
 
-  # Se não há buildinfo ainda, faz build primeiro
   if [[ ! -f "$buildinfo" ]]; then
     log_warn "Buildinfo não encontrado para ${cat}/${pkg} (${libc}). Rodando build..."
     cmd_build "${cat}/${pkg}" "$libc"
   fi
 
-  # Carrega buildinfo
   # shellcheck disable=SC1090
   . "$buildinfo"
 
@@ -602,7 +609,6 @@ cmd_install() {
     printf 'PKG_LIBC=%s\n'     "$(sh_quote "${libc}")"
     printf 'PKG_TARBALL=%s\n'  "$(sh_quote "${PKG_TARBALL}")"
 
-    # Dependências deste pacote (não recursivas)
     local deps_line
     deps_line="$(read_deps_file "${pdir}/${pkg}.deps" | tr '\n' ' ' || true)"
     printf 'PKG_DEPS=%s\n' "$(sh_quote "${deps_line}")"
@@ -635,7 +641,6 @@ cmd_uninstall() {
     die "Pacote ${cat}/${pkg} (${libc}) não parece estar instalado (faltam arquivos em ${DB_DIR})."
   fi
 
-  # Carrega metadata de forma segura
   if ! . "$meta"; then
     log_error "Arquivo de metadata inválido ou corrompido: ${meta}"
     die "Não foi possível carregar metadata para ${cat}/${pkg} (${libc})."
@@ -658,7 +663,6 @@ cmd_uninstall() {
 
   log_info "Removendo arquivos de ${target} (${libc})"
 
-  # Remove arquivos listados, com verificação básica de segurança de caminho
   while IFS= read -r path; do
     [[ -z "$path" ]] && continue
 
@@ -676,13 +680,10 @@ cmd_uninstall() {
     rm -f "${rootfs}/${path}" || log_warn "Falha ao remover arquivo '${rootfs}/${path}'"
   done < "$filesdb"
 
-  # Tenta remover diretórios vazios (em ordem reversa)
   sort -r "$filesdb" 2>/dev/null | while IFS= read -r path; do
     [[ -z "$path" ]] && continue
-
     case "$path" in
       /*|*'..'*)
-        # já avisamos acima quando necessário
         continue
         ;;
     esac
@@ -700,79 +701,70 @@ cmd_uninstall() {
 }
 
 cmd_list() {
-    printf "%-5s %-30s %-15s %-10s %-20s\n" "OK" "PACOTE" "VERSÃO" "LIBC" "CATEG."
-    printf "%-5s %-30s %-15s %-10s %-20s\n" "-----" "------------------------------" "---------------" "----------" "--------------------"
+    printf '%-5s %-30s %-15s %-8s %-15s\n' "OK" "PACOTE" "VERSÃO" "LIBC" "CATEG"
+    local meta id name cat ver libc
 
-    local meta
     for meta in "$DB_DIR"/*.meta; do
-        [ -e "$meta" ] || continue
+        [ -f "$meta" ] || continue
 
         unset PKG_ID PKG_NAME PKG_CATEGORY PKG_VERSION PKG_LIBC
-
-        # Carrega .meta com proteção: se falhar, avisa e pula
+        # shellcheck disable=SC1090
         if ! . "$meta"; then
-            log_warn "Falha ao carregar meta $meta (arquivo inválido?), ignorando na listagem."
+            log_warn "Falha ao ler meta $meta (arquivo inválido?). Ignorando na listagem."
             continue
         fi
 
-        local id="${PKG_ID:-unknown}"
-        local name="${PKG_NAME:-unknown}"
-        local cat="${PKG_CATEGORY:-unknown}"
-        local ver="${PKG_VERSION:-unknown}"
-        local libc="${PKG_LIBC:-unknown}"
+        id="${PKG_ID:-unknown}"
+        name="${PKG_NAME:-unknown}"
+        cat="${PKG_CATEGORY:-unknown}"
+        ver="${PKG_VERSION:-unknown}"
+        libc="${PKG_LIBC:-unknown}"
 
-        printf "%-5s %-30s %-15s %-10s %-20s\n" "[✔]" "$id" "$ver" "$libc" "$cat"
+        printf '%-5s %-30s %-15s %-8s %-15s\n' "[✔]" "$id" "$ver" "$libc" "$cat"
     done
 }
 
 cmd_search() {
-    local pattern="$1"
-    ensure_repo
-    [ -d "$PKG_BASE_DIR" ] || die "Diretório de pacotes não encontrado: $PKG_BASE_DIR"
+    local pattern="${1:-}"
+    [ -n "$pattern" ] || die "Informe um padrão para busca."
 
-    local found=0
+    ensure_repo
+    [ -d "$PKG_BASE_DIR" ] || die "Diretório base de pacotes não existe: $PKG_BASE_DIR"
+
+    local found=0 dir cat pkg mark
+
     while IFS= read -r -d '' dir; do
-        local pkg cat
         pkg="$(basename "$dir")"
         cat="$(basename "$(dirname "$dir")")"
-
-        # case-insensitive match
         if [[ "${pkg,,}" == *"${pattern,,}"* ]]; then
             found=1
-            local mark="[    ]"
+            mark="[    ]"
             if pkg_is_installed_any_libc "$cat" "$pkg"; then
                 mark="[ ✔️ ]"
             fi
-            printf "%s %s/%s\n" "$mark" "$cat" "$pkg"
+            printf '%s %s/%s\n' "$mark" "$cat" "$pkg"
         fi
     done < <(find "$PKG_BASE_DIR" -mindepth 2 -maxdepth 2 -type d -print0)
 
     if [ "$found" -eq 0 ]; then
-        log_warn "Nenhum pacote encontrado que corresponda a '$pattern'."
+        log_warn "Nenhum pacote encontrado para o padrão: $pattern"
     fi
 }
 
 cmd_info() {
     local name="$1"
-
     ensure_repo
+    [ -d "$PKG_BASE_DIR" ] || die "Diretório base de pacotes não existe: $PKG_BASE_DIR"
 
-    if [ ! -d "$PKG_BASE_DIR" ]; then
-        die "Diretório de pacotes não encontrado: $PKG_BASE_DIR"
-    fi
-
-    local matches=()
+    local matches=() cat pkg dir entry meta installed mark any_meta
 
     if [[ "$name" == */* ]]; then
-        local cat="${name%/*}"
-        local pkg="${name##*/}"
-        local dir="${PKG_BASE_DIR}/${cat}/${pkg}"
-        if [ ! -d "$dir" ]; then
-            die "Pacote '${name}' não encontrado."
-        fi
+        cat="${name%/*}"
+        pkg="${name##*/}"
+        dir="${PKG_BASE_DIR}/${cat}/${pkg}"
+        [ -d "$dir" ] || die "Pacote '${name}' não encontrado."
         matches+=("${cat}|${pkg}|${dir}")
     else
-        local dir cat pkg
         while IFS= read -r -d '' dir; do
             pkg="$(basename "$dir")"
             cat="$(basename "$(dirname "$dir")")"
@@ -786,11 +778,11 @@ cmd_info() {
         die "Pacote '${name}' não encontrado."
     fi
 
-    local entry cat pkg dir
     for entry in "${matches[@]}"; do
-        IFS='|' read -r cat pkg dir <<< "$entry"
+        cat="${entry%%|*}"
+        pkg="${entry#*|}"; pkg="${pkg%%|*}"
+        dir="${entry##*|}"
 
-        local installed mark
         if pkg_is_installed_any_libc "$cat" "$pkg"; then
             installed="sim"
             mark="[ ✔️ ]"
@@ -799,34 +791,31 @@ cmd_info() {
             mark="[    ]"
         fi
 
-        printf "%s%s/%s%s\n" "$mark " "$cat" "$pkg" "$RESET"
-        printf "  Diretório: %s\n" "$dir"
+        printf '%s %s/%s\n' "$mark" "$cat" "$pkg"
+        printf '  Diretório: %s\n' "$dir"
 
-        local any_meta=0
-        local meta
+        any_meta=0
         for meta in "${DB_DIR}/${cat}__${pkg}__"*.meta; do
             [ -f "$meta" ] || continue
             any_meta=1
 
             unset PKG_LIBC PKG_VERSION PKG_TARBALL
-
-            # Carrega .meta com proteção
+            # shellcheck disable=SC1090
             if ! . "$meta"; then
-                log_warn "Falha ao carregar meta $meta (arquivo inválido?), ignorando nesta saída."
+                log_warn "Falha ao ler meta $meta (arquivo inválido?). Ignorando."
                 continue
             fi
 
-            printf "  - libc:      %s\n" "${PKG_LIBC:-unknown}"
-            printf "    versão:    %s\n" "${PKG_VERSION:-unknown}"
-            printf "    tarball:   %s\n" "${PKG_TARBALL:-unknown}"
+            printf '  - libc: %s\n' "${PKG_LIBC:-unknown}"
+            printf '    versão: %s\n' "${PKG_VERSION:-unknown}"
+            printf '    tarball: %s\n' "${PKG_TARBALL:-unknown}"
         done
 
         if [ "$any_meta" -eq 0 ]; then
-            printf "  Instaldo?:   %s\n" "$installed"
+            printf '  Instalado?: %s\n' "$installed"
         fi
 
-        printf "  Script:     %s/%s.sh\n" "$dir" "$pkg"
-        echo
+        printf '  Script: %s/%s.sh\n\n' "$dir" "$pkg"
     done
 }
 
@@ -834,6 +823,7 @@ cmd_info() {
 
 main() {
     local cmd="${1:-}"
+
     case "$cmd" in
         build)
             [ $# -ge 2 ] || { usage; exit 1; }
