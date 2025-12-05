@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação específico para Binutils
+#
+# Chamado pelo adm via run_hook("post_install", ...):
+#   ROOTFS           - rootfs onde os binutils foram instalados
+#   ADM_CATEGORY     - categoria do pacote (ex: "toolchain")
+#   ADM_PKG_NAME     - nome do pacote (ex: "binutils")
+#   ADM_LIBC         - libc alvo
+#   ADM_PKG_VERSION  - versão dos binutils (ex: "2.45.1")
+#
+# Variáveis opcionais:
+#   BINUTILS_SANITY_STRICT       - se "1", falhas viram erro fatal (default: 1)
+#   BINUTILS_SANITY_CHROOT_TEST  - se "1", tenta rodar 'ld --version' dentro do ROOTFS via chroot
+#   ADM_BINUTILS_TARGET          - se definido, também checa binários prefixados (TARGET-ld, etc)
+#
+# Objetivo:
+#   - Confirmar que binários essenciais de binutils existem em /usr/bin no ROOTFS
+#   - Se possível, verificar que são ELF
+#   - Opcionalmente rodar um teste simples de execução via chroot
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_tag() {
+  printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[binutils-sanity:%s] %s\n' "$(_tag)" "$*"; }
+warn() { printf '[binutils-sanity:%s][WARN] %s\n' "$(_tag)" "$*" >&2; }
+fail() { printf '[binutils-sanity:%s][ERRO] %s\n' "$(_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook binutils.post_install.}"
+
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer no fluxo de chroot do adm."
+fi
+
+BINUTILS_VER="${ADM_PKG_VERSION:-desconhecida}"
+STRICT="${BINUTILS_SANITY_STRICT:-1}"
+CHROOT_TEST="${BINUTILS_SANITY_CHROOT_TEST:-0}"
+TARGET_TRIPLET="${ADM_BINUTILS_TARGET:-}"
+
+log "Sanity-check dos Binutils (versão reportada: ${BINUTILS_VER})"
+log "  ROOTFS       = ${ROOTFS}"
+log "  STRICT       = ${STRICT}"
+log "  TARGET_TRIPLET = ${TARGET_TRIPLET:-(não definido)}"
+log "  CHROOT_TEST  = ${CHROOT_TEST}"
+
+###############################################################################
+# LISTA DE BINÁRIOS ESSENCIAIS
+###############################################################################
+
+ESSENTIAL_BINARIES=(
+  ld
+  as
+  nm
+  objdump
+  readelf
+  ar
+  ranlib
+  strings
+)
+
+missing=0
+checked_paths=()
+
+check_bin_presence() {
+  local name="$1"
+  local rel="/usr/bin/${name}"
+  local abs="${ROOTFS%/}${rel}"
+  if [ -x "$abs" ]; then
+    log "Binário encontrado: ${abs}"
+    checked_paths+=("$abs")
+  else
+    warn "Binário NÃO encontrado ou não executável: ${abs}"
+    missing=$((missing + 1))
+  fi
+}
+
+# Checa sem prefixo
+for b in "${ESSENTIAL_BINARIES[@]}"; do
+  check_bin_presence "$b"
+done
+
+# Se TARGET_TRIPLET definido, checa também prefixados
+if [ -n "$TARGET_TRIPLET" ]; then
+  log "Checando também binários prefixados com TARGET_TRIPLET=${TARGET_TRIPLET}"
+  for b in "${ESSENTIAL_BINARIES[@]}"; do
+    check_bin_presence "${TARGET_TRIPLET}-${b}"
+  done
+fi
+
+if [ "$missing" -gt 0 ]; then
+  msg="${missing} binário(s) essencial(is) de binutils ausente(s) ou não executável(is)."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# VERIFICAR TIPO ELF, SE POSSÍVEL
+###############################################################################
+
+if has_cmd file; then
+  for p in "${checked_paths[@]}"; do
+    desc="$(file -b "$p" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf'; then
+      log "OK (ELF): $p -> $desc"
+    else
+      msg="Binário com tipo inesperado: $p -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+else
+  warn "Comando 'file' não encontrado; não foi possível validar o tipo ELF dos binários."
+fi
+
+###############################################################################
+# TESTE OPCIONAL VIA CHROOT
+###############################################################################
+
+if [ "$CHROOT_TEST" = "1" ] && has_cmd chroot; then
+  # Escolher algo simples pra testar: ld ou $TARGET_TRIPLET-ld se existir
+  test_ld=""
+  if [ -n "$TARGET_TRIPLET" ] && [ -x "${ROOTFS%/}/usr/bin/${TARGET_TRIPLET}-ld" ]; then
+    test_ld="/usr/bin/${TARGET_TRIPLET}-ld"
+  elif [ -x "${ROOTFS%/}/usr/bin/ld" ]; then
+    test_ld="/usr/bin/ld"
+  fi
+
+  if [ -z "$test_ld" ]; then
+    warn "CHROOT_TEST=1, mas não encontrei um 'ld' adequado dentro do ROOTFS para testar."
+  else
+    log "Rodando teste simples dentro do ROOTFS: '${test_ld} --version'"
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/usr/bin:/bin:/sbin:/usr/sbin" "$test_ld" --version >/dev/null 2>&1; then
+      msg="Falha ao executar '${test_ld} --version' dentro do ROOTFS."
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    else
+      log "Execução de '${test_ld} --version' dentro do ROOTFS parece OK."
+    fi
+  fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check dos Binutils concluído com sucesso."
+exit 0
