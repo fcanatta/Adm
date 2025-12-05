@@ -557,6 +557,7 @@ run_parallel_builds() {
 
     log_info "Iniciando fila de builds paralelos (até $jobs jobs simultâneos)"
 
+    local -a pids=()
     local running=0
     local pkg
 
@@ -566,17 +567,31 @@ run_parallel_builds() {
             do_pkg_build_and_binpkg "$pkg"
             log_ok "[BUILDQUEUE] Build concluído: $pkg"
         ) &
+        pids+=("$!")
         ((running++))
 
+        # Quando atinge o limite de jobs, espera esse lote terminar
         if (( running >= jobs )); then
-            # Espera terminar esse lote antes de iniciar novos
-            wait
+            local pid
+            for pid in "${pids[@]}"; do
+                if ! wait "$pid"; then
+                    die "Algum build paralelo falhou (PID=$pid)"
+                fi
+            done
+            pids=()
             running=0
         fi
     done
 
     # Espera qualquer job restante
-    wait || die "Algum build paralelo falhou"
+    if ((${#pids[@]} > 0)); then
+        local pid
+        for pid in "${pids[@]}"; do
+            if ! wait "$pid"; then
+                die "Algum build paralelo falhou (PID=$pid)"
+            fi
+        done
+    fi
 }
 
 # Empacota DESTDIR em binário tar.gz preservando permissões/links
@@ -603,10 +618,11 @@ install_destdir_to_rootfs() {
     # Usa rsync para preservar perms e links
     rsync -aHAX --numeric-ids "$ADM_PKG_DESTDIR"/ "$ADM_ROOTFS"/
 
-    # Gera lista de arquivos instalados (relativos ao ROOTFS)
-    (cd "$ADM_ROOTFS" && find . -mindepth 1 -type f -o -type l -o -type d) \
-        | sed 's|^\./||' \
-        > "$manifest"
+    # Gera lista de arquivos instalados (relativos ao ROOTFS),
+    # baseada apenas no DESTDIR do pacote, e só arquivos/links.
+    (cd "$ADM_PKG_DESTDIR" && \
+        find . -mindepth 1 \( -type f -o -type l \) \
+        | sed 's|^\./||') > "$manifest"
 }
 
 run_hook_if_exists() {
@@ -674,9 +690,12 @@ do_pkg_uninstall() {
     if [[ -f "$manifest" ]]; then
         log_info "Removendo arquivos listados em manifest"
         while IFS= read -r f; do
+            # ignora linhas vazias
+            [[ -z "$f" ]] && continue
+
             local full="$ADM_ROOTFS/$f"
             if [[ -e "$full" || -L "$full" ]]; then
-                rm -rf "$full"
+                rm -f "$full"
             fi
         done < "$manifest"
     else
@@ -826,10 +845,15 @@ cmd_info() {
 cmd_list_installed() {
     ensure_dirs
     log_info "Lista de pacotes instalados em $ADM_ROOTFS"
-    find "$ADM_DB_DIR" -mindepth 2 -maxdepth 2 -type f -name "installed" \
-        | sed "s|$ADM_DB_DIR/||; s|/installed||" \
-        | sort \
-        || true
+
+    if [[ -d "$ADM_DB_DIR" ]]; then
+        find "$ADM_DB_DIR" -type f -name "installed" \
+            | sed "s|$ADM_DB_DIR/||; s|/installed||" \
+            | sort \
+            || true
+    else
+        log_warn "Diretório de banco de dados não existe: $ADM_DB_DIR"
+    fi
 }
 
 #########################
@@ -925,10 +949,13 @@ cmd_world_remove() {
 
     world_ensure_file
 
-    grep -vx "$pkg" "$ADM_WORLD_FILE" > "$ADM_WORLD_FILE.tmp"
+    # grep retorna status 1 se não houver linhas que casem com o padrão,
+    # o que com -v significa "nenhuma linha diferente" → sem problemas.
+    # O `|| true` evita que o `set -e` derrube o script.
+    grep -vx "$pkg" "$ADM_WORLD_FILE" > "$ADM_WORLD_FILE.tmp" || true
     mv "$ADM_WORLD_FILE.tmp" "$ADM_WORLD_FILE"
 
-    log_ok "Removido do world: $pkg"
+    log_ok "Removido do world (se existia): $pkg"
 }
 
 ############################################################
