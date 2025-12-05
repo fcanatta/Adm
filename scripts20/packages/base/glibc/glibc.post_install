@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação específico para Glibc
+#
+# Chamado pelo adm via run_hook("post_install", ...):
+#   ROOTFS           - rootfs onde a glibc foi instalada (ex: /opt/systems/glibc-rootfs)
+#   ADM_CATEGORY     - categoria do pacote (ex: "libc")
+#   ADM_PKG_NAME     - nome do pacote (ex: "glibc")
+#   ADM_LIBC         - libc alvo ("glibc")
+#   ADM_PKG_VERSION  - versão da glibc (ex: "2.42")
+#
+# Variáveis opcionais:
+#   GLIBC_SANITY_STRICT  - se "1", qualquer problema relevante vira erro fatal (default: 1)
+#   GLIBC_SANITY_LDD     - se "1", tenta rodar ldd dentro do ROOTFS para um binário de teste
+#
+# Objetivo:
+#   - Verificar que o loader dinâmico (ld-linux-*) existe em um libdir plausível.
+#   - Confirmar que libs essenciais da glibc existem (libc.so.6, libm.so.6, etc).
+#   - Confirmar que headers básicos da glibc foram instalados.
+#   - Opcionalmente, testar ldd dentro do ROOTFS.
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_tag() {
+  printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[glibc-sanity:%s] %s\n' "$(_tag)" "$*"; }
+warn() { printf '[glibc-sanity:%s][WARN] %s\n' "$(_tag)" "$*" >&2; }
+fail() { printf '[glibc-sanity:%s][ERRO] %s\n' "$(_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# CONTEXTO BÁSICO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook glibc.post_install.}"
+
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer no fluxo de chroot do adm."
+fi
+
+if [ "${ADM_LIBC:-glibc}" != "glibc" ]; then
+  fail "Hook glibc.post_install chamado com ADM_LIBC='${ADM_LIBC:-}', esperado 'glibc'."
+fi
+
+GLIBC_VER="${ADM_PKG_VERSION:-desconhecida}"
+STRICT="${GLIBC_SANITY_STRICT:-1}"
+USE_LDD="${GLIBC_SANITY_LDD:-0}"
+
+log "Sanity-check da Glibc (versão reportada: ${GLIBC_VER})"
+log "  ROOTFS = ${ROOTFS}"
+log "  STRICT = ${STRICT}"
+log "  USE_LDD = ${USE_LDD}"
+
+###############################################################################
+# DETECTAR ARQUITETURA E LOADER DINÂMICO ESPERADO
+###############################################################################
+
+ARCH="$(uname -m || echo unknown)"
+
+# Lista de candidatos a loader por arquitetura.
+loader_candidates=()
+
+case "$ARCH" in
+  x86_64)
+    loader_candidates=(
+      "lib/ld-linux-x86-64.so.2"
+      "usr/lib/ld-linux-x86-64.so.2"
+      "lib64/ld-linux-x86-64.so.2"
+    )
+    ;;
+  i?86)
+    loader_candidates=(
+      "lib/ld-linux.so.2"
+      "usr/lib/ld-linux.so.2"
+    )
+    ;;
+  aarch64)
+    loader_candidates=(
+      "lib/ld-linux-aarch64.so.1"
+      "usr/lib/ld-linux-aarch64.so.1"
+      "lib64/ld-linux-aarch64.so.1"
+    )
+    ;;
+  armv7l|armv6l|armhf|arm*)
+    loader_candidates=(
+      "lib/ld-linux-armhf.so.3"
+      "usr/lib/ld-linux-armhf.so.3"
+      "lib/ld-linux.so.3"
+      "usr/lib/ld-linux.so.3"
+    )
+    ;;
+  *)
+    warn "Arquitetura desconhecida para autodetectar loader dinâmico: '$ARCH'."
+    loader_candidates=(
+      "lib/ld-linux.so.2"
+      "usr/lib/ld-linux.so.2"
+      "lib/ld-linux-x86-64.so.2"
+      "usr/lib/ld-linux-x86-64.so.2"
+      "lib64/ld-linux-x86-64.so.2"
+    )
+    ;;
+esac
+
+found_loader=""
+for rel in "${loader_candidates[@]}"; do
+  cand="${ROOTFS%/}/${rel}"
+  if [ -x "$cand" ]; then
+    found_loader="$cand"
+    break
+  fi
+done
+
+if [ -n "$found_loader" ]; then
+  log "Loader dinâmico encontrado: ${found_loader}"
+else
+  msg="Nenhum loader dinâmico glibc encontrado nos caminhos esperados para $ARCH."
+  msg+=" (candidatos: ${loader_candidates[*]})"
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# VERIFICAR BIBLIOTECAS ESSENCIAIS
+###############################################################################
+
+# libs essenciais de runtime que normalmente a glibc instala
+ESSENTIAL_LIBS=(
+  "libc.so.6"
+  "libm.so.6"
+  "libpthread.so.0"
+  "librt.so.1"
+  "libdl.so.2"
+  "libutil.so.1"
+  "libnsl.so.1"
+  "libresolv.so.2"
+  "libnss_files.so.2"
+  "libnss_dns.so.2"
+)
+
+libdirs=(
+  "lib"
+  "lib64"
+  "usr/lib"
+)
+
+missing_libs=()
+checked_libs=()
+
+find_lib_in_rootfs() {
+  local name="$1" d
+  for d in "${libdirs[@]}"; do
+    local p="${ROOTFS%/}/${d}/${name}"
+    if [ -e "$p" ]; then
+      printf '%s\n' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+for lib in "${ESSENTIAL_LIBS[@]}"; do
+  path="$(find_lib_in_rootfs "$lib" || true)"
+  if [ -n "$path" ]; then
+    log "Biblioteca essencial encontrada: ${path}"
+    checked_libs+=("$path")
+  else
+    warn "Biblioteca essencial NÃO encontrada: ${lib} (nas dirs: ${libdirs[*]})"
+    missing_libs+=("$lib")
+  fi
+done
+
+if [ "${#missing_libs[@]}" -gt 0 ]; then
+  msg="Um ou mais libs essenciais da glibc estão ausentes: ${missing_libs[*]}"
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# VERIFICAR QUE AS LIBS ENCONTRADAS SÃO ELF SHARED OBJECTS
+###############################################################################
+
+if has_cmd file; then
+  for libpath in "${checked_libs[@]}"; do
+    desc="$(file -b "$libpath" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf' && echo "$desc" | grep -qi 'shared object'; then
+      log "OK (ELF SO): $libpath -> $desc"
+    else
+      msg="Arquivo de biblioteca com descrição inesperada: $libpath -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+else
+  warn "Comando 'file' não encontrado; não foi possível validar o tipo ELF das bibliotecas."
+fi
+
+###############################################################################
+# HEADERS BÁSICOS DA GLIBC
+###############################################################################
+
+INC_BASE="${ROOTFS%/}/usr/include"
+
+headers_ok=1
+
+if [ ! -d "$INC_BASE" ]; then
+  warn "Diretório de headers da glibc não encontrado: $INC_BASE"
+  headers_ok=0
+else
+  # Alguns headers-chave típicos da glibc
+  REQUIRED_HEADERS=(
+    "features.h"
+    "gnu/libc-version.h"
+    "bits/libc-header-start.h"
+    "sys/types.h"
+    "unistd.h"
+  )
+
+  for h in "${REQUIRED_HEADERS[@]}"; do
+    hpath="${INC_BASE}/${h}"
+    if [ ! -f "$hpath" ]; then
+      warn "Header da glibc ausente (esperado): ${hpath}"
+      headers_ok=0
+    else
+      log "Header encontrado: ${hpath}"
+    fi
+  done
+fi
+
+if [ "$headers_ok" -eq 0 ]; then
+  msg="Nem todos os headers básicos da glibc foram encontrados em ${INC_BASE}."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# TESTE OPCIONAL COM LDD DENTRO DO ROOTFS
+###############################################################################
+
+if [ "$USE_LDD" = "1" ] && has_cmd chroot; then
+  ldd_path=""
+  if [ -x "${ROOTFS%/}/usr/bin/ldd" ]; then
+    ldd_path="/usr/bin/ldd"
+  elif [ -x "${ROOTFS%/}/bin/ldd" ]; then
+    ldd_path="/bin/ldd"
+  fi
+
+  test_bin=""
+  if [ -x "${ROOTFS%/}/usr/bin/true" ]; then
+    test_bin="/usr/bin/true"
+  elif [ -x "${ROOTFS%/}/bin/true" ]; then
+    test_bin="/bin/true"
+  fi
+
+  if [ -z "$ldd_path" ]; then
+    warn "GLIBC_SANITY_LDD=1, mas 'ldd' não foi encontrado no ROOTFS."
+  elif [ -z "$test_bin" ]; then
+    warn "GLIBC_SANITY_LDD=1, mas não encontrei um binário simples para testar (ex: /bin/true)."
+  else
+    log "Rodando ldd dentro do ROOTFS: chroot '${ROOTFS}' $ldd_path $test_bin"
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/usr/bin:/bin:/sbin:/usr/sbin" "$ldd_path" "$test_bin" >/dev/null 2>&1; then
+      msg="ldd falhou dentro do ROOTFS ao inspecionar '$test_bin'."
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    else
+      log "ldd parece funcionar corretamente dentro do ROOTFS."
+    fi
+  fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check da Glibc concluído com sucesso."
+exit 0
