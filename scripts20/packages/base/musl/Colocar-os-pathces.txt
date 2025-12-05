@@ -1,0 +1,8 @@
+# Colocar os patches no diretório 
+/usr/src/adm/patches/musl-1.2.5/
+/usr/src/adm/patches/musl-1.2.5/001-cve-XXXX-fix.patch
+/usr/src/adm/patches/musl-1.2.5/002-cve-YYYY-fix.patch
+
+# Se quiser forçar outro diretório 
+ADM_MUSL_PATCHDIR=/meu/caminho/de/patches adm build libc/musl musl
+
