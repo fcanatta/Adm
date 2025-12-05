@@ -1,0 +1,2 @@
+sudo mkdir -p /opt/systems/musl-rootfs/usr/share
+sudo nano /opt/systems/musl-rootfs/usr/share/config.musl.site
