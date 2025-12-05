@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação para Linux API Headers
+# Sanity-check após adm instalar o pacote dentro do ROOTFS.
+#
+# Variáveis recebidas do adm (via run_hook):
+#   ROOTFS            - rootfs onde o pacote foi instalado
+#   ADM_CATEGORY      - categoria do pacote (ex: "linux")
+#   ADM_PKG_NAME      - nome do pacote (ex: "linux-headers")
+#   ADM_LIBC          - libc alvo ("glibc" ou "musl")
+#   ADM_PKG_VERSION   - versão do pacote (ex: "6.17.9")
+
+set -euo pipefail
+
+log() {
+  printf '[sanity:%s] %s\n' "${ADM_PKG_NAME:-unknown}" "$*"
+}
+
+fail() {
+  printf '[sanity:%s][ERRO] %s\n' "${ADM_PKG_NAME:-unknown}" "$*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 1. Checagens básicas de ambiente
+# ---------------------------------------------------------------------------
+
+: "${ROOTFS:?ROOTFS não definido no hook de sanity-check.}"
+
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+# Evitar desastre se ROOTFS for "/"
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer em ambiente de chroot do adm."
+fi
+
+log "Iniciando sanity-check em ROOTFS: $ROOTFS (libc=${ADM_LIBC:-?}, versão=${ADM_PKG_VERSION:-?})"
+
+# ---------------------------------------------------------------------------
+# 2. Verificar estrutura básica de headers
+# ---------------------------------------------------------------------------
+
+INCLUDE_DIR="$ROOTFS/usr/include"
+
+[ -d "$INCLUDE_DIR" ] || fail "Diretório não encontrado: $INCLUDE_DIR"
+
+for d in linux asm asm-generic; do
+  if [ ! -d "$INCLUDE_DIR/$d" ]; then
+    fail "Diretório de headers não encontrado: $INCLUDE_DIR/$d"
+  fi
+done
+
+log "Diretórios básicos de headers encontrados em $INCLUDE_DIR/{linux,asm,asm-generic}"
+
+# ---------------------------------------------------------------------------
+# 3. Verificar arquivo linux/version.h
+# ---------------------------------------------------------------------------
+
+VERSION_H="$INCLUDE_DIR/linux/version.h"
+
+if [ ! -f "$VERSION_H" ]; then
+  fail "Arquivo linux/version.h não encontrado em: $VERSION_H"
+fi
+
+log "Encontrado linux/version.h em $VERSION_H"
+
+# ---------------------------------------------------------------------------
+# 4. Se ADM_PKG_VERSION estiver em formato X.Y.Z, validar LINUX_VERSION_CODE
+# ---------------------------------------------------------------------------
+
+if [ -n "${ADM_PKG_VERSION:-}" ] && printf '%s\n' "$ADM_PKG_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  KMAJOR="${ADM_PKG_VERSION%%.*}"
+  REST="${ADM_PKG_VERSION#*.}"
+  KMINOR="${REST%%.*}"
+  KPATCH="${REST#*.}"
+
+  # LINUX_VERSION_CODE = (major << 16) + (minor << 8) + patch
+  EXPECTED_CODE=$(( KMAJOR * 65536 + KMINOR * 256 + KPATCH ))
+
+  ACTUAL_CODE="$(grep -E '^[[:space:]]*#define[[:space:]]+LINUX_VERSION_CODE[[:space:]]+[0-9]+' "$VERSION_H" \
+    | awk '{print $3}' \
+    | head -n1 || true)"
+
+  if [ -z "$ACTUAL_CODE" ]; then
+    fail "Não foi possível localizar LINUX_VERSION_CODE em $VERSION_H"
+  fi
+
+  if [ "$ACTUAL_CODE" -ne "$EXPECTED_CODE" ]; then
+    fail "LINUX_VERSION_CODE inconsistente: esperado=$EXPECTED_CODE (para ${ADM_PKG_VERSION}), encontrado=$ACTUAL_CODE"
+  fi
+
+  log "LINUX_VERSION_CODE OK: $ACTUAL_CODE (compatível com ${ADM_PKG_VERSION})"
+else
+  log "ADM_PKG_VERSION ausente ou em formato inesperado ('${ADM_PKG_VERSION:-}'), pulando validação de LINUX_VERSION_CODE."
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Sanity extra: verificar se pelo menos um header "típico" existe
+# ---------------------------------------------------------------------------
+
+TYPICAL_HEADERS=(
+  "$INCLUDE_DIR/linux/limits.h"
+  "$INCLUDE_DIR/linux/types.h"
+  "$INCLUDE_DIR/asm/posix_types.h"
+)
+
+MISSING_EXTRA=0
+for h in "${TYPICAL_HEADERS[@]}"; do
+  if [ ! -f "$h" ]; then
+    log "Aviso: header típico não encontrado (não é fatal): $h"
+    MISSING_EXTRA=1
+  fi
+done
+
+if [ "$MISSING_EXTRA" -eq 0 ]; then
+  log "Alguns headers típicos foram encontrados com sucesso."
+else
+  log "Alguns headers típicos não foram encontrados; verifique se isso é esperado para sua arquitetura."
+fi
+
+log "Sanity-check dos Linux API Headers concluído com sucesso."
+exit 0
