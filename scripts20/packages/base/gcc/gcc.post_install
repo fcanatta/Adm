@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação específico para GCC (C + C++ / libstdc++)
+#
+# Chamado pelo adm via run_hook("post_install", ...):
+#   ROOTFS           - rootfs onde o gcc foi instalado
+#   ADM_CATEGORY     - categoria do pacote (ex: "toolchain")
+#   ADM_PKG_NAME     - nome do pacote (ex: "gcc")
+#   ADM_LIBC         - libc alvo
+#   ADM_PKG_VERSION  - versão do gcc (ex: "15.2.0")
+#
+# Variáveis opcionais:
+#   GCC_SANITY_STRICT       - se "1", falhas viram erro fatal (default: 1)
+#   GCC_SANITY_CHROOT_TEST  - se "1", testa g++ dentro do ROOTFS via chroot
+#   ADM_GCC_TARGET          - se definido, também checa binários prefixados (TARGET-gcc/g++)
+#
+# Objetivo:
+#   - Checar existência de gcc/g++/cpp em /usr/bin
+#   - Confirmar que headers C++ foram instalados em /usr/include/c++/<versão>
+#   - Confirmar que libstdc++.so.* existe em /usr/lib ou /usr/lib64
+#   - Validar tipo ELF (se 'file' disponível)
+#   - Opcionalmente, rodar 'g++ --version' dentro do ROOTFS
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_tag() {
+  printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[gcc-sanity:%s] %s\n' "$(_tag)" "$*"; }
+warn() { printf '[gcc-sanity:%s][WARN] %s\n' "$(_tag)" "$*" >&2; }
+fail() { printf '[gcc-sanity:%s][ERRO] %s\n' "$(_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook gcc.post_install.}"
+
+if [ ! -d "$ROOTFS" ]; then
+  fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+  fail "ROOTFS é '/', isso não deveria acontecer no fluxo de chroot do adm."
+fi
+
+GCC_VER="${ADM_PKG_VERSION:-desconhecida}"
+STRICT="${GCC_SANITY_STRICT:-1}"
+CHROOT_TEST="${GCC_SANITY_CHROOT_TEST:-0}"
+TARGET_TRIPLET="${ADM_GCC_TARGET:-}"
+
+log "Sanity-check do GCC (versão reportada: ${GCC_VER})"
+log "  ROOTFS         = ${ROOTFS}"
+log "  STRICT         = ${STRICT}"
+log "  TARGET_TRIPLET = ${TARGET_TRIPLET:-(não definido)}"
+log "  CHROOT_TEST    = ${CHROOT_TEST}"
+
+###############################################################################
+# BINÁRIOS BÁSICOS: gcc, g++, cpp
+###############################################################################
+
+ESSENTIAL_BINS=(
+  gcc
+  g++
+  cpp
+)
+
+missing_bins=0
+checked_bins=()
+
+check_bin() {
+  local name="$1"
+  local rel="/usr/bin/${name}"
+  local abs="${ROOTFS%/}${rel}"
+  if [ -x "$abs" ]; then
+    log "Binário encontrado: ${abs}"
+    checked_bins+=("$abs")
+  else
+    warn "Binário NÃO encontrado ou não executável: ${abs}"
+    missing_bins=$((missing_bins + 1))
+  fi
+}
+
+# Sem prefixo
+for b in "${ESSENTIAL_BINS[@]}"; do
+  check_bin "$b"
+done
+
+# Se TARGET_TRIPLET definido, checar também prefixados
+if [ -n "$TARGET_TRIPLET" ]; then
+  log "Checando também binários prefixados com TARGET_TRIPLET=${TARGET_TRIPLET}"
+  for b in "${ESSENTIAL_BINS[@]}"; do
+    check_bin "${TARGET_TRIPLET}-${b}"
+  done
+fi
+
+if [ "$missing_bins" -gt 0 ]; then
+  msg="${missing_bins} binário(s) essencial(is) de GCC ausente(s) ou não executável(is)."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# HEADERS C++: /usr/include/c++/<versão>
+###############################################################################
+
+INC_BASE="${ROOTFS%/}/usr/include/c++"
+
+headers_ok=1
+if [ ! -d "$INC_BASE" ]; then
+  warn "Diretório base de headers C++ não encontrado: $INC_BASE"
+  headers_ok=0
+else
+  # Se a versão foi informada (PKG_VERSION), usamos como subdiretório esperado.
+  # Ex: /usr/include/c++/15.2.0
+  if [ "$GCC_VER" != "desconhecida" ]; then
+    INC_VER_DIR="${INC_BASE}/${GCC_VER}"
+    if [ ! -d "$INC_VER_DIR" ]; then
+      warn "Diretório de headers C++ para a versão ${GCC_VER} não encontrado: ${INC_VER_DIR}"
+      headers_ok=0
+    else
+      log "Diretório de headers C++ encontrado: ${INC_VER_DIR}"
+      # Checar alguns headers típicos:
+      REQUIRED_HEADERS=(
+        "iostream"
+        "vector"
+        "string"
+        "memory"
+        "algorithm"
+      )
+      for h in "${REQUIRED_HEADERS[@]}"; do
+        if [ ! -f "${INC_VER_DIR}/${h}" ] && [ ! -f "${INC_VER_DIR}/${h}.h" ]; then
+          warn "Header C++ ausente (esperado): ${INC_VER_DIR}/${h}[.h]"
+          headers_ok=0
+        else
+          log "Header C++ encontrado (alguma forma de ${h}): ${INC_VER_DIR}"
+        fi
+      done
+    fi
+  else
+    warn "ADM_PKG_VERSION não definido; não foi possível checar /usr/include/c++/<versão> de forma precisa."
+    headers_ok=0
+  fi
+fi
+
+if [ "$headers_ok" -eq 0 ]; then
+  msg="Nem todos os headers C++ básicos foram encontrados em ${INC_BASE}."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+fi
+
+###############################################################################
+# libstdc++.so.* em /usr/lib ou /usr/lib64
+###############################################################################
+
+libstdc_paths=()
+search_libstdc() {
+  local base="$1"
+  local pattern
+  for pattern in "libstdc++.so.6"* "libstdc++.so"; do
+    for p in "${base}/${pattern}"; do
+      [ -e "$p" ] || continue
+      libstdc_paths+=("$p")
+    done
+  done
+}
+
+search_libstdc "${ROOTFS%/}/usr/lib"
+search_libstdc "${ROOTFS%/}/usr/lib64"
+
+if [ "${#libstdc_paths[@]}" -eq 0 ]; then
+  msg="Nenhuma libstdc++ encontrada em ${ROOTFS%/}/usr/lib ou ${ROOTFS%/}/usr/lib64."
+  if [ "$STRICT" = "1" ]; then
+    fail "$msg"
+  else
+    warn "$msg"
+  fi
+else
+  for p in "${libstdc_paths[@]}"; do
+    log "libstdc++ encontrada: ${p}"
+  done
+fi
+
+###############################################################################
+# Validar tipo ELF das libs e bins, se 'file' existir
+###############################################################################
+
+if has_cmd file; then
+  # libs
+  for p in "${libstdc_paths[@]}"; do
+    desc="$(file -b "$p" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf' && echo "$desc" | grep -qi 'shared object'; then
+      log "OK (ELF SO): $p -> $desc"
+    else
+      msg="libstdc++ com tipo inesperado: $p -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+
+  # gcc/g++
+  for p in "${checked_bins[@]}"; do
+    desc="$(file -b "$p" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf'; then
+      log "OK (ELF bin): $p -> $desc"
+    else
+      msg="Binário GCC com tipo inesperado: $p -> $desc"
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    fi
+  done
+else
+  warn "Comando 'file' não encontrado; não foi possível validar tipo ELF de gcc/g++/libstdc++."
+fi
+
+###############################################################################
+# TESTE OPCIONAL VIA CHROOT: g++ --version
+###############################################################################
+
+if [ "$CHROOT_TEST" = "1" ] && has_cmd chroot; then
+  test_gpp=""
+  if [ -n "$TARGET_TRIPLET" ] && [ -x "${ROOTFS%/}/usr/bin/${TARGET_TRIPLET}-g++" ]; then
+    test_gpp="/usr/bin/${TARGET_TRIPLET}-g++"
+  elif [ -x "${ROOTFS%/}/usr/bin/g++" ]; then
+    test_gpp="/usr/bin/g++"
+  fi
+
+  if [ -z "$test_gpp" ]; then
+    warn "CHROOT_TEST=1, mas não encontrei um g++ dentro do ROOTFS para testar."
+  else
+    log "Rodando teste simples dentro do ROOTFS: '${test_gpp} --version'"
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/usr/bin:/bin:/sbin:/usr/sbin" "$test_gpp" --version >/dev/null 2>&1; then
+      msg="Falha ao executar '${test_gpp} --version' dentro do ROOTFS."
+      if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+      else
+        warn "$msg"
+      fi
+    else
+      log "Execução de '${test_gpp} --version' dentro do ROOTFS parece OK."
+    fi
+  fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check do GCC + libstdc++ concluído com sucesso."
+exit 0
