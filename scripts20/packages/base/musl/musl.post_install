@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# Hook de pós-instalação específico para musl
+#
+# Chamado pelo adm via run_hook("post_install", ...):
+#   ROOTFS           - rootfs onde o musl foi instalado (ex: /opt/systems/musl-rootfs)
+#   ADM_CATEGORY     - categoria do pacote (ex: "libc")
+#   ADM_PKG_NAME     - nome do pacote (ex: "musl")
+#   ADM_LIBC         - libc alvo (esperado: "musl")
+#   ADM_PKG_VERSION  - versão do musl (ex: "1.2.5")
+#
+# Variáveis opcionais:
+#   MUSL_SANITY_STRICT  - se "1", falhas viram erro fatal (default: 1)
+#   MUSL_SANITY_CHROOT  - se "1", tenta rodar ld-musl-*.so.1 --help via chroot
+#   ADM_MUSL_SYSLIBDIR  - syslibdir usado na instalação (default: /lib)
+#
+# Objetivo:
+#   - Confirmar que o loader dinâmico ld-musl-*.so.1 existe
+#   - Confirmar que libc.so existe no syslibdir (/lib por padrão)
+#   - Confirmar que headers básicos existem em /usr/include
+#   - Validar que ld-musl-*.so.1 é ELF (se 'file' estiver disponível)
+#   - Opcionalmente, testar execução via chroot
+
+set -euo pipefail
+
+###############################################################################
+# LOG / HELPERS
+###############################################################################
+
+_tag() {
+    printf '%s/%s' "${ADM_CATEGORY:-?}" "${ADM_PKG_NAME:-?}"
+}
+
+log()  { printf '[musl-sanity:%s] %s\n' "$(_tag)" "$*"; }
+warn() { printf '[musl-sanity:%s][WARN] %s\n' "$(_tag)" "$*" >&2; }
+fail() { printf '[musl-sanity:%s][ERRO] %s\n' "$(_tag)" "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+###############################################################################
+# CONTEXTO
+###############################################################################
+
+: "${ROOTFS:?ROOTFS não definido no hook musl.post_install.}"
+
+if [ ! -d "$ROOTFS" ]; then
+    fail "ROOTFS não é um diretório válido: $ROOTFS"
+fi
+
+if [ "$ROOTFS" = "/" ]; then
+    fail "ROOTFS é '/', isso não deveria acontecer no fluxo do adm."
+fi
+
+if [ "${ADM_LIBC:-musl}" != "musl" ]; then
+    fail "Hook musl.post_install chamado com ADM_LIBC='${ADM_LIBC:-}', esperado 'musl'."
+fi
+
+MUSL_VER="${ADM_PKG_VERSION:-desconhecida}"
+STRICT="${MUSL_SANITY_STRICT:-1}"
+CHROOT_TEST="${MUSL_SANITY_CHROOT:-0}"
+SYSLIBDIR="${ADM_MUSL_SYSLIBDIR:-/lib}"
+
+log "Sanity-check do musl (versão reportada: ${MUSL_VER})"
+log "  ROOTFS    = ${ROOTFS}"
+log "  STRICT    = ${STRICT}"
+log "  SYSLIBDIR = ${SYSLIBDIR}"
+log "  CHROOT    = ${CHROOT_TEST}"
+
+###############################################################################
+# DETECTAR ARQUITETURA E LOADER
+###############################################################################
+
+ARCH="$(uname -m || echo unknown)"
+
+loader_candidates=()
+
+case "$ARCH" in
+    x86_64)
+        loader_candidates=("ld-musl-x86_64.so.1")
+        ;;
+    i?86)
+        loader_candidates=("ld-musl-i386.so.1" "ld-musl-x86.so.1")
+        ;;
+    aarch64)
+        loader_candidates=("ld-musl-aarch64.so.1")
+        ;;
+    armv7l|armv6l|armhf|arm*)
+        loader_candidates=("ld-musl-armhf.so.1" "ld-musl-arm.so.1")
+        ;;
+    *)
+        warn "Arquitetura desconhecida para autodetectar loader musl: '${ARCH}'. Tentando alguns nomes comuns."
+        loader_candidates=(
+            "ld-musl-x86_64.so.1"
+            "ld-musl-i386.so.1"
+            "ld-musl-aarch64.so.1"
+            "ld-musl-armhf.so.1"
+        )
+        ;;
+esac
+
+found_loader=""
+for name in "${loader_candidates[@]}"; do
+    cand="${ROOTFS%/}${SYSLIBDIR%/}/${name}"
+    if [ -x "$cand" ]; then
+        found_loader="$cand"
+        break
+    fi
+done
+
+if [ -n "$found_loader" ]; then
+    log "Loader dinâmico musl encontrado: ${found_loader}"
+else
+    msg="Nenhum loader dinâmico musl encontrado em ${ROOTFS%/}${SYSLIBDIR%/}/{${loader_candidates[*]}}."
+    if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+    else
+        warn "$msg"
+    fi
+fi
+
+###############################################################################
+# libc.so em SYSLIBDIR
+###############################################################################
+
+LIBC_SO="${ROOTFS%/}${SYSLIBDIR%/}/libc.so"
+
+if [ -e "$LIBC_SO" ]; then
+    log "libc.so encontrada em ${LIBC_SO}"
+else
+    msg="libc.so não encontrada em ${LIBC_SO}"
+    if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+    else
+        warn "$msg"
+    fi
+fi
+
+###############################################################################
+# HEADERS BÁSICOS em /usr/include
+###############################################################################
+
+INC_BASE="${ROOTFS%/}/usr/include"
+headers_ok=1
+
+if [ ! -d "$INC_BASE" ]; then
+    warn "Diretório de headers não encontrado: ${INC_BASE}"
+    headers_ok=0
+else
+    REQUIRED_HEADERS=(
+        "stdio.h"
+        "stdlib.h"
+        "string.h"
+        "unistd.h"
+        "errno.h"
+        "features.h"
+    )
+
+    for h in "${REQUIRED_HEADERS[@]}"; do
+        if [ ! -f "${INC_BASE}/${h}" ]; then
+            warn "Header básico ausente: ${INC_BASE}/${h}"
+            headers_ok=0
+        else
+            log "Header encontrado: ${INC_BASE}/${h}"
+        fi
+    done
+
+    # Checagem extra opcional: verificar se features.h parece ser do musl
+    FEATURES="${INC_BASE}/features.h"
+    if [ -f "$FEATURES" ]; then
+        if grep -qi 'musl' "$FEATURES" 2>/dev/null; then
+            log "features.h parece ser do musl (contém 'musl')."
+        else
+            warn "features.h não parece mencionar 'musl'; verifique se não há headers misturados de outra libc."
+        fi
+    fi
+fi
+
+if [ "$headers_ok" -eq 0 ]; then
+    msg="Nem todos os headers básicos foram encontrados em ${INC_BASE}."
+    if [ "$STRICT" = "1" ]; then
+        fail "$msg"
+    else
+        warn "$msg"
+    fi
+fi
+
+###############################################################################
+# Validar tipo ELF do loader com 'file', se disponível
+###############################################################################
+
+if [ -n "$found_loader" ] && has_cmd file; then
+    desc="$(file -b "$found_loader" 2>/dev/null || true)"
+    if echo "$desc" | grep -qi 'elf' && echo "$desc" | grep -qi 'shared object'; then
+        log "OK (ELF SO): $found_loader -> $desc"
+    else
+        msg="Loader musl com tipo inesperado: $found_loader -> $desc"
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    fi
+elif [ -n "$found_loader" ]; then
+    warn "Comando 'file' não encontrado; não foi possível validar tipo ELF do loader."
+fi
+
+###############################################################################
+# TESTE OPCIONAL VIA CHROOT: ld-musl-*.so.1 --help
+###############################################################################
+
+if [ "$CHROOT_TEST" = "1" ] && has_cmd chroot && [ -n "$found_loader" ]; then
+    # Caminho visto de dentro do chroot
+    loader_in_chroot="${found_loader#${ROOTFS%/}}"
+    log "Rodando teste simples dentro do ROOTFS: '${loader_in_chroot} --help'"
+    if ! chroot "$ROOTFS" /usr/bin/env PATH="/usr/bin:/bin:/sbin:/usr/sbin:${SYSLIBDIR}" "$loader_in_chroot" --help >/dev/null 2>&1; then
+        msg="Falha ao executar '${loader_in_chroot} --help' dentro do ROOTFS."
+        if [ "$STRICT" = "1" ]; then
+            fail "$msg"
+        else
+            warn "$msg"
+        fi
+    else
+        log "Execução de '${loader_in_chroot} --help' dentro do ROOTFS parece OK."
+    fi
+fi
+
+###############################################################################
+# FINAL
+###############################################################################
+
+log "Sanity-check do musl concluído com sucesso."
+exit 0
