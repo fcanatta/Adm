@@ -21,6 +21,15 @@ ADM_LOG_DIR="$ADM_ROOT/log"
 ADM_DB_DIR="$ADM_ROOT/db"
 ADM_STATE_DIR="$ADM_ROOT/state"
 
+# Número de builds paralelos (jobs de compilação)
+# Pode ser sobrescrito com variável de ambiente ADM_JOBS.
+if command -v nproc >/dev/null 2>&1; then
+    ADM_JOBS_DEFAULT="$(nproc)"
+else
+    ADM_JOBS_DEFAULT=2
+fi
+ADM_JOBS="${ADM_JOBS:-$ADM_JOBS_DEFAULT}"
+
 # Ajuste para o seu repositório de scripts de construção
 # (pode ser https, ssh, gitlab, github, etc)
 ADM_REPO_URL="${ADM_REPO_URL:-git@gitlab.com:usuario/meu-adm-repo.git}"
@@ -163,6 +172,51 @@ pkg_manifest_file() {
 
 pkg_last_success_file() {
     echo "$ADM_STATE_DIR/last_successful_build"
+}
+
+#########################
+# Hash do ambiente      #
+#########################
+
+env_fingerprint() {
+    # Tudo que define o "ambiente" de build
+    local data=""
+    data+="ADM_PROFILE=$ADM_PROFILE\n"
+    data+="ADM_ROOTFS=$ADM_ROOTFS\n"
+    data+="ADM_PERF_LEVEL=${ADM_PERF_LEVEL:-}\n"
+    data+="CHOST=${CHOST:-}\n"
+    data+="CC=${CC:-}\n"
+    data+="CXX=${CXX:-}\n"
+    data+="CFLAGS=${CFLAGS:-}\n"
+    data+="CXXFLAGS=${CXXFLAGS:-}\n"
+    data+="LDFLAGS=${LDFLAGS:-}\n"
+    data+="MAKEFLAGS=${MAKEFLAGS:-}\n"
+
+    printf '%b' "$data" | sha256sum | awk '{print $1}'
+}
+
+pkg_env_hash_file() {
+    echo "$ADM_PKG_DB_DIR/env.hash"
+}
+
+pkg_get_stored_env_hash() {
+    local f
+    f=$(pkg_env_hash_file)
+    [[ -f "$f" ]] && cat "$f" || echo ""
+}
+
+pkg_store_env_hash() {
+    local f
+    f=$(pkg_env_hash_file)
+    mkdir -p "$(dirname "$f")"
+    env_fingerprint > "$f"
+}
+
+pkg_env_changed() {
+    local cur old
+    cur=$(env_fingerprint)
+    old=$(pkg_get_stored_env_hash)
+    [[ "$cur" != "$old" ]]
 }
 
 #########################
@@ -490,6 +544,41 @@ do_pkg_build() {
     log_ok "Build de $ADM_PKG_ID concluído"
 }
 
+do_pkg_build_and_binpkg() {
+    local pkg_id="$1"
+    do_pkg_build "$pkg_id"
+    create_binpkg "$pkg_id"
+}
+
+run_parallel_builds() {
+    # Uso: run_parallel_builds pkg1 pkg2 pkg3 ...
+    local jobs="$ADM_JOBS"
+    (( jobs < 1 )) && jobs=1
+
+    log_info "Iniciando fila de builds paralelos (até $jobs jobs simultâneos)"
+
+    local running=0
+    local pkg
+
+    for pkg in "$@"; do
+        (
+            log_info "[BUILDQUEUE] Compilando $pkg ..."
+            do_pkg_build_and_binpkg "$pkg"
+            log_ok "[BUILDQUEUE] Build concluído: $pkg"
+        ) &
+        ((running++))
+
+        if (( running >= jobs )); then
+            # Espera terminar esse lote antes de iniciar novos
+            wait
+            running=0
+        fi
+    done
+
+    # Espera qualquer job restante
+    wait || die "Algum build paralelo falhou"
+}
+
 # Empacota DESTDIR em binário tar.gz preservando permissões/links
 create_binpkg() {
     local pkg_id="$1"
@@ -563,6 +652,7 @@ do_pkg_install() {
 
     pkg_mark_installed
     echo "$ADM_PKG_ID" > "$(pkg_last_success_file)"
+    pkg_store_env_hash
 
     log_ok "Instalação concluída: $ADM_PKG_ID"
 }
@@ -853,57 +943,145 @@ cmd_world_upgrade() {
     log_info "RootFS: $ADM_ROOTFS"
     log_info "-------------------------------------"
 
+    # Garante env do profile carregado (CFLAGS, CHOST, etc.)
+    load_profile_env
+
     # 1. Sincroniza repo
     cmd_sync_repo
 
-    # Registrar lista de pacotes do mundo
+    # Lista world
     mapfile -t WORLD_PKGS < "$ADM_WORLD_FILE"
 
+    local -a TO_UPGRADE=()
     local updated_any=0
 
     for pkg in "${WORLD_PKGS[@]}"; do
-        log_info "Verificando pacote $pkg..."
+        [[ -z "$pkg" ]] && continue
 
         load_pkg_script "$pkg"
 
+        local reason=""
         local installed_version="none"
+
         if pkg_installed_mark; then
             installed_version=$(cat "$ADM_PKG_DB_DIR/version")
+        else
+            reason="não instalado"
         fi
 
-        if [[ "$installed_version" != "$PKG_VERSION" ]]; then
-            log_warn "→ Atualizando: $pkg ($installed_version → $PKG_VERSION)"
-            install_with_deps "$pkg"
-            updated_any=1
-            continue
+        # Razão 1: versão mudou
+        if [[ -z "$reason" && "$installed_version" != "$PKG_VERSION" ]]; then
+            reason="versão mudou ($installed_version → $PKG_VERSION)"
         fi
 
-        # Verificar se alguma dependência foi atualizada depois
-        resolve_deps_for_pkg "$pkg"
+        # Razão 2: ambiente mudou (hash diferente)
+        if [[ -z "$reason" ]] && pkg_env_changed; then
+            reason="ambiente de build mudou (FLAGS/perfil/toolchain)"
+        fi
 
-        local dep
-        for dep in "${ADM_RESOLVED_DEPS[@]}"; do
-            [[ "$dep" == "$pkg" ]] && continue
-            load_pkg_script "$dep"
+        # Razão 3: dependência mudou (versão diferente)
+        if [[ -z "$reason" ]]; then
+            resolve_deps_for_pkg "$pkg"
+            local dep
+            for dep in "${ADM_RESOLVED_DEPS[@]}"; do
+                [[ "$dep" == "$pkg" ]] && continue
+                load_pkg_script "$dep"
 
-            local dep_ver dep_inst
-            dep_ver="$PKG_VERSION"
-            dep_inst=$(cat "$ADM_DB_DIR/$dep/version" 2>/dev/null || echo "none")
+                local dep_ver dep_inst
+                dep_ver="$PKG_VERSION"
+                dep_inst=$(cat "$ADM_DB_DIR/$dep/version" 2>/dev/null || echo "none")
 
-            if [[ "$dep_inst" != "$dep_ver" ]]; then
-                log_warn "→ Recompilando $pkg pois dependência mudou: $dep"
-                install_with_deps "$pkg"
-                updated_any=1
-                break
+                if [[ "$dep_inst" != "$dep_ver" ]]; then
+                    reason="dependência mudou: $dep ($dep_inst → $dep_ver)"
+                    break
+                fi
+            done
+        fi
+
+        if [[ -n "$reason" ]]; then
+            log_warn "→ $pkg precisa de upgrade: $reason"
+            TO_UPGRADE+=("$pkg")
+        else
+            log_ok "$pkg já está atualizado"
+        fi
+    done
+
+    if ((${#TO_UPGRADE[@]} == 0)); then
+        log_ok "Sistema já está totalmente atualizado! 🎉"
+        return 0
+    fi
+
+    log_info "Pacotes a atualizar:"
+    printf '  - %s\n' "${TO_UPGRADE[@]}"
+
+    # Aqui ainda usamos upgrade serial com deps para garantir segurança.
+    # (Podemos paralelizar builds no futuro, mas install+deps em paralelo
+    # é mais propenso a race conditions.)
+    for pkg in "${TO_UPGRADE[@]}"; do
+        install_with_deps "$pkg"
+        updated_any=1
+    done
+
+    if ((updated_any == 0)); then
+        log_ok "Nada foi atualizado."
+    else
+        log_ok "WORLD UPGRADE concluído!"
+    fi
+}
+
+cmd_world_rebuild_all() {
+    world_ensure_file
+
+    log_warn "=== WORLD REBUILD ALL (full recompile) ==="
+    log_warn "Isso vai recompilar TODOS os pacotes do world + dependências."
+    log_warn "Perfil: $ADM_PROFILE  |  RootFS: $ADM_ROOTFS"
+    echo
+
+    load_profile_env
+    cmd_sync_repo
+
+    mapfile -t WORLD_PKGS < "$ADM_WORLD_FILE"
+
+    # Monta conjunto de pacotes a rebuildar (world + deps, sem duplicar)
+    declare -A seen=()
+    local -a REBUILD_LIST=()
+
+    local w pkg dep
+
+    for w in "${WORLD_PKGS[@]}"; do
+        [[ -z "$w" ]] && continue
+        resolve_deps_for_pkg "$w"
+        for pkg in "${ADM_RESOLVED_DEPS[@]}"; do
+            [[ -z "$pkg" ]] && continue
+            if [[ -z "${seen[$pkg]:-}" ]]; then
+                seen[$pkg]=1
+                REBUILD_LIST+=("$pkg")
             fi
         done
     done
 
-    if ((updated_any == 0)); then
-        log_ok "Sistema já está totalmente atualizado! 🎉"
-    else
-        log_ok "WORLD UPGRADE concluído!"
+    if ((${#REBUILD_LIST[@]} == 0)); then
+        log_warn "World está vazio; nada para rebuildar."
+        return 0
     fi
+
+    log_info "Pacotes que serão REBUILDADOS (ordem aproximada):"
+    printf '  - %s\n' "${REBUILD_LIST[@]}"
+
+    echo
+    log_info "Etapa 1/2: compilando todos os pacotes em paralelo (binpkgs)..."
+    run_parallel_builds "${REBUILD_LIST[@]}"
+
+    echo
+    log_info "Etapa 2/2: reinstalando todos os pacotes a partir dos binpkgs..."
+
+    for pkg in "${REBUILD_LIST[@]}"; do
+        log_info "[REINSTALL] $pkg"
+        # Vai usar o binário em cache e atualizar hash de ambiente
+        do_pkg_install "$pkg"
+    done
+
+    log_ok "WORLD REBUILD ALL concluído com sucesso! 🚀"
 }
 
 #########################
@@ -997,6 +1175,9 @@ main() {
             ;;
         world-upgrade)
             cmd_world_upgrade
+            ;;
+        world-rebuild-all)
+            cmd_world_rebuild_all
             ;;
         rebuild-last)
             cmd_rebuild_last
