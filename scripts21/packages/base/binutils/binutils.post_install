@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# Hook post_install para Binutils-2.45.1
+# Executado pelo ADM após a instalação no ROOTFS.
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido}"
+: "${CHOST:?CHOST não definido}"
+
+echo "[binutils-post] Pós-instalação do Binutils-2.45.1"
+echo "[binutils-post] ROOTFS=${ROOTFS}"
+echo "[binutils-post] CHOST=${CHOST}"
+
+# 1) Verifica binários principais
+for b in ld ld.bfd as objdump readelf; do
+    if [[ ! -x "$ROOTFS/usr/bin/$b" ]]; then
+        echo "ERRO [binutils-sanity]: $ROOTFS/usr/bin/$b não existe ou não é executável."
+        exit 1
+    fi
+done
+
+echo "[binutils-sanity] ld, ld.bfd, as, objdump, readelf presentes em /usr/bin."
+
+# 2) Testa ld --version
+if ! "$ROOTFS/usr/bin/ld" --version >/dev/null 2>&1; then
+    echo "ERRO [binutils-sanity]: $ROOTFS/usr/bin/ld --version falhou."
+    exit 1
+fi
+echo "[binutils-sanity] ld --version OK."
+
+# 3) Verifica libbfd.so (e outras libs principais)
+for lib in libbfd.so libctf.so libctf-nobfd.so libopcodes.so libsframe.so; do
+    if [[ ! -e "$ROOTFS/usr/lib/$lib" ]]; then
+        echo "AVISO [binutils-sanity]: $ROOTFS/usr/lib/$lib não encontrado (verifique se é esperado)."
+    else
+        echo "[binutils-sanity] $lib presente em /usr/lib."
+    fi
+done
+
+# 4) Compila e inspeciona um binário com GCC (se disponível)
+tmpdir="$(mktemp -d -t binutils-sanity.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+cd "$tmpdir"
+
+cat > test.c << 'EOF'
+#include <stdio.h>
+int main(void) {
+    puts("binutils sanity OK");
+    return 0;
+}
+EOF
+
+# Escolhe um gcc do ROOTFS ou do host
+cc=""
+candidates=(
+    "$ROOTFS/usr/bin/${CHOST}-gcc"
+    "$ROOTFS/usr/bin/gcc"
+    "${CHOST}-gcc"
+    "gcc"
+)
+
+for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+        cc="$c"
+        break
+    fi
+    if command -v "$c" >/dev/null 2>&1; then
+        cc="$c"
+        break
+    fi
+done
+
+if [[ -z "$cc" ]]; then
+    echo "AVISO [binutils-sanity]: nenhum gcc encontrado; pulando teste de link."
+    exit 0
+fi
+
+echo "[binutils-sanity] usando compilador: $cc"
+
+# Compila com --sysroot="$ROOTFS" e -Wl,--verbose pra forçar uso do ld novo
+if ! "$cc" --sysroot="$ROOTFS" -Wl,--verbose test.c -o a.out &> link.log; then
+    echo "ERRO [binutils-sanity]: falha ao compilar/linkar programa de teste."
+    sed 's/^/    /' link.log || true
+    exit 1
+fi
+
+echo "[binutils-sanity] programa de teste linkado com sucesso."
+
+# 5) Se readelf existir no host ou dentro do ROOTFS, inspeciona o a.out
+if command -v readelf >/dev/null 2>&1; then
+    re="readelf"
+elif [[ -x "$ROOTFS/usr/bin/readelf" ]]; then
+    re="$ROOTFS/usr/bin/readelf"
+else
+    echo "AVISO [binutils-sanity]: readelf não disponível; pulando check de headers ELF."
+    echo "[binutils-post] Sanity-check básico concluído."
+    exit 0
+fi
+
+interp="$($re -l a.out | awk '/Requesting program interpreter/ {print $NF}' | tr -d '[]')"
+
+if [[ -z "$interp" ]]; then
+    echo "ERRO [binutils-sanity]: não consegui detectar o interpretador dinâmico via readelf."
+    exit 1
+fi
+
+echo "[binutils-sanity] interpretador do a.out: ${interp}"
+
+if [[ ! -e "$ROOTFS/$interp" && ! -e "$ROOTFS/usr/lib/${interp##*/}" ]]; then
+    echo "AVISO [binutils-sanity]: interpretador ${interp} não encontrado no ROOTFS (pode ser GCC/GLIBC ainda antigos)."
+else
+    echo "[binutils-sanity] interpretador encontrado dentro do ROOTFS."
+fi
+
+echo "[binutils-post] Sanity-check do Binutils-2.45.1 concluído."
