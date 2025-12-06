@@ -114,11 +114,31 @@ load_profile_env() {
 # Entrada pode ser "categoria/programa" (preferido).
 parse_pkg_id() {
     local pkg_id="$1"
+
     if [[ "$pkg_id" != */* ]]; then
         die "ID de pacote deve ser categoria/programa (ex: core/bash)"
     fi
-    ADM_PKG_CATEGORY="${pkg_id%%/*}"
-    ADM_PKG_NAME="${pkg_id##*/}"
+
+    # Impede caminhos estranhos: múltiplas barras, .., caminho absoluto, etc.
+    if [[ "$pkg_id" == */*/* ]]; then
+        die "ID de pacote inválido (apenas uma / é permitida: categoria/programa)"
+    fi
+    if [[ "$pkg_id" == /* || "$pkg_id" == *'..'* ]]; then
+        die "ID de pacote inválido (não pode conter .. nem começar com /)"
+    fi
+
+    local cat name
+    cat="${pkg_id%%/*}"
+    name="${pkg_id##*/}"
+
+    # Só permite caracteres seguros em cat e name
+    local re='^[A-Za-z0-9._+-]+$'
+    if [[ ! "$cat" =~ $re || ! "$name" =~ $re ]]; then
+        die "ID de pacote inválido: use apenas letras, números, '.', '_', '+' e '-'"
+    fi
+
+    ADM_PKG_CATEGORY="$cat"
+    ADM_PKG_NAME="$name"
     ADM_PKG_DIR="$ADM_PACKAGES_DIR/$ADM_PKG_CATEGORY/$ADM_PKG_NAME"
     ADM_PKG_SCRIPT="$ADM_PKG_DIR/${ADM_PKG_NAME}.sh"
     [[ -f "$ADM_PKG_SCRIPT" ]] || die "Script de pacote não encontrado: $ADM_PKG_SCRIPT"
@@ -366,6 +386,13 @@ download_all_sources() {
 
     log_info "Iniciando downloads de source (possível paralelo)"
 
+    # Limite de jobs paralelos (para não explodir conexões/processos)
+    local max_jobs="${ADM_DL_JOBS:-${ADM_JOBS:-4}}"
+    (( max_jobs < 1 )) && max_jobs=1
+
+    local running=0
+    local ok=1
+
     for i in "${!srcs_ref[@]}"; do
         url="${srcs_ref[$i]}"
         checksum="${sums_ref[$i]:-SKIP}"
@@ -378,7 +405,16 @@ download_all_sources() {
             continue
         fi
 
-        # Para arquivos normais: roda em paralelo
+        # Throttle de jobs em paralelo
+        while (( running >= max_jobs )); do
+            if ! wait "${pids[0]}"; then
+                ok=0
+            fi
+            pids=("${pids[@]:1}")
+            ((running--))
+        done
+
+        # Para arquivos normais: roda em paralelo (respeitando limite)
         local tmpout
         tmpout="$(mktemp)"
         tmpfiles+=("$tmpout")
@@ -389,10 +425,10 @@ download_all_sources() {
             echo "$dlfile" > "$tmpout"
         ) &
         pids+=("$!")
+        ((running++))
     done
 
-    # Espera downloads em paralelo
-    local ok=1
+    # Espera jobs restantes
     for pid in "${pids[@]:-}"; do
         if ! wait "$pid"; then
             ok=0
@@ -412,7 +448,6 @@ download_all_sources() {
     # Exporta via variável global
     ADM_PKG_SOURCES_DOWNLOADED=("${results[@]}")
 }
-
 #########################
 # Extração e patches    #
 #########################
@@ -553,8 +588,8 @@ do_pkg_build() {
     # Funções obrigatórias pkg_build & opcional pkg_install
     type pkg_build >/dev/null 2>&1 || die "Pacote $ADM_PKG_ID não definiu função pkg_build"
 
-    run_with_log "$ADM_PKG_LOG_FILE" bash -c '
-        set -euo pipefail
+    # Executa build+install no mesmo shell (mantendo funções pkg_*)
+    do_pkg_build_inner() {
         cd "$SRC_DIR"
         pkg_build
         if type pkg_install >/dev/null 2>&1; then
@@ -565,7 +600,10 @@ do_pkg_build() {
                 make DESTDIR="$DESTDIR" install
             fi
         fi
-    '
+    }
+
+    run_with_log "$ADM_PKG_LOG_FILE" do_pkg_build_inner
+    unset -f do_pkg_build_inner
 
     log_ok "Build de $ADM_PKG_ID concluído"
 }
@@ -641,8 +679,14 @@ install_destdir_to_rootfs() {
     mkdir -p "$ADM_ROOTFS" "$(dirname "$manifest")"
     : > "$manifest"
 
-    # Usa rsync para preservar perms e links
-    rsync -aHAX --numeric-ids "$ADM_PKG_DESTDIR"/ "$ADM_ROOTFS"/
+    # Usa rsync para preservar perms e links.
+    # Em alguns FS, atributos estendidos (-X) podem falhar; nesse caso
+    # tentamos novamente sem -X.
+    if ! rsync -aHAX --numeric-ids "$ADM_PKG_DESTDIR"/ "$ADM_ROOTFS"/; then
+        log_warn "rsync com atributos estendidos (-X) falhou; tentando sem -X"
+        rsync -aHA --numeric-ids "$ADM_PKG_DESTDIR"/ "$ADM_ROOTFS"/ \
+            || die "Falha ao copiar arquivos do DESTDIR para ROOTFS"
+    fi
 
     # Gera lista de arquivos instalados (relativos ao ROOTFS),
     # baseada apenas no DESTDIR do pacote, e só arquivos/links.
@@ -823,17 +867,25 @@ cmd_search() {
         cat=$(basename "$(dirname "$script")")
         pkg_id="$cat/$name"
 
-        load_pkg_script "$pkg_id" 2>/dev/null || continue
+        # Carrega descrição de forma isolada, sem deixar um pacote quebrado
+        # derrubar o processo principal.
+        local desc
+        desc=$(
+            PKG_DESC=""
+            # Dentro do subshell, anula die para ele só retornar erro
+            die() { return 1; }
+            # shellcheck source=/dev/null
+            . "$script" >/dev/null 2>&1 || exit 1
+            printf '%s' "${PKG_DESC:-Sem descrição}"
+        ) || continue
 
         local mark=""
-        if pkg_installed_mark; then
+        if [[ -f "$ADM_DB_DIR/$pkg_id/installed" ]]; then
             mark=" [✔️]"
-        else
-            mark=""
         fi
 
-        if [[ "$pkg_id" == *"$pattern"* || "$PKG_DESC" == *"$pattern"* ]]; then
-            echo "$pkg_id$mark - $PKG_DESC"
+        if [[ "$pkg_id" == *"$pattern"* || "$desc" == *"$pattern"* ]]; then
+            echo "$pkg_id$mark - $desc"
         fi
     done < <(find "$ADM_PACKAGES_DIR" -type f -name "*.sh" | sort)
 }
@@ -924,17 +976,26 @@ cmd_rebuild_last() {
 
 cmd_sync_repo() {
     ensure_dirs
+
+    # Se já for um repositório git, apenas atualiza
     if [[ -d "$ADM_PACKAGES_DIR/.git" ]]; then
         log_info "Atualizando repositório existente em $ADM_PACKAGES_DIR"
         (cd "$ADM_PACKAGES_DIR" && git fetch --all --prune && git pull --rebase) \
             || die "Falha ao atualizar repositório de scripts"
     else
+        # Evita apagar conteúdo não versionado sem querer
+        if [[ -d "$ADM_PACKAGES_DIR" && -n "$(ls -A "$ADM_PACKAGES_DIR" 2>/dev/null)" ]]; then
+            die "Diretório $ADM_PACKAGES_DIR já existe e não é um repositório git. \
+Mova ou limpe manualmente antes de rodar sync-repo."
+        fi
+
         log_info "Clonando repositório de scripts em $ADM_PACKAGES_DIR"
         rm -rf "$ADM_PACKAGES_DIR"
         mkdir -p "$(dirname "$ADM_PACKAGES_DIR")"
         git clone "$ADM_REPO_URL" "$ADM_PACKAGES_DIR" \
             || die "Falha ao clonar repositório $ADM_REPO_URL"
     fi
+
     log_ok "Repositório de scripts sincronizado"
 }
 
@@ -1167,6 +1228,21 @@ Comandos principais:
 
   uninstall <categoria/programa>
       Executa hooks de uninstall e remove arquivos registrados no manifest.
+
+  world-list
+      Lista todos os pacotes que fazem parte do "world".
+
+  world-add <categoria/programa>
+      Adiciona um pacote ao "world" (base do sistema).
+
+  world-remove <categoria/programa>
+      Remove um pacote do "world" (se existir).
+
+  world-upgrade
+      Atualiza todos os pacotes do "world" + dependências (rolling release).
+
+  world-rebuild-all
+      Recompila TODOS os pacotes do "world" + dependências a partir do source.
 
   rebuild-last
       Reconstrói o último pacote que foi construído com sucesso.
