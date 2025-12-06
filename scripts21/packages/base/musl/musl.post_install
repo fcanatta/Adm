@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Hook post_install para musl-1.2.5
+# Executado automaticamente pelo ADM após instalar o pacote no ROOTFS.
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido}"
+: "${CHOST:?CHOST não definido}"
+
+echo "[musl-post] Pós-instalação da musl-1.2.5"
+echo "[musl-post] ROOTFS=${ROOTFS}"
+echo "[musl-post] CHOST=${CHOST}"
+
+# 1) Verifica headers básicos
+for h in stdio.h stdlib.h string.h errno.h; do
+    if [[ ! -f "$ROOTFS/usr/include/$h" ]]; then
+        echo "ERRO [musl-sanity]: header $ROOTFS/usr/include/$h não encontrado."
+        exit 1
+    fi
+done
+echo "[musl-sanity] Headers básicos presentes em /usr/include."
+
+# 2) Verifica dynamic linker ld-musl-*.so.1
+ld_musl="$(find "$ROOTFS/lib" -maxdepth 1 -type f -name 'ld-musl-*.so.1' 2>/dev/null | head -n1 || true)"
+if [[ -z "$ld_musl" ]]; then
+    echo "ERRO [musl-sanity]: nenhum ld-musl-*.so.1 encontrado em $ROOTFS/lib."
+    exit 1
+fi
+echo "[musl-sanity] Dynamic linker detectado: ${ld_musl#$ROOTFS}"
+
+# 3) Compila um Hello World usando --sysroot=$ROOTFS
+tmpdir="$(mktemp -d -t musl-sanity.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+cd "$tmpdir"
+
+cat > test.c << 'EOF'
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    const char *msg = "musl sanity OK\n";
+    fwrite(msg, 1, strlen(msg), stdout);
+    return 0;
+}
+EOF
+
+cc=""
+candidates=(
+    "$ROOTFS/usr/bin/${CHOST}-gcc"
+    "$ROOTFS/usr/bin/gcc"
+    "$ROOTFS/tools/bin/${CHOST}-gcc"
+    "${CHOST}-gcc"
+    "gcc"
+)
+
+for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+        cc="$c"
+        break
+    fi
+    if command -v "$c" >/dev/null 2>&1; then
+        cc="$c"
+        break
+    fi
+done
+
+if [[ -z "$cc" ]]; then
+    echo "AVISO [musl-sanity]: nenhum compilador encontrado; pulando teste de link."
+    echo "[musl-post] Sanity-check parcial concluído."
+    exit 0
+fi
+
+echo "[musl-sanity] Usando compilador: $cc"
+
+# Compilação dinâmica usando o sysroot do ROOTFS
+if ! "$cc" --sysroot="$ROOTFS" test.c -o test > build.log 2>&1; then
+    echo "ERRO [musl-sanity]: falha ao compilar/linkar programa de teste."
+    sed 's/^/    /' build.log || true
+    exit 1
+fi
+
+echo "[musl-sanity] Programa de teste compilado e linkado com sucesso."
+
+# 4) Verifica o program interpreter via readelf
+if command -v readelf >/dev/null 2>&1; then
+    re="readelf"
+elif [[ -x "$ROOTFS/usr/bin/readelf" ]]; then
+    re="$ROOTFS/usr/bin/readelf"
+else
+    echo "AVISO [musl-sanity]: readelf não disponível; pulando check do program interpreter."
+    echo "[musl-post] Sanity-check básico concluído."
+    exit 0
+fi
+
+interp="$($re -l test | awk '/Requesting program interpreter/ {print $NF}' | tr -d '[]')"
+
+if [[ -z "$interp" ]]; then
+    echo "ERRO [musl-sanity]: não consegui detectar o program interpreter via readelf."
+    exit 1
+fi
+
+echo "[musl-sanity] Program interpreter do teste: ${interp}"
+
+case "$interp" in
+    /lib/ld-musl-*.so.1)
+        echo "[musl-sanity] Interpreter aponta corretamente para ld-musl em /lib."
+        ;;
+    *)
+        echo "ERRO [musl-sanity]: interpreter inesperado: ${interp} (esperado algo como /lib/ld-musl-*.so.1)."
+        exit 1
+        ;;
+esac
+
+echo "[musl-post] Sanity-check da musl-1.2.5 concluído com sucesso."
