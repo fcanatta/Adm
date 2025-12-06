@@ -5,3 +5,7 @@ export ADM_PERF_LEVEL=high
 /opt/adm/adm.sh install core/hello
 
 Se quiser voltar pro “seguro”, é só não exportar ADM_PERF_LEVEL (ou setar low / normal).
+
+# Dentro do chroot
+ADM_PROFILE=chroot adm.sh build core/bash
+ADM_PROFILE=chroot adm.sh install core/bash
