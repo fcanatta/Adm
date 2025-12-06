@@ -3,31 +3,25 @@
 # adm-chroot.sh
 #
 # Gerencia um chroot seguro dentro do ROOTFS do ADM:
-#   - prepara o ambiente (mounts /dev, /proc, /sys, /run, /tmp, /opt/adm, /etc/resolv.conf)
-#   - entra no chroot com shell interativo
-#   - executa comandos dentro do chroot
-#   - desmonta tudo de forma segura e em ordem correta
+#   - prepara o ambiente (mounts /dev, /proc, /sys, /run, /opt/adm, /tmp, etc)
+#   - entra em shell interativo dentro do chroot
+#   - executa comandos únicos dentro do chroot (exec)
+#   - desmonta tudo de forma segura
 #
 # Características:
-#   - sem erros silenciosos: qualquer falha relevante causa exit != 0 com mensagem
-#   - não deixa mounts esquecidos (usa arquivo de estado para rastrear)
-#   - garante que o ADM está disponível em /opt/adm dentro do chroot
-#   - usa o profile do ADM (glibc.profile, musl.profile, etc) para descobrir o ROOTFS
+#   - sem erros silenciosos (falhas importantes derrubam o script)
+#   - não deixa mounts esquecidos (usa arquivo de estado por profile)
+#   - garante que /opt/adm do host esteja disponível no chroot
+#   - saída colorida, organizada
 #
 # Uso:
 #   ADM_PROFILE=glibc ./adm-chroot.sh prepare
 #   ADM_PROFILE=glibc ./adm-chroot.sh enter
-#   ADM_PROFILE=glibc ./adm-chroot.sh run "adm.sh bootstrap all"
+#   ADM_PROFILE=glibc ./adm-chroot.sh exec "adm.sh bootstrap all"
 #   ADM_PROFILE=glibc ./adm-chroot.sh umount
 #   ADM_PROFILE=glibc ./adm-chroot.sh status
 #
-# Variáveis:
-#   ADM_SH            caminho para adm.sh            (default: /opt/adm/adm.sh)
-#   ADM_PROFILE       nome do profile (glibc/musl/..) (default: glibc)
-#   ADM_PROFILE_DIR   diretório de profiles          (default: /opt/adm/profiles)
-#   ADM_ROOT_DIR      diretório base do ADM          (default: /opt/adm)
-#   ADM_STATE_DIR     diretório de estado            (default: /opt/adm/state)
-#
+
 set -euo pipefail
 
 # ------------------------- CONFIG DEFAULTS -------------------------
@@ -37,8 +31,9 @@ ADM_PROFILE="${ADM_PROFILE:-glibc}"
 ADM_PROFILE_DIR="${ADM_PROFILE_DIR:-/opt/adm/profiles}"
 ADM_ROOT_DIR="${ADM_ROOT_DIR:-/opt/adm}"
 ADM_STATE_DIR="${ADM_STATE_DIR:-/opt/adm/state}"
+ADM_LOG_DIR="${ADM_LOG_DIR:-/opt/adm/logs}"
 
-mkdir -p "$ADM_STATE_DIR"
+mkdir -p "$ADM_STATE_DIR" "$ADM_LOG_DIR"
 
 # --------------------------- CORES / UI ----------------------------
 
@@ -102,18 +97,15 @@ load_profile() {
 }
 
 STATE_FILE() {
-  # estado separado por profile
   echo "$ADM_STATE_DIR/chroot-${ADM_PROFILE}.mounts"
 }
 
 is_subdir_of_root() {
-  # Evita chrootar em algo obviamente perigoso (tipo /)
   local path="$1"
   local real
   real="$(readlink -f "$path" || echo "")"
   [[ -n "$real" ]] || return 1
   [[ "$real" != "/" ]] || return 1
-  [[ "$real" != "" ]] || return 1
   return 0
 }
 
@@ -121,8 +113,6 @@ ensure_rootfs_safe() {
   [[ -d "$ROOTFS" ]] || die "ROOTFS não existe: $ROOTFS"
   is_subdir_of_root "$ROOTFS" || die "ROOTFS inválido ou perigoso: $ROOTFS"
 }
-
-# --------------------------- MOUNTS ----------------------------
 
 mountpoint_in_root() {
   local sub="$1"
@@ -155,6 +145,8 @@ record_mount() {
   grep -qxF "$dest" "$sf" 2>/dev/null || echo "$dest" >> "$sf"
 }
 
+# --------------------------- PREPARE ----------------------------
+
 prepare_mounts() {
   require_root
   load_profile
@@ -163,7 +155,7 @@ prepare_mounts() {
   local sf; sf="$(STATE_FILE)"
   : > "$sf"
 
-  # Garante diretórios
+  # Diretórios base
   mkdir -p \
     "$(mountpoint_in_root /dev)" \
     "$(mountpoint_in_root /dev/pts)" \
@@ -176,12 +168,11 @@ prepare_mounts() {
     "$(mountpoint_in_root /etc)"
 
   # /dev e /dev/pts
-  do_mount /dev      "$(mountpoint_in_root /dev)"      --bind
+  do_mount /dev     "$(mountpoint_in_root /dev)"     --bind
   record_mount "$(mountpoint_in_root /dev)"
 
-  mkdir -p /dev/pts
-  mkdir -p "$(mountpoint_in_root /dev/pts)"
-  do_mount /dev/pts  "$(mountpoint_in_root /dev/pts)"  --bind
+  mkdir -p /dev/pts "$(mountpoint_in_root /dev/pts)"
+  do_mount /dev/pts "$(mountpoint_in_root /dev/pts)" --bind
   record_mount "$(mountpoint_in_root /dev/pts)"
 
   # /proc
@@ -197,9 +188,10 @@ prepare_mounts() {
   record_mount "$(mountpoint_in_root /run)"
 
   # /tmp e /var/tmp
-  chmod 1777 "$(mountpoint_in_root /tmp)" "$(mountpoint_in_root /var/tmp)" || die "Falha ao ajustar permissões de /tmp e /var/tmp"
+  chmod 1777 "$(mountpoint_in_root /tmp)" "$(mountpoint_in_root /var/tmp)" || \
+    die "Falha ao ajustar permissões de /tmp e /var/tmp"
 
-  # /opt/adm (bind do ADM do host em /opt/adm do chroot)
+  # /opt/adm
   if [[ -d "$ADM_ROOT_DIR" ]]; then
     mkdir -p "$(mountpoint_in_root /opt/adm)"
     do_mount "$ADM_ROOT_DIR" "$(mountpoint_in_root /opt/adm)" --bind
@@ -208,7 +200,7 @@ prepare_mounts() {
     die "ADM_ROOT_DIR não encontrado: $ADM_ROOT_DIR (esperado /opt/adm ou similar)"
   fi
 
-  # /etc/resolv.conf para DNS dentro do chroot
+  # resolv.conf para DNS
   if [[ -f /etc/resolv.conf ]]; then
     cp -L /etc/resolv.conf "$(mountpoint_in_root /etc/resolv.conf)"
   fi
@@ -221,6 +213,8 @@ prepare_mounts() {
   log "OK" "Mounts preparados com sucesso para chroot em $ROOTFS"
 }
 
+# --------------------------- UNMOUNT ----------------------------
+
 unmount_all() {
   require_root
   load_profile
@@ -229,8 +223,7 @@ unmount_all() {
   local sf; sf="$(STATE_FILE)"
 
   if [[ ! -f "$sf" ]]; then
-    log "WARN" "Nenhum estado de mounts encontrado para este profile ($sf). Tentando detectar montagens em $ROOTFS."
-    # fallback: tenta desmontar manualmente algumas paths em ordem reversa
+    log "WARN" "Nenhum estado de mounts encontrado ($sf). Tentando fallback."
     local fallback=(
       /opt/adm
       /dev/pts
@@ -251,7 +244,6 @@ unmount_all() {
     return 0
   fi
 
-  # desmonta em ordem reversa do registro
   mapfile -t mps < "$sf"
   for (( idx=${#mps[@]}-1 ; idx>=0 ; idx-- )); do
     local mp="${mps[idx]}"
@@ -280,7 +272,7 @@ status_mounts() {
   local sf; sf="$(STATE_FILE)"
   if [[ -f "$sf" ]]; then
     echo
-    echo "${C_CYAN}Mounts registrados para desmontagem (${sf}):${C_RESET}"
+    echo "${C_CYAN}Mounts registrados (${sf}):${C_RESET}"
     cat "$sf"
   else
     echo
@@ -295,7 +287,6 @@ enter_chroot_shell() {
   load_profile
   ensure_rootfs_safe
 
-  # Se ainda não estiver preparado, prepara
   local sf; sf="$(STATE_FILE)"
   if [[ ! -f "$sf" ]]; then
     banner "Preparando mounts para chroot"
@@ -304,24 +295,20 @@ enter_chroot_shell() {
 
   banner "Entrando no chroot (ROOTFS=$ROOTFS)"
 
-  # PATH dentro do chroot (inclui /tools/bin se ainda existir)
   local chroot_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
   if [[ -d "$ROOTFS/tools/bin" ]]; then
     chroot_path="/tools/bin:${chroot_path}"
   fi
 
-  # Garante que /bin/sh existe
   if [[ ! -x "$ROOTFS/bin/sh" && ! -x "$ROOTFS/bin/bash" ]]; then
-    die "Nenhum shell encontrado em $ROOTFS/bin/sh ou /bin/bash; instale um shell antes de chrootar."
+    die "Nenhum shell encontrado em $ROOTFS/bin/sh ou /bin/bash."
   fi
 
-  # Comando de shell preferido
   local shell_cmd="/bin/bash"
   if [[ ! -x "$ROOTFS$shell_cmd" ]]; then
     shell_cmd="/bin/sh"
   fi
 
-  # Exporta variáveis úteis dentro do chroot
   chroot "$ROOTFS" /usr/bin/env -i \
     HOME=/root \
     TERM="${TERM:-linux}" \
@@ -333,19 +320,18 @@ enter_chroot_shell() {
     "$shell_cmd" --login
 }
 
-run_in_chroot() {
+exec_in_chroot() {
   require_root
   load_profile
   ensure_rootfs_safe
 
   if [[ $# -lt 1 ]]; then
-    die "Uso: $0 run \"comando ...\""
+    die "Uso: $0 exec \"comando ...\""
   fi
 
   local cmd="$*"
-
-  # Se ainda não estiver preparado, prepara
   local sf; sf="$(STATE_FILE)"
+
   if [[ ! -f "$sf" ]]; then
     banner "Preparando mounts para chroot"
     prepare_mounts
@@ -358,6 +344,13 @@ run_in_chroot() {
     chroot_path="/tools/bin:${chroot_path}"
   fi
 
+  local ts
+  ts="$(date +%Y%m%d-%H%M%S)"
+  local log_file="$ADM_LOG_DIR/chroot-exec-${ADM_PROFILE}-${ts}.log"
+
+  log "INFO" "Log do comando será salvo em: $log_file"
+
+  set -o pipefail
   chroot "$ROOTFS" /usr/bin/env -i \
     HOME=/root \
     TERM="${TERM:-linux}" \
@@ -365,7 +358,15 @@ run_in_chroot() {
     ADM_PROFILE="$ADM_PROFILE" \
     CHOST="$CHOST" \
     ADM_CHROOT=1 \
-    /bin/sh -lc "$cmd"
+    /bin/sh -lc "$cmd" 2>&1 | tee "$log_file"
+  local status=${PIPESTATUS[0]}
+  set +o pipefail
+
+  if (( status != 0 )); then
+    die "Comando dentro do chroot falhou com status $status (veja o log em $log_file)."
+  fi
+
+  log "OK" "Comando dentro do chroot executado com sucesso."
 }
 
 usage() {
@@ -373,21 +374,19 @@ usage() {
 Uso: $(basename "$0") <comando>
 
 Comandos:
-  prepare   - prepara o ROOTFS para chroot (mounts /dev, /proc, /sys, /run, /opt/adm, etc)
-  enter     - entra em um shell interativo dentro do chroot
-  run CMD   - executa CMD dentro do chroot e retorna ao host
-  umount    - desmonta todos os mounts associados a este profile
-  status    - mostra os mounts atuais relacionados ao ROOTFS e o estado salvo
+  prepare    - prepara o ROOTFS para chroot (mounts /dev, /proc, /sys, /run, /opt/adm, etc)
+  enter      - entra em um shell interativo dentro do chroot
+  exec CMD   - executa CMD dentro do chroot, com log e status corretos
+  umount     - desmonta todos os mounts associados a este profile
+  status     - mostra mounts atuais relacionados ao ROOTFS e o estado salvo
 
 Exemplos:
   ADM_PROFILE=glibc $(basename "$0") prepare
   ADM_PROFILE=glibc $(basename "$0") enter
-  ADM_PROFILE=glibc $(basename "$0") run "adm.sh bootstrap all"
+  ADM_PROFILE=glibc $(basename "$0") exec "adm.sh bootstrap all"
   ADM_PROFILE=glibc $(basename "$0") umount
 EOF
 }
-
-# --------------------------- MAIN ----------------------------
 
 main() {
   if [[ $# -lt 1 ]]; then
@@ -405,8 +404,8 @@ main() {
     enter)
       enter_chroot_shell
       ;;
-    run)
-      run_in_chroot "$@"
+    exec)
+      exec_in_chroot "$@"
       ;;
     umount)
       banner "Desmontando mounts do chroot"
