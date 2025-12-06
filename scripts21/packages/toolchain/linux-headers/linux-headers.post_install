@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Hook post_install para core/linux-api-headers
+# Faz sanity-check dos headers no ROOTFS
+
+set -euo pipefail
+
+# KERNEL_VERSION(6,17,9) = (6 << 16) + (17 << 8) + 9 = 397577
+EXPECTED_CODE=397577
+HDR_PATH="$ROOTFS/usr/include/linux/version.h"
+
+echo "Sanity-check (linux-api-headers): verificando $HDR_PATH"
+
+if [[ ! -f "$HDR_PATH" ]]; then
+    echo "ERRO: $HDR_PATH não encontrado após instalação dos API headers." >&2
+    exit 1
+fi
+
+# Extrai o valor numérico de LINUX_VERSION_CODE
+CODE="$(awk '/LINUX_VERSION_CODE/ {print $3}' "$HDR_PATH" || true)"
+
+if [[ -z "$CODE" ]]; then
+    echo "ERRO: não foi possível extrair LINUX_VERSION_CODE de $HDR_PATH" >&2
+    exit 1
+fi
+
+if [[ "$CODE" != "$EXPECTED_CODE" ]]; then
+    echo "ERRO: LINUX_VERSION_CODE inesperado em $HDR_PATH: $CODE (esperado $EXPECTED_CODE para 6.17.9)" >&2
+    exit 1
+fi
+
+echo "Sanity-check: LINUX_VERSION_CODE OK ($CODE == $EXPECTED_CODE)"
+
+# Teste extra opcional: compilar um programinha simples usando esses headers.
+# Não é obrigatório para passar no sanity-check: se cc não existir, apenas avisa.
+if command -v cc >/dev/null 2>&1; then
+    TMPDIR="$(mktemp -d)"
+    cat >"$TMPDIR/test.c" <<'EOF'
+#include <linux/version.h>
+#ifndef LINUX_VERSION_CODE
+#error "LINUX_VERSION_CODE não definido"
+#endif
+
+int main(void) {
+    return 0;
+}
+EOF
+
+    # Usa explicitamente os includes do ROOTFS
+    if ! cc -I"$ROOTFS/usr/include" -c "$TMPDIR/test.c" -o "$TMPDIR/test.o" >/dev/null 2>&1; then
+        echo "ERRO: falha ao compilar teste simples com <linux/version.h> do ROOTFS." >&2
+        rm -rf "$TMPDIR"
+        exit 1
+    fi
+    rm -rf "$TMPDIR"
+    echo "Sanity-check: compilação de teste com <linux/version.h> OK."
+else
+    echo "Aviso: compilador 'cc' não encontrado; pulando teste de compilação." >&2
+fi
+
+exit 0
