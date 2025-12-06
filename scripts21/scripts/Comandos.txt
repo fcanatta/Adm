@@ -28,3 +28,32 @@ ADM_PROFILE=musl ADM_PERF_LEVEL=high ADM_JOBS=8 adm.sh world-rebuild-all
 Etapa 1: compila tudo em paralelo (usa todos os perfis/flags atuais)
 
 Etapa 2: instala tudo em sequência, atualizando hashes de ambiente
+
+# Como usar no chroot
+Como tudo se encaixa
+
+1. Do host, você prepara e entra no chroot:
+
+
+
+sudo ADM_PROFILE=glibc /opt/adm/scripts/adm-chroot.sh prepare
+sudo ADM_PROFILE=glibc /opt/adm/scripts/adm-chroot.sh enter
+
+2. Dentro do chroot, usa o profile especial:
+
+
+
+export ADM_PROFILE=chroot
+/opt/adm/scripts/adm-autoinstall-base.sh all
+
+3. Se quiser só rodar um comando pelo host (sem entrar):
+
+
+
+sudo ADM_PROFILE=glibc /opt/adm/scripts/adm-chroot.sh exec "ADM_PROFILE=chroot /opt/adm/scripts/adm-autoinstall-base.sh all"
+
+4. Quando terminar:
+
+
+
+sudo ADM_PROFILE=glibc /opt/adm/scripts/adm-chroot.sh umount
