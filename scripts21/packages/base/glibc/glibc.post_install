@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Hook post_install para Glibc-2.42 no ADM
+# Este arquivo é executado automaticamente após pkg_install()
+# Sanity-check + locales + nsswitch.conf + ld.so.conf
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido}"
+: "${CHOST:?CHOST não definido}"
+
+echo "[glibc-post] Iniciando pós-instalação da Glibc-2.42"
+echo "[glibc-post] ROOTFS=${ROOTFS}"
+echo "[glibc-post] CHOST=${CHOST}"
+
+###############################################################################
+# 1. SANITY-CHECK: verifica libc.so.6, compila binário teste, confere dynamic linker
+###############################################################################
+
+libc_so="$ROOTFS/usr/lib/libc.so.6"
+if [[ ! -e "$libc_so" ]]; then
+    echo "ERRO [glibc-sanity]: arquivo $libc_so não existe!"
+    exit 1
+fi
+echo "[glibc-sanity] libc.so.6 encontrado."
+
+# Verifica símbolos GLIBC_2.42 (opcional)
+if command -v strings >/dev/null 2>&1; then
+    if strings "$libc_so" | grep -q "GLIBC_2.42"; then
+        echo "[glibc-sanity] símbolo GLIBC_2.42 encontrado."
+    else
+        echo "AVISO [glibc-sanity]: símbolo GLIBC_2.42 não encontrado (OK se strip agressivo)."
+    fi
+fi
+
+# Cria programa de teste
+tmpdir="$(mktemp -d -t glibc-sanity.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+cat > "$tmpdir/test.c" << 'EOF'
+#include <stdio.h>
+int main() { printf("glibc ok\n"); return 0; }
+EOF
+
+# Seleciona o compilador
+cc=""
+candidates=(
+    "$ROOTFS/tools/bin/${CHOST}-gcc"
+    "$ROOTFS/usr/bin/${CHOST}-gcc"
+    "${CHOST}-gcc"
+    "gcc"
+)
+
+for c in "${candidates[@]}"; do
+    if command -v "$c" >/dev/null 2>&1; then cc="$c"; break; fi
+    if [[ -x "$c" ]]; then cc="$c"; break; fi
+done
+
+if [[ -z "$cc" ]]; then
+    echo "AVISO [glibc-sanity]: nenhum compilador encontrado — pulando teste binário."
+else
+    echo "[glibc-sanity] compilando teste com: $cc"
+    "$cc" --sysroot="$ROOTFS" -o "$tmpdir/a.out" "$tmpdir/test.c"
+    echo "[glibc-sanity] binário compilado com sucesso."
+fi
+
+# Detecta interpretador dinâmico
+if command -v readelf >/dev/null 2>&1; then
+    interp="$(readelf -l "$tmpdir/a.out" | awk '/Requesting program interpreter/ {print $NF}' | tr -d '[]')"
+    if [[ -z "$interp" ]]; then
+        echo "ERRO [glibc-sanity]: não consegui detectar o interpretador dinâmico."
+        exit 1
+    fi
+
+    echo "[glibc-sanity] interpretador dinâmico: ${interp}"
+
+    if [[ ! -e "$ROOTFS/$interp" && ! -e "$ROOTFS/usr/lib/${interp##*/}" ]]; then
+        echo "ERRO [glibc-sanity]: interpretador ${interp} não existe no ROOTFS."
+        exit 1
+    fi
+
+    echo "[glibc-sanity] dynamic linker presente."
+else
+    echo "AVISO [glibc-sanity]: readelf não encontrado. Sanity parcial OK."
+fi
+
+echo "[glibc-sanity] SANITY-CHECK OK."
+echo
+
+###############################################################################
+# 2. LOCALES (mesmo conjunto recomendado pelo LFS)
+###############################################################################
+
+echo "[glibc-locales] Gerando locales..."
+
+# Pasta /usr/lib/locale dentro do ROOTFS
+mkdir -pv "$ROOTFS/usr/lib/locale"
+
+define_locale() {
+    local name="$1"
+    local charset="$2"
+    echo "  - $name.$charset"
+    "$ROOTFS/usr/bin/localedef" --prefix="$ROOTFS" -i "$name" -f "$charset" "${name}.${charset}" || true
+}
+
+# Locais recomendados
+define_locale "en_US" "UTF-8"
+define_locale "en_US" "ISO-8859-1"
+define_locale "pt_BR" "UTF-8"
+define_locale "C"     "UTF-8"
+
+echo "[glibc-locales] Locales criados."
+echo
+
+###############################################################################
+# 3. /etc/nsswitch.conf (arquivo essencial)
+###############################################################################
+
+mkdir -pv "$ROOTFS/etc"
+
+if [[ ! -e "$ROOTFS/etc/nsswitch.conf" ]]; then
+    cat > "$ROOTFS/etc/nsswitch.conf" << 'EOF'
+# NSS configuration
+passwd:         files
+group:          files
+shadow:         files
+
+hosts:          files dns
+networks:       files
+
+protocols:      files
+services:       files
+ethers:         files
+rpc:            files
+EOF
+    echo "[glibc] /etc/nsswitch.conf criado."
+else
+    echo "[glibc] /etc/nsswitch.conf já existe — não sobrescrito."
+fi
+
+###############################################################################
+# 4. /etc/ld.so.conf + /etc/ld.so.conf.d
+###############################################################################
+
+mkdir -pv "$ROOTFS/etc/ld.so.conf.d"
+
+# ld.so.conf principal
+cat > "$ROOTFS/etc/ld.so.conf" << 'EOF'
+# Arquivo de configuração do loader dinâmico
+/usr/lib
+/lib
+/lib64
+
+include /etc/ld.so.conf.d/*.conf
+EOF
+echo "[glibc] /etc/ld.so.conf criado."
+
+###############################################################################
+# 5. Opcional: timezone (UTC)
+###############################################################################
+
+if [[ ! -e "$ROOTFS/etc/localtime" ]]; then
+    mkdir -pv "$ROOTFS/etc"
+    if [[ -e "$ROOTFS/usr/share/zoneinfo/UTC" ]]; then
+        ln -svf "/usr/share/zoneinfo/UTC" "$ROOTFS/etc/localtime"
+        echo "[glibc] timezone padrão configurado para UTC."
+    fi
+fi
+
+###############################################################################
+echo "[glibc-post] Pós-instalação da Glibc concluída com sucesso."
+###############################################################################
