@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Hook pós-instalação para GCC 15.2.0 - Pass 1
+# Caminho esperado:
+#   /opt/adm/packages/toolchain/gcc-pass1/gcc-pass1.post_install
+#
+# Variáveis recebidas do ADM:
+#   ROOTFS  -> raiz do sistema alvo (ex: /mnt/lfs)
+#   DESTDIR -> staging do pacote
+#   PkgID   -> categoria/nome
+#
+# O perfil do ADM deve ter LFS_TGT e afins.
+
+set -euo pipefail
+
+log() {
+    echo "[hook gcc-pass1.post_install] $*"
+}
+
+LFS="${ROOTFS:-/mnt/lfs}"
+
+if [[ -z "${LFS_TGT:-}" ]]; then
+    log "AVISO: LFS_TGT não definido no ambiente do ADM. Não é possível testar o cross-compiler."
+    exit 0
+fi
+
+# Garante que /tools do sistema alvo venha antes no PATH
+export PATH="$LFS/tools/bin:$PATH"
+
+cc="$LFS/tools/bin/${LFS_TGT}-gcc"
+
+if [[ ! -x "$cc" ]]; then
+    log "ERRO: não encontrei $cc no ROOTFS ($LFS). Verifique a instalação do GCC Pass 1."
+    exit 1
+fi
+
+tmpdir="$LFS/tmp/adm-gcc-pass1-test"
+mkdir -p "$tmpdir"
+cd "$tmpdir"
+
+log "Sanity-check básico: compilando um programa C simples (apenas .o, sem link)..."
+
+cat > dummy.c << 'EOF'
+int main(void) { return 0; }
+EOF
+
+# Compilação apenas até objeto, não exige Glibc instalada ainda.
+"$cc" -c dummy.c -o dummy.o
+
+if [[ ! -f dummy.o ]]; then
+    log "ERRO: GCC não gerou dummy.o. Há algo errado com a toolchain (GCC/AS)."
+    exit 1
+fi
+
+log "OK: ${LFS_TGT}-gcc compilou dummy.c em dummy.o com sucesso."
+
+# Teste opcional de link, só se já houver indícios de Glibc no sysroot.
+# Isso é útil se você rodar este hook de novo mais tarde, após Glibc.
+if [[ -f "$LFS/usr/include/stdio.h" ]] || [[ -d "$LFS/lib" || -d "$LFS/lib64" ]]; then
+    log "Glip Glibc detectada no sysroot. Tentando sanity-check de link (opcional)..."
+
+    # Este teste pode falhar se Glibc ainda estiver incompleta; nesse caso,
+    # só emitimos log e abortamos com erro para você revisar.
+    if echo 'int main() { return 0; }' \
+        | "$cc" -x c - -v -Wl,--verbose -o dummy &> dummy.log; then
+
+        log "Link bem-sucedido. Interpretador dinâmico:"
+        if command -v "${LFS_TGT}-readelf" &>/dev/null; then
+            "${LFS_TGT}-readelf" -l dummy | grep 'Requesting program interpreter' || true
+        else
+            # Usa readelf padrão do host como fallback (não é o ideal, mas ajuda)
+            if command -v readelf &>/dev/null; then
+                readelf -l dummy | grep 'Requesting program interpreter' || true
+            fi
+        fi
+
+        log "Sanity-check de linkagem também passou (ver $tmpdir/dummy.log para detalhes)."
+    else
+        log "ERRO: falha ao linkar o programa de teste (veja $tmpdir/dummy.log)."
+        exit 1
+    fi
+fi
+
+# Limpeza leve (mantém dummy.log se existir)
+rm -f dummy.c dummy.o dummy a.out 2>/dev/null || true
+
+log "Sanity-check do GCC Pass 1 concluído."
