@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Hook post_install para Zlib-1.3.1
+# Executado automaticamente pelo ADM após instalar o pacote no ROOTFS.
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido}"
+: "${CHOST:?CHOST não definido}"
+
+echo "[zlib-post] Pós-instalação da Zlib-1.3.1"
+echo "[zlib-post] ROOTFS=${ROOTFS}"
+echo "[zlib-post] CHOST=${CHOST}"
+
+# 1) Verifica headers e libs principais
+hdr="$ROOTFS/usr/include/zlib.h"
+if [[ ! -f "$hdr" ]]; then
+    echo "ERRO [zlib-sanity]: header $hdr não encontrado."
+    exit 1
+fi
+echo "[zlib-sanity] Header zlib.h encontrado."
+
+lib_any=""
+if [[ -f "$ROOTFS/usr/lib/libz.so" ]]; then
+    lib_any="$ROOTFS/usr/lib/libz.so"
+else
+    # tenta achar alguma libz.so.* como fallback
+    lib_candidates=( "$ROOTFS"/usr/lib/libz.so.* )
+    if [[ -e "${lib_candidates[0]}" ]]; then
+        lib_any="${lib_candidates[0]}"
+    fi
+fi
+
+if [[ -z "$lib_any" ]]; then
+    echo "ERRO [zlib-sanity]: nenhuma libz.so encontrada em $ROOTFS/usr/lib."
+    exit 1
+fi
+
+echo "[zlib-sanity] Biblioteca encontrada: ${lib_any#$ROOTFS}"
+
+# 2) Compila e linka um programinha de teste com -lz
+tmpdir="$(mktemp -d -t zlib-sanity.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+cd "$tmpdir"
+
+cat > test.c << 'EOF'
+#include <stdio.h>
+#include <string.h>
+#include <zlib.h>
+
+int main(void) {
+    const char *ver = zlibVersion();
+    if (!ver || strlen(ver) == 0) {
+        fprintf(stderr, "zlibVersion() retornou string vazia\n");
+        return 1;
+    }
+    printf("zlib sanity OK, version: %s\n", ver);
+    return 0;
+}
+EOF
+
+cc=""
+candidates=(
+    "$ROOTFS/usr/bin/${CHOST}-gcc"
+    "$ROOTFS/usr/bin/gcc"
+    "${CHOST}-gcc"
+    "gcc"
+)
+
+for c in "${candidates[@]}"; do
+    if [[ -x "$c" ]]; then
+        cc="$c"
+        break
+    fi
+    if command -v "$c" >/dev/null 2>&1; then
+        cc="$c"
+        break
+    fi
+done
+
+if [[ -z "$cc" ]]; then
+    echo "AVISO [zlib-sanity]: nenhum compilador encontrado; pulando teste de link."
+    echo "[zlib-post] Sanity-check parcial concluído."
+    exit 0
+fi
+
+echo "[zlib-sanity] Usando compilador: $cc"
+
+# Compila com --sysroot e linka contra -lz
+if ! "$cc" --sysroot="$ROOTFS" test.c -o test -lz > build.log 2>&1; then
+    echo "ERRO [zlib-sanity]: falha ao compilar/linkar programa de teste."
+    sed 's/^/    /' build.log || true
+    exit 1
+fi
+
+echo "[zlib-sanity] Programa de teste compilado e linkado com sucesso."
+
+# Opcional: roda o binário (se fizer sentido no ambiente)
+if ./test >/dev/null 2>&1; then
+    echo "[zlib-sanity] Execução do programa de teste OK."
+else
+    echo "AVISO [zlib-sanity]: programa de teste não rodou corretamente (verifique manualmente)."
+fi
+
+echo "[zlib-post] Sanity-check da Zlib-1.3.1 concluído."
