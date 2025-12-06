@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Hook post_install para GCC-15.2.0
+# Rodado automaticamente pelo ADM após instalar o pacote no ROOTFS.
+
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido}"
+: "${CHOST:?CHOST não definido}"
+
+echo "[gcc-post] Iniciando sanity-check do GCC-15.2.0"
+echo "[gcc-post] ROOTFS=${ROOTFS}"
+echo "[gcc-post] CHOST=${CHOST}"
+
+tmpdir="$(mktemp -d -t gcc-sanity.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+cd "$tmpdir"
+
+# Escolhe um compilador "cc" dentro do ROOTFS
+cc=""
+
+if [[ -x "$ROOTFS/usr/bin/${CHOST}-gcc" ]]; then
+    cc="$ROOTFS/usr/bin/${CHOST}-gcc"
+elif [[ -x "$ROOTFS/usr/bin/gcc" ]]; then
+    cc="$ROOTFS/usr/bin/gcc"
+elif [[ -x "$ROOTFS/usr/bin/cc" ]]; then
+    cc="$ROOTFS/usr/bin/cc"
+elif command -v "${CHOST}-gcc" >/dev/null 2>&1; then
+    cc="${CHOST}-gcc"
+elif command -v gcc >/dev/null 2>&1; then
+    cc="gcc"
+fi
+
+if [[ -z "$cc" ]]; then
+    echo "ERRO [gcc-sanity]: nenhum compilador GCC encontrado."
+    exit 1
+fi
+
+echo "[gcc-sanity] usando compilador: $cc"
+
+# Programa de teste
+cat > test.c << 'EOF'
+#include <stdio.h>
+int main(void) {
+    puts("GCC sanity OK");
+    return 0;
+}
+EOF
+
+# Compila com verbosidade máxima e --sysroot=$ROOTFS
+echo "[gcc-sanity] compilando programa de teste..."
+echo 'int main(){}' | "$cc" --sysroot="$ROOTFS" -x c - -v -Wl,--verbose -o a.out &> dummy.log
+
+if [[ ! -x a.out ]]; then
+    echo "ERRO [gcc-sanity]: a.out não foi gerado."
+    sed 's/^/    /' dummy.log || true
+    exit 1
+fi
+
+echo "[gcc-sanity] a.out gerado com sucesso."
+
+# Verifica interpretador dinâmico (dynamic linker) via readelf, se disponível
+if command -v readelf >/dev/null 2>&1; then
+    interp="$(readelf -l a.out | awk '/Requesting program interpreter/ {print $NF}' | tr -d '[]')"
+    if [[ -z "$interp" ]]; then
+        echo "ERRO [gcc-sanity]: não consegui detectar o interpretador dinâmico via readelf."
+        exit 1
+    fi
+
+    echo "[gcc-sanity] interpretador reportado: ${interp}"
+
+    if [[ ! -e "$ROOTFS/$interp" && ! -e "$ROOTFS/usr/lib/${interp##*/}" ]]; then
+        echo "ERRO [gcc-sanity]: interpretador ${interp} não existe dentro do ROOTFS."
+        exit 1
+    fi
+else
+    echo "AVISO [gcc-sanity]: 'readelf' não disponível, pulando check do interpretador."
+fi
+
+# Verifica se /usr/include está na lista de include dirs (estilo LFS) 
+if grep -B4 '^ /usr/include' dummy.log >/dev/null 2>&1; then
+    echo "[gcc-sanity] /usr/include aparece na ordem de busca de headers."
+else
+    echo "AVISO [gcc-sanity]: /usr/include não apareceu claramente em dummy.log (verifique manualmente)."
+fi
+
+# Verifica se está usando a libc correta dentro do ROOTFS
+if grep "libc.so.6" dummy.log | grep -q "/usr/lib/libc.so.6"; then
+    echo "[gcc-sanity] libc usada é /usr/lib/libc.so.6 (OK)."
+else
+    echo "AVISO [gcc-sanity]: não consegui confirmar /usr/lib/libc.so.6 em dummy.log."
+fi
+
+# Verifica se liblto_plugin está apontada no lugar correto (opcional)
+if grep -q "liblto_plugin.so" dummy.log; then
+    echo "[gcc-sanity] liblto_plugin.so aparece na saída do linker (LTO habilitado)."
+fi
+
+echo "[gcc-post] sanity-check do GCC concluído com sucesso."
