@@ -1,0 +1,73 @@
+# /opt/adm/packages/sys-apps/findutils/findutils.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+echo "[findutils sanity-check] Verificando instalação em $ROOTFS"
+
+# Binários principais
+bins=(
+    /usr/bin/find
+    /usr/bin/xargs
+    /usr/bin/locate
+    /usr/bin/updatedb
+)
+
+missing=0
+for b in "${bins[@]}"; do
+    full="$ROOTFS$b"
+    if [[ ! -x "$full" ]]; then
+        echo "[findutils sanity-check] ERRO: binário ausente ou não executável: $full" >&2
+        missing=1
+    fi
+done
+
+if (( missing != 0 )); then
+    exit 1
+fi
+
+# Testes simples de --version (não dependem do ROOTFS estar montado/chrootado)
+if ! "$ROOTFS/usr/bin/find" --version >/dev/null 2>&1; then
+    echo "[findutils sanity-check] ERRO: 'find --version' falhou" >&2
+    exit 1
+fi
+
+if ! "$ROOTFS/usr/bin/xargs" --version >/dev/null 2>&1; then
+    echo "[findutils sanity-check] ERRO: 'xargs --version' falhou" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo usando find + xargs
+tmp_root="${TMPDIR:-/tmp}/findutils-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root/sub1" "$tmp_root/sub2"
+
+echo "a" > "$tmp_root/sub1/file_a.txt"
+echo "b" > "$tmp_root/sub2/file_b.log"
+
+# 1) find deve localizar apenas os arquivos *.txt
+mapfile -t res_txt < <("$ROOTFS/usr/bin/find" "$tmp_root" -type f -name '*.txt' | sort)
+
+if (( "${#res_txt[@]}" != 1 )) || [[ "${res_txt[0]}" != "$tmp_root/sub1/file_a.txt" ]]; then
+    echo "[findutils sanity-check] ERRO: resultado inesperado de 'find ... -name \"*.txt\"'" >&2
+    printf 'Saída obtida:\n%s\n' "${res_txt[@]}" >&2 || true
+    exit 1
+fi
+
+# 2) find + xargs: renomear a extensão .log para .log.bak
+"$ROOTFS/usr/bin/find" "$tmp_root" -type f -name '*.log' \
+    -print0 | "$ROOTFS/usr/bin/xargs" -0 -r -n1 \
+    "$ROOTFS/usr/bin/sh" -c 'for p do mv "$p" "$p.bak"; done' sh || {
+        echo "[findutils sanity-check] ERRO: pipeline find|xargs de teste falhou" >&2
+        exit 1
+    }
+
+if [[ ! -f "$tmp_root/sub2/file_b.log.bak" ]]; then
+    echo "[findutils sanity-check] ERRO: renomeação via find|xargs não ocorreu como esperado" >&2
+    exit 1
+fi
+
+echo "[findutils sanity-check] OK: findutils 4.10.0 instaladas e funcionando em testes básicos."
