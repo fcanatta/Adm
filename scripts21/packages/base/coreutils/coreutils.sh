@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="coreutils"
-PKG_CATEGORY="sys-apps"
+PKG_CATEGORY="base"
 PKG_VERSION="9.9"
 PKG_DESC="GNU Coreutils - ferramentas básicas de manipulação de arquivos, texto e sistema"
 PKG_HOMEPAGE="https://www.gnu.org/software/coreutils/"
