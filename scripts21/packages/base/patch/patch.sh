@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="patch"
-PKG_CATEGORY="sys-apps"
+PKG_CATEGORY="base"
 PKG_VERSION="2.8"
 PKG_DESC="GNU Patch - aplica patches estilo diff em arquivos"
 PKG_HOMEPAGE="https://www.gnu.org/software/patch/"
