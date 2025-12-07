@@ -1,0 +1,67 @@
+# /opt/adm/packages/sys-apps/sed/sed.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/sed"
+bin_bin="$ROOTFS/bin/sed"
+
+echo "[sed sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_bin (se existir)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[sed sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica /bin/sed se existir
+if [[ -e "$bin_bin" ]]; then
+    if [[ -L "$bin_bin" ]]; then
+        echo "[sed sanity-check] OK: /bin/sed é symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[sed sanity-check] OK: /bin/sed é executável"
+    else
+        echo "[sed sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[sed sanity-check] ERRO: falha ao executar 'sed --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 1: substituição simples
+out1="$("$bin_usr" 's/foo/bar/' <<< 'foo baz')" || {
+    echo "[sed sanity-check] ERRO: falha no teste de substituição simples" >&2
+    exit 1
+}
+if [[ "$out1" != "bar baz" ]]; then
+    echo "[sed sanity-check] ERRO: saída inesperada (esperado 'bar baz', obtido '$out1')" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 2: deleção de linha por padrão
+out2="$("$bin_usr" '/^#/d' << 'EOF'
+linha1
+#comentario
+linha2
+EOF
+)" || {
+    echo "[sed sanity-check] ERRO: falha no teste de deleção de linhas" >&2
+    exit 1
+}
+
+# Espera-se apenas 'linha1' e 'linha2'
+if [[ "$out2" != $'linha1\nlinha2' ]]; then
+    echo "[sed sanity-check] ERRO: saída inesperada no filtro de comentários" >&2
+    printf 'Saída obtida:\n%s\n' "$out2" >&2
+    exit 1
+fi
+
+echo "[sed sanity-check] OK: sed 4.9 instalado e funcionando."
