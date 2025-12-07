@@ -1,0 +1,75 @@
+# /opt/adm/packages/sys-devel/gettext/gettext.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_gettext="$ROOTFS/usr/bin/gettext"
+bin_msgfmt="$ROOTFS/usr/bin/msgfmt"
+bin_xgettext="$ROOTFS/usr/bin/xgettext"
+
+echo "[gettext sanity-check] Verificando instalação em:"
+echo "  - $bin_gettext"
+echo "  - $bin_msgfmt"
+echo "  - $bin_xgettext"
+
+# Verifica binários principais
+for b in "$bin_gettext" "$bin_msgfmt" "$bin_xgettext"; do
+    if [[ ! -x "$b" ]]; then
+        echo "[gettext sanity-check] ERRO: binário ausente ou não executável: $b" >&2
+        exit 1
+    fi
+done
+
+# Teste de --version em pelo menos gettext e msgfmt
+if ! "$bin_gettext" --version >/dev/null 2>&1; then
+    echo "[gettext sanity-check] ERRO: 'gettext --version' falhou" >&2
+    exit 1
+fi
+if ! "$bin_msgfmt" --version >/dev/null 2>&1; then
+    echo "[gettext sanity-check] ERRO: 'msgfmt --version' falhou" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo:
+#  - cria um .po simples
+#  - gera .mo com msgfmt
+#  - usa gettext para traduzir a string "Hello" -> "Olá"
+tmp_root="${TMPDIR:-/tmp}/gettext-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root/locale/pt_BR/LC_MESSAGES"
+cd "$tmp_root"
+
+cat > test.po << 'EOF'
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: pt_BR\n"
+
+msgid "Hello"
+msgstr "Olá"
+EOF
+
+# Gera o .mo
+"$bin_msgfmt" -o "$tmp_root/locale/pt_BR/LC_MESSAGES/test.mo" test.po || {
+    echo "[gettext sanity-check] ERRO: 'msgfmt' falhou ao gerar test.mo" >&2
+    exit 1
+}
+
+# Usa o binário gettext instalado para buscar a tradução
+export TEXTDOMAIN="test"
+export TEXTDOMAINDIR="$tmp_root/locale"
+
+out="$("$bin_gettext" 'Hello')" || {
+    echo "[gettext sanity-check] ERRO: 'gettext \"Hello\"' falhou" >&2
+    exit 1
+}
+
+if [[ "$out" != "Olá" ]]; then
+    echo "[gettext sanity-check] ERRO: tradução inesperada (esperado 'Olá', obtido '$out')" >&2
+    exit 1
+fi
+
+echo "[gettext sanity-check] OK: gettext 0.26 instalado e funcionando (tradução básica verificada)."
