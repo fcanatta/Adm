@@ -1,0 +1,98 @@
+# /opt/adm/packages/app-arch/tar/tar.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/tar"
+bin_bin="$ROOTFS/bin/tar"
+
+echo "[tar sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_bin (se existir)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[tar sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica /bin/tar se existir
+if [[ -e "$bin_bin" ]]; then
+    if [[ -L "$bin_bin" ]]; then
+        echo "[tar sanity-check] OK: /bin/tar é symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[tar sanity-check] OK: /bin/tar é executável"
+    else
+        echo "[tar sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[tar sanity-check] ERRO: falha ao executar 'tar --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: criar, listar e extrair um arquivo tar
+tmp_root="${TMPDIR:-/tmp}/tar-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root/src" "$tmp_root/dst"
+cd "$tmp_root/src"
+
+# Cria alguns arquivos de teste
+echo "linha1" > a.txt
+echo "linha2" > b.txt
+
+# Cria o tar
+tarfile="$tmp_root/test.tar"
+if ! "$bin_usr" -cf "$tarfile" a.txt b.txt; then
+    echo "[tar sanity-check] ERRO: falha ao criar arquivo tar de teste" >&2
+    exit 1
+fi
+
+if [[ ! -f "$tarfile" ]]; then
+    echo "[tar sanity-check] ERRO: arquivo tar de teste não foi criado" >&2
+    exit 1
+fi
+
+# Lista o conteúdo
+list_out="$("$bin_usr" -tf "$tarfile")" || {
+    echo "[tar sanity-check] ERRO: falha ao listar conteúdo do tar de teste" >&2
+    exit 1
+}
+
+if ! printf '%s\n' "$list_out" | grep -qx 'a.txt'; then
+    echo "[tar sanity-check] ERRO: 'a.txt' não encontrado na listagem do tar" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$list_out" | grep -qx 'b.txt'; then
+    echo "[tar sanity-check] ERRO: 'b.txt' não encontrado na listagem do tar" >&2
+    exit 1
+fi
+
+# Extrai para diretório separado
+cd "$tmp_root/dst"
+if ! "$bin_usr" -xf "$tarfile"; then
+    echo "[tar sanity-check] ERRO: falha ao extrair o tar de teste" >&2
+    exit 1
+fi
+
+if [[ ! -f a.txt || ! -f b.txt ]]; then
+    echo "[tar sanity-check] ERRO: arquivos não reapareceram após extração" >&2
+    exit 1
+fi
+
+if ! grep -qx 'linha1' a.txt; then
+    echo "[tar sanity-check] ERRO: conteúdo inesperado em a.txt após extração" >&2
+    exit 1
+fi
+if ! grep -qx 'linha2' b.txt; then
+    echo "[tar sanity-check] ERRO: conteúdo inesperado em b.txt após extração" >&2
+    exit 1
+fi
+
+echo "[tar sanity-check] OK: tar 1.35 instalado e funcionando."
