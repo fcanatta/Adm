@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="xz"
-PKG_CATEGORY="app-arch"
+PKG_CATEGORY="base"
 PKG_VERSION="5.8.1"
 PKG_DESC="XZ Utils - compactação LZMA/LZMA2 (xz, unxz, liblzma)"
 PKG_HOMEPAGE="https://tukaani.org/xz/"
