@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/bash"
+bin_bin="$ROOTFS/bin/bash"
+
+echo "[bash sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_bin (symlink esperado)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[bash sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica /bin/bash (symlink ou binário)
+if [[ ! -e "$bin_bin" ]]; then
+    echo "[bash sanity-check] AVISO: '$bin_bin' não existe (sem symlink /bin/bash)" >&2
+else
+    if [[ -L "$bin_bin" ]]; then
+        echo "[bash sanity-check] OK: /bin/bash é um symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[bash sanity-check] OK: /bin/bash é executável"
+    else
+        echo "[bash sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[bash sanity-check] ERRO: falha ao executar 'bash --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: rodar um comando simples
+out="$("$bin_usr" -c 'echo OK')" || {
+    echo "[bash sanity-check] ERRO: falha ao executar comando simples com bash" >&2
+    exit 1
+}
+
+if [[ "$out" != "OK" ]]; then
+    echo "[bash sanity-check] ERRO: saída inesperada do teste funcional (esperado 'OK', obtido '$out')" >&2
+    exit 1
+fi
+
+echo "[bash sanity-check] OK: bash instalado e funcionando."
