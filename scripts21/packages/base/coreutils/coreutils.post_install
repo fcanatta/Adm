@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+echo "[coreutils sanity-check] Verificando instalação em $ROOTFS"
+
+# Lista de binários que vamos checar
+essential_bins=(
+    /usr/bin/ls
+    /usr/bin/cp
+    /usr/bin/mv
+    /usr/bin/rm
+    /usr/bin/mkdir
+    /usr/bin/touch
+    /usr/bin/printf
+    /usr/bin/echo
+)
+
+missing=0
+
+for b in "${essential_bins[@]}"; do
+    full="$ROOTFS$b"
+    if [[ ! -x "$full" ]]; then
+        echo "[coreutils sanity-check] ERRO: binário essencial ausente ou não executável: $full" >&2
+        missing=1
+    fi
+done
+
+if (( missing != 0 )); then
+    exit 1
+fi
+
+# Teste funcional mínimo:
+# 1) cria um diretório de teste
+# 2) cria um arquivo
+# 3) copia, move, lista e remove
+tmp_root="${TMPDIR:-/tmp}/coreutils-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root/testdir"
+(
+    cd "$tmp_root/testdir"
+
+    # touch
+    "$ROOTFS/usr/bin/touch" file1 || {
+        echo "[coreutils sanity-check] ERRO: 'touch file1' falhou" >&2
+        exit 1
+    }
+
+    # cp
+    "$ROOTFS/usr/bin/cp" file1 file2 || {
+        echo "[coreutils sanity-check] ERRO: 'cp file1 file2' falhou" >&2
+        exit 1
+    }
+
+    # mv
+    "$ROOTFS/usr/bin/mv" file2 file3 || {
+        echo "[coreutils sanity-check] ERRO: 'mv file2 file3' falhou" >&2
+        exit 1
+    }
+
+    # ls
+    ls_output="$("$ROOTFS/usr/bin/ls")" || {
+        echo "[coreutils sanity-check] ERRO: 'ls' falhou" >&2
+        exit 1
+    }
+
+    # checa se os nomes esperados aparecem
+    for f in file1 file3; do
+        if ! grep -qw "$f" <<<"$ls_output"; then
+            echo "[coreutils sanity-check] ERRO: arquivo '$f' não apareceu na saída de 'ls'" >&2
+            echo "Saída de ls:" >&2
+            echo "$ls_output" >&2
+            exit 1
+        fi
+    done
+
+    # rm
+    "$ROOTFS/usr/bin/rm" -f file1 file3 || {
+        echo "[coreutils sanity-check] ERRO: 'rm file1 file3' falhou" >&2
+        exit 1
+    }
+
+    # diretório deve ficar vazio
+    if [[ "$("$ROOTFS/usr/bin/ls" | wc -l)" -ne 0 ]]; then
+        echo "[coreutils sanity-check] ERRO: diretório de teste não ficou vazio após 'rm'" >&2
+        exit 1
+    fi
+)
+
+echo "[coreutils sanity-check] OK: coreutils 9.9 instaladas e funcionando em operações básicas."
