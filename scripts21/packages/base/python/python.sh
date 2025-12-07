@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="python"
-PKG_CATEGORY="dev-lang"
+PKG_CATEGORY="base"
 PKG_VERSION="3.14.0"
 PKG_DESC="Python 3.14 - linguagem de programação de alto nível, interpretada"
 PKG_HOMEPAGE="https://www.python.org/"
