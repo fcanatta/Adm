@@ -1,0 +1,61 @@
+# /opt/adm/packages/sys-apps/gawk/gawk.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_gawk="$ROOTFS/usr/bin/gawk"
+bin_awk="$ROOTFS/usr/bin/awk"
+
+echo "[gawk sanity-check] Verificando instalação em:"
+echo "  - $bin_gawk"
+echo "  - $bin_awk (symlink esperado)"
+
+# Verifica gawk principal
+if [[ ! -x "$bin_gawk" ]]; then
+    echo "[gawk sanity-check] ERRO: '$bin_gawk' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica awk genérico (symlink ou binário)
+if [[ ! -e "$bin_awk" ]]; then
+    echo "[gawk sanity-check] AVISO: '$bin_awk' não existe (sem link awk -> gawk)" >&2
+else
+    if [[ -L "$bin_awk" ]]; then
+        echo "[gawk sanity-check] OK: /usr/bin/awk é symlink para $(readlink -f "$bin_awk")"
+    elif [[ -x "$bin_awk" ]]; then
+        echo "[gawk sanity-check] OK: /usr/bin/awk é executável"
+    else
+        echo "[gawk sanity-check] ERRO: '$bin_awk' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_gawk" --version >/dev/null 2>&1; then
+    echo "[gawk sanity-check] ERRO: falha ao executar 'gawk --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 1: soma simples
+res_sum="$("$bin_gawk" 'BEGIN { print 2 + 3 }')" || {
+    echo "[gawk sanity-check] ERRO: falha ao executar teste de soma com gawk" >&2
+    exit 1
+}
+if [[ "$res_sum" != "5" ]]; then
+    echo "[gawk sanity-check] ERRO: resultado inesperado na soma (esperado 5, obtido '$res_sum')" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 2: processamento de linha
+res_field="$(echo 'foo bar baz' | "$bin_gawk" '{ print $2 }')" || {
+    echo "[gawk sanity-check] ERRO: falha ao executar teste de campo com gawk" >&2
+    exit 1
+}
+if [[ "$res_field" != "bar" ]]; then
+    echo "[gawk sanity-check] ERRO: extração de campo inesperada (esperado 'bar', obtido '$res_field')" >&2
+    exit 1
+fi
+
+echo "[gawk sanity-check] OK: gawk 5.3.2 instalado e funcionando."
