@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="bison"
-PKG_CATEGORY="sys-devel"
+PKG_CATEGORY="base"
 PKG_VERSION="3.8.2"
 PKG_DESC="GNU Bison - gerador de analisadores sintáticos (parser generator)"
 PKG_HOMEPAGE="https://www.gnu.org/software/bison/"
