@@ -76,4 +76,4 @@ if ! grep -qi 'sample.info' dir; then
 fi
 
 echo "[texinfo sanity-check] OK: texinfo 7.2 instalado, info/install-info funcionando em testes básicos."
-```0
+
