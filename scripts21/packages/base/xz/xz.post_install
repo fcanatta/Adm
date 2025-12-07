@@ -1,0 +1,95 @@
+# /opt/adm/packages/app-arch/xz/xz.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/xz"
+bin_unxz="$ROOTFS/usr/bin/unxz"
+bin_xzcat="$ROOTFS/usr/bin/xzcat"
+bin_bin="$ROOTFS/bin/xz"
+
+echo "[xz sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_unxz"
+echo "  - $bin_xzcat"
+echo "  - $bin_bin (se existir)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[xz sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica ferramentas auxiliares se existirem
+for b in "$bin_unxz" "$bin_xzcat"; do
+    if [[ -e "$b" ]]; then
+        if [[ ! -x "$b" ]]; then
+            echo "[xz sanity-check] ERRO: '$b' existe mas não é executável" >&2
+            exit 1
+        fi
+    fi
+done
+
+# Verifica /bin/xz se existir
+if [[ -e "$bin_bin" ]]; then
+    if [[ -L "$bin_bin" ]]; then
+        echo "[xz sanity-check] OK: /bin/xz é symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[xz sanity-check] OK: /bin/xz é executável"
+    else
+        echo "[xz sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[xz sanity-check] ERRO: falha ao executar 'xz --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: comprimir/descomprimir e checar integridade
+tmp_root="${TMPDIR:-/tmp}/xz-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+printf 'teste-xz-adm\nlinha2\n' > sample.txt
+
+# Compacta
+"$bin_usr" sample.txt || {
+    echo "[xz sanity-check] ERRO: falha ao executar 'xz sample.txt'" >&2
+    exit 1
+}
+
+if [[ ! -f sample.txt.xz ]]; then
+    echo "[xz sanity-check] ERRO: arquivo compactado sample.txt.xz não foi criado" >&2
+    exit 1
+fi
+
+# Verifica integridade
+if ! "$bin_usr" -t sample.txt.xz >/dev/null 2>&1; then
+    echo "[xz sanity-check] ERRO: 'xz -t sample.txt.xz' falhou na verificação de integridade" >&2
+    exit 1
+fi
+
+# Descompacta de volta
+"$bin_usr" -d sample.txt.xz || {
+    echo "[xz sanity-check] ERRO: falha ao executar 'xz -d sample.txt.xz'" >&2
+    exit 1
+}
+
+if [[ ! -f sample.txt ]]; then
+    echo "[xz sanity-check] ERRO: sample.txt não reapareceu após descompressão" >&2
+    exit 1
+fi
+
+if ! grep -qx 'teste-xz-adm' sample.txt; then
+    echo "[xz sanity-check] ERRO: conteúdo inesperado em sample.txt após ciclo de compressão" >&2
+    exit 1
+fi
+
+echo "[xz sanity-check] OK: xz 5.8.1 instalado e funcionando."
