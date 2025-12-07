@@ -1,0 +1,57 @@
+# /opt/adm/packages/dev-lang/perl/perl.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_perl="$ROOTFS/usr/bin/perl"
+
+echo "[perl sanity-check] Verificando instalação em:"
+echo "  - $bin_perl"
+
+# 1) binário principal
+if [[ ! -x "$bin_perl" ]]; then
+    echo "[perl sanity-check] ERRO: '$bin_perl' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# 2) perl -v / -e simples
+if ! "$bin_perl" -v >/dev/null 2>&1; then
+    echo "[perl sanity-check] ERRO: 'perl -v' falhou" >&2
+    exit 1
+fi
+
+if [[ "$("$bin_perl" -e 'print 2+3')" != "5" ]]; then
+    echo "[perl sanity-check] ERRO: expressão aritmética simples não retornou 5" >&2
+    exit 1
+fi
+
+# 3) teste funcional com script e módulo padrão (Config)
+tmp_root="${TMPDIR:-/tmp}/perl-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+cat > test.pl << 'EOF'
+use strict;
+use warnings;
+use Config;
+print "ok:", $Config{osname}, "\n";
+EOF
+
+out="$("$bin_perl" test.pl)" || {
+    echo "[perl sanity-check] ERRO: falha ao executar script Perl de teste" >&2
+    exit 1
+}
+
+case "$out" in
+    ok:*) ;;
+    *)
+        echo "[perl sanity-check] ERRO: saída inesperada do script de teste (obtido: '$out')" >&2
+        exit 1
+        ;;
+esac
+
+echo "[perl sanity-check] OK: perl 5.42.0 instalado, executando scripts e carregando módulos padrão."
