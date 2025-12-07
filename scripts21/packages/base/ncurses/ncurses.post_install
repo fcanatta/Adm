@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+echo "[ncurses sanity-check] Verificando instalação em $ROOTFS"
+
+bin_tput="$ROOTFS/usr/bin/tput"
+bin_clear="$ROOTFS/usr/bin/clear"
+libdir="$ROOTFS/usr/lib"
+
+# Verifica binários principais
+if [[ ! -x "$bin_tput" ]]; then
+    echo "[ncurses sanity-check] ERRO: '$bin_tput' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+if [[ ! -x "$bin_clear" ]]; then
+    echo "[ncurses sanity-check] ERRO: '$bin_clear' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica bibliotecas wide-char
+missing_libs=0
+for lib in libncursesw.so libformw.so libmenuw.so libpanelw.so ; do
+    if [[ ! -e "$libdir/$lib" ]]; then
+        echo "[ncurses sanity-check] ERRO: biblioteca '$libdir/$lib' ausente" >&2
+        missing_libs=1
+    fi
+done
+
+if (( missing_libs != 0 )); then
+    exit 1
+fi
+
+# Teste funcional simples com tput
+TERM=${TERM:-xterm}
+if ! "$bin_tput" cols >/dev/null 2>&1; then
+    echo "[ncurses sanity-check] ERRO: 'tput cols' falhou" >&2
+    exit 1
+fi
+
+if ! "$bin_tput" clear >/dev/null 2>&1; then
+    echo "[ncurses sanity-check] ERRO: 'tput clear' falhou" >&2
+    exit 1
+fi
+
+echo "[ncurses sanity-check] OK: ncurses instalado e funcionando."
