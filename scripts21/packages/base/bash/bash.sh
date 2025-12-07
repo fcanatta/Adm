@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="bash"
-PKG_CATEGORY="app-shells"
+PKG_CATEGORY="base"
 PKG_VERSION="5.3"
 PKG_DESC="GNU Bash - Bourne Again SHell"
 PKG_HOMEPAGE="https://www.gnu.org/software/bash/"
