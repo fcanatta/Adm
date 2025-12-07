@@ -1,0 +1,64 @@
+# /opt/adm/packages/sys-apps/grep/grep.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+echo "[grep sanity-check] Verificando instalação em $ROOTFS"
+
+bin_grep="$ROOTFS/usr/bin/grep"
+bin_egrep="$ROOTFS/usr/bin/egrep"
+bin_fgrep="$ROOTFS/usr/bin/fgrep"
+
+# Verifica binário principal
+if [[ ! -x "$bin_grep" ]]; then
+    echo "[grep sanity-check] ERRO: '$bin_grep' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica wrappers/links egrep/fgrep se existirem
+for b in "$bin_egrep" "$bin_fgrep"; do
+    if [[ -e "$b" ]]; then
+        if [[ -x "$b" ]]; then
+            echo "[grep sanity-check] OK: $(basename "$b") presente e executável"
+        else
+            echo "[grep sanity-check] ERRO: '$b' existe mas não é executável" >&2
+            exit 1
+        fi
+    fi
+done
+
+# Teste de --version
+if ! "$bin_grep" --version >/dev/null 2>&1; then
+    echo "[grep sanity-check] ERRO: falha ao executar 'grep --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 1: correspondência simples
+out1="$(printf 'foo\nbar\nbaz\n' | "$bin_grep" 'ba')" || {
+    echo "[grep sanity-check] ERRO: falha ao executar grep em teste simples" >&2
+    exit 1
+}
+
+# Deve conter "bar" e "baz" em linhas separadas
+if ! printf '%s\n' "$out1" | grep -qx 'bar'; then
+    echo "[grep sanity-check] ERRO: linha 'bar' não encontrada na saída de grep" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$out1" | grep -qx 'baz'; then
+    echo "[grep sanity-check] ERRO: linha 'baz' não encontrada na saída de grep" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 2: opção -q (quiet), retorno apenas
+if ! printf 'abc\n' | "$bin_grep" -q 'abc'; then
+    echo "[grep sanity-check] ERRO: 'grep -q abc' retornou erro para texto correspondente" >&2
+    exit 1
+fi
+if printf 'abc\n' | "$bin_grep" -q 'zzz'; then
+    echo "[grep sanity-check] ERRO: 'grep -q zzz' retornou sucesso para texto não correspondente" >&2
+    exit 1
+fi
+
+echo "[grep sanity-check] OK: grep 3.12 instalado e funcionando."
