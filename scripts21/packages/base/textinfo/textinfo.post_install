@@ -1,0 +1,79 @@
+# /opt/adm/packages/sys-apps/texinfo/texinfo.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_info="$ROOTFS/usr/bin/info"
+bin_install_info="$ROOTFS/usr/bin/install-info"
+
+echo "[texinfo sanity-check] Verificando instalação em:"
+echo "  - $bin_info"
+echo "  - $bin_install_info"
+
+# Verifica binários principais
+if [[ ! -x "$bin_info" ]]; then
+    echo "[texinfo sanity-check] ERRO: '$bin_info' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+if [[ ! -x "$bin_install_info" ]]; then
+    echo "[texinfo sanity-check] ERRO: '$bin_install_info' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Testes básicos de versão
+if ! "$bin_info" --version >/dev/null 2>&1; then
+    echo "[texinfo sanity-check] ERRO: 'info --version' falhou" >&2
+    exit 1
+fi
+
+if ! "$bin_install_info" --version >/dev/null 2>&1; then
+    echo "[texinfo sanity-check] ERRO: 'install-info --version' falhou" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 1:
+# Tentar acessar o manual "info" e descartar a saída
+if ! "$bin_info" -o /dev/null info >/dev/null 2>&1; then
+    echo "[texinfo sanity-check] ERRO: 'info info' falhou (não conseguiu abrir manual básico)" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 2:
+# Criar um diretório de info temporário e usar install-info com um arquivo artificial simples
+tmp_root="${TMPDIR:-/tmp}/texinfo-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root/dir.d"
+cd "$tmp_root"
+
+# Arquivo .info extremamente simples só para testar install-info
+cat > sample.info << 'EOF'
+This is sample.info, produced for sanity-check.
+
+* Menu:
+
+* Sample Node::   A dummy node.
+
+File: sample.info,  Node: Sample Node,  Next: ,  Prev: ,  Up: Top
+
+This is only a test node.
+EOF
+
+# Cria um arquivo dir vazio que será manipulado pelo install-info
+: > dir
+
+if ! "$bin_install_info" --dir-file=dir sample.info >/dev/null 2>&1; then
+    echo "[texinfo sanity-check] ERRO: 'install-info' falhou ao registrar sample.info em dir" >&2
+    exit 1
+fi
+
+if ! grep -qi 'sample.info' dir; then
+    echo "[texinfo sanity-check] ERRO: entrada de sample.info não encontrada em dir após install-info" >&2
+    exit 1
+fi
+
+echo "[texinfo sanity-check] OK: texinfo 7.2 instalado, info/install-info funcionando em testes básicos."
+```0
