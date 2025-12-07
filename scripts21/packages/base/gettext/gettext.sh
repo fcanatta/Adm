@@ -2,7 +2,7 @@
 #!/usr/bin/env bash
 
 PKG_NAME="gettext"
-PKG_CATEGORY="sys-devel"
+PKG_CATEGORY="base"
 PKG_VERSION="0.26"
 PKG_DESC="GNU Gettext - ferramentas e bibliotecas para internacionalização (i18n)"
 PKG_HOMEPAGE="https://www.gnu.org/software/gettext/"
