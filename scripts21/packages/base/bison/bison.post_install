@@ -1,0 +1,51 @@
+# /opt/adm/packages/sys-devel/bison/bison.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_bison="$ROOTFS/usr/bin/bison"
+
+echo "[bison sanity-check] Verificando instalação em:"
+echo "  - $bin_bison"
+
+# Verifica binário principal
+if [[ ! -x "$bin_bison" ]]; then
+    echo "[bison sanity-check] ERRO: '$bin_bison' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Teste de --version
+if ! "$bin_bison" --version >/dev/null 2>&1; then
+    echo "[bison sanity-check] ERRO: falha ao executar 'bison --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: gerar código C a partir de uma gramática simples
+tmp_root="${TMPDIR:-/tmp}/bison-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+cat > test.y << 'EOF'
+%define api.prefix {test}
+
+%%
+input:
+    /* empty */ ;
+%%
+EOF
+
+if ! "$bin_bison" -o test.c test.y; then
+    echo "[bison sanity-check] ERRO: falha ao gerar código C a partir da gramática de teste" >&2
+    exit 1
+fi
+
+if [[ ! -s test.c ]]; then
+    echo "[bison sanity-check] ERRO: arquivo test.c não foi criado ou está vazio" >&2
+    exit 1
+fi
+
+echo "[bison sanity-check] OK: bison 3.8.2 instalado e gerando código C a partir de gramática simples."
