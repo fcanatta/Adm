@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+echo "[file sanity-check] Verificando instalação em $ROOTFS"
+
+bin_file="$ROOTFS/usr/bin/file"
+magic_db1="$ROOTFS/usr/share/misc/magic.mgc"
+magic_db2="$ROOTFS/usr/share/file/magic.mgc"  # fallback em alguns layouts
+
+# Verifica binário principal
+if [[ ! -x "$bin_file" ]]; then
+    echo "[file sanity-check] ERRO: '$bin_file' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica base de dados magic
+if [[ -f "$magic_db1" ]]; then
+    magic_db="$magic_db1"
+elif [[ -f "$magic_db2" ]]; then
+    magic_db="$magic_db2"
+else
+    echo "[file sanity-check] AVISO: magic.mgc não encontrado em '$magic_db1' nem '$magic_db2'" >&2
+    magic_db=""
+fi
+
+# Teste de --version
+if ! "$bin_file" --version >/dev/null 2>&1; then
+    echo "[file sanity-check] ERRO: falha ao executar 'file --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo
+tmp_root="${TMPDIR:-/tmp}/file-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+# Cria um arquivo de texto simples
+cat > texto.txt << 'EOF'
+Hello ADM file test
+EOF
+
+# Usa o binário instalado no ROOTFS; se tiver magic_db, usa -m
+if [[ -n "${magic_db:-}" ]]; then
+    out="$("$bin_file" -m "$magic_db" texto.txt)" || {
+        echo "[file sanity-check] ERRO: 'file -m magic texto.txt' falhou" >&2
+        exit 1
+    }
+else
+    out="$("$bin_file" texto.txt)" || {
+        echo "[file sanity-check] ERRO: 'file texto.txt' falhou" >&2
+        exit 1
+    }
+fi
+
+# Só checa se a saída parece indicar texto (não for "data")
+if echo "$out" | grep -qi "text"; then
+    echo "[file sanity-check] OK: 'file' identifica texto corretamente."
+else
+    echo "[file sanity-check] AVISO: saída inesperada de 'file': $out" >&2
+    # Não falho aqui, apenas aviso – o binário rodou, mas o magic pode estar diferente
+fi
