@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+BIN="$ROOTFS/usr/bin/m4"
+
+echo "[m4 sanity-check] Verificando instalação em: $BIN"
+
+if [[ ! -x "$BIN" ]]; then
+    echo "[m4 sanity-check] ERRO: binário não encontrado ou não executável em $BIN" >&2
+    exit 1
+fi
+
+# Teste simples de --version
+if ! "$BIN" --version >/dev/null 2>&1; then
+    echo "[m4 sanity-check] ERRO: falha ao executar '$BIN --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: macro simples
+tmp_out="${TMPDIR:-/tmp}/m4-sanity-$$.out"
+trap 'rm -f "$tmp_out"' EXIT
+
+echo 'define(TEST,ok) TEST' | "$BIN" > "$tmp_out"
+
+if ! grep -qx "ok" "$tmp_out"; then
+    echo "[m4 sanity-check] ERRO: saída inesperada no teste funcional do m4" >&2
+    echo "[m4 sanity-check] Conteúdo obtido:" >&2
+    cat "$tmp_out" >&2 || true
+    exit 1
+fi
+
+echo "[m4 sanity-check] OK: m4 instalado e respondendo corretamente."
