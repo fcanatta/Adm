@@ -1,0 +1,78 @@
+# /opt/adm/packages/sys-devel/make/make.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/make"
+bin_bin="$ROOTFS/bin/make"
+
+echo "[make sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_bin (se existir)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[make sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica /bin/make se existir
+if [[ -e "$bin_bin" ]]; then
+    if [[ -L "$bin_bin" ]]; then
+        echo "[make sanity-check] OK: /bin/make é symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[make sanity-check] OK: /bin/make é executável"
+    else
+        echo "[make sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[make sanity-check] ERRO: falha ao executar 'make --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: compilar um programinha C simples
+tmp_root="${TMPDIR:-/tmp}/make-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+cat > hello.c << 'EOF'
+#include <stdio.h>
+int main(void) {
+    puts("hello-from-make");
+    return 0;
+}
+EOF
+
+cat > Makefile << 'EOF'
+all: hello
+
+hello: hello.c
+	$(CC) $(CFLAGS) hello.c -o hello
+EOF
+
+# Usa o make instalado no ROOTFS; assume que CC/CFLAGS vêm do profile
+if ! "$bin_usr"; then
+    echo "[make sanity-check] ERRO: 'make' falhou ao construir o alvo padrão" >&2
+    exit 1
+fi
+
+if [[ ! -x ./hello ]]; then
+    echo "[make sanity-check] ERRO: binário 'hello' não foi gerado" >&2
+    exit 1
+fi
+
+out="$(./hello || true)"
+if [[ "$out" != "hello-from-make" ]]; then
+    echo "[make sanity-check] ERRO: saída inesperada do binário de teste (obtido: '$out')" >&2
+    exit 1
+fi
+
+echo "[make sanity-check] OK: make 4.4.1 instalado e funcionando."
