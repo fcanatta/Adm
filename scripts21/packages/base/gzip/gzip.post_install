@@ -1,0 +1,76 @@
+# /opt/adm/packages/app-arch/gzip/gzip.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+bin_usr="$ROOTFS/usr/bin/gzip"
+bin_bin="$ROOTFS/bin/gzip"
+
+echo "[gzip sanity-check] Verificando instalação em:"
+echo "  - $bin_usr"
+echo "  - $bin_bin (symlink esperado)"
+
+# Verifica binário principal
+if [[ ! -x "$bin_usr" ]]; then
+    echo "[gzip sanity-check] ERRO: '$bin_usr' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Verifica /bin/gzip (se existir)
+if [[ -e "$bin_bin" ]]; then
+    if [[ -L "$bin_bin" ]]; then
+        echo "[gzip sanity-check] OK: /bin/gzip é symlink para $(readlink -f "$bin_bin")"
+    elif [[ -x "$bin_bin" ]]; then
+        echo "[gzip sanity-check] OK: /bin/gzip é executável"
+    else
+        echo "[gzip sanity-check] ERRO: '$bin_bin' existe mas não é executável" >&2
+        exit 1
+    fi
+fi
+
+# Teste de --version
+if ! "$bin_usr" --version >/dev/null 2>&1; then
+    echo "[gzip sanity-check] ERRO: falha ao executar 'gzip --version'" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo: comprimir e descomprimir um arquivo
+tmp_root="${TMPDIR:-/tmp}/gzip-sanity-$$"
+trap 'rm -rf "'"$tmp_root"'"' EXIT
+
+mkdir -p "$tmp_root"
+cd "$tmp_root"
+
+printf 'teste-gzip-adm\n' > sample.txt
+
+# Compacta
+"$bin_usr" sample.txt || {
+    echo "[gzip sanity-check] ERRO: falha ao executar 'gzip sample.txt'" >&2
+    exit 1
+}
+
+if [[ ! -f sample.txt.gz ]]; then
+    echo "[gzip sanity-check] ERRO: arquivo compactado sample.txt.gz não foi criado" >&2
+    exit 1
+fi
+
+# Descompacta
+"$bin_usr" -d sample.txt.gz || {
+    echo "[gzip sanity-check] ERRO: falha ao executar 'gzip -d sample.txt.gz'" >&2
+    exit 1
+}
+
+if [[ ! -f sample.txt ]]; then
+    echo "[gzip sanity-check] ERRO: arquivo sample.txt não reapareceu após descompactar" >&2
+    exit 1
+fi
+
+# Confere conteúdo
+if ! grep -qx 'teste-gzip-adm' sample.txt; then
+    echo "[gzip sanity-check] ERRO: conteúdo inesperado após (des)compressão" >&2
+    exit 1
+fi
+
+echo "[gzip sanity-check] OK: gzip 1.14 instalado e funcionando."
