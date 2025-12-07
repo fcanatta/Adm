@@ -1,0 +1,74 @@
+# /opt/adm/packages/dev-lang/python/python.post_install
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${ROOTFS:?ROOTFS não definido pelo ADM}"
+: "${DESTDIR:=}"
+
+py_main="$ROOTFS/usr/bin/python3.14"
+py3="$ROOTFS/usr/bin/python3"
+py="$ROOTFS/usr/bin/python"
+
+echo "[python sanity-check] Verificando instalação em:"
+echo "  - $py_main"
+echo "  - $py3 (symlink esperado)"
+echo "  - $py  (symlink esperado)"
+
+# Binário principal
+if [[ ! -x "$py_main" ]]; then
+    echo "[python sanity-check] ERRO: '$py_main' não encontrado ou não executável" >&2
+    exit 1
+fi
+
+# Symlinks (se existirem)
+for b in "$py3" "$py"; do
+    if [[ -e "$b" ]]; then
+        if [[ -L "$b" || -x "$b" ]]; then
+            :
+        else
+            echo "[python sanity-check] ERRO: '$b' existe mas não é executável" >&2
+            exit 1
+        fi
+    fi
+done
+
+# Teste de versão
+if ! "$py_main" -V >/dev/null 2>&1; then
+    echo "[python sanity-check] ERRO: 'python3.14 -V' falhou" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 1: aritmética simples
+out1="$("$py_main" - << 'EOF'
+print(2 + 3)
+EOF
+)" || {
+    echo "[python sanity-check] ERRO: falha ao executar teste aritmético simples" >&2
+    exit 1
+}
+
+if [[ "$out1" != "5" ]]; then
+    echo "[python sanity-check] ERRO: resultado inesperado (esperado '5', obtido '$out1')" >&2
+    exit 1
+fi
+
+# Teste funcional mínimo 2: import de módulos básicos e acesso a sys.executable
+out2="$("$py_main" - << 'EOF'
+import sys, os, math
+print("ok", bool(sys.executable), math.sqrt(16))
+EOF
+)" || {
+    echo "[python sanity-check] ERRO: falha ao importar módulos básicos" >&2
+    exit 1
+}
+
+case "$out2" in
+    "ok True 4.0"|"ok True 4")
+        ;;
+    *)
+        echo "[python sanity-check] ERRO: saída inesperada ao importar módulos básicos: '$out2'" >&2
+        exit 1
+        ;;
+esac
+
+echo "[python sanity-check] OK: Python 3.14.0 instalado e executando scripts simples com módulos básicos."
